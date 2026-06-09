@@ -113,7 +113,7 @@ type Runner struct {
 
 func ArchitectureSupported(arch string) bool {
 	switch arch {
-	case "llama", "llama2", "llama3", "mistral", "mistral3", "qwen2":
+	case "llama", "llama2", "llama3", "mistral", "mistral3", "qwen2", "gpt-oss", "gemma", "gemma2", "gemma4":
 		return true
 	default:
 		return false

@@ -34,3 +34,35 @@ func TestTopPSlicesTopKCandidateSet(t *testing.T) {
 		}
 	}
 }
+
+func TestTopPWithoutTopKUsesTopMassOnly(t *testing.T) {
+	config := SamplerConfig{Temperature: 1, TopP: 0.6, TopK: 0, RepeatPenalty: 1}
+	rng := NewRng(42)
+	scratch := make([]TokenProb, 0, 4)
+	for range 64 {
+		logits := []float32{10, 9, 0, -1}
+		token := SampleWithScratch(logits, config, rng, nil, &scratch)
+		if token != 0 {
+			t.Fatalf("token = %d, want 0", token)
+		}
+	}
+	if cap(scratch) < 4 {
+		t.Fatalf("scratch capacity = %d, want at least 4", cap(scratch))
+	}
+}
+
+func BenchmarkSampleTopPFullVocabWithScratch(b *testing.B) {
+	config := SamplerConfig{Temperature: 1, TopP: 0.9, TopK: 0, RepeatPenalty: 1}
+	base := make([]float32, 32000)
+	for i := range base {
+		base[i] = float32(i%997) / 997
+	}
+	logits := make([]float32, len(base))
+	scratch := make([]TokenProb, 0, len(base))
+	rng := NewRng(1)
+	b.ReportAllocs()
+	for b.Loop() {
+		copy(logits, base)
+		_ = SampleWithScratch(logits, config, rng, nil, &scratch)
+	}
+}

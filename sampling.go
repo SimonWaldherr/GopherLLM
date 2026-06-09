@@ -2,7 +2,7 @@ package main
 
 import (
 	"math"
-	"sort"
+	"slices"
 )
 
 type Rng struct{ state uint64 }
@@ -104,47 +104,68 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 		logits[i] /= sum
 	}
 	if config.TopP < 1 {
-		sorted := make([]TokenProb, n)
-		for i, p := range logits {
-			sorted[i] = TokenProb{i, p}
-		}
-		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Prob > sorted[j].Prob })
-		cumsum := float32(0)
-		cutoff := len(sorted)
-		for i, item := range sorted {
-			cumsum += item.Prob
-			if cumsum > config.TopP {
-				cutoff = i + 1
-				break
-			}
-		}
-		keep := make([]bool, n)
-		for _, item := range sorted[:cutoff] {
-			keep[item.Token] = true
-		}
-		var newSum float32
-		for i := range logits {
-			if !keep[i] {
-				logits[i] = 0
-			} else {
-				newSum += logits[i]
-			}
-		}
-		if newSum > 0 {
-			for i := range logits {
-				logits[i] /= newSum
-			}
-		}
+		return sampleTopPFromProbs(logits, config.TopP, rng, candidates)
 	}
+	return sampleFromProbs(logits, rng)
+}
+
+func sampleFromProbs(probs []float32, rng *Rng) uint32 {
 	r := rng.NextF32()
 	var cumsum float32
-	for i, p := range logits {
+	for i, p := range probs {
 		cumsum += p
 		if cumsum > r {
 			return uint32(i)
 		}
 	}
-	return uint32(n - 1)
+	return uint32(len(probs) - 1)
+}
+
+func sampleTopPFromProbs(probs []float32, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
+	*candidates = (*candidates)[:0]
+	for i, p := range probs {
+		*candidates = append(*candidates, TokenProb{i, p})
+	}
+	slices.SortFunc(*candidates, func(a, b TokenProb) int {
+		if a.Prob > b.Prob {
+			return -1
+		}
+		if a.Prob < b.Prob {
+			return 1
+		}
+		if a.Token < b.Token {
+			return -1
+		}
+		if a.Token > b.Token {
+			return 1
+		}
+		return 0
+	})
+	cumsum := float32(0)
+	cutoff := len(*candidates)
+	for i, item := range *candidates {
+		cumsum += item.Prob
+		if cumsum > topP {
+			cutoff = i + 1
+			break
+		}
+	}
+	var kept float32
+	for _, item := range (*candidates)[:cutoff] {
+		kept += item.Prob
+	}
+	if kept <= 0 {
+		return argmaxToken(probs)
+	}
+	r := rng.NextF32() * kept
+	cumsum = 0
+	for _, item := range (*candidates)[:cutoff] {
+		cumsum += item.Prob
+		if cumsum > r {
+			return uint32(item.Token)
+		}
+	}
+	return uint32((*candidates)[cutoff-1].Token)
 }
 
 func sampleTopK(logits []float32, topK int, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {

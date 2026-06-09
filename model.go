@@ -286,6 +286,8 @@ type DecodeBuffer struct {
 	SamplerCandidates       []TokenProb
 	Q4KXSums                []float32
 	RopeInvFreq             []float32
+	RopeSin                 []float32
+	RopeCos                 []float32
 	RopeGptOssInvFreq       []float32
 	RopeGptOssConcentration float32
 }
@@ -317,6 +319,8 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		SamplerCandidates:       make([]TokenProb, 0, 64),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
 		RopeInvFreq:             inv,
+		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),
+		RopeCos:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeGptOssInvFreq:       gptInv,
 		RopeGptOssConcentration: concentration,
 	}
@@ -709,6 +713,8 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	dim := config.Dim
 	headDim := config.HeadDim
 	kvMul := max(1, config.KVMul)
+	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, &buf.RopeSin, &buf.RopeCos)
+	ropeIsInterleaved := ropeInterleaved(config.Arch)
 	weights.TokenEmbd.RowInto(int(token), dim, &buf.X)
 	if config.EmbeddingScale != 1 {
 		ScaleF32(buf.X[:dim], config.EmbeddingScale)
@@ -737,8 +743,8 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.K, layer.BK)
 			addInPlace(buf.V, layer.BV)
 		}
-		applyRope(buf.Q, pos, headDim, config.NHeads, config.RopeDimensionCount, buf.RopeInvFreq, ropeInterleaved(config.Arch))
-		applyRope(buf.K, pos, headDim, config.NKVHeads, config.RopeDimensionCount, buf.RopeInvFreq, ropeInterleaved(config.Arch))
+		applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
+		applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
 
 		kStart := pos * cache.PerPosKDim
 		vStart := pos * cache.PerPosVDim
@@ -874,29 +880,43 @@ func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 }
 
 func applyRope(vec []float32, pos, headDim, nHeads, ropeDim int, invFreq []float32, interleaved bool) {
+	sinScratch := []float32{}
+	cosScratch := []float32{}
+	half, nCache := prepareRopeScratch(pos, headDim, ropeDim, invFreq, &sinScratch, &cosScratch)
+	applyPreparedRope(vec, headDim, nHeads, half, nCache, sinScratch, cosScratch, interleaved)
+}
+
+func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, sinScratch, cosScratch *[]float32) (int, int) {
 	if ropeDim <= 0 || ropeDim > headDim {
 		ropeDim = headDim
 	}
 	ropeDim -= ropeDim % 2
 	half := ropeDim / 2
 	if half <= 0 {
-		return
+		return 0, 0
 	}
 
 	nCache := min(half, len(invFreq))
 	if nCache <= 0 {
-		return
+		return half, 0
 	}
 
-	type sinCos struct {
-		s float32
-		c float32
-	}
-	scCache := make([]sinCos, nCache)
-	for i := range scCache {
+	ensureLenNoClear(sinScratch, nCache)
+	ensureLenNoClear(cosScratch, nCache)
+	sin := *sinScratch
+	cos := *cosScratch
+	for i := range nCache {
 		angle := float64(float32(pos) * invFreq[i])
 		s64, c64 := math.Sincos(angle)
-		scCache[i] = sinCos{s: float32(s64), c: float32(c64)}
+		sin[i] = float32(s64)
+		cos[i] = float32(c64)
+	}
+	return half, nCache
+}
+
+func applyPreparedRope(vec []float32, headDim, nHeads, half, nCache int, sin, cos []float32, interleaved bool) {
+	if nCache <= 0 {
+		return
 	}
 
 	for h := range nHeads {
@@ -910,18 +930,18 @@ func applyRope(vec []float32, pos, headDim, nHeads, ropeDim int, invFreq []float
 		if interleaved {
 			for i := 0; i < nCache; i++ {
 				idx0, idx1 := i*2, i*2+1
-				sc := scCache[i]
+				s, c := sin[i], cos[i]
 				v0, v1 := sub[idx0], sub[idx1]
-				sub[idx0] = v0*sc.c - v1*sc.s
-				sub[idx1] = v0*sc.s + v1*sc.c
+				sub[idx0] = v0*c - v1*s
+				sub[idx1] = v0*s + v1*c
 			}
 		} else {
 			for i := 0; i < nCache; i++ {
 				idx0, idx1 := i, i+half
-				sc := scCache[i]
+				s, c := sin[i], cos[i]
 				v0, v1 := sub[idx0], sub[idx1]
-				sub[idx0] = v0*sc.c - v1*sc.s
-				sub[idx1] = v0*sc.s + v1*sc.c
+				sub[idx0] = v0*c - v1*s
+				sub[idx1] = v0*s + v1*c
 			}
 		}
 	}
