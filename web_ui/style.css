@@ -1,0 +1,267 @@
+/* ── Design tokens ── */
+:root {
+  color-scheme: light dark;
+  --bg: #f6f4ef;
+  --panel: #ffffff;
+  --ink: #1d1f24;
+  --muted: #666b74;
+  --line: #d9d5cc;
+  --accent: #2d6e4e;
+  --accent-2: #8f4e2f;
+  --user: #e5f0ea;
+  --assistant: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171717;
+    --panel: #222326;
+    --ink: #f0eee8;
+    --muted: #aaa49a;
+    --line: #393a3d;
+    --accent: #5aad7e;
+    --accent-2: #d69a73;
+    --user: #173d28;
+    --assistant: #252629;
+  }
+}
+
+/* ── Reset & base ── */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font: 15px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+}
+.app {
+  min-height: 100%;
+  display: grid;
+}
+
+/* ── Chrome ── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px clamp(14px, 3vw, 28px);
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+}
+h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 650;
+}
+.status {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+#modelSelect {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  max-width: 280px;
+  cursor: pointer;
+}
+#modelSelect:disabled {
+  opacity: .55;
+  cursor: not-allowed;
+}
+
+/* ── Buttons ── */
+button {
+  min-height: 38px;
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, var(--line));
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+}
+button.secondary {
+  background: transparent;
+  color: var(--accent-2);
+  border-color: color-mix(in srgb, var(--accent-2) 55%, var(--line));
+}
+button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+/* ── Focus ── */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ── Message bubbles ── */
+.msg {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  position: relative;
+}
+.msg.user {
+  align-self: flex-end;
+  background: var(--user);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+}
+.msg.assistant {
+  align-self: flex-start;
+  background: var(--assistant);
+  white-space: normal;
+}
+.msg.error {
+  align-self: flex-start;
+  background: color-mix(in srgb, #cc3333 8%, var(--panel));
+  border-color: color-mix(in srgb, #cc3333 40%, var(--line));
+  color: var(--ink);
+  font-size: 13px;
+}
+.msg pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  background: #101820;
+  color: #f0eee8;
+  border-radius: 6px;
+  overflow-x: auto;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre;
+}
+@media (prefers-color-scheme: dark) {
+  .msg pre { background: #0d0f12; }
+}
+.msg code {
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.msg pre code { background: none; padding: 0; }
+.msg h1, .msg h2, .msg h3 { margin: 10px 0 4px; font-size: 1em; font-weight: 700; }
+.msg ul, .msg ol { margin: 4px 0; padding-left: 20px; }
+.msg strong { font-weight: 700; }
+
+/* ── Copy button ── */
+.copy-btn {
+  position: absolute;
+  top: 7px;
+  right: 8px;
+  min-height: auto;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0;
+  transition: opacity 0.15s;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--muted);
+  cursor: pointer;
+}
+.msg:hover .copy-btn,
+.copy-btn:focus-visible { opacity: 1; }
+
+/* ── Utilities ── */
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+
+/* ════════════════════════════════
+   Chat UI layout
+   ════════════════════════════════ */
+body.chat .app { grid-template-rows: auto 1fr auto; }
+
+body.chat .top { display: flex; align-items: center; gap: 14px; }
+
+body.chat main {
+  overflow: auto;
+  padding: 20px clamp(12px, 3vw, 28px);
+}
+body.chat .messages {
+  width: min(900px, 100%);
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+body.chat .msg { max-width: min(760px, 92%); }
+body.chat .empty {
+  margin: 18vh auto 0;
+  width: min(520px, 100%);
+  color: var(--muted);
+  text-align: center;
+}
+
+/* Composer */
+body.chat form {
+  border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  padding: 12px clamp(12px, 3vw, 28px) 16px;
+}
+body.chat .composer {
+  width: min(900px, 100%);
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+body.chat textarea {
+  width: 100%;
+  min-height: 48px;
+  max-height: 180px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+body.chat .actions { display: grid; gap: 8px; }
+body.chat button { min-width: 74px; }
+body.chat .settings {
+  width: min(900px, 100%);
+  margin: 8px auto 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+body.chat label { display: inline-flex; align-items: center; gap: 7px; }
+body.chat input[type="number"] {
+  width: 76px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 7px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+body.chat input[type="range"] { accent-color: var(--accent); }
+
+@media (max-width: 560px) {
+  body.chat .composer { grid-template-columns: 1fr; }
+  body.chat .actions { grid-template-columns: 1fr 1fr; }
+  body.chat button { width: 100%; }
+  body.chat .msg { max-width: 100%; }
+}
+
+/* Typing dots */
+@keyframes dot-blink { 0%, 80%, 100% { opacity: 0; } 40% { opacity: 1; } }
+.dots span { animation: dot-blink 1.2s infinite; opacity: 0; display: inline-block; }
+.dots span:nth-child(2) { animation-delay: .2s; }
+.dots span:nth-child(3) { animation-delay: .4s; }

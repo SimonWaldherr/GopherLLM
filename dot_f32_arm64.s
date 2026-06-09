@@ -1,0 +1,68 @@
+#include "textflag.h"
+
+// func dotF32(a, b []float32) float32
+TEXT ·dotF32(SB), NOSPLIT|NOFRAME, $0-52
+	MOVD a_base+0(FP), R0
+	MOVD a_len+8(FP), R2
+	MOVD b_base+24(FP), R1
+	MOVD b_len+32(FP), R3
+	CMP R3, R2
+	BLS min_done
+	MOVD R3, R2
+
+min_done:
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V9.B16, V9.B16, V9.B16
+	VEOR V10.B16, V10.B16, V10.B16
+	VEOR V11.B16, V11.B16, V11.B16
+	FMOVS $(1.0), F31
+	VDUP V31.S[0], V31.S4
+	CBZ R2, reduce
+	CMP $16, R2
+	BLT reduce
+
+loop16:
+	VLD1.P 16(R0), [V1.S4]
+	VLD1.P 16(R1), [V2.S4]
+	VFMLA V1.S4, V2.S4, V0.S4
+	VLD1.P 16(R0), [V3.S4]
+	VLD1.P 16(R1), [V4.S4]
+	VFMLA V3.S4, V4.S4, V9.S4
+	VLD1.P 16(R0), [V5.S4]
+	VLD1.P 16(R1), [V6.S4]
+	VFMLA V5.S4, V6.S4, V10.S4
+	VLD1.P 16(R0), [V7.S4]
+	VLD1.P 16(R1), [V8.S4]
+	VFMLA V7.S4, V8.S4, V11.S4
+	SUB $16, R2, R2
+	CMP $16, R2
+	BGE loop16
+
+reduce:
+	VFMLA V9.S4, V31.S4, V0.S4
+	VFMLA V10.S4, V31.S4, V0.S4
+	VFMLA V11.S4, V31.S4, V0.S4
+	VMOV V0.S[0], R4
+	VMOV V0.S[1], R5
+	VMOV V0.S[2], R6
+	VMOV V0.S[3], R7
+	FMOVS R4, F0
+	FMOVS R5, F1
+	FMOVS R6, F2
+	FMOVS R7, F3
+	FADDS F1, F0
+	FADDS F3, F2
+	FADDS F2, F0
+	CBZ R2, done
+
+tail:
+	FMOVS.P 4(R0), F4
+	FMOVS.P 4(R1), F5
+	FMULS F5, F4, F4
+	FADDS F4, F0
+	SUB $1, R2, R2
+	CBNZ R2, tail
+
+done:
+	FMOVS F0, ret+48(FP)
+	RET

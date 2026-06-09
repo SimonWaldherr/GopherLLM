@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <meta name="description" content="Simple chat interface for GopherLLM — local LLM inference.">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="color-scheme" content="light dark">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="chat">
+
+<div class="app">
+  <header role="banner">
+    <h1>{{.Title}}</h1>
+    <div class="top">
+      <select id="modelSelect" aria-label="Select model">
+        <option value="">{{.Model}}</option>
+      </select>
+      <div id="status" class="status" role="status" aria-live="polite">Ready</div>
+    </div>
+  </header>
+
+  <main id="scroll" aria-label="Conversation">
+    <div class="messages" id="messages" role="log" aria-label="Message history" aria-live="polite" aria-relevant="additions">
+      <div class="empty" id="empty">Ask something to start a local chat.</div>
+    </div>
+  </main>
+
+  <form id="form" aria-label="Chat input" novalidate>
+    <div class="composer">
+      <textarea
+        id="prompt"
+        name="prompt"
+        rows="2"
+        placeholder="Message GopherLLM"
+        autofocus
+        autocomplete="off"
+        aria-required="true"
+      ></textarea>
+      <div class="actions">
+        <button id="send" type="submit" aria-label="Send message">Send</button>
+        <button id="clear" class="secondary" type="button" aria-label="Clear conversation">Clear</button>
+      </div>
+    </div>
+    <div class="settings">
+      <label>Max tokens <input id="maxTokens" type="number" min="1" max="4096" value="{{.MaxTokens}}" inputmode="numeric" autocomplete="off"></label>
+      <label>Temperature
+        <input id="temperature" type="range" min="0" max="2" step="0.05" value="{{printf "%.2f" .Temperature}}" aria-valuemin="0" aria-valuemax="2" aria-valuenow="{{printf "%.2f" .Temperature}}">
+        <span id="tempValue">{{printf "%.2f" .Temperature}}</span>
+      </label>
+    </div>
+  </form>
+</div>
+
+<noscript>
+  <p style="padding:2rem;text-align:center;">GopherLLM Chat requires JavaScript to be enabled.</p>
+</noscript>
+
+<script src="/script.js"></script>
+</body>
+</html>
