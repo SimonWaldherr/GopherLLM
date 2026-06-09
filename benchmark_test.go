@@ -123,6 +123,42 @@ func BenchmarkDotQ6K_4096(b *testing.B) {
 	}
 }
 
+func BenchmarkDotQ4KWithXSums_4096(b *testing.B) {
+	row := benchBytes((4096 / 256) * 144)
+	x := benchFloatSlice(4096)
+	scratch := []float32{}
+	xs := fillQ4KXSums(x, 4096, &scratch)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row) + len(x)*4))
+	for b.Loop() {
+		_ = dotQ4KF32WithXSums(row, x, xs, 4096)
+	}
+}
+
+func BenchmarkDotQ6KWithXSums_4096(b *testing.B) {
+	row := benchBytes((4096 / 256) * 210)
+	x := benchFloatSlice(4096)
+	scratch := []float32{}
+	xs := fillQ6KXSums16(x, 4096, &scratch)
+	out := make([]float32, 1)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row) + len(x)*4))
+	for b.Loop() {
+		dotQ6KRowsWithXSums(row, x, xs, 4096, len(row), 0, 1, out)
+	}
+}
+
+func BenchmarkMatvecQ6K_1024x1024(b *testing.B) {
+	data := benchBytes(1024 * (1024 / 256) * 210)
+	x := benchFloatSlice(1024)
+	out := make([]float32, 1024)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data) + len(x)*4))
+	for b.Loop() {
+		MatvecQ6KInto(data, x, 1024, 1024, &out)
+	}
+}
+
 func BenchmarkGenerationConfiguredModel(b *testing.B) {
 	modelPath := os.Getenv("GOPHERLLM_BENCH_MODEL")
 	if modelPath == "" {

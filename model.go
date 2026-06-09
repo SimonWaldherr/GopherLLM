@@ -760,23 +760,32 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		if config.SlidingWindow > 0 {
 			attnStart = max(0, pos-config.SlidingWindow)
 		}
-		for h := range config.NHeads {
-			kvH := h / kvMul
-			qOff := h * headDim
-			outOff := h * config.ValueDim
-			onlineAttention(
-				buf.Q[qOff:qOff+headDim],
-				cache.K[l][kvH*config.HeadDim:],
-				cache.V[l][kvH*config.ValueDim:],
-				cache.PerPosKDim,
-				cache.PerPosVDim,
-				headDim,
-				config.ValueDim,
-				attnStart,
-				pos,
-				scale,
-				buf.AttnOut[outOff:outOff+config.ValueDim],
-			)
+		attnHeads := func(hStart, hEnd int) {
+			for h := hStart; h < hEnd; h++ {
+				kvH := h / kvMul
+				qOff := h * headDim
+				outOff := h * config.ValueDim
+				onlineAttention(
+					buf.Q[qOff:qOff+headDim],
+					cache.K[l][kvH*config.HeadDim:],
+					cache.V[l][kvH*config.ValueDim:],
+					cache.PerPosKDim,
+					cache.PerPosVDim,
+					headDim,
+					config.ValueDim,
+					attnStart,
+					pos,
+					scale,
+					buf.AttnOut[outOff:outOff+config.ValueDim],
+				)
+			}
+		}
+		// Attention cost grows with context length; spread heads across the
+		// worker pool once there is enough work to amortize dispatch overhead.
+		if attnLen := pos - attnStart + 1; attnLen >= 128 && config.NHeads > 1 {
+			parallelChunks(config.NHeads, attnHeads)
+		} else {
+			attnHeads(0, config.NHeads)
 		}
 		layer.WO.MatvecInto(buf.AttnOut, &buf.Proj)
 		if config.ResidualScale != 1 {

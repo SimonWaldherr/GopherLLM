@@ -162,13 +162,22 @@ func MatvecQ4_0Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	})
 }
 
+var xsumsScratchPool = sync.Pool{New: func() any {
+	s := make([]float32, 0, 1024)
+	return &s
+}}
+
 func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 256) * 144
 	ensureLenNoClear(out, rows)
-	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes {
+	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ4KXSums(x, cols, scratch)
 		parallelRows(rows, func(start, end int) {
-			dotQ4KRows(data, x, cols, rowBytes, start, end, *out)
+			dotQ4KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
 		})
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
 		return
 	}
 	parallelRows(rows, func(start, end int) {
@@ -235,11 +244,17 @@ func MatvecQ5KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 func MatvecQ6KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 256) * 210
 	ensureLenNoClear(out, rows)
+	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ6KXSums16(x, cols, scratch)
+		parallelRows(rows, func(start, end int) {
+			dotQ6KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
+		})
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return
+	}
 	parallelRows(rows, func(start, end int) {
-		if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes {
-			dotQ6KRows(data, x, cols, rowBytes, start, end, *out)
-			return
-		}
 		for r := start; r < end; r++ {
 			off := r * rowBytes
 			(*out)[r] = DotQ6KF32(data[off:min(off+rowBytes, len(data))], x, cols)
@@ -257,15 +272,19 @@ func MatvecQ6K2Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	}
 	ensureLenNoClear(aOut, aRows)
 	ensureLenNoClear(bOut, bRows)
+	scratch := xsumsScratchPool.Get().(*[]float32)
+	xs := fillQ6KXSums16(x, aCols, scratch)
 	totalRows := aRows + bRows
 	parallelRows(totalRows, func(start, end int) {
 		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-			dotQ6KRows(aData, x, aCols, rowBytes, as, ae, *aOut)
+			dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
 		}
 		if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
-			dotQ6KRows(bData, x, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
 		}
 	})
+	*scratch = xs
+	xsumsScratchPool.Put(scratch)
 	return true
 }
 
@@ -280,19 +299,23 @@ func MatvecQ6K3Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	ensureLenNoClear(aOut, aRows)
 	ensureLenNoClear(bOut, bRows)
 	ensureLenNoClear(cOut, cRows)
+	scratch := xsumsScratchPool.Get().(*[]float32)
+	xs := fillQ6KXSums16(x, aCols, scratch)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
 	parallelRows(totalRows, func(start, end int) {
 		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-			dotQ6KRows(aData, x, aCols, rowBytes, as, ae, *aOut)
+			dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
 		}
 		if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-			dotQ6KRows(bData, x, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
 		}
 		if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-			dotQ6KRows(cData, x, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
+			dotQ6KRowsWithXSums(cData, x, xs, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
 		}
 	})
+	*scratch = xs
+	xsumsScratchPool.Put(scratch)
 	return true
 }
 
@@ -301,6 +324,67 @@ func dotQ6KRows(data []byte, x []float32, cols, rowBytes, start, end int, out []
 		off := r * rowBytes
 		out[r] = DotQ6KF32(data[off:off+rowBytes], x, cols)
 	}
+}
+
+func dotQ6KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start, end int, out []float32) {
+	if !hasQuantNEON {
+		dotQ6KRows(data, x, cols, rowBytes, start, end, out)
+		return
+	}
+	for r := start; r < end; r++ {
+		off := r * rowBytes
+		out[r] = dotQ6KF32NEONWithXSums(data[off:off+rowBytes], x, xsums, cols)
+	}
+}
+
+// fillQ6KXSums16 computes per-16-element sums of x, used to fold the
+// constant -32 offset of Q6_K quants out of the inner dot product.
+func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
+	groups := cols / 16
+	ensureLenNoClear(scratch, groups)
+	out := *scratch
+	for g := range groups {
+		base := g * 16
+		if base+16 > len(x) {
+			out[g] = 0
+			continue
+		}
+		xBlock := x[base : base+16]
+		_ = xBlock[15]
+		var s0, s1, s2, s3 float32
+		for i := 0; i < 16; i += 4 {
+			s0 += xBlock[i]
+			s1 += xBlock[i+1]
+			s2 += xBlock[i+2]
+			s3 += xBlock[i+3]
+		}
+		out[g] = (s0 + s1) + (s2 + s3)
+	}
+	return out
+}
+
+// dotQ6KF32NEONWithXSums computes a Q6_K row dot product using the NEON
+// block kernel. xsums must hold per-16-element sums of x (fillQ6KXSums16).
+func dotQ6KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
+	var qdots [16]float32
+	var sum float32
+	blocks := cols / 256
+	for b := 0; b < blocks; b++ {
+		base := b * 210
+		if base+210 > len(row) {
+			break
+		}
+		block := row[base : base+210]
+		sc := block[192:208]
+		d := F16ToF32(binaryLE16(block[208:]))
+		q6kQDots16(&block[0], &block[128], &x[b*256], &qdots[0])
+		var blockSum float32
+		for j := 0; j < 16; j++ {
+			blockSum += float32(int8(sc[j])) * (qdots[j] - 32*xsums[b*16+j])
+		}
+		sum += d * blockSum
+	}
+	return sum
 }
 
 func MatvecMXFP4Into(data []byte, x []float32, rows, cols int, out *[]float32) {
@@ -529,6 +613,47 @@ func fillQ4KXSums(x []float32, cols int, scratch *[]float32) []float32 {
 }
 
 func dotQ4KF32WithXSums(row []byte, x, xsums []float32, cols int) float32 {
+	if hasQuantNEON && cols > 0 && cols%256 == 0 && len(x) >= cols && len(xsums) >= cols/32 {
+		return dotQ4KF32NEONWithXSums(row, x, xsums, cols)
+	}
+	return dotQ4KF32ScalarWithXSums(row, x, xsums, cols)
+}
+
+// dotQ4KF32NEONWithXSums computes a Q4_K row dot product using the NEON
+// block kernel. xsums must hold per-32-element sums of x (fillQ4KXSums).
+func dotQ4KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
+	var qdots [8]float32
+	var sum float32
+	blocks := cols / 256
+	for b := 0; b < blocks; b++ {
+		base := b * 144
+		if base+144 > len(row) {
+			break
+		}
+		block := row[base : base+144]
+		d := F16ToF32(binaryLE16(block[0:]))
+		dmin := F16ToF32(binaryLE16(block[2:]))
+		scales := block[4:16]
+		q4kQDots8(&block[16], &x[b*256], &qdots[0])
+		for step := 0; step < 4; step++ {
+			is := step * 2
+			var sc1, m1, sc2, m2 byte
+			if is < 4 {
+				sc1, m1 = scales[is]&63, scales[is+4]&63
+				sc2, m2 = scales[is+1]&63, scales[is+5]&63
+			} else {
+				sc1, m1 = (scales[is+4]&0x0f)|((scales[is-4]>>6)<<4), (scales[is+4]>>4)|((scales[is]>>6)<<4)
+				sc2, m2 = (scales[is+5]&0x0f)|((scales[is-3]>>6)<<4), (scales[is+5]>>4)|((scales[is+1]>>6)<<4)
+			}
+			xsumBase := b*8 + is
+			sum += d*float32(sc1)*qdots[is] - dmin*float32(m1)*xsums[xsumBase]
+			sum += d*float32(sc2)*qdots[is+1] - dmin*float32(m2)*xsums[xsumBase+1]
+		}
+	}
+	return sum
+}
+
+func dotQ4KF32ScalarWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var sum float32
 	blocks := cols / 256
 	for b := 0; b < blocks; b++ {
@@ -1262,17 +1387,39 @@ func parallelRows(rows int, fn func(start, end int)) {
 		fn(0, rows)
 		return
 	}
-	pool := getRowWorkerPool(threads)
-	done := rowDonePool.Get().(chan struct{})
-	if cap(done) < threads {
-		done = make(chan struct{}, threads)
+	dispatchParallel(threads, rows, fn)
+}
+
+// parallelChunks splits n items across the worker pool without the minimum
+// per-thread row count required by parallelRows. Intended for coarse-grained
+// items (e.g. attention heads) where even a single item is substantial work.
+func parallelChunks(n int, fn func(start, end int)) {
+	threads := min(numThreads(), n)
+	if threads <= 1 {
+		fn(0, n)
+		return
 	}
-	for w := range threads {
-		start := rows * w / threads
-		end := rows * (w + 1) / threads
+	dispatchParallel(threads, n, fn)
+}
+
+func dispatchParallel(threads, rows int, fn func(start, end int)) {
+	pool := getRowWorkerPool(threads)
+	// Issue more chunks than workers so faster cores naturally pick up the
+	// slack of slower ones (e.g. efficiency cores on Apple Silicon).
+	chunks := threads
+	if rows >= threads*16 {
+		chunks = min(threads*4, cap(pool.jobs))
+	}
+	done := rowDonePool.Get().(chan struct{})
+	if cap(done) < chunks {
+		done = make(chan struct{}, chunks)
+	}
+	for w := range chunks {
+		start := rows * w / chunks
+		end := rows * (w + 1) / chunks
 		pool.jobs <- rowJob{start: start, end: end, fn: fn, done: done}
 	}
-	for range threads {
+	for range chunks {
 		<-done
 	}
 	if cap(done) <= 128 {
