@@ -126,6 +126,9 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
   comparisons.
 - The runtime currently reports Metal as unavailable; inference runs through the Go
   and assembly CPU kernels.
+- On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are spread
+  across the worker pool at longer contexts, and matvec work is over-chunked so
+  performance cores absorb efficiency-core stragglers.
 
 ## Supported Architectures
 
