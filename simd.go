@@ -369,19 +369,38 @@ func dotQ6KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [16]float32
 	var sum float32
 	blocks := cols / 256
+	blocks = min(blocks, len(row)/210)
+	blocks = min(blocks, len(x)/256)
+	blocks = min(blocks, len(xsums)/16)
+	if blocks <= 0 {
+		return 0
+	}
+	_ = row[blocks*210-1]
+	_ = x[blocks*256-1]
+	_ = xsums[blocks*16-1]
 	for b := 0; b < blocks; b++ {
 		base := b * 210
-		if base+210 > len(row) {
-			break
-		}
-		block := row[base : base+210]
-		sc := block[192:208]
-		d := F16ToF32(binaryLE16(block[208:]))
-		q6kQDots16(&block[0], &block[128], &x[b*256], &qdots[0])
-		var blockSum float32
-		for j := 0; j < 16; j++ {
-			blockSum += float32(int8(sc[j])) * (qdots[j] - 32*xsums[b*16+j])
-		}
+		d := F16ToF32(uint16(row[base+208]) | uint16(row[base+209])<<8)
+		q6kQDots16(&row[base], &row[base+128], &x[b*256], &qdots[0])
+		xs := xsums[b*16:]
+		_ = xs[15]
+		blockSum :=
+			float32(int8(row[base+192]))*(qdots[0]-32*xs[0]) +
+				float32(int8(row[base+193]))*(qdots[1]-32*xs[1]) +
+				float32(int8(row[base+194]))*(qdots[2]-32*xs[2]) +
+				float32(int8(row[base+195]))*(qdots[3]-32*xs[3]) +
+				float32(int8(row[base+196]))*(qdots[4]-32*xs[4]) +
+				float32(int8(row[base+197]))*(qdots[5]-32*xs[5]) +
+				float32(int8(row[base+198]))*(qdots[6]-32*xs[6]) +
+				float32(int8(row[base+199]))*(qdots[7]-32*xs[7]) +
+				float32(int8(row[base+200]))*(qdots[8]-32*xs[8]) +
+				float32(int8(row[base+201]))*(qdots[9]-32*xs[9]) +
+				float32(int8(row[base+202]))*(qdots[10]-32*xs[10]) +
+				float32(int8(row[base+203]))*(qdots[11]-32*xs[11]) +
+				float32(int8(row[base+204]))*(qdots[12]-32*xs[12]) +
+				float32(int8(row[base+205]))*(qdots[13]-32*xs[13]) +
+				float32(int8(row[base+206]))*(qdots[14]-32*xs[14]) +
+				float32(int8(row[base+207]))*(qdots[15]-32*xs[15])
 		sum += d * blockSum
 	}
 	return sum

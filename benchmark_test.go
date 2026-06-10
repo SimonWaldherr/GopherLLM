@@ -148,6 +148,19 @@ func BenchmarkDotQ6KWithXSums_4096(b *testing.B) {
 	}
 }
 
+func BenchmarkDotQ6KWithXSums_3072(b *testing.B) {
+	row := benchBytes((3072 / 256) * 210)
+	x := benchFloatSlice(3072)
+	scratch := []float32{}
+	xs := fillQ6KXSums16(x, 3072, &scratch)
+	out := make([]float32, 1)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row) + len(x)*4))
+	for b.Loop() {
+		dotQ6KRowsWithXSums(row, x, xs, 3072, len(row), 0, 1, out)
+	}
+}
+
 func BenchmarkMatvecQ6K_1024x1024(b *testing.B) {
 	data := benchBytes(1024 * (1024 / 256) * 210)
 	x := benchFloatSlice(1024)

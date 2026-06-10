@@ -137,6 +137,8 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are spread
   across the worker pool at longer contexts, and matvec work is over-chunked so
   performance cores absorb efficiency-core stragglers.
+- See `OPTIMIZATION_LOG.md` for measured optimization attempts, including rejected
+  Q6_K/NEON approaches that should not be retried without new evidence.
 
 ## Supported Architectures
 
