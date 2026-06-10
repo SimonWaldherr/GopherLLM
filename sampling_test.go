@@ -51,6 +51,27 @@ func TestTopPWithoutTopKUsesTopMassOnly(t *testing.T) {
 	}
 }
 
+func TestSortTokenProbsOrdersByProbabilityThenToken(t *testing.T) {
+	candidates := []TokenProb{
+		{Token: 4, Prob: 0.2},
+		{Token: 2, Prob: 0.7},
+		{Token: 1, Prob: 0.7},
+		{Token: 3, Prob: 0.4},
+	}
+	sortTokenProbs(candidates)
+	want := []TokenProb{
+		{Token: 1, Prob: 0.7},
+		{Token: 2, Prob: 0.7},
+		{Token: 3, Prob: 0.4},
+		{Token: 4, Prob: 0.2},
+	}
+	for i := range want {
+		if candidates[i] != want[i] {
+			t.Fatalf("candidates[%d] = %+v, want %+v", i, candidates[i], want[i])
+		}
+	}
+}
+
 func BenchmarkSampleTopPFullVocabWithScratch(b *testing.B) {
 	config := SamplerConfig{Temperature: 1, TopP: 0.9, TopK: 0, RepeatPenalty: 1}
 	base := make([]float32, 32000)
@@ -59,6 +80,22 @@ func BenchmarkSampleTopPFullVocabWithScratch(b *testing.B) {
 	}
 	logits := make([]float32, len(base))
 	scratch := make([]TokenProb, 0, len(base))
+	rng := NewRng(1)
+	b.ReportAllocs()
+	for b.Loop() {
+		copy(logits, base)
+		_ = SampleWithScratch(logits, config, rng, nil, &scratch)
+	}
+}
+
+func BenchmarkSampleDefaultTopKWithScratch(b *testing.B) {
+	config := DefaultSamplerConfig()
+	base := make([]float32, 32000)
+	for i := range base {
+		base[i] = float32(i%997) / 997
+	}
+	logits := make([]float32, len(base))
+	scratch := make([]TokenProb, 0, config.TopK)
 	rng := NewRng(1)
 	b.ReportAllocs()
 	for b.Loop() {

@@ -2,7 +2,6 @@ package main
 
 import (
 	"math"
-	"slices"
 )
 
 type Rng struct{ state uint64 }
@@ -100,11 +99,11 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 	if sum <= 0 || math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
 		return argmaxToken(logits)
 	}
+	if config.TopP < 1 {
+		return sampleTopPFromWeights(logits, sum, config.TopP, rng, candidates)
+	}
 	for i := range logits {
 		logits[i] /= sum
-	}
-	if config.TopP < 1 {
-		return sampleTopPFromProbs(logits, config.TopP, rng, candidates)
 	}
 	return sampleFromProbs(logits, rng)
 }
@@ -122,40 +121,32 @@ func sampleFromProbs(probs []float32, rng *Rng) uint32 {
 }
 
 func sampleTopPFromProbs(probs []float32, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
-	*candidates = (*candidates)[:0]
-	for i, p := range probs {
-		*candidates = append(*candidates, TokenProb{i, p})
+	var total float32
+	for _, p := range probs {
+		total += p
 	}
-	slices.SortFunc(*candidates, func(a, b TokenProb) int {
-		if a.Prob > b.Prob {
-			return -1
-		}
-		if a.Prob < b.Prob {
-			return 1
-		}
-		if a.Token < b.Token {
-			return -1
-		}
-		if a.Token > b.Token {
-			return 1
-		}
-		return 0
-	})
-	cumsum := float32(0)
+	return sampleTopPFromWeights(probs, total, topP, rng, candidates)
+}
+
+func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
+	*candidates = (*candidates)[:0]
+	for i, w := range weights {
+		*candidates = append(*candidates, TokenProb{i, w})
+	}
+	sortTokenProbs(*candidates)
+	target := topP * total
+	var cumsum float32
 	cutoff := len(*candidates)
 	for i, item := range *candidates {
 		cumsum += item.Prob
-		if cumsum > topP {
+		if cumsum > target {
 			cutoff = i + 1
 			break
 		}
 	}
-	var kept float32
-	for _, item := range (*candidates)[:cutoff] {
-		kept += item.Prob
-	}
-	if kept <= 0 {
-		return argmaxToken(probs)
+	kept := cumsum
+	if kept <= 0 || math.IsNaN(float64(kept)) || math.IsInf(float64(kept), 0) {
+		return argmaxToken(weights)
 	}
 	r := rng.NextF32() * kept
 	cumsum = 0
@@ -191,30 +182,24 @@ func sampleTopK(logits []float32, topK int, topP float32, rng *Rng, candidates *
 	if sum <= 0 {
 		return uint32((*candidates)[0].Token)
 	}
-	for i := range *candidates {
-		(*candidates)[i].Prob /= sum
-	}
 	cutoff := len(*candidates)
+	kept := sum
 	if topP < 1 {
+		target := topP * sum
 		var cumsum float32
 		for i, item := range *candidates {
 			cumsum += item.Prob
-			if cumsum > topP {
+			if cumsum > target {
 				cutoff = i + 1
 				break
 			}
 		}
-		var kept float32
-		for _, item := range (*candidates)[:cutoff] {
-			kept += item.Prob
-		}
-		if kept > 0 {
-			for i := range (*candidates)[:cutoff] {
-				(*candidates)[i].Prob /= kept
-			}
-		}
+		kept = cumsum
 	}
-	r := rng.NextF32()
+	if kept <= 0 {
+		return uint32((*candidates)[0].Token)
+	}
+	r := rng.NextF32() * kept
 	var cumsum float32
 	for _, item := range (*candidates)[:cutoff] {
 		cumsum += item.Prob
@@ -229,6 +214,70 @@ func bubbleUpLast(c []TokenProb) {
 	for i := len(c) - 1; i > 0 && c[i].Prob > c[i-1].Prob; i-- {
 		c[i], c[i-1] = c[i-1], c[i]
 	}
+}
+
+func sortTokenProbs(c []TokenProb) {
+	if len(c) < 2 {
+		return
+	}
+	quickSortTokenProbs(c, 0, len(c)-1)
+}
+
+func quickSortTokenProbs(c []TokenProb, lo, hi int) {
+	for hi-lo > 16 {
+		mid := lo + (hi-lo)/2
+		if tokenProbLess(c[mid], c[lo]) {
+			c[mid], c[lo] = c[lo], c[mid]
+		}
+		if tokenProbLess(c[hi], c[mid]) {
+			c[hi], c[mid] = c[mid], c[hi]
+			if tokenProbLess(c[mid], c[lo]) {
+				c[mid], c[lo] = c[lo], c[mid]
+			}
+		}
+		pivot := c[mid]
+		i, j := lo, hi
+		for {
+			for tokenProbLess(c[i], pivot) {
+				i++
+			}
+			for tokenProbLess(pivot, c[j]) {
+				j--
+			}
+			if i >= j {
+				break
+			}
+			c[i], c[j] = c[j], c[i]
+			i++
+			j--
+		}
+		if j-lo < hi-i {
+			quickSortTokenProbs(c, lo, j)
+			lo = i
+		} else {
+			quickSortTokenProbs(c, i, hi)
+			hi = j
+		}
+	}
+	insertionSortTokenProbs(c[lo : hi+1])
+}
+
+func insertionSortTokenProbs(c []TokenProb) {
+	for i := 1; i < len(c); i++ {
+		v := c[i]
+		j := i - 1
+		for ; j >= 0 && tokenProbLess(v, c[j]); j-- {
+			c[j+1] = c[j]
+		}
+		c[j+1] = v
+	}
+}
+
+func tokenProbLess(a, b TokenProb) bool {
+	if a.Prob != b.Prob {
+		return a.Prob > b.Prob
+	}
+	return a.Token < b.Token
 }
 
 func argmaxToken(logits []float32) uint32 {
