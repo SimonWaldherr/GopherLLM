@@ -32,7 +32,7 @@ CHAT_FLAG  := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
 _MODEL_ARG := $(if $(MODEL),--model "$(MODEL)",)
 _RUN_ARGS  := $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)")
 
-.PHONY: all build release run repl serve serve-metal https list-models inspect list-tensors bench bench-model synonym-bench nato-bench kernel-bench fmt test test-small-models vet check clean help
+.PHONY: all build release cross-build run repl serve serve-metal https list-models inspect list-tensors bench bench-model synonym-bench nato-bench kernel-bench fmt test test-small-models vet check clean help
 
 all: check release
 
@@ -41,6 +41,15 @@ build:
 	$(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BIN) .
 
 release: build
+
+cross-build:
+	@mkdir -p $(BUILD_DIR) $(GOCACHE)
+	GOOS=darwin GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-amd64 .
+	GOOS=darwin GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-arm64 .
+	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-amd64 .
+	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-arm64 .
+	GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-amd64.exe .
+	GOOS=windows GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-arm64.exe .
 
 run: release
 	$(BIN) $(_RUN_ARGS)
@@ -117,6 +126,7 @@ help:
 	@printf "Targets:\n"
 	@printf "  make all                             Run check and release build\n"
 	@printf "  make build/release                   Build ./$(BIN)\n"
+	@printf "  make cross-build                     Build darwin/linux/windows for amd64 and arm64\n"
 	@printf "  make run MODEL=... PROMPT='...'      Generate from a one-shot prompt\n"
 	@printf "  make run ARGS='...'                  Run the CLI with custom args\n"
 	@printf "  make repl MODEL=...                  Start interactive REPL mode\n"

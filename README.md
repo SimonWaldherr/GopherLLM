@@ -41,6 +41,12 @@ To run formatting, tests, vet, and the release build:
 make all
 ```
 
+To verify release builds for macOS, Linux, and Windows on `amd64` and `arm64`:
+
+```sh
+make cross-build
+```
+
 ## CLI Usage
 
 List discovered GGUF models:
@@ -117,6 +123,8 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 - `make bench-model MODEL=...` runs generation benchmark JSON.
 - `make kernel-bench MODEL=...` benchmarks isolated model kernels.
 - `make test`, `make vet`, and `make check` verify the codebase.
+- `make cross-build` compiles release binaries for macOS, Linux, and Windows on
+  `amd64` and `arm64`.
 
 ## Performance Notes
 
@@ -156,3 +164,6 @@ go test -run '^$' -bench=BenchmarkMatvecQ4K -benchmem .
 ```
 
 Local build artifacts are kept in `bin/` and `.cache/`, both ignored by git.
+
+GitHub Actions runs `go test`, `go vet`, and `go build` on Linux, macOS, and
+Windows, plus the `make cross-build` release matrix on Linux.
