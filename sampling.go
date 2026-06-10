@@ -4,6 +4,8 @@ import (
 	"math"
 )
 
+var negInf32 = float32(math.Inf(-1))
+
 type Rng struct{ state uint64 }
 
 func NewRng(seed uint64) *Rng {
@@ -51,8 +53,8 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 			for _, tok := range recent {
 				if int(tok) < n {
 					v := logits[tok]
-					if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-						logits[tok] = float32(math.Inf(-1))
+					if !finiteLogit(v) {
+						logits[tok] = negInf32
 					} else if v > 0 {
 						logits[tok] = v / config.RepeatPenalty
 					} else {
@@ -63,38 +65,48 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 		}
 		return argmaxFiniteToken(logits)
 	}
-	for i, v := range logits {
-		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			logits[i] = float32(math.Inf(-1))
-		}
-	}
 	if config.RepeatPenalty != 1 {
 		for _, tok := range recent {
 			if int(tok) < n {
-				if logits[tok] > 0 {
-					logits[tok] /= config.RepeatPenalty
+				v := logits[tok]
+				if !finiteLogit(v) {
+					logits[tok] = negInf32
+				} else if v > 0 {
+					logits[tok] = v / config.RepeatPenalty
 				} else {
-					logits[tok] *= config.RepeatPenalty
+					logits[tok] = v * config.RepeatPenalty
 				}
 			}
 		}
 	}
 	invTemp := 1 / config.Temperature
-	for i := range logits {
-		logits[i] *= invTemp
-	}
 	if config.TopK > 0 && config.TopK < n {
-		return sampleTopK(logits, config.TopK, config.TopP, rng, candidates)
+		if config.TopK == 1 {
+			return argmaxFiniteToken(logits)
+		}
+		return sampleTopK(logits, config.TopK, config.TopP, invTemp, rng, candidates)
 	}
-	maxLogit := float32(math.Inf(-1))
-	for _, v := range logits {
+	maxLogit := negInf32
+	for i, v := range logits {
+		if !finiteLogit(v) {
+			logits[i] = negInf32
+			continue
+		}
 		maxLogit = max(maxLogit, v)
 	}
 	var sum float32
-	for i, v := range logits {
-		p := float32(math.Exp(float64(v - maxLogit)))
-		logits[i] = p
-		sum += p
+	if invTemp == 1 {
+		for i, v := range logits {
+			p := float32(math.Exp(float64(v - maxLogit)))
+			logits[i] = p
+			sum += p
+		}
+	} else {
+		for i, v := range logits {
+			p := float32(math.Exp(float64((v - maxLogit) * invTemp)))
+			logits[i] = p
+			sum += p
+		}
 	}
 	if sum <= 0 || math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
 		return argmaxToken(logits)
@@ -129,9 +141,9 @@ func sampleTopPFromProbs(probs []float32, topP float32, rng *Rng, candidates *[]
 }
 
 func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
-	*candidates = (*candidates)[:0]
+	ensureLenNoClear(candidates, len(weights))
 	for i, w := range weights {
-		*candidates = append(*candidates, TokenProb{i, w})
+		(*candidates)[i] = TokenProb{i, w}
 	}
 	sortTokenProbs(*candidates)
 	target := topP * total
@@ -159,24 +171,30 @@ func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, can
 	return uint32((*candidates)[cutoff-1].Token)
 }
 
-func sampleTopK(logits []float32, topK int, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
+func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	*candidates = (*candidates)[:0]
 	for i, logit := range logits {
 		if len(*candidates) < topK {
+			if !finiteLogit(logit) {
+				logit = negInf32
+			}
 			*candidates = append(*candidates, TokenProb{i, logit})
 			bubbleUpLast(*candidates)
 		} else if logit > (*candidates)[len(*candidates)-1].Prob {
+			if !finiteLogit(logit) {
+				continue
+			}
 			(*candidates)[len(*candidates)-1] = TokenProb{i, logit}
 			bubbleUpLast(*candidates)
 		}
 	}
 	if len(*candidates) == 0 || math.IsInf(float64((*candidates)[0].Prob), -1) {
-		return argmaxToken(logits)
+		return argmaxFiniteToken(logits)
 	}
 	maxLogit := (*candidates)[0].Prob
 	var sum float32
 	for i := range *candidates {
-		(*candidates)[i].Prob = float32(math.Exp(float64((*candidates)[i].Prob - maxLogit)))
+		(*candidates)[i].Prob = float32(math.Exp(float64(((*candidates)[i].Prob - maxLogit) * invTemp)))
 		sum += (*candidates)[i].Prob
 	}
 	if sum <= 0 {
@@ -280,6 +298,10 @@ func tokenProbLess(a, b TokenProb) bool {
 	return a.Token < b.Token
 }
 
+func finiteLogit(v float32) bool {
+	return math.Float32bits(v)&0x7f800000 != 0x7f800000
+}
+
 func argmaxToken(logits []float32) uint32 {
 	best := 0
 	for i := 1; i < len(logits); i++ {
@@ -293,14 +315,14 @@ func argmaxToken(logits []float32) uint32 {
 func argmaxFiniteToken(logits []float32) uint32 {
 	best := 0
 	bestValue := logits[0]
-	if math.IsNaN(float64(bestValue)) || math.IsInf(float64(bestValue), 0) {
-		bestValue = float32(math.Inf(-1))
+	if !finiteLogit(bestValue) {
+		bestValue = negInf32
 		logits[0] = bestValue
 	}
 	for i := 1; i < len(logits); i++ {
 		v := logits[i]
-		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			v = float32(math.Inf(-1))
+		if !finiteLogit(v) {
+			v = negInf32
 			logits[i] = v
 		}
 		if v > bestValue {

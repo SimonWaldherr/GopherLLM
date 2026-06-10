@@ -171,3 +171,69 @@ q6k_step:
 	SUB   $1, R3, R3
 	CBNZ  R3, q6k_step
 	RET
+
+// func sumF32Groups32(x *float32, out *float32, groups int)
+//
+// Writes out[g] = sum(x[g*32:(g+1)*32]).
+TEXT ·sumF32Groups32(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD  x+0(FP), R0
+	MOVD  out+8(FP), R1
+	MOVD  groups+16(FP), R2
+	CBZ   R2, sum32_done
+
+sum32_loop:
+	VEOR   V0.B16, V0.B16, V0.B16
+	VLD1.P 16(R0), [V1.S4]
+	WORD   $0x4E21D400 // fadd v0.4s, v0.4s, v1.4s
+	VLD1.P 16(R0), [V2.S4]
+	WORD   $0x4E22D400 // fadd v0.4s, v0.4s, v2.4s
+	VLD1.P 16(R0), [V3.S4]
+	WORD   $0x4E23D400 // fadd v0.4s, v0.4s, v3.4s
+	VLD1.P 16(R0), [V4.S4]
+	WORD   $0x4E24D400 // fadd v0.4s, v0.4s, v4.4s
+	VLD1.P 16(R0), [V5.S4]
+	WORD   $0x4E25D400 // fadd v0.4s, v0.4s, v5.4s
+	VLD1.P 16(R0), [V6.S4]
+	WORD   $0x4E26D400 // fadd v0.4s, v0.4s, v6.4s
+	VLD1.P 16(R0), [V7.S4]
+	WORD   $0x4E27D400 // fadd v0.4s, v0.4s, v7.4s
+	VLD1.P 16(R0), [V8.S4]
+	WORD   $0x4E28D400 // fadd v0.4s, v0.4s, v8.4s
+	WORD   $0x6E20D400 // faddp v0.4s, v0.4s, v0.4s
+	WORD   $0x6E20D400 // faddp v0.4s, v0.4s, v0.4s
+	FMOVS  F0, (R1)
+	ADD    $4, R1
+	SUB    $1, R2, R2
+	CBNZ   R2, sum32_loop
+
+sum32_done:
+	RET
+
+// func sumF32Groups16(x *float32, out *float32, groups int)
+//
+// Writes out[g] = sum(x[g*16:(g+1)*16]).
+TEXT ·sumF32Groups16(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD  x+0(FP), R0
+	MOVD  out+8(FP), R1
+	MOVD  groups+16(FP), R2
+	CBZ   R2, sum16_done
+
+sum16_loop:
+	VEOR   V0.B16, V0.B16, V0.B16
+	VLD1.P 16(R0), [V1.S4]
+	WORD   $0x4E21D400 // fadd v0.4s, v0.4s, v1.4s
+	VLD1.P 16(R0), [V2.S4]
+	WORD   $0x4E22D400 // fadd v0.4s, v0.4s, v2.4s
+	VLD1.P 16(R0), [V3.S4]
+	WORD   $0x4E23D400 // fadd v0.4s, v0.4s, v3.4s
+	VLD1.P 16(R0), [V4.S4]
+	WORD   $0x4E24D400 // fadd v0.4s, v0.4s, v4.4s
+	WORD   $0x6E20D400 // faddp v0.4s, v0.4s, v0.4s
+	WORD   $0x6E20D400 // faddp v0.4s, v0.4s, v0.4s
+	FMOVS  F0, (R1)
+	ADD    $4, R1
+	SUB    $1, R2, R2
+	CBNZ   R2, sum16_loop
+
+sum16_done:
+	RET

@@ -54,6 +54,15 @@ func TestVectorOpsMatchScalar(t *testing.T) {
 		scaleAddF32Scalar(want, 0.5, x)
 		assertFloatSlicesClose(t, "scaleAdd", got, want)
 
+		weight := make([]float32, n+1)
+		for i := range weight {
+			weight[i] = 0.5*float32(i%5) - 1
+		}
+		got, want = make([]float32, n), make([]float32, n)
+		mulScaleF32(base, weight, -0.25, got)
+		mulScaleF32Scalar(base, weight, -0.25, want)
+		assertFloatSlicesClose(t, "mulScale", got, want)
+
 		if n > 2 {
 			shortX := x[:n-2]
 			got, want = append([]float32(nil), base...), append([]float32(nil), base...)

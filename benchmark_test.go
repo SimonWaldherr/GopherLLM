@@ -56,6 +56,28 @@ func BenchmarkScaleAddF32_4096(b *testing.B) {
 	}
 }
 
+func BenchmarkMulScaleF32_4096(b *testing.B) {
+	x := benchFloatSlice(4096)
+	weight := benchFloatSlice(4096)
+	out := make([]float32, 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(out) * 4 * 3))
+	for b.Loop() {
+		mulScaleF32(x, weight, 0.999, out)
+	}
+}
+
+func BenchmarkRMSNorm_4096(b *testing.B) {
+	x := benchFloatSlice(4096)
+	weight := benchFloatSlice(4096)
+	out := make([]float32, 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(out) * 4 * 3))
+	for b.Loop() {
+		rmsNormInto(x, weight, 1e-5, &out)
+	}
+}
+
 func BenchmarkDotQ4K_4096(b *testing.B) {
 	row := benchBytes((4096 / 256) * 144)
 	x := benchFloatSlice(4096)
@@ -132,6 +154,26 @@ func BenchmarkDotQ4KWithXSums_4096(b *testing.B) {
 	b.SetBytes(int64(len(row) + len(x)*4))
 	for b.Loop() {
 		_ = dotQ4KF32WithXSums(row, x, xs, 4096)
+	}
+}
+
+func BenchmarkFillQ4KXSums_4096(b *testing.B) {
+	x := benchFloatSlice(4096)
+	scratch := []float32{}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(x) * 4))
+	for b.Loop() {
+		_ = fillQ4KXSums(x, 4096, &scratch)
+	}
+}
+
+func BenchmarkFillQ6KXSums16_4096(b *testing.B) {
+	x := benchFloatSlice(4096)
+	scratch := []float32{}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(x) * 4))
+	for b.Loop() {
+		_ = fillQ6KXSums16(x, 4096, &scratch)
 	}
 }
 

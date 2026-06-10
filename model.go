@@ -873,10 +873,7 @@ func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 	_ = x[n-1]
 
 	if len(weight) >= n {
-		_ = weight[n-1]
-		for i := 0; i < n; i++ {
-			o[i] = x[i] * scale * weight[i]
-		}
+		mulScaleF32(x[:n], weight[:n], scale, o[:n])
 	} else {
 		for i := 0; i < n; i++ {
 			w := float32(1)

@@ -112,6 +112,12 @@ func scaleAddF32Scalar(out []float32, alpha float32, x []float32) {
 	}
 }
 
+func mulScaleF32Scalar(x []float32, weight []float32, scale float32, out []float32) {
+	for i := 0; i < min(len(x), len(weight), len(out)); i++ {
+		out[i] = x[i] * weight[i] * scale
+	}
+}
+
 func MatvecF32(data, x []float32, rows, cols int) []float32 {
 	out := make([]float32, rows)
 	MatvecF32Into(data, x, rows, cols, &out)
@@ -343,6 +349,10 @@ func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
 	groups := cols / 16
 	ensureLenNoClear(scratch, groups)
 	out := *scratch
+	if hasQuantNEON && groups > 0 && len(x) >= groups*16 {
+		sumF32Groups16(&x[0], &out[0], groups)
+		return out
+	}
 	for g := range groups {
 		base := g * 16
 		if base+16 > len(x) {
@@ -611,6 +621,10 @@ func fillQ4KXSums(x []float32, cols int, scratch *[]float32) []float32 {
 	groups := cols / 32
 	ensureLenNoClear(scratch, groups)
 	out := *scratch
+	if hasQuantNEON && groups > 0 && len(x) >= groups*32 {
+		sumF32Groups32(&x[0], &out[0], groups)
+		return out
+	}
 	for g := range groups {
 		base := g * 32
 		if base+32 > len(x) {
