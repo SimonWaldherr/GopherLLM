@@ -9,8 +9,10 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quickstart](#quickstart)
+- [Use as a Go Library](#use-as-a-go-library)
 - [Build](#build)
 - [CLI Usage](#cli-usage)
+- [GGUF Analyzer](#gguf-analyzer)
 - [Server](#server)
 - [Tool Use / Agentic](#tool-use--agentic)
 - [Make Targets](#make-targets)
@@ -70,6 +72,53 @@ make build
 make list-models MODEL_DIR=/path/to/models
 make run MODEL_DIR=/path/to/models MODEL="some-model" PROMPT="Explain local LLM inference in three sentences."
 ```
+
+## Use as a Go Library
+
+GopherLLM is an importable module — inference runs in-process, with no child
+process and no HTTP round-trips:
+
+```sh
+go get github.com/SimonWaldherr/GopherLLM
+```
+
+```go
+import gopherllm "github.com/SimonWaldherr/GopherLLM"
+
+model, err := gopherllm.Open(ctx, "model.gguf")
+if err != nil { ... }
+defer model.Close()
+
+// One-shot generation with functional options.
+res, err := model.Generate(ctx, "Explain GGUF in one sentence.",
+    gopherllm.WithMaxTokens(128), gopherllm.WithTemperature(0.7))
+fmt.Println(res.Text)
+
+// Streaming (ctx cancels cleanly between tokens).
+model.Stream(ctx, []gopherllm.ChatMessage{gopherllm.UserMessage("hi")},
+    func(delta string) error { fmt.Print(delta); return nil })
+
+// Embeddings, tokenization, GGUF analysis:
+emb, _ := model.Embed(ctx, "semantic search query")
+ids := model.Tokenize("hello")
+gopherllm.AnalyzeGGUF(model.GGUF(), model.Tokenizer()).WriteText(os.Stdout)
+```
+
+For applications that expose the model over HTTP themselves, the entire
+OpenAI-/Ollama-compatible API mounts as a plain `http.Handler` — under any
+router, prefix, or middleware stack:
+
+```go
+mux.Handle("/llm/", http.StripPrefix("/llm",
+    model.HTTPHandler(gopherllm.HandlerOptions{Defaults: gopherllm.DefaultGenerationOptions()})))
+```
+
+The library never writes to stdout/stderr on its own; pass
+`gopherllm.WithLogWriter(os.Stderr)` (or `HandlerOptions.LogWriter`) to opt
+into diagnostics. Tool calling, reasoning extraction, and skills are available
+via `WithTools`, `Result.ReasoningText`, and `RunAgenticChat` — see the godoc
+and the runnable examples in `example_test.go`; `testdata/consumer` is a
+complete external application using the API.
 
 ## Build
 
@@ -136,6 +185,40 @@ Create an embedding:
 ```sh
 bin/gopherllm /path/to/model.gguf --embed --prompt "semantic search query"
 ```
+
+## GGUF Analyzer
+
+Inspect any GGUF's structure without loading weights (instant, even on
+multi-gigabyte files):
+
+```sh
+bin/gopherllm /path/to/model.gguf --analyze
+```
+
+Reports architecture/geometry, parameter count, effective bits per weight,
+the quantization mix per tensor type, rope/sliding-window configuration,
+tokenizer + detected chat-template family, KV-cache size estimates, and the
+largest tensors.
+
+Search the vocabulary:
+
+```sh
+bin/gopherllm /path/to/model.gguf --find-token "weather"
+```
+
+Explore embedding space — which tokens the model treats as related (this
+loads the weights and scans the embedding table):
+
+```sh
+bin/gopherllm /path/to/model.gguf --token-neighbors king --neighbors 8
+#  34567  "King"      cos=0.5807
+#  12566  " king"     cos=0.5079
+#  108083 "キング"     cos=0.3692
+#  25776  "王"         cos=0.3416
+```
+
+The same features are available in the library as `AnalyzeGGUF`,
+`SearchTokens`, and `Model.NearestTokens`.
 
 ## Server
 
@@ -341,9 +424,17 @@ default; details in the bullets they annotate):
 The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
-llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, gpt-oss,
-gemma, gemma2, gemma4
+llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen3,
+gpt-oss, gemma, gemma2, gemma4
 ```
+
+qwen3 (including the DeepSeek-R1 Qwen3 distills) adds per-head QK-norm on top
+of the qwen2 graph; DeepSeek-R1 reasoning output is separated into
+`reasoning_content` in both template conventions (self-opened `<think>` blocks
+and the newer forced-open templates whose output begins mid-reasoning).
+`deepseek2` (MLA attention) is not supported. Mistral-family models support
+assistant-message prefill: a conversation ending in an assistant message
+leaves the turn open so generation continues it.
 
 Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
