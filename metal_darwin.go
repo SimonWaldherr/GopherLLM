@@ -17,6 +17,10 @@ func MetalAvailable() bool {
 	return metalbackend.Available()
 }
 
+func MetalError() string {
+	return metalbackend.LastError()
+}
+
 func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int) *MetalWeight {
 	if typ != GGMLTypeQ6_K || rows < metalQ6KMinRows || cols <= 0 || cols%256 != 0 {
 		return nil

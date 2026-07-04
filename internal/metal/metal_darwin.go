@@ -22,6 +22,14 @@ typedef struct {
 	int row_bytes;
 } GLLMMetalWeight;
 
+typedef struct {
+	uint32_t rows;
+	uint32_t cols;
+	uint32_t row_bytes;
+	uint32_t n_blocks;
+	uint32_t rows_per_group;
+} GLLMMetalParams;
+
 static id<MTLDevice> gllm_device = nil;
 static id<MTLCommandQueue> gllm_queue = nil;
 static id<MTLComputePipelineState> gllm_q6k_pipeline = nil;
@@ -36,71 +44,87 @@ static void gllm_set_error(NSString* prefix, NSError* error) {
 static const char* gllm_q6k_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"static inline float gllm_f16(const device uchar* p) {\n"
-"  ushort bits = ushort(p[0]) | (ushort(p[1]) << 8);\n"
-"  return float(as_type<half>(bits));\n"
-"}\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
 "static inline int gllm_i8(uchar v) {\n"
 "  int x = int(v);\n"
 "  return x >= 128 ? x - 256 : x;\n"
-"}\n"
-"static inline int gllm_q6(const device uchar* ql, const device uchar* qh, int local, thread int& scale_idx) {\n"
-"  int l;\n"
-"  if (local < 32) {\n"
-"    l = local;\n"
-"    scale_idx = (l < 16) ? 0 : 1;\n"
-"    return int((ql[l] & 0x0f) | ((qh[l] & 0x03) << 4));\n"
-"  }\n"
-"  if (local < 64) {\n"
-"    l = local - 32;\n"
-"    scale_idx = (l < 16) ? 2 : 3;\n"
-"    return int((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 0x03) << 4));\n"
-"  }\n"
-"  if (local < 96) {\n"
-"    l = local - 64;\n"
-"    scale_idx = (l < 16) ? 4 : 5;\n"
-"    return int((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4));\n"
-"  }\n"
-"  l = local - 96;\n"
-"  scale_idx = (l < 16) ? 6 : 7;\n"
-"  return int((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4));\n"
 "}\n"
 "kernel void gllm_q6k_matvec(\n"
 "    const device uchar* data [[buffer(0)]],\n"
 "    const device float* x [[buffer(1)]],\n"
 "    device float* out [[buffer(2)]],\n"
-"    constant int& rows [[buffer(3)]],\n"
-"    constant int& cols [[buffer(4)]],\n"
-"    constant int& row_bytes [[buffer(5)]],\n"
-"    uint tg [[threadgroup_position_in_grid]],\n"
-"    uint lane [[thread_index_in_threadgroup]]) {\n"
-"  constexpr int rows_per_tg = 1;\n"
-"  int blocks = cols / 256;\n"
-"  int row0 = int(tg) * rows_per_tg;\n"
-"  for (int rr = 0; rr < rows_per_tg; rr++) {\n"
-"    int row = row0 + rr;\n"
-"    if (row >= rows) { return; }\n"
-"    const device uchar* rowp = data + row * row_bytes;\n"
-"    float acc = 0.0f;\n"
-"    for (int b = 0; b < blocks; b++) {\n"
-"      const device uchar* block = rowp + b * 210;\n"
-"      const device uchar* ql = block;\n"
-"      const device uchar* qh = block + 128;\n"
-"      const device uchar* sc = block + 192;\n"
-"      float d = gllm_f16(block + 208);\n"
-"      for (int idx = int(lane); idx < 256; idx += 32) {\n"
-"        int step = idx >= 128 ? 1 : 0;\n"
-"        int local = idx - step * 128;\n"
-"        int scale_local = 0;\n"
-"        int q = gllm_q6(ql + step * 64, qh + step * 32, local, scale_local) - 32;\n"
-"        int scale_i = step * 8 + scale_local;\n"
-"        acc += d * float(gllm_i8(sc[scale_i])) * float(q) * x[b * 256 + idx];\n"
+"    constant Params& p [[buffer(3)]],\n"
+"    uint group [[threadgroup_position_in_grid]],\n"
+"    uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]) {\n"
+"  uint row_half = lane >> 4;\n"
+"  uint sublane = lane & 15;\n"
+"  uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
+"  if (row >= p.rows) { return; }\n"
+"  const device uchar* row_base = data + row * p.row_bytes;\n"
+"  float sum = 0.0f;\n"
+"  for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
+"    const device uchar* block = row_base + b * 210;\n"
+"    const device uchar* ql = block;\n"
+"    const device uchar* qh = block + 128;\n"
+"    const device uchar* sc = block + 192;\n"
+"    ushort db = ushort(block[208]) | (ushort(block[209]) << 8);\n"
+"    float d = float(as_type<half>(db));\n"
+"    uint xoff = b * 256;\n"
+"    #pragma unroll\n"
+"    for (uint step = 0; step < 2; ++step) {\n"
+"      const device uchar* ql_sub = ql + step * 64;\n"
+"      const device uchar* qh_sub = qh + step * 32;\n"
+"      const device uchar* sc_sub = sc + step * 8;\n"
+"      uint y = xoff + step * 128;\n"
+"      float dsc0 = d * float(gllm_i8(sc_sub[0]));\n"
+"      float dsc2 = d * float(gllm_i8(sc_sub[2]));\n"
+"      float dsc4 = d * float(gllm_i8(sc_sub[4]));\n"
+"      float dsc6 = d * float(gllm_i8(sc_sub[6]));\n"
+"      #pragma unroll(16)\n"
+"      for (uint l = 0; l < 16; ++l) {\n"
+"        uchar ql0 = ql_sub[l];\n"
+"        uchar ql32 = ql_sub[l + 32];\n"
+"        uchar qh0 = qh_sub[l];\n"
+"        sum += dsc0 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x[y + l];\n"
+"        sum += dsc2 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x[y + 32 + l];\n"
+"        sum += dsc4 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x[y + 64 + l];\n"
+"        sum += dsc6 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x[y + 96 + l];\n"
+"      }\n"
+"      float dsc1 = d * float(gllm_i8(sc_sub[1]));\n"
+"      float dsc3 = d * float(gllm_i8(sc_sub[3]));\n"
+"      float dsc5 = d * float(gllm_i8(sc_sub[5]));\n"
+"      float dsc7 = d * float(gllm_i8(sc_sub[7]));\n"
+"      #pragma unroll(16)\n"
+"      for (uint l = 16; l < 32; ++l) {\n"
+"        uchar ql0 = ql_sub[l];\n"
+"        uchar ql32 = ql_sub[l + 32];\n"
+"        uchar qh0 = qh_sub[l];\n"
+"        sum += dsc1 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x[y + l];\n"
+"        sum += dsc3 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x[y + 32 + l];\n"
+"        sum += dsc5 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x[y + 64 + l];\n"
+"        sum += dsc7 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x[y + 96 + l];\n"
 "      }\n"
 "    }\n"
-"    acc = simd_sum(acc);\n"
-"    if (lane == 0) { out[row] = acc; }\n"
 "  }\n"
+"  for (ushort offset = 8; offset > 0; offset >>= 1) {\n"
+"    sum += simd_shuffle_xor(sum, offset);\n"
+"  }\n"
+"  if (sublane == 0) { out[row] = sum; }\n"
 "}\n";
+
+static int gllm_q6k_rows_per_group(int rows) {
+	const char* value = getenv("GOPHERLLM_METAL_Q6K_ROWS_PER_GROUP");
+	if (value != NULL && value[0] != '\0') {
+		char* end = NULL;
+		long parsed = strtol(value, &end, 10);
+		if (end != value && parsed >= 2 && parsed <= 8 && (parsed % 2) == 0) {
+			return (int)parsed;
+		}
+	}
+	(void)rows;
+	return 8;
+}
 
 static bool gllm_metal_init(void) {
 	@autoreleasepool {
@@ -123,6 +147,10 @@ static bool gllm_metal_init(void) {
 
 static bool gllm_metal_available(void) {
 	return gllm_metal_init();
+}
+
+static const char* gllm_metal_last_error(void) {
+	return gllm_error;
 }
 
 static bool gllm_metal_init_q6k(void) {
@@ -208,14 +236,17 @@ static int gllm_metal_q6k_matvec(void* handle, const float* x, float* out) {
 		[enc setBuffer:w->weights offset:0 atIndex:0];
 		[enc setBuffer:w->x offset:0 atIndex:1];
 		[enc setBuffer:w->out offset:0 atIndex:2];
-		int rows = w->rows;
-		int cols = w->cols;
-		int row_bytes = w->row_bytes;
-		[enc setBytes:&rows length:sizeof(rows) atIndex:3];
-		[enc setBytes:&cols length:sizeof(cols) atIndex:4];
-		[enc setBytes:&row_bytes length:sizeof(row_bytes) atIndex:5];
-		MTLSize groups = MTLSizeMake((NSUInteger)rows, 1, 1);
-		MTLSize threads = MTLSizeMake(32, 1, 1);
+		int rows_per_group = gllm_q6k_rows_per_group(w->rows);
+		GLLMMetalParams params = {
+			.rows = (uint32_t)w->rows,
+			.cols = (uint32_t)w->cols,
+			.row_bytes = (uint32_t)w->row_bytes,
+			.n_blocks = (uint32_t)(w->cols / 256),
+			.rows_per_group = (uint32_t)rows_per_group,
+		};
+		[enc setBytes:&params length:sizeof(params) atIndex:3];
+		MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, 1, 1);
+		MTLSize threads = MTLSizeMake(32 * ((NSUInteger)rows_per_group / 2), 1, 1);
 		[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 		[enc endEncoding];
 		[cb commit];
@@ -267,6 +298,10 @@ type Weight struct {
 
 func Available() bool {
 	return bool(C.gllm_metal_available())
+}
+
+func LastError() string {
+	return C.GoString(C.gllm_metal_last_error())
 }
 
 func PrepareQ6K(data []byte, rows, cols int) *Weight {

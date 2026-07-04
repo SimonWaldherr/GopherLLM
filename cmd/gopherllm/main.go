@@ -154,7 +154,10 @@ func run() error {
 	metalAvailable := gopherllm.MetalAvailable()
 	if cfg.useMetal {
 		if !metalAvailable {
-			return fmt.Errorf("Metal requested but unavailable; build with CGO_ENABLED=1 -tags metal on macOS")
+			if errText := gopherllm.MetalError(); errText != "" {
+				return fmt.Errorf("Metal requested but unavailable: %s", errText)
+			}
+			return fmt.Errorf("Metal requested but unavailable")
 		}
 		fmt.Fprintln(os.Stderr, "Metal: enabled (experimental Q6_K matvec offload)")
 	} else if metalAvailable {

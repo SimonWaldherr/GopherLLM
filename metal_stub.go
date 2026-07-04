@@ -6,6 +6,8 @@ type MetalWeight struct{}
 
 func MetalAvailable() bool { return false }
 
+func MetalError() string { return "not built with CGO_ENABLED=1 -tags metal on macOS" }
+
 func prepareMetalWeight(_ []byte, _ GGMLType, _, _ int) *MetalWeight {
 	return nil
 }

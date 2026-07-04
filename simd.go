@@ -422,8 +422,9 @@ func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
 	return out
 }
 
-// dotQ6KF32SIMDWithXSums computes a Q6_K row dot product using the SIMD
-// block kernel. xsums must hold per-16-element sums of x (fillQ6KXSums16).
+// dotQ6KF32SIMDWithXSums computes a Q6_K row dot product using the SIMD block
+// kernel. xsums must hold 32x per-16-element sums of x, folding the Q6_K -32
+// offset out of each row.
 func dotQ6KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [16]float32
 	var sum float32
@@ -1518,7 +1519,9 @@ func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	// slack of slower ones (e.g. efficiency cores on Apple Silicon). Small
 	// matvecs stay at one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
-	if rows >= threads*128 {
+	if rows >= threads*4096 {
+		chunks = min(threads*8, cap(pool.jobs))
+	} else if rows >= threads*128 {
 		chunks = min(threads*4, cap(pool.jobs))
 	}
 	done := rowDonePool.Get().(chan struct{})
@@ -1575,7 +1578,7 @@ func getRowWorkerPool(threads int) *rowWorkerPool {
 	}
 	pool := &rowWorkerPool{
 		threads: threads,
-		jobs:    make(chan rowJob, threads*4),
+		jobs:    make(chan rowJob, threads*8),
 		stop:    make(chan struct{}),
 	}
 	for range threads {

@@ -73,7 +73,6 @@ TEXT ·scaleF32(SB), NOSPLIT|NOFRAME, $0-28
 	MOVD out_len+8(FP), R2
 	FMOVS alpha+24(FP), F31
 	VDUP V31.S[0], V31.S4
-	VEOR V30.B16, V30.B16, V30.B16
 	CMP $16, R2
 	BLT scale_loop4_start
 
@@ -82,18 +81,14 @@ scale_loop16:
 	VLD1.P 16(R0), [V5.S4]
 	VLD1.P 16(R0), [V6.S4]
 	VLD1.P 16(R0), [V7.S4]
-	VMOV V30.B16, V0.B16
-	VMOV V30.B16, V1.B16
-	VMOV V30.B16, V2.B16
-	VMOV V30.B16, V3.B16
-	VFMLA V4.S4, V31.S4, V0.S4
-	VFMLA V5.S4, V31.S4, V1.S4
-	VFMLA V6.S4, V31.S4, V2.S4
-	VFMLA V7.S4, V31.S4, V3.S4
-	VST1.P [V0.S4], 16(R4)
-	VST1.P [V1.S4], 16(R4)
-	VST1.P [V2.S4], 16(R4)
-	VST1.P [V3.S4], 16(R4)
+	WORD   $0x6E3FDC84 // fmul v4.4s, v4.4s, v31.4s
+	WORD   $0x6E3FDCA5 // fmul v5.4s, v5.4s, v31.4s
+	WORD   $0x6E3FDCC6 // fmul v6.4s, v6.4s, v31.4s
+	WORD   $0x6E3FDCE7 // fmul v7.4s, v7.4s, v31.4s
+	VST1.P [V4.S4], 16(R4)
+	VST1.P [V5.S4], 16(R4)
+	VST1.P [V6.S4], 16(R4)
+	VST1.P [V7.S4], 16(R4)
 	SUB $16, R2, R2
 	CMP $16, R2
 	BGE scale_loop16
@@ -104,9 +99,8 @@ scale_loop4_start:
 
 scale_loop4:
 	VLD1.P 16(R0), [V0.S4]
-	VMOV V30.B16, V1.B16
-	VFMLA V0.S4, V31.S4, V1.S4
-	VST1.P [V1.S4], 16(R4)
+	WORD   $0x6E3FDC00 // fmul v0.4s, v0.4s, v31.4s
+	VST1.P [V0.S4], 16(R4)
 	SUB $4, R2, R2
 	CMP $4, R2
 	BGE scale_loop4
