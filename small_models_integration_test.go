@@ -21,7 +21,7 @@ func TestSmallLocalModelsAnswerEinsteinPrompt(t *testing.T) {
 	if modelDir == "" {
 		modelDir = DefaultModelDir()
 	}
-	entries, err := DiscoverModels(modelDir)
+	entries, err := DiscoverModels(modelDir, os.Stderr)
 	if err != nil {
 		t.Fatal(err)
 	}

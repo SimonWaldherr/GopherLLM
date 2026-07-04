@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"strings"
@@ -42,7 +43,7 @@ func TestBatchedPrefillMatchesPerToken(t *testing.T) {
 	// Batched.
 	c2, b2 := newRun()
 	got := []float32{}
-	r.prefillBatched(c2, b2, tokens, &got)
+	_ = r.prefillBatched(context.Background(), c2, b2, tokens, &got)
 
 	if len(got) != len(ref) {
 		t.Fatalf("logit len %d vs %d", len(got), len(ref))

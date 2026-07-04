@@ -56,7 +56,10 @@ func DefaultModelDir() string {
 // file's header (mmap'd, weights untouched) to fill in architecture, name,
 // and support status. Unparseable files are skipped with a stderr note rather
 // than failing the whole scan. Results are sorted by ID.
-func DiscoverModels(root string) ([]ModelEntry, error) {
+func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
 	files := []string{}
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -75,7 +78,7 @@ func DiscoverModels(root string) ([]ModelEntry, error) {
 	for _, path := range files {
 		entry, err := inspectModel(root, path)
 		if err != nil {
-			fmt.Fprintf(stderr(), "Skipping %s: %v\n", path, err)
+			fmt.Fprintf(logw, "Skipping %s: %v\n", path, err)
 			continue
 		}
 		entries = append(entries, entry)
@@ -96,11 +99,11 @@ func ResolveModelPath(selection *string, modelDir string) (string, error) {
 				return selected, nil
 			}
 			if st.IsDir() {
-				return chooseFromDirectory(selected, nil, os.Stdin, stderr())
+				return chooseFromDirectory(selected, nil, os.Stdin, os.Stderr)
 			}
 			return "", fmt.Errorf("model path is neither a file nor a directory: %s", selected)
 		}
-		entries, err := DiscoverModels(modelDir)
+		entries, err := DiscoverModels(modelDir, os.Stderr)
 		if err != nil {
 			return "", err
 		}
@@ -110,7 +113,7 @@ func ResolveModelPath(selection *string, modelDir string) (string, error) {
 		}
 		return entry.Path, nil
 	}
-	return chooseFromDirectory(modelDir, nil, os.Stdin, stderr())
+	return chooseFromDirectory(modelDir, nil, os.Stdin, os.Stderr)
 }
 
 // SelectModel matches selector against the usable (supported, non-projector)
@@ -167,7 +170,7 @@ func PrintModelList(entries []ModelEntry) {
 }
 
 func chooseFromDirectory(dir string, selector *string, in io.Reader, out io.Writer) (string, error) {
-	entries, err := DiscoverModels(dir)
+	entries, err := DiscoverModels(dir, out)
 	if err != nil {
 		return "", err
 	}

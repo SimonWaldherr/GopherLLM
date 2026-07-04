@@ -1,9 +1,11 @@
 package gopherllm
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"strings"
@@ -71,6 +73,21 @@ type GenerationOptions struct {
 	// tool rendering for this request; any other value (including the default
 	// "auto") offers all of Tools.
 	ToolChoice string
+	// ctx, when set (by the Model API's context-first methods), cancels
+	// generation between prefill chunks and between decoded tokens. Stored on
+	// the options value rather than passed positionally so the many existing
+	// Generate* entry points keep their signatures; the request-options
+	// pattern (like http.Request) is the accepted exception to "don't store a
+	// Context in a struct".
+	ctx context.Context
+}
+
+// generationContext returns the request context, defaulting to Background.
+func (o GenerationOptions) generationContext() context.Context {
+	if o.ctx != nil {
+		return o.ctx
+	}
+	return context.Background()
 }
 
 func DefaultGenerationOptions() GenerationOptions {
@@ -179,15 +196,22 @@ func ArchitectureSupported(arch string) bool {
 	}
 }
 
+// RunnerFromGGUFBytes loads a model from an in-memory GGUF, copying quantized
+// tensors into owned memory. It is silent; use Open with WithLogWriter for
+// load-progress diagnostics.
 func RunnerFromGGUFBytes(data []byte) (*Runner, error) {
-	return runnerFromGGUFBytes(data, false)
+	return runnerFromGGUFBytes(data, false, io.Discard)
 }
 
-func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
+func runnerFromGGUFBytes(data []byte, borrowQuantized bool, logw io.Writer) (*Runner, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
 	gguf, err := ParseGGUF(data)
 	if err != nil {
 		return nil, err
 	}
+	fmt.Fprintf(logw, "GGUF v%d - %d tensors, %d metadata entries\n", gguf.Version, len(gguf.Tensors), len(gguf.Metadata))
 	arch, ok := gguf.GetString("general.architecture")
 	if !ok || arch == "" {
 		arch = "llama"
@@ -202,7 +226,7 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 	r := &Runner{gguf: gguf, arch: arch, tok: tok}
 	switch arch {
 	case "gpt-oss":
-		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized)
+		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, logw)
 		if err != nil {
 			return nil, err
 		}
@@ -216,14 +240,14 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 		// factors, per-layer RoPE bases, cross-layer KV sharing, per-layer
 		// embeddings, the 26B MoE) are still missing. See
 		// docs/INFERENCE_NOTES.md.
-		fmt.Fprintf(stderr(), "Warning: %s support is experimental (dense graph implemented, unvalidated against real weights; Gemma 4 p-RoPE/PLE/MoE missing — see docs/INFERENCE_NOTES.md)\n", arch)
-		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized)
+		fmt.Fprintf(logw, "Warning: %s support is experimental (dense graph implemented, unvalidated against real weights; Gemma 4 p-RoPE/PLE/MoE missing — see docs/INFERENCE_NOTES.md)\n", arch)
+		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized, logw)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.gemma4, r.kind = config, weights, loadedGemma4
 	default:
-		config, weights, err := LoadModel(data, gguf, borrowQuantized)
+		config, weights, err := LoadModel(data, gguf, borrowQuantized, logw)
 		if err != nil {
 			return nil, err
 		}
@@ -232,13 +256,20 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 	return r, nil
 }
 
+// RunnerFromPath memory-maps a GGUF file and loads it with zero-copy borrowed
+// quantized weights. Silent; prefer Open, which adds context support,
+// configurable logging, and a higher-level Model wrapper.
 func RunnerFromPath(path string) (*Runner, LoadInfo, error) {
+	return runnerFromPath(path, io.Discard)
+}
+
+func runnerFromPath(path string, logw io.Writer) (*Runner, LoadInfo, error) {
 	t0 := time.Now()
 	mmap, err := OpenMmap(path)
 	if err != nil {
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
-	r, err := runnerFromGGUFBytes(mmap.Bytes(), true)
+	r, err := runnerFromGGUFBytes(mmap.Bytes(), true, logw)
 	if err != nil {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, err
@@ -322,12 +353,21 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		seed = uint64(time.Now().UnixNano())
 	}
 	rng := NewRng(seed)
+	ctx := options.generationContext()
+	if err := ctx.Err(); err != nil {
+		return GenerationResult{}, err
+	}
 	prefillStart := time.Now()
 	logits := []float32{}
 	if r.canBatchPrefill() {
-		r.prefillBatched(cache, buf, tokens, &logits)
+		if err := r.prefillBatched(ctx, cache, buf, tokens, &logits); err != nil {
+			return GenerationResult{}, err
+		}
 	} else {
 		for pos, tok := range tokens {
+			if err := ctx.Err(); err != nil {
+				return GenerationResult{}, err
+			}
 			if pos == len(tokens)-1 {
 				r.forwardTokenInto(cache, buf, tok, pos, &logits)
 			} else {
@@ -387,6 +427,9 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	}
 decode:
 	for range options.MaxTokens {
+		if err := ctx.Err(); err != nil {
+			return buildResult(), err
+		}
 		token := SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
 		if r.isStopToken(token) {
 			finishReason = "stop"
@@ -510,13 +553,17 @@ func (r *Runner) canBatchPrefill() bool {
 // costing more in misses per dequantized weight row than the extra dequant
 // amortization buys back. 32 was consistently ~15-20% faster than the
 // previous default of 64 across repeated runs.
-func (r *Runner) prefillBatched(cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) {
+func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) error {
 	const chunk = 32
 	n := len(tokens)
 	for start := 0; start < n; start += chunk {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		end := min(start+chunk, n)
 		ForwardBatchInto(r.config, r.standard, cache, buf, tokens[start:end], start, end == n, logits)
 	}
+	return nil
 }
 
 func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {

@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"sort"
@@ -618,9 +619,12 @@ func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
 // lifetime; without it they are copied into owned memory (the in-memory test
 // path). Models without a separate output.weight tie the output projection to
 // the token embeddings.
-func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, ModelWeights, error) {
+func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool, logw io.Writer) (Config, ModelWeights, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
 	config := ConfigFromGGUF(gguf)
-	fmt.Fprintf(stderr(), "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
+	fmt.Fprintf(logw, "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
 		config.Dim, config.NLayers, config.NHeads, config.NKVHeads, config.HiddenDim, config.VocabSize, config.MaxSeqLen)
 	tensorIdx := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
@@ -647,7 +651,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Model
 			return config, ModelWeights{}, err
 		}
 	} else {
-		fmt.Fprintln(stderr(), "Note: output tied to embeddings")
+		fmt.Fprintln(logw, "Note: output tied to embeddings")
 	}
 
 	layers := make([]LayerWeights, 0, config.NLayers)
@@ -661,19 +665,19 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Model
 		}
 		layers = append(layers, layer)
 		if l == 0 || (l+1)%8 == 0 || l+1 == config.NLayers {
-			fmt.Fprintf(stderr(), "  Loaded layer %d/%d\n", l+1, config.NLayers)
+			fmt.Fprintf(logw, "  Loaded layer %d/%d\n", l+1, config.NLayers)
 		}
 	}
 	return config, ModelWeights{TokenEmbd: tokenEmbd, OutputNorm: outputNorm, Output: output, Layers: layers}, nil
 }
 
-func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, GptOssWeights, error) {
-	config, weights, err := LoadModel(data, gguf, borrowQuantized)
+func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized bool, logw io.Writer) (Config, GptOssWeights, error) {
+	config, weights, err := LoadModel(data, gguf, borrowQuantized, logw)
 	return config, GptOssWeights{Standard: weights}, err
 }
 
-func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Gemma4Weights, error) {
-	config, std, err := LoadModel(data, gguf, borrowQuantized)
+func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized bool, logw io.Writer) (Config, Gemma4Weights, error) {
+	config, std, err := LoadModel(data, gguf, borrowQuantized, logw)
 	if err != nil {
 		return config, Gemma4Weights{}, err
 	}

@@ -4,6 +4,7 @@ import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,7 +114,7 @@ func run() error {
 		return err
 	}
 	if cfg.listModels {
-		entries, err := gopherllm.DiscoverModels(cfg.modelDir)
+		entries, err := gopherllm.DiscoverModels(cfg.modelDir, os.Stderr)
 		if err != nil {
 			return err
 		}
@@ -150,13 +151,15 @@ func run() error {
 	if cfg.inspect || cfg.listTensors || cfg.listMetadata {
 		return inspectGGUF(modelPath, cfg.listMetadata, cfg.listTensors)
 	}
-	runner, info, err := gopherllm.RunnerFromPath(modelPath)
+	model, err := gopherllm.Open(context.Background(), modelPath, gopherllm.WithLogWriter(os.Stderr))
 	if err != nil {
 		return err
 	}
-	defer runner.Close()
+	defer model.Close()
+	runner := model.Runner()
+	info := model.Info()
 	fmt.Fprintf(os.Stderr, "Loaded %s (%.2f GB) in %.2fs\n", filepath.Base(modelPath), float64(info.FileSizeBytes)/(1024*1024*1024), info.LoadTime.Seconds())
-	if name, ok := runner.ModelName(); ok {
+	if name := model.Name(); name != "" {
 		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
 	}
 	fmt.Fprintf(os.Stderr, "Architecture: %s\n", runner.Architecture())

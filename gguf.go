@@ -317,10 +317,10 @@ type GGUFFile struct {
 // ParseGGUF parses a GGUF header, logging a one-line summary to stderr.
 // ParseGGUFQuiet is the same without the log line (used by model discovery,
 // which parses every file in a directory).
-func ParseGGUF(data []byte) (*GGUFFile, error)      { return parseGGUF(data, true) }
-func ParseGGUFQuiet(data []byte) (*GGUFFile, error) { return parseGGUF(data, false) }
+func ParseGGUF(data []byte) (*GGUFFile, error)      { return parseGGUF(data) }
+func ParseGGUFQuiet(data []byte) (*GGUFFile, error) { return parseGGUF(data) }
 
-func parseGGUF(data []byte, verbose bool) (*GGUFFile, error) {
+func parseGGUF(data []byte) (*GGUFFile, error) {
 	c := cursor{data: data}
 	if len(data) < 4 {
 		return nil, fmt.Errorf("file too small for GGUF header")
@@ -340,9 +340,6 @@ func parseGGUF(data []byte, verbose bool) (*GGUFFile, error) {
 	nKV, err := c.u64()
 	if err != nil {
 		return nil, err
-	}
-	if verbose {
-		fmt.Fprintf(stderr(), "GGUF v%d - %d tensors, %d metadata entries\n", version, nTensors, nKV)
 	}
 	metadata := make(map[string]MetaValue, int(nKV))
 	for range int(nKV) {

@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -67,6 +69,33 @@ func (s *runnerState) getPath() string {
 	return s.path
 }
 
+// HandlerOptions configures the mountable HTTP API handler.
+type HandlerOptions struct {
+	// Defaults are the generation settings requests inherit unless they
+	// override individual fields.
+	Defaults GenerationOptions
+	// MaxConcurrentRequests bounds in-flight generation requests (default 8).
+	// Requests beyond the bound queue rather than failing.
+	MaxConcurrentRequests int
+	// ChatUI serves the embedded browser chat at /chat (plus its assets).
+	ChatUI bool
+	// ModelDir enables GET /models discovery and POST /models/load hot-swap
+	// within that directory.
+	ModelDir string
+	// ModelPath is the initially loaded model's path (reported by /models).
+	ModelPath string
+	// SkillsDir, if set, is scanned once at handler construction for SKILL.md
+	// files (see skills.go). Every chat/generate endpoint offers a load_skill
+	// tool and resolves it server-side via RunAgenticChat.
+	SkillsDir string
+	// LogWriter receives handler diagnostics (skill load notes). Defaults to
+	// io.Discard.
+	LogWriter io.Writer
+}
+
+// ServeOptions is HandlerOptions plus the listen address, for the Serve
+// convenience wrapper (used by the CLI). ChatHistoryPath/ChatHistoryLock are
+// retained for compatibility but unused.
 type ServeOptions struct {
 	Addr                     string
 	Defaults                 GenerationOptions
@@ -76,28 +105,62 @@ type ServeOptions struct {
 	ChatHistoryLock          *sync.Mutex
 	ModelDir                 string
 	ModelPath                string
-	// SkillsDir, if set, is scanned once at startup for SKILL.md files (see
-	// skills.go). Every chat/generate endpoint offers a load_skill tool and
-	// resolves it server-side via RunAgenticChat.
-	SkillsDir string
+	SkillsDir                string
+	// LogWriter receives startup and handler diagnostics; Serve defaults it
+	// to os.Stderr (CLI behavior), unlike NewHandler's io.Discard.
+	LogWriter io.Writer
 }
 
+// Serve builds the API handler and runs a blocking http.Server on opts.Addr.
+// Library consumers who want to control the server lifecycle, add middleware,
+// TLS, or mount the API under a path prefix should use NewHandler instead:
+//
+//	handler := gopherllm.NewHandler(model.Runner(), gopherllm.HandlerOptions{...})
+//	mux.Handle("/llm/", http.StripPrefix("/llm", handler))
 func Serve(initialRunner *Runner, opts ServeOptions) error {
-	if opts.MaxConcurrentConnections <= 0 {
-		opts.MaxConcurrentConnections = 8
+	logw := opts.LogWriter
+	if logw == nil {
+		logw = os.Stderr
+	}
+	handler := NewHandler(initialRunner, HandlerOptions{
+		Defaults:              opts.Defaults,
+		MaxConcurrentRequests: opts.MaxConcurrentConnections,
+		ChatUI:                opts.ChatUI,
+		ModelDir:              opts.ModelDir,
+		ModelPath:             opts.ModelPath,
+		SkillsDir:             opts.SkillsDir,
+		LogWriter:             logw,
+	})
+	server := &http.Server{Addr: opts.Addr, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
+	fmt.Fprintf(logw, "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
+	return server.ListenAndServe()
+}
+
+// NewHandler returns the complete GopherLLM HTTP API (OpenAI-compatible,
+// Ollama-compatible, and native endpoints — see the README's endpoint table)
+// as a mountable http.Handler. It owns no listener and writes nothing except
+// to opts.LogWriter, so it composes with any router, middleware stack, or
+// server the host application already has.
+func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
+	logw := opts.LogWriter
+	if logw == nil {
+		logw = io.Discard
+	}
+	if opts.MaxConcurrentRequests <= 0 {
+		opts.MaxConcurrentRequests = 8
 	}
 	skills, err := LoadSkills(opts.SkillsDir)
 	if err != nil {
-		fmt.Fprintf(stderr(), "Warning: skills: %v (continuing without skills)\n", err)
+		fmt.Fprintf(logw, "Warning: skills: %v (continuing without skills)\n", err)
 	} else if len(skills) > 0 {
 		names := make([]string, len(skills))
 		for i, s := range skills {
 			names[i] = s.Name
 		}
-		fmt.Fprintf(stderr(), "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
+		fmt.Fprintf(logw, "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
 	state := &runnerState{r: initialRunner, path: opts.ModelPath}
-	sem := make(chan struct{}, opts.MaxConcurrentConnections)
+	sem := make(chan struct{}, opts.MaxConcurrentRequests)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get())})
@@ -263,7 +326,7 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
 			return
 		}
-		entries, err := DiscoverModels(opts.ModelDir)
+		entries, err := DiscoverModels(opts.ModelDir, io.Discard)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -343,9 +406,7 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 			fmt.Fprint(w, chatJS)
 		})
 	}
-	server := &http.Server{Addr: opts.Addr, Handler: mux, ReadHeaderTimeout: 30 * time.Second}
-	fmt.Fprintf(stderr(), "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
-	return server.ListenAndServe()
+	return mux
 }
 
 func displayServerURL(addr string, chatUI bool) string {
