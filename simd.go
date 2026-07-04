@@ -1,4 +1,23 @@
-package main
+package gopherllm
+
+// CPU compute kernels: dot products and matrix-vector products over the
+// quantized block formats (layouts documented on GGMLType.DataSize),
+// dequantization, and the worker pool that parallelizes matvecs across rows.
+//
+// Every kernel exists in up to three tiers, chosen at runtime:
+//
+//	portable Go scalar  (always present; the correctness reference the
+//	                     differential tests compare against)
+//	ARM64 NEON          (hasQuantSIMD const true on arm64; *_arm64.s)
+//	x86-64 AVX2+FMA     (hasAVX2/hasQuantSIMD via CPUID; *_amd64.s,
+//	                     GOPHERLLM_DISABLE_SIMD=1 forces scalar)
+//
+// The "xsums" trick used by the Q4_K/Q6_K fast paths: both formats apply a
+// per-sub-block affine dequant (val = d*sc*q - dmin*m for Q4_K; a -32 offset
+// for Q6_K), so dot(row, x) splits into a quant-dependent term and a term
+// that only needs the SUM of x over each sub-block. Those sums are computed
+// once per matvec (fillQ4KXSums / fillQ6KXSums16) and shared by every row,
+// removing the offset handling from the inner loop.
 
 import (
 	"math"
@@ -11,6 +30,9 @@ var configuredThreads atomic.Int64
 
 var mxfp4LUT = [...]float32{0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6}
 
+// SetNumThreads overrides the worker count used by the parallel matvec
+// dispatch (default GOMAXPROCS). The CLI's --threads flag calls this and sets
+// GOMAXPROCS to the same value.
 func SetNumThreads(n int) {
 	if n < 1 {
 		n = 1
@@ -25,6 +47,10 @@ func numThreads() int {
 	return max(1, runtime.GOMAXPROCS(0))
 }
 
+// f16LUT maps every possible f16 bit pattern to its float32 value (256 KB,
+// built once at startup). Block scales in every quant format are f16, so this
+// lookup sits on the innermost dequant loops; a table beats bit manipulation
+// there.
 var f16LUT []float32
 var int8ToFloat32LUT [256]float32
 var byteToFloat32LUT [256]float32
@@ -185,9 +211,17 @@ func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)
-		parallelRows(rows, func(start, end int) {
-			dotQ4KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
-		})
+		if useQ8Activations {
+			q8, xsc, release := acquireQ8(x, cols)
+			parallelRows(rows, func(start, end int) {
+				dotQ4KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
+			})
+			release()
+		} else {
+			parallelRows(rows, func(start, end int) {
+				dotQ4KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
+			})
+		}
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return
@@ -217,6 +251,19 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 	ensureLenNoClear(bOut, bRows)
 	xs := fillQ4KXSums(x, aCols, xSums)
 	totalRows := aRows + bRows
+	if useQ8Activations {
+		q8, xsc, release := acquireQ8(x, aCols)
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ4KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
+				dotQ4KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			}
+		})
+		release()
+		return true
+	}
 	parallelRows(totalRows, func(start, end int) {
 		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
 			dotQ4KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
@@ -226,13 +273,6 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 		}
 	})
 	return true
-}
-
-func dotQ4KRows(data []byte, x []float32, cols, rowBytes, start, end int, out []float32) {
-	for r := start; r < end; r++ {
-		off := r * rowBytes
-		out[r] = DotQ4KF32(data[off:off+rowBytes], x, cols)
-	}
 }
 
 func dotQ4KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start, end int, out []float32) {
@@ -342,13 +382,13 @@ func dotQ6KRows(data []byte, x []float32, cols, rowBytes, start, end int, out []
 }
 
 func dotQ6KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start, end int, out []float32) {
-	if !hasQuantNEON {
+	if !hasQuantSIMD {
 		dotQ6KRows(data, x, cols, rowBytes, start, end, out)
 		return
 	}
 	for r := start; r < end; r++ {
 		off := r * rowBytes
-		out[r] = dotQ6KF32NEONWithXSums(data[off:off+rowBytes], x, xsums, cols)
+		out[r] = dotQ6KF32SIMDWithXSums(data[off:off+rowBytes], x, xsums, cols)
 	}
 }
 
@@ -358,7 +398,7 @@ func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
 	groups := cols / 16
 	ensureLenNoClear(scratch, groups)
 	out := *scratch
-	if hasQuantNEON && groups > 0 && len(x) >= groups*16 {
+	if hasQuantSIMD && groups > 0 && len(x) >= groups*16 {
 		sumF32Groups16(&x[0], &out[0], groups)
 		return out
 	}
@@ -382,9 +422,9 @@ func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
 	return out
 }
 
-// dotQ6KF32NEONWithXSums computes a Q6_K row dot product using the NEON
+// dotQ6KF32SIMDWithXSums computes a Q6_K row dot product using the SIMD
 // block kernel. xsums must hold per-16-element sums of x (fillQ6KXSums16).
-func dotQ6KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
+func dotQ6KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [16]float32
 	var sum float32
 	blocks := cols / 256
@@ -632,7 +672,7 @@ func fillQ4KXSums(x []float32, cols int, scratch *[]float32) []float32 {
 	groups := cols / 32
 	ensureLenNoClear(scratch, groups)
 	out := *scratch
-	if hasQuantNEON && groups > 0 && len(x) >= groups*32 {
+	if hasQuantSIMD && groups > 0 && len(x) >= groups*32 {
 		sumF32Groups32(&x[0], &out[0], groups)
 		return out
 	}
@@ -657,15 +697,15 @@ func fillQ4KXSums(x []float32, cols int, scratch *[]float32) []float32 {
 }
 
 func dotQ4KF32WithXSums(row []byte, x, xsums []float32, cols int) float32 {
-	if hasQuantNEON && cols > 0 && cols%256 == 0 && len(x) >= cols && len(xsums) >= cols/32 {
-		return dotQ4KF32NEONWithXSums(row, x, xsums, cols)
+	if hasQuantSIMD && cols > 0 && cols%256 == 0 && len(x) >= cols && len(xsums) >= cols/32 {
+		return dotQ4KF32SIMDWithXSums(row, x, xsums, cols)
 	}
 	return dotQ4KF32ScalarWithXSums(row, x, xsums, cols)
 }
 
-// dotQ4KF32NEONWithXSums computes a Q4_K row dot product using the NEON
+// dotQ4KF32SIMDWithXSums computes a Q4_K row dot product using the SIMD
 // block kernel. xsums must hold per-32-element sums of x (fillQ4KXSums).
-func dotQ4KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
+func dotQ4KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [8]float32
 	var sum float32
 	blocks := cols / 256
@@ -1300,6 +1340,11 @@ func DequantRowQ4_0(row []byte, cols int) []float32 {
 
 func DequantRowQ4K(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ4KInto(row, cols, out)
+	return out
+}
+
+func DequantRowQ4KInto(row []byte, cols int, out []float32) {
 	for b := range cols / 256 {
 		base := b * 144
 		if base+144 > len(row) {
@@ -1326,7 +1371,6 @@ func DequantRowQ4K(row []byte, cols int) []float32 {
 			is += 2
 		}
 	}
-	return out
 }
 
 func DequantRowQ5K(row []byte, cols int) []float32 {
@@ -1375,6 +1419,11 @@ func DequantRowQ5K(row []byte, cols int) []float32 {
 
 func DequantRowQ6K(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ6KInto(row, cols, out)
+	return out
+}
+
+func DequantRowQ6KInto(row []byte, cols int, out []float32) {
 	for b := range cols / 256 {
 		base := b * 210
 		if base+210 > len(row) {
@@ -1402,7 +1451,6 @@ func DequantRowQ6K(row []byte, cols int) []float32 {
 			sc = sc[8:]
 		}
 	}
-	return out
 }
 
 func DequantRowMXFP4(row []byte, cols int) []float32 {
@@ -1433,10 +1481,10 @@ func getScaleMinK4(j int, q []byte) (byte, byte) {
 	return (q[j+4] & 0x0f) | ((q[j-4] >> 6) << 4), (q[j+4] >> 4) | ((q[j] >> 6) << 4)
 }
 
-func mxfp4Value(v byte) float32 {
-	return mxfp4LUT[v&0x0f]
-}
-
+// parallelRows splits [0, rows) across the persistent worker pool, running
+// fn(start, end) on each range concurrently and returning when all are done.
+// Small row counts (< 8 rows per worker) run inline — the dispatch overhead
+// would exceed the work.
 func parallelRows(rows int, fn func(start, end int)) {
 	threads := min(numThreads(), rows)
 	if threads <= 1 || rows < threads*8 {
@@ -1490,6 +1538,11 @@ type rowJob struct {
 	done  chan<- struct{}
 }
 
+// rowWorkerPool is the process-wide pool of matvec worker goroutines. It is
+// created lazily at the first parallel dispatch and rebuilt (old workers
+// stopped) if SetNumThreads changes the thread count. Keeping the goroutines
+// alive across calls avoids per-matvec spawn cost — matvecs run ~30x per
+// generated token.
 type rowWorkerPool struct {
 	threads int
 	jobs    chan rowJob
@@ -1537,6 +1590,10 @@ func rowWorker(jobs <-chan rowJob, stop <-chan struct{}) {
 	}
 }
 
+// ensureLen resizes *s to length n, reusing capacity when possible, and
+// zeroes the contents. ensureLenNoClear is the same without the zeroing, for
+// buffers that are fully overwritten anyway — it is the standard idiom for
+// every scratch buffer on the decode path.
 func ensureLen[T any](s *[]T, n int) {
 	if cap(*s) < n {
 		*s = make([]T, n)

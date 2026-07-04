@@ -1,11 +1,12 @@
-//go:build !arm64
+//go:build !arm64 && !amd64
 
-package main
+package gopherllm
 
-const hasQuantNEON = false
+const hasQuantSIMD = false
+const hasPreparedQ4K = false
 
 func q4kQDots8(q *byte, x *float32, qdots *float32) {
-	panic("q4kQDots8 is only available on arm64")
+	panic("q4kQDots8 requires arm64 (NEON) or amd64 (AVX2)")
 }
 
 func q4kDotPrepared(q *byte, x *float32, scales *float32, mins *float32, xsums *float32, blocks int) float32 {
@@ -13,13 +14,13 @@ func q4kDotPrepared(q *byte, x *float32, scales *float32, mins *float32, xsums *
 }
 
 func q6kQDots16(ql *byte, qh *byte, x *float32, qdots *float32) {
-	panic("q6kQDots16 is only available on arm64")
+	panic("q6kQDots16 requires arm64 (NEON) or amd64 (AVX2)")
 }
 
 func sumF32Groups32(x *float32, out *float32, groups int) {
-	panic("sumF32Groups32 is only available on arm64")
+	panic("sumF32Groups32 requires arm64 (NEON) or amd64 (AVX2)")
 }
 
 func sumF32Groups16(x *float32, out *float32, groups int) {
-	panic("sumF32Groups16 is only available on arm64")
+	panic("sumF32Groups16 requires arm64 (NEON) or amd64 (AVX2)")
 }

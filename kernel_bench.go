@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 import (
 	"encoding/json"
@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// KernelBenchRow is one kernel's timing in the --kernel-bench report: a named
+// matvec (attn_q, ffn_down, output, ...) from a real layer of the loaded
+// model, so the numbers reflect the model's true shapes and quant types
+// rather than synthetic sizes.
 type KernelBenchRow struct {
 	Name    string  `json:"name"`
 	DType   string  `json:"dtype"`
@@ -17,6 +21,10 @@ type KernelBenchRow struct {
 	TotalMS float64 `json:"total_ms"`
 }
 
+// RunKernelBench times each weight matvec of one transformer layer (plus the
+// embedding row lookup and the output projection) in isolation, printing a
+// table or, with jsonOut, the machine-readable llm-kernel-bench.v1 document
+// that `make kernel-bench` emits for cross-runtime comparisons.
 func RunKernelBench(r *Runner, modelPath string, runs, requestedLayer int, jsonOut bool) error {
 	if runs <= 0 {
 		return fmt.Errorf("--kernel-bench-runs must be greater than 0")

@@ -1,4 +1,18 @@
-package main
+package gopherllm
+
+// Token sampling. The pipeline applied to each step's logits, in order:
+//
+//  1. repeat penalty on tokens in the recent window (divides positive
+//     logits, multiplies negative ones — the llama.cpp convention);
+//  2. temperature == 0 (or top-k == 1) short-circuits to greedy argmax;
+//  3. otherwise softmax with temperature, restricted to the top-k
+//     candidates when top-k > 0;
+//  4. min-p: drop candidates below MinP * (probability of the best token);
+//  5. top-p (nucleus): keep the smallest prefix of the sorted candidates
+//     whose cumulative mass exceeds TopP, then sample from it.
+//
+// Non-finite logits (NaN/±Inf, which a numerical blow-up upstream would
+// produce) are treated as -Inf everywhere so they can never be sampled.
 
 import (
 	"math"
@@ -6,8 +20,12 @@ import (
 
 var negInf32 = float32(math.Inf(-1))
 
+// Rng is a xorshift64 generator. Generation is fully deterministic for a
+// fixed seed (the CLI's --seed): the same seed replays the same tokens.
 type Rng struct{ state uint64 }
 
+// NewRng seeds an Rng; a zero seed is remapped to a fixed non-zero constant
+// because xorshift has an all-zero fixed point.
 func NewRng(seed uint64) *Rng {
 	if seed == 0 {
 		seed = 0xDEAD_BEEF_CAFE_1337
@@ -15,6 +33,7 @@ func NewRng(seed uint64) *Rng {
 	return &Rng{state: seed}
 }
 
+// NextF32 returns a uniform float in [0, 1) with 24 bits of precision.
 func (r *Rng) NextF32() float32 {
 	r.state ^= r.state << 13
 	r.state ^= r.state >> 7
@@ -22,27 +41,43 @@ func (r *Rng) NextF32() float32 {
 	return float32(r.state>>40) / float32(uint64(1)<<24)
 }
 
+// SamplerConfig holds the user-tunable sampling knobs. Disabled values:
+// TopK <= 0 (consider all tokens), TopP >= 1, MinP <= 0, RepeatPenalty == 1.
+// Temperature 0 means greedy decoding. See the file comment above for how
+// the knobs compose, and GenerationOptions.Validate for the accepted ranges.
 type SamplerConfig struct {
 	Temperature   float32
 	TopP          float32
 	TopK          int
+	MinP          float32
 	RepeatPenalty float32
 }
 
+// DefaultSamplerConfig is a generic chat baseline. Model vendors publish
+// family-specific recommendations that override these (e.g. Gemma wants
+// temp 1.0 / top-p 0.95 / top-k 64 — see docs/INFERENCE_NOTES.md).
 func DefaultSamplerConfig() SamplerConfig {
-	return SamplerConfig{Temperature: 0.7, TopP: 0.9, TopK: 40, RepeatPenalty: 1.1}
+	return SamplerConfig{Temperature: 0.7, TopP: 0.9, TopK: 40, MinP: 0, RepeatPenalty: 1.1}
 }
 
+// TokenProb pairs a token id with its (possibly unnormalized) weight while a
+// candidate set is being filtered and sampled.
 type TokenProb struct {
 	Token int
 	Prob  float32
 }
 
+// Sample picks the next token id from logits. recent is the trailing token
+// window the repeat penalty applies to. NOTE: logits is mutated in place
+// (penalties and softmax are applied destructively) — callers must not reuse
+// the slice's prior contents afterwards.
 func Sample(logits []float32, config SamplerConfig, rng *Rng, recent []uint32) uint32 {
 	candidates := []TokenProb{}
 	return SampleWithScratch(logits, config, rng, recent, &candidates)
 }
 
+// SampleWithScratch is Sample with a caller-owned candidate scratch buffer so
+// the per-token decode loop allocates nothing. Same logits-mutation caveat.
 func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent []uint32, candidates *[]TokenProb) uint32 {
 	n := len(logits)
 	if n == 0 {
@@ -84,7 +119,7 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 		if config.TopK == 1 {
 			return argmaxFiniteToken(logits)
 		}
-		return sampleTopK(logits, config.TopK, config.TopP, invTemp, rng, candidates)
+		return sampleTopK(logits, config.TopK, config.TopP, config.MinP, invTemp, rng, candidates)
 	}
 	maxLogit := negInf32
 	for i, v := range logits {
@@ -111,8 +146,8 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 	if sum <= 0 || math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
 		return argmaxToken(logits)
 	}
-	if config.TopP < 1 {
-		return sampleTopPFromWeights(logits, sum, config.TopP, rng, candidates)
+	if config.TopP < 1 || config.MinP > 0 {
+		return sampleTopPFromWeights(logits, sum, config.TopP, config.MinP, rng, candidates)
 	}
 	for i := range logits {
 		logits[i] /= sum
@@ -120,6 +155,7 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 	return sampleFromProbs(logits, rng)
 }
 
+// sampleFromProbs draws from an already-normalized distribution.
 func sampleFromProbs(probs []float32, rng *Rng) uint32 {
 	r := rng.NextF32()
 	var cumsum float32
@@ -132,15 +168,10 @@ func sampleFromProbs(probs []float32, rng *Rng) uint32 {
 	return uint32(len(probs) - 1)
 }
 
-func sampleTopPFromProbs(probs []float32, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
-	var total float32
-	for _, p := range probs {
-		total += p
-	}
-	return sampleTopPFromWeights(probs, total, topP, rng, candidates)
-}
-
-func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
+// sampleTopPFromWeights applies min-p then top-p over the full-vocabulary
+// weight array (the TopK<=0 path) and samples from what remains. weights are
+// unnormalized softmax terms; total is their sum.
+func sampleTopPFromWeights(weights []float32, total, topP, minP float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	var maxProb float32
 	for _, w := range weights {
 		if w > maxProb {
@@ -163,11 +194,22 @@ func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, can
 		}
 	}
 	sortTokenProbs(*candidates)
+	cutoff := len(*candidates)
+	if minP > 0 && cutoff > 0 {
+		threshold := minP * (*candidates)[0].Prob
+		total = 0
+		for i, item := range *candidates {
+			if i > 0 && item.Prob < threshold {
+				cutoff = i
+				break
+			}
+			total += item.Prob
+		}
+	}
 	target := topP * total
 	var cumsum float32
-	cutoff := len(*candidates)
-	for i, item := range *candidates {
-		cumsum += item.Prob
+	for i := 0; i < cutoff; i++ {
+		cumsum += (*candidates)[i].Prob
 		if cumsum > target {
 			cutoff = i + 1
 			break
@@ -188,7 +230,11 @@ func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, can
 	return uint32((*candidates)[cutoff-1].Token)
 }
 
-func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
+// sampleTopK selects the top-K logits with a bounded insertion pass (no full
+// vocab sort), softmaxes just those, then applies min-p and top-p within the
+// candidate set. This is the common path: K is ~40-64 while vocabularies run
+// 32K-262K, so avoiding the full-vocab sort dominates sampler cost.
+func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	*candidates = (*candidates)[:0]
 	var threshold float32 = negInf32
 	for i, logit := range logits {
@@ -224,11 +270,24 @@ func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, can
 	}
 	cutoff := len(*candidates)
 	kept := sum
+	if minP > 0 {
+		threshold := minP * (*candidates)[0].Prob
+		var s float32
+		for i, item := range *candidates {
+			if i > 0 && item.Prob < threshold {
+				cutoff = i
+				break
+			}
+			s += item.Prob
+		}
+		sum = s
+		kept = s
+	}
 	if topP < 1 {
 		target := topP * sum
 		var cumsum float32
-		for i, item := range *candidates {
-			cumsum += item.Prob
+		for i := 0; i < cutoff; i++ {
+			cumsum += (*candidates)[i].Prob
 			if cumsum > target {
 				cutoff = i + 1
 				break
@@ -250,12 +309,18 @@ func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, can
 	return uint32((*candidates)[cutoff-1].Token)
 }
 
+// bubbleUpLast restores descending-probability order after appending or
+// replacing the last element of an otherwise-sorted candidate slice.
 func bubbleUpLast(c []TokenProb) {
 	for i := len(c) - 1; i > 0 && c[i].Prob > c[i-1].Prob; i-- {
 		c[i], c[i-1] = c[i-1], c[i]
 	}
 }
 
+// sortTokenProbs sorts by probability descending, token id ascending as the
+// tie-break (a stable, deterministic order for equal probabilities). Hand-
+// rolled quicksort+insertion because sort.Slice allocates its closure on a
+// per-decoded-token hot path.
 func sortTokenProbs(c []TokenProb) {
 	if len(c) < 2 {
 		return

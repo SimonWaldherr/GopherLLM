@@ -1,8 +1,8 @@
 //go:build darwin && cgo && metal
 
-package main
+package gopherllm
 
-import metalbackend "gopherllm/internal/metal"
+import metalbackend "github.com/SimonWaldherr/GopherLLM/internal/metal"
 
 const metalQ6KMinRows = 32768
 

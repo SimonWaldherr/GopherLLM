@@ -1,7 +1,10 @@
 package main
 
 import (
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,7 +20,7 @@ import (
 )
 
 func printUsage(name string) {
-	fmt.Fprintf(os.Stderr, "gopherllm %s\n\n", Version)
+	fmt.Fprintf(os.Stderr, "gopherllm %s\n\n", gopherllm.Version)
 	fmt.Fprintf(os.Stderr, "Usage: %s [model.gguf|model-name|model-dir] [options]\n\n", name)
 	fmt.Fprintln(os.Stderr, "Options:")
 	fmt.Fprintln(os.Stderr, "  --model <name>           Select a GGUF from --model-dir by repo, file, or metadata name")
@@ -33,6 +36,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
 	fmt.Fprintln(os.Stderr, "  --top-p <F>               Nucleus sampling threshold (default: 0.9)")
 	fmt.Fprintln(os.Stderr, "  --top-k <N>               Top-K filtering (default: 40)")
+	fmt.Fprintln(os.Stderr, "  --min-p <F>               Min-P sampling threshold (default: 0, disabled)")
 	fmt.Fprintln(os.Stderr, "  --repeat-penalty <F>      Repetition penalty (default: 1.1)")
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
@@ -40,6 +44,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute Q4_K scale data during load for faster matvecs")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
+	fmt.Fprintln(os.Stderr, "  --skills-dir <path>       Directory of SKILL.md files offered via a load_skill tool")
 	fmt.Fprintln(os.Stderr, "  --embed                   Embed prompt and print the vector")
 	fmt.Fprintln(os.Stderr, "  --bench                   Run a non-streaming generation benchmark")
 	fmt.Fprintln(os.Stderr, "  --bench-json              Run benchmark and emit machine-readable JSON")
@@ -54,13 +59,17 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --inspect                 Inspect GGUF metadata and compatibility without loading weights")
 	fmt.Fprintln(os.Stderr, "  --list-metadata           Print GGUF metadata with --inspect")
 	fmt.Fprintln(os.Stderr, "  --list-tensors            Print GGUF tensor inventory and exit")
+	fmt.Fprintln(os.Stderr, "  --analyze                 Print a structural analysis report (params, quant mix, geometry)")
+	fmt.Fprintln(os.Stderr, "  --find-token <text>       Search the vocabulary for tokens containing <text>")
+	fmt.Fprintln(os.Stderr, "  --token-neighbors <t>     Show embedding-space nearest neighbors of a token (id or text)")
+	fmt.Fprintln(os.Stderr, "  --neighbors <N>           Neighbor count for --token-neighbors (default: 12)")
 }
 
 type cliConfig struct {
 	modelSelector    *string
 	modelDir         string
 	prompt           string
-	options          GenerationOptions
+	options          gopherllm.GenerationOptions
 	listModels       bool
 	listTensors      bool
 	repl             bool
@@ -82,6 +91,11 @@ type cliConfig struct {
 	prepareQuant     bool
 	inspect          bool
 	listMetadata     bool
+	skillsDir        string
+	analyze          bool
+	findToken        string
+	tokenNeighbors   string
+	neighborCount    int
 }
 
 func main() {
@@ -103,7 +117,7 @@ func run() error {
 			return nil
 		}
 		if arg == "--version" || arg == "-V" {
-			fmt.Println(Version)
+			fmt.Println(gopherllm.Version)
 			return nil
 		}
 	}
@@ -112,11 +126,11 @@ func run() error {
 		return err
 	}
 	if cfg.listModels {
-		entries, err := DiscoverModels(cfg.modelDir)
+		entries, err := gopherllm.DiscoverModels(cfg.modelDir, os.Stderr)
 		if err != nil {
 			return err
 		}
-		PrintModelList(entries)
+		gopherllm.PrintModelList(entries)
 		return nil
 	}
 	if cfg.options.MaxTokens <= 0 {
@@ -136,40 +150,53 @@ func run() error {
 		return err
 	}
 	defer stopProfile()
-	fmt.Fprintf(stderr(), "System: %d threads\n", runtime.GOMAXPROCS(0))
-	metalAvailable := MetalAvailable()
+	fmt.Fprintf(os.Stderr, "System: %d threads\n", runtime.GOMAXPROCS(0))
+	metalAvailable := gopherllm.MetalAvailable()
 	if cfg.useMetal {
 		if !metalAvailable {
 			return fmt.Errorf("Metal requested but unavailable; build with CGO_ENABLED=1 -tags metal on macOS")
 		}
-		fmt.Fprintln(stderr(), "Metal: enabled (experimental Q6_K matvec offload)")
+		fmt.Fprintln(os.Stderr, "Metal: enabled (experimental Q6_K matvec offload)")
 	} else if metalAvailable {
-		fmt.Fprintln(stderr(), "Metal: available (disabled; pass --metal)")
+		fmt.Fprintln(os.Stderr, "Metal: available (disabled; pass --metal)")
 	} else {
-		fmt.Fprintln(stderr(), "Metal: unavailable (pure Go / no CGO)")
+		fmt.Fprintln(os.Stderr, "Metal: unavailable (pure Go / no CGO)")
 	}
 	if cfg.prepareQuant {
-		fmt.Fprintln(stderr(), "Quant prep: enabled for Q4_K weights")
+		fmt.Fprintln(os.Stderr, "Quant prep: enabled for Q4_K weights")
 	}
-	modelPath, err := ResolveModelPath(cfg.modelSelector, cfg.modelDir)
+	modelPath, err := gopherllm.ResolveModelPath(cfg.modelSelector, cfg.modelDir)
 	if err != nil {
 		return err
 	}
 	if cfg.inspect || cfg.listTensors || cfg.listMetadata {
 		return inspectGGUF(modelPath, cfg.listMetadata, cfg.listTensors)
 	}
-	runner, info, err := RunnerFromPathWithOptions(modelPath, LoadOptions{PrepareQuantized: cfg.prepareQuant, UseMetal: cfg.useMetal})
+	if cfg.analyze || cfg.findToken != "" {
+		// Header-only analysis: no weights are loaded, so this is instant
+		// even for multi-gigabyte files.
+		return analyzeGGUF(modelPath, cfg)
+	}
+	model, err := gopherllm.Open(
+		context.Background(),
+		modelPath,
+		gopherllm.WithLogWriter(os.Stderr),
+		gopherllm.WithPrepareQuantized(cfg.prepareQuant),
+		gopherllm.WithMetal(cfg.useMetal),
+	)
 	if err != nil {
 		return err
 	}
-	defer runner.Close()
-	fmt.Fprintf(stderr(), "Loaded %s (%.2f GB) in %.2fs\n", filepath.Base(modelPath), float64(info.FileSizeBytes)/(1024*1024*1024), info.LoadTime.Seconds())
-	if name, ok := runner.ModelName(); ok {
-		fmt.Fprintf(stderr(), "Model: %s\n", name)
+	defer model.Close()
+	runner := model.Runner()
+	info := model.Info()
+	fmt.Fprintf(os.Stderr, "Loaded %s (%.2f GB) in %.2fs\n", filepath.Base(modelPath), float64(info.FileSizeBytes)/(1024*1024*1024), info.LoadTime.Seconds())
+	if name := model.Name(); name != "" {
+		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
 	}
-	fmt.Fprintf(stderr(), "Architecture: %s\n", runner.Architecture())
+	fmt.Fprintf(os.Stderr, "Architecture: %s\n", runner.Architecture())
 	if cfg.serveAddr != "" {
-		return Serve(runner, ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath})
+		return gopherllm.Serve(runner, gopherllm.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -182,34 +209,64 @@ func run() error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"token_count": result.TokenCount, "embedding": result.Embedding})
 	}
+	if cfg.tokenNeighbors != "" {
+		matches, err := model.NearestTokens(cfg.tokenNeighbors, cfg.neighborCount)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("nearest neighbors of %q in embedding space:\n", cfg.tokenNeighbors)
+		for _, m := range matches {
+			fmt.Printf("  %6d  %-24q cos=%.4f\n", m.ID, m.Text, m.Score)
+		}
+		return nil
+	}
 	if cfg.bench {
 		return runBench(runner, cfg)
 	}
 	if cfg.kernelBench {
-		return RunKernelBench(runner, modelPath, cfg.kernelBenchRuns, cfg.kernelBenchLayer, cfg.kernelBenchJSON)
+		return gopherllm.RunKernelBench(runner, modelPath, cfg.kernelBenchRuns, cfg.kernelBenchLayer, cfg.kernelBenchJSON)
+	}
+	skills, err := gopherllm.LoadSkills(cfg.skillsDir)
+	if err != nil {
+		return err
+	}
+	if len(skills) > 0 {
+		fmt.Fprintf(os.Stderr, "Skills: loaded %d from %s\n", len(skills), cfg.skillsDir)
 	}
 	if cfg.repl || cfg.prompt == "" {
-		return runREPL(runner, cfg.options)
+		return runREPL(runner, cfg.options, skills)
 	}
-	result, err := runWithTimeout(cfg.timeout, func() (GenerationResult, error) {
-		return runner.GenerateStream(cfg.prompt, cfg.options, func(s string) {
-			writeStreamChunk(s)
+	result, err := runWithTimeout(cfg.timeout, func() (gopherllm.GenerationResult, error) {
+		return gopherllm.RunAgenticChat(runner, []gopherllm.ChatMessage{gopherllm.UserMessage(cfg.prompt)}, cfg.options, skills, func(s string) bool {
+			fmt.Print(s)
+			return true
 		})
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Println()
+	printReasoningAndToolCalls(result)
 	printStats(result.Stats)
 	return nil
 }
 
-func writeStreamChunk(s string) {
-	_, _ = os.Stdout.WriteString(s)
+// printReasoningAndToolCalls surfaces the parts of a gopherllm.GenerationResult that the
+// CLI's plain stdout stream doesn't otherwise show: any chain-of-thought the
+// model separated out, and any tool call the model wants that the CLI (unlike
+// the HTTP server) has no client to hand it back to. Both go to stderr so
+// stdout stays just the visible answer for piping.
+func printReasoningAndToolCalls(result gopherllm.GenerationResult) {
+	if result.ReasoningText != "" {
+		fmt.Fprintf(os.Stderr, "[reasoning]\n%s\n[/reasoning]\n", result.ReasoningText)
+	}
+	for _, call := range result.ToolCalls {
+		fmt.Fprintf(os.Stderr, "[tool_call] %s(%s) — no --skills-dir tool executor is configured to answer this\n", call.Function.Name, call.Function.Arguments)
+	}
 }
 
 func parseCLI(args []string) (cliConfig, error) {
-	cfg := cliConfig{modelDir: DefaultModelDir(), options: DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8}
+	cfg := cliConfig{modelDir: gopherllm.DefaultModelDir(), options: gopherllm.DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8}
 	setSelector := func(value string) error {
 		if cfg.modelSelector != nil {
 			return fmt.Errorf("multiple model selectors were provided")
@@ -296,6 +353,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.options.Sampler.TopK = v
+		case "--min-p":
+			v, err := parseNextFloat(next, arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.options.Sampler.MinP = v
 		case "--repeat-penalty":
 			v, err := parseNextFloat(next, arg)
 			if err != nil {
@@ -317,7 +380,7 @@ func parseCLI(args []string) (cliConfig, error) {
 			if err != nil {
 				return cfg, err
 			}
-			SetNumThreads(v)
+			gopherllm.SetNumThreads(v)
 			runtime.GOMAXPROCS(v)
 		case "--metal":
 			cfg.useMetal = true
@@ -335,6 +398,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.options.StopSequences = append(cfg.options.StopSequences, v)
+		case "--skills-dir":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.skillsDir = v
 		case "--embed":
 			cfg.embed = true
 		case "--bench":
@@ -387,6 +456,26 @@ func parseCLI(args []string) (cliConfig, error) {
 			cfg.listMetadata = true
 		case "--list-tensors":
 			cfg.listTensors = true
+		case "--analyze":
+			cfg.analyze = true
+		case "--find-token":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.findToken = v
+		case "--token-neighbors":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.tokenNeighbors = v
+		case "--neighbors":
+			v, err := parseNextInt(next, arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.neighborCount = v
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return cfg, fmt.Errorf("unknown option: %s", arg)
@@ -450,19 +539,52 @@ func parseNextDuration(next func(string) (string, error), flag string) (time.Dur
 	return d, nil
 }
 
-func inspectGGUF(path string, listMetadata, listTensors bool) error {
-	mmap, err := OpenMmap(path)
+// analyzeGGUF handles --analyze and --find-token: header-only work over the
+// mmap'd file, no weight loading.
+func analyzeGGUF(path string, cfg cliConfig) error {
+	mmap, err := gopherllm.OpenMmap(path)
 	if err != nil {
 		return err
 	}
 	defer mmap.Close()
-	gguf, err := ParseGGUF(mmap.Bytes())
+	gguf, err := gopherllm.ParseGGUF(mmap.Bytes())
+	if err != nil {
+		return err
+	}
+	tok, err := gopherllm.TokenizerFromMetadata(gguf.Metadata)
+	if err != nil {
+		tok = nil // analysis still works without a tokenizer
+	}
+	if cfg.analyze {
+		fmt.Printf("file:           %s (%.2f GB)\n", path, float64(mmap.Len())/(1024*1024*1024))
+		gopherllm.AnalyzeGGUF(gguf, tok).WriteText(os.Stdout)
+	}
+	if cfg.findToken != "" {
+		if tok == nil {
+			return fmt.Errorf("--find-token requires a tokenizer, which this file lacks")
+		}
+		matches := gopherllm.SearchTokens(tok, cfg.findToken, 50)
+		fmt.Printf("%d tokens match %q:\n", len(matches), cfg.findToken)
+		for _, m := range matches {
+			fmt.Printf("  %6d  %q\n", m.ID, m.Text)
+		}
+	}
+	return nil
+}
+
+func inspectGGUF(path string, listMetadata, listTensors bool) error {
+	mmap, err := gopherllm.OpenMmap(path)
+	if err != nil {
+		return err
+	}
+	defer mmap.Close()
+	gguf, err := gopherllm.ParseGGUF(mmap.Bytes())
 	if err != nil {
 		return err
 	}
 	arch, _ := gguf.GetString("general.architecture")
 	name, _ := gguf.GetString("general.name")
-	fmt.Printf("file: %s\nname: %s\narchitecture: %s\nsupported: %v\nmetadata: %d\ntensors: %d\ndata_offset: %d\n", path, name, arch, ArchitectureSupported(arch), len(gguf.Metadata), len(gguf.Tensors), gguf.DataOffset)
+	fmt.Printf("file: %s\nname: %s\narchitecture: %s\nsupported: %v\nmetadata: %d\ntensors: %d\ndata_offset: %d\n", path, name, arch, gopherllm.ArchitectureSupported(arch), len(gguf.Metadata), len(gguf.Tensors), gguf.DataOffset)
 	if listMetadata {
 		keys := make([]string, 0, len(gguf.Metadata))
 		for key := range gguf.Metadata {
@@ -481,9 +603,9 @@ func inspectGGUF(path string, listMetadata, listTensors bool) error {
 	return nil
 }
 
-func formatMetaValue(v MetaValue, depth int) string {
+func formatMetaValue(v gopherllm.MetaValue, depth int) string {
 	switch x := v.Value.(type) {
-	case []MetaValue:
+	case []gopherllm.MetaValue:
 		if depth > 0 {
 			return fmt.Sprintf("[%d values]", len(x))
 		}
@@ -511,7 +633,7 @@ func promptText(prompt string) (string, error) {
 	return string(b), err
 }
 
-func runREPL(r *Runner, options GenerationOptions) error {
+func runREPL(r *gopherllm.Runner, options gopherllm.GenerationOptions, skills []gopherllm.Skill) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Fprintln(os.Stderr, "Enter prompts; empty line exits.")
 	for {
@@ -523,22 +645,23 @@ func runREPL(r *Runner, options GenerationOptions) error {
 		if prompt == "" {
 			return nil
 		}
-		_, err := r.GenerateStream(prompt, options, func(s string) { fmt.Print(s) })
+		result, err := gopherllm.RunAgenticChat(r, []gopherllm.ChatMessage{gopherllm.UserMessage(prompt)}, options, skills, func(s string) bool { fmt.Print(s); return true })
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
 		fmt.Println()
+		printReasoningAndToolCalls(result)
 	}
 }
 
-func runBench(r *Runner, cfg cliConfig) error {
+func runBench(r *gopherllm.Runner, cfg cliConfig) error {
 	prompt := cfg.prompt
 	if prompt == "" {
 		prompt = "Write a concise explanation of local LLM inference."
 	}
-	results := []GenerationResult{}
+	results := []gopherllm.GenerationResult{}
 	for range cfg.benchRuns {
-		result, err := runWithTimeout(cfg.timeout, func() (GenerationResult, error) {
+		result, err := runWithTimeout(cfg.timeout, func() (gopherllm.GenerationResult, error) {
 			return r.Generate(prompt, cfg.options)
 		})
 		if err != nil {
@@ -605,12 +728,12 @@ func startCPUProfile(path string) (func(), error) {
 	}, nil
 }
 
-func runWithTimeout(timeout time.Duration, fn func() (GenerationResult, error)) (GenerationResult, error) {
+func runWithTimeout(timeout time.Duration, fn func() (gopherllm.GenerationResult, error)) (gopherllm.GenerationResult, error) {
 	if timeout <= 0 {
 		return fn()
 	}
 	type response struct {
-		result GenerationResult
+		result gopherllm.GenerationResult
 		err    error
 	}
 	done := make(chan response, 1)
@@ -624,11 +747,11 @@ func runWithTimeout(timeout time.Duration, fn func() (GenerationResult, error)) 
 	case res := <-done:
 		return res.result, res.err
 	case <-timer.C:
-		return GenerationResult{}, fmt.Errorf("generation timed out after %s", timeout)
+		return gopherllm.GenerationResult{}, fmt.Errorf("generation timed out after %s", timeout)
 	}
 }
 
-func printStats(s GenerationStats) {
+func printStats(s gopherllm.GenerationStats) {
 	tps := float64(s.GeneratedTokens) / max(1e-9, s.DecodeTime.Seconds())
 	fmt.Fprintf(os.Stderr, "prompt=%d generated=%d prefill=%s decode=%s total=%s tok/s=%.2f\n", s.PromptTokens, s.GeneratedTokens, s.PrefillTime.Round(time.Millisecond), s.DecodeTime.Round(time.Millisecond), s.TotalTime.Round(time.Millisecond), tps)
 }

@@ -1,13 +1,27 @@
-package main
+package gopherllm
 
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"sort"
 )
 
+// Config is the model's hyperparameter set, read from GGUF metadata by
+// ConfigFromGGUF and then refined against actual tensor shapes by
+// inferAttentionShape (GGUF metadata is frequently missing or wrong about
+// head dims, so the tensor shapes are authoritative).
+//
+// Attention shape vocabulary used throughout the forward pass:
+// HeadDim is the per-head Q/K width, ValueDim the per-head V width (usually
+// equal), NKVHeads the number of K/V heads (< NHeads under grouped-query
+// attention), KVMul = NHeads/NKVHeads the number of query heads sharing each
+// KV head, and KVDim = NKVHeads*ValueDim the per-position V cache width.
+// The scale factors (Embedding/Residual/Logit/Attention) default to 1 (or 0
+// meaning "use 1/sqrt(HeadDim)" for AttentionScale) and are only non-trivial
+// for architectures whose GGUFs carry them.
 type Config struct {
 	Arch                      string
 	Dim                       int
@@ -34,8 +48,50 @@ type Config struct {
 	RopeScalingFactor         float32
 	RopeAttentionFactor       float32
 	RopeOriginalContextLength int
+	RopeScalingType           string
+	RopeYarnBetaFast          float32
+	RopeYarnBetaSlow          float32
+	RopeYarnLogMultiplier     float32
 	RopeFactorsLong           []float32
 	RopeFactorsShort          []float32
+	// Gemma-family mechanics (all inert at their zero values; see
+	// docs/INFERENCE_NOTES.md for the researched semantics):
+	// UseGELU switches the FFN activation from SiLU to tanh-approximated GELU.
+	// AttnLogitSoftcap/FinalLogitSoftcap apply cap*tanh(v/cap) to attention
+	// scores / final logits (Gemma 2: 50.0 / 30.0). SWAPattern, when non-nil,
+	// restricts the sliding window to layers whose entry is true (Gemma 4
+	// ships it as bool-array metadata; Gemma 2's alternating pattern is
+	// synthesized); nil means SlidingWindow applies to every layer.
+	UseGELU           bool
+	AttnLogitSoftcap  float32
+	FinalLogitSoftcap float32
+	SWAPattern        []bool
+}
+
+// gemmaFamily reports whether arch is a Gemma generation, all of which share
+// the hardcoded sqrt(dim) embedding scaling and GELU FFN.
+func gemmaFamily(arch string) bool {
+	switch arch {
+	case "gemma", "gemma2", "gemma3", "gemma4":
+		return true
+	default:
+		return false
+	}
+}
+
+// layerUsesSWA reports whether layer il attends with the sliding window (true)
+// or over the full context (false, or when no window is configured).
+func (c Config) layerUsesSWA(il int) bool {
+	if c.SlidingWindow <= 0 {
+		return false
+	}
+	if c.SWAPattern == nil {
+		return true
+	}
+	if il < 0 || il >= len(c.SWAPattern) {
+		return false
+	}
+	return c.SWAPattern[il]
 }
 
 func ConfigFromGGUF(gguf *GGUFFile) Config {
@@ -65,9 +121,16 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	if nKVHeads > 0 && nHeads > 0 {
 		kvMul = max(1, nHeads/nKVHeads)
 	}
-	embeddingScale := gguf.GetF32(p+".embedding_scale", 1)
+	embeddingScale := gguf.GetF32(p+".embedding_scale", 0)
 	if embeddingScale == 0 {
-		embeddingScale = 1
+		if gemmaFamily(p) && dim > 0 {
+			// Gemma scales input embeddings by sqrt(dim); reference
+			// implementations hardcode this — it is NOT in GGUF metadata
+			// (verified against llama.cpp's gemma graphs).
+			embeddingScale = float32(math.Sqrt(float64(dim)))
+		} else {
+			embeddingScale = 1
+		}
 	}
 	residualScale := gguf.GetF32(p+".residual_scale", 1)
 	if residualScale == 0 {
@@ -103,9 +166,52 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeScalingFactor:         gguf.GetF32(p+".rope.scaling.factor", 1),
 		RopeAttentionFactor:       gguf.GetF32(p+".rope.scaling.attn_factor", 1),
 		RopeOriginalContextLength: int(gguf.GetU32(p+".rope.scaling.original_context_length", 0)),
+		RopeScalingType:           ropeScalingType(gguf, p),
+		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
+		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
+		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
+		UseGELU:                   gemmaFamily(p),
+		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
+		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
+		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
 }
 
+// swaPattern determines which layers use the sliding window. Priority:
+// explicit bool-array metadata ({arch}.attention.sliding_window_pattern, one
+// entry per layer — the Gemma 4 convention), then the known per-architecture
+// interleave defaults expressed as "every Nth layer is global" (Gemma 2
+// alternates 1:1, Gemma 3/4 run 5 local then 1 global). nil means every layer
+// uses the window (the pre-Gemma behavior, correct for e.g. old Mistral).
+func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
+	if v, ok := gguf.Metadata[p+".attention.sliding_window_pattern"]; ok {
+		if arr, ok := v.AsBoolArray(); ok && len(arr) > 0 {
+			return arr
+		}
+	}
+	period := 0
+	switch p {
+	case "gemma2":
+		period = 2
+	case "gemma3", "gemma4":
+		period = 6
+	}
+	if period == 0 || nLayers <= 0 {
+		return nil
+	}
+	pattern := make([]bool, nLayers)
+	for il := range pattern {
+		pattern[il] = il%period < period-1
+	}
+	return pattern
+}
+
+// Weight is one loaded tensor in exactly one of two states: F32 non-nil
+// (plain floats, converted at load time from F32/F16 storage) or Raw non-nil
+// (still-quantized bytes, usually borrowed zero-copy from the mmap'd file,
+// dequantized on the fly inside the matvec kernels). Rows/Cols only apply to
+// the quantized form; the F32 form infers rows from len(F32)/cols at the
+// call site.
 type Weight struct {
 	F32      []float32
 	Raw      []byte
@@ -116,6 +222,9 @@ type Weight struct {
 	Metal    *MetalWeight
 }
 
+// Matvec computes out = W·x, allocating the result. MatvecInto is the
+// allocation-free form used on the decode hot path; it dispatches to the
+// quant-type-specific parallel kernel in simd.go.
 func (w Weight) Matvec(x []float32) []float32 {
 	out := make([]float32, max(0, w.Rows))
 	w.MatvecInto(x, &out)
@@ -137,6 +246,18 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ8_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_0:
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ4_1:
+		MatvecQ4_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ5_0:
+		MatvecQ5_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ5_1:
+		MatvecQ5_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ8_1:
+		MatvecQ8_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ2_K:
+		MatvecQ2KInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ3_K:
+		MatvecQ3KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_K:
 		if MatvecPreparedQ4KInto(w.Raw, w.Prepared, x, w.Rows, w.Cols, out) {
 			return
@@ -156,6 +277,8 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 	}
 }
 
+// Row dequantizes a single weight row (used for token-embedding lookups).
+// RowInto is the allocation-free form.
 func (w Weight) Row(row, cols int) []float32 {
 	out := make([]float32, cols)
 	w.RowInto(row, cols, &out)
@@ -176,6 +299,24 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeQ4_0:
 		rowBytes := (cols / 32) * 18
 		copy(*out, DequantRowQ4_0(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+	case GGMLTypeQ4_1:
+		rowBytes := (cols / 32) * 20
+		DequantRowQ4_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ5_0:
+		rowBytes := (cols / 32) * 22
+		DequantRowQ5_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ5_1:
+		rowBytes := (cols / 32) * 24
+		DequantRowQ5_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ8_1:
+		rowBytes := (cols / 32) * 36
+		DequantRowQ8_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ2_K:
+		rowBytes := (cols / 256) * 84
+		DequantRowQ2KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ3_K:
+		rowBytes := (cols / 256) * 110
+		DequantRowQ3KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_K:
 		rowBytes := (cols / 256) * 144
 		copy(*out, DequantRowQ4K(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
@@ -232,6 +373,10 @@ func (w Weight) RowF32(row, cols int) []float32 {
 	return w.F32[start : start+cols]
 }
 
+// LayerWeights holds one transformer block. Attention is either split
+// (WQ/WK/WV, with optional biases BQ/BK/BV) or fused into a single WQKV
+// (HasQKV); the SwiGLU FFN is likewise either split (W1 = gate, W3 = up,
+// W2 = down — llama.cpp naming) or fused gate+up in WGateUp (HasGateUp).
 type LayerWeights struct {
 	AttnNorm  []float32
 	WQ        Weight
@@ -249,6 +394,15 @@ type LayerWeights struct {
 	W3        Weight
 	WGateUp   Weight
 	HasGateUp bool
+	// Optional Gemma-family norms, nil when the tensors are absent:
+	// AttnQNorm/AttnKNorm are per-head RMS norms of length HeadDim applied
+	// after the Q/K projections (before RoPE); PostAttnNorm/PostFFNNorm are
+	// full-width RMS norms applied to the attention/FFN outputs before their
+	// residual adds.
+	AttnQNorm    []float32
+	AttnKNorm    []float32
+	PostAttnNorm []float32
+	PostFFNNorm  []float32
 }
 
 type ModelWeights struct {
@@ -286,6 +440,12 @@ type GptOssWeights struct {
 	Standard ModelWeights
 }
 
+// KVCache stores the attention keys and values of every processed position,
+// one flat slice per layer laid out position-major: position p's keys occupy
+// K[layer][p*PerPosKDim : (p+1)*PerPosKDim] (all KV heads concatenated), and
+// likewise for V. Sized once per generation to prompt+max_tokens (capped at
+// the model context length); there is no ring/eviction — generation stops at
+// MaxLen.
 type KVCache struct {
 	K          [][]float32
 	V          [][]float32
@@ -294,6 +454,8 @@ type KVCache struct {
 	MaxLen     int
 }
 
+// NewKVCache allocates a cache for `layers` layers of maxLen positions with
+// the given per-position K and V widths (see KVCache).
 func NewKVCache(layers, kDim, vDim, maxLen int) *KVCache {
 	k := make([][]float32, layers)
 	v := make([][]float32, layers)
@@ -304,6 +466,14 @@ func NewKVCache(layers, kDim, vDim, maxLen int) *KVCache {
 	return &KVCache{K: k, V: v, PerPosKDim: kDim, PerPosVDim: vDim, MaxLen: maxLen}
 }
 
+// DecodeBuffer is the per-generation scratch memory for the single-token
+// forward pass: activation vectors (X residual stream, XN/XN2 normed views,
+// Q/K/V/AttnOut/Proj attention buffers, Gate/Up/Hidden FFN buffers), the
+// sampler's candidate scratch, and precomputed RoPE tables (per-pair inverse
+// frequencies plus per-position sin/cos filled in prepareRopeScratch). One
+// DecodeBuffer serves a whole generation, so the decode loop allocates
+// nothing per token. Not safe for concurrent use — Runner.genLock serializes
+// generations.
 type DecodeBuffer struct {
 	X                       []float32
 	XN                      []float32
@@ -327,6 +497,7 @@ type DecodeBuffer struct {
 	RopeInvFreq             []float32
 	RopeSin                 []float32
 	RopeCos                 []float32
+	RopeMscale              float32
 	RopeGptOssInvFreq       []float32
 	RopeGptOssConcentration float32
 }
@@ -337,7 +508,7 @@ type ExpertScore struct {
 }
 
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
-	inv := buildRopeInvFreq(config, maxHeadDim)
+	inv, mscale := buildRopeInvFreq(config, maxHeadDim)
 	gptInv, concentration := buildRopeInvFreqGptOss(config)
 	return &DecodeBuffer{
 		X:                       make([]float32, config.Dim),
@@ -360,17 +531,35 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		RopeInvFreq:             inv,
 		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeCos:                 make([]float32, max(1, maxHeadDim/2)),
+		RopeMscale:              mscale,
 		RopeGptOssInvFreq:       gptInv,
 		RopeGptOssConcentration: concentration,
 	}
 }
 
-func buildRopeInvFreq(config Config, maxHeadDim int) []float32 {
+func ropeScalingType(gguf *GGUFFile, p string) string {
+	if os.Getenv("GOPHERLLM_DISABLE_YARN") != "" {
+		return ""
+	}
+	if s, ok := gguf.GetString(p + ".rope.scaling.type"); ok {
+		return s
+	}
+	return ""
+}
+
+// buildRopeInvFreq returns the per-pair inverse RoPE frequencies and the
+// attention magnitude scale (mscale) applied to the rotated Q/K vectors. mscale
+// is 1 except for YaRN-scaled models (e.g. Ministral) where the rotation is
+// amplified to match how the model was trained.
+func buildRopeInvFreq(config Config, maxHeadDim int) ([]float32, float32) {
 	ropeDim := config.RopeDimensionCount
 	if ropeDim <= 0 || ropeDim > maxHeadDim {
 		ropeDim = maxHeadDim
 	}
 	pairs := ropeDim / 2
+	if config.RopeScalingType == "yarn" && config.RopeScalingFactor > 1 && config.RopeOriginalContextLength > 0 {
+		return buildRopeInvFreqYarn(config, ropeDim, pairs)
+	}
 	inv := make([]float32, pairs)
 	factors := config.RopeFactorsShort
 	if config.RopeOriginalContextLength > 0 && config.MaxSeqLen > config.RopeOriginalContextLength && len(config.RopeFactorsLong) >= pairs {
@@ -385,7 +574,54 @@ func buildRopeInvFreq(config Config, maxHeadDim int) []float32 {
 		}
 		inv[pair] = 1 / (factor * base)
 	}
-	return inv
+	return inv, 1
+}
+
+// buildRopeInvFreqYarn implements YaRN "NTK-by-parts" frequency interpolation
+// and the attention magnitude scale, mirroring llama.cpp's rope_yarn. High
+// frequencies (short wavelengths) are left untouched, low frequencies are
+// interpolated by 1/factor, and a linear ramp blends the middle band.
+func buildRopeInvFreqYarn(config Config, ropeDim, pairs int) ([]float32, float32) {
+	inv := make([]float32, pairs)
+	base := float64(config.RopeTheta)
+	nDims := float64(ropeDim)
+	nOrig := float64(config.RopeOriginalContextLength)
+	factor := float64(config.RopeScalingFactor)
+	freqScale := 1 / factor
+	betaFast := float64(config.RopeYarnBetaFast)
+	if betaFast <= 0 {
+		betaFast = 32
+	}
+	betaSlow := float64(config.RopeYarnBetaSlow)
+	if betaSlow <= 0 {
+		betaSlow = 1
+	}
+
+	corrDim := func(nRot float64) float64 {
+		return nDims * math.Log(nOrig/(nRot*2*math.Pi)) / (2 * math.Log(base))
+	}
+	low := math.Floor(corrDim(betaFast))
+	high := math.Ceil(corrDim(betaSlow))
+	low = math.Max(0, low)
+	high = math.Min(nDims-1, high)
+	denom := math.Max(0.001, high-low)
+
+	for pair := 0; pair < pairs; pair++ {
+		i := float64(pair * 2)
+		freqExtrap := 1 / math.Pow(base, i/nDims)
+		freqInterp := freqExtrap * freqScale
+		y := (float64(pair) - low) / denom
+		ramp := 1 - math.Min(1, math.Max(0, y)) // 1 => keep extrapolated, 0 => interpolate
+		freq := freqInterp*(1-ramp) + freqExtrap*ramp
+		inv[pair] = float32(freq)
+	}
+	// YaRN also defines an attention-magnitude scale (mscale = 1 + 0.1*ln(factor))
+	// applied to the rotated Q/K. Enabling it measurably degraded Ministral output
+	// at ordinary context lengths — attention became over-sharpened and greedy
+	// decoding derailed (e.g. "Alphabet" -> "Al data"). The frequency
+	// interpolation above is what actually extends usable context, so we keep it
+	// and leave the magnitude scale at 1.
+	return inv, 1
 }
 
 func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
@@ -416,9 +652,18 @@ func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
 	return inv, concentration
 }
 
-func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool) (Config, ModelWeights, error) {
+// LoadModel loads the standard llama-style weight set from a parsed GGUF.
+// With borrowQuantized set (the mmap path), quantized tensors are zero-copy
+// sub-slices of data — the caller must keep data alive for the model's
+// lifetime; without it they are copied into owned memory (the in-memory test
+// path). Models without a separate output.weight tie the output projection to
+// the token embeddings.
+func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, ModelWeights, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
 	config := ConfigFromGGUF(gguf)
-	fmt.Fprintf(stderr(), "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
+	fmt.Fprintf(logw, "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
 		config.Dim, config.NLayers, config.NHeads, config.NKVHeads, config.HiddenDim, config.VocabSize, config.MaxSeqLen)
 	tensorIdx := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
@@ -445,7 +690,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 			return config, ModelWeights{}, err
 		}
 	} else {
-		fmt.Fprintln(stderr(), "Note: output tied to embeddings")
+		fmt.Fprintln(logw, "Note: output tied to embeddings")
 	}
 
 	layers := make([]LayerWeights, 0, config.NLayers)
@@ -459,19 +704,19 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		}
 		layers = append(layers, layer)
 		if l == 0 || (l+1)%8 == 0 || l+1 == config.NLayers {
-			fmt.Fprintf(stderr(), "  Loaded layer %d/%d\n", l+1, config.NLayers)
+			fmt.Fprintf(logw, "  Loaded layer %d/%d\n", l+1, config.NLayers)
 		}
 	}
 	return config, ModelWeights{TokenEmbd: tokenEmbd, OutputNorm: outputNorm, Output: output, Layers: layers}, nil
 }
 
-func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool) (Config, GptOssWeights, error) {
-	config, weights, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal)
+func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, GptOssWeights, error) {
+	config, weights, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw)
 	return config, GptOssWeights{Standard: weights}, err
 }
 
-func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool) (Config, Gemma4Weights, error) {
-	config, std, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal)
+func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, Gemma4Weights, error) {
+	config, std, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw)
 	if err != nil {
 		return config, Gemma4Weights{}, err
 	}
@@ -561,7 +806,27 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 		W3:        w3,
 		WGateUp:   wGateUp,
 		HasGateUp: hasGateUp,
+		// Unlike the biases above (where a zero-filled default is inert),
+		// these must stay nil when absent: applying an all-zero norm would
+		// zero the activations.
+		AttnQNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_q_norm.weight", tensors, inferred),
+		AttnKNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_k_norm.weight", tensors, inferred),
+		PostAttnNorm: loadOptionalF32VecNil(data, dataOffset, prefix+"post_attention_norm.weight", tensors, inferred),
+		PostFFNNorm:  loadOptionalF32VecNil(data, dataOffset, prefix+"post_ffw_norm.weight", tensors, inferred),
 	}, nil
+}
+
+// loadOptionalF32VecNil loads a float vector tensor, returning nil (not a
+// zero-filled slice) when the tensor does not exist or fails to load.
+func loadOptionalF32VecNil(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int) []float32 {
+	if _, ok := tensors[name]; !ok {
+		return nil
+	}
+	v, err := loadF32Vec(data, dataOffset, name, tensors, inferred)
+	if err != nil {
+		return nil
+	}
+	return v
 }
 
 func indexTensors(gguf *GGUFFile) map[string]TensorInfo {
@@ -572,6 +837,10 @@ func indexTensors(gguf *GGUFFile) map[string]TensorInfo {
 	return out
 }
 
+// inferTensorSizes derives each tensor's byte size from the gap to the next
+// tensor's offset (last one runs to end of file). Used as the fallback when a
+// tensor's dtype can't be sized analytically, and as a bounds cross-check in
+// loadWeight.
 func inferTensorSizes(data []byte, gguf *GGUFFile) map[string]int {
 	type offIdx struct {
 		off uint64
@@ -635,6 +904,11 @@ func inferAttentionShape(config *Config, tensors map[string]TensorInfo) {
 	}
 }
 
+// loadWeight materializes one named tensor as a Weight: F32/F16 storage is
+// converted to owned float32s; supported quantized types stay in their packed
+// byte form, borrowed from data when borrow is set or copied otherwise.
+// forceF32 additionally dequantizes Q8_0/Q4_0 at load (used for norm vectors
+// that must be plain floats).
 func loadWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, forceF32, borrow, prepareQuantized, useMetal bool) (Weight, error) {
 	info, ok := tensors[name]
 	if !ok {
@@ -658,18 +932,13 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 	rawEnd := min(offset+byteSize, len(data))
 	raw := data[offset:rawEnd]
 	if len(raw) < byteSize {
-		if info.DType == GGMLTypeF32 || info.DType == GGMLTypeF16 {
+		if info.DType == GGMLTypeF32 || info.DType == GGMLTypeF16 || info.DType == GGMLTypeBF16 {
 			return Weight{}, fmt.Errorf("tensor %s exceeds file length", name)
 		}
 		padded := make([]byte, byteSize)
 		copy(padded, raw)
 		raw = padded
 	}
-	switch info.DType {
-	case GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1:
-		return Weight{}, fmt.Errorf("tensor type %s is parsed but not implemented correctly yet for %s", info.DType, name)
-	}
-	effectiveForce := forceF32
 	switch info.DType {
 	case GGMLTypeF32:
 		f := make([]float32, numel)
@@ -683,16 +952,20 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			f[i] = F16ToF32(binary.LittleEndian.Uint16(raw[i*2:]))
 		}
 		return Weight{F32: f}, nil
-	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
-		if effectiveForce {
-			if info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ5_K || info.DType == GGMLTypeQ6_K || info.DType == GGMLTypeMXFP4 {
+	case GGMLTypeBF16:
+		// bfloat16 is the top 16 bits of an IEEE float32 (QAT checkpoints and
+		// many recent full-precision GGUFs use it), so conversion is a shift.
+		f := make([]float32, numel)
+		for i := range numel {
+			f[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
+		}
+		return Weight{F32: f}, nil
+	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1,
+		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
+		if forceF32 {
+			f, ok := dequantTensor(info.DType, raw, numel)
+			if !ok {
 				return Weight{}, fmt.Errorf("%s force_f32 dequantization not implemented for %s", info.DType, name)
-			}
-			f := make([]float32, numel)
-			if info.DType == GGMLTypeQ8_0 {
-				copy(f, DequantRowQ8_0(raw, numel))
-			} else {
-				copy(f, DequantRowQ4_0(raw, numel))
 			}
 			return Weight{F32: f}, nil
 		}
@@ -719,6 +992,40 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 	}
 }
 
+// dequantTensor fully dequantizes a contiguous quantized tensor (treated as
+// one long row, which is valid because rows are stored back to back with no
+// padding). Used by the forceF32 load path for norm vectors and rope factors.
+func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
+	switch t {
+	case GGMLTypeQ8_0:
+		return DequantRowQ8_0(raw, numel), true
+	case GGMLTypeQ4_0:
+		return DequantRowQ4_0(raw, numel), true
+	case GGMLTypeQ4_1:
+		return DequantRowQ4_1(raw, numel), true
+	case GGMLTypeQ5_0:
+		return DequantRowQ5_0(raw, numel), true
+	case GGMLTypeQ5_1:
+		return DequantRowQ5_1(raw, numel), true
+	case GGMLTypeQ8_1:
+		return DequantRowQ8_1(raw, numel), true
+	case GGMLTypeQ2_K:
+		return DequantRowQ2K(raw, numel), true
+	case GGMLTypeQ3_K:
+		return DequantRowQ3K(raw, numel), true
+	case GGMLTypeQ4_K:
+		return DequantRowQ4K(raw, numel), true
+	case GGMLTypeQ5_K:
+		return DequantRowQ5K(raw, numel), true
+	case GGMLTypeQ6_K:
+		return DequantRowQ6K(raw, numel), true
+	case GGMLTypeMXFP4:
+		return DequantRowMXFP4(raw, numel), true
+	default:
+		return nil, false
+	}
+}
+
 func loadF32Vec(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int) ([]float32, error) {
 	w, err := loadWeight(data, dataOffset, name, tensors, inferred, true, false, false, false)
 	if err != nil {
@@ -741,6 +1048,9 @@ func loadOptionalF32Vec(data []byte, dataOffset int, name string, tensors map[st
 	return v
 }
 
+// Forward runs one token through the transformer and returns its
+// next-token logits; ForwardInto is the allocation-free form. Both append the
+// token's K/V to the cache at position pos as a side effect.
 func Forward(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {
 	logits := make([]float32, 0)
 	ForwardInto(config, weights, cache, buf, token, pos, &logits)
@@ -753,13 +1063,26 @@ func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *Decod
 	if config.LogitScale != 1 {
 		ScaleF32(*logits, 1/config.LogitScale)
 	}
+	if config.FinalLogitSoftcap > 0 {
+		softcapF32(*logits, config.FinalLogitSoftcap)
+	}
 }
 
+// ForwardBodyInto is the transformer body shared by logits, prefill, and
+// embedding paths: embed the token, then per layer run pre-norm attention
+// (RoPE'd Q/K, K/V appended to the cache, online-softmax attention over all
+// cached positions, output projection, residual add) followed by a pre-norm
+// SwiGLU FFN, and finally apply the output norm, leaving the normed hidden
+// state in buf.XN for the caller to project (or pool, for embeddings).
+// Attention heads are spread across the worker pool once the attended span is
+// long enough to amortize dispatch (see the comment at the call site); the
+// Q/K/V and gate/up matvecs go through the fused multi-matrix kernels when
+// the quant types allow (tryMatvec3Into/tryMatvec2Into).
 func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {
 	dim := config.Dim
 	headDim := config.HeadDim
 	kvMul := max(1, config.KVMul)
-	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, &buf.RopeSin, &buf.RopeCos)
+	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
 	ropeIsInterleaved := ropeInterleaved(config.Arch)
 	weights.TokenEmbd.RowInto(int(token), dim, &buf.X)
 	if config.EmbeddingScale != 1 {
@@ -789,6 +1112,14 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.K, layer.BK)
 			addInPlace(buf.V, layer.BV)
 		}
+		// Gemma 3/4-style QK-norm (per-head RMS on the projected Q/K, before
+		// RoPE); inert for models without the norm tensors.
+		if layer.AttnQNorm != nil {
+			perHeadRMSNormInPlace(buf.Q, headDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
+		}
+		if layer.AttnKNorm != nil {
+			perHeadRMSNormInPlace(buf.K, headDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
+		}
 		applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
 		applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
 
@@ -803,7 +1134,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			scale = float32(1 / math.Sqrt(float64(headDim)))
 		}
 		attnStart := 0
-		if config.SlidingWindow > 0 {
+		if config.layerUsesSWA(l) {
 			attnStart = max(0, pos-config.SlidingWindow)
 		}
 		attnHeads := func(hStart, hEnd int) {
@@ -822,6 +1153,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 					attnStart,
 					pos,
 					scale,
+					config.AttnLogitSoftcap,
 					buf.AttnOut[outOff:outOff+config.ValueDim],
 				)
 			}
@@ -834,6 +1166,9 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			attnHeads(0, config.NHeads)
 		}
 		layer.WO.MatvecInto(buf.AttnOut, &buf.Proj)
+		if layer.PostAttnNorm != nil {
+			rmsNormInto(buf.Proj, layer.PostAttnNorm, config.RMSNormEps, &buf.Proj)
+		}
 		if config.ResidualScale != 1 {
 			ScaleF32(buf.Proj, config.ResidualScale)
 		}
@@ -861,12 +1196,21 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			_ = gate[hDim-1]
 			_ = up[hDim-1]
 			_ = hidden[hDim-1]
-			for i := 0; i < hDim; i++ {
-				g := gate[i]
-				hidden[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
+			if config.UseGELU {
+				for i := 0; i < hDim; i++ {
+					hidden[i] = geluTanh(gate[i]) * up[i]
+				}
+			} else {
+				for i := 0; i < hDim; i++ {
+					g := gate[i]
+					hidden[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
+				}
 			}
 		}
 		layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
+		if layer.PostFFNNorm != nil {
+			rmsNormInto(buf.Proj, layer.PostFFNNorm, config.RMSNormEps, &buf.Proj)
+		}
 		if config.ResidualScale != 1 {
 			ScaleF32(buf.Proj, config.ResidualScale)
 		}
@@ -905,6 +1249,44 @@ func ForwardHiddenGemma4(config Config, weights Gemma4Weights, cache *KVCache, b
 	return out
 }
 
+// geluTanh is the tanh-approximated GELU (gelu_pytorch_tanh) used by the
+// Gemma family's FFN in place of SiLU.
+func geluTanh(x float32) float32 {
+	const sqrt2OverPi = 0.7978845608028654
+	return 0.5 * x * (1 + float32(math.Tanh(sqrt2OverPi*float64(x+0.044715*x*x*x))))
+}
+
+// softcapF32 applies v = cap*tanh(v/cap) elementwise — Gemma's logit
+// softcapping, which bounds values to (-cap, cap) while staying smooth.
+func softcapF32(v []float32, cap float32) {
+	inv := 1 / cap
+	for i, x := range v {
+		v[i] = cap * float32(math.Tanh(float64(x*inv)))
+	}
+}
+
+// perHeadRMSNormInPlace RMS-normalizes each head's headDim-wide slice of vec
+// independently against a shared headDim-length weight — Gemma 3/4-style
+// QK-norm, applied to the projected Q/K before RoPE.
+func perHeadRMSNormInPlace(vec []float32, headDim, nHeads int, weight []float32, eps float32) {
+	if len(weight) < headDim {
+		return
+	}
+	for h := 0; h < nHeads; h++ {
+		off := h * headDim
+		if off+headDim > len(vec) {
+			break
+		}
+		sub := vec[off : off+headDim]
+		ss := DotF32(sub, sub)
+		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+eps)))
+		mulScaleF32(sub, weight[:headDim], scale, sub)
+	}
+}
+
+// rmsNormInto writes out[i] = x[i] / rms(x) * weight[i] where
+// rms(x) = sqrt(mean(x²) + eps) — RMSNorm as used by all supported
+// architectures (no mean subtraction, no bias).
 func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 	n := len(x)
 	ensureLenNoClear(out, n)
@@ -931,14 +1313,15 @@ func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 	}
 }
 
-func applyRope(vec []float32, pos, headDim, nHeads, ropeDim int, invFreq []float32, interleaved bool) {
-	sinScratch := []float32{}
-	cosScratch := []float32{}
-	half, nCache := prepareRopeScratch(pos, headDim, ropeDim, invFreq, &sinScratch, &cosScratch)
-	applyPreparedRope(vec, headDim, nHeads, half, nCache, sinScratch, cosScratch, interleaved)
-}
-
-func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, sinScratch, cosScratch *[]float32) (int, int) {
+// prepareRopeScratch fills sin/cos tables for one position from the
+// precomputed inverse frequencies (optionally magnitude-scaled by mscale, the
+// YaRN attention factor — currently always 1, see buildRopeInvFreqYarn).
+// It returns the pair half-width and the number of cached pairs for
+// applyPreparedRope, which rotates each head either in interleaved pair
+// order (dims 2i,2i+1 — the original RoPE layout used by llama/mistral) or
+// split-half order (dims i, i+half — the NeoX layout everything else uses);
+// ropeInterleaved picks per architecture.
+func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, mscale float32, sinScratch, cosScratch *[]float32) (int, int) {
 	if ropeDim <= 0 || ropeDim > headDim {
 		ropeDim = headDim
 	}
@@ -957,11 +1340,14 @@ func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, sinScratch
 	ensureLenNoClear(cosScratch, nCache)
 	sin := *sinScratch
 	cos := *cosScratch
+	if mscale == 0 {
+		mscale = 1
+	}
 	for i := range nCache {
 		angle := float64(float32(pos) * invFreq[i])
 		s64, c64 := math.Sincos(angle)
-		sin[i] = float32(s64)
-		cos[i] = float32(c64)
+		sin[i] = float32(s64) * mscale
+		cos[i] = float32(c64) * mscale
 	}
 	return half, nCache
 }
@@ -1008,6 +1394,11 @@ func ropeInterleaved(arch string) bool {
 	}
 }
 
+// tryMatvec3Into / tryMatvec2Into route same-typed Q4_K or Q6_K weight groups
+// (Q/K/V projections; FFN gate+up) through the fused kernels that share one
+// activation-sums pass and one worker-pool dispatch. They return false —
+// having written nothing — whenever types or shapes don't line up, and the
+// caller falls back to independent matvecs.
 func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) bool {
 	if wq.Type != wk.Type || wq.Type != wv.Type || wq.Cols != wk.Cols || wq.Cols != wv.Cols || wq.Cols != len(x) || wq.F32 != nil || wk.F32 != nil || wv.F32 != nil {
 		return false
@@ -1064,7 +1455,17 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 	}
 }
 
-func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale float32, out []float32) {
+// onlineAttention computes softmax(q·K^T * scale)·V for one head over cached
+// positions [startT, endT] using the online-softmax algorithm: a single pass
+// that tracks the running max score and rescales the accumulated output
+// whenever a new maximum appears (out *= exp(oldMax-newMax)), so no
+// per-position score array is materialized regardless of context length.
+// keys/values are the head's slices into the position-major KV cache, striding
+// by keyStride/valueStride per position. softcap > 0 applies Gemma 2-style
+// attention-logit softcapping (cap*tanh(score/cap)) before the softmax. out
+// must be zeroed by the caller and receives the already-normalized weighted
+// value sum.
+func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
 	maxScore := float32(math.Inf(-1))
 	denom := float32(0)
 	for t := startT; t <= endT; t++ {
@@ -1074,6 +1475,9 @@ func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyH
 			break
 		}
 		score := DotF32(query, keys[kOff:kOff+keyHeadDim]) * scale
+		if softcap > 0 {
+			score = softcap * float32(math.Tanh(float64(score/softcap)))
+		}
 		valueRow := values[vOff : vOff+valueHeadDim]
 		if score > maxScore {
 			oldScale := float32(0)
@@ -1094,17 +1498,8 @@ func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyH
 	}
 }
 
-func silu(x float32) float32 {
-	return x / (1 + float32(math.Exp(float64(-x))))
-}
-
 func addInPlace(dst, src []float32) {
 	AxpyF32(dst, 1.0, src)
-}
-
-func fastAttentionEnabled() bool {
-	_, ok := os.LookupEnv("GOPHER_LLM_FAST_ATTN")
-	return ok
 }
 
 func clamp(v, lo, hi float32) float32 {

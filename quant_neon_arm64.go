@@ -1,8 +1,9 @@
 //go:build arm64
 
-package main
+package gopherllm
 
-const hasQuantNEON = true
+const hasQuantSIMD = true
+const hasPreparedQ4K = true
 
 // q4kQDots8 computes the 8 per-sub-block dot products (unsigned 4-bit
 // quants times activations) of one Q4_K block. q must point at the 128

@@ -1,6 +1,6 @@
 //go:build arm64
 
-package main
+package gopherllm
 
 func axpyF32(out []float32, alpha float32, x []float32)
 func scaleF32(out []float32, alpha float32)

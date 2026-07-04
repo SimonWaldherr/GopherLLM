@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 type PreparedQuantizedWeight struct {
 	Type   GGMLType
@@ -61,7 +61,7 @@ func MatvecPreparedQ4KInto(data []byte, p *PreparedQuantizedWeight, x []float32,
 	if len(data) < rows*rowBytes || len(p.Scales) < rows*p.Blocks*8 || len(p.Mins) < rows*p.Blocks*8 {
 		return false
 	}
-	if !hasQuantNEON {
+	if !hasPreparedQ4K {
 		MatvecQ4KInto(data, x, rows, cols, out)
 		return true
 	}
@@ -84,7 +84,7 @@ func MatvecPreparedQ4K2IntoWithXSums(aData []byte, aPrep *PreparedQuantizedWeigh
 	if len(aData) < aRows*rowBytes || len(bData) < bRows*rowBytes {
 		return false
 	}
-	if !hasQuantNEON {
+	if !hasPreparedQ4K {
 		return MatvecQ4K2IntoWithXSums(aData, aRows, aCols, bData, bRows, bCols, x, xSums, aOut, bOut)
 	}
 	ensureLenNoClear(aOut, aRows)
@@ -110,7 +110,7 @@ func MatvecPreparedQ4K3IntoWithXSums(aData []byte, aPrep *PreparedQuantizedWeigh
 	if len(aData) < aRows*rowBytes || len(bData) < bRows*rowBytes || len(cData) < cRows*rowBytes {
 		return false
 	}
-	if !hasQuantNEON {
+	if !hasPreparedQ4K {
 		return Q4KMatvec3IntoWithXSums(
 			Q4KMatrix{Data: aData, Rows: aRows, Cols: aCols},
 			Q4KMatrix{Data: bData, Rows: bRows, Cols: bCols},

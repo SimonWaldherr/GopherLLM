@@ -1,6 +1,6 @@
 //go:build !darwin || !cgo || !metal
 
-package main
+package gopherllm
 
 type MetalWeight struct{}
 

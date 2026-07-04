@@ -1,4 +1,17 @@
-package main
+package gopherllm
+
+// GGUF container parsing.
+//
+// A GGUF file is, in order: the 4-byte magic "GGUF", a u32 version, a u64
+// tensor count, a u64 metadata count, the metadata key/value entries, the
+// tensor descriptors (name, dims, dtype, data offset), and finally — aligned
+// to general.alignment (default 32) — the raw tensor data. All integers are
+// little-endian. Tensor offsets are relative to the aligned data start
+// (GGUFFile.DataOffset), not the file start.
+//
+// Parsing here reads only the header; tensor data is left in place so callers
+// can borrow it directly from a memory-mapped file (see loadWeight's borrow
+// mode) instead of copying multi-gigabyte weights.
 
 import (
 	"encoding/binary"
@@ -6,6 +19,11 @@ import (
 	"math"
 )
 
+// GGMLType identifies a tensor's on-disk element encoding, matching the
+// ggml type ids used by llama.cpp. F32/F16 are plain element arrays; the
+// quantized types pack fixed-size blocks of elements together with their
+// scale factors — see BlockBytes/DataSize for the exact per-block sizes the
+// matvec kernels in simd.go rely on.
 type GGMLType uint32
 
 const (
@@ -23,15 +41,19 @@ const (
 	GGMLTypeQ5_K    GGMLType = 13
 	GGMLTypeQ6_K    GGMLType = 14
 	GGMLTypeQ8_K    GGMLType = 15
+	GGMLTypeBF16    GGMLType = 30
 	GGMLTypeMXFP4   GGMLType = 39
 	GGMLTypeUnknown GGMLType = 255
 )
 
+// ggmlTypeFromUint32 maps a raw GGUF dtype id to a GGMLType, folding every id
+// this runtime cannot execute into GGMLTypeUnknown so the mismatch surfaces as
+// a load-time error instead of a bogus kernel dispatch.
 func ggmlTypeFromUint32(v uint32) GGMLType {
 	switch GGMLType(v) {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
-		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeMXFP4:
+		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeBF16, GGMLTypeMXFP4:
 		return GGMLType(v)
 	default:
 		return GGMLTypeUnknown
@@ -56,12 +78,18 @@ func (t GGMLType) String() string {
 		return "Q8_0"
 	case GGMLTypeQ8_1:
 		return "Q8_1"
+	case GGMLTypeQ2_K:
+		return "Q2_K"
+	case GGMLTypeQ3_K:
+		return "Q3_K"
 	case GGMLTypeQ4_K:
 		return "Q4_K"
 	case GGMLTypeQ5_K:
 		return "Q5_K"
 	case GGMLTypeQ6_K:
 		return "Q6_K"
+	case GGMLTypeBF16:
+		return "BF16"
 	case GGMLTypeMXFP4:
 		return "MXFP4"
 	default:
@@ -69,6 +97,10 @@ func (t GGMLType) String() string {
 	}
 }
 
+// BlockSize returns how many elements one quantization block encodes (1 for
+// the plain float types). Note the K-quants (Q4_K/Q5_K/Q6_K) actually use
+// 256-element superblocks; this legacy accessor is only used with the 32-wide
+// simple quants, and DataSize handles the K-quant sizes explicitly.
 func (t GGMLType) BlockSize() int {
 	if t == GGMLTypeF32 || t == GGMLTypeF16 {
 		return 1
@@ -76,6 +108,10 @@ func (t GGMLType) BlockSize() int {
 	return 32
 }
 
+// BlockBytes returns the byte size of one block for the simple (32-element)
+// quant formats, e.g. Q8_0 = 2-byte f16 scale + 32 int8 quants = 34 bytes,
+// Q4_0 = 2-byte f16 scale + 16 packed-nibble bytes = 18 bytes. K-quants and
+// MXFP4 are not representable here (ok=false); use DataSize instead.
 func (t GGMLType) BlockBytes() (int, bool) {
 	switch t {
 	case GGMLTypeF32:
@@ -99,15 +135,42 @@ func (t GGMLType) BlockBytes() (int, bool) {
 	}
 }
 
+// DataSize returns the exact byte size of n elements of this type. The
+// per-block layouts, which the dot kernels in simd.go index by hand:
+//
+//	Q4_0:  18 B / 32 elems  = f16 scale + 16 nibble-packed bytes
+//	Q4_1:  20 B / 32 elems  = f16 scale + f16 min + 16 nibble bytes
+//	Q5_0:  22 B / 32 elems  = f16 scale + 4 B 5th-bit plane + 16 nibbles
+//	Q5_1:  24 B / 32 elems  = f16 scale + f16 min + 4 B 5th bits + 16 nibbles
+//	Q8_0:  34 B / 32 elems  = f16 scale + 32 int8
+//	Q8_1:  36 B / 32 elems  = f16 scale + f16 quant-sum + 32 int8
+//	Q2_K:  84 B / 256 elems = 16 B packed 4-bit scale/min pairs +
+//	       64 B 2-bit quants + f16 d + f16 dmin
+//	Q3_K: 110 B / 256 elems = 32 B high-bit plane + 64 B 2-bit lows +
+//	       12 B packed 6-bit scales + f16 d
+//	Q4_K: 144 B / 256 elems = f16 d + f16 dmin + 12 B packed 6-bit
+//	       scales/mins (8 sub-blocks) + 128 nibble-packed bytes
+//	Q5_K: 176 B / 256 elems = Q4_K layout + 32 B of 5th-bit planes
+//	Q6_K: 210 B / 256 elems = 128 B low nibbles + 64 B 2-bit highs +
+//	       16 int8 sub-block scales + f16 d
+//	MXFP4: 17 B / 32 elems  = 16 nibble-packed FP4 values + 1 shared
+//	       power-of-two exponent byte
+//
+// ok is false for types this runtime cannot size (callers then fall back to
+// offset-difference inference; see inferTensorSizes).
 func (t GGMLType) DataSize(n int) (int, bool) {
 	switch t {
 	case GGMLTypeF32:
 		return n * 4, true
-	case GGMLTypeF16:
+	case GGMLTypeF16, GGMLTypeBF16:
 		return n * 2, true
 	case GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_0, GGMLTypeQ8_1:
 		b, _ := t.BlockBytes()
 		return (n / t.BlockSize()) * b, true
+	case GGMLTypeQ2_K:
+		return (n / 256) * 84, true
+	case GGMLTypeQ3_K:
+		return (n / 256) * 110, true
 	case GGMLTypeQ4_K:
 		return (n / 256) * 144, true
 	case GGMLTypeQ5_K:
@@ -121,6 +184,11 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 	}
 }
 
+// MetaValue is one decoded GGUF metadata value. Kind is the GGUF wire-type
+// name ("u32", "str", "array", ...) and Value holds the corresponding Go value
+// (arrays are []MetaValue). The As* accessors below do tolerant conversions —
+// GGUF producers are inconsistent about integer widths, so e.g. AsU32 accepts
+// any integer kind rather than only u32.
 type MetaValue struct {
 	Kind  string
 	Value any
@@ -184,6 +252,24 @@ func (v MetaValue) AsStringArray() ([]string, bool) {
 	return out, true
 }
 
+// AsBoolArray decodes an array of bools (e.g. Gemma 4's per-layer
+// attention.sliding_window_pattern).
+func (v MetaValue) AsBoolArray() ([]bool, bool) {
+	arr, ok := v.Value.([]MetaValue)
+	if !ok {
+		return nil, false
+	}
+	out := make([]bool, 0, len(arr))
+	for _, item := range arr {
+		b, ok := item.AsBool()
+		if !ok {
+			return nil, false
+		}
+		out = append(out, b)
+	}
+	return out, true
+}
+
 func (v MetaValue) AsF32Array() ([]float32, bool) {
 	arr, ok := v.Value.([]MetaValue)
 	if !ok {
@@ -198,6 +284,10 @@ func (v MetaValue) AsF32Array() ([]float32, bool) {
 	return out, true
 }
 
+// TensorInfo describes one tensor from the GGUF header. Dims follow GGUF's
+// convention of fastest-varying dimension first, so for a 2-D weight
+// Dims[0] is the input (column) count and Dims[1] the output (row) count.
+// Offset is relative to GGUFFile.DataOffset.
 type TensorInfo struct {
 	Name   string
 	Dims   []uint64
@@ -205,6 +295,7 @@ type TensorInfo struct {
 	Offset uint64
 }
 
+// Numel returns the total element count (product of Dims).
 func (t TensorInfo) Numel() int {
 	n := 1
 	for _, d := range t.Dims {
@@ -213,6 +304,9 @@ func (t TensorInfo) Numel() int {
 	return n
 }
 
+// GGUFFile is a parsed GGUF header: all metadata, all tensor descriptors, and
+// the alignment-adjusted offset where tensor data begins within the original
+// byte slice. It does not own or copy any tensor data.
 type GGUFFile struct {
 	Metadata   map[string]MetaValue
 	Tensors    []TensorInfo
@@ -220,10 +314,13 @@ type GGUFFile struct {
 	Version    uint32
 }
 
-func ParseGGUF(data []byte) (*GGUFFile, error)      { return parseGGUF(data, true) }
-func ParseGGUFQuiet(data []byte) (*GGUFFile, error) { return parseGGUF(data, false) }
+// ParseGGUF parses a GGUF header, logging a one-line summary to stderr.
+// ParseGGUFQuiet is the same without the log line (used by model discovery,
+// which parses every file in a directory).
+func ParseGGUF(data []byte) (*GGUFFile, error)      { return parseGGUF(data) }
+func ParseGGUFQuiet(data []byte) (*GGUFFile, error) { return parseGGUF(data) }
 
-func parseGGUF(data []byte, verbose bool) (*GGUFFile, error) {
+func parseGGUF(data []byte) (*GGUFFile, error) {
 	c := cursor{data: data}
 	if len(data) < 4 {
 		return nil, fmt.Errorf("file too small for GGUF header")
@@ -243,9 +340,6 @@ func parseGGUF(data []byte, verbose bool) (*GGUFFile, error) {
 	nKV, err := c.u64()
 	if err != nil {
 		return nil, err
-	}
-	if verbose {
-		fmt.Fprintf(stderr(), "GGUF v%d - %d tensors, %d metadata entries\n", version, nTensors, nKV)
 	}
 	metadata := make(map[string]MetaValue, int(nKV))
 	for range int(nKV) {
@@ -299,6 +393,8 @@ func parseGGUF(data []byte, verbose bool) (*GGUFFile, error) {
 	return &GGUFFile{Metadata: metadata, Tensors: tensors, DataOffset: divCeil(c.pos, alignment) * alignment, Version: version}, nil
 }
 
+// GetU32/GetF32/GetString are convenience metadata lookups; the numeric
+// variants return def when the key is absent or has an incompatible kind.
 func (g *GGUFFile) GetU32(key string, def uint32) uint32 {
 	if v, ok := g.Metadata[key]; ok {
 		if n, ok := v.AsU32(); ok {
@@ -324,6 +420,9 @@ func (g *GGUFFile) GetString(key string) (string, bool) {
 	return "", false
 }
 
+// cursor is a bounds-checked little-endian reader over the raw file bytes;
+// every read verifies remaining length so truncated files fail with a clear
+// "unexpected EOF at byte N" instead of a panic.
 type cursor struct {
 	data []byte
 	pos  int

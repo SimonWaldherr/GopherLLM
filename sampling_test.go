@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 import (
 	"math"
@@ -65,6 +65,68 @@ func TestTopPWithoutTopKUsesTopMassOnly(t *testing.T) {
 	}
 	if cap(scratch) < 4 {
 		t.Fatalf("scratch capacity = %d, want at least 4", cap(scratch))
+	}
+}
+
+func TestMinPExcludesLowProbabilityTokens(t *testing.T) {
+	// exp(9-10) ≈ 0.368 of the peak; a 0.5 threshold drops everything but token 0.
+	rng := NewRng(42)
+	scratch := make([]TokenProb, 0, 8)
+
+	// Full path (top_k disabled, top_p disabled): min-p must still apply.
+	full := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0.5, RepeatPenalty: 1}
+	for range 64 {
+		logits := []float32{10, 9, 1, 0}
+		if token := SampleWithScratch(logits, full, rng, nil, &scratch); token != 0 {
+			t.Fatalf("full-path min_p token = %d, want 0", token)
+		}
+	}
+
+	// Top-k path exercises the other cutoff branch.
+	topk := SamplerConfig{Temperature: 1, TopP: 1, TopK: 3, MinP: 0.5, RepeatPenalty: 1}
+	for range 64 {
+		logits := []float32{10, 9, 1, 0}
+		if token := SampleWithScratch(logits, topk, rng, nil, &scratch); token != 0 {
+			t.Fatalf("top-k min_p token = %d, want 0", token)
+		}
+	}
+
+	// A gentler threshold keeps the top two but never the tail.
+	gentle := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0.3, RepeatPenalty: 1}
+	for range 128 {
+		logits := []float32{10, 9, 1, 0}
+		token := SampleWithScratch(logits, gentle, rng, nil, &scratch)
+		if token != 0 && token != 1 {
+			t.Fatalf("gentle min_p token = %d, want 0 or 1", token)
+		}
+	}
+}
+
+func TestSampleFullDistributionPath(t *testing.T) {
+	// TopK=0, TopP=1, MinP=0 routes through the normalize + sampleFromProbs path.
+	cfg := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0, RepeatPenalty: 1}
+	rng := NewRng(1)
+	scratch := make([]TokenProb, 0, 4)
+	for range 32 {
+		logits := []float32{100, 0, 0, 0} // sharply peaked -> token 0
+		if token := SampleWithScratch(logits, cfg, rng, nil, &scratch); token != 0 {
+			t.Fatalf("token = %d, want 0", token)
+		}
+	}
+}
+
+func TestRepeatPenaltyDownweightsRecentTokens(t *testing.T) {
+	// Greedy path: without penalty token 0 wins; a strong penalty on token 0
+	// hands the win to token 1.
+	rng := NewRng(1)
+	base := SamplerConfig{Temperature: 0, TopP: 1, TopK: 0, MinP: 0, RepeatPenalty: 1}
+	if tok := Sample([]float32{5, 4, 0}, base, rng, []uint32{0}); tok != 0 {
+		t.Fatalf("no-penalty greedy token = %d, want 0", tok)
+	}
+	pen := base
+	pen.RepeatPenalty = 4
+	if tok := Sample([]float32{5, 4, 0}, pen, rng, []uint32{0}); tok != 1 {
+		t.Fatalf("penalized greedy token = %d, want 1", tok)
 	}
 }
 
