@@ -1293,6 +1293,11 @@ func DequantRowQ4_0(row []byte, cols int) []float32 {
 
 func DequantRowQ4K(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ4KInto(row, cols, out)
+	return out
+}
+
+func DequantRowQ4KInto(row []byte, cols int, out []float32) {
 	for b := range cols / 256 {
 		base := b * 144
 		if base+144 > len(row) {
@@ -1319,7 +1324,6 @@ func DequantRowQ4K(row []byte, cols int) []float32 {
 			is += 2
 		}
 	}
-	return out
 }
 
 func DequantRowQ5K(row []byte, cols int) []float32 {
@@ -1368,6 +1372,11 @@ func DequantRowQ5K(row []byte, cols int) []float32 {
 
 func DequantRowQ6K(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ6KInto(row, cols, out)
+	return out
+}
+
+func DequantRowQ6KInto(row []byte, cols int, out []float32) {
 	for b := range cols / 256 {
 		base := b * 210
 		if base+210 > len(row) {
@@ -1395,7 +1404,6 @@ func DequantRowQ6K(row []byte, cols int) []float32 {
 			sc = sc[8:]
 		}
 	}
-	return out
 }
 
 func DequantRowMXFP4(row []byte, cols int) []float32 {

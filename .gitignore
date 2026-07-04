@@ -2,3 +2,4 @@ bin/
 .cache/
 gopherllm
 *.gguf
+scratch/p.prof

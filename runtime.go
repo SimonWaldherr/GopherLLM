@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -242,11 +243,15 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	rng := NewRng(seed)
 	prefillStart := time.Now()
 	logits := []float32{}
-	for pos, tok := range tokens {
-		if pos == len(tokens)-1 {
-			r.forwardTokenInto(cache, buf, tok, pos, &logits)
-		} else {
-			r.forwardPrefillToken(cache, buf, tok, pos)
+	if r.canBatchPrefill() {
+		r.prefillBatched(cache, buf, tokens, &logits)
+	} else {
+		for pos, tok := range tokens {
+			if pos == len(tokens)-1 {
+				r.forwardTokenInto(cache, buf, tok, pos, &logits)
+			} else {
+				r.forwardPrefillToken(cache, buf, tok, pos)
+			}
 		}
 	}
 	prefillTime := time.Since(prefillStart)
@@ -376,6 +381,34 @@ func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uin
 		return ForwardHiddenGemma4(r.config, r.gemma4, cache, buf, token, pos)
 	default:
 		return ForwardHidden(r.config, r.standard, cache, buf, token, pos)
+	}
+}
+
+// canBatchPrefill reports whether the model uses the standard non-fused
+// transformer path that ForwardBatchInto supports.
+func (r *Runner) canBatchPrefill() bool {
+	if r.kind != loadedStandard || len(r.standard.Layers) == 0 {
+		return false
+	}
+	if os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
+		return false
+	}
+	for _, l := range r.standard.Layers {
+		if l.HasQKV || l.HasGateUp {
+			return false
+		}
+	}
+	return true
+}
+
+// prefillBatched processes the prompt in chunks, streaming each weight once per
+// chunk instead of once per token.
+func (r *Runner) prefillBatched(cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) {
+	const chunk = 64
+	n := len(tokens)
+	for start := 0; start < n; start += chunk {
+		end := min(start+chunk, n)
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens[start:end], start, end == n, logits)
 	}
 }
 

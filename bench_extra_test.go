@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"math/rand"
+	"testing"
+)
 
 func BenchmarkOnlineAttention_ctx512(b *testing.B) {
 	const headDim, ctx = 128, 512
@@ -81,6 +84,26 @@ func BenchmarkEncodeSentencePiece(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = tok.EncodeWithoutBOS(text)
+	}
+}
+
+func BenchmarkMatvecBatchQ4K_3072x3072_P32(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	const rows, cols, P = 3072, 3072, 32
+	data := make([]byte, 0, rows*(cols/256)*144)
+	for r := 0; r < rows; r++ {
+		data = append(data, randomQ4KRow(rng, cols)...)
+	}
+	w := Weight{Raw: data, Type: GGMLTypeQ4_K, Rows: rows, Cols: cols}
+	xs := make([][]float32, P)
+	outs := make([][]float32, P)
+	for p := range xs {
+		xs[p] = randomVec(rng, cols)
+		outs[p] = make([]float32, rows)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		matvecBatch(w, xs, outs)
 	}
 }
 

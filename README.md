@@ -140,6 +140,11 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
   kernels (auto-detected via CPUID). This gives roughly a 3x end-to-end decode
   speedup over the scalar path on Q4_K_M models. Set `GOPHERLLM_DISABLE_SIMD=1` to
   force the portable scalar kernels (useful for A/B benchmarking).
+- Prompt processing (prefill) is batched: each weight is dequantized once per
+  prompt chunk and reused across all prompt tokens, instead of re-running the
+  quantized kernels once per token. Since prefill is compute-bound this is a large
+  speedup (~4x measured on a Q4_K_M model). Set `GOPHERLLM_NO_BATCH_PREFILL=1` to
+  fall back to the per-token path (A/B benchmarking / debugging).
 - Set `GOPHERLLM_Q8_ACTIVATIONS=1` (x86-64, opt-in) to quantize activations to int8
   and run the Q4_K matvecs with `VPMADDUBSW` integer dot products. This is roughly
   1.15-1.2x faster on the Q4_K path at the cost of a small activation-quantization
