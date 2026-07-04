@@ -102,6 +102,34 @@ func TestMinPExcludesLowProbabilityTokens(t *testing.T) {
 	}
 }
 
+func TestSampleFullDistributionPath(t *testing.T) {
+	// TopK=0, TopP=1, MinP=0 routes through the normalize + sampleFromProbs path.
+	cfg := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0, RepeatPenalty: 1}
+	rng := NewRng(1)
+	scratch := make([]TokenProb, 0, 4)
+	for range 32 {
+		logits := []float32{100, 0, 0, 0} // sharply peaked -> token 0
+		if token := SampleWithScratch(logits, cfg, rng, nil, &scratch); token != 0 {
+			t.Fatalf("token = %d, want 0", token)
+		}
+	}
+}
+
+func TestRepeatPenaltyDownweightsRecentTokens(t *testing.T) {
+	// Greedy path: without penalty token 0 wins; a strong penalty on token 0
+	// hands the win to token 1.
+	rng := NewRng(1)
+	base := SamplerConfig{Temperature: 0, TopP: 1, TopK: 0, MinP: 0, RepeatPenalty: 1}
+	if tok := Sample([]float32{5, 4, 0}, base, rng, []uint32{0}); tok != 0 {
+		t.Fatalf("no-penalty greedy token = %d, want 0", tok)
+	}
+	pen := base
+	pen.RepeatPenalty = 4
+	if tok := Sample([]float32{5, 4, 0}, pen, rng, []uint32{0}); tok != 1 {
+		t.Fatalf("penalized greedy token = %d, want 1", tok)
+	}
+}
+
 func TestSortTokenProbsOrdersByProbabilityThenToken(t *testing.T) {
 	candidates := []TokenProb{
 		{Token: 4, Prob: 0.2},

@@ -75,6 +75,36 @@ func TestGenerateTinyModelDeterministic(t *testing.T) {
 	}
 }
 
+func TestWeightAndForwardWrappers(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dim := r.config.Dim
+
+	if row := r.standard.TokenEmbd.Row(0, dim); len(row) != dim {
+		t.Fatalf("Row len = %d, want %d", len(row), dim)
+	}
+	if rf := r.standard.TokenEmbd.RowF32(1, dim); len(rf) != dim {
+		t.Fatalf("RowF32 len = %d, want %d", len(rf), dim)
+	}
+	xn := make([]float32, dim)
+	for i := range xn {
+		xn[i] = 0.1
+	}
+	if logits := r.standard.Output.Matvec(xn); len(logits) != r.config.VocabSize {
+		t.Fatalf("Matvec len = %d, want %d", len(logits), r.config.VocabSize)
+	}
+
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, 4)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := Forward(r.config, r.standard, cache, buf, 3, 0)
+	if len(logits) != r.config.VocabSize {
+		t.Fatalf("Forward logits len = %d, want %d", len(logits), r.config.VocabSize)
+	}
+}
+
 func TestEmbedTinyModel(t *testing.T) {
 	runner, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {
