@@ -1519,9 +1519,7 @@ func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	// slack of slower ones (e.g. efficiency cores on Apple Silicon). Small
 	// matvecs stay at one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
-	if rows >= threads*4096 {
-		chunks = min(threads*8, cap(pool.jobs))
-	} else if rows >= threads*128 {
+	if rows >= threads*128 {
 		chunks = min(threads*4, cap(pool.jobs))
 	}
 	done := rowDonePool.Get().(chan struct{})
