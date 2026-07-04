@@ -57,6 +57,10 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --inspect                 Inspect GGUF metadata and compatibility without loading weights")
 	fmt.Fprintln(os.Stderr, "  --list-metadata           Print GGUF metadata with --inspect")
 	fmt.Fprintln(os.Stderr, "  --list-tensors            Print GGUF tensor inventory and exit")
+	fmt.Fprintln(os.Stderr, "  --analyze                 Print a structural analysis report (params, quant mix, geometry)")
+	fmt.Fprintln(os.Stderr, "  --find-token <text>       Search the vocabulary for tokens containing <text>")
+	fmt.Fprintln(os.Stderr, "  --token-neighbors <t>     Show embedding-space nearest neighbors of a token (id or text)")
+	fmt.Fprintln(os.Stderr, "  --neighbors <N>           Neighbor count for --token-neighbors (default: 12)")
 }
 
 type cliConfig struct {
@@ -84,6 +88,10 @@ type cliConfig struct {
 	inspect          bool
 	listMetadata     bool
 	skillsDir        string
+	analyze          bool
+	findToken        string
+	tokenNeighbors   string
+	neighborCount    int
 }
 
 func main() {
@@ -151,6 +159,11 @@ func run() error {
 	if cfg.inspect || cfg.listTensors || cfg.listMetadata {
 		return inspectGGUF(modelPath, cfg.listMetadata, cfg.listTensors)
 	}
+	if cfg.analyze || cfg.findToken != "" {
+		// Header-only analysis: no weights are loaded, so this is instant
+		// even for multi-gigabyte files.
+		return analyzeGGUF(modelPath, cfg)
+	}
 	model, err := gopherllm.Open(context.Background(), modelPath, gopherllm.WithLogWriter(os.Stderr))
 	if err != nil {
 		return err
@@ -176,6 +189,17 @@ func run() error {
 			return err
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{"token_count": result.TokenCount, "embedding": result.Embedding})
+	}
+	if cfg.tokenNeighbors != "" {
+		matches, err := model.NearestTokens(cfg.tokenNeighbors, cfg.neighborCount)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("nearest neighbors of %q in embedding space:\n", cfg.tokenNeighbors)
+		for _, m := range matches {
+			fmt.Printf("  %6d  %-24q cos=%.4f\n", m.ID, m.Text, m.Score)
+		}
+		return nil
 	}
 	if cfg.bench {
 		return runBench(runner, cfg)
@@ -409,6 +433,26 @@ func parseCLI(args []string) (cliConfig, error) {
 			cfg.listMetadata = true
 		case "--list-tensors":
 			cfg.listTensors = true
+		case "--analyze":
+			cfg.analyze = true
+		case "--find-token":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.findToken = v
+		case "--token-neighbors":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.tokenNeighbors = v
+		case "--neighbors":
+			v, err := parseNextInt(next, arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.neighborCount = v
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return cfg, fmt.Errorf("unknown option: %s", arg)
@@ -470,6 +514,39 @@ func parseNextDuration(next func(string) (string, error), flag string) (time.Dur
 		return 0, fmt.Errorf("%s must be greater than 0", flag)
 	}
 	return d, nil
+}
+
+// analyzeGGUF handles --analyze and --find-token: header-only work over the
+// mmap'd file, no weight loading.
+func analyzeGGUF(path string, cfg cliConfig) error {
+	mmap, err := gopherllm.OpenMmap(path)
+	if err != nil {
+		return err
+	}
+	defer mmap.Close()
+	gguf, err := gopherllm.ParseGGUF(mmap.Bytes())
+	if err != nil {
+		return err
+	}
+	tok, err := gopherllm.TokenizerFromMetadata(gguf.Metadata)
+	if err != nil {
+		tok = nil // analysis still works without a tokenizer
+	}
+	if cfg.analyze {
+		fmt.Printf("file:           %s (%.2f GB)\n", path, float64(mmap.Len())/(1024*1024*1024))
+		gopherllm.AnalyzeGGUF(gguf, tok).WriteText(os.Stdout)
+	}
+	if cfg.findToken != "" {
+		if tok == nil {
+			return fmt.Errorf("--find-token requires a tokenizer, which this file lacks")
+		}
+		matches := gopherllm.SearchTokens(tok, cfg.findToken, 50)
+		fmt.Printf("%d tokens match %q:\n", len(matches), cfg.findToken)
+		for _, m := range matches {
+			fmt.Printf("  %6d  %q\n", m.ID, m.Text)
+		}
+	}
+	return nil
 }
 
 func inspectGGUF(path string, listMetadata, listTensors bool) error {

@@ -23,22 +23,5 @@
 //   - main.go       CLI flag parsing and command dispatch
 package gopherllm
 
-import (
-	"io"
-	"os"
-)
-
-// Version is reported by --version and the usage header.
+// Version is reported by the CLI's --version and usage header.
 const Version = "0.3.0-go"
-
-// errWriter is the destination for human-facing diagnostics; tests swap it to
-// capture or silence output. Generation results go to stdout, diagnostics
-// here, so `gopherllm ... > out.txt` captures only model output.
-var errWriter io.Writer = os.Stderr
-
-func stderr() io.Writer {
-	if errWriter == nil {
-		return os.Stderr
-	}
-	return errWriter
-}
