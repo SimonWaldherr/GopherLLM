@@ -60,7 +60,7 @@ func TestOllamaRequestOptions(t *testing.T) {
 
 func TestApplyRequestOptionsOverridesSampler(t *testing.T) {
 	def := DefaultGenerationOptions()
-	got := applyRequestOptions(def, intp(3), f32p(0.4), f32p(0.7), intp(9), f32p(0.15), f32p(1.3), nil, nil, nil)
+	got := applyRequestOptions(def, intp(3), f32p(0.4), f32p(0.7), intp(9), f32p(0.15), f32p(1.3), nil, nil, nil, nil, "")
 	if got.MaxTokens != 3 || got.Sampler.Temperature != 0.4 || got.Sampler.TopP != 0.7 ||
 		got.Sampler.TopK != 9 || got.Sampler.MinP != 0.15 || got.Sampler.RepeatPenalty != 1.3 {
 		t.Fatalf("got = %+v / %+v", got, got.Sampler)

@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -14,9 +15,12 @@ func TestBatchedPrefillMatchesPerToken(t *testing.T) {
 	if !r.canBatchPrefill() {
 		t.Fatal("tiny llama should support batched prefill")
 	}
-	tokens := r.tok.Encode("abcdefghij")
-	if len(tokens) < 4 {
-		t.Fatalf("need a multi-token prompt, got %d", len(tokens))
+	// Repeated well past the prefill chunk size so this exercises multi-chunk
+	// stitching (KV cache continuity across chunk boundaries), not just a
+	// single chunk's worth of tokens.
+	tokens := r.tok.Encode(strings.Repeat("abcdefghij", 10))
+	if len(tokens) < 80 {
+		t.Fatalf("need a prompt spanning multiple prefill chunks, got %d tokens", len(tokens))
 	}
 
 	kDim, vDim, mh, mk, mv := r.cacheDims()

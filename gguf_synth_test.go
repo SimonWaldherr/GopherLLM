@@ -203,7 +203,7 @@ func buildTinyLlamaGGUF() []byte {
 		{"llama.attention.key_length", ggufU32, uint32(hdim)},
 		{"llama.attention.value_length", ggufU32, uint32(hdim)},
 		{"llama.feed_forward_length", ggufU32, uint32(hidden)},
-		{"llama.context_length", ggufU32, uint32(32)},
+		{"llama.context_length", ggufU32, uint32(1024)},
 		{"llama.attention.layer_norm_rms_epsilon", ggufF32, float32(1e-5)},
 		{"llama.rope.freq_base", ggufF32, float32(10000)},
 		{"llama.rope.dimension_count", ggufU32, uint32(hdim)},

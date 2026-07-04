@@ -118,7 +118,7 @@ func TestRenderPlainMessagesFallback(t *testing.T) {
 	delete(tok.TokenToID, "[INST]")
 	delete(tok.TokenToID, "[/INST]")
 	r := &Runner{tok: tok, arch: "llama", gguf: &GGUFFile{Metadata: map[string]MetaValue{}}}
-	tokens := r.renderMessages([]ChatMessage{UserMessage("hi")}, "sys")
+	tokens := r.renderMessages([]ChatMessage{UserMessage("hi")}, "sys", nil)
 	if len(tokens) == 0 || tokens[0] != tok.BOSID {
 		t.Fatalf("plain fallback should start with BOS: %v", tokens)
 	}

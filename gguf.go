@@ -1,11 +1,29 @@
 package main
 
+// GGUF container parsing.
+//
+// A GGUF file is, in order: the 4-byte magic "GGUF", a u32 version, a u64
+// tensor count, a u64 metadata count, the metadata key/value entries, the
+// tensor descriptors (name, dims, dtype, data offset), and finally — aligned
+// to general.alignment (default 32) — the raw tensor data. All integers are
+// little-endian. Tensor offsets are relative to the aligned data start
+// (GGUFFile.DataOffset), not the file start.
+//
+// Parsing here reads only the header; tensor data is left in place so callers
+// can borrow it directly from a memory-mapped file (see loadWeight's borrow
+// mode) instead of copying multi-gigabyte weights.
+
 import (
 	"encoding/binary"
 	"fmt"
 	"math"
 )
 
+// GGMLType identifies a tensor's on-disk element encoding, matching the
+// ggml type ids used by llama.cpp. F32/F16 are plain element arrays; the
+// quantized types pack fixed-size blocks of elements together with their
+// scale factors — see BlockBytes/DataSize for the exact per-block sizes the
+// matvec kernels in simd.go rely on.
 type GGMLType uint32
 
 const (
@@ -27,6 +45,9 @@ const (
 	GGMLTypeUnknown GGMLType = 255
 )
 
+// ggmlTypeFromUint32 maps a raw GGUF dtype id to a GGMLType, folding every id
+// this runtime cannot execute into GGMLTypeUnknown so the mismatch surfaces as
+// a load-time error instead of a bogus kernel dispatch.
 func ggmlTypeFromUint32(v uint32) GGMLType {
 	switch GGMLType(v) {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
@@ -69,6 +90,10 @@ func (t GGMLType) String() string {
 	}
 }
 
+// BlockSize returns how many elements one quantization block encodes (1 for
+// the plain float types). Note the K-quants (Q4_K/Q5_K/Q6_K) actually use
+// 256-element superblocks; this legacy accessor is only used with the 32-wide
+// simple quants, and DataSize handles the K-quant sizes explicitly.
 func (t GGMLType) BlockSize() int {
 	if t == GGMLTypeF32 || t == GGMLTypeF16 {
 		return 1
@@ -76,6 +101,10 @@ func (t GGMLType) BlockSize() int {
 	return 32
 }
 
+// BlockBytes returns the byte size of one block for the simple (32-element)
+// quant formats, e.g. Q8_0 = 2-byte f16 scale + 32 int8 quants = 34 bytes,
+// Q4_0 = 2-byte f16 scale + 16 packed-nibble bytes = 18 bytes. K-quants and
+// MXFP4 are not representable here (ok=false); use DataSize instead.
 func (t GGMLType) BlockBytes() (int, bool) {
 	switch t {
 	case GGMLTypeF32:
@@ -99,6 +128,21 @@ func (t GGMLType) BlockBytes() (int, bool) {
 	}
 }
 
+// DataSize returns the exact byte size of n elements of this type. The
+// per-block layouts, which the dot kernels in simd.go index by hand:
+//
+//	Q4_0:  18 B / 32 elems  = f16 scale + 16 nibble-packed bytes
+//	Q8_0:  34 B / 32 elems  = f16 scale + 32 int8
+//	Q4_K: 144 B / 256 elems = f16 d + f16 dmin + 12 B packed 6-bit
+//	       scales/mins (8 sub-blocks) + 128 nibble-packed bytes
+//	Q5_K: 176 B / 256 elems = Q4_K layout + 32 B of 5th-bit planes
+//	Q6_K: 210 B / 256 elems = 128 B low nibbles + 64 B 2-bit highs +
+//	       16 int8 sub-block scales + f16 d
+//	MXFP4: 17 B / 32 elems  = 16 nibble-packed FP4 values + 1 shared
+//	       power-of-two exponent byte
+//
+// ok is false for types this runtime cannot size (callers then fall back to
+// offset-difference inference; see inferTensorSizes).
 func (t GGMLType) DataSize(n int) (int, bool) {
 	switch t {
 	case GGMLTypeF32:
@@ -121,6 +165,11 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 	}
 }
 
+// MetaValue is one decoded GGUF metadata value. Kind is the GGUF wire-type
+// name ("u32", "str", "array", ...) and Value holds the corresponding Go value
+// (arrays are []MetaValue). The As* accessors below do tolerant conversions —
+// GGUF producers are inconsistent about integer widths, so e.g. AsU32 accepts
+// any integer kind rather than only u32.
 type MetaValue struct {
 	Kind  string
 	Value any
@@ -198,6 +247,10 @@ func (v MetaValue) AsF32Array() ([]float32, bool) {
 	return out, true
 }
 
+// TensorInfo describes one tensor from the GGUF header. Dims follow GGUF's
+// convention of fastest-varying dimension first, so for a 2-D weight
+// Dims[0] is the input (column) count and Dims[1] the output (row) count.
+// Offset is relative to GGUFFile.DataOffset.
 type TensorInfo struct {
 	Name   string
 	Dims   []uint64
@@ -205,6 +258,7 @@ type TensorInfo struct {
 	Offset uint64
 }
 
+// Numel returns the total element count (product of Dims).
 func (t TensorInfo) Numel() int {
 	n := 1
 	for _, d := range t.Dims {
@@ -213,6 +267,9 @@ func (t TensorInfo) Numel() int {
 	return n
 }
 
+// GGUFFile is a parsed GGUF header: all metadata, all tensor descriptors, and
+// the alignment-adjusted offset where tensor data begins within the original
+// byte slice. It does not own or copy any tensor data.
 type GGUFFile struct {
 	Metadata   map[string]MetaValue
 	Tensors    []TensorInfo
@@ -220,6 +277,9 @@ type GGUFFile struct {
 	Version    uint32
 }
 
+// ParseGGUF parses a GGUF header, logging a one-line summary to stderr.
+// ParseGGUFQuiet is the same without the log line (used by model discovery,
+// which parses every file in a directory).
 func ParseGGUF(data []byte) (*GGUFFile, error)      { return parseGGUF(data, true) }
 func ParseGGUFQuiet(data []byte) (*GGUFFile, error) { return parseGGUF(data, false) }
 
@@ -299,6 +359,8 @@ func parseGGUF(data []byte, verbose bool) (*GGUFFile, error) {
 	return &GGUFFile{Metadata: metadata, Tensors: tensors, DataOffset: divCeil(c.pos, alignment) * alignment, Version: version}, nil
 }
 
+// GetU32/GetF32/GetString are convenience metadata lookups; the numeric
+// variants return def when the key is absent or has an incompatible kind.
 func (g *GGUFFile) GetU32(key string, def uint32) uint32 {
 	if v, ok := g.Metadata[key]; ok {
 		if n, ok := v.AsU32(); ok {
@@ -324,6 +386,9 @@ func (g *GGUFFile) GetString(key string) (string, bool) {
 	return "", false
 }
 
+// cursor is a bounds-checked little-endian reader over the raw file bytes;
+// every read verifies remaining length so truncated files fail with a clear
+// "unexpected EOF at byte N" instead of a panic.
 type cursor struct {
 	data []byte
 	pos  int

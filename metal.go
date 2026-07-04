@@ -3,8 +3,15 @@ package main
 // Metal acceleration in the Rust project uses Objective-C and therefore CGO
 // in a Go port. GopherLLM keeps the public shape but uses pure-Go fallbacks.
 
+// MetalAvailable reports GPU availability; always false in the pure-Go build.
 func MetalAvailable() bool { return false }
 
+// Q4KMatvec3Into computes three Q4_K matvecs (attention Q/K/V projections)
+// against the same activation vector in one fused pass: the per-32-element
+// activation sums are computed once and the combined row range is spread over
+// the worker pool as a single parallel dispatch instead of three. Returns
+// false (nothing written) if shapes are incompatible, in which case the
+// caller falls back to three separate matvecs.
 func Q4KMatvec3Into(wq, wk, wv Q4KMatrix, x []float32, q, k, v *[]float32) bool {
 	scratch := []float32{}
 	return Q4KMatvec3IntoWithXSums(wq, wk, wv, x, &scratch, q, k, v)
@@ -72,6 +79,8 @@ func clippedRange(start, end, lo, hi int) (int, int) {
 	return start, end
 }
 
+// Q4KMatrix is a borrowed view of a Q4_K weight tensor: Rows x Cols elements
+// packed as (Cols/256) 144-byte superblocks per row (see GGMLType.DataSize).
 type Q4KMatrix struct {
 	Data []byte
 	Rows int

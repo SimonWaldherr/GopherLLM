@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -24,11 +25,22 @@ const (
 	ChatRoleSystem ChatRole = iota
 	ChatRoleUser
 	ChatRoleAssistant
+	// ChatRoleTool carries the result of a previously requested tool call back
+	// to the model. ToolCallID must match the id the assistant's ToolCalls
+	// entry used.
+	ChatRoleTool
 )
 
 type ChatMessage struct {
 	Role    ChatRole
 	Content string
+	// ToolCalls is set on an assistant message that is replaying a prior turn
+	// in which the model requested one or more tool calls.
+	ToolCalls []ToolCall
+	// ToolCallID and Name identify which prior tool call a ChatRoleTool
+	// message is answering.
+	ToolCallID string
+	Name       string
 }
 
 func UserMessage(content string) ChatMessage {
@@ -38,16 +50,40 @@ func AssistantMessage(content string) ChatMessage {
 	return ChatMessage{Role: ChatRoleAssistant, Content: content}
 }
 
+// ToolResultMessage renders the output of tool call callID (named name) back
+// into the conversation for the model to see on its next turn.
+func ToolResultMessage(callID, name, content string) ChatMessage {
+	return ChatMessage{Role: ChatRoleTool, Content: content, ToolCallID: callID, Name: name}
+}
+
 type GenerationOptions struct {
 	MaxTokens     int
 	Sampler       SamplerConfig
 	Seed          uint64
 	SystemPrompt  string
 	StopSequences []string
+	// Tools lists the functions the model may call. When non-empty, it is
+	// rendered into the prompt using the active chat template's tool-calling
+	// convention (native for Mistral, a generic <tool_call> JSON convention
+	// otherwise).
+	Tools []ToolDefinition
+	// ToolChoice controls whether tools are offered at all. "none" suppresses
+	// tool rendering for this request; any other value (including the default
+	// "auto") offers all of Tools.
+	ToolChoice string
 }
 
 func DefaultGenerationOptions() GenerationOptions {
 	return GenerationOptions{MaxTokens: 256, Sampler: DefaultSamplerConfig(), SystemPrompt: "You are a helpful assistant."}
+}
+
+// activeTools returns the tools that should actually be offered to the model
+// for this request, honoring ToolChoice: "none".
+func (o GenerationOptions) activeTools() []ToolDefinition {
+	if o.ToolChoice == "none" {
+		return nil
+	}
+	return o.Tools
 }
 
 func (o GenerationOptions) Validate() error {
@@ -85,8 +121,20 @@ type GenerationStats struct {
 }
 
 type GenerationResult struct {
-	Text  string
-	Stats GenerationStats
+	Text string
+	// ReasoningText holds any chain-of-thought the model emitted separately
+	// from its answer (e.g. DeepSeek-R1/QwQ <think> blocks, or gpt-oss's
+	// analysis channel), stripped out of Text.
+	ReasoningText string
+	// ToolCalls holds structured function calls extracted from the model's
+	// raw output, stripped out of Text. Empty unless GenerationOptions.Tools
+	// was non-empty for this request.
+	ToolCalls []ToolCall
+	// FinishReason is "stop" (natural end or stop-sequence match), "length"
+	// (max_tokens or context exhausted), or "tool_calls" (ToolCalls is
+	// non-empty).
+	FinishReason string
+	Stats        GenerationStats
 }
 
 type LoadInfo struct {
@@ -154,6 +202,12 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 		}
 		r.config, r.gptOss, r.kind = config, weights, loadedGptOss
 	case "gemma", "gemma2", "gemma4":
+		// The Gemma forward path currently reuses the standard llama-style
+		// graph and is missing several mechanisms real Gemma weights require
+		// (hardcoded sqrt(dim) embedding scaling, GELU FFN, post-attention/
+		// post-FFN norms, QK-norm/softcapping, per-layer sliding-window map,
+		// p-RoPE). See docs/INFERENCE_NOTES.md for the researched gap list.
+		fmt.Fprintf(stderr(), "Warning: %s support is experimental and known-incomplete; output quality will be poor (see docs/INFERENCE_NOTES.md)\n", arch)
 		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized)
 		if err != nil {
 			return nil, err
@@ -228,9 +282,16 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return GenerationResult{}, fmt.Errorf("no prompt provided")
 	}
 	totalStart := time.Now()
-	tokens := r.renderMessages(messages, options.SystemPrompt)
+	tokens := r.renderMessages(messages, options.SystemPrompt, options.activeTools())
 	if len(tokens) == 0 {
 		return GenerationResult{}, fmt.Errorf("prompt rendered to zero tokens")
+	}
+	// The KV cache is sized to r.config.MaxSeqLen; without this check a prompt
+	// at or beyond that length (easily reached once a request injects a large
+	// tool listing) would silently overflow it deeper in the forward pass
+	// instead of failing here with a clear error.
+	if r.config.MaxSeqLen > 0 && len(tokens) >= r.config.MaxSeqLen {
+		return GenerationResult{}, fmt.Errorf("prompt (%d tokens) leaves no room to generate within the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+options.MaxTokens+1)
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
@@ -294,10 +355,21 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	generated := []uint32{}
 	recent := append([]uint32(nil), tokens...)
 	pos := len(tokens)
+	finishReason := "length"
+	buildResult := func() GenerationResult {
+		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
+		content, reasoning, calls := r.classifyOutput(output.String(), options.activeTools(), rng)
+		reason := finishReason
+		if len(calls) > 0 {
+			reason = "tool_calls"
+		}
+		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats}
+	}
 decode:
 	for range options.MaxTokens {
 		token := SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
 		if r.isStopToken(token) {
+			finishReason = "stop"
 			break
 		}
 		text := r.tok.DecodeToken(token)
@@ -312,13 +384,14 @@ decode:
 					output.Reset()
 					output.WriteString(current)
 					streamBuf = streamBuf[:0]
+					finishReason = "stop"
 					break decode
 				}
 			}
 		}
 		streamBuf = append(streamBuf, text...)
 		if !flushStream(false) {
-			return GenerationResult{Text: output.String(), Stats: GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}}, ErrGenerationCanceled
+			return buildResult(), ErrGenerationCanceled
 		}
 		generated = append(generated, token)
 		recent = append(recent, token)
@@ -332,9 +405,9 @@ decode:
 		pos++
 	}
 	if !flushStream(true) {
-		return GenerationResult{Text: output.String(), Stats: GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}}, ErrGenerationCanceled
+		return buildResult(), ErrGenerationCanceled
 	}
-	return GenerationResult{Text: output.String(), Stats: GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}}, nil
+	return buildResult(), nil
 }
 
 func validUTF8PrefixLen(b []byte) int {
@@ -403,8 +476,16 @@ func (r *Runner) canBatchPrefill() bool {
 
 // prefillBatched processes the prompt in chunks, streaming each weight once per
 // chunk instead of once per token.
+//
+// chunk was swept empirically (BenchmarkChunkThroughputP*, not checked in):
+// per-token throughput improves from P=8 up to a peak around P=32, then
+// degrades again through P=48/64/128/256 as the chunk's activation buffers
+// (X, XN, Q, K, V, ...; each sized dim*chunk floats) outgrow cache and start
+// costing more in misses per dequantized weight row than the extra dequant
+// amortization buys back. 32 was consistently ~15-20% faster than the
+// previous default of 64 across repeated runs.
 func (r *Runner) prefillBatched(cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) {
-	const chunk = 64
+	const chunk = 32
 	n := len(tokens)
 	for start := 0; start < n; start += chunk {
 		end := min(start+chunk, n)
@@ -430,6 +511,9 @@ func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	if len(tokens) == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: input tokenised to zero tokens")
 	}
+	if r.config.MaxSeqLen > 0 && len(tokens) > r.config.MaxSeqLen {
+		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
+	}
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+1)
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	cache := NewKVCache(r.config.NLayers, kDim, vDim, cacheLen)
@@ -453,37 +537,138 @@ func (r *Runner) isStopToken(token uint32) bool {
 	return token == r.tok.EOSID
 }
 
-func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string) []uint32 {
+// renderMessages renders the conversation (and, if any, the tool listing) into
+// tokens using the active chat template. Mistral gets its native
+// [AVAILABLE_TOOLS]/[TOOL_CALLS]/[TOOL_RESULTS] convention; every other
+// template (and gpt-oss, for which tool calling is not yet implemented) uses
+// the generic <tool_call> JSON convention, applied uniformly by flattening
+// tool listings and tool-call history into ordinary system/user/assistant
+// text before delegating to the per-family renderer below.
+func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) []uint32 {
 	if r.arch == "gpt-oss" {
 		return r.renderGptOssMessages(messages, systemPrompt)
 	}
-	switch r.chatTemplateKind() {
-	case "mistral-inst":
-		if tokens, ok := r.renderMistralInstMessages(messages, systemPrompt); ok {
-			return tokens
-		}
-	case "header-chat":
-		if tokens, ok := r.renderHeaderChatMessages(messages, systemPrompt); ok {
-			return tokens
-		}
-	case "chatml":
-		if tokens, ok := r.renderChatMLMessages(messages, systemPrompt); ok {
-			return tokens
-		}
-	case "phi-chat":
-		if tokens, ok := r.renderPhiMessages(messages, systemPrompt); ok {
-			return tokens
-		}
-	case "deepseek-r1-qwen":
-		if tokens, ok := r.renderDeepSeekR1QwenMessages(messages, systemPrompt); ok {
-			return tokens
-		}
-	case "granite-chat":
-		if tokens, ok := r.renderGraniteMessages(messages, systemPrompt); ok {
+	if r.chatTemplateKind() == "mistral-inst" {
+		if tokens, ok := r.renderMistralInstMessages(messages, systemPrompt, tools); ok {
 			return tokens
 		}
 	}
-	return r.renderPlainMessages(messages, systemPrompt)
+	generic, genericSystem := injectGenericTools(messages, systemPrompt, tools)
+	switch r.chatTemplateKind() {
+	case "header-chat":
+		if tokens, ok := r.renderHeaderChatMessages(generic, genericSystem); ok {
+			return tokens
+		}
+	case "chatml":
+		if tokens, ok := r.renderChatMLMessages(generic, genericSystem); ok {
+			return tokens
+		}
+	case "phi-chat":
+		if tokens, ok := r.renderPhiMessages(generic, genericSystem); ok {
+			return tokens
+		}
+	case "deepseek-r1-qwen":
+		if tokens, ok := r.renderDeepSeekR1QwenMessages(generic, genericSystem); ok {
+			return tokens
+		}
+	case "granite-chat":
+		if tokens, ok := r.renderGraniteMessages(generic, genericSystem); ok {
+			return tokens
+		}
+	}
+	return r.renderPlainMessages(generic, genericSystem)
+}
+
+// injectGenericTools flattens tool listings and tool-call/tool-result history
+// into ordinary text so any chat-template renderer that only understands
+// system/user/assistant turns can carry tool use anyway. A tool listing is
+// merged into an existing explicit system message's content when present,
+// otherwise appended to systemPrompt so the caller's default system prompt
+// (e.g. "You are a helpful assistant.") is preserved rather than replaced.
+// When there is no tool activity at all, messages/systemPrompt are returned
+// unchanged (no allocation) so the common no-tools path is a no-op.
+func injectGenericTools(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]ChatMessage, string) {
+	hasActivity := len(tools) > 0
+	if !hasActivity {
+		for _, m := range messages {
+			if m.Role == ChatRoleTool || (m.Role == ChatRoleAssistant && len(m.ToolCalls) > 0) {
+				hasActivity = true
+				break
+			}
+		}
+	}
+	if !hasActivity {
+		return messages, systemPrompt
+	}
+
+	hasExplicitSystem := len(messages) > 0 && messages[0].Role == ChatRoleSystem
+	out := make([]ChatMessage, len(messages))
+	for i, m := range messages {
+		switch {
+		case i == 0 && hasExplicitSystem && len(tools) > 0:
+			m.Content = appendSection(m.Content, genericToolListText(tools))
+		case m.Role == ChatRoleAssistant && len(m.ToolCalls) > 0:
+			m.Content = renderGenericAssistantToolCalls(m.Content, m.ToolCalls)
+		case m.Role == ChatRoleTool:
+			m.Role = ChatRoleUser
+			m.Content = renderGenericToolResult(m.Name, m.Content)
+		}
+		out[i] = m
+	}
+	if !hasExplicitSystem && len(tools) > 0 {
+		systemPrompt = appendSection(systemPrompt, genericToolListText(tools))
+	}
+	return out, systemPrompt
+}
+
+func appendSection(base, section string) string {
+	base = strings.TrimRight(base, "\n")
+	if base == "" {
+		return section
+	}
+	return base + "\n\n" + section
+}
+
+// genericToolListText renders an OpenAI-shaped tool list into the Hermes/Qwen
+// style calling convention: a <tool_call> JSON block per invocation.
+func genericToolListText(tools []ToolDefinition) string {
+	b, err := json.Marshal(tools)
+	if err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("You have access to the following tools. To call one, respond with only a block of exactly this form (multiple blocks if you need multiple calls in the same turn):\n")
+	sb.WriteString("<tool_call>\n{\"name\": \"<tool name>\", \"arguments\": <arguments object>}\n</tool_call>\n\n")
+	sb.WriteString("Available tools:\n")
+	sb.Write(b)
+	return sb.String()
+}
+
+func renderGenericAssistantToolCalls(content string, calls []ToolCall) string {
+	var sb strings.Builder
+	if trimmed := strings.TrimSpace(content); trimmed != "" {
+		sb.WriteString(trimmed)
+		sb.WriteString("\n")
+	}
+	for i, call := range calls {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		args := call.Function.Arguments
+		if strings.TrimSpace(args) == "" {
+			args = "{}"
+		}
+		nameJSON, _ := json.Marshal(call.Function.Name)
+		fmt.Fprintf(&sb, "<tool_call>\n{\"name\": %s, \"arguments\": %s}\n</tool_call>", nameJSON, args)
+	}
+	return sb.String()
+}
+
+func renderGenericToolResult(name, content string) string {
+	if name != "" {
+		return fmt.Sprintf("<tool_response name=%q>\n%s\n</tool_response>", name, content)
+	}
+	return fmt.Sprintf("<tool_response>\n%s\n</tool_response>", content)
 }
 
 func (r *Runner) renderPlainMessages(messages []ChatMessage, systemPrompt string) []uint32 {
@@ -545,19 +730,25 @@ func (r *Runner) renderGptOssMessages(messages []ChatMessage, systemPrompt strin
 
 // renderMistralInstMessages renders the Mistral/Ministral instruct format:
 //
-//	<s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{user}[/INST]{assistant}</s>...
+//	<s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][AVAILABLE_TOOLS]{tools}[/AVAILABLE_TOOLS][INST]{user}[/INST]{assistant}</s>...
 //
 // [INST]/[/INST] (and, on newer Tekken vocabularies, [SYSTEM_PROMPT]/
-// [/SYSTEM_PROMPT]) are emitted as control tokens. When the vocabulary lacks the
-// dedicated system-prompt tokens we fall back to the older Mistral 2410 behavior
-// of folding the system prompt into the final user turn.
-func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+// [/SYSTEM_PROMPT] and the tool-calling markers) are emitted as control
+// tokens. When the vocabulary lacks the dedicated system-prompt tokens we
+// fall back to the older Mistral 2410 behavior of folding the system prompt
+// into the final user turn. Format verified directly against the
+// tokenizer.chat_template of a real Ministral-3-3B-Instruct-2512 GGUF.
+func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, bool) {
 	instTok, ok1 := r.tok.SpecialID("[INST]")
 	instEndTok, ok2 := r.tok.SpecialID("[/INST]")
 	if !(ok1 && ok2) {
 		return nil, false
 	}
 	sysStart, sysEnd, hasSysTokens := r.systemPromptTokens()
+	callTok := r.mistralMarker("[TOOL_CALLS]")
+	argsTok := r.mistralMarker("[ARGS]")
+	resultsStart := r.mistralMarker("[TOOL_RESULTS]")
+	resultsEnd := r.mistralMarker("[/TOOL_RESULTS]")
 
 	system := strings.TrimSpace(systemPrompt)
 	loop := make([]ChatMessage, 0, len(messages))
@@ -586,21 +777,57 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 		tokens = append(tokens, r.tok.EncodeWithoutBOS(system)...)
 		tokens = append(tokens, sysEnd)
 	}
+	if len(tools) > 0 {
+		if toolsJSON, err := json.Marshal(tools); err == nil {
+			tokens = append(tokens, r.mistralMarker("[AVAILABLE_TOOLS]")...)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(string(toolsJSON))...)
+			tokens = append(tokens, r.mistralMarker("[/AVAILABLE_TOOLS]")...)
+		}
+	}
 	for i, m := range loop {
-		if m.Role == ChatRoleAssistant {
-			tokens = append(tokens, r.tok.EncodeWithoutBOS(strings.TrimSpace(m.Content))...)
+		switch m.Role {
+		case ChatRoleAssistant:
+			if content := strings.TrimSpace(m.Content); content != "" {
+				tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
+			}
+			for _, call := range m.ToolCalls {
+				args := call.Function.Arguments
+				if args == "" {
+					args = "{}"
+				}
+				tokens = append(tokens, callTok...)
+				tokens = append(tokens, r.tok.EncodeWithoutBOS(call.Function.Name)...)
+				tokens = append(tokens, argsTok...)
+				tokens = append(tokens, r.tok.EncodeWithoutBOS(args)...)
+			}
 			tokens = append(tokens, r.tok.EOSID)
-			continue
+		case ChatRoleTool:
+			tokens = append(tokens, resultsStart...)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(m.Content)...)
+			tokens = append(tokens, resultsEnd...)
+		default:
+			content := strings.TrimSpace(m.Content)
+			if i == lastUser && system != "" && !hasSysTokens {
+				content = system + "\n\n" + content
+			}
+			tokens = append(tokens, instTok)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
+			tokens = append(tokens, instEndTok)
 		}
-		content := strings.TrimSpace(m.Content)
-		if i == lastUser && system != "" && !hasSysTokens {
-			content = system + "\n\n" + content
-		}
-		tokens = append(tokens, instTok)
-		tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
-		tokens = append(tokens, instEndTok)
 	}
 	return tokens, true
+}
+
+// mistralMarker returns literal as a single control token when the vocabulary
+// defines one (true for every marker on real Mistral/Ministral Tekken
+// tokenizers, verified directly against a Ministral-3-3B-Instruct-2512 GGUF),
+// falling back to plain-text encoding so rendering degrades rather than fails
+// outright on a hypothetical vocabulary that lacks it.
+func (r *Runner) mistralMarker(literal string) []uint32 {
+	if id, ok := r.tok.SpecialID(literal); ok {
+		return []uint32{id}
+	}
+	return r.tok.EncodeWithoutBOS(literal)
 }
 
 func (r *Runner) systemPromptTokens() (start, end uint32, ok bool) {

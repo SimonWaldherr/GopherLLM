@@ -7,6 +7,11 @@ import (
 	"syscall"
 )
 
+// MmapFile exposes a model file as one immutable byte slice, memory-mapped
+// where the platform allows so multi-gigabyte weights are paged in on demand
+// rather than copied. Quantized Weights borrow sub-slices of it directly
+// (loadWeight's borrow mode), so it must stay open for the Runner's lifetime;
+// Runner.Close unmaps it.
 type MmapFile struct {
 	data []byte
 	mmap bool

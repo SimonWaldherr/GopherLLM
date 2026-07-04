@@ -13,6 +13,10 @@ import (
 
 const lmStudioCommunitySubdir = ".cache/lm-studio/models/lmstudio-community"
 
+// ModelEntry describes one GGUF file found under the model directory. ID is
+// the root-relative path without the .gguf suffix (unique within a scan and
+// what --list-models prints); IsProjector marks multimodal companion files
+// (mmproj-*/clip) that must not be offered for text generation.
 type ModelEntry struct {
 	ID           string
 	Repository   string
@@ -35,6 +39,9 @@ func (m ModelEntry) Status() string {
 	return "unsupported"
 }
 
+// DefaultModelDir returns the directory scanned when --model-dir is not
+// given: $RUSTY_LLM_MODEL_DIR if set, else the LM Studio community models
+// directory under $HOME. (MODEL_DIR is a Makefile variable, not read here.)
 func DefaultModelDir() string {
 	if path := strings.TrimSpace(os.Getenv("RUSTY_LLM_MODEL_DIR")); path != "" {
 		return path
@@ -45,6 +52,10 @@ func DefaultModelDir() string {
 	return lmStudioCommunitySubdir
 }
 
+// DiscoverModels recursively finds every .gguf under root and parses each
+// file's header (mmap'd, weights untouched) to fill in architecture, name,
+// and support status. Unparseable files are skipped with a stderr note rather
+// than failing the whole scan. Results are sorted by ID.
 func DiscoverModels(root string) ([]ModelEntry, error) {
 	files := []string{}
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -73,6 +84,10 @@ func DiscoverModels(root string) ([]ModelEntry, error) {
 	return entries, nil
 }
 
+// ResolveModelPath turns the CLI's model selector into a concrete .gguf path.
+// A selector that is an existing file wins outright; an existing directory
+// (or a nil selector) opens the interactive picker over that directory;
+// anything else is matched against the discovered models by SelectModel.
 func ResolveModelPath(selection *string, modelDir string) (string, error) {
 	if selection != nil {
 		selected := *selection
@@ -98,6 +113,11 @@ func ResolveModelPath(selection *string, modelDir string) (string, error) {
 	return chooseFromDirectory(modelDir, nil, os.Stdin, stderr())
 }
 
+// SelectModel matches selector against the usable (supported, non-projector)
+// entries: exact matches on id/repo/filename/name/path beat substring
+// matches, a unique match wins, and ambiguity or matching only an
+// unsupported/projector file produces a descriptive error listing the
+// choices.
 func SelectModel(entries []ModelEntry, selector string) (ModelEntry, error) {
 	selector = strings.TrimSpace(selector)
 	if selector == "" {
@@ -178,6 +198,9 @@ func chooseFromDirectory(dir string, selector *string, in io.Reader, out io.Writ
 	}
 }
 
+// PromptModelSelection runs the interactive terminal picker: a numbered menu
+// that accepts an index, a filter substring (re-listing the matches), or
+// q/quit/exit to abort.
 func PromptModelSelection(dir string, entries []ModelEntry, in io.Reader, out io.Writer) (ModelEntry, error) {
 	if len(entries) == 0 {
 		return ModelEntry{}, fmt.Errorf("no selectable GGUF models found in %s", dir)

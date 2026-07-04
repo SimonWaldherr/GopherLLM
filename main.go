@@ -39,6 +39,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
+	fmt.Fprintln(os.Stderr, "  --skills-dir <path>       Directory of SKILL.md files offered via a load_skill tool")
 	fmt.Fprintln(os.Stderr, "  --embed                   Embed prompt and print the vector")
 	fmt.Fprintln(os.Stderr, "  --bench                   Run a non-streaming generation benchmark")
 	fmt.Fprintln(os.Stderr, "  --bench-json              Run benchmark and emit machine-readable JSON")
@@ -79,6 +80,7 @@ type cliConfig struct {
 	cpuProfile       string
 	inspect          bool
 	listMetadata     bool
+	skillsDir        string
 }
 
 func main() {
@@ -157,7 +159,7 @@ func run() error {
 	}
 	fmt.Fprintf(stderr(), "Architecture: %s\n", runner.Architecture())
 	if cfg.serveAddr != "" {
-		return Serve(runner, ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath})
+		return Serve(runner, ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -176,20 +178,43 @@ func run() error {
 	if cfg.kernelBench {
 		return RunKernelBench(runner, modelPath, cfg.kernelBenchRuns, cfg.kernelBenchLayer, cfg.kernelBenchJSON)
 	}
+	skills, err := LoadSkills(cfg.skillsDir)
+	if err != nil {
+		return err
+	}
+	if len(skills) > 0 {
+		fmt.Fprintf(stderr(), "Skills: loaded %d from %s\n", len(skills), cfg.skillsDir)
+	}
 	if cfg.repl || cfg.prompt == "" {
-		return runREPL(runner, cfg.options)
+		return runREPL(runner, cfg.options, skills)
 	}
 	result, err := runWithTimeout(cfg.timeout, func() (GenerationResult, error) {
-		return runner.GenerateStream(cfg.prompt, cfg.options, func(s string) {
+		return RunAgenticChat(runner, []ChatMessage{UserMessage(cfg.prompt)}, cfg.options, skills, func(s string) bool {
 			fmt.Print(s)
+			return true
 		})
 	})
 	if err != nil {
 		return err
 	}
 	fmt.Println()
+	printReasoningAndToolCalls(result)
 	printStats(result.Stats)
 	return nil
+}
+
+// printReasoningAndToolCalls surfaces the parts of a GenerationResult that the
+// CLI's plain stdout stream doesn't otherwise show: any chain-of-thought the
+// model separated out, and any tool call the model wants that the CLI (unlike
+// the HTTP server) has no client to hand it back to. Both go to stderr so
+// stdout stays just the visible answer for piping.
+func printReasoningAndToolCalls(result GenerationResult) {
+	if result.ReasoningText != "" {
+		fmt.Fprintf(os.Stderr, "[reasoning]\n%s\n[/reasoning]\n", result.ReasoningText)
+	}
+	for _, call := range result.ToolCalls {
+		fmt.Fprintf(os.Stderr, "[tool_call] %s(%s) — no --skills-dir tool executor is configured to answer this\n", call.Function.Name, call.Function.Arguments)
+	}
 }
 
 func parseCLI(args []string) (cliConfig, error) {
@@ -321,6 +346,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.options.StopSequences = append(cfg.options.StopSequences, v)
+		case "--skills-dir":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.skillsDir = v
 		case "--embed":
 			cfg.embed = true
 		case "--bench":
@@ -497,7 +528,7 @@ func promptText(prompt string) (string, error) {
 	return string(b), err
 }
 
-func runREPL(r *Runner, options GenerationOptions) error {
+func runREPL(r *Runner, options GenerationOptions, skills []Skill) error {
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Fprintln(os.Stderr, "Enter prompts; empty line exits.")
 	for {
@@ -509,11 +540,12 @@ func runREPL(r *Runner, options GenerationOptions) error {
 		if prompt == "" {
 			return nil
 		}
-		_, err := r.GenerateStream(prompt, options, func(s string) { fmt.Print(s) })
+		result, err := RunAgenticChat(r, []ChatMessage{UserMessage(prompt)}, options, skills, func(s string) bool { fmt.Print(s); return true })
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
 		fmt.Println()
+		printReasoningAndToolCalls(result)
 	}
 }
 

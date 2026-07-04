@@ -16,6 +16,10 @@ MAX_TOKENS    ?= 32
 TEMP          ?= 0
 TOP_P         ?= 0.9
 TOP_K         ?= 40
+MIN_P         ?= 0
+REPEAT_PENALTY ?= 1.1
+SEED          ?=
+SKILLS_DIR    ?=
 BENCH_RUNS    ?= 3
 KERNEL_BENCH_RUNS ?= 25
 KERNEL_BENCH_LAYER ?= 0
@@ -24,16 +28,20 @@ ADDR          ?= 127.0.0.1:8080
 SERVE_ADDR    ?= $(ADDR)
 CHAT          ?= 1
 ARGS          ?=
+COVER_PROFILE ?= $(CACHE_DIR)/cover.out
 
 export CGO_ENABLED
 export GOCACHE
 
-BIN        := $(BUILD_DIR)/$(BINARY)
-CHAT_FLAG  := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
-_MODEL_ARG := $(if $(MODEL),--model "$(MODEL)",)
-_RUN_ARGS  := $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)")
+BIN          := $(BUILD_DIR)/$(BINARY)
+CHAT_FLAG    := $(if $(filter 1 true yes on,$(CHAT)),--chat,)
+_MODEL_ARG   := $(if $(MODEL),--model "$(MODEL)",)
+_SEED_FLAG   := $(if $(SEED),--seed "$(SEED)",)
+_SKILLS_FLAG := $(if $(SKILLS_DIR),--skills-dir "$(SKILLS_DIR)",)
+_SAMPLER_ARGS := --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p "$(MIN_P)" --repeat-penalty "$(REPEAT_PENALTY)" $(_SEED_FLAG)
+_RUN_ARGS    := $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 
-.PHONY: all build release cross-build run repl serve serve-metal https list-models inspect list-tensors bench bench-model synonym-bench nato-bench kernel-bench fmt test test-small-models vet check clean help
+.PHONY: all build release cross-build run repl serve serve-metal https list-models inspect list-tensors bench bench-model synonym-bench nato-bench kernel-bench fmt test test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -56,10 +64,10 @@ run: release
 	$(BIN) $(_RUN_ARGS)
 
 repl: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --repl
+	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_SAMPLER_ARGS) --repl
 
 serve: release
-	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
+	$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
 serve-metal:
 	@printf "serve-metal is not available: the Go port currently runs pure Go / no CGO only.\n"
@@ -120,6 +128,14 @@ vet:
 
 check: fmt test vet
 
+coverage:
+	@mkdir -p $(GOCACHE) $(dir $(COVER_PROFILE))
+	$(GO) test $(GOFLAGS) -count=1 -coverprofile="$(COVER_PROFILE)" .
+	$(GO) tool cover -func="$(COVER_PROFILE)"
+
+coverage-html: coverage
+	$(GO) tool cover -html="$(COVER_PROFILE)"
+
 clean:
 	rm -rf $(BUILD_DIR) .cache
 
@@ -143,6 +159,8 @@ help:
 	@printf "  make nato-bench MODEL=...            Run fixed NATO alphabet prompt benchmark\n"
 	@printf "  make kernel-bench MODEL=...          Run isolated kernel benchmark JSON\n"
 	@printf "  make fmt/test/vet/check              Format, test, vet, or all three\n"
+	@printf "  make coverage                        Run tests and print per-function coverage\n"
+	@printf "  make coverage-html                   Run tests and open an HTML coverage report\n"
 	@printf "  make test-small-models               Run local <5GB model prompt sweep\n"
 	@printf "  make clean                           Remove build artifacts\n"
 	@printf "\nVariables:\n"
@@ -151,6 +169,12 @@ help:
 	@printf "  PROMPT=%s\n" "$(PROMPT)"
 	@printf "  SYNONYM_PROMPT=%s\n" "$(SYNONYM_PROMPT)"
 	@printf "  NATO_PROMPT=%s\n" "$(NATO_PROMPT)"
-	@printf "  MAX_TOKENS=%s TEMP=%s TOP_P=%s TOP_K=%s\n" "$(MAX_TOKENS)" "$(TEMP)" "$(TOP_P)" "$(TOP_K)"
+	@printf "  MAX_TOKENS=%s TEMP=%s TOP_P=%s TOP_K=%s MIN_P=%s REPEAT_PENALTY=%s\n" "$(MAX_TOKENS)" "$(TEMP)" "$(TOP_P)" "$(TOP_K)" "$(MIN_P)" "$(REPEAT_PENALTY)"
+	@printf "  SEED=%s (unset by default; passed as --seed only when set)\n" "$(SEED)"
+	@printf "  SKILLS_DIR=%s (passed to run/repl/serve as --skills-dir when set; see README)\n" "$(SKILLS_DIR)"
 	@printf "  BENCH_RUNS=%s MODEL_TIMEOUT=%s SERVE_ADDR=%s CHAT=%s\n" "$(BENCH_RUNS)" "$(MODEL_TIMEOUT)" "$(SERVE_ADDR)" "$(CHAT)"
 	@printf "  KERNEL_BENCH_RUNS=%s KERNEL_BENCH_LAYER=%s\n" "$(KERNEL_BENCH_RUNS)" "$(KERNEL_BENCH_LAYER)"
+	@printf "  COVER_PROFILE=%s\n" "$(COVER_PROFILE)"
+	@printf "\nRuntime env vars (set directly, e.g. GOPHERLLM_Q8_ACTIVATIONS=1 make bench-model ...):\n"
+	@printf "  GOPHERLLM_DISABLE_SIMD, GOPHERLLM_NO_BATCH_PREFILL, GOPHERLLM_Q8_ACTIVATIONS,\n"
+	@printf "  GOPHERLLM_DISABLE_YARN — see the Performance Notes section of README.md\n"

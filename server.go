@@ -76,11 +76,25 @@ type ServeOptions struct {
 	ChatHistoryLock          *sync.Mutex
 	ModelDir                 string
 	ModelPath                string
+	// SkillsDir, if set, is scanned once at startup for SKILL.md files (see
+	// skills.go). Every chat/generate endpoint offers a load_skill tool and
+	// resolves it server-side via RunAgenticChat.
+	SkillsDir string
 }
 
 func Serve(initialRunner *Runner, opts ServeOptions) error {
 	if opts.MaxConcurrentConnections <= 0 {
 		opts.MaxConcurrentConnections = 8
+	}
+	skills, err := LoadSkills(opts.SkillsDir)
+	if err != nil {
+		fmt.Fprintf(stderr(), "Warning: skills: %v (continuing without skills)\n", err)
+	} else if len(skills) > 0 {
+		names := make([]string, len(skills))
+		for i, s := range skills {
+			names[i] = s.Name
+		}
+		fmt.Fprintf(stderr(), "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
 	state := &runnerState{r: initialRunner, path: opts.ModelPath}
 	sem := make(chan struct{}, opts.MaxConcurrentConnections)
@@ -96,7 +110,7 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 		}
 		messages, options := body.ToMessagesAndOptions(opts.Defaults)
 		state.withRunner(func(r *Runner) {
-			result, err := r.GenerateChat(messages, options)
+			result, err := RunAgenticChat(r, messages, options, skills, alwaysContinue)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -114,10 +128,10 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
 			if body.Stream {
-				streamOpenAIChat(w, req, r, model, body.ChatMessages(), options)
+				streamOpenAIChat(w, req, r, model, body.ChatMessages(), options, skills)
 				return
 			}
-			result, err := r.GenerateChat(body.ChatMessages(), options)
+			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -169,6 +183,16 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 		model := modelID(state.get())
 		writeJSON(w, map[string]any{"object": "list", "data": []any{map[string]any{"id": model, "object": "model", "created": 0, "owned_by": "gopherllm"}}})
 	})
+	mux.HandleFunc("/v1/skills", func(w http.ResponseWriter, _ *http.Request) {
+		// Only name/description are exposed here, matching the progressive
+		// disclosure the load_skill tool itself uses: full bodies are loaded
+		// on demand by the model, not dumped up front.
+		list := make([]map[string]string, len(skills))
+		for i, s := range skills {
+			list[i] = map[string]string{"name": s.Name, "description": s.Description}
+		}
+		writeJSON(w, map[string]any{"skills": list})
+	})
 	mux.HandleFunc("/api/generate", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		var body OllamaGenerateRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
@@ -178,7 +202,7 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 		options := body.GenerationOptions(opts.Defaults)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
-			result, err := r.Generate(body.Prompt, options)
+			result, err := RunAgenticChat(r, []ChatMessage{UserMessage(body.Prompt)}, options, skills, alwaysContinue)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -195,7 +219,7 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 		options := body.GenerationOptions(opts.Defaults)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
-			result, err := r.GenerateChat(body.ChatMessages(), options)
+			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -347,22 +371,24 @@ func displayServerURL(addr string, chatUI bool) string {
 }
 
 type GenerateRequest struct {
-	Prompt        string       `json:"prompt"`
-	Messages      []APIMessage `json:"messages"`
-	MaxTokens     *int         `json:"max_tokens"`
-	Temp          *float32     `json:"temp"`
-	Temperature   *float32     `json:"temperature"`
-	TopP          *float32     `json:"top_p"`
-	TopK          *int         `json:"top_k"`
-	MinP          *float32     `json:"min_p"`
-	RepeatPenalty *float32     `json:"repeat_penalty"`
-	Seed          *uint64      `json:"seed"`
-	SystemPrompt  *string      `json:"system_prompt"`
-	Stop          any          `json:"stop"`
+	Prompt        string           `json:"prompt"`
+	Messages      []APIMessage     `json:"messages"`
+	MaxTokens     *int             `json:"max_tokens"`
+	Temp          *float32         `json:"temp"`
+	Temperature   *float32         `json:"temperature"`
+	TopP          *float32         `json:"top_p"`
+	TopK          *int             `json:"top_k"`
+	MinP          *float32         `json:"min_p"`
+	RepeatPenalty *float32         `json:"repeat_penalty"`
+	Seed          *uint64          `json:"seed"`
+	SystemPrompt  *string          `json:"system_prompt"`
+	Stop          any              `json:"stop"`
+	Tools         []ToolDefinition `json:"tools"`
+	ToolChoice    any              `json:"tool_choice"`
 }
 
 func (g GenerateRequest) ToMessagesAndOptions(def GenerationOptions) ([]ChatMessage, GenerationOptions) {
-	options := applyRequestOptions(def, g.MaxTokens, firstFloat(g.Temp, g.Temperature), g.TopP, g.TopK, g.MinP, g.RepeatPenalty, g.Seed, g.SystemPrompt, g.Stop)
+	options := applyRequestOptions(def, g.MaxTokens, firstFloat(g.Temp, g.Temperature), g.TopP, g.TopK, g.MinP, g.RepeatPenalty, g.Seed, g.SystemPrompt, g.Stop, g.Tools, normalizeToolChoice(g.ToolChoice))
 	if len(g.Messages) > 0 {
 		return apiMessages(g.Messages), options
 	}
@@ -370,8 +396,11 @@ func (g GenerateRequest) ToMessagesAndOptions(def GenerationOptions) ([]ChatMess
 }
 
 type APIMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
 }
 
 func apiMessages(items []APIMessage) []ChatMessage {
@@ -383,10 +412,28 @@ func apiMessages(items []APIMessage) []ChatMessage {
 			role = ChatRoleSystem
 		case "assistant":
 			role = ChatRoleAssistant
+		case "tool", "function", "ipython":
+			role = ChatRoleTool
 		}
-		out = append(out, ChatMessage{Role: role, Content: contentText(item.Content)})
+		out = append(out, ChatMessage{Role: role, Content: contentText(item.Content), ToolCalls: item.ToolCalls, ToolCallID: item.ToolCallID, Name: item.Name})
 	}
 	return out
+}
+
+// alwaysContinue is passed to RunAgenticChat by non-streaming handlers, which
+// only care about the returned GenerationResult, not incremental delivery.
+func alwaysContinue(string) bool { return true }
+
+// normalizeToolChoice extracts the OpenAI-compatible "tool_choice" value's
+// meaning that this server actually acts on. A literal "none" suppresses tool
+// offering; every other form (the default "auto", "required", or an object
+// forcing a specific tool) is treated as "offer the tools" since GopherLLM
+// has no constrained decoding to force a specific one.
+func normalizeToolChoice(raw any) string {
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	return ""
 }
 
 func contentText(v any) string {
@@ -412,19 +459,21 @@ func contentText(v any) string {
 }
 
 type OpenAIChatRequest struct {
-	Model               string       `json:"model"`
-	Messages            []APIMessage `json:"messages"`
-	Stream              bool         `json:"stream"`
-	MaxTokens           *int         `json:"max_tokens"`
-	MaxCompletionTokens *int         `json:"max_completion_tokens"`
-	Temperature         *float32     `json:"temperature"`
-	TopP                *float32     `json:"top_p"`
-	TopK                *int         `json:"top_k"`
-	MinP                *float32     `json:"min_p"`
-	RepeatPenalty       *float32     `json:"repeat_penalty"`
-	Seed                *uint64      `json:"seed"`
-	SystemPrompt        *string      `json:"system_prompt"`
-	Stop                any          `json:"stop"`
+	Model               string           `json:"model"`
+	Messages            []APIMessage     `json:"messages"`
+	Stream              bool             `json:"stream"`
+	MaxTokens           *int             `json:"max_tokens"`
+	MaxCompletionTokens *int             `json:"max_completion_tokens"`
+	Temperature         *float32         `json:"temperature"`
+	TopP                *float32         `json:"top_p"`
+	TopK                *int             `json:"top_k"`
+	MinP                *float32         `json:"min_p"`
+	RepeatPenalty       *float32         `json:"repeat_penalty"`
+	Seed                *uint64          `json:"seed"`
+	SystemPrompt        *string          `json:"system_prompt"`
+	Stop                any              `json:"stop"`
+	Tools               []ToolDefinition `json:"tools"`
+	ToolChoice          any              `json:"tool_choice"`
 }
 
 func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
@@ -432,7 +481,7 @@ func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
 	}
-	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop)
+	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop, o.Tools, normalizeToolChoice(o.ToolChoice))
 }
 
 func (o OpenAIChatRequest) ChatMessages() []ChatMessage { return apiMessages(o.Messages) }
@@ -471,7 +520,7 @@ func (o OpenAICompletionRequest) Options(def GenerationOptions) GenerationOption
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
 	}
-	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop)
+	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop, nil, "")
 }
 
 type EmbeddingsRequest struct {
@@ -510,18 +559,19 @@ func (o OllamaGenerateRequest) GenerationOptions(def GenerationOptions) Generati
 	if o.System != "" {
 		system = &o.System
 	}
-	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, system, firstStop(o.Stop, o.Options.Stop))
+	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, system, firstStop(o.Stop, o.Options.Stop), nil, "")
 }
 
 type OllamaChatRequest struct {
-	Model    string          `json:"model"`
-	Messages []OllamaMessage `json:"messages"`
-	Stream   bool            `json:"stream"`
-	Options  OllamaOptions   `json:"options"`
+	Model    string           `json:"model"`
+	Messages []OllamaMessage  `json:"messages"`
+	Stream   bool             `json:"stream"`
+	Options  OllamaOptions    `json:"options"`
+	Tools    []ToolDefinition `json:"tools"`
 }
 
 func (o OllamaChatRequest) GenerationOptions(def GenerationOptions) GenerationOptions {
-	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, nil, o.Options.Stop)
+	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, nil, o.Options.Stop, o.Tools, "")
 }
 
 func (o OllamaChatRequest) ChatMessages() []ChatMessage {
@@ -558,7 +608,7 @@ func (o OllamaEmbeddingRequest) Inputs() []string {
 	return EmbeddingsRequest{Input: o.Input}.Inputs()
 }
 
-func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, topP *float32, topK *int, minP *float32, repeat *float32, seed *uint64, system *string, stop any) GenerationOptions {
+func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, topP *float32, topK *int, minP *float32, repeat *float32, seed *uint64, system *string, stop any, tools []ToolDefinition, toolChoice string) GenerationOptions {
 	o := def
 	if maxTokens != nil {
 		o.MaxTokens = *maxTokens
@@ -586,6 +636,12 @@ func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, t
 	}
 	if parsed, ok := parseStop(stop); ok {
 		o.StopSequences = parsed
+	}
+	if len(tools) > 0 {
+		o.Tools = tools
+	}
+	if toolChoice != "" {
+		o.ToolChoice = toolChoice
 	}
 	return o
 }
@@ -636,7 +692,16 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func streamOpenAIChat(w http.ResponseWriter, req *http.Request, r *Runner, model string, messages []ChatMessage, options GenerationOptions) {
+// streamOpenAIChat streams a chat completion via SSE. Content deltas flow
+// incrementally exactly as before whenever no tool call could possibly be in
+// play; once skills or caller tools are active, RunAgenticChat buffers the
+// winning turn and calls onToken once with the final, already-classified
+// content, so raw tool-call syntax never leaks into a content delta (see
+// RunAgenticChat's doc comment). Either way, the connection ends with one
+// terminal chunk carrying finish_reason, usage, and — when present —
+// reasoning_content and tool_calls, computed from the authoritative final
+// GenerationResult rather than reconstructed from what was streamed.
+func streamOpenAIChat(w http.ResponseWriter, req *http.Request, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -649,17 +714,17 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, r *Runner, model
 
 	id := fmt.Sprintf("chatcmpl-gopherllm-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
-	if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]string{"role": "assistant"}, nil); err != nil {
+	if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
 		return
 	}
 
 	var streamErr error
-	result, err := r.GenerateChatStreamUntil(messages, options, func(text string) bool {
+	result, err := RunAgenticChat(r, messages, options, skills, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
 		}
-		if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]string{"content": text}, nil); err != nil {
+		if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{"content": text}, nil); err != nil {
 			streamErr = err
 			return false
 		}
@@ -675,13 +740,19 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, r *Runner, model
 		writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
 		return
 	}
-	usage := usage(result)
-	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]string{}, map[string]any{"finish_reason": "stop", "usage": usage})
+	finalDelta := map[string]any{}
+	if result.ReasoningText != "" {
+		finalDelta["reasoning_content"] = result.ReasoningText
+	}
+	if len(result.ToolCalls) > 0 {
+		finalDelta["tool_calls"] = result.ToolCalls
+	}
+	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason), "usage": usage(result)})
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
-func writeOpenAIStreamChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, delta map[string]string, extra map[string]any) error {
+func writeOpenAIStreamChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, delta map[string]any, extra map[string]any) error {
 	choice := map[string]any{"index": 0, "delta": delta}
 	for k, v := range extra {
 		choice[k] = v
@@ -713,11 +784,38 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, v any) 
 }
 
 func generateResponse(result GenerationResult) map[string]any {
-	return map[string]any{"text": result.Text, "prompt_tokens": result.Stats.PromptTokens, "generated_tokens": result.Stats.GeneratedTokens, "prefill_ms": result.Stats.PrefillTime.Milliseconds(), "decode_ms": result.Stats.DecodeTime.Milliseconds(), "total_ms": result.Stats.TotalTime.Milliseconds()}
+	resp := map[string]any{"text": result.Text, "prompt_tokens": result.Stats.PromptTokens, "generated_tokens": result.Stats.GeneratedTokens, "prefill_ms": result.Stats.PrefillTime.Milliseconds(), "decode_ms": result.Stats.DecodeTime.Milliseconds(), "total_ms": result.Stats.TotalTime.Milliseconds(), "finish_reason": finishReasonOrDefault(result.FinishReason)}
+	if result.ReasoningText != "" {
+		resp["reasoning"] = result.ReasoningText
+	}
+	if len(result.ToolCalls) > 0 {
+		resp["tool_calls"] = result.ToolCalls
+	}
+	return resp
 }
 
 func openAIChatResponse(model string, result GenerationResult) map[string]any {
-	return map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": map[string]any{"role": "assistant", "content": result.Text}, "finish_reason": "stop"}}, "usage": usage(result)}
+	message := map[string]any{"role": "assistant", "content": result.Text}
+	if len(result.ToolCalls) > 0 {
+		message["tool_calls"] = result.ToolCalls
+		if result.Text == "" {
+			message["content"] = nil
+		}
+	}
+	if result.ReasoningText != "" {
+		message["reasoning_content"] = result.ReasoningText
+	}
+	return map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
+}
+
+// finishReasonOrDefault falls back to "stop" for callers of GenerateResult
+// that predate FinishReason (in-tree, only GenerationResult zero values hit
+// this) so every response always carries a valid OpenAI-shaped finish_reason.
+func finishReasonOrDefault(reason string) string {
+	if reason == "" {
+		return "stop"
+	}
+	return reason
 }
 
 func usage(result GenerationResult) map[string]int {

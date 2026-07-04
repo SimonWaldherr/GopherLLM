@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,28 @@ func TestGenerateTinyModelDeterministic(t *testing.T) {
 	}
 	if a.Text != b.Text {
 		t.Fatalf("greedy output not deterministic: %q vs %q", a.Text, b.Text)
+	}
+}
+
+// TestGenerateRejectsPromptExceedingContextLength guards against a real crash
+// that was possible before this check existed: a prompt at or beyond
+// MaxSeqLen silently overflowed the KV cache (sized to MaxSeqLen) deeper in
+// the forward pass instead of failing here with a clear error. Long tool
+// listings make this easy to reach in practice, not just a theoretical edge.
+func TestGenerateRejectsPromptExceedingContextLength(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	longPrompt := strings.Repeat("a b c d e f g h i j ", r.config.MaxSeqLen)
+	opts := DefaultGenerationOptions()
+	opts.MaxTokens = 4
+	opts.SystemPrompt = ""
+	if _, err := r.Generate(longPrompt, opts); err == nil {
+		t.Fatal("expected an error for a prompt exceeding the model's context length, got nil")
+	}
+	if _, err := r.Embed(longPrompt); err == nil {
+		t.Fatal("expected an error from Embed for an over-length input, got nil")
 	}
 }
 
