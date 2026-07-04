@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 // Metal acceleration in the Rust project uses Objective-C and therefore CGO
 // in a Go port. GopherLLM keeps the public shape but uses pure-Go fallbacks.

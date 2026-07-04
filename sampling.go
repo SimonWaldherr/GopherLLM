@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 // Token sampling. The pipeline applied to each step's logits, in order:
 //

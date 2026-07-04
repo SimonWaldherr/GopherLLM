@@ -21,7 +21,7 @@
 //   - catalog.go    model discovery/selection in a models directory
 //   - server.go     HTTP API
 //   - main.go       CLI flag parsing and command dispatch
-package main
+package gopherllm
 
 import (
 	"io"

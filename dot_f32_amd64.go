@@ -1,6 +1,6 @@
 //go:build amd64
 
-package main
+package gopherllm
 
 // dotF32AVX2 computes the dot product of the overlapping prefix of a and b
 // using AVX2 + FMA. Implemented in dot_f32_amd64.s.

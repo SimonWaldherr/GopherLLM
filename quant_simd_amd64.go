@@ -1,6 +1,6 @@
 //go:build amd64
 
-package main
+package gopherllm
 
 // hasQuantSIMD gates the AVX2 quantized dot-product fast paths on amd64. It
 // mirrors hasAVX2 so callers fall back to the portable scalar kernels when the

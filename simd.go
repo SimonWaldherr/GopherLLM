@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 // CPU compute kernels: dot products and matrix-vector products over the
 // quantized block formats (layouts documented on GGMLType.DataSize),

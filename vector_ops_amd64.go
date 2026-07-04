@@ -1,6 +1,6 @@
 //go:build amd64
 
-package main
+package gopherllm
 
 //go:noescape
 func axpyF32AVX2(out []float32, alpha float32, x []float32)

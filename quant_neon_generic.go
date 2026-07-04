@@ -1,6 +1,6 @@
 //go:build !arm64 && !amd64
 
-package main
+package gopherllm
 
 const hasQuantSIMD = false
 

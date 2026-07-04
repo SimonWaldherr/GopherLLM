@@ -1,6 +1,6 @@
 //go:build amd64
 
-package main
+package gopherllm
 
 import (
 	"math"

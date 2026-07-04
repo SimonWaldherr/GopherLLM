@@ -1,6 +1,6 @@
 //go:build !amd64
 
-package main
+package gopherllm
 
 // The int8-activation Q4_K path is amd64-only (it relies on VPMADDUBSW). On
 // other targets useQ8Activations is a compile-time false, so these stubs are

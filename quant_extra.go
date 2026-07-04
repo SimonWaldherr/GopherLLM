@@ -1,4 +1,4 @@
-package main
+package gopherllm
 
 // Compatibility kernels for the less-common GGUF quantization formats:
 // the legacy simple quants Q4_1/Q5_0/Q5_1/Q8_1 and the small K-quants
