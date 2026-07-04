@@ -62,6 +62,9 @@ func (o GenerationOptions) Validate() error {
 	if o.Sampler.TopK < 0 {
 		return fmt.Errorf("top_k must be greater than or equal to 0")
 	}
+	if !finite32(o.Sampler.MinP) || o.Sampler.MinP < 0 || o.Sampler.MinP > 1 {
+		return fmt.Errorf("min_p must be in the range [0, 1]")
+	}
 	if !finite32(o.Sampler.RepeatPenalty) || o.Sampler.RepeatPenalty <= 0 {
 		return fmt.Errorf("repeat_penalty must be a finite number > 0")
 	}
@@ -113,7 +116,8 @@ type Runner struct {
 
 func ArchitectureSupported(arch string) bool {
 	switch arch {
-	case "llama", "llama2", "llama3", "mistral", "mistral3", "qwen2", "gpt-oss", "gemma", "gemma2", "gemma4":
+	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
+		"qwen2", "gpt-oss", "gemma", "gemma2", "gemma4":
 		return true
 	default:
 		return false
@@ -421,6 +425,10 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string) []u
 		return r.renderGptOssMessages(messages, systemPrompt)
 	}
 	switch r.chatTemplateKind() {
+	case "mistral-inst":
+		if tokens, ok := r.renderMistralInstMessages(messages, systemPrompt); ok {
+			return tokens
+		}
 	case "header-chat":
 		if tokens, ok := r.renderHeaderChatMessages(messages, systemPrompt); ok {
 			return tokens
@@ -500,6 +508,72 @@ func (r *Runner) renderGptOssMessages(messages []ChatMessage, systemPrompt strin
 	}
 	tokens = append(tokens, start, assistant, channel, finalTok, message)
 	return tokens
+}
+
+// renderMistralInstMessages renders the Mistral/Ministral instruct format:
+//
+//	<s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{user}[/INST]{assistant}</s>...
+//
+// [INST]/[/INST] (and, on newer Tekken vocabularies, [SYSTEM_PROMPT]/
+// [/SYSTEM_PROMPT]) are emitted as control tokens. When the vocabulary lacks the
+// dedicated system-prompt tokens we fall back to the older Mistral 2410 behavior
+// of folding the system prompt into the final user turn.
+func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	instTok, ok1 := r.tok.SpecialID("[INST]")
+	instEndTok, ok2 := r.tok.SpecialID("[/INST]")
+	if !(ok1 && ok2) {
+		return nil, false
+	}
+	sysStart, sysEnd, hasSysTokens := r.systemPromptTokens()
+
+	system := strings.TrimSpace(systemPrompt)
+	loop := make([]ChatMessage, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == ChatRoleSystem {
+			if s := strings.TrimSpace(m.Content); s != "" {
+				system = s
+			}
+			continue
+		}
+		loop = append(loop, m)
+	}
+	lastUser := -1
+	for i, m := range loop {
+		if m.Role == ChatRoleUser {
+			lastUser = i
+		}
+	}
+
+	tokens := []uint32{}
+	if r.tok.AddBOS {
+		tokens = append(tokens, r.tok.BOSID)
+	}
+	if system != "" && hasSysTokens {
+		tokens = append(tokens, sysStart)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(system)...)
+		tokens = append(tokens, sysEnd)
+	}
+	for i, m := range loop {
+		if m.Role == ChatRoleAssistant {
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(strings.TrimSpace(m.Content))...)
+			tokens = append(tokens, r.tok.EOSID)
+			continue
+		}
+		content := strings.TrimSpace(m.Content)
+		if i == lastUser && system != "" && !hasSysTokens {
+			content = system + "\n\n" + content
+		}
+		tokens = append(tokens, instTok)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
+		tokens = append(tokens, instEndTok)
+	}
+	return tokens, true
+}
+
+func (r *Runner) systemPromptTokens() (start, end uint32, ok bool) {
+	s, ok1 := r.tok.SpecialID("[SYSTEM_PROMPT]")
+	e, ok2 := r.tok.SpecialID("[/SYSTEM_PROMPT]")
+	return s, e, ok1 && ok2
 }
 
 func (r *Runner) renderHeaderChatMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
@@ -688,6 +762,8 @@ func (r *Runner) chatTemplateKind() string {
 	if v, ok := r.gguf.Metadata["tokenizer.chat_template"]; ok {
 		if s, ok := v.AsString(); ok {
 			switch {
+			case strings.Contains(s, "[INST]") && strings.Contains(s, "[/INST]"):
+				return "mistral-inst"
 			case strings.Contains(s, "<|start_header_id|>") && strings.Contains(s, "<|eot_id|>"):
 				return "header-chat"
 			case strings.Contains(s, "<|im_start|>") && strings.Contains(s, "<|im_end|>"):
@@ -699,6 +775,11 @@ func (r *Runner) chatTemplateKind() string {
 			case strings.Contains(s, "<|start_of_role|>") && strings.Contains(s, "<|end_of_role|>"):
 				return "granite-chat"
 			}
+		}
+	}
+	if _, ok := r.tok.SpecialID("[INST]"); ok {
+		if _, ok := r.tok.SpecialID("[/INST]"); ok {
+			return "mistral-inst"
 		}
 	}
 	if _, ok := r.tok.SpecialID("<|im_start|>"); ok {

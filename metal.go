@@ -32,6 +32,22 @@ func Q4KMatvec3IntoWithXSums(wq, wk, wv Q4KMatrix, x []float32, xSums *[]float32
 	qRows := wq.Rows
 	kRows := wk.Rows
 	totalRows := qRows + kRows + wv.Rows
+	if useQ8Activations {
+		q8, xsc, release := acquireQ8(x, wq.Cols)
+		parallelRows(totalRows, func(start, end int) {
+			if qs, qe := clippedRange(start, end, 0, qRows); qs < qe {
+				dotQ4KRowsQ8(wq.Data, q8, xsc, xs, wq.Cols, qRowBytes, qs, qe, *q)
+			}
+			if ks, ke := clippedRange(start, end, qRows, qRows+kRows); ks < ke {
+				dotQ4KRowsQ8(wk.Data, q8, xsc, xs, wk.Cols, kRowBytes, ks-qRows, ke-qRows, *k)
+			}
+			if vs, ve := clippedRange(start, end, qRows+kRows, totalRows); vs < ve {
+				dotQ4KRowsQ8(wv.Data, q8, xsc, xs, wv.Cols, vRowBytes, vs-qRows-kRows, ve-qRows-kRows, *v)
+			}
+		})
+		release()
+		return true
+	}
 	parallelRows(totalRows, func(start, end int) {
 		if qs, qe := clippedRange(start, end, 0, qRows); qs < qe {
 			dotQ4KRowsWithXSums(wq.Data, x, xs, wq.Cols, qRowBytes, qs, qe, *q)

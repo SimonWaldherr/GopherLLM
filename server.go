@@ -354,6 +354,7 @@ type GenerateRequest struct {
 	Temperature   *float32     `json:"temperature"`
 	TopP          *float32     `json:"top_p"`
 	TopK          *int         `json:"top_k"`
+	MinP          *float32     `json:"min_p"`
 	RepeatPenalty *float32     `json:"repeat_penalty"`
 	Seed          *uint64      `json:"seed"`
 	SystemPrompt  *string      `json:"system_prompt"`
@@ -361,7 +362,7 @@ type GenerateRequest struct {
 }
 
 func (g GenerateRequest) ToMessagesAndOptions(def GenerationOptions) ([]ChatMessage, GenerationOptions) {
-	options := applyRequestOptions(def, g.MaxTokens, firstFloat(g.Temp, g.Temperature), g.TopP, g.TopK, g.RepeatPenalty, g.Seed, g.SystemPrompt, g.Stop)
+	options := applyRequestOptions(def, g.MaxTokens, firstFloat(g.Temp, g.Temperature), g.TopP, g.TopK, g.MinP, g.RepeatPenalty, g.Seed, g.SystemPrompt, g.Stop)
 	if len(g.Messages) > 0 {
 		return apiMessages(g.Messages), options
 	}
@@ -419,6 +420,7 @@ type OpenAIChatRequest struct {
 	Temperature         *float32     `json:"temperature"`
 	TopP                *float32     `json:"top_p"`
 	TopK                *int         `json:"top_k"`
+	MinP                *float32     `json:"min_p"`
 	RepeatPenalty       *float32     `json:"repeat_penalty"`
 	Seed                *uint64      `json:"seed"`
 	SystemPrompt        *string      `json:"system_prompt"`
@@ -430,7 +432,7 @@ func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
 	}
-	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop)
+	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop)
 }
 
 func (o OpenAIChatRequest) ChatMessages() []ChatMessage { return apiMessages(o.Messages) }
@@ -443,6 +445,7 @@ type OpenAICompletionRequest struct {
 	Temperature         *float32 `json:"temperature"`
 	TopP                *float32 `json:"top_p"`
 	TopK                *int     `json:"top_k"`
+	MinP                *float32 `json:"min_p"`
 	RepeatPenalty       *float32 `json:"repeat_penalty"`
 	Seed                *uint64  `json:"seed"`
 	SystemPrompt        *string  `json:"system_prompt"`
@@ -468,7 +471,7 @@ func (o OpenAICompletionRequest) Options(def GenerationOptions) GenerationOption
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
 	}
-	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop)
+	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop)
 }
 
 type EmbeddingsRequest struct {
@@ -507,7 +510,7 @@ func (o OllamaGenerateRequest) GenerationOptions(def GenerationOptions) Generati
 	if o.System != "" {
 		system = &o.System
 	}
-	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.RepeatPenalty, o.Options.Seed, system, firstStop(o.Stop, o.Options.Stop))
+	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, system, firstStop(o.Stop, o.Options.Stop))
 }
 
 type OllamaChatRequest struct {
@@ -518,7 +521,7 @@ type OllamaChatRequest struct {
 }
 
 func (o OllamaChatRequest) GenerationOptions(def GenerationOptions) GenerationOptions {
-	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.RepeatPenalty, o.Options.Seed, nil, o.Options.Stop)
+	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, nil, o.Options.Stop)
 }
 
 func (o OllamaChatRequest) ChatMessages() []ChatMessage {
@@ -539,6 +542,7 @@ type OllamaOptions struct {
 	Temperature   *float32 `json:"temperature"`
 	TopP          *float32 `json:"top_p"`
 	TopK          *int     `json:"top_k"`
+	MinP          *float32 `json:"min_p"`
 	RepeatPenalty *float32 `json:"repeat_penalty"`
 	Seed          *uint64  `json:"seed"`
 	Stop          any      `json:"stop"`
@@ -554,7 +558,7 @@ func (o OllamaEmbeddingRequest) Inputs() []string {
 	return EmbeddingsRequest{Input: o.Input}.Inputs()
 }
 
-func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, topP *float32, topK *int, repeat *float32, seed *uint64, system *string, stop any) GenerationOptions {
+func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, topP *float32, topK *int, minP *float32, repeat *float32, seed *uint64, system *string, stop any) GenerationOptions {
 	o := def
 	if maxTokens != nil {
 		o.MaxTokens = *maxTokens
@@ -567,6 +571,9 @@ func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, t
 	}
 	if topK != nil {
 		o.Sampler.TopK = *topK
+	}
+	if minP != nil {
+		o.Sampler.MinP = *minP
 	}
 	if repeat != nil {
 		o.Sampler.RepeatPenalty = *repeat

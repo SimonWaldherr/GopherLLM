@@ -179,9 +179,17 @@ func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)
-		parallelRows(rows, func(start, end int) {
-			dotQ4KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
-		})
+		if useQ8Activations {
+			q8, xsc, release := acquireQ8(x, cols)
+			parallelRows(rows, func(start, end int) {
+				dotQ4KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
+			})
+			release()
+		} else {
+			parallelRows(rows, func(start, end int) {
+				dotQ4KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
+			})
+		}
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return
@@ -211,6 +219,19 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 	ensureLenNoClear(bOut, bRows)
 	xs := fillQ4KXSums(x, aCols, xSums)
 	totalRows := aRows + bRows
+	if useQ8Activations {
+		q8, xsc, release := acquireQ8(x, aCols)
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ4KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
+				dotQ4KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			}
+		})
+		release()
+		return true
+	}
 	parallelRows(totalRows, func(start, end int) {
 		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
 			dotQ4KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
@@ -220,13 +241,6 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 		}
 	})
 	return true
-}
-
-func dotQ4KRows(data []byte, x []float32, cols, rowBytes, start, end int, out []float32) {
-	for r := start; r < end; r++ {
-		off := r * rowBytes
-		out[r] = DotQ4KF32(data[off:off+rowBytes], x, cols)
-	}
 }
 
 func dotQ4KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start, end int, out []float32) {
@@ -333,13 +347,13 @@ func dotQ6KRows(data []byte, x []float32, cols, rowBytes, start, end int, out []
 }
 
 func dotQ6KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start, end int, out []float32) {
-	if !hasQuantNEON {
+	if !hasQuantSIMD {
 		dotQ6KRows(data, x, cols, rowBytes, start, end, out)
 		return
 	}
 	for r := start; r < end; r++ {
 		off := r * rowBytes
-		out[r] = dotQ6KF32NEONWithXSums(data[off:off+rowBytes], x, xsums, cols)
+		out[r] = dotQ6KF32SIMDWithXSums(data[off:off+rowBytes], x, xsums, cols)
 	}
 }
 
@@ -349,7 +363,7 @@ func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
 	groups := cols / 16
 	ensureLenNoClear(scratch, groups)
 	out := *scratch
-	if hasQuantNEON && groups > 0 && len(x) >= groups*16 {
+	if hasQuantSIMD && groups > 0 && len(x) >= groups*16 {
 		sumF32Groups16(&x[0], &out[0], groups)
 		return out
 	}
@@ -373,9 +387,9 @@ func fillQ6KXSums16(x []float32, cols int, scratch *[]float32) []float32 {
 	return out
 }
 
-// dotQ6KF32NEONWithXSums computes a Q6_K row dot product using the NEON
+// dotQ6KF32SIMDWithXSums computes a Q6_K row dot product using the SIMD
 // block kernel. xsums must hold per-16-element sums of x (fillQ6KXSums16).
-func dotQ6KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
+func dotQ6KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [16]float32
 	var sum float32
 	blocks := cols / 256
@@ -621,7 +635,7 @@ func fillQ4KXSums(x []float32, cols int, scratch *[]float32) []float32 {
 	groups := cols / 32
 	ensureLenNoClear(scratch, groups)
 	out := *scratch
-	if hasQuantNEON && groups > 0 && len(x) >= groups*32 {
+	if hasQuantSIMD && groups > 0 && len(x) >= groups*32 {
 		sumF32Groups32(&x[0], &out[0], groups)
 		return out
 	}
@@ -646,15 +660,15 @@ func fillQ4KXSums(x []float32, cols int, scratch *[]float32) []float32 {
 }
 
 func dotQ4KF32WithXSums(row []byte, x, xsums []float32, cols int) float32 {
-	if hasQuantNEON && cols > 0 && cols%256 == 0 && len(x) >= cols && len(xsums) >= cols/32 {
-		return dotQ4KF32NEONWithXSums(row, x, xsums, cols)
+	if hasQuantSIMD && cols > 0 && cols%256 == 0 && len(x) >= cols && len(xsums) >= cols/32 {
+		return dotQ4KF32SIMDWithXSums(row, x, xsums, cols)
 	}
 	return dotQ4KF32ScalarWithXSums(row, x, xsums, cols)
 }
 
-// dotQ4KF32NEONWithXSums computes a Q4_K row dot product using the NEON
+// dotQ4KF32SIMDWithXSums computes a Q4_K row dot product using the SIMD
 // block kernel. xsums must hold per-32-element sums of x (fillQ4KXSums).
-func dotQ4KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
+func dotQ4KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [8]float32
 	var sum float32
 	blocks := cols / 256
@@ -668,6 +682,8 @@ func dotQ4KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 		dmin := F16ToF32(binaryLE16(block[2:]))
 		scales := block[4:16]
 		q4kQDots8(&block[16], &x[b*256], &qdots[0])
+		// The 8-wide combine is left in scalar: benchmarking an AVX2 variant
+		// showed the horizontal reductions cost more than 8 FMAs at this width.
 		for step := 0; step < 4; step++ {
 			is := step * 2
 			var sc1, m1, sc2, m2 byte
@@ -1408,10 +1424,6 @@ func getScaleMinK4(j int, q []byte) (byte, byte) {
 		return q[j] & 63, q[j+4] & 63
 	}
 	return (q[j+4] & 0x0f) | ((q[j-4] >> 6) << 4), (q[j+4] >> 4) | ((q[j] >> 6) << 4)
-}
-
-func mxfp4Value(v byte) float32 {
-	return mxfp4LUT[v&0x0f]
 }
 
 func parallelRows(rows int, fn func(start, end int)) {

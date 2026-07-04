@@ -68,6 +68,40 @@ func TestTopPWithoutTopKUsesTopMassOnly(t *testing.T) {
 	}
 }
 
+func TestMinPExcludesLowProbabilityTokens(t *testing.T) {
+	// exp(9-10) ≈ 0.368 of the peak; a 0.5 threshold drops everything but token 0.
+	rng := NewRng(42)
+	scratch := make([]TokenProb, 0, 8)
+
+	// Full path (top_k disabled, top_p disabled): min-p must still apply.
+	full := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0.5, RepeatPenalty: 1}
+	for range 64 {
+		logits := []float32{10, 9, 1, 0}
+		if token := SampleWithScratch(logits, full, rng, nil, &scratch); token != 0 {
+			t.Fatalf("full-path min_p token = %d, want 0", token)
+		}
+	}
+
+	// Top-k path exercises the other cutoff branch.
+	topk := SamplerConfig{Temperature: 1, TopP: 1, TopK: 3, MinP: 0.5, RepeatPenalty: 1}
+	for range 64 {
+		logits := []float32{10, 9, 1, 0}
+		if token := SampleWithScratch(logits, topk, rng, nil, &scratch); token != 0 {
+			t.Fatalf("top-k min_p token = %d, want 0", token)
+		}
+	}
+
+	// A gentler threshold keeps the top two but never the tail.
+	gentle := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0.3, RepeatPenalty: 1}
+	for range 128 {
+		logits := []float32{10, 9, 1, 0}
+		token := SampleWithScratch(logits, gentle, rng, nil, &scratch)
+		if token != 0 && token != 1 {
+			t.Fatalf("gentle min_p token = %d, want 0 or 1", token)
+		}
+	}
+}
+
 func TestSortTokenProbsOrdersByProbabilityThenToken(t *testing.T) {
 	candidates := []TokenProb{
 		{Token: 4, Prob: 0.2},

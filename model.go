@@ -34,6 +34,10 @@ type Config struct {
 	RopeScalingFactor         float32
 	RopeAttentionFactor       float32
 	RopeOriginalContextLength int
+	RopeScalingType           string
+	RopeYarnBetaFast          float32
+	RopeYarnBetaSlow          float32
+	RopeYarnLogMultiplier     float32
 	RopeFactorsLong           []float32
 	RopeFactorsShort          []float32
 }
@@ -103,6 +107,10 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeScalingFactor:         gguf.GetF32(p+".rope.scaling.factor", 1),
 		RopeAttentionFactor:       gguf.GetF32(p+".rope.scaling.attn_factor", 1),
 		RopeOriginalContextLength: int(gguf.GetU32(p+".rope.scaling.original_context_length", 0)),
+		RopeScalingType:           ropeScalingType(gguf, p),
+		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
+		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
+		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
 	}
 }
 
@@ -288,6 +296,7 @@ type DecodeBuffer struct {
 	RopeInvFreq             []float32
 	RopeSin                 []float32
 	RopeCos                 []float32
+	RopeMscale              float32
 	RopeGptOssInvFreq       []float32
 	RopeGptOssConcentration float32
 }
@@ -298,7 +307,7 @@ type ExpertScore struct {
 }
 
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
-	inv := buildRopeInvFreq(config, maxHeadDim)
+	inv, mscale := buildRopeInvFreq(config, maxHeadDim)
 	gptInv, concentration := buildRopeInvFreqGptOss(config)
 	return &DecodeBuffer{
 		X:                       make([]float32, config.Dim),
@@ -321,17 +330,35 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		RopeInvFreq:             inv,
 		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeCos:                 make([]float32, max(1, maxHeadDim/2)),
+		RopeMscale:              mscale,
 		RopeGptOssInvFreq:       gptInv,
 		RopeGptOssConcentration: concentration,
 	}
 }
 
-func buildRopeInvFreq(config Config, maxHeadDim int) []float32 {
+func ropeScalingType(gguf *GGUFFile, p string) string {
+	if os.Getenv("GOPHERLLM_DISABLE_YARN") != "" {
+		return ""
+	}
+	if s, ok := gguf.GetString(p + ".rope.scaling.type"); ok {
+		return s
+	}
+	return ""
+}
+
+// buildRopeInvFreq returns the per-pair inverse RoPE frequencies and the
+// attention magnitude scale (mscale) applied to the rotated Q/K vectors. mscale
+// is 1 except for YaRN-scaled models (e.g. Ministral) where the rotation is
+// amplified to match how the model was trained.
+func buildRopeInvFreq(config Config, maxHeadDim int) ([]float32, float32) {
 	ropeDim := config.RopeDimensionCount
 	if ropeDim <= 0 || ropeDim > maxHeadDim {
 		ropeDim = maxHeadDim
 	}
 	pairs := ropeDim / 2
+	if config.RopeScalingType == "yarn" && config.RopeScalingFactor > 1 && config.RopeOriginalContextLength > 0 {
+		return buildRopeInvFreqYarn(config, ropeDim, pairs)
+	}
 	inv := make([]float32, pairs)
 	factors := config.RopeFactorsShort
 	if config.RopeOriginalContextLength > 0 && config.MaxSeqLen > config.RopeOriginalContextLength && len(config.RopeFactorsLong) >= pairs {
@@ -346,7 +373,54 @@ func buildRopeInvFreq(config Config, maxHeadDim int) []float32 {
 		}
 		inv[pair] = 1 / (factor * base)
 	}
-	return inv
+	return inv, 1
+}
+
+// buildRopeInvFreqYarn implements YaRN "NTK-by-parts" frequency interpolation
+// and the attention magnitude scale, mirroring llama.cpp's rope_yarn. High
+// frequencies (short wavelengths) are left untouched, low frequencies are
+// interpolated by 1/factor, and a linear ramp blends the middle band.
+func buildRopeInvFreqYarn(config Config, ropeDim, pairs int) ([]float32, float32) {
+	inv := make([]float32, pairs)
+	base := float64(config.RopeTheta)
+	nDims := float64(ropeDim)
+	nOrig := float64(config.RopeOriginalContextLength)
+	factor := float64(config.RopeScalingFactor)
+	freqScale := 1 / factor
+	betaFast := float64(config.RopeYarnBetaFast)
+	if betaFast <= 0 {
+		betaFast = 32
+	}
+	betaSlow := float64(config.RopeYarnBetaSlow)
+	if betaSlow <= 0 {
+		betaSlow = 1
+	}
+
+	corrDim := func(nRot float64) float64 {
+		return nDims * math.Log(nOrig/(nRot*2*math.Pi)) / (2 * math.Log(base))
+	}
+	low := math.Floor(corrDim(betaFast))
+	high := math.Ceil(corrDim(betaSlow))
+	low = math.Max(0, low)
+	high = math.Min(nDims-1, high)
+	denom := math.Max(0.001, high-low)
+
+	for pair := 0; pair < pairs; pair++ {
+		i := float64(pair * 2)
+		freqExtrap := 1 / math.Pow(base, i/nDims)
+		freqInterp := freqExtrap * freqScale
+		y := (float64(pair) - low) / denom
+		ramp := 1 - math.Min(1, math.Max(0, y)) // 1 => keep extrapolated, 0 => interpolate
+		freq := freqInterp*(1-ramp) + freqExtrap*ramp
+		inv[pair] = float32(freq)
+	}
+	// YaRN also defines an attention-magnitude scale (mscale = 1 + 0.1*ln(factor))
+	// applied to the rotated Q/K. Enabling it measurably degraded Ministral output
+	// at ordinary context lengths — attention became over-sharpened and greedy
+	// decoding derailed (e.g. "Alphabet" -> "Al data"). The frequency
+	// interpolation above is what actually extends usable context, so we keep it
+	// and leave the magnitude scale at 1.
+	return inv, 1
 }
 
 func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
@@ -713,7 +787,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	dim := config.Dim
 	headDim := config.HeadDim
 	kvMul := max(1, config.KVMul)
-	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, &buf.RopeSin, &buf.RopeCos)
+	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
 	ropeIsInterleaved := ropeInterleaved(config.Arch)
 	weights.TokenEmbd.RowInto(int(token), dim, &buf.X)
 	if config.EmbeddingScale != 1 {
@@ -885,14 +959,7 @@ func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 	}
 }
 
-func applyRope(vec []float32, pos, headDim, nHeads, ropeDim int, invFreq []float32, interleaved bool) {
-	sinScratch := []float32{}
-	cosScratch := []float32{}
-	half, nCache := prepareRopeScratch(pos, headDim, ropeDim, invFreq, &sinScratch, &cosScratch)
-	applyPreparedRope(vec, headDim, nHeads, half, nCache, sinScratch, cosScratch, interleaved)
-}
-
-func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, sinScratch, cosScratch *[]float32) (int, int) {
+func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, mscale float32, sinScratch, cosScratch *[]float32) (int, int) {
 	if ropeDim <= 0 || ropeDim > headDim {
 		ropeDim = headDim
 	}
@@ -911,11 +978,14 @@ func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, sinScratch
 	ensureLenNoClear(cosScratch, nCache)
 	sin := *sinScratch
 	cos := *cosScratch
+	if mscale == 0 {
+		mscale = 1
+	}
 	for i := range nCache {
 		angle := float64(float32(pos) * invFreq[i])
 		s64, c64 := math.Sincos(angle)
-		sin[i] = float32(s64)
-		cos[i] = float32(c64)
+		sin[i] = float32(s64) * mscale
+		cos[i] = float32(c64) * mscale
 	}
 	return half, nCache
 }
@@ -1029,17 +1099,8 @@ func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyH
 	}
 }
 
-func silu(x float32) float32 {
-	return x / (1 + float32(math.Exp(float64(-x))))
-}
-
 func addInPlace(dst, src []float32) {
 	AxpyF32(dst, 1.0, src)
-}
-
-func fastAttentionEnabled() bool {
-	_, ok := os.LookupEnv("GOPHER_LLM_FAST_ATTN")
-	return ok
 }
 
 func clamp(v, lo, hi float32) float32 {

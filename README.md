@@ -6,9 +6,10 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 
 ## Features
 
-- Pure Go runtime with optional ARM64 assembly kernels.
+- Pure Go runtime with optional ARM64 (NEON) and x86-64 (AVX2 + FMA) assembly kernels.
 - Memory-mapped GGUF loading for fast startup and lower copy pressure.
 - Quantized matrix kernels for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, and MXFP4 tensors.
+- Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
 - CLI generation, REPL mode, embeddings, metadata inspection, and tensor listing.
 - HTTP API with `/generate`, `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/api/generate`, `/api/chat`, and `/api/embeddings`.
@@ -130,13 +131,26 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 
 - Use `--threads <N>` to set both GopherLLM worker threads and `GOMAXPROCS`.
 - Use `--temp 0 --top-k 1` for deterministic greedy output.
+- Use `--min-p <F>` (e.g. `0.05`) for min-p nucleus sampling; `0` disables it.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
   comparisons.
 - The runtime currently reports Metal as unavailable; inference runs through the Go
   and assembly CPU kernels.
+- On x86-64, `DotF32`, the F32 vector ops, and the Q4_K/Q6_K matvecs use AVX2 + FMA
+  kernels (auto-detected via CPUID). This gives roughly a 3x end-to-end decode
+  speedup over the scalar path on Q4_K_M models. Set `GOPHERLLM_DISABLE_SIMD=1` to
+  force the portable scalar kernels (useful for A/B benchmarking).
+- Set `GOPHERLLM_Q8_ACTIVATIONS=1` (x86-64, opt-in) to quantize activations to int8
+  and run the Q4_K matvecs with `VPMADDUBSW` integer dot products. This is roughly
+  1.15-1.2x faster on the Q4_K path at the cost of a small activation-quantization
+  error (output direction stays within cosine 0.999 of the float path). Off by
+  default so the float kernels remain bit-for-bit reproducible against the scalar
+  reference.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are spread
   across the worker pool at longer contexts, and matvec work is over-chunked so
   performance cores absorb efficiency-core stragglers.
+- Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
+  it.
 - See `OPTIMIZATION_LOG.md` for measured optimization attempts, including rejected
   Q6_K/NEON approaches that should not be retried without new evidence.
 
@@ -145,8 +159,13 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
-llama, llama2, llama3, mistral, mistral3, qwen2, gpt-oss, gemma, gemma2, gemma4
+llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, gpt-oss,
+gemma, gemma2, gemma4
 ```
+
+Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
+chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
+scaling when the GGUF declares it.
 
 Projector files such as `mmproj-*` are detected and excluded from text-model
 selection.

@@ -43,7 +43,7 @@ func TestApplyRequestOptionsPreservesDefaultStopsWhenStopOmitted(t *testing.T) {
 	def := DefaultGenerationOptions()
 	def.StopSequences = []string{"</s>"}
 
-	got := applyRequestOptions(def, nil, nil, nil, nil, nil, nil, nil, nil)
+	got := applyRequestOptions(def, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	if len(got.StopSequences) != 1 || got.StopSequences[0] != "</s>" {
 		t.Fatalf("stop sequences = %#v", got.StopSequences)
 	}
@@ -53,7 +53,7 @@ func TestApplyRequestOptionsOverridesStopsWhenProvided(t *testing.T) {
 	def := DefaultGenerationOptions()
 	def.StopSequences = []string{"</s>"}
 
-	got := applyRequestOptions(def, nil, nil, nil, nil, nil, nil, nil, []any{"END", "STOP"})
+	got := applyRequestOptions(def, nil, nil, nil, nil, nil, nil, nil, nil, []any{"END", "STOP"})
 	if len(got.StopSequences) != 2 || got.StopSequences[0] != "END" || got.StopSequences[1] != "STOP" {
 		t.Fatalf("stop sequences = %#v", got.StopSequences)
 	}

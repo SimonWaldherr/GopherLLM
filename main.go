@@ -33,6 +33,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
 	fmt.Fprintln(os.Stderr, "  --top-p <F>               Nucleus sampling threshold (default: 0.9)")
 	fmt.Fprintln(os.Stderr, "  --top-k <N>               Top-K filtering (default: 40)")
+	fmt.Fprintln(os.Stderr, "  --min-p <F>               Min-P sampling threshold (default: 0, disabled)")
 	fmt.Fprintln(os.Stderr, "  --repeat-penalty <F>      Repetition penalty (default: 1.1)")
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
@@ -279,6 +280,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.options.Sampler.TopK = v
+		case "--min-p":
+			v, err := parseNextFloat(next, arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.options.Sampler.MinP = v
 		case "--repeat-penalty":
 			v, err := parseNextFloat(next, arg)
 			if err != nil {

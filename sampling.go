@@ -26,11 +26,12 @@ type SamplerConfig struct {
 	Temperature   float32
 	TopP          float32
 	TopK          int
+	MinP          float32
 	RepeatPenalty float32
 }
 
 func DefaultSamplerConfig() SamplerConfig {
-	return SamplerConfig{Temperature: 0.7, TopP: 0.9, TopK: 40, RepeatPenalty: 1.1}
+	return SamplerConfig{Temperature: 0.7, TopP: 0.9, TopK: 40, MinP: 0, RepeatPenalty: 1.1}
 }
 
 type TokenProb struct {
@@ -84,7 +85,7 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 		if config.TopK == 1 {
 			return argmaxFiniteToken(logits)
 		}
-		return sampleTopK(logits, config.TopK, config.TopP, invTemp, rng, candidates)
+		return sampleTopK(logits, config.TopK, config.TopP, config.MinP, invTemp, rng, candidates)
 	}
 	maxLogit := negInf32
 	for i, v := range logits {
@@ -111,8 +112,8 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 	if sum <= 0 || math.IsNaN(float64(sum)) || math.IsInf(float64(sum), 0) {
 		return argmaxToken(logits)
 	}
-	if config.TopP < 1 {
-		return sampleTopPFromWeights(logits, sum, config.TopP, rng, candidates)
+	if config.TopP < 1 || config.MinP > 0 {
+		return sampleTopPFromWeights(logits, sum, config.TopP, config.MinP, rng, candidates)
 	}
 	for i := range logits {
 		logits[i] /= sum
@@ -132,25 +133,28 @@ func sampleFromProbs(probs []float32, rng *Rng) uint32 {
 	return uint32(len(probs) - 1)
 }
 
-func sampleTopPFromProbs(probs []float32, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
-	var total float32
-	for _, p := range probs {
-		total += p
-	}
-	return sampleTopPFromWeights(probs, total, topP, rng, candidates)
-}
-
-func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
+func sampleTopPFromWeights(weights []float32, total, topP, minP float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	ensureLenNoClear(candidates, len(weights))
 	for i, w := range weights {
 		(*candidates)[i] = TokenProb{i, w}
 	}
 	sortTokenProbs(*candidates)
+	cutoff := len(*candidates)
+	if minP > 0 && cutoff > 0 {
+		threshold := minP * (*candidates)[0].Prob
+		total = 0
+		for i, item := range *candidates {
+			if i > 0 && item.Prob < threshold {
+				cutoff = i
+				break
+			}
+			total += item.Prob
+		}
+	}
 	target := topP * total
 	var cumsum float32
-	cutoff := len(*candidates)
-	for i, item := range *candidates {
-		cumsum += item.Prob
+	for i := 0; i < cutoff; i++ {
+		cumsum += (*candidates)[i].Prob
 		if cumsum > target {
 			cutoff = i + 1
 			break
@@ -171,7 +175,7 @@ func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, can
 	return uint32((*candidates)[cutoff-1].Token)
 }
 
-func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
+func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	*candidates = (*candidates)[:0]
 	for i, logit := range logits {
 		if len(*candidates) < topK {
@@ -202,11 +206,24 @@ func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, can
 	}
 	cutoff := len(*candidates)
 	kept := sum
+	if minP > 0 {
+		threshold := minP * (*candidates)[0].Prob
+		var s float32
+		for i, item := range *candidates {
+			if i > 0 && item.Prob < threshold {
+				cutoff = i
+				break
+			}
+			s += item.Prob
+		}
+		sum = s
+		kept = s
+	}
 	if topP < 1 {
 		target := topP * sum
 		var cumsum float32
-		for i, item := range *candidates {
-			cumsum += item.Prob
+		for i := 0; i < cutoff; i++ {
+			cumsum += (*candidates)[i].Prob
 			if cumsum > target {
 				cutoff = i + 1
 				break
