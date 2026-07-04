@@ -186,10 +186,21 @@ type Runner struct {
 	mappedFile *MmapFile
 }
 
+// ArchitectureSupported reports whether the loader accepts this
+// general.architecture value. Notes on specific families:
+//
+//   - qwen3 (incl. the DeepSeek-R1-0528 Qwen3 distills): the qwen2 graph plus
+//     per-head QK-norm, which loads via the optional attn_q_norm/attn_k_norm
+//     tensors and applies exactly as for Gemma 3/4.
+//   - deepseek2 (MLA attention) is NOT supported; DeepSeek-R1 distills ship
+//     as qwen2/qwen3/llama and work through those graphs.
+//   - Devstral and Mistral-Small GGUFs usually declare llama or mistral3;
+//     their [INST]/Tekken behavior is picked up from tokenizer metadata, not
+//     the arch string.
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "gpt-oss", "gemma", "gemma2", "gemma4":
+		"qwen2", "qwen3", "gpt-oss", "gemma", "gemma2", "gemma4":
 		return true
 	default:
 		return false
@@ -887,6 +898,12 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 				tokens = append(tokens, r.tok.EncodeWithoutBOS(call.Function.Name)...)
 				tokens = append(tokens, argsTok...)
 				tokens = append(tokens, r.tok.EncodeWithoutBOS(args)...)
+			}
+			// A trailing assistant message is a prefill continuation: leave
+			// the turn open (no EOS) so generation extends it — the standard
+			// way to seed a reply prefix with Mistral/Devstral models.
+			if i == len(loop)-1 && len(m.ToolCalls) == 0 {
+				break
 			}
 			tokens = append(tokens, r.tok.EOSID)
 		case ChatRoleTool:

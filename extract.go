@@ -45,12 +45,22 @@ func (r *Runner) classifyOutput(raw string, tools []ToolDefinition, rng *Rng) (c
 // concatenated reasoning separately. An unterminated trailing <think> (e.g.
 // generation was cut off by max_tokens mid-thought) is treated as reasoning
 // through the end of the text, which is safer than leaking a half-formed
-// thought into the visible answer.
+// thought into the visible answer. A leading </think> with no prior <think>
+// (newer DeepSeek-R1 templates force the opening tag into the PROMPT, so the
+// model's output begins mid-reasoning) likewise marks everything before it as
+// reasoning.
 func extractThink(text string) (content, reasoning string) {
 	const openTag, closeTag = "<think>", "</think>"
 	var contentBuf strings.Builder
 	var reasoningParts []string
 	rest := text
+	if closeIdx := strings.Index(rest, closeTag); closeIdx >= 0 {
+		openIdx := strings.Index(rest, openTag)
+		if openIdx < 0 || closeIdx < openIdx {
+			reasoningParts = append(reasoningParts, rest[:closeIdx])
+			rest = rest[closeIdx+len(closeTag):]
+		}
+	}
 	for {
 		i := strings.Index(rest, openTag)
 		if i < 0 {
