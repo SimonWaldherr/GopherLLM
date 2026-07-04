@@ -15,6 +15,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - [GGUF Analyzer](#gguf-analyzer)
 - [Server](#server)
 - [Tool Use / Agentic](#tool-use--agentic)
+- [Benchmarking and Profiling](#benchmarking-and-profiling)
 - [Make Targets](#make-targets)
 - [Performance Notes](#performance-notes)
 - [Supported Architectures](#supported-architectures)
@@ -63,6 +64,14 @@ make build                                    # -> bin/gopherllm
 bin/gopherllm --model-dir /path/to/models --list-models
 bin/gopherllm --model-dir /path/to/models --model "some-model" \
   --prompt "Explain local LLM inference in three sentences." --max-tokens 128
+```
+
+You can also pass an absolute `.gguf` path directly:
+
+```sh
+bin/gopherllm /path/to/model.gguf \
+  --prompt "Explain local LLM inference in three sentences." \
+  --max-tokens 128
 ```
 
 Or, with `make` filling in the CLI flags for you:
@@ -140,6 +149,14 @@ To verify release builds for macOS, Linux, and Windows on `amd64` and `arm64`:
 make cross-build
 ```
 
+On sandboxed macOS shells, `/usr/bin/make` may print `xcrun_db-*` cache
+warnings before the Makefile can set its build environment. Use the Command
+Line Tools `make` directly if that happens:
+
+```sh
+/Library/Developer/CommandLineTools/usr/bin/make build-metal
+```
+
 ## CLI Usage
 
 List discovered GGUF models:
@@ -155,6 +172,15 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
   --model "model-name-or-file-fragment" \
   --prompt "Explain local LLM inference in three sentences." \
   --max-tokens 128
+```
+
+Run a prompt against an exact GGUF file:
+
+```sh
+bin/gopherllm /path/to/model.gguf \
+  --prompt "Explain local LLM inference in three sentences." \
+  --max-tokens 128 \
+  --temp 0.7
 ```
 
 Start an interactive REPL:
@@ -346,6 +372,54 @@ skills' names and descriptions. Tool calls for anything else (i.e. tools the
 *caller* supplied) are returned to the caller as usual, even with skills
 configured. `--skills-dir` works the same way in one-shot/`--repl` CLI mode.
 
+## Benchmarking and Profiling
+
+Run synthetic Go microbenchmarks:
+
+```sh
+go test -run '^$' -bench=. -benchmem .
+```
+
+Run an end-to-end generation benchmark against a real GGUF:
+
+```sh
+bin/gopherllm /path/to/model.gguf \
+  --prompt "Wer war Albert Einstein?" \
+  --max-tokens 128 \
+  --temp 0 \
+  --bench --bench-json --bench-runs 3
+```
+
+Time individual model kernels for one transformer layer:
+
+```sh
+bin/gopherllm /path/to/model.gguf \
+  --kernel-bench-json \
+  --kernel-bench-runs 25 \
+  --kernel-bench-layer 0
+```
+
+Capture a CPU profile during a real generation benchmark:
+
+```sh
+bin/gopherllm /path/to/model.gguf \
+  --prompt "Wer war Albert Einstein?" \
+  --max-tokens 128 \
+  --temp 0 \
+  --bench --bench-json --bench-runs 1 \
+  --cpuprofile /tmp/gopherllm.prof
+```
+
+If your Go toolchain includes `pprof`, inspect it with:
+
+```sh
+go tool pprof -top bin/gopherllm /tmp/gopherllm.prof
+```
+
+For repeatable comparisons, keep the prompt, token count, sampler settings,
+thread count, and model path fixed. The first run may include cache and warmup
+effects, so prefer `--bench-runs 3` or more when comparing changes.
+
 ## Make Targets
 
 - `make run MODEL=... PROMPT='...'` builds and runs one prompt.
@@ -389,7 +463,8 @@ configured. `--skills-dir` works the same way in one-shot/`--repl` CLI mode.
 
 - Use `--threads <N>` to set both GopherLLM worker threads and `GOMAXPROCS`.
 - Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
-  scale/min data and switches those rows to row-level NEON prepared kernels.
+  scale/min data plus selected Q6_K scale data, then switches supported rows to
+  prepared kernels.
 - Use `--temp 0 --top-k 1` for deterministic greedy output.
 - Use `--min-p <F>` (e.g. `0.05`) for min-p nucleus sampling; `0` disables it.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
@@ -494,7 +569,7 @@ selection.
 | Tool calling / reasoning / skills | `tools.go`, `extract.go`, `agent.go`, `skills.go` |
 | Model discovery + selection | `catalog.go` |
 | HTTP server | `server.go`, `web_ui/` |
-| CLI | `main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
+| CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
 
 The same map, with more detail, is in the package comment in `lib.go`. Every
 SIMD kernel has a portable Go scalar reference implementation, and
@@ -520,6 +595,14 @@ Run a focused benchmark:
 
 ```sh
 go test -run '^$' -bench=BenchmarkMatvecQ4K -benchmem .
+```
+
+Profile a real-model benchmark:
+
+```sh
+bin/gopherllm /path/to/model.gguf --prompt "test" --max-tokens 128 \
+  --temp 0 --bench --bench-json --bench-runs 1 \
+  --cpuprofile /tmp/gopherllm.prof
 ```
 
 Local build artifacts are kept in `bin/` and `.cache/`, both ignored by git.

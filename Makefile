@@ -1,11 +1,23 @@
 BINARY       ?= gopherllm
 BUILD_DIR    ?= bin
 CACHE_DIR    ?= $(CURDIR)/.cache/go-build
+MODCACHE_DIR ?= $(CURDIR)/.cache/gomod
+TMP_DIR      ?= $(CURDIR)/.cache/tmp
 GO           ?= go
 GOFLAGS      ?=
 CGO_ENABLED  ?= 0
 CROSS_CGO_ENABLED ?= 0
 GOCACHE      ?= $(CACHE_DIR)
+GOMODCACHE   ?= $(MODCACHE_DIR)
+CLT_CC       := /Library/Developer/CommandLineTools/usr/bin/cc
+CLT_CXX      := /Library/Developer/CommandLineTools/usr/bin/c++
+CLT_SDK      := /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+CLT_SDK_HEADER := $(firstword $(wildcard $(CLT_SDK)/usr/include/pthread.h /Library/Developer/CommandLineTools/SDKs/MacOSX15.sdk/usr/include/pthread.h /Library/Developer/CommandLineTools/SDKs/MacOSX14.sdk/usr/include/pthread.h))
+METAL_CC     ?= $(if $(wildcard $(CLT_CC)),$(CLT_CC),cc)
+METAL_CXX    ?= $(if $(wildcard $(CLT_CXX)),$(CLT_CXX),c++)
+METAL_SDK    ?= $(patsubst %/usr/include/pthread.h,%,$(CLT_SDK_HEADER))
+METAL_CFLAGS ?= $(if $(METAL_SDK),-isysroot $(METAL_SDK),)
+METAL_LDFLAGS ?= $(if $(METAL_SDK),-isysroot $(METAL_SDK),)
 METAL_BIN    ?= $(BUILD_DIR)/$(BINARY)-metal
 METAL_TAGS   ?= metal
 
@@ -35,6 +47,7 @@ COVER_PROFILE ?= $(CACHE_DIR)/cover.out
 
 export CGO_ENABLED
 export GOCACHE
+export GOMODCACHE
 
 BIN          := $(BUILD_DIR)/$(BINARY)
 METAL_RUN_ARGS := --metal $(_RUN_ARGS)
@@ -52,17 +65,17 @@ _RUN_ARGS    := $(PREPARE_FLAG) $(_BASE_RUN_ARGS)
 all: check release
 
 build:
-	@mkdir -p $(BUILD_DIR) $(GOCACHE)
+	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE)
 	$(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/gopherllm
 
 release: build
 
 build-metal:
-	@mkdir -p $(BUILD_DIR) $(GOCACHE)
-	@CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags "$(METAL_TAGS)" -trimpath -ldflags="-s -w" -o $(METAL_BIN) ./cmd/gopherllm
+	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
+	@TMPDIR="$(TMP_DIR)/" GOTMPDIR="$(TMP_DIR)" CC="$(METAL_CC)" CXX="$(METAL_CXX)" CGO_CFLAGS="$(CGO_CFLAGS) $(METAL_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS) $(METAL_LDFLAGS)" CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags "$(METAL_TAGS)" -trimpath -ldflags="-s -w" -o $(METAL_BIN) ./cmd/gopherllm
 
 cross-build:
-	@mkdir -p $(BUILD_DIR) $(GOCACHE)
+	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE)
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=darwin GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-amd64 ./cmd/gopherllm
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=darwin GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-arm64 ./cmd/gopherllm
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-amd64 ./cmd/gopherllm
@@ -279,6 +292,9 @@ help:
 	@printf "  BENCH_RUNS=%s MODEL_TIMEOUT=%s SERVE_ADDR=%s CHAT=%s\n" "$(BENCH_RUNS)" "$(MODEL_TIMEOUT)" "$(SERVE_ADDR)" "$(CHAT)"
 	@printf "  KERNEL_BENCH_RUNS=%s KERNEL_BENCH_LAYER=%s\n" "$(KERNEL_BENCH_RUNS)" "$(KERNEL_BENCH_LAYER)"
 	@printf "  PREPARE_QUANT=%s\n" "$(PREPARE_QUANT)"
+	@printf "  GOCACHE=%s GOMODCACHE=%s TMP_DIR=%s\n" "$(GOCACHE)" "$(GOMODCACHE)" "$(TMP_DIR)"
+	@printf "  METAL_CC=%s METAL_CXX=%s\n" "$(METAL_CC)" "$(METAL_CXX)"
+	@printf "  METAL_SDK=%s\n" "$(METAL_SDK)"
 	@printf "  COVER_PROFILE=%s\n" "$(COVER_PROFILE)"
 	@printf "\nRuntime env vars (set directly, e.g. GOPHERLLM_Q8_ACTIVATIONS=1 make bench-model ...):\n"
 	@printf "  GOPHERLLM_DISABLE_SIMD, GOPHERLLM_NO_BATCH_PREFILL, GOPHERLLM_Q8_ACTIVATIONS,\n"

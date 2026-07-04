@@ -709,11 +709,17 @@ func dotQ4KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	var qdots [8]float32
 	var sum float32
 	blocks := cols / 256
+	blocks = min(blocks, len(row)/144)
+	blocks = min(blocks, len(x)/256)
+	blocks = min(blocks, len(xsums)/8)
+	if blocks <= 0 {
+		return 0
+	}
+	_ = row[blocks*144-1]
+	_ = x[blocks*256-1]
+	_ = xsums[blocks*8-1]
 	for b := 0; b < blocks; b++ {
 		base := b * 144
-		if base+144 > len(row) {
-			break
-		}
 		block := row[base : base+144]
 		d := F16ToF32(binaryLE16(block[0:]))
 		dmin := F16ToF32(binaryLE16(block[2:]))
@@ -1509,9 +1515,10 @@ func parallelChunks(n int, fn func(start, end int)) {
 func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	pool := getRowWorkerPool(threads)
 	// Issue more chunks than workers so faster cores naturally pick up the
-	// slack of slower ones (e.g. efficiency cores on Apple Silicon).
+	// slack of slower ones (e.g. efficiency cores on Apple Silicon). Small
+	// matvecs stay at one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
-	if rows >= threads*16 {
+	if rows >= threads*128 {
 		chunks = min(threads*4, cap(pool.jobs))
 	}
 	done := rowDonePool.Get().(chan struct{})

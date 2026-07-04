@@ -57,8 +57,8 @@ func WithThreads(n int) Option {
 	return func(s *loadSettings) { s.threads = n }
 }
 
-// WithPrepareQuantized precomputes Q4_K scale/min data at load time for the
-// prepared quantized kernels.
+// WithPrepareQuantized precomputes supported quantized scale data at load time
+// for the prepared quantized kernels.
 func WithPrepareQuantized(enabled bool) Option {
 	return func(s *loadSettings) { s.prepareQuantized = enabled }
 }

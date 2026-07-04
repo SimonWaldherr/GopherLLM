@@ -259,6 +259,20 @@ func BenchmarkMatvecQ6K_1024x1024(b *testing.B) {
 	}
 }
 
+func BenchmarkMatvecPreparedQ6K_1024x1024(b *testing.B) {
+	data := benchBytes(1024 * (1024 / 256) * 210)
+	prepared := PrepareQuantizedWeight(data, GGMLTypeQ6_K, 1024, 1024)
+	x := benchFloatSlice(1024)
+	out := make([]float32, 1024)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data) + len(x)*4))
+	for b.Loop() {
+		if !MatvecPreparedQ6KInto(data, prepared, x, 1024, 1024, &out) {
+			b.Fatal("MatvecPreparedQ6KInto returned false")
+		}
+	}
+}
+
 func BenchmarkGenerationConfiguredModel(b *testing.B) {
 	modelPath := os.Getenv("GOPHERLLM_BENCH_MODEL")
 	if modelPath == "" {

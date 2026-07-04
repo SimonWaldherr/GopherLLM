@@ -41,7 +41,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
 	fmt.Fprintln(os.Stderr, "  --metal                   Use experimental Metal Q6_K matvec offload when available")
-	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute Q4_K scale data during load for faster matvecs")
+	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute supported quantized scale data during load for faster matvecs")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
 	fmt.Fprintln(os.Stderr, "  --skills-dir <path>       Directory of SKILL.md files offered via a load_skill tool")
@@ -163,7 +163,7 @@ func run() error {
 		fmt.Fprintln(os.Stderr, "Metal: unavailable (pure Go / no CGO)")
 	}
 	if cfg.prepareQuant {
-		fmt.Fprintln(os.Stderr, "Quant prep: enabled for Q4_K weights")
+		fmt.Fprintln(os.Stderr, "Quant prep: enabled for supported quantized weights")
 	}
 	modelPath, err := gopherllm.ResolveModelPath(cfg.modelSelector, cfg.modelDir)
 	if err != nil {

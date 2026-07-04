@@ -269,6 +269,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		if matvecMetalQ6KInto(w.Metal, x, w.Rows, w.Cols, out) {
 			return
 		}
+		if MatvecPreparedQ6KInto(w.Raw, w.Prepared, x, w.Rows, w.Cols, out) {
+			return
+		}
 		MatvecQ6KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeMXFP4:
 		MatvecMXFP4Into(w.Raw, x, w.Rows, w.Cols, out)
@@ -980,7 +983,7 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			raw = owned
 		}
 		w := Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}
-		if prepareQuantized && info.DType == GGMLTypeQ4_K {
+		if prepareQuantized && (info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ6_K) {
 			w.Prepared = PrepareQuantizedWeight(raw, info.DType, rows, cols)
 		}
 		if useMetal {

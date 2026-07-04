@@ -142,6 +142,40 @@ func TestPreparedQ4KMatvecMatchesStandard(t *testing.T) {
 	}
 }
 
+func TestPreparedQ6KMatvecMatchesStandard(t *testing.T) {
+	rng := rand.New(rand.NewSource(23))
+	const rows, cols = 16, 512
+	rowBytes := (cols / 256) * 210
+	data := make([]byte, 0, rows*rowBytes)
+	for range rows {
+		data = append(data, randomQ6KRow(rng, cols)...)
+	}
+	x := randomVec(rng, cols)
+	prepared := PrepareQuantizedWeight(data, GGMLTypeQ6_K, rows, cols)
+	if prepared == nil {
+		t.Fatal("PrepareQuantizedWeight returned nil")
+	}
+	want := []float32{}
+	got := []float32{}
+	MatvecQ6KInto(data, x, rows, cols, &want)
+	if !MatvecPreparedQ6KInto(data, prepared, x, rows, cols, &got) {
+		t.Fatal("MatvecPreparedQ6KInto returned false")
+	}
+	for r := range rows {
+		if math.Abs(float64(got[r]-want[r])) > 1e-2*math.Max(1, math.Abs(float64(want[r]))) {
+			t.Fatalf("row %d: %v, want %v", r, got[r], want[r])
+		}
+	}
+}
+
+func TestPrepareQ6KSkipsWideWeights(t *testing.T) {
+	const rows, cols = 2, preparedQ6KMaxCols + 256
+	data := make([]byte, rows*(cols/256)*210)
+	if prepared := PrepareQuantizedWeight(data, GGMLTypeQ6_K, rows, cols); prepared != nil {
+		t.Fatal("PrepareQuantizedWeight prepared a wide Q6_K weight")
+	}
+}
+
 func TestMatvecQ6KIntoMatchesPerRowDot(t *testing.T) {
 	rng := rand.New(rand.NewSource(17))
 	const rows, cols = 16, 512
@@ -157,6 +191,28 @@ func TestMatvecQ6KIntoMatchesPerRowDot(t *testing.T) {
 		want := DotQ6KF32(data[r*rowBytes:(r+1)*rowBytes], x, cols)
 		if math.Abs(float64(out[r]-want)) > 1e-2*math.Max(1, math.Abs(float64(want))) {
 			t.Fatalf("row %d: %v, want %v", r, out[r], want)
+		}
+	}
+}
+
+func TestWeightMatvecUsesPreparedQ6KWeight(t *testing.T) {
+	rng := rand.New(rand.NewSource(31))
+	const rows, cols = 8, 512
+	rowBytes := (cols / 256) * 210
+	data := make([]byte, 0, rows*rowBytes)
+	for range rows {
+		data = append(data, randomQ6KRow(rng, cols)...)
+	}
+	x := randomVec(rng, cols)
+	prepared := PrepareQuantizedWeight(data, GGMLTypeQ6_K, rows, cols)
+	weight := Weight{Raw: data, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols, Prepared: prepared}
+	want := []float32{}
+	got := []float32{}
+	MatvecQ6KInto(data, x, rows, cols, &want)
+	weight.MatvecInto(x, &got)
+	for r := range rows {
+		if math.Abs(float64(got[r]-want[r])) > 1e-2*math.Max(1, math.Abs(float64(want[r]))) {
+			t.Fatalf("row %d: %v, want %v", r, got[r], want[r])
 		}
 	}
 }
