@@ -22,7 +22,9 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 
 - Pure Go runtime with optional ARM64 (NEON) and x86-64 (AVX2 + FMA) assembly kernels.
 - Memory-mapped GGUF loading for fast startup and lower copy pressure.
-- Quantized matrix kernels for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, and MXFP4 tensors.
+- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1,
+  Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/BF16 loaded directly
+  (BF16 covers QAT-derived and modern full-precision GGUFs).
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
 - OpenAI-compatible tool/function calling, with a native prompt format for
   Mistral-family models and a generic convention for everything else.
@@ -161,6 +163,24 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness + loaded model id |
+| POST | `/generate` | Native generation API (prompt or messages; accepts tools) |
+| POST | `/v1/chat/completions` | OpenAI-compatible chat (streaming, tools, reasoning) |
+| POST | `/v1/completions` | OpenAI-compatible text completion |
+| POST | `/v1/embeddings` | OpenAI-compatible embeddings |
+| GET | `/v1/models` | OpenAI-compatible model listing (the loaded model) |
+| GET | `/v1/skills` | Names + descriptions of configured skills |
+| POST | `/api/generate` | Ollama-compatible generation |
+| POST | `/api/chat` | Ollama-compatible chat (accepts tools) |
+| POST | `/api/embeddings` | Ollama-compatible embeddings |
+| GET | `/models` | Scan `--model-dir` and list all discovered GGUFs |
+| POST | `/models/load` | Hot-swap the loaded model (`{"path": "..."}`) |
+| GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |
 
 ## Tool Use / Agentic
 
@@ -303,6 +323,19 @@ configured. `--skills-dir` works the same way in one-shot/`--repl` CLI mode.
 - Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
   it.
 
+### Environment variables
+
+Quick reference for the runtime toggles described above (all off/unset by
+default; details in the bullets they annotate):
+
+| Variable | Effect |
+|---|---|
+| `RUSTY_LLM_MODEL_DIR` | Default model directory when `--model-dir` is not given |
+| `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
+| `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
+| `GOPHERLLM_Q8_ACTIVATIONS` | Opt-in int8-activation Q4_K matvecs (x86-64) |
+| `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
+
 ## Supported Architectures
 
 The loader currently accepts GGUF files whose `general.architecture` is one of:
@@ -316,20 +349,46 @@ Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
 scaling when the GGUF declares it.
 
-Gemma-family support (`gemma`/`gemma2`/`gemma4`, including the Gemma 4 QAT
-GGUFs) is **experimental and known-incomplete**: the forward pass currently
-reuses the standard llama-style graph and lacks several mechanisms Gemma
-weights require (hardcoded `sqrt(dim)` embedding scaling, GELU FFN,
-post-attention/post-FFN norms, QK-norm, per-layer sliding-window map, p-RoPE),
-so output quality will be poor. The loader prints a warning. See
-[docs/INFERENCE_NOTES.md](docs/INFERENCE_NOTES.md) for the researched gap list,
-Gemma 4/QAT architecture notes, and per-family recommended sampling settings
-(e.g. Gemma: `--temp 1.0 --top-p 0.95 --top-k 64`).
+Gemma-family support (`gemma`/`gemma2`/`gemma4`, including the Gemma QAT
+GGUFs) is **experimental**: the dense Gemma graph is implemented — hardcoded
+`sqrt(dim)` embedding scaling, GELU FFN, QK-norm, post-attention/post-FFN
+norms, attention/final logit softcapping, the per-layer sliding-window map
+(explicit `sliding_window_pattern` bool-array metadata or the known Gemma 2/4
+interleave defaults), the `<start_of_turn>` chat template, and `<end_of_turn>`
+as a stop token — but it has not been validated against real Gemma weights
+yet, and the Gemma 4-specific mechanisms (p-RoPE frequency factors, per-layer
+RoPE bases, cross-layer KV sharing, per-layer embeddings, the 26B MoE) are
+still missing. The loader prints a warning. See
+[docs/INFERENCE_NOTES.md](docs/INFERENCE_NOTES.md) for the architecture notes,
+QAT specifics, and per-family recommended sampling settings (e.g. Gemma:
+`--temp 1.0 --top-p 0.95 --top-k 64`).
 
 Projector files such as `mmproj-*` are detected and excluded from text-model
 selection.
 
 ## Development
+
+### Project layout
+
+| Area | Files |
+|---|---|
+| GGUF parsing + file mapping | `gguf.go`, `mmap.go` / `mmap_fallback.go` |
+| Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
+| Compute kernels + worker pool | `simd.go`; assembly in `*_amd64.s` / `*_arm64.s` behind `dot_f32_*.go`, `vector_ops_*.go`, `quant_*.go`, `q4k_q8_*.go` dispatch shims |
+| Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE) |
+| Sampling | `sampling.go` |
+| Generation orchestration + chat templates | `runtime.go` |
+| Tool calling / reasoning / skills | `tools.go`, `extract.go`, `agent.go`, `skills.go` |
+| Model discovery + selection | `catalog.go` |
+| HTTP server | `server.go`, `web_ui/` |
+| CLI | `main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
+
+The same map, with more detail, is in the package comment in `lib.go`. Every
+SIMD kernel has a portable Go scalar reference implementation, and
+differential tests assert they agree — when touching a kernel, run the `Q4K`/
+`Q6K`/`DotF32`/`VectorOps` test groups first. Model-behavior research notes
+(Gemma 4 / QAT specifics, per-family sampling recommendations) live in
+[docs/INFERENCE_NOTES.md](docs/INFERENCE_NOTES.md).
 
 Run the full local check:
 

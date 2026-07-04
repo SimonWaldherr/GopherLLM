@@ -61,6 +61,30 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 // if cols is incompatible or the type has no dequantizer.
 func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32) {
 	switch w.Type {
+	case GGMLTypeQ4_1:
+		if cols%32 == 0 {
+			return DequantRowQ4_1Into
+		}
+	case GGMLTypeQ5_0:
+		if cols%32 == 0 {
+			return DequantRowQ5_0Into
+		}
+	case GGMLTypeQ5_1:
+		if cols%32 == 0 {
+			return DequantRowQ5_1Into
+		}
+	case GGMLTypeQ8_1:
+		if cols%32 == 0 {
+			return DequantRowQ8_1Into
+		}
+	case GGMLTypeQ2_K:
+		if cols%256 == 0 {
+			return DequantRowQ2KInto
+		}
+	case GGMLTypeQ3_K:
+		if cols%256 == 0 {
+			return DequantRowQ3KInto
+		}
 	case GGMLTypeQ4_K:
 		if cols%256 == 0 {
 			return DequantRowQ4KInto
@@ -160,7 +184,7 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			for t := ts; t < te; t++ {
 				pos := startPos + t
 				attnStart := 0
-				if config.SlidingWindow > 0 {
+				if config.layerUsesSWA(l) {
 					attnStart = max(0, pos-config.SlidingWindow)
 				}
 				clear(AttnOut[t])
@@ -173,6 +197,7 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 						cache.PerPosKDim, cache.PerPosVDim,
 						headDim, valueDim,
 						attnStart, pos, scale,
+						config.AttnLogitSoftcap,
 						AttnOut[t][h*valueDim:h*valueDim+valueDim],
 					)
 				}
@@ -218,6 +243,9 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		weights.Output.MatvecInto(buf.XN, logits)
 		if config.LogitScale != 1 {
 			ScaleF32(*logits, 1/config.LogitScale)
+		}
+		if config.FinalLogitSoftcap > 0 {
+			softcapF32(*logits, config.FinalLogitSoftcap)
 		}
 	}
 }

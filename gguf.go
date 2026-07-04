@@ -41,6 +41,7 @@ const (
 	GGMLTypeQ5_K    GGMLType = 13
 	GGMLTypeQ6_K    GGMLType = 14
 	GGMLTypeQ8_K    GGMLType = 15
+	GGMLTypeBF16    GGMLType = 30
 	GGMLTypeMXFP4   GGMLType = 39
 	GGMLTypeUnknown GGMLType = 255
 )
@@ -52,7 +53,7 @@ func ggmlTypeFromUint32(v uint32) GGMLType {
 	switch GGMLType(v) {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
-		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeMXFP4:
+		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeBF16, GGMLTypeMXFP4:
 		return GGMLType(v)
 	default:
 		return GGMLTypeUnknown
@@ -77,12 +78,18 @@ func (t GGMLType) String() string {
 		return "Q8_0"
 	case GGMLTypeQ8_1:
 		return "Q8_1"
+	case GGMLTypeQ2_K:
+		return "Q2_K"
+	case GGMLTypeQ3_K:
+		return "Q3_K"
 	case GGMLTypeQ4_K:
 		return "Q4_K"
 	case GGMLTypeQ5_K:
 		return "Q5_K"
 	case GGMLTypeQ6_K:
 		return "Q6_K"
+	case GGMLTypeBF16:
+		return "BF16"
 	case GGMLTypeMXFP4:
 		return "MXFP4"
 	default:
@@ -132,7 +139,15 @@ func (t GGMLType) BlockBytes() (int, bool) {
 // per-block layouts, which the dot kernels in simd.go index by hand:
 //
 //	Q4_0:  18 B / 32 elems  = f16 scale + 16 nibble-packed bytes
+//	Q4_1:  20 B / 32 elems  = f16 scale + f16 min + 16 nibble bytes
+//	Q5_0:  22 B / 32 elems  = f16 scale + 4 B 5th-bit plane + 16 nibbles
+//	Q5_1:  24 B / 32 elems  = f16 scale + f16 min + 4 B 5th bits + 16 nibbles
 //	Q8_0:  34 B / 32 elems  = f16 scale + 32 int8
+//	Q8_1:  36 B / 32 elems  = f16 scale + f16 quant-sum + 32 int8
+//	Q2_K:  84 B / 256 elems = 16 B packed 4-bit scale/min pairs +
+//	       64 B 2-bit quants + f16 d + f16 dmin
+//	Q3_K: 110 B / 256 elems = 32 B high-bit plane + 64 B 2-bit lows +
+//	       12 B packed 6-bit scales + f16 d
 //	Q4_K: 144 B / 256 elems = f16 d + f16 dmin + 12 B packed 6-bit
 //	       scales/mins (8 sub-blocks) + 128 nibble-packed bytes
 //	Q5_K: 176 B / 256 elems = Q4_K layout + 32 B of 5th-bit planes
@@ -147,11 +162,15 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 	switch t {
 	case GGMLTypeF32:
 		return n * 4, true
-	case GGMLTypeF16:
+	case GGMLTypeF16, GGMLTypeBF16:
 		return n * 2, true
 	case GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_0, GGMLTypeQ8_1:
 		b, _ := t.BlockBytes()
 		return (n / t.BlockSize()) * b, true
+	case GGMLTypeQ2_K:
+		return (n / 256) * 84, true
+	case GGMLTypeQ3_K:
+		return (n / 256) * 110, true
 	case GGMLTypeQ4_K:
 		return (n / 256) * 144, true
 	case GGMLTypeQ5_K:
@@ -229,6 +248,24 @@ func (v MetaValue) AsStringArray() ([]string, bool) {
 		if s, ok := item.AsString(); ok {
 			out = append(out, s)
 		}
+	}
+	return out, true
+}
+
+// AsBoolArray decodes an array of bools (e.g. Gemma 4's per-layer
+// attention.sliding_window_pattern).
+func (v MetaValue) AsBoolArray() ([]bool, bool) {
+	arr, ok := v.Value.([]MetaValue)
+	if !ok {
+		return nil, false
+	}
+	out := make([]bool, 0, len(arr))
+	for _, item := range arr {
+		b, ok := item.AsBool()
+		if !ok {
+			return nil, false
+		}
+		out = append(out, b)
 	}
 	return out, true
 }

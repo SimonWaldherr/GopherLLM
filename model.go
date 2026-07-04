@@ -53,6 +53,44 @@ type Config struct {
 	RopeYarnLogMultiplier     float32
 	RopeFactorsLong           []float32
 	RopeFactorsShort          []float32
+	// Gemma-family mechanics (all inert at their zero values; see
+	// docs/INFERENCE_NOTES.md for the researched semantics):
+	// UseGELU switches the FFN activation from SiLU to tanh-approximated GELU.
+	// AttnLogitSoftcap/FinalLogitSoftcap apply cap*tanh(v/cap) to attention
+	// scores / final logits (Gemma 2: 50.0 / 30.0). SWAPattern, when non-nil,
+	// restricts the sliding window to layers whose entry is true (Gemma 4
+	// ships it as bool-array metadata; Gemma 2's alternating pattern is
+	// synthesized); nil means SlidingWindow applies to every layer.
+	UseGELU           bool
+	AttnLogitSoftcap  float32
+	FinalLogitSoftcap float32
+	SWAPattern        []bool
+}
+
+// gemmaFamily reports whether arch is a Gemma generation, all of which share
+// the hardcoded sqrt(dim) embedding scaling and GELU FFN.
+func gemmaFamily(arch string) bool {
+	switch arch {
+	case "gemma", "gemma2", "gemma3", "gemma4":
+		return true
+	default:
+		return false
+	}
+}
+
+// layerUsesSWA reports whether layer il attends with the sliding window (true)
+// or over the full context (false, or when no window is configured).
+func (c Config) layerUsesSWA(il int) bool {
+	if c.SlidingWindow <= 0 {
+		return false
+	}
+	if c.SWAPattern == nil {
+		return true
+	}
+	if il < 0 || il >= len(c.SWAPattern) {
+		return false
+	}
+	return c.SWAPattern[il]
 }
 
 func ConfigFromGGUF(gguf *GGUFFile) Config {
@@ -82,9 +120,16 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	if nKVHeads > 0 && nHeads > 0 {
 		kvMul = max(1, nHeads/nKVHeads)
 	}
-	embeddingScale := gguf.GetF32(p+".embedding_scale", 1)
+	embeddingScale := gguf.GetF32(p+".embedding_scale", 0)
 	if embeddingScale == 0 {
-		embeddingScale = 1
+		if gemmaFamily(p) && dim > 0 {
+			// Gemma scales input embeddings by sqrt(dim); reference
+			// implementations hardcode this — it is NOT in GGUF metadata
+			// (verified against llama.cpp's gemma graphs).
+			embeddingScale = float32(math.Sqrt(float64(dim)))
+		} else {
+			embeddingScale = 1
+		}
 	}
 	residualScale := gguf.GetF32(p+".residual_scale", 1)
 	if residualScale == 0 {
@@ -124,7 +169,40 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
 		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
 		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
+		UseGELU:                   gemmaFamily(p),
+		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
+		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
+		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
+}
+
+// swaPattern determines which layers use the sliding window. Priority:
+// explicit bool-array metadata ({arch}.attention.sliding_window_pattern, one
+// entry per layer — the Gemma 4 convention), then the known per-architecture
+// interleave defaults expressed as "every Nth layer is global" (Gemma 2
+// alternates 1:1, Gemma 3/4 run 5 local then 1 global). nil means every layer
+// uses the window (the pre-Gemma behavior, correct for e.g. old Mistral).
+func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
+	if v, ok := gguf.Metadata[p+".attention.sliding_window_pattern"]; ok {
+		if arr, ok := v.AsBoolArray(); ok && len(arr) > 0 {
+			return arr
+		}
+	}
+	period := 0
+	switch p {
+	case "gemma2":
+		period = 2
+	case "gemma3", "gemma4":
+		period = 6
+	}
+	if period == 0 || nLayers <= 0 {
+		return nil
+	}
+	pattern := make([]bool, nLayers)
+	for il := range pattern {
+		pattern[il] = il%period < period-1
+	}
+	return pattern
 }
 
 // Weight is one loaded tensor in exactly one of two states: F32 non-nil
@@ -165,6 +243,18 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ8_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_0:
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ4_1:
+		MatvecQ4_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ5_0:
+		MatvecQ5_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ5_1:
+		MatvecQ5_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ8_1:
+		MatvecQ8_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ2_K:
+		MatvecQ2KInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ3_K:
+		MatvecQ3KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_K:
 		MatvecQ4KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ5_K:
@@ -200,6 +290,24 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeQ4_0:
 		rowBytes := (cols / 32) * 18
 		copy(*out, DequantRowQ4_0(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+	case GGMLTypeQ4_1:
+		rowBytes := (cols / 32) * 20
+		DequantRowQ4_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ5_0:
+		rowBytes := (cols / 32) * 22
+		DequantRowQ5_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ5_1:
+		rowBytes := (cols / 32) * 24
+		DequantRowQ5_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ8_1:
+		rowBytes := (cols / 32) * 36
+		DequantRowQ8_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ2_K:
+		rowBytes := (cols / 256) * 84
+		DequantRowQ2KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ3_K:
+		rowBytes := (cols / 256) * 110
+		DequantRowQ3KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_K:
 		rowBytes := (cols / 256) * 144
 		copy(*out, DequantRowQ4K(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
@@ -246,6 +354,15 @@ type LayerWeights struct {
 	W3        Weight
 	WGateUp   Weight
 	HasGateUp bool
+	// Optional Gemma-family norms, nil when the tensors are absent:
+	// AttnQNorm/AttnKNorm are per-head RMS norms of length HeadDim applied
+	// after the Q/K projections (before RoPE); PostAttnNorm/PostFFNNorm are
+	// full-width RMS norms applied to the attention/FFN outputs before their
+	// residual adds.
+	AttnQNorm    []float32
+	AttnKNorm    []float32
+	PostAttnNorm []float32
+	PostFFNNorm  []float32
 }
 
 type ModelWeights struct {
@@ -646,7 +763,27 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 		W3:        w3,
 		WGateUp:   wGateUp,
 		HasGateUp: hasGateUp,
+		// Unlike the biases above (where a zero-filled default is inert),
+		// these must stay nil when absent: applying an all-zero norm would
+		// zero the activations.
+		AttnQNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_q_norm.weight", tensors, inferred),
+		AttnKNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_k_norm.weight", tensors, inferred),
+		PostAttnNorm: loadOptionalF32VecNil(data, dataOffset, prefix+"post_attention_norm.weight", tensors, inferred),
+		PostFFNNorm:  loadOptionalF32VecNil(data, dataOffset, prefix+"post_ffw_norm.weight", tensors, inferred),
 	}, nil
+}
+
+// loadOptionalF32VecNil loads a float vector tensor, returning nil (not a
+// zero-filled slice) when the tensor does not exist or fails to load.
+func loadOptionalF32VecNil(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int) []float32 {
+	if _, ok := tensors[name]; !ok {
+		return nil
+	}
+	v, err := loadF32Vec(data, dataOffset, name, tensors, inferred)
+	if err != nil {
+		return nil
+	}
+	return v
 }
 
 func indexTensors(gguf *GGUFFile) map[string]TensorInfo {
@@ -752,18 +889,13 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 	rawEnd := min(offset+byteSize, len(data))
 	raw := data[offset:rawEnd]
 	if len(raw) < byteSize {
-		if info.DType == GGMLTypeF32 || info.DType == GGMLTypeF16 {
+		if info.DType == GGMLTypeF32 || info.DType == GGMLTypeF16 || info.DType == GGMLTypeBF16 {
 			return Weight{}, fmt.Errorf("tensor %s exceeds file length", name)
 		}
 		padded := make([]byte, byteSize)
 		copy(padded, raw)
 		raw = padded
 	}
-	switch info.DType {
-	case GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1:
-		return Weight{}, fmt.Errorf("tensor type %s is parsed but not implemented correctly yet for %s", info.DType, name)
-	}
-	effectiveForce := forceF32
 	switch info.DType {
 	case GGMLTypeF32:
 		f := make([]float32, numel)
@@ -777,16 +909,20 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			f[i] = F16ToF32(binary.LittleEndian.Uint16(raw[i*2:]))
 		}
 		return Weight{F32: f}, nil
-	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
-		if effectiveForce {
-			if info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ5_K || info.DType == GGMLTypeQ6_K || info.DType == GGMLTypeMXFP4 {
+	case GGMLTypeBF16:
+		// bfloat16 is the top 16 bits of an IEEE float32 (QAT checkpoints and
+		// many recent full-precision GGUFs use it), so conversion is a shift.
+		f := make([]float32, numel)
+		for i := range numel {
+			f[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
+		}
+		return Weight{F32: f}, nil
+	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1,
+		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
+		if forceF32 {
+			f, ok := dequantTensor(info.DType, raw, numel)
+			if !ok {
 				return Weight{}, fmt.Errorf("%s force_f32 dequantization not implemented for %s", info.DType, name)
-			}
-			f := make([]float32, numel)
-			if info.DType == GGMLTypeQ8_0 {
-				copy(f, DequantRowQ8_0(raw, numel))
-			} else {
-				copy(f, DequantRowQ4_0(raw, numel))
 			}
 			return Weight{F32: f}, nil
 		}
@@ -803,6 +939,40 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		return Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}, nil
 	default:
 		return Weight{}, fmt.Errorf("unsupported tensor type for %s: %s", name, info.DType)
+	}
+}
+
+// dequantTensor fully dequantizes a contiguous quantized tensor (treated as
+// one long row, which is valid because rows are stored back to back with no
+// padding). Used by the forceF32 load path for norm vectors and rope factors.
+func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
+	switch t {
+	case GGMLTypeQ8_0:
+		return DequantRowQ8_0(raw, numel), true
+	case GGMLTypeQ4_0:
+		return DequantRowQ4_0(raw, numel), true
+	case GGMLTypeQ4_1:
+		return DequantRowQ4_1(raw, numel), true
+	case GGMLTypeQ5_0:
+		return DequantRowQ5_0(raw, numel), true
+	case GGMLTypeQ5_1:
+		return DequantRowQ5_1(raw, numel), true
+	case GGMLTypeQ8_1:
+		return DequantRowQ8_1(raw, numel), true
+	case GGMLTypeQ2_K:
+		return DequantRowQ2K(raw, numel), true
+	case GGMLTypeQ3_K:
+		return DequantRowQ3K(raw, numel), true
+	case GGMLTypeQ4_K:
+		return DequantRowQ4K(raw, numel), true
+	case GGMLTypeQ5_K:
+		return DequantRowQ5K(raw, numel), true
+	case GGMLTypeQ6_K:
+		return DequantRowQ6K(raw, numel), true
+	case GGMLTypeMXFP4:
+		return DequantRowMXFP4(raw, numel), true
+	default:
+		return nil, false
 	}
 }
 
@@ -842,6 +1012,9 @@ func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *Decod
 	weights.Output.MatvecInto(buf.XN, logits)
 	if config.LogitScale != 1 {
 		ScaleF32(*logits, 1/config.LogitScale)
+	}
+	if config.FinalLogitSoftcap > 0 {
+		softcapF32(*logits, config.FinalLogitSoftcap)
 	}
 }
 
@@ -889,6 +1062,14 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.K, layer.BK)
 			addInPlace(buf.V, layer.BV)
 		}
+		// Gemma 3/4-style QK-norm (per-head RMS on the projected Q/K, before
+		// RoPE); inert for models without the norm tensors.
+		if layer.AttnQNorm != nil {
+			perHeadRMSNormInPlace(buf.Q, headDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
+		}
+		if layer.AttnKNorm != nil {
+			perHeadRMSNormInPlace(buf.K, headDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
+		}
 		applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
 		applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
 
@@ -903,7 +1084,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			scale = float32(1 / math.Sqrt(float64(headDim)))
 		}
 		attnStart := 0
-		if config.SlidingWindow > 0 {
+		if config.layerUsesSWA(l) {
 			attnStart = max(0, pos-config.SlidingWindow)
 		}
 		attnHeads := func(hStart, hEnd int) {
@@ -922,6 +1103,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 					attnStart,
 					pos,
 					scale,
+					config.AttnLogitSoftcap,
 					buf.AttnOut[outOff:outOff+config.ValueDim],
 				)
 			}
@@ -934,6 +1116,9 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			attnHeads(0, config.NHeads)
 		}
 		layer.WO.MatvecInto(buf.AttnOut, &buf.Proj)
+		if layer.PostAttnNorm != nil {
+			rmsNormInto(buf.Proj, layer.PostAttnNorm, config.RMSNormEps, &buf.Proj)
+		}
 		if config.ResidualScale != 1 {
 			ScaleF32(buf.Proj, config.ResidualScale)
 		}
@@ -961,12 +1146,21 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			_ = gate[hDim-1]
 			_ = up[hDim-1]
 			_ = hidden[hDim-1]
-			for i := 0; i < hDim; i++ {
-				g := gate[i]
-				hidden[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
+			if config.UseGELU {
+				for i := 0; i < hDim; i++ {
+					hidden[i] = geluTanh(gate[i]) * up[i]
+				}
+			} else {
+				for i := 0; i < hDim; i++ {
+					g := gate[i]
+					hidden[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
+				}
 			}
 		}
 		layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
+		if layer.PostFFNNorm != nil {
+			rmsNormInto(buf.Proj, layer.PostFFNNorm, config.RMSNormEps, &buf.Proj)
+		}
 		if config.ResidualScale != 1 {
 			ScaleF32(buf.Proj, config.ResidualScale)
 		}
@@ -1003,6 +1197,41 @@ func ForwardHiddenGemma4(config Config, weights Gemma4Weights, cache *KVCache, b
 	out := make([]float32, len(buf.XN))
 	copy(out, buf.XN)
 	return out
+}
+
+// geluTanh is the tanh-approximated GELU (gelu_pytorch_tanh) used by the
+// Gemma family's FFN in place of SiLU.
+func geluTanh(x float32) float32 {
+	const sqrt2OverPi = 0.7978845608028654
+	return 0.5 * x * (1 + float32(math.Tanh(sqrt2OverPi*float64(x+0.044715*x*x*x))))
+}
+
+// softcapF32 applies v = cap*tanh(v/cap) elementwise — Gemma's logit
+// softcapping, which bounds values to (-cap, cap) while staying smooth.
+func softcapF32(v []float32, cap float32) {
+	inv := 1 / cap
+	for i, x := range v {
+		v[i] = cap * float32(math.Tanh(float64(x*inv)))
+	}
+}
+
+// perHeadRMSNormInPlace RMS-normalizes each head's headDim-wide slice of vec
+// independently against a shared headDim-length weight — Gemma 3/4-style
+// QK-norm, applied to the projected Q/K before RoPE.
+func perHeadRMSNormInPlace(vec []float32, headDim, nHeads int, weight []float32, eps float32) {
+	if len(weight) < headDim {
+		return
+	}
+	for h := 0; h < nHeads; h++ {
+		off := h * headDim
+		if off+headDim > len(vec) {
+			break
+		}
+		sub := vec[off : off+headDim]
+		ss := DotF32(sub, sub)
+		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+eps)))
+		mulScaleF32(sub, weight[:headDim], scale, sub)
+	}
 }
 
 // rmsNormInto writes out[i] = x[i] / rms(x) * weight[i] where
@@ -1163,9 +1392,11 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 // whenever a new maximum appears (out *= exp(oldMax-newMax)), so no
 // per-position score array is materialized regardless of context length.
 // keys/values are the head's slices into the position-major KV cache, striding
-// by keyStride/valueStride per position. out must be zeroed by the caller and
-// receives the already-normalized weighted value sum.
-func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale float32, out []float32) {
+// by keyStride/valueStride per position. softcap > 0 applies Gemma 2-style
+// attention-logit softcapping (cap*tanh(score/cap)) before the softmax. out
+// must be zeroed by the caller and receives the already-normalized weighted
+// value sum.
+func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
 	maxScore := float32(math.Inf(-1))
 	denom := float32(0)
 	for t := startT; t <= endT; t++ {
@@ -1175,6 +1406,9 @@ func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyH
 			break
 		}
 		score := DotF32(query, keys[kOff:kOff+keyHeadDim]) * scale
+		if softcap > 0 {
+			score = softcap * float32(math.Tanh(float64(score/softcap)))
+		}
 		valueRow := values[vOff : vOff+valueHeadDim]
 		if score > maxScore {
 			oldScale := float32(0)

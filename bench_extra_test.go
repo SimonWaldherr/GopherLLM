@@ -15,7 +15,7 @@ func BenchmarkOnlineAttention_ctx512(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		clear(out)
-		onlineAttention(q, keys, values, headDim, headDim, headDim, headDim, 0, ctx-1, scale, out)
+		onlineAttention(q, keys, values, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
 	}
 }
 

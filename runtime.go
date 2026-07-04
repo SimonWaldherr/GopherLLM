@@ -150,6 +150,12 @@ const (
 	loadedGemma4
 )
 
+// Runner is a fully loaded model ready to generate: parsed GGUF header,
+// tokenizer, config, and weights (one of the three kind-specific sets).
+// Generations and embeddings are serialized by genLock — a Runner is safe to
+// share across goroutines (the HTTP server does), but runs one request at a
+// time. Close releases the memory-mapped weight file; quantized weights
+// borrow from it, so no method may be called after Close.
 type Runner struct {
 	gguf       *GGUFFile
 	arch       string
@@ -202,12 +208,15 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 		}
 		r.config, r.gptOss, r.kind = config, weights, loadedGptOss
 	case "gemma", "gemma2", "gemma4":
-		// The Gemma forward path currently reuses the standard llama-style
-		// graph and is missing several mechanisms real Gemma weights require
-		// (hardcoded sqrt(dim) embedding scaling, GELU FFN, post-attention/
-		// post-FFN norms, QK-norm/softcapping, per-layer sliding-window map,
-		// p-RoPE). See docs/INFERENCE_NOTES.md for the researched gap list.
-		fmt.Fprintf(stderr(), "Warning: %s support is experimental and known-incomplete; output quality will be poor (see docs/INFERENCE_NOTES.md)\n", arch)
+		// The dense Gemma graph is implemented (sqrt(dim) embedding scaling,
+		// GELU FFN, QK-norm, post-attention/post-FFN norms, attention/final
+		// logit softcapping, per-layer sliding-window map, <start_of_turn>
+		// template) but has not yet been validated against real Gemma
+		// weights, and the Gemma 4-specific mechanisms (p-RoPE frequency
+		// factors, per-layer RoPE bases, cross-layer KV sharing, per-layer
+		// embeddings, the 26B MoE) are still missing. See
+		// docs/INFERENCE_NOTES.md.
+		fmt.Fprintf(stderr(), "Warning: %s support is experimental (dense graph implemented, unvalidated against real weights; Gemma 4 p-RoPE/PLE/MoE missing — see docs/INFERENCE_NOTES.md)\n", arch)
 		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized)
 		if err != nil {
 			return nil, err
@@ -272,6 +281,17 @@ func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOp
 	})
 }
 
+// GenerateChatStreamUntil is the generation entry point everything else wraps
+// (Generate, GenerateChat, GenerateStream, ... are thin adapters over it):
+// render messages through the model's chat template, prefill the prompt
+// (batched when the architecture allows), then decode token by token until
+// EOS, a stop sequence, max_tokens, or the context limit. onToken receives
+// valid-UTF-8 text increments (bytes are buffered across token boundaries
+// until they complete a rune, and the tail is held back while it could still
+// be a stop-sequence prefix); returning false cancels generation, yielding
+// the partial result with ErrGenerationCanceled. The final result carries
+// content with reasoning and tool calls already extracted (classifyOutput)
+// and a FinishReason of "stop", "length", or "tool_calls".
 func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
@@ -466,8 +486,14 @@ func (r *Runner) canBatchPrefill() bool {
 	if os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
 		return false
 	}
+	// The batched graph implements only the plain llama-style block: fused
+	// weights and the Gemma-family mechanics (GELU, QK-norm, post-norms) fall
+	// back to the per-token path, which supports everything.
+	if r.config.UseGELU {
+		return false
+	}
 	for _, l := range r.standard.Layers {
-		if l.HasQKV || l.HasGateUp {
+		if l.HasQKV || l.HasGateUp || l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
 			return false
 		}
 	}
@@ -504,6 +530,10 @@ func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token ui
 	}
 }
 
+// Embed produces a text embedding by mean-pooling the final-layer hidden
+// states over all input tokens and L2-normalizing the result (so dot product
+// equals cosine similarity). Dimension is the model's hidden size — note this
+// uses the generation model's hidden states, not a dedicated embedding head.
 func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
@@ -534,6 +564,13 @@ func (r *Runner) isStopToken(token uint32) bool {
 	if r.arch == "gpt-oss" {
 		return token == r.tok.EOSID || token == 200002 || token == 200007
 	}
+	if gemmaFamily(r.arch) {
+		// Gemma instruct models end assistant turns with <end_of_turn>, not
+		// the <eos> the GGUF declares as EOS.
+		if id, ok := r.tok.SpecialID("<end_of_turn>"); ok && token == id {
+			return true
+		}
+	}
 	return token == r.tok.EOSID
 }
 
@@ -555,6 +592,10 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, too
 	}
 	generic, genericSystem := injectGenericTools(messages, systemPrompt, tools)
 	switch r.chatTemplateKind() {
+	case "gemma-chat":
+		if tokens, ok := r.renderGemmaMessages(generic, genericSystem); ok {
+			return tokens
+		}
 	case "header-chat":
 		if tokens, ok := r.renderHeaderChatMessages(generic, genericSystem); ok {
 			return tokens
@@ -836,6 +877,57 @@ func (r *Runner) systemPromptTokens() (start, end uint32, ok bool) {
 	return s, e, ok1 && ok2
 }
 
+// renderGemmaMessages renders the Gemma turn format:
+//
+//	<bos><start_of_turn>user\n{content}<end_of_turn>\n<start_of_turn>model\n{reply}<end_of_turn>\n...
+//
+// Gemma generations before 4 have no system role; the system prompt is folded
+// into the first user turn (the convention Google's reference templates use).
+// The assistant role is spelled "model".
+func (r *Runner) renderGemmaMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	startTurn, ok1 := r.tok.SpecialID("<start_of_turn>")
+	endTurn, ok2 := r.tok.SpecialID("<end_of_turn>")
+	if !(ok1 && ok2) {
+		return nil, false
+	}
+	system := strings.TrimSpace(systemPrompt)
+	loop := make([]ChatMessage, 0, len(messages))
+	for _, m := range messages {
+		if m.Role == ChatRoleSystem {
+			if s := strings.TrimSpace(m.Content); s != "" {
+				system = s
+			}
+			continue
+		}
+		loop = append(loop, m)
+	}
+	tokens := []uint32{}
+	if r.tok.AddBOS {
+		tokens = append(tokens, r.tok.BOSID)
+	}
+	firstUser := true
+	for _, m := range loop {
+		role := "user"
+		if m.Role == ChatRoleAssistant {
+			role = "model"
+		}
+		content := strings.TrimSpace(m.Content)
+		if m.Role == ChatRoleUser && firstUser && system != "" {
+			content = system + "\n\n" + content
+			firstUser = false
+		} else if m.Role == ChatRoleUser {
+			firstUser = false
+		}
+		tokens = append(tokens, startTurn)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(role+"\n"+content)...)
+		tokens = append(tokens, endTurn)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+	}
+	tokens = append(tokens, startTurn)
+	tokens = append(tokens, r.tok.EncodeWithoutBOS("model\n")...)
+	return tokens, true
+}
+
 func (r *Runner) renderHeaderChatMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
 	bot, ok1 := r.tok.SpecialID("<|begin_of_text|>")
 	startHeader, ok2 := r.tok.SpecialID("<|start_header_id|>")
@@ -1034,6 +1126,8 @@ func (r *Runner) chatTemplateKind() string {
 				return "deepseek-r1-qwen"
 			case strings.Contains(s, "<|start_of_role|>") && strings.Contains(s, "<|end_of_role|>"):
 				return "granite-chat"
+			case strings.Contains(s, "<start_of_turn>") && strings.Contains(s, "<end_of_turn>"):
+				return "gemma-chat"
 			}
 		}
 	}
@@ -1062,6 +1156,11 @@ func (r *Runner) chatTemplateKind() string {
 	if _, ok := r.tok.SpecialID("<|start_of_role|>"); ok {
 		if _, ok := r.tok.SpecialID("<|end_of_role|>"); ok {
 			return "granite-chat"
+		}
+	}
+	if _, ok := r.tok.SpecialID("<start_of_turn>"); ok {
+		if _, ok := r.tok.SpecialID("<end_of_turn>"); ok {
+			return "gemma-chat"
 		}
 	}
 	return ""
