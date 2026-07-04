@@ -90,6 +90,11 @@ type LoadInfo struct {
 	LoadTime      time.Duration
 }
 
+type LoadOptions struct {
+	PrepareQuantized bool
+	UseMetal         bool
+}
+
 type loadedKind int
 
 const (
@@ -121,10 +126,14 @@ func ArchitectureSupported(arch string) bool {
 }
 
 func RunnerFromGGUFBytes(data []byte) (*Runner, error) {
-	return runnerFromGGUFBytes(data, false)
+	return RunnerFromGGUFBytesWithOptions(data, LoadOptions{})
 }
 
-func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
+func RunnerFromGGUFBytesWithOptions(data []byte, options LoadOptions) (*Runner, error) {
+	return runnerFromGGUFBytes(data, false, options)
+}
+
+func runnerFromGGUFBytes(data []byte, borrowQuantized bool, options LoadOptions) (*Runner, error) {
 	gguf, err := ParseGGUF(data)
 	if err != nil {
 		return nil, err
@@ -143,19 +152,19 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 	r := &Runner{gguf: gguf, arch: arch, tok: tok}
 	switch arch {
 	case "gpt-oss":
-		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized)
+		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.gptOss, r.kind = config, weights, loadedGptOss
 	case "gemma", "gemma2", "gemma4":
-		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized)
+		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.gemma4, r.kind = config, weights, loadedGemma4
 	default:
-		config, weights, err := LoadModel(data, gguf, borrowQuantized)
+		config, weights, err := LoadModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal)
 		if err != nil {
 			return nil, err
 		}
@@ -165,12 +174,16 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool) (*Runner, error) {
 }
 
 func RunnerFromPath(path string) (*Runner, LoadInfo, error) {
+	return RunnerFromPathWithOptions(path, LoadOptions{})
+}
+
+func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadInfo, error) {
 	t0 := time.Now()
 	mmap, err := OpenMmap(path)
 	if err != nil {
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
-	r, err := runnerFromGGUFBytes(mmap.Bytes(), true)
+	r, err := runnerFromGGUFBytes(mmap.Bytes(), true, options)
 	if err != nil {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, err
@@ -186,12 +199,30 @@ func (r *Runner) Config() Config            { return r.config }
 func (r *Runner) ModelName() (string, bool) { return r.gguf.GetString("general.name") }
 
 func (r *Runner) Close() error {
-	if r == nil || r.mappedFile == nil {
+	if r == nil {
+		return nil
+	}
+	r.releaseMetalWeights()
+	if r.mappedFile == nil {
 		return nil
 	}
 	err := r.mappedFile.Close()
 	r.mappedFile = nil
 	return err
+}
+
+func (r *Runner) releaseMetalWeights() {
+	if r == nil {
+		return
+	}
+	switch r.kind {
+	case loadedGptOss:
+		releaseModelMetalWeights(&r.gptOss.Standard)
+	case loadedGemma4:
+		releaseModelMetalWeights(&r.gemma4.Standard)
+	default:
+		releaseModelMetalWeights(&r.standard)
+	}
 }
 
 func (r *Runner) Generate(prompt string, options GenerationOptions) (GenerationResult, error) {

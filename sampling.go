@@ -141,9 +141,26 @@ func sampleTopPFromProbs(probs []float32, topP float32, rng *Rng, candidates *[]
 }
 
 func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, candidates *[]TokenProb) uint32 {
-	ensureLenNoClear(candidates, len(weights))
+	var maxProb float32
+	for _, w := range weights {
+		if w > maxProb {
+			maxProb = w
+		}
+	}
+	threshold := maxProb * 1e-5
+	*candidates = (*candidates)[:0]
+	var keptSum float32
 	for i, w := range weights {
-		(*candidates)[i] = TokenProb{i, w}
+		if w >= threshold {
+			*candidates = append(*candidates, TokenProb{i, w})
+			keptSum += w
+		}
+	}
+	if keptSum < topP*total {
+		ensureLenNoClear(candidates, len(weights))
+		for i, w := range weights {
+			(*candidates)[i] = TokenProb{i, w}
+		}
 	}
 	sortTokenProbs(*candidates)
 	target := topP * total
@@ -173,6 +190,7 @@ func sampleTopPFromWeights(weights []float32, total, topP float32, rng *Rng, can
 
 func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	*candidates = (*candidates)[:0]
+	var threshold float32 = negInf32
 	for i, logit := range logits {
 		if len(*candidates) < topK {
 			if !finiteLogit(logit) {
@@ -180,12 +198,16 @@ func sampleTopK(logits []float32, topK int, topP, invTemp float32, rng *Rng, can
 			}
 			*candidates = append(*candidates, TokenProb{i, logit})
 			bubbleUpLast(*candidates)
-		} else if logit > (*candidates)[len(*candidates)-1].Prob {
+			if len(*candidates) == topK {
+				threshold = (*candidates)[topK-1].Prob
+			}
+		} else if logit > threshold {
 			if !finiteLogit(logit) {
 				continue
 			}
-			(*candidates)[len(*candidates)-1] = TokenProb{i, logit}
+			(*candidates)[topK-1] = TokenProb{i, logit}
 			bubbleUpLast(*candidates)
+			threshold = (*candidates)[topK-1].Prob
 		}
 	}
 	if len(*candidates) == 0 || math.IsInf(float64((*candidates)[0].Prob), -1) {

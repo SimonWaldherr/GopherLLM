@@ -99,6 +99,20 @@ func BenchmarkMatvecQ4K_1024x1024(b *testing.B) {
 	}
 }
 
+func BenchmarkMatvecPreparedQ4K_1024x1024(b *testing.B) {
+	data := benchBytes(1024 * (1024 / 256) * 144)
+	prepared := PrepareQuantizedWeight(data, GGMLTypeQ4_K, 1024, 1024)
+	x := benchFloatSlice(1024)
+	out := make([]float32, 1024)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data) + len(x)*4))
+	for b.Loop() {
+		if !MatvecPreparedQ4KInto(data, prepared, x, 1024, 1024, &out) {
+			b.Fatal("MatvecPreparedQ4KInto returned false")
+		}
+	}
+}
+
 func BenchmarkMatvecQ4K3_1024x1024(b *testing.B) {
 	qData := benchBytes(1024 * (1024 / 256) * 144)
 	kData := benchBytes(1024 * (1024 / 256) * 144)
@@ -121,6 +135,37 @@ func BenchmarkMatvecQ4K3_1024x1024(b *testing.B) {
 		)
 		if !ok {
 			b.Fatal("Q4KMatvec3Into returned false")
+		}
+	}
+}
+
+func BenchmarkMatvecPreparedQ4K3_1024x1024(b *testing.B) {
+	qData := benchBytes(1024 * (1024 / 256) * 144)
+	kData := benchBytes(1024 * (1024 / 256) * 144)
+	vData := benchBytes(1024 * (1024 / 256) * 144)
+	qPrep := PrepareQuantizedWeight(qData, GGMLTypeQ4_K, 1024, 1024)
+	kPrep := PrepareQuantizedWeight(kData, GGMLTypeQ4_K, 1024, 1024)
+	vPrep := PrepareQuantizedWeight(vData, GGMLTypeQ4_K, 1024, 1024)
+	x := benchFloatSlice(1024)
+	q := make([]float32, 1024)
+	k := make([]float32, 1024)
+	v := make([]float32, 1024)
+	xs := []float32{}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(qData) + len(kData) + len(vData) + len(x)*4))
+	for b.Loop() {
+		ok := MatvecPreparedQ4K3IntoWithXSums(
+			qData, qPrep, 1024, 1024,
+			kData, kPrep, 1024, 1024,
+			vData, vPrep, 1024, 1024,
+			x,
+			&xs,
+			&q,
+			&k,
+			&v,
+		)
+		if !ok {
+			b.Fatal("MatvecPreparedQ4K3IntoWithXSums returned false")
 		}
 	}
 }

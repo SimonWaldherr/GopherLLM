@@ -11,6 +11,13 @@ const hasQuantNEON = true
 //go:noescape
 func q4kQDots8(q *byte, x *float32, qdots *float32)
 
+// q4kDotPrepared computes one prepared Q4_K row dot product. q must point at
+// the first block's 128 packed nibble bytes, x at the row activations, and
+// scales/mins/xsums at 8 floats per block.
+//
+//go:noescape
+func q4kDotPrepared(q *byte, x *float32, scales *float32, mins *float32, xsums *float32, blocks int) float32
+
 // q6kQDots16 computes the 16 per-sub-block dot products (unsigned 6-bit
 // quants, before the -32 offset, times activations) of one Q6_K block.
 // ql must point at 128 bytes, qh at 64 bytes, x at 256 floats and qdots at

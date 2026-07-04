@@ -1,3 +1,5 @@
+//go:build arm64
+
 #include "textflag.h"
 
 // NEON kernels for K-quant dot products.
@@ -64,6 +66,74 @@ q4k_step:
 	ADD   $8, R2
 	SUB   $1, R3, R3
 	CBNZ  R3, q4k_step
+	RET
+
+// func q4kDotPrepared(q *byte, x *float32, scales *float32, mins *float32, xsums *float32, blocks int) float32
+//
+// q points at the first block's 128 packed nibble bytes (row block + 16).
+// scales/mins/xsums contain 8 floats per 256-value block.
+TEXT ·q4kDotPrepared(SB), NOSPLIT|NOFRAME, $0-52
+	MOVD  q+0(FP), R0
+	MOVD  x+8(FP), R1
+	MOVD  scales+16(FP), R2
+	MOVD  mins+24(FP), R3
+	MOVD  xsums+32(FP), R4
+	MOVD  blocks+40(FP), R5
+	VEOR  V30.B16, V30.B16, V30.B16
+	VMOVI $15, V31.B16
+	CBZ   R5, q4kprep_done
+
+q4kprep_block:
+	MOVD $4, R8
+
+q4kprep_step:
+	VLD1.P 32(R0), [V16.B16, V17.B16]
+	VAND   V31.B16, V16.B16, V18.B16
+	VAND   V31.B16, V17.B16, V19.B16
+	VUSHR  $4, V16.B16, V20.B16
+	VUSHR  $4, V17.B16, V21.B16
+	VEOR   V0.B16, V0.B16, V0.B16
+	VEOR   V1.B16, V1.B16, V1.B16
+	VEOR   V2.B16, V2.B16, V2.B16
+	VEOR   V3.B16, V3.B16, V3.B16
+
+	QGROUP(V18, V0, V1)
+	QGROUP(V19, V0, V1)
+	QGROUP(V20, V2, V3)
+	QGROUP(V21, V2, V3)
+
+	WORD $0x4E21D400 // fadd  v0.4s, v0.4s, v1.4s
+	WORD $0x4E23D442 // fadd  v2.4s, v2.4s, v3.4s
+	WORD $0x6E22D400 // faddp v0.4s, v0.4s, v2.4s
+	WORD $0x6E20D400 // faddp v0.4s, v0.4s, v0.4s
+
+	VMOV      V0.S[0], R6
+	VMOV      V0.S[1], R7
+	FMOVS     R6, F4
+	FMOVS     R7, F5
+	FMOVS.P   4(R2), F6
+	FMOVS.P   4(R2), F7
+	FMOVS.P   4(R3), F8
+	FMOVS.P   4(R3), F9
+	FMOVS.P   4(R4), F10
+	FMOVS.P   4(R4), F11
+	FMULS     F6, F4, F4
+	FMULS     F7, F5, F5
+	FMULS     F10, F8, F8
+	FMULS     F11, F9, F9
+	FSUBS     F8, F4, F4
+	FSUBS     F9, F5, F5
+	FADDS     F4, F30
+	FADDS     F5, F30
+	SUB       $1, R8, R8
+	CBNZ      R8, q4kprep_step
+
+	ADD $16, R0
+	SUB $1, R5, R5
+	CBNZ R5, q4kprep_block
+
+q4kprep_done:
+	FMOVS F30, ret+48(FP)
 	RET
 
 // func q6kQDots16(ql *byte, qh *byte, x *float32, qdots *float32)

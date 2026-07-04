@@ -1,10 +1,5 @@
 package main
 
-// Metal acceleration in the Rust project uses Objective-C and therefore CGO
-// in a Go port. GopherLLM keeps the public shape but uses pure-Go fallbacks.
-
-func MetalAvailable() bool { return false }
-
 func Q4KMatvec3Into(wq, wk, wv Q4KMatrix, x []float32, q, k, v *[]float32) bool {
 	scratch := []float32{}
 	return Q4KMatvec3IntoWithXSums(wq, wk, wv, x, &scratch, q, k, v)

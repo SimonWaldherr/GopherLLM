@@ -107,11 +107,13 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 }
 
 type Weight struct {
-	F32  []float32
-	Raw  []byte
-	Type GGMLType
-	Rows int
-	Cols int
+	F32      []float32
+	Raw      []byte
+	Type     GGMLType
+	Rows     int
+	Cols     int
+	Prepared *PreparedQuantizedWeight
+	Metal    *MetalWeight
 }
 
 func (w Weight) Matvec(x []float32) []float32 {
@@ -136,10 +138,16 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 	case GGMLTypeQ4_0:
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_K:
+		if MatvecPreparedQ4KInto(w.Raw, w.Prepared, x, w.Rows, w.Cols, out) {
+			return
+		}
 		MatvecQ4KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ5_K:
 		MatvecQ5KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ6_K:
+		if matvecMetalQ6KInto(w.Metal, x, w.Rows, w.Cols, out) {
+			return
+		}
 		MatvecQ6KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeMXFP4:
 		MatvecMXFP4Into(w.Raw, x, w.Rows, w.Cols, out)
@@ -182,6 +190,37 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 		copy(*out, DequantRowMXFP4(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
 	default:
 		panic(fmt.Sprintf("unsupported quantized row extraction: %v", w.Type))
+	}
+}
+
+func releaseModelMetalWeights(weights *ModelWeights) {
+	if weights == nil {
+		return
+	}
+	seen := map[*MetalWeight]bool{}
+	release := func(w *Weight) {
+		if w == nil || w.Metal == nil {
+			return
+		}
+		if !seen[w.Metal] {
+			releaseMetalWeight(w.Metal)
+			seen[w.Metal] = true
+		}
+		w.Metal = nil
+	}
+	release(&weights.TokenEmbd)
+	release(&weights.Output)
+	for i := range weights.Layers {
+		layer := &weights.Layers[i]
+		release(&layer.WQ)
+		release(&layer.WK)
+		release(&layer.WV)
+		release(&layer.WQKV)
+		release(&layer.WO)
+		release(&layer.W1)
+		release(&layer.W2)
+		release(&layer.W3)
+		release(&layer.WGateUp)
 	}
 }
 
@@ -377,7 +416,7 @@ func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
 	return inv, concentration
 }
 
-func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, ModelWeights, error) {
+func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool) (Config, ModelWeights, error) {
 	config := ConfigFromGGUF(gguf)
 	fmt.Fprintf(stderr(), "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
 		config.Dim, config.NLayers, config.NHeads, config.NKVHeads, config.HiddenDim, config.VocabSize, config.MaxSeqLen)
@@ -391,7 +430,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Model
 		config.RopeFactorsShort = loadOptionalF32Vec(data, gguf.DataOffset, "rope_factors_short.weight", tensorIdx, inferred, info.Numel())
 	}
 
-	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized)
+	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal)
 	if err != nil {
 		return config, ModelWeights{}, err
 	}
@@ -401,7 +440,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Model
 	}
 	output := tokenEmbd
 	if _, ok := tensorIdx["output.weight"]; ok {
-		output, err = loadWeight(data, gguf.DataOffset, "output.weight", tensorIdx, inferred, false, borrowQuantized)
+		output, err = loadWeight(data, gguf.DataOffset, "output.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal)
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
@@ -414,7 +453,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Model
 	kRows := config.NKVHeads * config.HeadDim
 	vRows := config.NKVHeads * config.ValueDim
 	for l := range config.NLayers {
-		layer, err := loadLayer(data, gguf.DataOffset, l, tensorIdx, inferred, borrowQuantized, qRows, kRows, vRows)
+		layer, err := loadLayer(data, gguf.DataOffset, l, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, qRows, kRows, vRows)
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
@@ -426,13 +465,13 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Model
 	return config, ModelWeights{TokenEmbd: tokenEmbd, OutputNorm: outputNorm, Output: output, Layers: layers}, nil
 }
 
-func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, GptOssWeights, error) {
-	config, weights, err := LoadModel(data, gguf, borrowQuantized)
+func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool) (Config, GptOssWeights, error) {
+	config, weights, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal)
 	return config, GptOssWeights{Standard: weights}, err
 }
 
-func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, Gemma4Weights, error) {
-	config, std, err := LoadModel(data, gguf, borrowQuantized)
+func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool) (Config, Gemma4Weights, error) {
+	config, std, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal)
 	if err != nil {
 		return config, Gemma4Weights{}, err
 	}
@@ -447,7 +486,7 @@ func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config,
 	return config, Gemma4Weights{TokenEmbd: std.TokenEmbd, OutputNorm: std.OutputNorm, Output: std.Output, Layers: layers, Standard: std}, nil
 }
 
-func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, inferred map[string]int, borrow bool, qRows, kRows, vRows int) (LayerWeights, error) {
+func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool, qRows, kRows, vRows int) (LayerWeights, error) {
 	prefix := fmt.Sprintf("blk.%d.", l)
 	attnNorm, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
 	if err != nil {
@@ -456,26 +495,26 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 	var wq, wk, wv, wqkv Weight
 	hasQKV := false
 	if _, ok := tensors[prefix+"attn_qkv.weight"]; ok {
-		wqkv, err = loadWeight(data, dataOffset, prefix+"attn_qkv.weight", tensors, inferred, false, borrow)
+		wqkv, err = loadWeight(data, dataOffset, prefix+"attn_qkv.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
 		hasQKV = true
 	} else {
-		wq, err = loadWeight(data, dataOffset, prefix+"attn_q.weight", tensors, inferred, false, borrow)
+		wq, err = loadWeight(data, dataOffset, prefix+"attn_q.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		wk, err = loadWeight(data, dataOffset, prefix+"attn_k.weight", tensors, inferred, false, borrow)
+		wk, err = loadWeight(data, dataOffset, prefix+"attn_k.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		wv, err = loadWeight(data, dataOffset, prefix+"attn_v.weight", tensors, inferred, false, borrow)
+		wv, err = loadWeight(data, dataOffset, prefix+"attn_v.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
 	}
-	wo, err := loadWeight(data, dataOffset, prefix+"attn_output.weight", tensors, inferred, false, borrow)
+	wo, err := loadWeight(data, dataOffset, prefix+"attn_output.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 	if err != nil {
 		return LayerWeights{}, err
 	}
@@ -483,23 +522,23 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 	if err != nil {
 		return LayerWeights{}, err
 	}
-	w2, err := loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow)
+	w2, err := loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 	if err != nil {
 		return LayerWeights{}, err
 	}
 	var w1, w3, wGateUp Weight
 	hasGateUp := false
 	if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
-		w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow)
+		w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow)
+		w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
 	} else {
-		wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow)
+		wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
@@ -596,7 +635,7 @@ func inferAttentionShape(config *Config, tensors map[string]TensorInfo) {
 	}
 }
 
-func loadWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, forceF32, borrow bool) (Weight, error) {
+func loadWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, forceF32, borrow, prepareQuantized, useMetal bool) (Weight, error) {
 	info, ok := tensors[name]
 	if !ok {
 		return Weight{}, fmt.Errorf("missing tensor: %s", name)
@@ -667,14 +706,21 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			copy(owned, raw)
 			raw = owned
 		}
-		return Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}, nil
+		w := Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}
+		if prepareQuantized && info.DType == GGMLTypeQ4_K {
+			w.Prepared = PrepareQuantizedWeight(raw, info.DType, rows, cols)
+		}
+		if useMetal {
+			w.Metal = prepareMetalWeight(raw, info.DType, rows, cols)
+		}
+		return w, nil
 	default:
 		return Weight{}, fmt.Errorf("unsupported tensor type for %s: %s", name, info.DType)
 	}
 }
 
 func loadF32Vec(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int) ([]float32, error) {
-	w, err := loadWeight(data, dataOffset, name, tensors, inferred, true, false)
+	w, err := loadWeight(data, dataOffset, name, tensors, inferred, true, false, false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -968,6 +1014,20 @@ func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v
 	}
 	switch wq.Type {
 	case GGMLTypeQ4_K:
+		if wq.Prepared != nil && wk.Prepared != nil && wv.Prepared != nil {
+			if MatvecPreparedQ4K3IntoWithXSums(
+				wq.Raw, wq.Prepared, wq.Rows, wq.Cols,
+				wk.Raw, wk.Prepared, wk.Rows, wk.Cols,
+				wv.Raw, wv.Prepared, wv.Rows, wv.Cols,
+				x,
+				q4kXSums,
+				q,
+				k,
+				v,
+			) {
+				return true
+			}
+		}
 		return Q4KMatvec3IntoWithXSums(
 			Q4KMatrix{Data: wq.Raw, Rows: wq.Rows, Cols: wq.Cols},
 			Q4KMatrix{Data: wk.Raw, Rows: wk.Rows, Cols: wk.Cols},
@@ -991,6 +1051,11 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 	}
 	switch a.Type {
 	case GGMLTypeQ4_K:
+		if a.Prepared != nil && b.Prepared != nil {
+			if MatvecPreparedQ4K2IntoWithXSums(a.Raw, a.Prepared, a.Rows, a.Cols, b.Raw, b.Prepared, b.Rows, b.Cols, x, q4kXSums, aOut, bOut) {
+				return true
+			}
+		}
 		return MatvecQ4K2IntoWithXSums(a.Raw, a.Rows, a.Cols, b.Raw, b.Rows, b.Cols, x, q4kXSums, aOut, bOut)
 	case GGMLTypeQ6_K:
 		return MatvecQ6K2Into(a.Raw, a.Rows, a.Cols, b.Raw, b.Rows, b.Cols, x, aOut, bOut)

@@ -1,3 +1,5 @@
+//go:build arm64
+
 #include "textflag.h"
 
 // func dotF32(a, b []float32) float32

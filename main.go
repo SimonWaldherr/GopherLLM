@@ -36,6 +36,8 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --repeat-penalty <F>      Repetition penalty (default: 1.1)")
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
+	fmt.Fprintln(os.Stderr, "  --metal                   Use experimental Metal Q6_K matvec offload when available")
+	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute Q4_K scale data during load for faster matvecs")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
 	fmt.Fprintln(os.Stderr, "  --embed                   Embed prompt and print the vector")
@@ -76,6 +78,8 @@ type cliConfig struct {
 	kernelBenchLayer int
 	timeout          time.Duration
 	cpuProfile       string
+	useMetal         bool
+	prepareQuant     bool
 	inspect          bool
 	listMetadata     bool
 }
@@ -133,10 +137,19 @@ func run() error {
 	}
 	defer stopProfile()
 	fmt.Fprintf(stderr(), "System: %d threads\n", runtime.GOMAXPROCS(0))
-	if MetalAvailable() {
-		fmt.Fprintln(stderr(), "Metal: enabled")
+	metalAvailable := MetalAvailable()
+	if cfg.useMetal {
+		if !metalAvailable {
+			return fmt.Errorf("Metal requested but unavailable; build with CGO_ENABLED=1 -tags metal on macOS")
+		}
+		fmt.Fprintln(stderr(), "Metal: enabled (experimental Q6_K matvec offload)")
+	} else if metalAvailable {
+		fmt.Fprintln(stderr(), "Metal: available (disabled; pass --metal)")
 	} else {
 		fmt.Fprintln(stderr(), "Metal: unavailable (pure Go / no CGO)")
+	}
+	if cfg.prepareQuant {
+		fmt.Fprintln(stderr(), "Quant prep: enabled for Q4_K weights")
 	}
 	modelPath, err := ResolveModelPath(cfg.modelSelector, cfg.modelDir)
 	if err != nil {
@@ -145,7 +158,7 @@ func run() error {
 	if cfg.inspect || cfg.listTensors || cfg.listMetadata {
 		return inspectGGUF(modelPath, cfg.listMetadata, cfg.listTensors)
 	}
-	runner, info, err := RunnerFromPath(modelPath)
+	runner, info, err := RunnerFromPathWithOptions(modelPath, LoadOptions{PrepareQuantized: cfg.prepareQuant, UseMetal: cfg.useMetal})
 	if err != nil {
 		return err
 	}
@@ -180,7 +193,7 @@ func run() error {
 	}
 	result, err := runWithTimeout(cfg.timeout, func() (GenerationResult, error) {
 		return runner.GenerateStream(cfg.prompt, cfg.options, func(s string) {
-			fmt.Print(s)
+			writeStreamChunk(s)
 		})
 	})
 	if err != nil {
@@ -189,6 +202,10 @@ func run() error {
 	fmt.Println()
 	printStats(result.Stats)
 	return nil
+}
+
+func writeStreamChunk(s string) {
+	_, _ = os.Stdout.WriteString(s)
 }
 
 func parseCLI(args []string) (cliConfig, error) {
@@ -302,6 +319,10 @@ func parseCLI(args []string) (cliConfig, error) {
 			}
 			SetNumThreads(v)
 			runtime.GOMAXPROCS(v)
+		case "--metal":
+			cfg.useMetal = true
+		case "--prepare-quant":
+			cfg.prepareQuant = true
 		case "--system-prompt":
 			v, err := next(arg)
 			if err != nil {

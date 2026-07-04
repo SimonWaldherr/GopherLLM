@@ -1,3 +1,5 @@
+//go:build arm64
+
 #include "textflag.h"
 
 // func axpyF32(out []float32, alpha float32, x []float32)

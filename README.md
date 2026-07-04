@@ -114,6 +114,13 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 ## Make Targets
 
 - `make run MODEL=... PROMPT='...'` builds and runs one prompt.
+- `make run-prep MODEL=...` runs the prompt with `--prepare-quant`.
+- `make build-metal` builds `bin/gopherllm-metal` with CGO and the `metal` tag.
+- `make run-metal MODEL=...` runs with experimental `--metal` enabled.
+- `make run-full MODEL=...` and `make run-full-prep MODEL=...` run 256-token
+  prompt checks without and with `--prepare-quant`.
+- `make run-full-metal MODEL=...` and `make run-full-metal-prep MODEL=...`
+  run 256-token prompt checks with Metal enabled.
 - `make repl MODEL=...` starts the REPL.
 - `make serve MODEL=... CHAT=1` starts the HTTP server and chat UI.
 - `make list-models` scans `MODEL_DIR`.
@@ -121,7 +128,14 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 - `make list-tensors MODEL=...` prints the tensor inventory.
 - `make bench` runs Go microbenchmarks.
 - `make bench-model MODEL=...` runs generation benchmark JSON.
+- `make bench-model-prep MODEL=...` and `make compare-bench MODEL=...` benchmark
+  the prepared quant path.
+- `make bench-model-metal MODEL=...` benchmarks the experimental Metal path.
 - `make kernel-bench MODEL=...` benchmarks isolated model kernels.
+- `make kernel-bench-prep MODEL=...` and `make compare-kernel-bench MODEL=...`
+  benchmark isolated kernels with prepared quant enabled.
+- `make kernel-bench-metal MODEL=...` benchmarks isolated kernels with Metal
+  enabled.
 - `make test`, `make vet`, and `make check` verify the codebase.
 - `make cross-build` compiles release binaries for macOS, Linux, and Windows on
   `amd64` and `arm64`.
@@ -129,11 +143,19 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 ## Performance Notes
 
 - Use `--threads <N>` to set both GopherLLM worker threads and `GOMAXPROCS`.
+- Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
+  scale/min data and switches those rows to row-level NEON prepared kernels.
 - Use `--temp 0 --top-k 1` for deterministic greedy output.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
   comparisons.
-- The runtime currently reports Metal as unavailable; inference runs through the Go
-  and assembly CPU kernels.
+- Metal is available only in `bin/gopherllm-metal` builds made with
+  `CGO_ENABLED=1 -tags metal`, and must be enabled with `--metal`. The current
+  path is experimental and only offloads large Q6_K matvecs to a Metal compute
+  kernel inspired by MLX's QMV/GEMV dispatch structure. It can improve isolated
+  output-matvec timings, but full generation can still be slower because each
+  token crosses the CPU/GPU boundary. Measure before using it for real runs;
+  more of the decode graph needs to stay resident on the GPU for Metal to win
+  consistently end to end.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are spread
   across the worker pool at longer contexts, and matvec work is over-chunked so
   performance cores absorb efficiency-core stragglers.

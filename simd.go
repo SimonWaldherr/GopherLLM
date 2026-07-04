@@ -26,11 +26,17 @@ func numThreads() int {
 }
 
 var f16LUT []float32
+var int8ToFloat32LUT [256]float32
+var byteToFloat32LUT [256]float32
 
 func init() {
 	f16LUT = make([]float32, 65536)
 	for i := 0; i < 65536; i++ {
 		f16LUT[i] = f16ToF32Soft(uint16(i))
+	}
+	for i := 0; i < 256; i++ {
+		int8ToFloat32LUT[i] = float32(int8(byte(i)))
+		byteToFloat32LUT[i] = float32(i)
 	}
 }
 
@@ -253,6 +259,7 @@ func MatvecQ6KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ6KXSums16(x, cols, scratch)
+		ScaleF32(xs, 32)
 		parallelRows(rows, func(start, end int) {
 			dotQ6KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
 		})
@@ -280,6 +287,7 @@ func MatvecQ6K2Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	ensureLenNoClear(bOut, bRows)
 	scratch := xsumsScratchPool.Get().(*[]float32)
 	xs := fillQ6KXSums16(x, aCols, scratch)
+	ScaleF32(xs, 32)
 	totalRows := aRows + bRows
 	parallelRows(totalRows, func(start, end int) {
 		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
@@ -307,6 +315,7 @@ func MatvecQ6K3Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	ensureLenNoClear(cOut, cRows)
 	scratch := xsumsScratchPool.Get().(*[]float32)
 	xs := fillQ6KXSums16(x, aCols, scratch)
+	ScaleF32(xs, 32)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
 	parallelRows(totalRows, func(start, end int) {
@@ -390,27 +399,29 @@ func dotQ6KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 	_ = xsums[blocks*16-1]
 	for b := 0; b < blocks; b++ {
 		base := b * 210
-		d := F16ToF32(uint16(row[base+208]) | uint16(row[base+209])<<8)
-		q6kQDots16(&row[base], &row[base+128], &x[b*256], &qdots[0])
-		xs := xsums[b*16:]
+		block := row[base : base+210]
+		_ = block[209]
+		d := F16ToF32(uint16(block[208]) | uint16(block[209])<<8)
+		q6kQDots16(&block[0], &block[128], &x[b*256], &qdots[0])
+		xs := xsums[b*16 : b*16+16]
 		_ = xs[15]
 		blockSum :=
-			float32(int8(row[base+192]))*(qdots[0]-32*xs[0]) +
-				float32(int8(row[base+193]))*(qdots[1]-32*xs[1]) +
-				float32(int8(row[base+194]))*(qdots[2]-32*xs[2]) +
-				float32(int8(row[base+195]))*(qdots[3]-32*xs[3]) +
-				float32(int8(row[base+196]))*(qdots[4]-32*xs[4]) +
-				float32(int8(row[base+197]))*(qdots[5]-32*xs[5]) +
-				float32(int8(row[base+198]))*(qdots[6]-32*xs[6]) +
-				float32(int8(row[base+199]))*(qdots[7]-32*xs[7]) +
-				float32(int8(row[base+200]))*(qdots[8]-32*xs[8]) +
-				float32(int8(row[base+201]))*(qdots[9]-32*xs[9]) +
-				float32(int8(row[base+202]))*(qdots[10]-32*xs[10]) +
-				float32(int8(row[base+203]))*(qdots[11]-32*xs[11]) +
-				float32(int8(row[base+204]))*(qdots[12]-32*xs[12]) +
-				float32(int8(row[base+205]))*(qdots[13]-32*xs[13]) +
-				float32(int8(row[base+206]))*(qdots[14]-32*xs[14]) +
-				float32(int8(row[base+207]))*(qdots[15]-32*xs[15])
+			int8ToFloat32LUT[block[192]]*(qdots[0]-xs[0]) +
+				int8ToFloat32LUT[block[193]]*(qdots[1]-xs[1]) +
+				int8ToFloat32LUT[block[194]]*(qdots[2]-xs[2]) +
+				int8ToFloat32LUT[block[195]]*(qdots[3]-xs[3]) +
+				int8ToFloat32LUT[block[196]]*(qdots[4]-xs[4]) +
+				int8ToFloat32LUT[block[197]]*(qdots[5]-xs[5]) +
+				int8ToFloat32LUT[block[198]]*(qdots[6]-xs[6]) +
+				int8ToFloat32LUT[block[199]]*(qdots[7]-xs[7]) +
+				int8ToFloat32LUT[block[200]]*(qdots[8]-xs[8]) +
+				int8ToFloat32LUT[block[201]]*(qdots[9]-xs[9]) +
+				int8ToFloat32LUT[block[202]]*(qdots[10]-xs[10]) +
+				int8ToFloat32LUT[block[203]]*(qdots[11]-xs[11]) +
+				int8ToFloat32LUT[block[204]]*(qdots[12]-xs[12]) +
+				int8ToFloat32LUT[block[205]]*(qdots[13]-xs[13]) +
+				int8ToFloat32LUT[block[206]]*(qdots[14]-xs[14]) +
+				int8ToFloat32LUT[block[207]]*(qdots[15]-xs[15])
 		sum += d * blockSum
 	}
 	return sum
@@ -668,20 +679,32 @@ func dotQ4KF32NEONWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 		dmin := F16ToF32(binaryLE16(block[2:]))
 		scales := block[4:16]
 		q4kQDots8(&block[16], &x[b*256], &qdots[0])
-		for step := 0; step < 4; step++ {
-			is := step * 2
-			var sc1, m1, sc2, m2 byte
-			if is < 4 {
-				sc1, m1 = scales[is]&63, scales[is+4]&63
-				sc2, m2 = scales[is+1]&63, scales[is+5]&63
-			} else {
-				sc1, m1 = (scales[is+4]&0x0f)|((scales[is-4]>>6)<<4), (scales[is+4]>>4)|((scales[is]>>6)<<4)
-				sc2, m2 = (scales[is+5]&0x0f)|((scales[is-3]>>6)<<4), (scales[is+5]>>4)|((scales[is+1]>>6)<<4)
-			}
-			xsumBase := b*8 + is
-			sum += d*float32(sc1)*qdots[is] - dmin*float32(m1)*xsums[xsumBase]
-			sum += d*float32(sc2)*qdots[is+1] - dmin*float32(m2)*xsums[xsumBase+1]
-		}
+
+		xsumBase := b * 8
+
+		// Step 0: is = 0
+		sc1_0, m1_0 := scales[0]&63, scales[4]&63
+		sc2_0, m2_0 := scales[1]&63, scales[5]&63
+		sum += d*byteToFloat32LUT[sc1_0]*qdots[0] - dmin*byteToFloat32LUT[m1_0]*xsums[xsumBase]
+		sum += d*byteToFloat32LUT[sc2_0]*qdots[1] - dmin*byteToFloat32LUT[m2_0]*xsums[xsumBase+1]
+
+		// Step 1: is = 2
+		sc1_1, m1_1 := scales[2]&63, scales[6]&63
+		sc2_1, m2_1 := scales[3]&63, scales[7]&63
+		sum += d*byteToFloat32LUT[sc1_1]*qdots[2] - dmin*byteToFloat32LUT[m1_1]*xsums[xsumBase+2]
+		sum += d*byteToFloat32LUT[sc2_1]*qdots[3] - dmin*byteToFloat32LUT[m2_1]*xsums[xsumBase+3]
+
+		// Step 2: is = 4
+		sc1_2, m1_2 := (scales[8]&0x0f)|((scales[0]>>6)<<4), (scales[8]>>4)|((scales[4]>>6)<<4)
+		sc2_2, m2_2 := (scales[9]&0x0f)|((scales[1]>>6)<<4), (scales[9]>>4)|((scales[5]>>6)<<4)
+		sum += d*byteToFloat32LUT[sc1_2]*qdots[4] - dmin*byteToFloat32LUT[m1_2]*xsums[xsumBase+4]
+		sum += d*byteToFloat32LUT[sc2_2]*qdots[5] - dmin*byteToFloat32LUT[m2_2]*xsums[xsumBase+5]
+
+		// Step 3: is = 6
+		sc1_3, m1_3 := (scales[10]&0x0f)|((scales[2]>>6)<<4), (scales[10]>>4)|((scales[6]>>6)<<4)
+		sc2_3, m2_3 := (scales[11]&0x0f)|((scales[3]>>6)<<4), (scales[11]>>4)|((scales[7]>>6)<<4)
+		sum += d*byteToFloat32LUT[sc1_3]*qdots[6] - dmin*byteToFloat32LUT[m1_3]*xsums[xsumBase+6]
+		sum += d*byteToFloat32LUT[sc2_3]*qdots[7] - dmin*byteToFloat32LUT[m2_3]*xsums[xsumBase+7]
 	}
 	return sum
 }
