@@ -8,6 +8,19 @@ import (
 	"sort"
 )
 
+// Config is the model's hyperparameter set, read from GGUF metadata by
+// ConfigFromGGUF and then refined against actual tensor shapes by
+// inferAttentionShape (GGUF metadata is frequently missing or wrong about
+// head dims, so the tensor shapes are authoritative).
+//
+// Attention shape vocabulary used throughout the forward pass:
+// HeadDim is the per-head Q/K width, ValueDim the per-head V width (usually
+// equal), NKVHeads the number of K/V heads (< NHeads under grouped-query
+// attention), KVMul = NHeads/NKVHeads the number of query heads sharing each
+// KV head, and KVDim = NKVHeads*ValueDim the per-position V cache width.
+// The scale factors (Embedding/Residual/Logit/Attention) default to 1 (or 0
+// meaning "use 1/sqrt(HeadDim)" for AttentionScale) and are only non-trivial
+// for architectures whose GGUFs carry them.
 type Config struct {
 	Arch                      string
 	Dim                       int
@@ -114,6 +127,12 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	}
 }
 
+// Weight is one loaded tensor in exactly one of two states: F32 non-nil
+// (plain floats, converted at load time from F32/F16 storage) or Raw non-nil
+// (still-quantized bytes, usually borrowed zero-copy from the mmap'd file,
+// dequantized on the fly inside the matvec kernels). Rows/Cols only apply to
+// the quantized form; the F32 form infers rows from len(F32)/cols at the
+// call site.
 type Weight struct {
 	F32  []float32
 	Raw  []byte
@@ -122,6 +141,9 @@ type Weight struct {
 	Cols int
 }
 
+// Matvec computes out = W·x, allocating the result. MatvecInto is the
+// allocation-free form used on the decode hot path; it dispatches to the
+// quant-type-specific parallel kernel in simd.go.
 func (w Weight) Matvec(x []float32) []float32 {
 	out := make([]float32, max(0, w.Rows))
 	w.MatvecInto(x, &out)
@@ -156,6 +178,8 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 	}
 }
 
+// Row dequantizes a single weight row (used for token-embedding lookups).
+// RowInto is the allocation-free form.
 func (w Weight) Row(row, cols int) []float32 {
 	out := make([]float32, cols)
 	w.RowInto(row, cols, &out)
@@ -201,6 +225,10 @@ func (w Weight) RowF32(row, cols int) []float32 {
 	return w.F32[start : start+cols]
 }
 
+// LayerWeights holds one transformer block. Attention is either split
+// (WQ/WK/WV, with optional biases BQ/BK/BV) or fused into a single WQKV
+// (HasQKV); the SwiGLU FFN is likewise either split (W1 = gate, W3 = up,
+// W2 = down — llama.cpp naming) or fused gate+up in WGateUp (HasGateUp).
 type LayerWeights struct {
 	AttnNorm  []float32
 	WQ        Weight
@@ -255,6 +283,12 @@ type GptOssWeights struct {
 	Standard ModelWeights
 }
 
+// KVCache stores the attention keys and values of every processed position,
+// one flat slice per layer laid out position-major: position p's keys occupy
+// K[layer][p*PerPosKDim : (p+1)*PerPosKDim] (all KV heads concatenated), and
+// likewise for V. Sized once per generation to prompt+max_tokens (capped at
+// the model context length); there is no ring/eviction — generation stops at
+// MaxLen.
 type KVCache struct {
 	K          [][]float32
 	V          [][]float32
@@ -263,6 +297,8 @@ type KVCache struct {
 	MaxLen     int
 }
 
+// NewKVCache allocates a cache for `layers` layers of maxLen positions with
+// the given per-position K and V widths (see KVCache).
 func NewKVCache(layers, kDim, vDim, maxLen int) *KVCache {
 	k := make([][]float32, layers)
 	v := make([][]float32, layers)
@@ -273,6 +309,14 @@ func NewKVCache(layers, kDim, vDim, maxLen int) *KVCache {
 	return &KVCache{K: k, V: v, PerPosKDim: kDim, PerPosVDim: vDim, MaxLen: maxLen}
 }
 
+// DecodeBuffer is the per-generation scratch memory for the single-token
+// forward pass: activation vectors (X residual stream, XN/XN2 normed views,
+// Q/K/V/AttnOut/Proj attention buffers, Gate/Up/Hidden FFN buffers), the
+// sampler's candidate scratch, and precomputed RoPE tables (per-pair inverse
+// frequencies plus per-position sin/cos filled in prepareRopeScratch). One
+// DecodeBuffer serves a whole generation, so the decode loop allocates
+// nothing per token. Not safe for concurrent use — Runner.genLock serializes
+// generations.
 type DecodeBuffer struct {
 	X                       []float32
 	XN                      []float32
@@ -451,6 +495,12 @@ func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
 	return inv, concentration
 }
 
+// LoadModel loads the standard llama-style weight set from a parsed GGUF.
+// With borrowQuantized set (the mmap path), quantized tensors are zero-copy
+// sub-slices of data — the caller must keep data alive for the model's
+// lifetime; without it they are copied into owned memory (the in-memory test
+// path). Models without a separate output.weight tie the output projection to
+// the token embeddings.
 func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized bool) (Config, ModelWeights, error) {
 	config := ConfigFromGGUF(gguf)
 	fmt.Fprintf(stderr(), "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
@@ -607,6 +657,10 @@ func indexTensors(gguf *GGUFFile) map[string]TensorInfo {
 	return out
 }
 
+// inferTensorSizes derives each tensor's byte size from the gap to the next
+// tensor's offset (last one runs to end of file). Used as the fallback when a
+// tensor's dtype can't be sized analytically, and as a bounds cross-check in
+// loadWeight.
 func inferTensorSizes(data []byte, gguf *GGUFFile) map[string]int {
 	type offIdx struct {
 		off uint64
@@ -670,6 +724,11 @@ func inferAttentionShape(config *Config, tensors map[string]TensorInfo) {
 	}
 }
 
+// loadWeight materializes one named tensor as a Weight: F32/F16 storage is
+// converted to owned float32s; supported quantized types stay in their packed
+// byte form, borrowed from data when borrow is set or copied otherwise.
+// forceF32 additionally dequantizes Q8_0/Q4_0 at load (used for norm vectors
+// that must be plain floats).
 func loadWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, forceF32, borrow bool) (Weight, error) {
 	info, ok := tensors[name]
 	if !ok {
@@ -769,6 +828,9 @@ func loadOptionalF32Vec(data []byte, dataOffset int, name string, tensors map[st
 	return v
 }
 
+// Forward runs one token through the transformer and returns its
+// next-token logits; ForwardInto is the allocation-free form. Both append the
+// token's K/V to the cache at position pos as a side effect.
 func Forward(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {
 	logits := make([]float32, 0)
 	ForwardInto(config, weights, cache, buf, token, pos, &logits)
@@ -783,6 +845,16 @@ func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *Decod
 	}
 }
 
+// ForwardBodyInto is the transformer body shared by logits, prefill, and
+// embedding paths: embed the token, then per layer run pre-norm attention
+// (RoPE'd Q/K, K/V appended to the cache, online-softmax attention over all
+// cached positions, output projection, residual add) followed by a pre-norm
+// SwiGLU FFN, and finally apply the output norm, leaving the normed hidden
+// state in buf.XN for the caller to project (or pool, for embeddings).
+// Attention heads are spread across the worker pool once the attended span is
+// long enough to amortize dispatch (see the comment at the call site); the
+// Q/K/V and gate/up matvecs go through the fused multi-matrix kernels when
+// the quant types allow (tryMatvec3Into/tryMatvec2Into).
 func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {
 	dim := config.Dim
 	headDim := config.HeadDim
@@ -933,6 +1005,9 @@ func ForwardHiddenGemma4(config Config, weights Gemma4Weights, cache *KVCache, b
 	return out
 }
 
+// rmsNormInto writes out[i] = x[i] / rms(x) * weight[i] where
+// rms(x) = sqrt(mean(x²) + eps) — RMSNorm as used by all supported
+// architectures (no mean subtraction, no bias).
 func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 	n := len(x)
 	ensureLenNoClear(out, n)
@@ -959,6 +1034,14 @@ func rmsNormInto(x, weight []float32, eps float32, out *[]float32) {
 	}
 }
 
+// prepareRopeScratch fills sin/cos tables for one position from the
+// precomputed inverse frequencies (optionally magnitude-scaled by mscale, the
+// YaRN attention factor — currently always 1, see buildRopeInvFreqYarn).
+// It returns the pair half-width and the number of cached pairs for
+// applyPreparedRope, which rotates each head either in interleaved pair
+// order (dims 2i,2i+1 — the original RoPE layout used by llama/mistral) or
+// split-half order (dims i, i+half — the NeoX layout everything else uses);
+// ropeInterleaved picks per architecture.
 func prepareRopeScratch(pos, headDim, ropeDim int, invFreq []float32, mscale float32, sinScratch, cosScratch *[]float32) (int, int) {
 	if ropeDim <= 0 || ropeDim > headDim {
 		ropeDim = headDim
@@ -1032,6 +1115,11 @@ func ropeInterleaved(arch string) bool {
 	}
 }
 
+// tryMatvec3Into / tryMatvec2Into route same-typed Q4_K or Q6_K weight groups
+// (Q/K/V projections; FFN gate+up) through the fused kernels that share one
+// activation-sums pass and one worker-pool dispatch. They return false —
+// having written nothing — whenever types or shapes don't line up, and the
+// caller falls back to independent matvecs.
 func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) bool {
 	if wq.Type != wk.Type || wq.Type != wv.Type || wq.Cols != wk.Cols || wq.Cols != wv.Cols || wq.Cols != len(x) || wq.F32 != nil || wk.F32 != nil || wv.F32 != nil {
 		return false
@@ -1069,6 +1157,14 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 	}
 }
 
+// onlineAttention computes softmax(q·K^T * scale)·V for one head over cached
+// positions [startT, endT] using the online-softmax algorithm: a single pass
+// that tracks the running max score and rescales the accumulated output
+// whenever a new maximum appears (out *= exp(oldMax-newMax)), so no
+// per-position score array is materialized regardless of context length.
+// keys/values are the head's slices into the position-major KV cache, striding
+// by keyStride/valueStride per position. out must be zeroed by the caller and
+// receives the already-normalized weighted value sum.
 func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale float32, out []float32) {
 	maxScore := float32(math.Inf(-1))
 	denom := float32(0)

@@ -1,5 +1,24 @@
 package main
 
+// CPU compute kernels: dot products and matrix-vector products over the
+// quantized block formats (layouts documented on GGMLType.DataSize),
+// dequantization, and the worker pool that parallelizes matvecs across rows.
+//
+// Every kernel exists in up to three tiers, chosen at runtime:
+//
+//	portable Go scalar  (always present; the correctness reference the
+//	                     differential tests compare against)
+//	ARM64 NEON          (hasQuantSIMD const true on arm64; *_arm64.s)
+//	x86-64 AVX2+FMA     (hasAVX2/hasQuantSIMD via CPUID; *_amd64.s,
+//	                     GOPHERLLM_DISABLE_SIMD=1 forces scalar)
+//
+// The "xsums" trick used by the Q4_K/Q6_K fast paths: both formats apply a
+// per-sub-block affine dequant (val = d*sc*q - dmin*m for Q4_K; a -32 offset
+// for Q6_K), so dot(row, x) splits into a quant-dependent term and a term
+// that only needs the SUM of x over each sub-block. Those sums are computed
+// once per matvec (fillQ4KXSums / fillQ6KXSums16) and shared by every row,
+// removing the offset handling from the inner loop.
+
 import (
 	"math"
 	"runtime"
@@ -11,6 +30,9 @@ var configuredThreads atomic.Int64
 
 var mxfp4LUT = [...]float32{0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6}
 
+// SetNumThreads overrides the worker count used by the parallel matvec
+// dispatch (default GOMAXPROCS). The CLI's --threads flag calls this and sets
+// GOMAXPROCS to the same value.
 func SetNumThreads(n int) {
 	if n < 1 {
 		n = 1
@@ -25,6 +47,10 @@ func numThreads() int {
 	return max(1, runtime.GOMAXPROCS(0))
 }
 
+// f16LUT maps every possible f16 bit pattern to its float32 value (256 KB,
+// built once at startup). Block scales in every quant format are f16, so this
+// lookup sits on the innermost dequant loops; a table beats bit manipulation
+// there.
 var f16LUT []float32
 
 func init() {
@@ -1434,6 +1460,10 @@ func getScaleMinK4(j int, q []byte) (byte, byte) {
 	return (q[j+4] & 0x0f) | ((q[j-4] >> 6) << 4), (q[j+4] >> 4) | ((q[j] >> 6) << 4)
 }
 
+// parallelRows splits [0, rows) across the persistent worker pool, running
+// fn(start, end) on each range concurrently and returning when all are done.
+// Small row counts (< 8 rows per worker) run inline — the dispatch overhead
+// would exceed the work.
 func parallelRows(rows int, fn func(start, end int)) {
 	threads := min(numThreads(), rows)
 	if threads <= 1 || rows < threads*8 {
@@ -1487,6 +1517,11 @@ type rowJob struct {
 	done  chan<- struct{}
 }
 
+// rowWorkerPool is the process-wide pool of matvec worker goroutines. It is
+// created lazily at the first parallel dispatch and rebuilt (old workers
+// stopped) if SetNumThreads changes the thread count. Keeping the goroutines
+// alive across calls avoids per-matvec spawn cost — matvecs run ~30x per
+// generated token.
 type rowWorkerPool struct {
 	threads int
 	jobs    chan rowJob
@@ -1534,6 +1569,10 @@ func rowWorker(jobs <-chan rowJob, stop <-chan struct{}) {
 	}
 }
 
+// ensureLen resizes *s to length n, reusing capacity when possible, and
+// zeroes the contents. ensureLenNoClear is the same without the zeroing, for
+// buffers that are fully overwritten anyway — it is the standard idiom for
+// every scratch buffer on the decode path.
 func ensureLen[T any](s *[]T, n int) {
 	if cap(*s) < n {
 		*s = make([]T, n)

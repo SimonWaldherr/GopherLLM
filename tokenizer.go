@@ -19,6 +19,18 @@ type Pair struct {
 	Right string
 }
 
+// Tokenizer implements the two GGUF tokenizer families:
+//
+//   - TokenizerSentencePiece (tokenizer.ggml.model = "llama"): text is mapped
+//     to "▁"-prefixed pieces and greedily merged by vocabulary Scores, with
+//     <0xNN> byte tokens as the fallback for uncovered bytes.
+//   - TokenizerGPT2BPE ("gpt2", incl. Mistral's Tekken and Qwen): text is
+//     pre-tokenized by a regex-equivalent splitter (Pre selects the Tekken
+//     variant), bytes are mapped through the GPT-2 printable-byte alphabet
+//     (ByteEncoder/ByteDecoder), and pieces are merged by MergeRanks.
+//
+// AddBOS mirrors tokenizer.ggml.add_bos_token: Encode prepends BOSID when
+// set, EncodeWithoutBOS never does (chat renderers place BOS themselves).
 type Tokenizer struct {
 	Vocab       []string
 	Scores      []float32
@@ -33,6 +45,9 @@ type Tokenizer struct {
 	EOSID       uint32
 }
 
+// TokenizerFromMetadata builds a Tokenizer from a GGUF's tokenizer.* keys:
+// vocabulary, merge ranks/scores, BOS/EOS ids, and the model/pre strings that
+// select the encoding mode.
 func TokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
 	tokensValue, ok := metadata["tokenizer.ggml.tokens"]
 	if !ok {
@@ -120,6 +135,10 @@ func (t *Tokenizer) decodeRaw(id uint32) string {
 	return ""
 }
 
+// DecodeToken renders one token id back to text: GPT-2 tokens go through the
+// byte alphabet, SentencePiece <0xNN> byte tokens decode to their raw byte,
+// and "▁" markers become spaces. Byte tokens may produce partial UTF-8; the
+// generation loop buffers output until it is valid (validUTF8PrefixLen).
 func (t *Tokenizer) DecodeToken(id uint32) string {
 	raw := t.decodeRaw(id)
 	if t.Mode == TokenizerGPT2BPE {
