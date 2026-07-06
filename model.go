@@ -1438,13 +1438,19 @@ func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v
 // tryMatvecAttentionInto keeps the attention projection fast for mixed-quant
 // GGUFs. Bottleneck: Ministral-3-3B-Q4_K_M stores Q/K as Q4_K but V as Q6_K,
 // so the previous all-or-nothing QKV fusion missed the reusable Q4_K xsums and
-// worker dispatch for Q+K. Change: try full QKV fusion first, then pairwise
-// fusion for any same-typed projection pair, then fall back to independent
-// matvecs. Expected effect: lower decode latency on mixed Q4_K/Q6_K attention
-// blocks. Risk: small extra branch cost. Rollback: replace this call with the
-// former three independent MatvecInto calls.
+// worker dispatch for Q+K, and still dispatched V separately. Change: try full
+// QKV fusion first, then the common mixed Q4_K/Q4_K/Q6_K one-dispatch path,
+// then pairwise fusion for other same-typed projection pairs. Expected effect:
+// lower decode latency on mixed Q4_K/Q6_K attention blocks. Risk: small extra
+// branch cost. Rollback: replace this call with the former three independent
+// MatvecInto calls.
 func tryMatvecAttentionInto(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) {
 	if tryMatvec3Into(wq, wk, wv, x, q4kXSums, q, k, v) {
+		return
+	}
+	if wq.F32 == nil && wk.F32 == nil && wv.F32 == nil &&
+		wq.Type == GGMLTypeQ4_K && wk.Type == GGMLTypeQ4_K && wv.Type == GGMLTypeQ6_K &&
+		MatvecQ4K2Q6KIntoWithXSums(wq.Raw, wq.Rows, wq.Cols, wk.Raw, wk.Rows, wk.Cols, wv.Raw, wv.Rows, wv.Cols, x, q4kXSums, q, k, v) {
 		return
 	}
 	if tryMatvec2Into(wq, wk, x, q4kXSums, q, k) {

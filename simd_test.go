@@ -298,6 +298,15 @@ func TestAttentionMatvecFusesMixedMinistralQKV(t *testing.T) {
 	assertFloatSlicesClose(t, "attn-q", gotQ, wantQ)
 	assertFloatSlicesClose(t, "attn-k", gotK, wantK)
 	assertFloatSlicesClose(t, "attn-v", gotV, wantV)
+
+	kernelQ, kernelK, kernelV := []float32{}, []float32{}, []float32{}
+	xsums = []float32{}
+	if !MatvecQ4K2Q6KIntoWithXSums(qData, qRows, cols, kData, kRows, cols, vData, vRows, cols, x, &xsums, &kernelQ, &kernelK, &kernelV) {
+		t.Fatal("mixed Q4_K/Q6_K kernel returned false")
+	}
+	assertFloatSlicesClose(t, "kernel-q", kernelQ, wantQ)
+	assertFloatSlicesClose(t, "kernel-k", kernelK, wantK)
+	assertFloatSlicesClose(t, "kernel-v", kernelV, wantV)
 }
 
 func TestDotQ6KMatchesDequantizedDot(t *testing.T) {

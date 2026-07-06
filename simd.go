@@ -275,6 +275,40 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 	return true
 }
 
+func MatvecQ4K2Q6KIntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows, bCols int, cData []byte, cRows, cCols int, x []float32, q4Sums *[]float32, aOut, bOut, cOut *[]float32) bool {
+	if aCols <= 0 || aCols != bCols || aCols != cCols || aCols != len(x) || aCols%256 != 0 {
+		return false
+	}
+	q4RowBytes := (aCols / 256) * 144
+	q6RowBytes := (aCols / 256) * 210
+	if len(aData) < aRows*q4RowBytes || len(bData) < bRows*q4RowBytes || len(cData) < cRows*q6RowBytes {
+		return false
+	}
+	ensureLenNoClear(aOut, aRows)
+	ensureLenNoClear(bOut, bRows)
+	ensureLenNoClear(cOut, cRows)
+	q4xs := fillQ4KXSums(x, aCols, q4Sums)
+	q6Scratch := xsumsScratchPool.Get().(*[]float32)
+	q6xs := fillQ6KXSums16(x, aCols, q6Scratch)
+	ScaleF32(q6xs, 32)
+	abRows := aRows + bRows
+	totalRows := abRows + cRows
+	parallelRows(totalRows, func(start, end int) {
+		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+			dotQ4KRowsWithXSums(aData, x, q4xs, aCols, q4RowBytes, as, ae, *aOut)
+		}
+		if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
+			dotQ4KRowsWithXSums(bData, x, q4xs, bCols, q4RowBytes, bs-aRows, be-aRows, *bOut)
+		}
+		if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
+			dotQ6KRowsWithXSums(cData, x, q6xs, cCols, q6RowBytes, cs-abRows, ce-abRows, *cOut)
+		}
+	})
+	*q6Scratch = q6xs
+	xsumsScratchPool.Put(q6Scratch)
+	return true
+}
+
 func dotQ4KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	for r := start; r < end; r++ {
 		off := r * rowBytes

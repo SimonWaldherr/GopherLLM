@@ -170,6 +170,43 @@ func BenchmarkMatvecPreparedQ4K3_1024x1024(b *testing.B) {
 	}
 }
 
+func BenchmarkMatvecQ4K2Q6K_AttentionShape(b *testing.B) {
+	const cols, qRows, kRows, vRows = 3072, 4096, 1024, 1024
+	qData := benchBytes(qRows * (cols / 256) * 144)
+	kData := benchBytes(kRows * (cols / 256) * 144)
+	vData := benchBytes(vRows * (cols / 256) * 210)
+	x := benchFloatSlice(cols)
+	q := make([]float32, qRows)
+	k := make([]float32, kRows)
+	v := make([]float32, vRows)
+	xs := []float32{}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(qData) + len(kData) + len(vData) + len(x)*4))
+	for b.Loop() {
+		if !MatvecQ4K2Q6KIntoWithXSums(qData, qRows, cols, kData, kRows, cols, vData, vRows, cols, x, &xs, &q, &k, &v) {
+			b.Fatal("MatvecQ4K2Q6KIntoWithXSums returned false")
+		}
+	}
+}
+
+func BenchmarkMatvecQ4K2Q6K_AttentionShapeSeparate(b *testing.B) {
+	const cols, qRows, kRows, vRows = 3072, 4096, 1024, 1024
+	wq := Weight{Raw: benchBytes(qRows * (cols / 256) * 144), Type: GGMLTypeQ4_K, Rows: qRows, Cols: cols}
+	wk := Weight{Raw: benchBytes(kRows * (cols / 256) * 144), Type: GGMLTypeQ4_K, Rows: kRows, Cols: cols}
+	wv := Weight{Raw: benchBytes(vRows * (cols / 256) * 210), Type: GGMLTypeQ6_K, Rows: vRows, Cols: cols}
+	x := benchFloatSlice(cols)
+	q := make([]float32, qRows)
+	k := make([]float32, kRows)
+	v := make([]float32, vRows)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(wq.Raw) + len(wk.Raw) + len(wv.Raw) + len(x)*4))
+	for b.Loop() {
+		wq.MatvecInto(x, &q)
+		wk.MatvecInto(x, &k)
+		wv.MatvecInto(x, &v)
+	}
+}
+
 func BenchmarkDotQ5K_4096(b *testing.B) {
 	row := benchBytes((4096 / 256) * 176)
 	x := benchFloatSlice(4096)
