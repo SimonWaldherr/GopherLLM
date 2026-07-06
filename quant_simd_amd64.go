@@ -21,12 +21,26 @@ func q4kDotPrepared(q *byte, x *float32, scales *float32, mins *float32, xsums *
 	panic("q4kDotPrepared is only available on arm64")
 }
 
-// q4kQDots8Q8 computes the 8 Q4_K sub-block dot products against int8-quantized
-// activations via VPMADDUBSW, writing 8 int32 results to intqdots. Used only by
-// the opt-in int8 activation path (see q4k_q8_amd64.go).
+// q8kQuantize quantizes x to int8 per 256-element block (symmetric absmax,
+// one float scale per block — llama.cpp's Q8_K convention), used by
+// acquireQ8 for the default int8-activation matvec path.
 //
 //go:noescape
-func q4kQDots8Q8(q *byte, q8 *int8, intqdots *int32)
+func q8kQuantize(x *float32, q8 *int8, scales *float32, blocks int)
+
+// q4kDotQ8KRow computes one full Q4_K row dot product against Q8K-quantized
+// activations via VPMADDUBSW, with in-register scale/min decode and a single
+// horizontal reduction per row. xsums are the per-32-element float sums of
+// the original activations (exact dmin term).
+//
+//go:noescape
+func q4kDotQ8KRow(q *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
+
+// q6kDotQ8KRow is the Q6_K full-row analogue. xsums are the per-16-element
+// sums of the original activations pre-scaled by 32.
+//
+//go:noescape
+func q6kDotQ8KRow(row *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
 
 // q6kQDots16 computes the 16 per-16-element dot products (unsigned 6-bit
 // quants, before the -32 offset, times activations) of one Q6_K block. ql

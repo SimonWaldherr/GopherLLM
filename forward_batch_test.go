@@ -140,23 +140,29 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 	}
 
 	for name, w := range weights {
-		want := make([][]float32, P)
-		for p := range want {
-			want[p] = w.Matvec(xs[p])
-		}
-		got := make([][]float32, P)
-		for p := range got {
-			got[p] = make([]float32, rows)
-		}
-		matvecBatch(w, xs, got)
-		for p := 0; p < P; p++ {
-			for r := 0; r < rows; r++ {
-				d := math.Abs(float64(got[p][r] - want[p][r]))
-				if d > 1e-3*math.Max(1, math.Abs(float64(want[p][r]))) {
-					t.Fatalf("%s token %d row %d: batch=%v per-token=%v", name, p, r, got[p][r], want[p][r])
+		// Force the float kernels on both sides: this test checks the batched
+		// dequantize-once bookkeeping against the per-token matvec exactly,
+		// which the int8-activation default would blur with quantization error
+		// (covered separately by TestMatvecBatchQ8CloseToFloat).
+		withQ8Activations(false, func() {
+			want := make([][]float32, P)
+			for p := range want {
+				want[p] = w.Matvec(xs[p])
+			}
+			got := make([][]float32, P)
+			for p := range got {
+				got[p] = make([]float32, rows)
+			}
+			matvecBatch(w, xs, got)
+			for p := 0; p < P; p++ {
+				for r := 0; r < rows; r++ {
+					d := math.Abs(float64(got[p][r] - want[p][r]))
+					if d > 1e-3*math.Max(1, math.Abs(float64(want[p][r]))) {
+						t.Fatalf("%s token %d row %d: batch=%v per-token=%v", name, p, r, got[p][r], want[p][r])
+					}
 				}
 			}
-		}
+		})
 	}
 }
 

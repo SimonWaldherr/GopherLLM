@@ -10,8 +10,22 @@ import "os"
 // GOPHERLLM_DISABLE_SIMD to force the scalar path (useful for A/B benchmarking).
 var hasAVX2 = detectAVX2()
 
+// hasF16C reports CPUID F16C support (VCVTPH2PS), required by the int8
+// activation kernels that convert f16 block scales in-register. Every
+// AVX2+FMA CPU in practice also has F16C, but the check is cheap.
+var hasF16C = detectF16C()
+
 func cpuid(eaxArg, ecxArg uint32) (eax, ebx, ecx, edx uint32)
 func xgetbv() uint32
+
+func detectF16C() bool {
+	if os.Getenv("GOPHERLLM_DISABLE_SIMD") != "" {
+		return false
+	}
+	const f16cBit = 1 << 29 // CPUID.1:ECX.F16C
+	_, _, ecx1, _ := cpuid(1, 0)
+	return ecx1&f16cBit != 0
+}
 
 func detectAVX2() bool {
 	if os.Getenv("GOPHERLLM_DISABLE_SIMD") != "" {

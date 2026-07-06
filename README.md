@@ -477,26 +477,28 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   token crosses the CPU/GPU boundary. Measure before using it for real runs;
   more of the decode graph needs to stay resident on the GPU for Metal to win
   consistently end to end.
-- On x86-64, `DotF32`, the F32 vector ops, and the Q4_K/Q6_K matvecs use AVX2 + FMA
-  kernels (auto-detected via CPUID). This gives roughly a 3x end-to-end decode
-  speedup over the scalar path on Q4_K_M models. Set `GOPHERLLM_DISABLE_SIMD=1` to
-  force the portable scalar kernels (useful for A/B benchmarking).
-- Prompt processing (prefill) is batched: each weight is dequantized once per
-  prompt chunk and reused across all prompt tokens, instead of re-running the
-  quantized kernels once per token. Since prefill is compute-bound this is a large
-  speedup (~4x measured on a Q4_K_M model). Set `GOPHERLLM_NO_BATCH_PREFILL=1` to
-  fall back to the per-token path (A/B benchmarking / debugging). The chunk size
-  (tokens processed per dequant pass) is tuned to 32: throughput improves with
-  chunk size up to that point (more reuse per dequant) and degrades past it (the
-  chunk's activation buffers outgrow cache, costing more in misses than the extra
-  reuse buys back) — empirically ~15-20% faster than a naively "bigger is better"
-  chunk size of 64 or 128.
-- Set `GOPHERLLM_Q8_ACTIVATIONS=1` (x86-64, opt-in) to quantize activations to int8
-  and run the Q4_K matvecs with `VPMADDUBSW` integer dot products. This is roughly
-  1.15-1.2x faster on the Q4_K path at the cost of a small activation-quantization
-  error (output direction stays within cosine 0.999 of the float path). Off by
-  default so the float kernels remain bit-for-bit reproducible against the scalar
-  reference.
+- On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K and Q6_K matvecs
+  default to int8-activation full-row kernels: the activation vector is quantized
+  once per matvec to int8 with one scale per 256-element block (llama.cpp's Q8_K
+  convention, `q8kQuantize`), and each weight row is processed by a single
+  assembly call (`q4kDotQ8KRow` / `q6kDotQ8KRow`) that decodes block scales
+  in-register, dots 32 weights per `VPMADDUBSW`, applies scales via `VPMADDWD`,
+  and reduces horizontally once per row. Versus the previous per-block float
+  kernels this is ~2.5x (Q4_K) to ~6x (Q6_K) per-row and roughly 4x end-to-end
+  decode on a Ministral 3B Q4_K_M. Set `GOPHERLLM_Q8_ACTIVATIONS=0` to force the
+  exact float kernels (bit-reproducible against the scalar reference; the int8
+  path stays within cosine 0.999 of it — the same accuracy tradeoff llama.cpp
+  makes by default). `GOPHERLLM_DISABLE_SIMD=1` still forces portable scalar
+  kernels everywhere.
+- Prompt processing (prefill) is batched. With the int8 path active, each raw
+  quantized weight row is streamed from memory exactly once per prompt chunk and
+  dotted against all prompt tokens' pre-quantized int8 activations in
+  L2-resident row tiles (`matvecBatchQ8`) — no f32 dequantization pass at all.
+  With `GOPHERLLM_Q8_ACTIVATIONS=0` the older dequantize-once-per-chunk f32 path
+  runs instead. Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token
+  path (A/B benchmarking / debugging).
+- SwiGLU's `x*sigmoid(x)*up` runs through an AVX2 kernel with a Cephes-style
+  expf polynomial (~1e-7 relative error) instead of per-element `math.Exp`.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are spread
   across the worker pool at longer contexts, and matvec work is over-chunked so
   performance cores absorb efficiency-core stragglers.
@@ -505,15 +507,15 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 
 ### Environment variables
 
-Quick reference for the runtime toggles described above (all off/unset by
-default; details in the bullets they annotate):
+Quick reference for the runtime toggles described above (unset by default;
+details in the bullets they annotate):
 
 | Variable | Effect |
 |---|---|
 | `RUSTY_LLM_MODEL_DIR` | Default model directory when `--model-dir` is not given |
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
-| `GOPHERLLM_Q8_ACTIVATIONS` | Opt-in int8-activation Q4_K matvecs (x86-64) |
+| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q6_K matvecs (x86-64) |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
 
 ## Supported Architectures

@@ -37,6 +37,10 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 		return
 	}
 
+	if useQ8Activations && matvecBatchQ8(w, xs, outs) {
+		return
+	}
+
 	dequant := dequantRowInto(w, cols)
 	if dequant == nil {
 		// No batched dequant for this type: fall back to per-token matvec.
@@ -246,14 +250,14 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			matvecBatch(layer.W1, XN, Gate)
 			matvecBatch(layer.W3, XN, Up)
 		}
-		for t := 0; t < p; t++ {
-			g := Gate[t]
-			u := Up[t]
-			hid := Hidden[t]
-			for i := 0; i < hDim; i++ {
-				gv := g[i]
-				hid[i] = (gv / (1 + float32(math.Exp(float64(-gv))))) * u[i]
-			}
+		if p > 1 {
+			parallelChunks(p, func(ts, te int) {
+				for t := ts; t < te; t++ {
+					siluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])
+				}
+			})
+		} else {
+			siluMulF32(Gate[0][:hDim], Up[0][:hDim], Hidden[0][:hDim])
 		}
 		matvecBatch(layer.W2, Hidden, Proj)
 		for t := 0; t < p; t++ {

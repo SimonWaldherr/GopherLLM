@@ -1200,10 +1200,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 					hidden[i] = geluTanh(gate[i]) * up[i]
 				}
 			} else {
-				for i := 0; i < hDim; i++ {
-					g := gate[i]
-					hidden[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
-				}
+				siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
 			}
 		}
 		layer.W2.MatvecInto(buf.Hidden, &buf.Proj)

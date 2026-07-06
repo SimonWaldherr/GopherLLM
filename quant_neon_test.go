@@ -107,7 +107,9 @@ func TestMatvecQ4KIntoMatchesPerRowDot(t *testing.T) {
 	}
 	x := randomVec(rng, cols)
 	out := []float32{}
-	MatvecQ4KInto(data, x, rows, cols, &out)
+	// Force the float kernels: this test validates the exact block layout
+	// handling, which the int8 default path would blur with quantization error.
+	withQ8Activations(false, func() { MatvecQ4KInto(data, x, rows, cols, &out) })
 	for r := range rows {
 		want := DotQ4KF32(data[r*rowBytes:(r+1)*rowBytes], x, cols)
 		if math.Abs(float64(out[r]-want)) > 1e-2*math.Max(1, math.Abs(float64(want))) {
@@ -186,7 +188,7 @@ func TestMatvecQ6KIntoMatchesPerRowDot(t *testing.T) {
 	}
 	x := randomVec(rng, cols)
 	out := []float32{}
-	MatvecQ6KInto(data, x, rows, cols, &out)
+	withQ8Activations(false, func() { MatvecQ6KInto(data, x, rows, cols, &out) })
 	for r := range rows {
 		want := DotQ6KF32(data[r*rowBytes:(r+1)*rowBytes], x, cols)
 		if math.Abs(float64(out[r]-want)) > 1e-2*math.Max(1, math.Abs(float64(want))) {

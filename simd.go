@@ -26,6 +26,11 @@ import (
 	"sync/atomic"
 )
 
+// oversubscribeDispatch issues 4x more matvec chunks than workers so faster
+// cores absorb stragglers — a win on heterogeneous big.LITTLE parts (Apple
+// Silicon), pure channel-wakeup overhead on homogeneous x86 cores.
+var oversubscribeDispatch = runtime.GOARCH == "arm64"
+
 var configuredThreads atomic.Int64
 
 var mxfp4LUT = [...]float32{0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6}
@@ -147,6 +152,13 @@ func scaleAddF32Scalar(out []float32, alpha float32, x []float32) {
 func mulScaleF32Scalar(x []float32, weight []float32, scale float32, out []float32) {
 	for i := 0; i < min(len(x), len(weight), len(out)); i++ {
 		out[i] = x[i] * weight[i] * scale
+	}
+}
+
+func siluMulF32Scalar(gate, up, out []float32, start, end int) {
+	for i := start; i < end; i++ {
+		g := gate[i]
+		out[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
 	}
 }
 
@@ -293,17 +305,33 @@ func MatvecQ4K2Q6KIntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bR
 	ScaleF32(q6xs, 32)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
-	parallelRows(totalRows, func(start, end int) {
-		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-			dotQ4KRowsWithXSums(aData, x, q4xs, aCols, q4RowBytes, as, ae, *aOut)
-		}
-		if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-			dotQ4KRowsWithXSums(bData, x, q4xs, bCols, q4RowBytes, bs-aRows, be-aRows, *bOut)
-		}
-		if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-			dotQ6KRowsWithXSums(cData, x, q6xs, cCols, q6RowBytes, cs-abRows, ce-abRows, *cOut)
-		}
-	})
+	if useQ8Activations {
+		q8, xsc, release := acquireQ8(x, aCols)
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ4KRowsQ8(aData, q8, xsc, q4xs, aCols, q4RowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
+				dotQ4KRowsQ8(bData, q8, xsc, q4xs, bCols, q4RowBytes, bs-aRows, be-aRows, *bOut)
+			}
+			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
+				dotQ6KRowsQ8(cData, q8, xsc, q6xs, cCols, q6RowBytes, cs-abRows, ce-abRows, *cOut)
+			}
+		})
+		release()
+	} else {
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ4KRowsWithXSums(aData, x, q4xs, aCols, q4RowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
+				dotQ4KRowsWithXSums(bData, x, q4xs, bCols, q4RowBytes, bs-aRows, be-aRows, *bOut)
+			}
+			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
+				dotQ6KRowsWithXSums(cData, x, q6xs, cCols, q6RowBytes, cs-abRows, ce-abRows, *cOut)
+			}
+		})
+	}
 	*q6Scratch = q6xs
 	xsumsScratchPool.Put(q6Scratch)
 	return true
@@ -334,9 +362,17 @@ func MatvecQ6KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ6KXSums16(x, cols, scratch)
 		ScaleF32(xs, 32)
-		parallelRows(rows, func(start, end int) {
-			dotQ6KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
-		})
+		if useQ8Activations {
+			q8, xsc, release := acquireQ8(x, cols)
+			parallelRows(rows, func(start, end int) {
+				dotQ6KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
+			})
+			release()
+		} else {
+			parallelRows(rows, func(start, end int) {
+				dotQ6KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
+			})
+		}
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return
@@ -363,14 +399,27 @@ func MatvecQ6K2Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	xs := fillQ6KXSums16(x, aCols, scratch)
 	ScaleF32(xs, 32)
 	totalRows := aRows + bRows
-	parallelRows(totalRows, func(start, end int) {
-		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-			dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
-		}
-		if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
-			dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-		}
-	})
+	if useQ8Activations {
+		q8, xsc, release := acquireQ8(x, aCols)
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ6KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
+				dotQ6KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			}
+		})
+		release()
+	} else {
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
+				dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			}
+		})
+	}
 	*scratch = xs
 	xsumsScratchPool.Put(scratch)
 	return true
@@ -392,17 +441,33 @@ func MatvecQ6K3Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	ScaleF32(xs, 32)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
-	parallelRows(totalRows, func(start, end int) {
-		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-			dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
-		}
-		if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-			dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-		}
-		if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-			dotQ6KRowsWithXSums(cData, x, xs, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
-		}
-	})
+	if useQ8Activations {
+		q8, xsc, release := acquireQ8(x, aCols)
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ6KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
+				dotQ6KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			}
+			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
+				dotQ6KRowsQ8(cData, q8, xsc, xs, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
+			}
+		})
+		release()
+	} else {
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
+				dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
+			}
+			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
+				dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
+			}
+			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
+				dotQ6KRowsWithXSums(cData, x, xs, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
+			}
+		})
+	}
 	*scratch = xs
 	xsumsScratchPool.Put(scratch)
 	return true
@@ -1550,10 +1615,12 @@ func parallelChunks(n int, fn func(start, end int)) {
 func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	pool := getRowWorkerPool(threads)
 	// Issue more chunks than workers so faster cores naturally pick up the
-	// slack of slower ones (e.g. efficiency cores on Apple Silicon). Small
-	// matvecs stay at one chunk per worker to avoid channel wakeup overhead.
+	// slack of slower ones (e.g. efficiency cores on Apple Silicon). On
+	// homogeneous-core amd64 the oversubscription only multiplies channel
+	// wakeups, so chunks stay 1:1 with workers there. Small matvecs stay at
+	// one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
-	if rows >= threads*128 {
+	if oversubscribeDispatch && rows >= threads*128 {
 		chunks = min(threads*4, cap(pool.jobs))
 	}
 	done := rowDonePool.Get().(chan struct{})

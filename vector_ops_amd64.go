@@ -3,6 +3,24 @@
 package gopherllm
 
 //go:noescape
+func siluMulF32AVX2(gate, up, out []float32)
+
+// siluMulF32 computes out[i] = silu(gate[i]) * up[i] (SwiGLU), vectorized
+// on AVX2 with a scalar tail.
+func siluMulF32(gate, up, out []float32) {
+	n := min(len(gate), len(up), len(out))
+	i := 0
+	if hasAVX2 {
+		n8 := n &^ 7
+		if n8 > 0 {
+			siluMulF32AVX2(gate[:n8], up[:n8], out[:n8])
+		}
+		i = n8
+	}
+	siluMulF32Scalar(gate, up, out, i, n)
+}
+
+//go:noescape
 func axpyF32AVX2(out []float32, alpha float32, x []float32)
 
 //go:noescape
