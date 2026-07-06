@@ -1106,11 +1106,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			copy(buf.K, buf.QKV[qLen:qLen+kLen])
 			copy(buf.V, buf.QKV[qLen+kLen:qLen+kLen+vLen])
 		} else {
-			if !tryMatvec3Into(layer.WQ, layer.WK, layer.WV, buf.XN, &buf.Q4KXSums, &buf.Q, &buf.K, &buf.V) {
-				layer.WQ.MatvecInto(buf.XN, &buf.Q)
-				layer.WK.MatvecInto(buf.XN, &buf.K)
-				layer.WV.MatvecInto(buf.XN, &buf.V)
-			}
+			tryMatvecAttentionInto(layer.WQ, layer.WK, layer.WV, buf.XN, &buf.Q4KXSums, &buf.Q, &buf.K, &buf.V)
 			addInPlace(buf.Q, layer.BQ)
 			addInPlace(buf.K, layer.BK)
 			addInPlace(buf.V, layer.BV)
@@ -1437,6 +1433,35 @@ func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v
 	default:
 		return false
 	}
+}
+
+// tryMatvecAttentionInto keeps the attention projection fast for mixed-quant
+// GGUFs. Bottleneck: Ministral-3-3B-Q4_K_M stores Q/K as Q4_K but V as Q6_K,
+// so the previous all-or-nothing QKV fusion missed the reusable Q4_K xsums and
+// worker dispatch for Q+K. Change: try full QKV fusion first, then pairwise
+// fusion for any same-typed projection pair, then fall back to independent
+// matvecs. Expected effect: lower decode latency on mixed Q4_K/Q6_K attention
+// blocks. Risk: small extra branch cost. Rollback: replace this call with the
+// former three independent MatvecInto calls.
+func tryMatvecAttentionInto(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) {
+	if tryMatvec3Into(wq, wk, wv, x, q4kXSums, q, k, v) {
+		return
+	}
+	if tryMatvec2Into(wq, wk, x, q4kXSums, q, k) {
+		wv.MatvecInto(x, v)
+		return
+	}
+	if tryMatvec2Into(wq, wv, x, q4kXSums, q, v) {
+		wk.MatvecInto(x, k)
+		return
+	}
+	if tryMatvec2Into(wk, wv, x, q4kXSums, k, v) {
+		wq.MatvecInto(x, q)
+		return
+	}
+	wq.MatvecInto(x, q)
+	wk.MatvecInto(x, k)
+	wv.MatvecInto(x, v)
 }
 
 func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[]float32) bool {

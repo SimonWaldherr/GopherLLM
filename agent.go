@@ -117,9 +117,14 @@ func loadSkillResultContent(call ToolCall, skills []Skill) string {
 }
 
 func sumGenerationStats(a, b GenerationStats) GenerationStats {
+	ttft := a.TTFT
+	if ttft == 0 {
+		ttft = b.TTFT
+	}
 	return GenerationStats{
 		PromptTokens:    a.PromptTokens + b.PromptTokens,
 		GeneratedTokens: a.GeneratedTokens + b.GeneratedTokens,
+		TTFT:            ttft,
 		PrefillTime:     a.PrefillTime + b.PrefillTime,
 		DecodeTime:      a.DecodeTime + b.DecodeTime,
 		TotalTime:       a.TotalTime + b.TotalTime,

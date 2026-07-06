@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +26,8 @@ var chatCSS string
 var chatJS string
 
 var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
+
+var inferenceRequestSeq atomic.Uint64
 
 type chatTemplateData struct {
 	Title       string
@@ -166,14 +169,18 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get())})
 	})
 	mux.HandleFunc("/generate", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		requestID := ensureRequestID(w, req)
 		var body GenerateRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		messages, options := body.ToMessagesAndOptions(opts.Defaults)
+		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
+			model := modelID(r)
 			result, err := RunAgenticChat(r, messages, options, skills, alwaysContinue)
+			logInferenceResult(logw, requestID, "/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -182,19 +189,22 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		})
 	}))
 	mux.HandleFunc("/v1/chat/completions", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		requestID := ensureRequestID(w, req)
 		var body OpenAIChatRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		options := body.Options(opts.Defaults)
+		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
 			if body.Stream {
-				streamOpenAIChat(w, req, r, model, body.ChatMessages(), options, skills)
+				streamOpenAIChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills)
 				return
 			}
 			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
+			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -203,15 +213,18 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		})
 	}))
 	mux.HandleFunc("/v1/completions", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		requestID := ensureRequestID(w, req)
 		var body OpenAICompletionRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		options := body.Options(opts.Defaults)
+		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
 			result, err := r.Generate(body.PromptString(), options)
+			logInferenceResult(logw, requestID, "/v1/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -257,15 +270,18 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		writeJSON(w, map[string]any{"skills": list})
 	})
 	mux.HandleFunc("/api/generate", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		requestID := ensureRequestID(w, req)
 		var body OllamaGenerateRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		options := body.GenerationOptions(opts.Defaults)
+		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
 			result, err := RunAgenticChat(r, []ChatMessage{UserMessage(body.Prompt)}, options, skills, alwaysContinue)
+			logInferenceResult(logw, requestID, "/api/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -274,15 +290,18 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		})
 	}))
 	mux.HandleFunc("/api/chat", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		requestID := ensureRequestID(w, req)
 		var body OllamaChatRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		options := body.GenerationOptions(opts.Defaults)
+		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
 			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
+			logInferenceResult(logw, requestID, "/api/chat", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -753,6 +772,88 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func ensureRequestID(w http.ResponseWriter, req *http.Request) string {
+	id := strings.TrimSpace(req.Header.Get("X-Request-ID"))
+	if id == "" {
+		id = fmt.Sprintf("gopherllm-%d-%d", time.Now().UnixNano(), inferenceRequestSeq.Add(1))
+	}
+	w.Header().Set("X-Request-ID", id)
+	return id
+}
+
+func withRequestContext(options GenerationOptions, req *http.Request) GenerationOptions {
+	options.ctx = req.Context()
+	return options
+}
+
+type inferenceLogRecord struct {
+	Event            string `json:"event"`
+	RequestID        string `json:"request_id"`
+	Endpoint         string `json:"endpoint"`
+	Provider         string `json:"provider"`
+	Model            string `json:"model"`
+	Streaming        bool   `json:"streaming"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	TTFTMS           int64  `json:"ttft_ms"`
+	PrefillMS        int64  `json:"prefill_ms"`
+	DecodeMS         int64  `json:"decode_ms"`
+	TotalMS          int64  `json:"total_ms"`
+	TokensPerSecond  string `json:"tokens_per_second"`
+	Cache            string `json:"cache"`
+	CacheHit         bool   `json:"cache_hit"`
+	RetryCount       int    `json:"retry_count"`
+	FinishReason     string `json:"finish_reason"`
+	ErrorType        string `json:"error_type,omitempty"`
+	Error            string `json:"error,omitempty"`
+}
+
+// Inference logs are deliberately emitted through the existing handler
+// LogWriter instead of adding a metrics backend. Bottleneck: TTFT/decode
+// regressions were not attributable per endpoint/request. Change: one
+// structured JSON line per completed local inference. Effect: usable latency,
+// throughput, token, cache, retry, and error dimensions for benchmarks and
+// production logs. Risk: small log volume increase. Rollback: pass nil/Discard
+// LogWriter or remove this helper call.
+func logInferenceResult(logw io.Writer, requestID, endpoint, model string, streaming bool, result GenerationResult, err error) {
+	if logw == nil || logw == io.Discard {
+		return
+	}
+	errorType, errorText := "", ""
+	if err != nil {
+		errorType = fmt.Sprintf("%T", err)
+		errorText = err.Error()
+	}
+	tps := float64(0)
+	if result.Stats.DecodeTime > 0 {
+		tps = float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds()
+	}
+	rec := inferenceLogRecord{
+		Event:            "inference",
+		RequestID:        requestID,
+		Endpoint:         endpoint,
+		Provider:         "local",
+		Model:            model,
+		Streaming:        streaming,
+		PromptTokens:     result.Stats.PromptTokens,
+		CompletionTokens: result.Stats.GeneratedTokens,
+		TTFTMS:           result.Stats.TTFT.Milliseconds(),
+		PrefillMS:        result.Stats.PrefillTime.Milliseconds(),
+		DecodeMS:         result.Stats.DecodeTime.Milliseconds(),
+		TotalMS:          result.Stats.TotalTime.Milliseconds(),
+		TokensPerSecond:  fmt.Sprintf("%.2f", tps),
+		Cache:            "none",
+		CacheHit:         false,
+		RetryCount:       0,
+		FinishReason:     finishReasonOrDefault(result.FinishReason),
+		ErrorType:        errorType,
+		Error:            errorText,
+	}
+	if b, jsonErr := json.Marshal(rec); jsonErr == nil {
+		fmt.Fprintln(logw, string(b))
+	}
+}
+
 // streamOpenAIChat streams a chat completion via SSE. Content deltas flow
 // incrementally exactly as before whenever no tool call could possibly be in
 // play; once skills or caller tools are active, RunAgenticChat buffers the
@@ -762,7 +863,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // terminal chunk carrying finish_reason, usage, and — when present —
 // reasoning_content and tool_calls, computed from the authoritative final
 // GenerationResult rather than reconstructed from what was streamed.
-func streamOpenAIChat(w http.ResponseWriter, req *http.Request, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill) {
+func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -792,8 +893,10 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, r *Runner, model
 		return true
 	})
 	if streamErr != nil {
+		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, streamErr)
 		return
 	}
+	logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, err)
 	if err != nil {
 		if errors.Is(err, ErrGenerationCanceled) {
 			return
@@ -845,7 +948,7 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, v any) 
 }
 
 func generateResponse(result GenerationResult) map[string]any {
-	resp := map[string]any{"text": result.Text, "prompt_tokens": result.Stats.PromptTokens, "generated_tokens": result.Stats.GeneratedTokens, "prefill_ms": result.Stats.PrefillTime.Milliseconds(), "decode_ms": result.Stats.DecodeTime.Milliseconds(), "total_ms": result.Stats.TotalTime.Milliseconds(), "finish_reason": finishReasonOrDefault(result.FinishReason)}
+	resp := map[string]any{"text": result.Text, "prompt_tokens": result.Stats.PromptTokens, "generated_tokens": result.Stats.GeneratedTokens, "ttft_ms": result.Stats.TTFT.Milliseconds(), "prefill_ms": result.Stats.PrefillTime.Milliseconds(), "decode_ms": result.Stats.DecodeTime.Milliseconds(), "total_ms": result.Stats.TotalTime.Milliseconds(), "finish_reason": finishReasonOrDefault(result.FinishReason)}
 	if result.ReasoningText != "" {
 		resp["reasoning"] = result.ReasoningText
 	}

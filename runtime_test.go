@@ -76,6 +76,28 @@ func TestGenerationOptionsRejectsInvalidFloatsAndTopK(t *testing.T) {
 	}
 }
 
+func TestPrefillChunkSizeEnvOverride(t *testing.T) {
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "")
+	if got := prefillChunkSize(Config{Dim: 4096, HiddenDim: 14336}); got != 32 {
+		t.Fatalf("large-model default chunk = %d, want 32", got)
+	}
+	if got := prefillChunkSize(Config{Dim: 3072, HiddenDim: 9216}); got != 128 {
+		t.Fatalf("small-model default chunk = %d, want 128", got)
+	}
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "64")
+	if got := prefillChunkSize(Config{Dim: 3072, HiddenDim: 9216}); got != 64 {
+		t.Fatalf("override chunk = %d, want 64", got)
+	}
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "999")
+	if got := prefillChunkSize(Config{}); got != 256 {
+		t.Fatalf("clamped chunk = %d, want 256", got)
+	}
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "nope")
+	if got := prefillChunkSize(Config{}); got != 32 {
+		t.Fatalf("invalid chunk = %d, want 32", got)
+	}
+}
+
 func TestValidUTF8PrefixLenKeepsIncompleteRuneBuffered(t *testing.T) {
 	b := []byte{'H', 'i', ' ', 0xe2, 0x82}
 	if got := validUTF8PrefixLen(b); got != 3 {

@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +133,7 @@ func finite32(v float32) bool {
 type GenerationStats struct {
 	PromptTokens    int
 	GeneratedTokens int
+	TTFT            time.Duration
 	PrefillTime     time.Duration
 	DecodeTime      time.Duration
 	TotalTime       time.Duration
@@ -417,6 +419,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	}
 	prefillTime := time.Since(prefillStart)
 	decodeStart := time.Now()
+	var ttft time.Duration
 	output := strings.Builder{}
 	maxStopLen := 0
 	for _, stop := range options.StopSequences {
@@ -457,7 +460,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	pos := len(tokens)
 	finishReason := "length"
 	buildResult := func() GenerationResult {
-		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
+		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
 		content, reasoning, calls := r.classifyOutput(output.String(), options.activeTools(), rng)
 		reason := finishReason
 		if len(calls) > 0 {
@@ -474,6 +477,9 @@ decode:
 		if r.isStopToken(token) {
 			finishReason = "stop"
 			break
+		}
+		if ttft == 0 {
+			ttft = time.Since(totalStart)
 		}
 		text := r.tok.DecodeToken(token)
 		output.WriteString(text)
@@ -569,14 +575,15 @@ func (r *Runner) canBatchPrefill() bool {
 	if os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
 		return false
 	}
-	// The batched graph implements only the plain llama-style block: fused
-	// weights and the Gemma-family mechanics (GELU, QK-norm, post-norms) fall
-	// back to the per-token path, which supports everything.
+	// The batched graph implements the plain llama-style block, including
+	// fused QKV and fused gate/up tensors. Gemma-family mechanics (GELU,
+	// QK-norm, post-norms) fall back to the per-token path, which supports
+	// everything.
 	if r.config.UseGELU {
 		return false
 	}
 	for _, l := range r.standard.Layers {
-		if l.HasQKV || l.HasGateUp || l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
+		if l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
 			return false
 		}
 	}
@@ -594,7 +601,7 @@ func (r *Runner) canBatchPrefill() bool {
 // amortization buys back. 32 was consistently ~15-20% faster than the
 // previous default of 64 across repeated runs.
 func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) error {
-	const chunk = 32
+	chunk := prefillChunkSize(r.config)
 	n := len(tokens)
 	for start := 0; start < n; start += chunk {
 		if err := ctx.Err(); err != nil {
@@ -604,6 +611,33 @@ func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *Decode
 		ForwardBatchInto(r.config, r.standard, cache, buf, tokens[start:end], start, end == n, logits)
 	}
 	return nil
+}
+
+// prefillChunkSize keeps a conservative default for larger models while using
+// larger chunks on small dense models such as Ministral-3-3B. Bottleneck:
+// prompt prefill is chunk-size sensitive because larger chunks amortize
+// dequantization but grow activation working sets. Change: small models default
+// to 128 after real Ministral measurement; GOPHERLLM_PREFILL_CHUNK can override
+// it for A/B testing. Expected effect: lower TTFT on 3B-class models. Risk:
+// too-large chunks can regress cache locality on bigger models. Rollback: set
+// GOPHERLLM_PREFILL_CHUNK=32.
+func prefillChunkSize(config Config) int {
+	const def = 32
+	raw := strings.TrimSpace(os.Getenv("GOPHERLLM_PREFILL_CHUNK"))
+	if raw == "" {
+		if config.Dim > 0 && config.Dim <= 3072 && config.HiddenDim <= 12288 {
+			return 128
+		}
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return def
+	}
+	if n > 256 {
+		return 256
+	}
+	return n
 }
 
 func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {

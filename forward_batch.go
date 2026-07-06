@@ -138,6 +138,8 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	Proj := batchViews(make([]float32, p*dim), p, dim)
 	Gate := batchViews(make([]float32, p*hDim), p, hDim)
 	Up := batchViews(make([]float32, p*hDim), p, hDim)
+	QKV := [][]float32(nil)
+	GateUp := [][]float32(nil)
 	Hidden := batchViews(make([]float32, p*hDim), p, hDim)
 
 	for t := 0; t < p; t++ {
@@ -158,9 +160,22 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		for t := 0; t < p; t++ {
 			rmsNormInto(X[t], layer.AttnNorm, eps, &XN[t])
 		}
-		matvecBatch(layer.WQ, XN, Q)
-		matvecBatch(layer.WK, XN, K)
-		matvecBatch(layer.WV, XN, V)
+		if layer.HasQKV {
+			qkvLen := qLen + kLen + vLen
+			if len(QKV) == 0 || len(QKV[0]) != qkvLen {
+				QKV = batchViews(make([]float32, p*qkvLen), p, qkvLen)
+			}
+			matvecBatch(layer.WQKV, XN, QKV)
+			for t := 0; t < p; t++ {
+				copy(Q[t], QKV[t][:qLen])
+				copy(K[t], QKV[t][qLen:qLen+kLen])
+				copy(V[t], QKV[t][qLen+kLen:qLen+kLen+vLen])
+			}
+		} else {
+			matvecBatch(layer.WQ, XN, Q)
+			matvecBatch(layer.WK, XN, K)
+			matvecBatch(layer.WV, XN, V)
+		}
 
 		// RoPE + KV cache write are sequential: RoPE reuses shared sin/cos
 		// scratch, and all K/V must be resident before attention so a token can
@@ -217,8 +232,20 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			addInPlace(X[t], Proj[t])
 			rmsNormInto(X[t], layer.FFNNorm, eps, &XN[t])
 		}
-		matvecBatch(layer.W1, XN, Gate)
-		matvecBatch(layer.W3, XN, Up)
+		if layer.HasGateUp {
+			gateUpLen := hDim * 2
+			if len(GateUp) == 0 || len(GateUp[0]) != gateUpLen {
+				GateUp = batchViews(make([]float32, p*gateUpLen), p, gateUpLen)
+			}
+			matvecBatch(layer.WGateUp, XN, GateUp)
+			for t := 0; t < p; t++ {
+				copy(Gate[t], GateUp[t][:hDim])
+				copy(Up[t], GateUp[t][hDim:gateUpLen])
+			}
+		} else {
+			matvecBatch(layer.W1, XN, Gate)
+			matvecBatch(layer.W3, XN, Up)
+		}
 		for t := 0; t < p; t++ {
 			g := Gate[t]
 			u := Up[t]

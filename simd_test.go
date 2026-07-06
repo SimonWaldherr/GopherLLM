@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -259,6 +260,44 @@ func TestQ4KMatvec2MatchesSeparateMatvecs(t *testing.T) {
 	}
 	assertFloatSlicesClose(t, "q4k2-a", gotA, wantA)
 	assertFloatSlicesClose(t, "q4k2-b", gotB, wantB)
+}
+
+func TestAttentionMatvecFusesMixedMinistralQKV(t *testing.T) {
+	rng := rand.New(rand.NewSource(19))
+	const cols = 512
+	const qRows = 24
+	const kRows = 8
+	const vRows = 8
+
+	qData := make([]byte, 0, qRows*(cols/256)*144)
+	kData := make([]byte, 0, kRows*(cols/256)*144)
+	vData := make([]byte, 0, vRows*(cols/256)*210)
+	for range qRows {
+		qData = append(qData, randomQ4KRow(rng, cols)...)
+	}
+	for range kRows {
+		kData = append(kData, randomQ4KRow(rng, cols)...)
+	}
+	for range vRows {
+		vData = append(vData, randomQ6KRow(rng, cols)...)
+	}
+	wq := Weight{Raw: qData, Type: GGMLTypeQ4_K, Rows: qRows, Cols: cols}
+	wk := Weight{Raw: kData, Type: GGMLTypeQ4_K, Rows: kRows, Cols: cols}
+	wv := Weight{Raw: vData, Type: GGMLTypeQ6_K, Rows: vRows, Cols: cols}
+	x := randomVec(rng, cols)
+
+	wantQ, wantK, wantV := []float32{}, []float32{}, []float32{}
+	wq.MatvecInto(x, &wantQ)
+	wk.MatvecInto(x, &wantK)
+	wv.MatvecInto(x, &wantV)
+
+	gotQ, gotK, gotV := []float32{}, []float32{}, []float32{}
+	xsums := []float32{}
+	tryMatvecAttentionInto(wq, wk, wv, x, &xsums, &gotQ, &gotK, &gotV)
+
+	assertFloatSlicesClose(t, "attn-q", gotQ, wantQ)
+	assertFloatSlicesClose(t, "attn-k", gotK, wantK)
+	assertFloatSlicesClose(t, "attn-v", gotV, wantV)
 }
 
 func TestDotQ6KMatchesDequantizedDot(t *testing.T) {

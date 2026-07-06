@@ -676,6 +676,7 @@ func runBench(r *gopherllm.Runner, cfg cliConfig) error {
 		type row struct {
 			PromptTokens          int     `json:"prompt_tokens"`
 			GeneratedTokens       int     `json:"generated_tokens"`
+			TTFTMS                int64   `json:"ttft_ms"`
 			PrefillMS             int64   `json:"prefill_ms"`
 			DecodeMS              int64   `json:"decode_ms"`
 			TotalMS               int64   `json:"total_ms"`
@@ -690,6 +691,7 @@ func runBench(r *gopherllm.Runner, cfg cliConfig) error {
 			item := row{
 				PromptTokens:          r.Stats.PromptTokens,
 				GeneratedTokens:       r.Stats.GeneratedTokens,
+				TTFTMS:                r.Stats.TTFT.Milliseconds(),
 				PrefillMS:             r.Stats.PrefillTime.Milliseconds(),
 				DecodeMS:              r.Stats.DecodeTime.Milliseconds(),
 				TotalMS:               r.Stats.TotalTime.Milliseconds(),
@@ -756,5 +758,5 @@ func runWithTimeout(timeout time.Duration, fn func() (gopherllm.GenerationResult
 
 func printStats(s gopherllm.GenerationStats) {
 	tps := float64(s.GeneratedTokens) / max(1e-9, s.DecodeTime.Seconds())
-	fmt.Fprintf(os.Stderr, "prompt=%d generated=%d prefill=%s decode=%s total=%s tok/s=%.2f\n", s.PromptTokens, s.GeneratedTokens, s.PrefillTime.Round(time.Millisecond), s.DecodeTime.Round(time.Millisecond), s.TotalTime.Round(time.Millisecond), tps)
+	fmt.Fprintf(os.Stderr, "prompt=%d generated=%d ttft=%s prefill=%s decode=%s total=%s tok/s=%.2f\n", s.PromptTokens, s.GeneratedTokens, s.TTFT.Round(time.Millisecond), s.PrefillTime.Round(time.Millisecond), s.DecodeTime.Round(time.Millisecond), s.TotalTime.Round(time.Millisecond), tps)
 }
