@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"sync"
 )
 
 // Config is the model's hyperparameter set, read from GGUF metadata by
@@ -278,6 +279,87 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 	default:
 		panic(fmt.Sprintf("unsupported quantized matvec: %v", w.Type))
 	}
+}
+
+// ArgmaxMatvec returns argmax(W*x) without materializing the full logits
+// vector. Observed bottleneck: Ministral-3 3B Q4_K_M spends most decode time in
+// the 131k-row output projection. For deterministic decoding, the sampler only
+// needs the winning token, so this saves the logits writeback and second full
+// vocab scan. Risk is limited by using it only for exact greedy-compatible
+// sampler settings; rollback is to disable the runtime fast-path.
+func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
+	if len(x) == 0 {
+		return 0, false
+	}
+	if w.F32 != nil {
+		rows := len(w.F32) / len(x)
+		if rows <= 0 || rows*len(x) > len(w.F32) {
+			return 0, false
+		}
+		return argmaxMatvecRows(rows, func(row int) float32 {
+			off := row * len(x)
+			return DotF32(w.F32[off:off+len(x)], x)
+		}), true
+	}
+	if w.Rows <= 0 || w.Cols != len(x) {
+		return 0, false
+	}
+	switch w.Type {
+	case GGMLTypeQ6_K:
+		if w.Cols%256 != 0 {
+			return 0, false
+		}
+		rowBytes := (w.Cols / 256) * 210
+		if len(w.Raw) < w.Rows*rowBytes {
+			return 0, false
+		}
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ6KXSums16(x, w.Cols, scratch)
+		ScaleF32(xs, 32)
+		tok := argmaxMatvecRows(w.Rows, func(row int) float32 {
+			off := row * rowBytes
+			return dotQ6KF32SIMDWithXSums(w.Raw[off:off+rowBytes], x, xs, w.Cols)
+		})
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return tok, true
+	default:
+		return 0, false
+	}
+}
+
+func argmaxMatvecRows(rows int, dot func(row int) float32) uint32 {
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for row := start; row < end; row++ {
+			v := dot(row)
+			if !finiteLogit(v) {
+				continue
+			}
+			if !localFound || v > localValue || (v == localValue && row < localToken) {
+				localToken = row
+				localValue = v
+				localFound = true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken = localToken
+			bestValue = localValue
+			found = true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken)
 }
 
 // Row dequantizes a single weight row (used for token-embedding lookups).
@@ -1062,6 +1144,10 @@ func Forward(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuf
 
 func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) {
 	ForwardBodyInto(config, weights, cache, buf, token, pos)
+	ProjectLogitsInto(config, weights, buf, logits)
+}
+
+func ProjectLogitsInto(config Config, weights ModelWeights, buf *DecodeBuffer, logits *[]float32) {
 	weights.Output.MatvecInto(buf.XN, logits)
 	if config.LogitScale != 1 {
 		ScaleF32(*logits, 1/config.LogitScale)
@@ -1069,6 +1155,13 @@ func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *Decod
 	if config.FinalLogitSoftcap > 0 {
 		softcapF32(*logits, config.FinalLogitSoftcap)
 	}
+}
+
+func ArgmaxOutputToken(config Config, weights ModelWeights, buf *DecodeBuffer) (uint32, bool) {
+	if !finite32(config.LogitScale) || config.LogitScale <= 0 || config.FinalLogitSoftcap < 0 {
+		return 0, false
+	}
+	return weights.Output.ArgmaxMatvec(buf.XN)
 }
 
 // ForwardBodyInto is the transformer body shared by logits, prefill, and

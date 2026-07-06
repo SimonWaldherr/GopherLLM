@@ -296,6 +296,34 @@ func BenchmarkMatvecQ6K_1024x1024(b *testing.B) {
 	}
 }
 
+func BenchmarkArgmaxMatvecQ6K_OutputShape(b *testing.B) {
+	const rows, cols = 131072, 3072
+	data := benchBytes(rows * (cols / 256) * 210)
+	x := benchFloatSlice(cols)
+	w := Weight{Raw: data, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data) + len(x)*4))
+	for b.Loop() {
+		if _, ok := w.ArgmaxMatvec(x); !ok {
+			b.Fatal("ArgmaxMatvec returned false")
+		}
+	}
+}
+
+func BenchmarkMatvecQ6KOutputShapeThenArgmax(b *testing.B) {
+	const rows, cols = 131072, 3072
+	data := benchBytes(rows * (cols / 256) * 210)
+	x := benchFloatSlice(cols)
+	out := make([]float32, rows)
+	w := Weight{Raw: data, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data) + len(x)*4))
+	for b.Loop() {
+		w.MatvecInto(x, &out)
+		_ = argmaxFiniteToken(out)
+	}
+}
+
 func BenchmarkMatvecPreparedQ6K_1024x1024(b *testing.B) {
 	data := benchBytes(1024 * (1024 / 256) * 210)
 	prepared := PrepareQuantizedWeight(data, GGMLTypeQ6_K, 1024, 1024)

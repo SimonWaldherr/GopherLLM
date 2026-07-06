@@ -416,6 +416,41 @@ func TestQ6KMatvec3MatchesSeparateMatvecs(t *testing.T) {
 	assertFloatSlicesClose(t, "q6k3-c", gotC, wantC)
 }
 
+func TestQ6KArgmaxMatvecMatchesFullMatvec(t *testing.T) {
+	const rows = 7
+	const cols = 256
+	data := make([]byte, rows*210)
+	for r := range rows {
+		row := data[r*210 : (r+1)*210]
+		for i := range 128 {
+			row[i] = byte(17 + r*11 + i)
+		}
+		for i := range 64 {
+			row[128+i] = byte(3 + r*7 + i*5)
+		}
+		for i := range 16 {
+			row[192+i] = byte(int8(i - 8 + r%3))
+		}
+		row[208], row[209] = 0x00, 0x3c
+	}
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32((i%19)-9) / 7
+	}
+
+	w := Weight{Raw: data, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols}
+	logits := []float32{}
+	w.MatvecInto(x, &logits)
+	want := argmaxFiniteToken(logits)
+	got, ok := w.ArgmaxMatvec(x)
+	if !ok {
+		t.Fatal("ArgmaxMatvec returned false")
+	}
+	if got != want {
+		t.Fatalf("argmax token = %d, want %d", got, want)
+	}
+}
+
 func TestDotQ5KMatchesDequantizedDot(t *testing.T) {
 	row := make([]byte, 176)
 	row[0], row[1] = 0x00, 0x3c

@@ -459,6 +459,9 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	recent := append([]uint32(nil), tokens...)
 	pos := len(tokens)
 	finishReason := "length"
+	greedyFastPath := r.canGreedyOutputFastPath(options)
+	haveNextToken := false
+	var nextToken uint32
 	buildResult := func() GenerationResult {
 		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
 		content, reasoning, calls := r.classifyOutput(output.String(), options.activeTools(), rng)
@@ -473,7 +476,12 @@ decode:
 		if err := ctx.Err(); err != nil {
 			return buildResult(), err
 		}
-		token := SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
+		token := nextToken
+		if haveNextToken {
+			haveNextToken = false
+		} else {
+			token = SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
+		}
 		if r.isStopToken(token) {
 			finishReason = "stop"
 			break
@@ -510,7 +518,13 @@ decode:
 		if len(generated) >= options.MaxTokens || pos >= cacheLen {
 			break
 		}
-		r.forwardTokenInto(cache, buf, token, pos, &logits)
+		if greedyFastPath {
+			var ok bool
+			nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, &logits)
+			haveNextToken = ok
+		} else {
+			r.forwardTokenInto(cache, buf, token, pos, &logits)
+		}
 		pos++
 	}
 	if !flushStream(true) {
@@ -553,6 +567,37 @@ func (r *Runner) forwardTokenInto(cache *KVCache, buf *DecodeBuffer, token uint3
 	default:
 		ForwardInto(r.config, r.standard, cache, buf, token, pos, logits)
 	}
+}
+
+func (r *Runner) canGreedyOutputFastPath(options GenerationOptions) bool {
+	s := options.Sampler
+	return os.Getenv("GOPHERLLM_NO_GREEDY_ARGMAX") != "1" &&
+		s.RepeatPenalty == 1 &&
+		(s.Temperature < 1e-6 || s.TopK == 1)
+}
+
+func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) (uint32, bool) {
+	switch r.kind {
+	case loadedGptOss:
+		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
+		if next, ok := ArgmaxOutputToken(r.config, r.gptOss.Standard, buf); ok {
+			return next, true
+		}
+		ProjectLogitsInto(r.config, r.gptOss.Standard, buf, logits)
+	case loadedGemma4:
+		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
+		if next, ok := ArgmaxOutputToken(r.config, r.gemma4.Standard, buf); ok {
+			return next, true
+		}
+		ProjectLogitsInto(r.config, r.gemma4.Standard, buf, logits)
+	default:
+		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
+		if next, ok := ArgmaxOutputToken(r.config, r.standard, buf); ok {
+			return next, true
+		}
+		ProjectLogitsInto(r.config, r.standard, buf, logits)
+	}
+	return 0, false
 }
 
 func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {

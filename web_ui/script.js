@@ -160,6 +160,21 @@ function attachCopyButton(el) {
     const decoder = new TextDecoder();
     let buffer = "";
     let answer = "";
+    let renderPending = false;
+
+    // Observed bottleneck: streamed chunks re-rendered the full Markdown tree
+    // on every token. Updating plain text once per animation frame keeps the
+    // stream responsive; final Markdown rendering still happens after decode.
+    function scheduleStreamingRender() {
+      if (renderPending) return;
+      renderPending = true;
+      requestAnimationFrame(() => {
+        renderPending = false;
+        assistantEl.dataset.raw = answer;
+        assistantEl.textContent = answer;
+        scrollEl.scrollTop = scrollEl.scrollHeight;
+      });
+    }
 
     function applyChunk(payload) {
       if (!payload || payload === "[DONE]") return;
@@ -170,8 +185,7 @@ function attachCopyButton(el) {
       if (!content) return;
       answer += content;
       assistantEl.dataset.raw = answer;
-      assistantEl.innerHTML = renderMarkdown(answer);
-      scrollEl.scrollTop = scrollEl.scrollHeight;
+      scheduleStreamingRender();
     }
 
     while (true) {
@@ -196,6 +210,8 @@ function attachCopyButton(el) {
         .join("\n");
       if (data) applyChunk(data);
     }
+    assistantEl.dataset.raw = answer;
+    assistantEl.textContent = answer;
     return answer;
   }
 
