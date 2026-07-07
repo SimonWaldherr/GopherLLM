@@ -1623,28 +1623,28 @@ func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	if oversubscribeDispatch && rows >= threads*128 {
 		chunks = min(threads*4, cap(pool.jobs))
 	}
-	done := rowDonePool.Get().(chan struct{})
-	if cap(done) < chunks {
-		done = make(chan struct{}, chunks)
-	}
+	// A WaitGroup replaces a per-chunk done-channel: completion is a single
+	// atomic counter drained by Done() (no per-chunk channel send/receive
+	// pair, no done-channel pool/allocation), and Wait() wakes once instead
+	// of the caller looping over `chunks` individual channel receives.
+	wg := wgPool.Get().(*sync.WaitGroup)
+	wg.Add(chunks)
 	for w := range chunks {
 		start := rows * w / chunks
 		end := rows * (w + 1) / chunks
-		pool.jobs <- rowJob{start: start, end: end, fn: fn, done: done}
+		pool.jobs <- rowJob{start: start, end: end, fn: fn, wg: wg}
 	}
-	for range chunks {
-		<-done
-	}
-	if cap(done) <= 128 {
-		rowDonePool.Put(done)
-	}
+	wg.Wait()
+	wgPool.Put(wg)
 }
+
+var wgPool = sync.Pool{New: func() any { return new(sync.WaitGroup) }}
 
 type rowJob struct {
 	start int
 	end   int
 	fn    func(start, end int)
-	done  chan<- struct{}
+	wg    *sync.WaitGroup
 }
 
 // rowWorkerPool is the process-wide pool of matvec worker goroutines. It is
@@ -1659,11 +1659,8 @@ type rowWorkerPool struct {
 }
 
 var (
-	rowPoolMu   sync.Mutex
-	rowPool     *rowWorkerPool
-	rowDonePool = sync.Pool{New: func() any {
-		return make(chan struct{}, 64)
-	}}
+	rowPoolMu sync.Mutex
+	rowPool   *rowWorkerPool
 )
 
 func getRowWorkerPool(threads int) *rowWorkerPool {
@@ -1692,7 +1689,7 @@ func rowWorker(jobs <-chan rowJob, stop <-chan struct{}) {
 		select {
 		case job := <-jobs:
 			job.fn(job.start, job.end)
-			job.done <- struct{}{}
+			job.wg.Done()
 		case <-stop:
 			return
 		}

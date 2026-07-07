@@ -196,11 +196,51 @@ DATA siluP5<>+24(SB)/4, $0x3f000000
 DATA siluP5<>+28(SB)/4, $0x3f000000
 GLOBL siluP5<>(SB), RODATA, $32
 
+// siluFxLo clamps the rounded exponent fx to >= -126 so the biased exponent
+// (fx+127) constructed below never underflows below the valid finite-normal
+// range [1, 254]. No upper clamp is needed: fx = a*log2e where a = -|gate|
+// is always <= 0, so fx is always <= 0 by construction and can never
+// overflow the exponent field on the positive side (see the comment on
+// siluMulF32AVX2 for why the exponent argument is restructured this way).
+DATA siluFxLo<>+0(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+4(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+8(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+12(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+16(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+20(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+24(SB)/4, $0xc2fc0000
+DATA siluFxLo<>+28(SB)/4, $0xc2fc0000
+GLOBL siluFxLo<>(SB), RODATA, $32
+
 // func siluMulF32AVX2(gate, up, out []float32)
 // out[i] = gate[i] * sigmoid(gate[i]) * up[i] (SwiGLU inner product), 8 lanes
-// per iteration. exp(-gate) uses the Cephes expf polynomial (range-reduced
-// degree-5, ~1e-7 relative error). Lengths must be equal multiples of 8
-// (the Go wrapper slices accordingly and handles the tail).
+// per iteration.
+//
+// sigmoid is evaluated via the numerically-stable split used by scipy's
+// expit / PyTorch: for gate>=0, sigmoid(gate) = 1/(1+exp(-gate)); for
+// gate<0, sigmoid(gate) = exp(gate)/(1+exp(gate)). Both branches only ever
+// evaluate exp() at a NON-POSITIVE argument (a = -|gate|), so exp(a) is
+// always in (0,1] and can never overflow — unlike clamping the exp() input
+// symmetrically to +-88.376, which keeps exp() itself finite but silently
+// turns "conceptually infinite" into "merely ~3.4e38", and that large-but-
+// finite value then multiplied against an equally extreme original `gate`
+// in the final step produces numerical garbage instead of the correct
+// near-zero result. (A prior version of this kernel did exactly that and
+// returned -1.4142231 instead of -0 for gate = -MaxFloat32.)
+//
+// exp(a) is computed from a CLAMPED copy of a (a >= -88.376, needed so the
+// 2^fx bit-trick reconstruction stays within the valid finite-exponent
+// range); that clamp always produces the same ~4e-39 result regardless of
+// how much more negative the true a is, so it is only safe to use directly
+// when the clamp didn't engage. When it did (the true |gate| is large
+// enough that the correct exp(a) is negligible relative to any float32
+// value it could plausibly be multiplied against), the result is forced to
+// exactly 0 instead — a standard flush-to-zero, matching what the true
+// unclamped exp(a) would round to for any realistic use. Both this and the
+// gate-sign branch above are combined via branchless bitwise blends.
+// exp(a) itself uses the Cephes expf polynomial (range-reduced degree-5,
+// ~1e-7 relative error). Lengths must be equal multiples of 8 (the Go
+// wrapper slices accordingly and handles the tail).
 TEXT ·siluMulF32AVX2(SB), NOSPLIT, $0-72
 	MOVQ gate_base+0(FP), DI
 	MOVQ gate_len+8(FP), AX
@@ -214,10 +254,7 @@ TEXT ·siluMulF32AVX2(SB), NOSPLIT, $0-72
 	VPBROADCASTD X0, Y9           // exponent bias 127
 	MOVL $0xc2b0c0a5, BX
 	MOVQ BX, X0
-	VPBROADCASTD X0, Y10          // lo clamp -88.376
-	MOVL $0x42b0c0a5, BX
-	MOVQ BX, X0
-	VPBROADCASTD X0, Y11          // hi clamp +88.376
+	VPBROADCASTD X0, Y10          // lo clamp -88.376 (a >= this; exp underflows to ~0 well before it)
 	MOVL $0xb95e8083, BX
 	MOVQ BX, X0
 	VPBROADCASTD X0, Y12          // c2 = -2.12194440e-4
@@ -235,13 +272,16 @@ si_loop:
 	CMPQ CX, AX
 	JGE  si_done
 	VMOVUPS (DI)(CX*4), Y0        // gate
-	VXORPS Y8, Y0, Y1             // x = -gate
-	VMINPS Y11, Y1, Y1
-	VMAXPS Y10, Y1, Y1
-	VMULPS Y15, Y1, Y2            // fx = x * log2e
+	VPANDN Y0, Y8, Y1             // absg = gate & ~signbit
+	VPOR   Y8, Y1, Y1             // a = absg | signbit = -|gate|  (a <= 0 always)
+	VMOVAPS Y1, Y11               // keep the unclamped a for the flush-to-zero test below
+	VMAXPS Y10, Y1, Y1            // clamp a >= -88.376
+	VMULPS Y15, Y1, Y2            // fx = a * log2e  (fx <= 0 always)
 	VROUNDPS $0, Y2, Y2           // round to nearest even
+	VMOVUPS siluFxLo<>(SB), Y7
+	VMAXPS Y7, Y2, Y2             // clamp fx >= -126 (defensive underflow floor)
 	VMOVAPS Y1, Y3
-	VFNMADD231PS Y14, Y2, Y3      // r = x - fx*c1
+	VFNMADD231PS Y14, Y2, Y3      // r = a - fx*c1
 	VFNMADD231PS Y12, Y2, Y3      // r -= fx*c2
 	VMOVUPS siluP0<>(SB), Y4
 	VFMADD213PS siluP1<>(SB), Y3, Y4
@@ -251,13 +291,19 @@ si_loop:
 	VFMADD213PS siluP5<>(SB), Y3, Y4
 	VMULPS Y3, Y3, Y5             // r^2
 	VFMADD213PS Y3, Y5, Y4        // y = y*r^2 + r
-	VADDPS Y13, Y4, Y4            // y += 1 -> exp(r)
+	VADDPS Y13, Y4, Y4            // y += 1 -> poly(r) ~= exp(r)
 	VCVTPS2DQ Y2, Y6
 	VPADDD Y9, Y6, Y6
-	VPSLLD $23, Y6, Y6            // 2^n
-	VMULPS Y6, Y4, Y4             // e = exp(-gate)
-	VADDPS Y13, Y4, Y4            // 1 + e
-	VDIVPS Y4, Y13, Y5            // s = 1 / (1 + e)
+	VPSLLD $23, Y6, Y6            // 2^fx (fx <= 0, biased exponent always in [1,127])
+	VMULPS Y6, Y4, Y4             // e = exp(a_clamped)
+	VCMPPS $1, Y10, Y11, Y6       // Y6 = (a_unclamped < -88.376) ? allones : 0
+	VPANDN Y4, Y6, Y4             // e = clamp engaged ? 0 : e  (flush-to-zero, see comment above)
+	VPSRAD $31, Y0, Y7            // signmask = all-1 if gate<0 else all-0
+	VPAND  Y7, Y4, Y5             // t1 = signmask & e
+	VPANDN Y13, Y7, Y6            // t2 = ~signmask & 1.0
+	VPOR   Y5, Y6, Y5             // numerator = gate<0 ? e : 1.0
+	VADDPS Y13, Y4, Y4            // denom = 1 + e
+	VDIVPS Y4, Y5, Y5             // s = numerator / denom = sigmoid(gate)
 	VMULPS Y0, Y5, Y5             // gate * s
 	VMULPS (SI)(CX*4), Y5, Y5     // * up
 	VMOVUPS Y5, (R8)(CX*4)
