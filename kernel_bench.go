@@ -89,6 +89,15 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		rows = append(rows, measureMatvec("attn_q", layer.WQ, dimInput, runs, &out))
 		rows = append(rows, measureMatvec("attn_k", layer.WK, dimInput, runs, &out))
 		rows = append(rows, measureMatvec("attn_v", layer.WV, dimInput, runs, &out))
+		q, k, v, xs := []float32{}, []float32{}, []float32{}, []float32{}
+		rows = append(rows, measureFunction(
+			"attn_qkv_path",
+			fmt.Sprintf("%s/%s/%s", layer.WQ.Type, layer.WK.Type, layer.WV.Type),
+			layer.WQ.Rows+layer.WK.Rows+layer.WV.Rows,
+			layer.WQ.Cols,
+			runs,
+			func() { tryMatvecAttentionInto(layer.WQ, layer.WK, layer.WV, dimInput, &xs, &q, &k, &v) },
+		))
 	}
 	rows = append(rows, measureMatvec("attn_output", layer.WO, attnOutInput, runs, &out))
 	if layer.HasGateUp {
@@ -96,6 +105,20 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 	} else {
 		rows = append(rows, measureMatvec("ffn_gate", layer.W1, dimInput, runs, &out))
 		rows = append(rows, measureMatvec("ffn_up", layer.W3, dimInput, runs, &out))
+		gate, up, xs := []float32{}, []float32{}, []float32{}
+		rows = append(rows, measureFunction(
+			"ffn_gate_up_path",
+			fmt.Sprintf("%s/%s", layer.W1.Type, layer.W3.Type),
+			layer.W1.Rows+layer.W3.Rows,
+			layer.W1.Cols,
+			runs,
+			func() {
+				if !tryMatvec2Into(layer.W1, layer.W3, dimInput, &xs, &gate, &up) {
+					layer.W1.MatvecInto(dimInput, &gate)
+					layer.W3.MatvecInto(dimInput, &up)
+				}
+			},
+		))
 	}
 	rows = append(rows, measureMatvec("ffn_down", layer.W2, hiddenInput, runs, &out))
 	rows = append(rows, measureMatvec("output", r.standard.Output, dimInput, runs, &out))
@@ -109,13 +132,17 @@ func measureMatvec(name string, weight Weight, x []float32, runs int, out *[]flo
 }
 
 func measureKernel(name string, weight Weight, rows, cols, runs int, body func()) KernelBenchRow {
+	return measureFunction(name, weight.Type.String(), rows, cols, runs, body)
+}
+
+func measureFunction(name, dtype string, rows, cols, runs int, body func()) KernelBenchRow {
 	body()
 	start := time.Now()
 	for range runs {
 		body()
 	}
 	totalMS := float64(time.Since(start).Microseconds()) / 1000
-	return KernelBenchRow{Name: name, DType: weight.Type.String(), Rows: rows, Cols: cols, Runs: runs, AvgMS: totalMS / float64(runs), TotalMS: totalMS}
+	return KernelBenchRow{Name: name, DType: dtype, Rows: rows, Cols: cols, Runs: runs, AvgMS: totalMS / float64(runs), TotalMS: totalMS}
 }
 
 func deterministicBenchVector(n int) []float32 {

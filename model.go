@@ -260,6 +260,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 	case GGMLTypeQ3_K:
 		MatvecQ3KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_K:
+		if matvecMetalQ4KInto(w.Metal, x, w.Rows, w.Cols, out) {
+			return
+		}
 		if MatvecPreparedQ4KInto(w.Raw, w.Prepared, x, w.Rows, w.Cols, out) {
 			return
 		}
@@ -528,9 +531,9 @@ type GptOssWeights struct {
 // KVCache stores the attention keys and values of every processed position,
 // one flat slice per layer laid out position-major: position p's keys occupy
 // K[layer][p*PerPosKDim : (p+1)*PerPosKDim] (all KV heads concatenated), and
-// likewise for V. Sized once per generation to prompt+max_tokens (capped at
-// the model context length); there is no ring/eviction — generation stops at
-// MaxLen.
+// likewise for V. Sized to prompt+max_tokens (capped at the model context
+// length) and reused by Runner when capacity permits; there is no ring/eviction
+// and generation stops at its request-local cache length.
 type KVCache struct {
 	K          [][]float32
 	V          [][]float32
@@ -551,14 +554,14 @@ func NewKVCache(layers, kDim, vDim, maxLen int) *KVCache {
 	return &KVCache{K: k, V: v, PerPosKDim: kDim, PerPosVDim: vDim, MaxLen: maxLen}
 }
 
-// DecodeBuffer is the per-generation scratch memory for the single-token
-// forward pass: activation vectors (X residual stream, XN/XN2 normed views,
+// DecodeBuffer is reusable request scratch for single-token decode and batched
+// prefill: activation vectors (X residual stream, XN/XN2 normed views,
 // Q/K/V/AttnOut/Proj attention buffers, Gate/Up/Hidden FFN buffers), the
 // sampler's candidate scratch, and precomputed RoPE tables (per-pair inverse
 // frequencies plus per-position sin/cos filled in prepareRopeScratch). One
-// DecodeBuffer serves a whole generation, so the decode loop allocates
-// nothing per token. Not safe for concurrent use — Runner.genLock serializes
-// generations.
+// DecodeBuffer serves successive requests, so decode allocates nothing per
+// token and prefill reuses its activation slabs. Not safe for concurrent use;
+// Runner.genLock serializes requests.
 type DecodeBuffer struct {
 	X                       []float32
 	XN                      []float32
@@ -585,6 +588,7 @@ type DecodeBuffer struct {
 	RopeMscale              float32
 	RopeGptOssInvFreq       []float32
 	RopeGptOssConcentration float32
+	batch                   batchDecodeBuffer
 }
 
 type ExpertScore struct {
@@ -1065,11 +1069,14 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			raw = owned
 		}
 		w := Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}
-		if prepareQuantized && (info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ6_K) {
-			w.Prepared = PrepareQuantizedWeight(raw, info.DType, rows, cols)
-		}
 		if useMetal {
 			w.Metal = prepareMetalWeight(raw, info.DType, rows, cols)
+		}
+		// Metal and prepared CPU weights are alternative decode layouts. Keeping
+		// both wastes hundreds of MiB on Ministral-3 3B; raw packed data remains
+		// available as the correctness fallback if a GPU command fails.
+		if w.Metal == nil && prepareQuantized && (info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ6_K) {
+			w.Prepared = PrepareQuantizedWeight(raw, info.DType, rows, cols)
 		}
 		return w, nil
 	default:
@@ -1158,8 +1165,23 @@ func ProjectLogitsInto(config Config, weights ModelWeights, buf *DecodeBuffer, l
 }
 
 func ArgmaxOutputToken(config Config, weights ModelWeights, buf *DecodeBuffer) (uint32, bool) {
+	return argmaxOutputTokenInto(config, weights, buf, nil)
+}
+
+func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffer, logits *[]float32) (uint32, bool) {
 	if !finite32(config.LogitScale) || config.LogitScale <= 0 || config.FinalLogitSoftcap < 0 {
 		return 0, false
+	}
+	// The CPU-only greedy path avoids materializing 131k logits. With Metal,
+	// however, that shortcut bypasses the accelerated output projection and is
+	// much slower on Ministral-3 3B. Materialize the GPU result, then scan it on
+	// the CPU; the extra ~512 KiB buffer is bounded and reused by the request.
+	if weights.Output.Metal != nil && logits != nil {
+		ProjectLogitsInto(config, weights, buf, logits)
+		if len(*logits) == 0 {
+			return 0, false
+		}
+		return argmaxFiniteToken(*logits), true
 	}
 	return weights.Output.ArgmaxMatvec(buf.XN)
 }
@@ -1566,6 +1588,9 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 	}
 	switch a.Type {
 	case GGMLTypeQ4_K:
+		if matvecMetalQ4K2Into(a.Metal, b.Metal, x, a.Rows, b.Rows, a.Cols, aOut, bOut) {
+			return true
+		}
 		if a.Prepared != nil && b.Prepared != nil {
 			if MatvecPreparedQ4K2IntoWithXSums(a.Raw, a.Prepared, a.Rows, a.Cols, b.Raw, b.Prepared, b.Rows, b.Cols, x, q4kXSums, aOut, bOut) {
 				return true

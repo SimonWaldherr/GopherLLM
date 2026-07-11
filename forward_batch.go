@@ -2,6 +2,31 @@ package gopherllm
 
 import "math"
 
+// batchDecodeBuffer owns the large activation slabs used by batched prefill.
+// It hangs off DecodeBuffer so prompt chunks and subsequent requests reuse the
+// same backing arrays instead of feeding tens or hundreds of MiB to the GC.
+type batchDecodeBuffer struct {
+	XFlat, XNFlat, QFlat, KFlat, VFlat []float32
+	AttnOutFlat, ProjFlat              []float32
+	GateFlat, UpFlat, HiddenFlat       []float32
+	QKVFlat, GateUpFlat                []float32
+	X, XN, Q, K, V, AttnOut, Proj      [][]float32
+	Gate, Up, Hidden, QKV, GateUp      [][]float32
+}
+
+func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]float32 {
+	ensureLenNoClear(flat, p*stride)
+	if cap(*views) < p {
+		*views = make([][]float32, p)
+	} else {
+		*views = (*views)[:p]
+	}
+	for i := 0; i < p; i++ {
+		(*views)[i] = (*flat)[i*stride : (i+1)*stride : (i+1)*stride]
+	}
+	return *views
+}
+
 // Batched (prefill) matvec and forward pass. During prompt processing the
 // per-token path re-streams every weight from memory once per token; batching
 // reads each weight row once and applies it to all prompt tokens, so a P-token
@@ -101,16 +126,6 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 	return nil
 }
 
-// batchViews slices a flat buffer of len len(xs) blocks into P non-overlapping
-// views of the given stride (3-index so a view can never spill into the next).
-func batchViews(flat []float32, p, stride int) [][]float32 {
-	v := make([][]float32, p)
-	for i := 0; i < p; i++ {
-		v[i] = flat[i*stride : (i+1)*stride : (i+1)*stride]
-	}
-	return v
-}
-
 // ForwardBatchInto processes a chunk of prompt tokens (positions
 // startPos..startPos+len(tokens)-1) through the standard transformer, populating
 // the KV cache. The matvecs are batched so each weight is streamed once for the
@@ -133,18 +148,19 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	interleaved := ropeInterleaved(config.Arch)
 	eps := config.RMSNormEps
 
-	X := batchViews(make([]float32, p*dim), p, dim)
-	XN := batchViews(make([]float32, p*dim), p, dim)
-	Q := batchViews(make([]float32, p*qLen), p, qLen)
-	K := batchViews(make([]float32, p*kLen), p, kLen)
-	V := batchViews(make([]float32, p*vLen), p, vLen)
-	AttnOut := batchViews(make([]float32, p*attnLen), p, attnLen)
-	Proj := batchViews(make([]float32, p*dim), p, dim)
-	Gate := batchViews(make([]float32, p*hDim), p, hDim)
-	Up := batchViews(make([]float32, p*hDim), p, hDim)
+	b := &buf.batch
+	X := reuseBatchViews(&b.XFlat, &b.X, p, dim)
+	XN := reuseBatchViews(&b.XNFlat, &b.XN, p, dim)
+	Q := reuseBatchViews(&b.QFlat, &b.Q, p, qLen)
+	K := reuseBatchViews(&b.KFlat, &b.K, p, kLen)
+	V := reuseBatchViews(&b.VFlat, &b.V, p, vLen)
+	AttnOut := reuseBatchViews(&b.AttnOutFlat, &b.AttnOut, p, attnLen)
+	Proj := reuseBatchViews(&b.ProjFlat, &b.Proj, p, dim)
+	Gate := reuseBatchViews(&b.GateFlat, &b.Gate, p, hDim)
+	Up := reuseBatchViews(&b.UpFlat, &b.Up, p, hDim)
 	QKV := [][]float32(nil)
 	GateUp := [][]float32(nil)
-	Hidden := batchViews(make([]float32, p*hDim), p, hDim)
+	Hidden := reuseBatchViews(&b.HiddenFlat, &b.Hidden, p, hDim)
 
 	for t := 0; t < p; t++ {
 		weights.TokenEmbd.RowInto(int(tokens[t]), dim, &X[t])
@@ -166,9 +182,7 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 		if layer.HasQKV {
 			qkvLen := qLen + kLen + vLen
-			if len(QKV) == 0 || len(QKV[0]) != qkvLen {
-				QKV = batchViews(make([]float32, p*qkvLen), p, qkvLen)
-			}
+			QKV = reuseBatchViews(&b.QKVFlat, &b.QKV, p, qkvLen)
 			matvecBatch(layer.WQKV, XN, QKV)
 			for t := 0; t < p; t++ {
 				copy(Q[t], QKV[t][:qLen])
@@ -238,9 +252,7 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 		if layer.HasGateUp {
 			gateUpLen := hDim * 2
-			if len(GateUp) == 0 || len(GateUp[0]) != gateUpLen {
-				GateUp = batchViews(make([]float32, p*gateUpLen), p, gateUpLen)
-			}
+			GateUp = reuseBatchViews(&b.GateUpFlat, &b.GateUp, p, gateUpLen)
 			matvecBatch(layer.WGateUp, XN, GateUp)
 			for t := 0; t < p; t++ {
 				copy(Gate[t], GateUp[t][:hDim])

@@ -434,6 +434,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   (bypasses `MODEL`/`PROMPT`/sampler variables entirely).
 - `make repl MODEL=...` starts the REPL.
 - `make serve MODEL=... CHAT=1` starts the HTTP server and chat UI.
+- `make serve-metal MODEL=... CHAT=1` starts the Metal server with prepared
+  CPU kernels enabled by default (`PREPARE_QUANT=0` disables preparation).
 - `make list-models` scans `MODEL_DIR`.
 - `make inspect MODEL=...` prints model metadata summary.
 - `make list-tensors MODEL=...` prints the tensor inventory.
@@ -470,13 +472,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
   comparisons.
 - Metal is available only in `bin/gopherllm-metal` builds made with
-  `CGO_ENABLED=1 -tags metal`, and must be enabled with `--metal`. The current
-  path is experimental and only offloads large Q6_K matvecs to a Metal compute
-  kernel inspired by MLX's QMV/GEMV dispatch structure. It can improve isolated
-  output-matvec timings, but full generation can still be slower because each
-  token crosses the CPU/GPU boundary. Measure before using it for real runs;
-  more of the decode graph needs to stay resident on the GPU for Metal to win
-  consistently end to end.
+  `CGO_ENABLED=1 -tags metal`, and must be enabled with `--metal`. The selective
+  path offloads large Q4_K FFN gate/up projections (fused into one command
+  buffer) plus Q6_K FFN-down and output projections. Small Q/K/V projections
+  stay on prepared ARM64 CPU kernels because their GPU dispatch overhead is
+  larger than the compute saved. The path remains experimental; use
+  `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
 - On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K and Q6_K matvecs
   default to int8-activation full-row kernels: the activation vector is quantized
   once per matvec to int8 with one scale per 256-element block (llama.cpp's Q8_K

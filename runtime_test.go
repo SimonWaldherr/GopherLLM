@@ -98,6 +98,25 @@ func TestPrefillChunkSizeEnvOverride(t *testing.T) {
 	}
 }
 
+func TestGenerationWorkspaceReusesAndGrowsBuffers(t *testing.T) {
+	r := &Runner{config: Config{
+		Dim: 8, HiddenDim: 16, NLayers: 2, NHeads: 2, NKVHeads: 1,
+		HeadDim: 4, ValueDim: 4, KVDim: 4, MaxSeqLen: 128,
+	}}
+	cache1, buf1 := r.generationWorkspace(16)
+	cache2, buf2 := r.generationWorkspace(8)
+	if cache2 != cache1 || buf2 != buf1 {
+		t.Fatal("workspace was not reused for a smaller request")
+	}
+	cache3, buf3 := r.generationWorkspace(32)
+	if cache3 == cache1 {
+		t.Fatal("KV cache did not grow for a larger request")
+	}
+	if cache3.MaxLen != 32 || buf3 != buf1 {
+		t.Fatalf("grown workspace: cache len=%d buffer reused=%v", cache3.MaxLen, buf3 == buf1)
+	}
+}
+
 func TestValidUTF8PrefixLenKeepsIncompleteRuneBuffered(t *testing.T) {
 	b := []byte{'H', 'i', ' ', 0xe2, 0x82}
 	if got := validUTF8PrefixLen(b); got != 3 {

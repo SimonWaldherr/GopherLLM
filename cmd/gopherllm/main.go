@@ -40,7 +40,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --repeat-penalty <F>      Repetition penalty (default: 1.1)")
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
-	fmt.Fprintln(os.Stderr, "  --metal                   Use experimental Metal Q6_K matvec offload when available")
+	fmt.Fprintln(os.Stderr, "  --metal                   Use selective Metal Q4_K/Q6_K matvec offload when available")
 	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute supported quantized scale data during load for faster matvecs")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
@@ -159,7 +159,7 @@ func run() error {
 			}
 			return fmt.Errorf("Metal requested but unavailable")
 		}
-		fmt.Fprintln(os.Stderr, "Metal: enabled (experimental Q6_K matvec offload)")
+		fmt.Fprintln(os.Stderr, "Metal: enabled (selective Q4_K/Q6_K matvec offload)")
 	} else if metalAvailable {
 		fmt.Fprintln(os.Stderr, "Metal: available (disabled; pass --metal)")
 	} else {

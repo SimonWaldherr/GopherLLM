@@ -8,6 +8,21 @@ import (
 	"testing"
 )
 
+func TestReuseBatchViewsReusesBackingStorage(t *testing.T) {
+	flat := []float32{}
+	views := [][]float32{}
+	first := reuseBatchViews(&flat, &views, 8, 16)
+	first[0][0] = 42
+	ptr := &flat[0]
+	second := reuseBatchViews(&flat, &views, 4, 16)
+	if &flat[0] != ptr {
+		t.Fatal("batch backing array was reallocated for a smaller chunk")
+	}
+	if len(second) != 4 || len(second[0]) != 16 || second[0][0] != 42 {
+		t.Fatalf("reused views have unexpected shape or backing: %dx%d first=%v", len(second), len(second[0]), second[0][0])
+	}
+}
+
 func TestBatchedPrefillMatchesPerToken(t *testing.T) {
 	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "32")
 	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())

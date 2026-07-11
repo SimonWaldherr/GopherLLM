@@ -182,16 +182,18 @@ const (
 // time. Close releases the memory-mapped weight file; quantized weights
 // borrow from it, so no method may be called after Close.
 type Runner struct {
-	gguf       *GGUFFile
-	arch       string
-	tok        *Tokenizer
-	config     Config
-	kind       loadedKind
-	standard   ModelWeights
-	gptOss     GptOssWeights
-	gemma4     Gemma4Weights
-	genLock    sync.Mutex
-	mappedFile *MmapFile
+	gguf           *GGUFFile
+	arch           string
+	tok            *Tokenizer
+	config         Config
+	kind           loadedKind
+	standard       ModelWeights
+	gptOss         GptOssWeights
+	gemma4         Gemma4Weights
+	genLock        sync.Mutex
+	workspaceCache *KVCache
+	workspaceBuf   *DecodeBuffer
+	mappedFile     *MmapFile
 }
 
 // ArchitectureSupported reports whether the loader accepts this
@@ -313,6 +315,8 @@ func (r *Runner) Close() error {
 		return nil
 	}
 	r.releaseMetalWeights()
+	r.workspaceCache = nil
+	r.workspaceBuf = nil
 	if r.mappedFile == nil {
 		return nil
 	}
@@ -387,9 +391,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return GenerationResult{}, fmt.Errorf("prompt (%d tokens) leaves no room to generate within the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+options.MaxTokens+1)
-	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
-	cache := NewKVCache(r.config.NLayers, kDim, vDim, cacheLen)
-	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	cache, buf := r.generationWorkspace(cacheLen)
 	seed := options.Seed
 	if seed == 0 {
 		seed = uint64(time.Now().UnixNano())
@@ -558,6 +560,31 @@ func (r *Runner) cacheDims() (int, int, int, int, int) {
 	return r.config.NKVHeads * r.config.HeadDim, r.config.KVDim, r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
 }
 
+const maxReusableKVCacheBytes int64 = 512 << 20
+
+// generationWorkspace reuses request scratch behind genLock. KV entries up to
+// the active position are always overwritten before attention reads them, so
+// stale suffix data is unreachable. Retaining at most 512 MiB avoids repeated
+// large allocations without pinning an unusually large one-off context.
+func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	layers := r.config.NLayers
+	cache := r.workspaceCache
+	compatible := cache != nil && len(cache.K) == layers && len(cache.V) == layers &&
+		cache.PerPosKDim == kDim && cache.PerPosVDim == vDim && cache.MaxLen >= cacheLen
+	if !compatible {
+		cache = NewKVCache(layers, kDim, vDim, cacheLen)
+		bytes := int64(layers) * int64(kDim+vDim) * int64(cacheLen) * 4
+		if bytes <= maxReusableKVCacheBytes {
+			r.workspaceCache = cache
+		}
+	}
+	if r.workspaceBuf == nil {
+		r.workspaceBuf = NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	}
+	return cache, r.workspaceBuf
+}
+
 func (r *Runner) forwardTokenInto(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) {
 	switch r.kind {
 	case loadedGptOss:
@@ -580,19 +607,19 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 	switch r.kind {
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
-		if next, ok := ArgmaxOutputToken(r.config, r.gptOss.Standard, buf); ok {
+		if next, ok := argmaxOutputTokenInto(r.config, r.gptOss.Standard, buf, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.gptOss.Standard, buf, logits)
 	case loadedGemma4:
 		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
-		if next, ok := ArgmaxOutputToken(r.config, r.gemma4.Standard, buf); ok {
+		if next, ok := argmaxOutputTokenInto(r.config, r.gemma4.Standard, buf, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.gemma4.Standard, buf, logits)
 	default:
 		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
-		if next, ok := ArgmaxOutputToken(r.config, r.standard, buf); ok {
+		if next, ok := argmaxOutputTokenInto(r.config, r.standard, buf, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.standard, buf, logits)
@@ -603,12 +630,13 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {
 	switch r.kind {
 	case loadedGptOss:
-		return ForwardHiddenGptOss(r.config, r.gptOss, cache, buf, token, pos)
+		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
-		return ForwardHiddenGemma4(r.config, r.gemma4, cache, buf, token, pos)
+		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
 	default:
-		return ForwardHidden(r.config, r.standard, cache, buf, token, pos)
+		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
 	}
+	return buf.XN
 }
 
 // canBatchPrefill reports whether the model uses the standard non-fused
@@ -711,9 +739,7 @@ func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+1)
-	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
-	cache := NewKVCache(r.config.NLayers, kDim, vDim, cacheLen)
-	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	cache, buf := r.generationWorkspace(cacheLen)
 	sum := make([]float32, r.config.Dim)
 	for pos, tok := range tokens {
 		h := r.forwardHiddenToken(cache, buf, tok, pos)

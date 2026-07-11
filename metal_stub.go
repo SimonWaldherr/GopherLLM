@@ -12,7 +12,15 @@ func prepareMetalWeight(_ []byte, _ GGMLType, _, _ int) *MetalWeight {
 	return nil
 }
 
+func matvecMetalQ4KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) bool {
+	return false
+}
+
 func matvecMetalQ6KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) bool {
+	return false
+}
+
+func matvecMetalQ4K2Into(_, _ *MetalWeight, _ []float32, _, _, _ int, _, _ *[]float32) bool {
 	return false
 }
 
