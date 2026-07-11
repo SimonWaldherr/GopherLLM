@@ -7,7 +7,10 @@ import (
 	"testing"
 )
 
-// Temporary audit tests: adversarial extremes for the new asm kernels.
+// Adversarial-extreme regression tests for the int8-activation asm kernels
+// and siluMulF32AVX2: saturation bounds, lane-order mixups, and (for SiLU)
+// the input range where a naive symmetric exp() clamp silently produces
+// finite-but-wrong results instead of the correct near-zero output.
 
 // All-max Q4_K block: every nibble 15, every scale/min 63 (0xff scale bytes),
 // activations all +1 so q8 = +127 everywhere. Max VPMADDUBSW pair = 3810,
