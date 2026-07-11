@@ -434,8 +434,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   (bypasses `MODEL`/`PROMPT`/sampler variables entirely).
 - `make repl MODEL=...` starts the REPL.
 - `make serve MODEL=... CHAT=1` starts the HTTP server and chat UI.
-- `make serve-metal MODEL=... CHAT=1` starts the Metal server with prepared
-  CPU kernels enabled by default (`PREPARE_QUANT=0` disables preparation).
+- `make serve-metal MODEL=... CHAT=1 THREADS=8` starts the Metal server with
+  prepared CPU fallback kernels enabled by default (`PREPARE_QUANT=0` disables
+  preparation).
 - `make list-models` scans `MODEL_DIR`.
 - `make inspect MODEL=...` prints model metadata summary.
 - `make list-tensors MODEL=...` prints the tensor inventory.
@@ -464,6 +465,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 ## Performance Notes
 
 - Use `--threads <N>` to set both GopherLLM worker threads and `GOMAXPROCS`.
+  Make targets expose the same setting as `THREADS=<N>`; 8 was fastest in the
+  measured M2 Max setup, but should be re-benchmarked on each target Mac.
 - Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
   scale/min data plus selected Q6_K scale data, then switches supported rows to
   prepared kernels.
@@ -473,10 +476,13 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   comparisons.
 - Metal is available only in `bin/gopherllm-metal` builds made with
   `CGO_ENABLED=1 -tags metal`, and must be enabled with `--metal`. The selective
-  path offloads large Q4_K FFN gate/up projections (fused into one command
-  buffer) plus Q6_K FFN-down and output projections. Small Q/K/V projections
-  stay on prepared ARM64 CPU kernels because their GPU dispatch overhead is
-  larger than the compute saved. The path remains experimental; use
+  path fuses mixed Q4_K/Q4_K/Q6_K Q/K/V projections into one command buffer and
+  offloads Q4_K attention-output, Q4_K gate/up + SiLU + Q6_K FFN-down in one
+  command buffer, and Q6_K vocabulary-output projections. GGUF files opened
+  through mmap are exposed to Metal as shared no-copy weight buffers;
+  byte-backed models retain the copying path for cgo safety. Prepared ARM64
+  kernels remain as the fallback for small projections and Metal failures. The
+  path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
 - On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K and Q6_K matvecs
   default to int8-activation full-row kernels: the activation vector is quantized
@@ -496,13 +502,16 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   dotted against all prompt tokens' pre-quantized int8 activations in
   L2-resident row tiles (`matvecBatchQ8`) — no f32 dequantization pass at all.
   With `GOPHERLLM_Q8_ACTIVATIONS=0` the older dequantize-once-per-chunk f32 path
-  runs instead. Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token
-  path (A/B benchmarking / debugging).
+  runs instead. ARM64 reuses per-worker dequantization rows and dispatches one
+  coarse batch range per worker to avoid allocation and scheduling overhead.
+  Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token path (A/B
+  benchmarking / debugging), or `GOPHERLLM_PREFILL_CHUNK=<N>` to tune the chunk
+  size on the deployment machine.
 - SwiGLU's `x*sigmoid(x)*up` runs through an AVX2 kernel with a Cephes-style
   expf polynomial (~1e-7 relative error) instead of per-element `math.Exp`.
-- On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are spread
-  across the worker pool at longer contexts, and matvec work is over-chunked so
-  performance cores absorb efficiency-core stragglers.
+- On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
+  spread across the worker pool at longer contexts, and single-token matvec work
+  is over-chunked so performance cores absorb efficiency-core stragglers.
 - Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
   it.
 
@@ -516,7 +525,10 @@ details in the bullets they annotate):
 | `RUSTY_LLM_MODEL_DIR` | Default model directory when `--model-dir` is not given |
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
+| `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q6_K matvecs (x86-64) |
+| `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
+| `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
 
 ## Supported Architectures

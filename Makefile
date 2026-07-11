@@ -33,6 +33,7 @@ TOP_K         ?= 40
 MIN_P         ?= 0
 REPEAT_PENALTY ?= 1.1
 SEED          ?=
+THREADS       ?=
 SKILLS_DIR    ?=
 BENCH_RUNS    ?= 3
 KERNEL_BENCH_RUNS ?= 25
@@ -55,9 +56,10 @@ CHAT_FLAG      = $(if $(filter 1 true yes on,$(CHAT)),--chat,)
 PREPARE_FLAG   = $(if $(filter 1 true yes on,$(PREPARE_QUANT)),--prepare-quant,)
 _MODEL_ARG     = $(if $(MODEL),--model "$(MODEL)",)
 _SEED_FLAG     = $(if $(SEED),--seed "$(SEED)",)
+_THREADS_FLAG  = $(if $(THREADS),--threads "$(THREADS)",)
 _SKILLS_FLAG   = $(if $(SKILLS_DIR),--skills-dir "$(SKILLS_DIR)",)
 _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p "$(MIN_P)" --repeat-penalty "$(REPEAT_PENALTY)" $(_SEED_FLAG)
-_BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
+_BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(PREPARE_FLAG) $(_BASE_RUN_ARGS)
 
 .PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt test test-small-models vet check coverage coverage-html clean help
@@ -123,14 +125,14 @@ compare-run-metal: release build-metal
 	@$(METAL_BIN) --metal --prepare-quant $(_BASE_RUN_ARGS)
 
 repl: release
-	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_SAMPLER_ARGS) --repl
+	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) $(_SAMPLER_ARGS) --repl
 
 serve: release
-	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
+	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
 serve-metal: PREPARE_QUANT=1
 serve-metal: build-metal
-	@$(METAL_BIN) --metal $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
+	@$(METAL_BIN) --metal $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
 https:
 	@printf "https is not available in the Go port yet.\n"
@@ -151,7 +153,7 @@ bench:
 	$(GO) test $(GOFLAGS) -run '^$$' -bench=. -benchmem .
 
 bench-model: release
-	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)" --timeout "$(MODEL_TIMEOUT)"
 
@@ -159,55 +161,55 @@ bench-model-prep: PREPARE_QUANT=1
 bench-model-prep: bench-model
 
 bench-model-metal: build-metal
-	@$(METAL_BIN) --metal $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(METAL_BIN) --metal $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)" --timeout "$(MODEL_TIMEOUT)"
 
 compare-bench: release
 	@printf "\n== normal bench ==\n"
-	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)" --timeout "$(MODEL_TIMEOUT)"
 	@printf "\n== prepare-quant bench ==\n"
-	@$(BIN) --prepare-quant --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --prepare-quant --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" --temp "$(TEMP)" \
 		--bench --bench-json --bench-runs "$(BENCH_RUNS)" --timeout "$(MODEL_TIMEOUT)"
 
 synonym-bench: release
-	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--prompt "$(SYNONYM_PROMPT)" --max-tokens "8" --temp "0" \
 		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --bench --bench-json --bench-runs "$(BENCH_RUNS)" --timeout "$(MODEL_TIMEOUT)"
 
 nato-bench: release
-	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--prompt "$(NATO_PROMPT)" --max-tokens "128" --temp "0" \
 		--top-p "$(TOP_P)" --top-k "$(TOP_K)" --repeat-penalty "1" --bench --bench-json --bench-runs "$(BENCH_RUNS)" --timeout "$(MODEL_TIMEOUT)"
 
 kernel-bench: release
-	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
 kernel-bench-prep: PREPARE_QUANT=1
 kernel-bench-prep: kernel-bench
 
 kernel-bench-metal: build-metal
-	@$(METAL_BIN) --metal $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(METAL_BIN) --metal $(PREPARE_FLAG) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
 compare-kernel-bench: release
 	@printf "\n== normal kernel bench ==\n"
-	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 	@printf "\n== prepare-quant kernel bench ==\n"
-	@$(BIN) --prepare-quant --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --prepare-quant --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
 compare-kernel-bench-metal: release build-metal
 	@printf "\n== normal kernel bench ==\n"
-	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 	@printf "\n== metal kernel bench ==\n"
-	@$(METAL_BIN) --metal --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+	@$(METAL_BIN) --metal --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_THREADS_FLAG) \
 		--kernel-bench-json --kernel-bench-runs "$(KERNEL_BENCH_RUNS)" --kernel-bench-layer "$(KERNEL_BENCH_LAYER)"
 
 fmt:
@@ -287,6 +289,7 @@ help:
 	@printf "  NATO_PROMPT=%s\n" "$(NATO_PROMPT)"
 	@printf "  MAX_TOKENS=%s TEMP=%s TOP_P=%s TOP_K=%s MIN_P=%s REPEAT_PENALTY=%s\n" "$(MAX_TOKENS)" "$(TEMP)" "$(TOP_P)" "$(TOP_K)" "$(MIN_P)" "$(REPEAT_PENALTY)"
 	@printf "  SEED=%s (unset by default; passed as --seed only when set)\n" "$(SEED)"
+	@printf "  THREADS=%s (unset by default; passed as --threads only when set)\n" "$(THREADS)"
 	@printf "  SKILLS_DIR=%s (passed to run/repl/serve as --skills-dir when set; see README)\n" "$(SKILLS_DIR)"
 	@printf "  BENCH_RUNS=%s MODEL_TIMEOUT=%s SERVE_ADDR=%s CHAT=%s\n" "$(BENCH_RUNS)" "$(MODEL_TIMEOUT)" "$(SERVE_ADDR)" "$(CHAT)"
 	@printf "  KERNEL_BENCH_RUNS=%s KERNEL_BENCH_LAYER=%s\n" "$(KERNEL_BENCH_RUNS)" "$(KERNEL_BENCH_LAYER)"

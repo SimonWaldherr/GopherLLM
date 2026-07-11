@@ -1600,6 +1600,19 @@ func parallelRows(rows int, fn func(start, end int)) {
 	dispatchParallel(threads, rows, fn)
 }
 
+// parallelRowsBatched keeps one coarse range per worker. A batch row already
+// performs many dot products, so the 4x ARM overdispatch used to balance short
+// decode rows adds scheduling overhead instead. The regular parallelRows path
+// remains unchanged, providing a local rollback for this prefill-only tuning.
+func parallelRowsBatched(rows int, fn func(start, end int)) {
+	threads := min(numThreads(), rows)
+	if threads <= 1 || rows < threads*8 {
+		fn(0, rows)
+		return
+	}
+	dispatchParallelMode(threads, rows, false, fn)
+}
+
 // parallelChunks splits n items across the worker pool without the minimum
 // per-thread row count required by parallelRows. Intended for coarse-grained
 // items (e.g. attention heads) where even a single item is substantial work.
@@ -1613,6 +1626,10 @@ func parallelChunks(n int, fn func(start, end int)) {
 }
 
 func dispatchParallel(threads, rows int, fn func(start, end int)) {
+	dispatchParallelMode(threads, rows, true, fn)
+}
+
+func dispatchParallelMode(threads, rows int, allowOversubscribe bool, fn func(start, end int)) {
 	pool := getRowWorkerPool(threads)
 	// Issue more chunks than workers so faster cores naturally pick up the
 	// slack of slower ones (e.g. efficiency cores on Apple Silicon). On
@@ -1620,7 +1637,7 @@ func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	// wakeups, so chunks stay 1:1 with workers there. Small matvecs stay at
 	// one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
-	if oversubscribeDispatch && rows >= threads*128 {
+	if allowOversubscribe && oversubscribeDispatch && rows >= threads*128 {
 		chunks = min(threads*4, cap(pool.jobs))
 	}
 	// A WaitGroup replaces a per-chunk done-channel: completion is a single

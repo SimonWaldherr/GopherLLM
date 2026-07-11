@@ -1,6 +1,19 @@
 package gopherllm
 
-import "math"
+import (
+	"math"
+	"sync"
+)
+
+// Batched quantized matvecs previously allocated one dequantized row per
+// worker chunk and projection, producing thousands of short-lived arrays over
+// a 26-layer prefill. Reusing those independent scratch rows removes GC work
+// without changing arithmetic. Risk is bounded retention of the largest row
+// seen per active chunk; rollback is to allocate make([]float32, cols) inline.
+var batchDequantScratchPool = sync.Pool{New: func() any {
+	scratch := make([]float32, 0)
+	return &scratch
+}}
 
 // batchDecodeBuffer owns the large activation slabs used by batched prefill.
 // It hangs off DecodeBuffer so prompt chunks and subsequent requests reuse the
@@ -51,7 +64,7 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 
 	if w.F32 != nil {
 		rows := len(w.F32) / cols
-		parallelRows(rows, func(start, end int) {
+		parallelRowsBatched(rows, func(start, end int) {
 			for r := start; r < end; r++ {
 				row := w.F32[r*cols : (r+1)*cols]
 				for t := 0; t < p; t++ {
@@ -75,14 +88,22 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 		return
 	}
 	rowBytes := len(w.Raw) / w.Rows
-	parallelRows(w.Rows, func(start, end int) {
-		deq := make([]float32, cols) // one scratch row per worker chunk
+	parallelRowsBatched(w.Rows, func(start, end int) {
+		scratch := batchDequantScratchPool.Get().(*[]float32)
+		if cap(*scratch) < cols {
+			*scratch = make([]float32, cols)
+		} else {
+			*scratch = (*scratch)[:cols]
+		}
+		deq := *scratch
 		for r := start; r < end; r++ {
 			dequant(w.Raw[r*rowBytes:(r+1)*rowBytes], cols, deq)
 			for t := 0; t < p; t++ {
 				outs[t][r] = DotF32(deq, xs[t])
 			}
 		}
+		*scratch = deq[:0]
+		batchDequantScratchPool.Put(scratch)
 	})
 }
 

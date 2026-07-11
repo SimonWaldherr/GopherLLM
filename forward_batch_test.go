@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -20,6 +21,23 @@ func TestReuseBatchViewsReusesBackingStorage(t *testing.T) {
 	}
 	if len(second) != 4 || len(second[0]) != 16 || second[0][0] != 42 {
 		t.Fatalf("reused views have unexpected shape or backing: %dx%d first=%v", len(second), len(second[0]), second[0][0])
+	}
+}
+
+func TestParallelRowsBatchedUsesOneRangePerWorker(t *testing.T) {
+	threads := numThreads()
+	rows := threads * 128
+	var calls atomic.Int32
+	var covered atomic.Int64
+	parallelRowsBatched(rows, func(start, end int) {
+		calls.Add(1)
+		covered.Add(int64(end - start))
+	})
+	if got := int(calls.Load()); got != threads {
+		t.Fatalf("batch dispatch ranges = %d, want one per worker (%d)", got, threads)
+	}
+	if got := int(covered.Load()); got != rows {
+		t.Fatalf("batch dispatch covered %d rows, want %d", got, rows)
 	}
 }
 

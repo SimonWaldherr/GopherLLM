@@ -1027,6 +1027,7 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		padded := make([]byte, byteSize)
 		copy(padded, raw)
 		raw = padded
+		borrow = false
 	}
 	switch info.DType {
 	case GGMLTypeF32:
@@ -1070,12 +1071,12 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		}
 		w := Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}
 		if useMetal {
-			w.Metal = prepareMetalWeight(raw, info.DType, rows, cols)
+			w.Metal = prepareMetalWeight(raw, info.DType, rows, cols, borrow)
 		}
-		// Metal and prepared CPU weights are alternative decode layouts. Keeping
-		// both wastes hundreds of MiB on Ministral-3 3B; raw packed data remains
-		// available as the correctness fallback if a GPU command fails.
-		if w.Metal == nil && prepareQuantized && (info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ6_K) {
+		// Direct Metal weights skip redundant prepared data. Small Q/K/V handles
+		// retain prepared CPU data so fused-attention dispatch can roll back
+		// without changing results if a GPU command fails.
+		if !metalWeightUsesDirect(w.Metal) && prepareQuantized && (info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ6_K) {
 			w.Prepared = PrepareQuantizedWeight(raw, info.DType, rows, cols)
 		}
 		return w, nil
@@ -1289,36 +1290,45 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		addInPlace(buf.X[:dim], buf.Proj)
 
 		rmsNormInto(buf.X, layer.FFNNorm, config.RMSNormEps, &buf.XN2)
-		if layer.HasGateUp {
-			layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
-			ensureLenNoClear(&buf.Gate, config.HiddenDim)
-			ensureLenNoClear(&buf.Up, config.HiddenDim)
-			copy(buf.Gate, buf.GateUp[:config.HiddenDim])
-			copy(buf.Up, buf.GateUp[config.HiddenDim:2*config.HiddenDim])
-		} else {
-			if !tryMatvec2Into(layer.W1, layer.W3, buf.XN2, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
-				layer.W1.MatvecInto(buf.XN2, &buf.Gate)
-				layer.W3.MatvecInto(buf.XN2, &buf.Up)
-			}
-		}
-		hDim := config.HiddenDim
-		ensureLenNoClear(&buf.Hidden, hDim)
-		if hDim > 0 {
-			gate := buf.Gate
-			up := buf.Up
-			hidden := buf.Hidden
-			_ = gate[hDim-1]
-			_ = up[hDim-1]
-			_ = hidden[hDim-1]
-			if config.UseGELU {
-				for i := 0; i < hDim; i++ {
-					hidden[i] = geluTanh(gate[i]) * up[i]
-				}
+		// Decode bottleneck: the selective Metal path previously synchronized and
+		// copied Gate/Up to the CPU for SiLU, then copied Hidden back for Down.
+		// Keep all three stages in one command buffer when the measured
+		// Q4_K/Q4_K/Q6_K shape matches. Any unsupported shape or GPU failure falls
+		// through to the unchanged CPU/GPU path; removing this branch is rollback.
+		fusedMetalFFN := !layer.HasGateUp && !config.UseGELU &&
+			matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
+		if !fusedMetalFFN {
+			if layer.HasGateUp {
+				layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
+				ensureLenNoClear(&buf.Gate, config.HiddenDim)
+				ensureLenNoClear(&buf.Up, config.HiddenDim)
+				copy(buf.Gate, buf.GateUp[:config.HiddenDim])
+				copy(buf.Up, buf.GateUp[config.HiddenDim:2*config.HiddenDim])
 			} else {
-				siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
+				if !tryMatvec2Into(layer.W1, layer.W3, buf.XN2, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+					layer.W1.MatvecInto(buf.XN2, &buf.Gate)
+					layer.W3.MatvecInto(buf.XN2, &buf.Up)
+				}
 			}
+			hDim := config.HiddenDim
+			ensureLenNoClear(&buf.Hidden, hDim)
+			if hDim > 0 {
+				gate := buf.Gate
+				up := buf.Up
+				hidden := buf.Hidden
+				_ = gate[hDim-1]
+				_ = up[hDim-1]
+				_ = hidden[hDim-1]
+				if config.UseGELU {
+					for i := 0; i < hDim; i++ {
+						hidden[i] = geluTanh(gate[i]) * up[i]
+					}
+				} else {
+					siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
+				}
+			}
+			layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
 		}
-		layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
 		if layer.PostFFNNorm != nil {
 			rmsNormInto(buf.Proj, layer.PostFFNNorm, config.RMSNormEps, &buf.Proj)
 		}
@@ -1557,6 +1567,9 @@ func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v
 // branch cost. Rollback: replace this call with the former three independent
 // MatvecInto calls.
 func tryMatvecAttentionInto(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) {
+	if matvecMetalQ4K2Q6KInto(wq.Metal, wk.Metal, wv.Metal, x, wq.Rows, wk.Rows, wv.Rows, wq.Cols, q, k, v) {
+		return
+	}
 	if tryMatvec3Into(wq, wk, wv, x, q4kXSums, q, k, v) {
 		return
 	}

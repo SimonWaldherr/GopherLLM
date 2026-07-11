@@ -295,7 +295,10 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	if err != nil {
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
-	r, err := runnerFromGGUFBytes(mmap.Bytes(), true, options)
+	// Only an actual mmap may be retained by Metal with bytesNoCopy. If mmap
+	// fell back to os.ReadFile, copy quantized weights so no C object keeps a
+	// pointer into Go-managed heap memory.
+	r, err := runnerFromGGUFBytes(mmap.Bytes(), mmap.mmap, options)
 	if err != nil {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, err
@@ -314,6 +317,8 @@ func (r *Runner) Close() error {
 	if r == nil {
 		return nil
 	}
+	r.genLock.Lock()
+	defer r.genLock.Unlock()
 	r.releaseMetalWeights()
 	r.workspaceCache = nil
 	r.workspaceBuf = nil
@@ -666,13 +671,10 @@ func (r *Runner) canBatchPrefill() bool {
 // prefillBatched processes the prompt in chunks, streaming each weight once per
 // chunk instead of once per token.
 //
-// chunk was swept empirically (BenchmarkChunkThroughputP*, not checked in):
-// per-token throughput improves from P=8 up to a peak around P=32, then
-// degrades again through P=48/64/128/256 as the chunk's activation buffers
-// (X, XN, Q, K, V, ...; each sized dim*chunk floats) outgrow cache and start
-// costing more in misses per dequantized weight row than the extra dequant
-// amortization buys back. 32 was consistently ~15-20% faster than the
-// previous default of 64 across repeated runs.
+// Generic synthetic sweeps peak near 32 as activation buffers outgrow cache,
+// while the dense 3B path benefits from more dequantization amortization and
+// uses the model-aware default below. Deployment-specific A/B runs can override
+// either choice through GOPHERLLM_PREFILL_CHUNK.
 func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) error {
 	chunk := prefillChunkSize(r.config)
 	n := len(tokens)

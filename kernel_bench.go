@@ -121,6 +121,38 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		))
 	}
 	rows = append(rows, measureMatvec("ffn_down", layer.W2, hiddenInput, runs, &out))
+	if !layer.HasGateUp && !r.config.UseGELU {
+		gate, up, hidden, projection, xs := []float32{}, []float32{}, []float32{}, []float32{}, []float32{}
+		oldPath := func() {
+			if !tryMatvec2Into(layer.W1, layer.W3, dimInput, &xs, &gate, &up) {
+				layer.W1.MatvecInto(dimInput, &gate)
+				layer.W3.MatvecInto(dimInput, &up)
+			}
+			ensureLenNoClear(&hidden, r.config.HiddenDim)
+			siluMulF32(gate, up, hidden)
+			layer.W2.MatvecInto(hidden, &projection)
+		}
+		rows = append(rows, measureFunction(
+			"ffn_swiglu_down_reference",
+			fmt.Sprintf("%s/%s/SiLU/%s", layer.W1.Type, layer.W3.Type, layer.W2.Type),
+			layer.W1.Rows+layer.W3.Rows+layer.W2.Rows,
+			layer.W1.Cols,
+			runs,
+			oldPath,
+		))
+		rows = append(rows, measureFunction(
+			"ffn_swiglu_down_path",
+			fmt.Sprintf("%s/%s/SiLU/%s", layer.W1.Type, layer.W3.Type, layer.W2.Type),
+			layer.W1.Rows+layer.W3.Rows+layer.W2.Rows,
+			layer.W1.Cols,
+			runs,
+			func() {
+				if !matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, dimInput, &projection) {
+					oldPath()
+				}
+			},
+		))
+	}
 	rows = append(rows, measureMatvec("output", r.standard.Output, dimInput, runs, &out))
 	return rows
 }
