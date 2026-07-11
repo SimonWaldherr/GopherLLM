@@ -2,6 +2,8 @@ package gopherllm
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -100,5 +102,54 @@ func TestPromptModelSelectionCanAbort(t *testing.T) {
 	var out bytes.Buffer
 	if _, err := PromptModelSelection("/models", entries, strings.NewReader("q\n"), &out); err == nil {
 		t.Fatal("expected abort error")
+	}
+}
+
+func TestDefaultModelDirPrefersEnvironment(t *testing.T) {
+	t.Setenv("RUSTY_LLM_MODEL_DIR", "  /models/custom  ")
+	if got := DefaultModelDir(); got != "/models/custom" {
+		t.Fatalf("DefaultModelDir() = %q", got)
+	}
+	t.Setenv("RUSTY_LLM_MODEL_DIR", "")
+	t.Setenv("HOME", "/home/tester")
+	if got := DefaultModelDir(); got != filepath.Join("/home/tester", lmStudioCommunitySubdir) {
+		t.Fatalf("DefaultModelDir() = %q", got)
+	}
+}
+
+func TestDiscoverModelsAndResolveModelPath(t *testing.T) {
+	root := t.TempDir()
+	modelPath := filepath.Join(root, "repo", "tiny.gguf")
+	if err := os.MkdirAll(filepath.Dir(modelPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(modelPath, buildTinyLlamaGGUF(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "broken.gguf"), []byte("not a GGUF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	entries, err := DiscoverModels(root, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ID != filepath.Join("repo", "tiny") || entries[0].ModelName != "tiny" || !entries[0].IsSupported {
+		t.Fatalf("entries = %+v", entries)
+	}
+	if !strings.Contains(logs.String(), "Skipping") {
+		t.Fatalf("expected broken model diagnostic, got %q", logs.String())
+	}
+
+	selector := "tiny"
+	if got, err := ResolveModelPath(&selector, root); err != nil || got != modelPath {
+		t.Fatalf("ResolveModelPath selector = %q, %v", got, err)
+	}
+	if got, err := ResolveModelPath(&modelPath, root); err != nil || got != modelPath {
+		t.Fatalf("ResolveModelPath path = %q, %v", got, err)
+	}
+	if got, err := chooseFromDirectory(root, nil, nil, nil); err != nil || got != modelPath {
+		t.Fatalf("chooseFromDirectory = %q, %v", got, err)
 	}
 }

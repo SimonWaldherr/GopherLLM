@@ -10,6 +10,7 @@ import "os"
 // for the Runner's lifetime just as in the mmap-backed variant.
 type MmapFile struct {
 	data []byte
+	mmap bool
 }
 
 // OpenMmap reads the whole file into memory (see type comment).

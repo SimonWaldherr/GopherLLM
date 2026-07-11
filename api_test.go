@@ -54,6 +54,59 @@ func TestOpenBytesIsSilentByDefault(t *testing.T) {
 	}
 }
 
+func TestLoadOptionsAndModelAccessors(t *testing.T) {
+	var logs bytes.Buffer
+	settings := applyLoadOptions([]Option{
+		WithLogWriter(&logs),
+		WithThreads(1),
+		WithPrepareQuantized(true),
+		WithMetal(true),
+	})
+	if settings.logw != &logs || settings.threads != 1 || !settings.prepareQuantized || !settings.useMetal {
+		t.Fatalf("settings = %+v", settings)
+	}
+	load := settings.loadOptions()
+	if load.LogWriter != &logs || !load.PrepareQuantized || !load.UseMetal {
+		t.Fatalf("load options = %+v", load)
+	}
+
+	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	if m.Runner() == nil || m.GGUF() == nil {
+		t.Fatal("model accessors returned nil")
+	}
+	if m.Info().FileSizeBytes != len(buildTinyLlamaGGUF()) || m.Name() != "tiny" {
+		t.Fatalf("info=%+v name=%q", m.Info(), m.Name())
+	}
+}
+
+func TestOpenRejectsCanceledContextBeforeReadingFile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Open(ctx, "does-not-exist.gguf"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Open error = %v, want context.Canceled", err)
+	}
+}
+
+func TestBuildGenOptionsAppliesEveryOption(t *testing.T) {
+	ctx := context.WithValue(context.Background(), "key", "value")
+	tools := []ToolDefinition{{Type: "function", Function: ToolFunctionDef{Name: "weather"}}}
+	got := buildGenOptions(ctx, []GenOption{
+		WithMaxTokens(12), WithTemperature(0.4), WithTopP(0.8), WithTopK(5), WithMinP(0.2),
+		WithRepeatPenalty(1.3), WithSeed(9), WithSystemPrompt("system"), WithStop("END", "STOP"),
+		WithTools(tools...), WithToolChoice("required"),
+	})
+	if got.MaxTokens != 12 || got.Sampler.Temperature != 0.4 || got.Sampler.TopP != 0.8 || got.Sampler.TopK != 5 || got.Sampler.MinP != 0.2 || got.Sampler.RepeatPenalty != 1.3 || got.Seed != 9 || got.SystemPrompt != "system" || got.ToolChoice != "required" {
+		t.Fatalf("options = %+v", got)
+	}
+	if len(got.StopSequences) != 2 || len(got.Tools) != 1 || got.ctx != ctx {
+		t.Fatalf("stops=%v tools=%v ctx=%v", got.StopSequences, got.Tools, got.ctx)
+	}
+}
+
 func TestGenerateContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())

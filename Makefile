@@ -5,6 +5,7 @@ MODCACHE_DIR ?= $(CURDIR)/.cache/gomod
 TMP_DIR      ?= $(CURDIR)/.cache/tmp
 GO           ?= go
 GOFLAGS      ?=
+TEST_FLAGS   ?= -count=1
 CGO_ENABLED  ?= 0
 CROSS_CGO_ENABLED ?= 0
 GOCACHE      ?= $(CACHE_DIR)
@@ -62,7 +63,7 @@ _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p 
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(PREPARE_FLAG) $(_BASE_RUN_ARGS)
 
-.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt test test-small-models vet check coverage coverage-html clean help
+.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -215,23 +216,35 @@ compare-kernel-bench-metal: release build-metal
 fmt:
 	$(GO) fmt ./...
 
+fmt-check:
+	@unformatted="$$(gofmt -l $$(find . -type f -name '*.go' -not -path './.cache/*'))"; \
+	if [ -n "$$unformatted" ]; then \
+		echo "Go files need formatting:"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+
 test:
-	@mkdir -p $(GOCACHE)
-	$(GO) test $(GOFLAGS) ./...
+	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
+	$(GO) test $(GOFLAGS) $(TEST_FLAGS) ./...
+
+test-race:
+	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
+	$(GO) test $(GOFLAGS) $(TEST_FLAGS) -race ./...
 
 test-small-models: release
 	GOPHERLLM_RUN_MODEL_SWEEP=1 GOPHERLLM_MODEL_DIR="$(MODEL_DIR)" GOPHERLLM_SWEEP_BINARY="$(CURDIR)/$(BIN)" GOPHERLLM_MODEL_SWEEP_TIMEOUT="$(MODEL_TIMEOUT)" \
 		$(GO) test $(GOFLAGS) -run TestSmallLocalModelsAnswerEinsteinPrompt -count=1 -timeout=20m -v .
 
 vet:
-	@mkdir -p $(GOCACHE)
+	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
 	$(GO) vet $(GOFLAGS) ./...
 
-check: fmt test vet
+check: fmt-check test vet
 
 coverage:
-	@mkdir -p $(GOCACHE) $(dir $(COVER_PROFILE))
-	$(GO) test $(GOFLAGS) -count=1 -coverprofile="$(COVER_PROFILE)" .
+	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR) $(dir $(COVER_PROFILE))
+	$(GO) test $(GOFLAGS) $(TEST_FLAGS) -coverprofile="$(COVER_PROFILE)" ./...
 	$(GO) tool cover -func="$(COVER_PROFILE)"
 
 coverage-html: coverage
@@ -246,6 +259,9 @@ help:
 	@printf "  make build/release                   Build ./$(BIN)\n"
 	@printf "  make build-metal                     Build ./$(METAL_BIN) with CGO+Metal tag\n"
 	@printf "  make cross-build                     Build darwin/linux/windows for amd64 and arm64\n"
+	@printf "  make fmt-check                       Fail if Go source files are not gofmt-formatted\n"
+	@printf "  make test                            Run all tests without using cached test results\n"
+	@printf "  make test-race                       Run all tests with the race detector\n"
 	@printf "  make run MODEL=... PROMPT='...'      Generate from a one-shot prompt\n"
 	@printf "  make run-prep MODEL=...              Generate with --prepare-quant\n"
 	@printf "  make run-metal MODEL=...             Generate with experimental --metal\n"
