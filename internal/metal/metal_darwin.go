@@ -12,12 +12,14 @@ package metal
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 
 typedef struct {
 	id<MTLBuffer> weights;
 	id<MTLBuffer> x;
 	id<MTLBuffer> out;
+	id<MTLBuffer> argmax;
 	int rows;
 	int cols;
 	int row_bytes;
@@ -32,11 +34,17 @@ typedef struct {
 	uint32_t rows_per_group;
 } GLLMMetalParams;
 
+typedef struct {
+	float value;
+	uint32_t index;
+} GLLMArgmaxResult;
+
 static id<MTLDevice> gllm_device = nil;
 static id<MTLCommandQueue> gllm_queue = nil;
 static id<MTLComputePipelineState> gllm_q4k_pipeline = nil;
 static id<MTLComputePipelineState> gllm_q6k_pipeline = nil;
 static id<MTLComputePipelineState> gllm_silu_pipeline = nil;
+static id<MTLComputePipelineState> gllm_argmax_pipeline = nil;
 static char gllm_error[1024];
 
 static void gllm_set_error(NSString* prefix, NSError* error) {
@@ -191,6 +199,37 @@ static const char* gllm_q6k_source =
 "    sum += simd_shuffle_xor(sum, offset);\n"
 "  }\n"
 "  if (sublane == 0) { out[row] = sum; }\n"
+"}\n"
+"struct ArgmaxResult { float value; uint index; };\n"
+"kernel void gllm_argmax_f32(\n"
+"    const device float* values [[buffer(0)]],\n"
+"    device ArgmaxResult* result [[buffer(1)]],\n"
+"    constant uint& n [[buffer(2)]],\n"
+"    uint tid [[thread_index_in_threadgroup]]) {\n"
+"  threadgroup float shared_values[256];\n"
+"  threadgroup uint shared_indices[256];\n"
+"  float best = -INFINITY;\n"
+"  uint best_index = 0;\n"
+"  for (uint i = tid; i < n; i += 256) {\n"
+"    float v = values[i];\n"
+"    if (!isfinite(v)) { v = -INFINITY; }\n"
+"    if (v > best || (v == best && i < best_index)) { best = v; best_index = i; }\n"
+"  }\n"
+"  shared_values[tid] = best;\n"
+"  shared_indices[tid] = best_index;\n"
+"  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  for (uint stride = 128; stride > 0; stride >>= 1) {\n"
+"    if (tid < stride) {\n"
+"      float other = shared_values[tid + stride];\n"
+"      uint other_index = shared_indices[tid + stride];\n"
+"      if (other > shared_values[tid] || (other == shared_values[tid] && other_index < shared_indices[tid])) {\n"
+"        shared_values[tid] = other;\n"
+"        shared_indices[tid] = other_index;\n"
+"      }\n"
+"    }\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"  }\n"
+"  if (tid == 0) { result[0].value = shared_values[0]; result[0].index = shared_indices[0]; }\n"
 "}\n";
 
 static int gllm_metal_rows_per_group(int rows) {
@@ -285,7 +324,7 @@ static bool gllm_metal_init_q6k(void) {
 		if (!gllm_metal_init()) {
 			return false;
 		}
-		if (gllm_q6k_pipeline != nil) {
+		if (gllm_q6k_pipeline != nil && gllm_argmax_pipeline != nil) {
 			return true;
 		}
 		NSError* error = nil;
@@ -295,19 +334,31 @@ static bool gllm_metal_init_q6k(void) {
 			gllm_set_error(@"failed to compile Q6_K Metal library", error);
 			return false;
 		}
-		id<MTLFunction> fn = [library newFunctionWithName:@"gllm_q6k_matvec"];
-		if (fn == nil) {
-			strncpy(gllm_error, "failed to load Q6_K Metal function", sizeof(gllm_error) - 1);
+		id<MTLFunction> q6_fn = [library newFunctionWithName:@"gllm_q6k_matvec"];
+		id<MTLFunction> argmax_fn = [library newFunctionWithName:@"gllm_argmax_f32"];
+		if (q6_fn == nil || argmax_fn == nil) {
+			strncpy(gllm_error, "failed to load Q6_K/argmax Metal functions", sizeof(gllm_error) - 1);
+			if (q6_fn != nil) [q6_fn release];
+			if (argmax_fn != nil) [argmax_fn release];
 			[library release];
 			return false;
 		}
-		gllm_q6k_pipeline = [gllm_device newComputePipelineStateWithFunction:fn error:&error];
-		[fn release];
+		id<MTLComputePipelineState> q6_pipeline = [gllm_device newComputePipelineStateWithFunction:q6_fn error:&error];
+		id<MTLComputePipelineState> argmax_pipeline = nil;
+		if (q6_pipeline != nil) {
+			argmax_pipeline = [gllm_device newComputePipelineStateWithFunction:argmax_fn error:&error];
+		}
+		[q6_fn release];
+		[argmax_fn release];
 		[library release];
-		if (gllm_q6k_pipeline == nil) {
-			gllm_set_error(@"failed to create Q6_K Metal pipeline", error);
+		if (q6_pipeline == nil || argmax_pipeline == nil) {
+			if (q6_pipeline != nil) [q6_pipeline release];
+			if (argmax_pipeline != nil) [argmax_pipeline release];
+			gllm_set_error(@"failed to create Q6_K/argmax Metal pipelines", error);
 			return false;
 		}
+		gllm_q6k_pipeline = q6_pipeline;
+		gllm_argmax_pipeline = argmax_pipeline;
 		return true;
 	}
 }
@@ -391,11 +442,13 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 		w->weights = gllm_metal_new_weight_buffer(data, len, no_copy, &w->weight_offset);
 		w->x = [gllm_device newBufferWithLength:(NSUInteger)cols * sizeof(float) options:MTLResourceStorageModeShared];
 		w->out = [gllm_device newBufferWithLength:(NSUInteger)rows * sizeof(float) options:MTLResourceStorageModeShared];
-		if (w->weights == nil || w->x == nil || w->out == nil) {
+		w->argmax = [gllm_device newBufferWithLength:sizeof(GLLMArgmaxResult) options:MTLResourceStorageModeShared];
+		if (w->weights == nil || w->x == nil || w->out == nil || w->argmax == nil) {
 			strncpy(gllm_error, "failed to allocate Metal weight buffer", sizeof(gllm_error) - 1);
 			if (w->weights != nil) [w->weights release];
 			if (w->x != nil) [w->x release];
 			if (w->out != nil) [w->out release];
+			if (w->argmax != nil) [w->argmax release];
 			free(w);
 			return NULL;
 		}
@@ -439,6 +492,15 @@ static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, 1, 1);
 	MTLSize threads = MTLSizeMake(32 * ((NSUInteger)rows_per_group / 2), 1, 1);
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w) {
+	[enc setComputePipelineState:gllm_argmax_pipeline];
+	[enc setBuffer:w->out offset:0 atIndex:0];
+	[enc setBuffer:w->argmax offset:0 atIndex:1];
+	uint32_t rows = (uint32_t)w->rows;
+	[enc setBytes:&rows length:sizeof(rows) atIndex:2];
+	[enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
 static void gllm_metal_encode_silu(
@@ -648,6 +710,42 @@ static int gllm_metal_q6k_matvec(void* handle, const float* x, float* out) {
 	}
 }
 
+static int gllm_metal_q6k_argmax(void* handle, const float* x, uint32_t* token) {
+	@autoreleasepool {
+		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
+		if (w == NULL || w->weights == nil || x == NULL || token == NULL || !gllm_metal_init_q6k()) {
+			return 0;
+		}
+		if (w->x == nil || w->out == nil || w->argmax == nil || w->rows <= 0) {
+			strncpy(gllm_error, "missing Metal argmax buffers", sizeof(gllm_error) - 1);
+			return 0;
+		}
+		memcpy([w->x contents], x, (NSUInteger)w->cols * sizeof(float));
+
+		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+		gllm_metal_encode_q6k(enc, w, w->x);
+		[enc endEncoding];
+		enc = [cb computeCommandEncoder];
+		gllm_metal_encode_argmax(enc, w);
+		[enc endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		if ([cb status] != MTLCommandBufferStatusCompleted) {
+			strncpy(gllm_error, "Metal argmax command buffer failed", sizeof(gllm_error) - 1);
+			return 0;
+		}
+		GLLMArgmaxResult result;
+		memcpy(&result, [w->argmax contents], sizeof(result));
+		if (result.index >= (uint32_t)w->rows || !isfinite(result.value)) {
+			strncpy(gllm_error, "Metal argmax produced an invalid result", sizeof(gllm_error) - 1);
+			return 0;
+		}
+		*token = result.index;
+		return 1;
+	}
+}
+
 static void gllm_metal_release_weight(void* handle) {
 	@autoreleasepool {
 		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
@@ -665,6 +763,10 @@ static void gllm_metal_release_weight(void* handle) {
 		if (w->out != nil) {
 			[w->out release];
 			w->out = nil;
+		}
+		if (w->argmax != nil) {
+			[w->argmax release];
+			w->argmax = nil;
 		}
 		free(w);
 	}
@@ -781,6 +883,17 @@ func MatvecQ6K(w *Weight, x, out []float32) bool {
 	}
 	ok := C.gllm_metal_q6k_matvec(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])))
 	return ok != 0
+}
+
+func ArgmaxQ6K(w *Weight, x []float32) (uint32, bool) {
+	if w == nil || w.ptr == nil || len(x) < w.cols || w.rows == 0 {
+		return 0, false
+	}
+	var token C.uint32_t
+	if C.gllm_metal_q6k_argmax(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), &token) == 0 {
+		return 0, false
+	}
+	return uint32(token), true
 }
 
 func Release(w *Weight) {

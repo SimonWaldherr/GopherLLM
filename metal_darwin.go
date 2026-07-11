@@ -90,6 +90,13 @@ func matvecMetalQ6KInto(w *MetalWeight, x []float32, rows, cols int, out *[]floa
 	return metalbackend.MatvecQ6K(w.q6, x, *out)
 }
 
+func argmaxMetalQ6K(w *MetalWeight, x []float32) (uint32, bool) {
+	if !metalWeightUsesDirect(w) || w.q6 == nil || w.typ != GGMLTypeQ6_K || len(x) < w.cols {
+		return 0, false
+	}
+	return metalbackend.ArgmaxQ6K(w.q6, x)
+}
+
 func matvecMetalQ4K2Into(a, b *MetalWeight, x []float32, aRows, bRows, cols int, aOut, bOut *[]float32) bool {
 	if !metalWeightUsesDirect(a) || !metalWeightUsesDirect(b) || a.q4 == nil || b.q4 == nil ||
 		a.typ != GGMLTypeQ4_K || b.typ != GGMLTypeQ4_K ||

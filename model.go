@@ -1173,10 +1173,13 @@ func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffe
 	if !finite32(config.LogitScale) || config.LogitScale <= 0 || config.FinalLogitSoftcap < 0 {
 		return 0, false
 	}
-	// The CPU-only greedy path avoids materializing 131k logits. With Metal,
-	// however, that shortcut bypasses the accelerated output projection and is
-	// much slower on Ministral-3 3B. Materialize the GPU result, then scan it on
-	// the CPU; the extra ~512 KiB buffer is bounded and reused by the request.
+	// Greedy decode only needs the winning token. Positive logit scaling and the
+	// optional positive softcap preserve argmax ordering, so Metal can reduce its
+	// Q6_K output buffer on-device and avoid a 131k-logit readback plus CPU scan.
+	// Sampling and unsupported output types retain the materialized fallback.
+	if token, ok := argmaxMetalQ6K(weights.Output.Metal, buf.XN); ok {
+		return token, true
+	}
 	if weights.Output.Metal != nil && logits != nil {
 		ProjectLogitsInto(config, weights, buf, logits)
 		if len(*logits) == 0 {

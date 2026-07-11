@@ -222,6 +222,9 @@ func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 		t.Fatalf("Q6_K Metal matvec: %s", MetalError())
 	}
 	assertMetalMatvecClose(t, got, want)
+	if token, ok := argmaxMetalQ6K(w, x); !ok || token != argmaxFiniteToken(want) {
+		t.Fatalf("Metal argmax token = %d, ok=%v, want %d", token, ok, argmaxFiniteToken(want))
+	}
 
 	weights := ModelWeights{Output: Weight{Raw: data, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols, Metal: w}}
 	logits := []float32{}

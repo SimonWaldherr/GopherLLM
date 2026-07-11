@@ -154,6 +154,18 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		))
 	}
 	rows = append(rows, measureMatvec("output", r.standard.Output, dimInput, runs, &out))
+	rows = append(rows, measureFunction(
+		"output_argmax_path",
+		fmt.Sprintf("%s/argmax", r.standard.Output.Type),
+		r.standard.Output.Rows,
+		r.standard.Output.Cols,
+		runs,
+		func() {
+			if _, ok := argmaxMetalQ6K(r.standard.Output.Metal, dimInput); !ok {
+				_, _ = r.standard.Output.ArgmaxMatvec(dimInput)
+			}
+		},
+	))
 	return rows
 }
 
