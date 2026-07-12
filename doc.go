@@ -18,7 +18,7 @@
 //
 //   - Model (api.go): the primary embedding API — context-first methods with
 //     functional options (Open, Generate, Chat, Stream, Embed, Tokenize,
-//     NearestTokens). Start here.
+//     Detokenize). Start here.
 //   - NewHandler (server.go): the OpenAI-/Ollama-compatible HTTP API as a
 //     mountable http.Handler for applications that expose the model over
 //     HTTP themselves.

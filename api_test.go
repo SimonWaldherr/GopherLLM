@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -88,6 +90,25 @@ func TestOpenRejectsCanceledContextBeforeReadingFile(t *testing.T) {
 	cancel()
 	if _, err := Open(ctx, "does-not-exist.gguf"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Open error = %v, want context.Canceled", err)
+	}
+}
+
+func TestOpenLoadsModelFromPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny.gguf")
+	data := buildTinyLlamaGGUF()
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Info().FileSizeBytes != len(data) || m.Name() != "tiny" {
+		t.Fatalf("info=%+v name=%q", m.Info(), m.Name())
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

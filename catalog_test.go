@@ -117,6 +117,37 @@ func TestDefaultModelDirPrefersEnvironment(t *testing.T) {
 	}
 }
 
+func TestCatalogHelpers(t *testing.T) {
+	if got := (ModelEntry{IsProjector: true, IsSupported: true}).Status(); got != "projector" {
+		t.Fatalf("projector status = %q", got)
+	}
+	if got := (ModelEntry{IsSupported: true}).Status(); got != "supported" {
+		t.Fatalf("supported status = %q", got)
+	}
+	if got := (ModelEntry{}).Status(); got != "unsupported" {
+		t.Fatalf("unsupported status = %q", got)
+	}
+	if got := truncate("abcdef", 4); got != "abc~" {
+		t.Fatalf("truncate = %q", got)
+	}
+	if got := truncate("abcdef", 1); got != "~" {
+		t.Fatalf("truncate short = %q", got)
+	}
+	entries := []ModelEntry{{ID: "first", Path: "/models/first.gguf"}, {ID: "second", Path: "/models/second.gguf"}}
+	if got := modelMenuIndex(entries, entries[1]); got != 2 {
+		t.Fatalf("modelMenuIndex = %d", got)
+	}
+	if got := modelMenuIndex(entries, ModelEntry{ID: "missing"}); got != 0 {
+		t.Fatalf("missing modelMenuIndex = %d", got)
+	}
+	if got := modelDirFromEntries(entries); got != "/models" {
+		t.Fatalf("modelDirFromEntries = %q", got)
+	}
+	if got := modelDirFromEntries(nil); got != "the model directory" {
+		t.Fatalf("empty modelDirFromEntries = %q", got)
+	}
+}
+
 func TestDiscoverModelsAndResolveModelPath(t *testing.T) {
 	root := t.TempDir()
 	modelPath := filepath.Join(root, "repo", "tiny.gguf")
