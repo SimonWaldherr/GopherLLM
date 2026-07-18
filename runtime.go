@@ -611,11 +611,15 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	layers := r.config.NLayers
 	cache := r.workspaceCache
-	compatible := cache != nil && len(cache.K) == layers && len(cache.V) == layers &&
+	compatible := cache != nil && cache.layerCount() == layers && cache.F16 == useF16KVCache &&
 		cache.PerPosKDim == kDim && cache.PerPosVDim == vDim && cache.MaxLen >= cacheLen
 	if !compatible {
-		cache = NewKVCache(layers, kDim, vDim, cacheLen)
-		bytes := int64(layers) * int64(kDim+vDim) * int64(cacheLen) * 4
+		cache = newKVCacheAuto(layers, kDim, vDim, cacheLen)
+		elemBytes := int64(4)
+		if cache.F16 {
+			elemBytes = 2
+		}
+		bytes := int64(layers) * int64(kDim+vDim) * int64(cacheLen) * elemBytes
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
 		}

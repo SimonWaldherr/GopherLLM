@@ -13,9 +13,67 @@ func BenchmarkOnlineAttention_ctx512(b *testing.B) {
 	out := make([]float32, headDim)
 	scale := float32(0.08838)
 	b.ReportAllocs()
+	b.SetBytes(int64(2 * ctx * headDim * 4))
 	for b.Loop() {
 		clear(out)
 		onlineAttention(q, keys, values, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
+	}
+}
+
+func BenchmarkOnlineAttentionF16_ctx512(b *testing.B) {
+	const headDim, ctx = 128, 512
+	rng := rand.New(rand.NewSource(9))
+	q := benchFloatSlice(headDim)
+	keys := make([]uint16, ctx*headDim)
+	values := make([]uint16, ctx*headDim)
+	for i := range keys {
+		keys[i] = F32ToF16(rng.Float32() - 0.5)
+		values[i] = F32ToF16(rng.Float32() - 0.5)
+	}
+	out := make([]float32, headDim)
+	scale := float32(0.08838)
+	b.ReportAllocs()
+	b.SetBytes(int64(2 * ctx * headDim * 2))
+	for b.Loop() {
+		clear(out)
+		onlineAttentionF16(q, keys, values, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
+	}
+}
+
+// The ctx4096 pair exceeds L2, exposing the memory-bandwidth halving that is
+// the point of the f16 cache (ctx512's 512 KiB working set is cache-resident).
+func BenchmarkOnlineAttention_ctx4096(b *testing.B) {
+	const headDim, ctx = 128, 4096
+	q := benchFloatSlice(headDim)
+	keys := benchFloatSlice(ctx * headDim)
+	values := benchFloatSlice(ctx * headDim)
+	out := make([]float32, headDim)
+	scale := float32(0.08838)
+	b.ReportAllocs()
+	b.SetBytes(int64(2 * ctx * headDim * 4))
+	for b.Loop() {
+		clear(out)
+		onlineAttention(q, keys, values, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
+	}
+}
+
+func BenchmarkOnlineAttentionF16_ctx4096(b *testing.B) {
+	const headDim, ctx = 128, 4096
+	rng := rand.New(rand.NewSource(9))
+	q := benchFloatSlice(headDim)
+	keys := make([]uint16, ctx*headDim)
+	values := make([]uint16, ctx*headDim)
+	for i := range keys {
+		keys[i] = F32ToF16(rng.Float32() - 0.5)
+		values[i] = F32ToF16(rng.Float32() - 0.5)
+	}
+	out := make([]float32, headDim)
+	scale := float32(0.08838)
+	b.ReportAllocs()
+	b.SetBytes(int64(2 * ctx * headDim * 2))
+	for b.Loop() {
+		clear(out)
+		onlineAttentionF16(q, keys, values, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
 	}
 }
 

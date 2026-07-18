@@ -227,10 +227,7 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			half, nCache := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &sinS, &cosS)
 			applyPreparedRope(Q[t], headDim, config.NHeads, half, nCache, sinS, cosS, interleaved)
 			applyPreparedRope(K[t], headDim, config.NKVHeads, half, nCache, sinS, cosS, interleaved)
-			kStart := pos * cache.PerPosKDim
-			vStart := pos * cache.PerPosVDim
-			copy(cache.K[l][kStart:kStart+min(len(K[t]), cache.PerPosKDim)], K[t])
-			copy(cache.V[l][vStart:vStart+min(len(V[t]), cache.PerPosVDim)], V[t])
+			cache.storeKV(l, pos, K[t], V[t])
 		}
 
 		// Attention is independent per token, so spread the chunk across workers.
@@ -244,16 +241,10 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				clear(AttnOut[t])
 				for h := 0; h < config.NHeads; h++ {
 					kvH := h / kvMul
-					onlineAttention(
-						Q[t][h*headDim:h*headDim+headDim],
-						cache.K[l][kvH*headDim:],
-						cache.V[l][kvH*valueDim:],
-						cache.PerPosKDim, cache.PerPosVDim,
-						headDim, valueDim,
-						attnStart, pos, scale,
+					cache.attendHead(l, kvH, Q[t][h*headDim:h*headDim+headDim],
+						headDim, valueDim, attnStart, pos, scale,
 						config.AttnLogitSoftcap,
-						AttnOut[t][h*valueDim:h*valueDim+valueDim],
-					)
+						AttnOut[t][h*valueDim:h*valueDim+valueDim])
 				}
 			}
 		}

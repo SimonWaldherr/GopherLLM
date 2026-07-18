@@ -531,6 +531,15 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   tensor data is merged into one in-memory buffer before loading. This costs
   one full copy of the model's weights at load time — true zero-copy mmap
   borrowing only applies to single-file GGUFs — but needs no other opt-in.
+- On x86-64 (F16C) the KV cache stores K/V rows as f16 by default: half the
+  cache memory (double the context fits the reusable-workspace cap) and half
+  the bytes attention streams per generated token, with rows converted
+  in-register (`VCVTPH2PS`) inside the attention kernels. Greedy decode on
+  the test model is bit-identical to the f32 cache; set `GOPHERLLM_KV_F16=0`
+  to force the exact f32 cache. Attention itself is two-pass (independent
+  score dots, then max-stabilized softmax weights and the weighted V
+  accumulation), which measured ~1.15x over the previous online-softmax loop
+  at 4k-16k context and uses the true score maximum for stability.
 - After mmap'ing a single-file GGUF, every page is touched once up front
   across all worker threads (`prefaultPages`) before the model is reported
   loaded. A memory-mapped file only pages in on first touch, and a forward
@@ -556,6 +565,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
+| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of f16 (x86-64) |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
