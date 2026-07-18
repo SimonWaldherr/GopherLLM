@@ -25,8 +25,11 @@ func TestOpenMmapReadsBytesAndCloses(t *testing.T) {
 	if mapped.Len() != len(want) {
 		t.Fatalf("len = %d, want %d", mapped.Len(), len(want))
 	}
-	if runtime.GOOS == "windows" && mapped.mmap {
-		t.Fatal("Windows fallback must not report an mmap-backed file")
+	switch runtime.GOOS {
+	case "windows", "linux", "darwin":
+		if !mapped.mmap {
+			t.Fatal("expected a real OS mapping on this platform, got the read-copy fallback")
+		}
 	}
 	if err := mapped.Close(); err != nil {
 		t.Fatal(err)

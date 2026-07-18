@@ -70,6 +70,10 @@ func TokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
 	mergeRanks := map[Pair]int{}
 	if v, ok := metadata["tokenizer.ggml.merges"]; ok {
 		if merges, ok := v.AsStringArray(); ok {
+			// Pre-sized: BPE merge lists commonly run to six figures, and an
+			// unsized map rehashes (full-table copy) on every doubling as it
+			// grows, which showed up as real load-time cost under profiling.
+			mergeRanks = make(map[Pair]int, len(merges))
 			for rank, merge := range merges {
 				if left, right, ok := strings.Cut(merge, " "); ok {
 					mergeRanks[Pair{left, right}] = rank

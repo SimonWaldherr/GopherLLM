@@ -340,6 +340,328 @@ q4kq8k_done:
 	VZEROUPPER
 	RET
 
+// Q5KQ8CHUNK processes one 32-byte nibble chunk s of a Q5_K block. Identical
+// to Q4KQ8CHUNK except each nibble gains a fifth bit from the qh plane held
+// in Y13: sub-block 2s takes bit QHSR1 (= 2s) of qh[l], sub-block 2s+1 takes
+// bit QHSR2 (= 2s+1), each shifted up to bit 4 and OR'd onto the nibble
+// before the VPMADDUBSW dot (quants stay <= 31, safely unsigned-byte range).
+// Y7 is the qh scratch; Y14 holds the per-byte 0x01 mask.
+#define Q5KQ8CHUNK(QOFF, Q8OFF, SCOFF, SCOFF2, QHSR1, QHSR2) \
+	VMOVDQU QOFF(SI), Y0 \
+	VPAND Y15, Y0, Y1 \
+	VPSRLW $4, Y0, Y2 \
+	VPAND Y15, Y2, Y2 \
+	VPSRLW $QHSR1, Y13, Y7 \
+	VPAND Y14, Y7, Y7 \
+	VPSLLW $4, Y7, Y7 \
+	VPOR Y7, Y1, Y1 \
+	VPSRLW $QHSR2, Y13, Y7 \
+	VPAND Y14, Y7, Y7 \
+	VPSLLW $4, Y7, Y7 \
+	VPOR Y7, Y2, Y2 \
+	VPMADDUBSW Q8OFF(DI), Y1, Y3 \
+	VPBROADCASTW SCOFF(SP), Y5 \
+	VPMADDWD Y5, Y3, Y3 \
+	VPADDD Y3, Y12, Y12 \
+	VPMADDUBSW (Q8OFF+32)(DI), Y2, Y4 \
+	VPBROADCASTW SCOFF2(SP), Y6 \
+	VPMADDWD Y6, Y4, Y4 \
+	VPADDD Y4, Y12, Y12
+
+// func q5kDotQ8KRow(q *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
+// Full-row Q5_K x int8-activation dot product. The Q5_K superblock is the
+// Q4_K layout (f16 d/dmin at +0/+2, 12 packed scale/min bytes at +4) plus a
+// 32-byte fifth-bit plane at +16, with the 128 nibble bytes at +48 and a
+// 176-byte stride. Scale/min decoding and the dmin/xsums term are exactly
+// q4kDotQ8KRow's; only the quant rebuild differs (see Q5KQ8CHUNK).
+TEXT ·q5kDotQ8KRow(SB), NOSPLIT, $32-44
+	MOVQ q+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ xsums+24(FP), R9
+	MOVQ blocks+32(FP), CX
+	MOVL $0x0f0f0f0f, AX
+	MOVQ AX, X15
+	VPBROADCASTD X15, Y15      // Y15 = per-byte 0x0f mask
+	MOVL $0x01010101, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14      // Y14 = per-byte 0x01 mask
+	VXORPS Y11, Y11, Y11       // Y11 = accF (d*sc integer-dot term)
+	VXORPS Y10, Y10, Y10       // Y10 = accM (dmin*min*xsum term)
+	TESTQ CX, CX
+	JLE q5kq8k_done
+q5kq8k_block:
+	// d (f16 at +0) and dmin (f16 at +2)
+	MOVL (SI), AX
+	MOVQ AX, X8
+	VCVTPH2PS X8, X8           // X8 = [d, dmin, ., .]
+	// decode the 12 packed scale/min bytes (identical to q4kDotQ8KRow)
+	MOVL 4(SI), AX             // A = scale bytes 0..3
+	MOVL 8(SI), BX             // B = scale bytes 4..7
+	MOVL 12(SI), R10           // C = scale bytes 8..11
+	MOVL AX, R11
+	ANDL $0x3f3f3f3f, R11      // sc[0..3] = A & 63
+	MOVL R10, R12
+	ANDL $0x0f0f0f0f, R12
+	MOVL AX, R13
+	SHRL $2, R13
+	ANDL $0x30303030, R13
+	ORL R13, R12               // sc[4..7] = (C & 0x0f) | ((A >> 6) << 4)
+	MOVL BX, R13
+	ANDL $0x3f3f3f3f, R13      // m[0..3] = B & 63
+	SHRL $4, R10
+	ANDL $0x0f0f0f0f, R10
+	MOVL BX, AX
+	SHRL $2, AX
+	ANDL $0x30303030, AX
+	ORL AX, R10                // m[4..7] = (C >> 4) | ((B >> 6) << 4)
+	MOVL R11, 0(SP)
+	MOVL R12, 4(SP)
+	MOVL R13, 8(SP)
+	MOVL R10, 12(SP)
+	VPMOVZXBW 0(SP), X1        // 8 scales -> int16
+	VMOVDQU X1, 16(SP)
+	// min term: accM += dmin * mins_f32 * xsums
+	VPMOVZXBD 8(SP), Y2
+	VCVTDQ2PS Y2, Y2
+	VMULPS (R9), Y2, Y2
+	VPSHUFD $0x55, X8, X4      // X4[0] = dmin
+	VBROADCASTSS X4, Y4
+	VFMADD231PS Y4, Y2, Y10
+	// fifth-bit plane, shared by all four chunks of this block
+	VMOVDQU 16(SI), Y13
+	// integer dots: accI (Y12) collects sc-weighted sub-block dots
+	VPXOR Y12, Y12, Y12
+	Q5KQ8CHUNK(48, 0, 16, 18, 0, 1)
+	Q5KQ8CHUNK(80, 64, 20, 22, 2, 3)
+	Q5KQ8CHUNK(112, 128, 24, 26, 4, 5)
+	Q5KQ8CHUNK(144, 192, 28, 30, 6, 7)
+	// accF += float(accI) * (d * activation scale)
+	VCVTDQ2PS Y12, Y12
+	VMULSS (R8), X8, X6
+	VBROADCASTSS X6, Y6
+	VFMADD231PS Y6, Y12, Y11
+	ADDQ $176, SI
+	ADDQ $256, DI
+	ADDQ $4, R8
+	ADDQ $32, R9
+	DECQ CX
+	JNZ q5kq8k_block
+q5kq8k_done:
+	VSUBPS Y10, Y11, Y11
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VMOVSS X11, ret+40(FP)
+	VZEROUPPER
+	RET
+
+// Q40Q41EXPAND loads one legacy 32-element block's 16 packed nibble bytes
+// and expands them to 32 unsigned int8 quants in Y2, in memory order:
+// low nibbles are elements 0..15 (lower lane), high nibbles elements 16..31
+// (upper lane). X15 must hold the per-byte 0x0f mask.
+#define Q40Q41EXPAND(NIBOFF) \
+	VMOVDQU NIBOFF(SI), X1 \
+	VPAND X15, X1, X2 \
+	VPSRLW $4, X1, X3 \
+	VPAND X15, X3, X3 \
+	VINSERTI128 $1, X3, Y2, Y2
+
+// func q4_0DotQ8KRow(row *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
+// Full-row Q4_0 x int8-activation dot product. Q4_0 packs 32 elements into
+// 18 bytes (f16 d + 16 nibble bytes), value = d*(q-8). blocks counts
+// 256-element superchunks (8 legacy blocks each) sharing one Q8K activation
+// scale. The integer dot uses the raw unsigned quants 0..15; the -8 offset
+// is applied exactly afterwards as -8*d*xsum with the per-32-element float
+// activation sums (xsums), mirroring the Q4_K dmin term.
+TEXT ·q4_0DotQ8KRow(SB), NOSPLIT, $0-44
+	MOVQ row+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ xsums+24(FP), R9
+	MOVQ blocks+32(FP), CX
+	MOVL $0x0f0f0f0f, AX
+	MOVQ AX, X15
+	VPBROADCASTD X15, Y15      // Y15/X15 = per-byte 0x0f mask
+	MOVL $0x00010001, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14      // Y14 = int16 ones for VPMADDWD
+	MOVL $0xc1000000, AX       // -8.0f
+	MOVQ AX, X13
+	VXORPS Y11, Y11, Y11       // Y11 = vector accumulator (d*xscale*intdot)
+	VXORPS X10, X10, X10       // X10 = scalar accumulator (-8*d*xsum terms)
+	TESTQ CX, CX
+	JLE q40q8k_done
+q40q8k_super:
+	VBROADCASTSS (R8), Y9      // activation scale for this 256-superchunk
+	MOVQ $8, DX
+q40q8k_block:
+	MOVWLZX (SI), AX           // f16 d
+	VMOVD AX, X0
+	VCVTPH2PS X0, X0           // X0[0] = d
+	Q40Q41EXPAND(2)
+	VPMADDUBSW (DI), Y2, Y4
+	VPMADDWD Y14, Y4, Y4       // 8 int32 partial dots of this block
+	VCVTDQ2PS Y4, Y4
+	VMULSS X9, X0, X5          // d * xscale
+	VBROADCASTSS X5, Y5
+	VFMADD231PS Y5, Y4, Y11
+	VMULSS (R9), X0, X6        // d * xsum
+	VFMADD231SS X13, X6, X10   // accS += -8 * d * xsum
+	ADDQ $18, SI
+	ADDQ $32, DI
+	ADDQ $4, R9
+	DECQ DX
+	JNZ q40q8k_block
+	ADDQ $4, R8
+	DECQ CX
+	JNZ q40q8k_super
+q40q8k_done:
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VADDSS X10, X11, X11
+	VMOVSS X11, ret+40(FP)
+	VZEROUPPER
+	RET
+
+// func q4_1DotQ8KRow(row *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
+// Q4_1 analogue: 20-byte blocks (f16 d + f16 m + 16 nibble bytes), value =
+// d*q + m. Same integer dot as Q4_0; the additive offset lands as +m*xsum.
+TEXT ·q4_1DotQ8KRow(SB), NOSPLIT, $0-44
+	MOVQ row+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ xsums+24(FP), R9
+	MOVQ blocks+32(FP), CX
+	MOVL $0x0f0f0f0f, AX
+	MOVQ AX, X15
+	VPBROADCASTD X15, Y15
+	MOVL $0x00010001, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14
+	VXORPS Y11, Y11, Y11       // Y11 = vector accumulator (d*xscale*intdot)
+	VXORPS X10, X10, X10       // X10 = scalar accumulator (+m*xsum terms)
+	TESTQ CX, CX
+	JLE q41q8k_done
+q41q8k_super:
+	VBROADCASTSS (R8), Y9
+	MOVQ $8, DX
+q41q8k_block:
+	MOVL (SI), AX              // f16 d | f16 m
+	VMOVD AX, X0
+	VCVTPH2PS X0, X0           // X0 = [d, m, ., .]
+	Q40Q41EXPAND(4)
+	VPMADDUBSW (DI), Y2, Y4
+	VPMADDWD Y14, Y4, Y4
+	VCVTDQ2PS Y4, Y4
+	VMULSS X9, X0, X5          // d * xscale
+	VBROADCASTSS X5, Y5
+	VFMADD231PS Y5, Y4, Y11
+	VPSHUFD $0x55, X0, X6      // X6[0] = m
+	VMULSS (R9), X6, X6        // m * xsum
+	VADDSS X6, X10, X10
+	ADDQ $20, SI
+	ADDQ $32, DI
+	ADDQ $4, R9
+	DECQ DX
+	JNZ q41q8k_block
+	ADDQ $4, R8
+	DECQ CX
+	JNZ q41q8k_super
+q41q8k_done:
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VADDSS X10, X11, X11
+	VMOVSS X11, ret+40(FP)
+	VZEROUPPER
+	RET
+
+// mxfp4MagLUT maps an FP4 e2m1 code (0..15) to 2x its magnitude — doubling
+// {0, 0.5, 1, 1.5, 2, 3, 4, 6} makes every value an exact small integer
+// {0,1,2,3,4,6,8,12}, so the dot product can run through the same int8
+// VPMADDUBSW pipeline as the integer quant formats. The sign (code bit 3)
+// is applied to the activation operand via VPSIGNB using mxfp4SignLUT.
+DATA mxfp4MagLUT<>+0(SB)/8, $0x0c08060403020100
+DATA mxfp4MagLUT<>+8(SB)/8, $0x0c08060403020100
+GLOBL mxfp4MagLUT<>(SB), RODATA|NOPTR, $16
+
+DATA mxfp4SignLUT<>+0(SB)/8, $0x0101010101010101
+DATA mxfp4SignLUT<>+8(SB)/8, $0xffffffffffffffff
+GLOBL mxfp4SignLUT<>(SB), RODATA|NOPTR, $16
+
+// func mxfp4DotQ8KRow(row *byte, q8 *int8, xscales *float32, blocks int) float32
+// Full-row MXFP4 x int8-activation dot product. MXFP4 packs 32 elements into
+// 17 bytes: 16 nibble bytes (element 2i = low nibble of byte i, element 2i+1
+// = high nibble — interleaved, unlike Q4_0's half-split) followed by one
+// E8M0 scale byte e meaning 2^(e-127), materialized directly as float bits
+// e<<23 (e=0 collapses a ~1e-38 denormal scale to zero — irrelevant for
+// weights). The format is symmetric, so unlike Q4_0/Q4_1 no xsums offset
+// term exists. blocks counts 256-element superchunks (8 blocks each) sharing
+// one Q8K activation scale; the doubled LUT magnitudes are compensated by
+// folding 0.5 into the per-superchunk scale.
+TEXT ·mxfp4DotQ8KRow(SB), NOSPLIT, $0-36
+	MOVQ row+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ blocks+24(FP), CX
+	MOVL $0x0f0f0f0f, AX
+	MOVQ AX, X15
+	VPBROADCASTD X15, Y15          // Y15/X15 = per-byte 0x0f mask
+	MOVL $0x00010001, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14          // Y14 = int16 ones for VPMADDWD
+	VBROADCASTI128 mxfp4MagLUT<>(SB), Y13
+	VBROADCASTI128 mxfp4SignLUT<>(SB), Y12
+	MOVL $0x3f000000, AX           // 0.5f
+	MOVQ AX, X7
+	VXORPS Y11, Y11, Y11           // Y11 = float accumulator
+	TESTQ CX, CX
+	JLE mxfp4q8k_done
+mxfp4q8k_super:
+	VMULSS (R8), X7, X10           // X10 = 0.5 * activation scale
+	MOVQ $8, DX
+mxfp4q8k_block:
+	VMOVDQU (SI), X1               // 16 packed nibble bytes
+	VPAND X15, X1, X2              // low-nibble codes (elements 0,2,4,...)
+	VPSRLW $4, X1, X3
+	VPAND X15, X3, X3              // high-nibble codes (elements 1,3,5,...)
+	VPUNPCKLBW X3, X2, X4          // codes of elements 0..15, in order
+	VPUNPCKHBW X3, X2, X5          // codes of elements 16..31
+	VINSERTI128 $1, X5, Y4, Y4     // Y4 = 32 codes in element order
+	VPSHUFB Y4, Y13, Y6            // unsigned doubled magnitudes 0..12
+	VPSHUFB Y4, Y12, Y8            // sign bytes +1/-1 (code bit 3)
+	VMOVDQU (DI), Y9
+	VPSIGNB Y8, Y9, Y9             // activations with weight signs applied
+	VPMADDUBSW Y9, Y6, Y9
+	VPMADDWD Y14, Y9, Y9           // 8 int32 partial dots of this block
+	VCVTDQ2PS Y9, Y9
+	MOVBLZX 16(SI), AX             // E8M0 scale byte
+	SHLL $23, AX                   // float bits of 2^(e-127)
+	VMOVD AX, X0
+	VMULSS X10, X0, X0             // block scale * 0.5 * xscale
+	VBROADCASTSS X0, Y0
+	VFMADD231PS Y0, Y9, Y11
+	ADDQ $17, SI
+	ADDQ $32, DI
+	DECQ DX
+	JNZ mxfp4q8k_block
+	ADDQ $4, R8
+	DECQ CX
+	JNZ mxfp4q8k_super
+mxfp4q8k_done:
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VMOVSS X11, ret+32(FP)
+	VZEROUPPER
+	RET
+
 // Q6KQ8QUAD processes one 32-value quadrant of a Q6_K half: rebuilds the
 // unsigned 6-bit quants from the low-nibble/high-bit planes already loaded
 // in Y0 (ql lo), Y1 (ql hi) and Y2 (qh), dots them against 32 int8
@@ -535,5 +857,74 @@ q6k_half:
 	INCQ CX
 	JMP  q6k_half
 q6k_ret:
+	VZEROUPPER
+	RET
+
+// Q80CHUNK processes one 34-byte Q8_0 sub-block (BLOCKOFF(SI): 2-byte f16
+// scale + 32 signed int8 weights) against the matching 32-byte slice of
+// Q8K-quantized activations at Q8OFF(DI). VPMADDUBSW needs one unsigned
+// operand, and both Q8_0 weights and Q8K activations are signed, so this
+// uses the standard abs/sign-restore identity a*b = |a| * (sign(a)*b):
+// Y2 = |weight| (now safely unsigned), Y3 = sign(weight) applied to the
+// activation bytes, VPMADDUBSW(Y3, Y2) reproduces the exact signed product
+// pairwise-summed as int16, VPMADDWD against the constant 1 (Y14) widens
+// and folds pairs to int32 with no scale applied, and the result is
+// multiplied by this sub-block's own d and folded into the per-superblock
+// accumulator Y12 (the shared per-256-element activation scale is applied
+// once by the caller after all 8 sub-blocks are summed).
+#define Q80CHUNK(BLOCKOFF, Q8OFF) \
+	MOVWLZX (BLOCKOFF)(SI), AX \
+	MOVQ AX, X8 \
+	VCVTPH2PS X8, X8 \
+	VBROADCASTSS X8, Y8 \
+	VMOVDQU (BLOCKOFF+2)(SI), Y0 \
+	VMOVDQU (Q8OFF)(DI), Y1 \
+	VPABSB  Y0, Y2 \
+	VPSIGNB Y0, Y1, Y3 \
+	VPMADDUBSW Y3, Y2, Y4 \
+	VPMADDWD Y14, Y4, Y4 \
+	VCVTDQ2PS Y4, Y4 \
+	VFMADD231PS Y8, Y4, Y12
+
+// func q8_0DotQ8KRow(row *byte, q8 *int8, xscales *float32, blocks int) float32
+// Full-row Q8_0 x int8-activation dot product: one call per weight row. row
+// points at the row's 272-byte groups (8 Q8_0 blocks = 256 elements each,
+// matching one Q8K activation super-block), q8/xscales as in
+// q4kDotQ8KRow/q6kDotQ8KRow. Unlike the K-quants, Q8_0 has no dmin/offset
+// term (symmetric quantization), so there is no xsums argument.
+TEXT ·q8_0DotQ8KRow(SB), NOSPLIT, $0-36
+	MOVQ row+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ blocks+24(FP), CX
+	MOVL $0x00010001, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14      // Y14 = per-16-bit-lane constant 1 (VPMADDWD widen)
+	VXORPS Y11, Y11, Y11       // Y11 = row accumulator
+	TESTQ CX, CX
+	JLE q80q8k_done
+q80q8k_block:
+	VXORPS Y12, Y12, Y12       // Y12 = per-superblock lane accumulator (pre activation-scale)
+	Q80CHUNK(0, 0)
+	Q80CHUNK(34, 32)
+	Q80CHUNK(68, 64)
+	Q80CHUNK(102, 96)
+	Q80CHUNK(136, 128)
+	Q80CHUNK(170, 160)
+	Q80CHUNK(204, 192)
+	Q80CHUNK(238, 224)
+	VBROADCASTSS (R8), Y6
+	VFMADD231PS Y6, Y12, Y11
+	ADDQ $272, SI
+	ADDQ $256, DI
+	ADDQ $4, R8
+	DECQ CX
+	JNZ q80q8k_block
+q80q8k_done:
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VMOVSS X11, ret+32(FP)
 	VZEROUPPER
 	RET

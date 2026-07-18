@@ -302,7 +302,12 @@ func TestMatvecBatchQ8CloseToFloat(t *testing.T) {
 		gen      func(*rand.Rand, int) []byte
 	}{
 		{"q4k", GGMLTypeQ4_K, (cols / 256) * 144, randomQ4KRow},
+		{"q5k", GGMLTypeQ5_K, (cols / 256) * 176, randomQ5KRow},
 		{"q6k", GGMLTypeQ6_K, (cols / 256) * 210, randomQ6KRow},
+		{"q8_0", GGMLTypeQ8_0, (cols / 32) * 34, randomQ8_0Row},
+		{"q4_0", GGMLTypeQ4_0, (cols / 32) * 18, randomQ4_0Row},
+		{"q4_1", GGMLTypeQ4_1, (cols / 32) * 20, randomQ4_1Row},
+		{"mxfp4", GGMLTypeMXFP4, (cols / 32) * 17, randomMXFP4Row},
 	} {
 		data := make([]byte, 0, rows*tc.rowBytes)
 		for range rows {

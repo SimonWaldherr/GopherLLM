@@ -24,7 +24,13 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 ## Features
 
 - Pure Go runtime with optional ARM64 (NEON) and x86-64 (AVX2 + FMA) assembly kernels.
-- Memory-mapped GGUF loading for fast startup and lower copy pressure.
+- Memory-mapped GGUF loading for fast startup and lower copy pressure, on
+  every platform (Unix `mmap`, Windows `CreateFileMapping`/`MapViewOfFile`):
+  weights page in on demand and quantized tensors borrow the mapping
+  zero-copy.
+- Split/sharded GGUF loading: point at any one shard of a
+  `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
+  and merged automatically (see [Performance Notes](#performance-notes)).
 - Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1,
   Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/BF16 loaded directly
   (BF16 covers QAT-derived and modern full-precision GGUFs).
@@ -51,8 +57,9 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 ```
 
 That default is resolved in this order: the `--model-dir <path>` flag (highest
-priority), then the `RUSTY_LLM_MODEL_DIR` environment variable, then the
-built-in default above. `MODEL_DIR` is a separate thing: it's a *Makefile*
+priority), then the `GOPHERLLM_MODEL_DIR` environment variable (with
+`RUSTY_LLM_MODEL_DIR`, the project's pre-rename spelling, still honored as a
+deprecated fallback), then the built-in default above. `MODEL_DIR` is a separate thing: it's a *Makefile*
 variable (see [Make Targets](#make-targets)) that `make` targets use to fill in
 `--model-dir` for you — it isn't read by the `gopherllm` binary itself, so
 `MODEL_DIR=... bin/gopherllm ...` (without `make`) has no effect.
@@ -484,18 +491,22 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   kernels remain as the fallback for small projections and Metal failures. The
   path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
-- On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K and Q6_K matvecs
-  default to int8-activation full-row kernels: the activation vector is quantized
-  once per matvec to int8 with one scale per 256-element block (llama.cpp's Q8_K
-  convention, `q8kQuantize`), and each weight row is processed by a single
-  assembly call (`q4kDotQ8KRow` / `q6kDotQ8KRow`) that decodes block scales
-  in-register, dots 32 weights per `VPMADDUBSW`, applies scales via `VPMADDWD`,
-  and reduces horizontally once per row. Versus the previous per-block float
-  kernels this is ~2.5x (Q4_K) to ~6x (Q6_K) per-row and roughly 4x end-to-end
-  decode on a Ministral 3B Q4_K_M. Set `GOPHERLLM_Q8_ACTIVATIONS=0` to force the
-  exact float kernels (bit-reproducible against the scalar reference; the int8
-  path stays within cosine 0.999 of it — the same accuracy tradeoff llama.cpp
-  makes by default). `GOPHERLLM_DISABLE_SIMD=1` still forces portable scalar
+- On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K, Q5_K, Q6_K,
+  Q8_0, Q4_0, Q4_1, and MXFP4 matvecs default to int8-activation full-row kernels: the activation
+  vector is quantized once per matvec to int8 with one scale per 256-element
+  block (llama.cpp's Q8_K convention, `q8kQuantize`), and each weight row is
+  processed by a single assembly call (`q4kDotQ8KRow` / `q5kDotQ8KRow` /
+  `q6kDotQ8KRow` / `q8_0DotQ8KRow`) that decodes block scales in-register,
+  dots 32 weights per `VPMADDUBSW` (Q8_0's own signed weights use the
+  abs/sign-restore identity so the same unsigned-operand instruction applies),
+  applies scales via `VPMADDWD`, and reduces horizontally once per row. Versus
+  the previous per-block float kernels this is ~2.5x (Q4_K) to ~6x (Q6_K and
+  Q8_0) per-row — and >20x for Q5_K, which previously had no SIMD fast path at
+  all — and roughly 4x end-to-end decode on a Ministral 3B Q4_K_M. Set
+  `GOPHERLLM_Q8_ACTIVATIONS=0` to force the exact float kernels
+  (bit-reproducible against the scalar reference; the int8 path stays within
+  cosine 0.999 of it — the same accuracy tradeoff llama.cpp makes by default).
+  `GOPHERLLM_DISABLE_SIMD=1` still forces portable scalar
   kernels everywhere.
 - Prompt processing (prefill) is batched. With the int8 path active, each raw
   quantized weight row is streamed from memory exactly once per prompt chunk and
@@ -514,6 +525,32 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   is over-chunked so performance cores absorb efficiency-core stragglers.
 - Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
   it.
+- Split GGUFs (llama.cpp's `gguf-split` naming convention,
+  `<name>-00001-of-00005.gguf`) are detected from any one shard's
+  `split.count` metadata; every sibling is located next to it, and their
+  tensor data is merged into one in-memory buffer before loading. This costs
+  one full copy of the model's weights at load time — true zero-copy mmap
+  borrowing only applies to single-file GGUFs — but needs no other opt-in.
+- On x86-64 (F16C) the KV cache stores K/V rows as f16 by default: half the
+  cache memory (double the context fits the reusable-workspace cap) and half
+  the bytes attention streams per generated token, with rows converted
+  in-register (`VCVTPH2PS`) inside the attention kernels. Greedy decode on
+  the test model is bit-identical to the f32 cache; set `GOPHERLLM_KV_F16=0`
+  to force the exact f32 cache. Attention itself is two-pass (independent
+  score dots, then max-stabilized softmax weights and the weighted V
+  accumulation), which measured ~1.15x over the previous online-softmax loop
+  at 4k-16k context and uses the true score maximum for stability.
+- After mmap'ing a single-file GGUF, every page is touched once up front
+  across all worker threads (`prefaultPages`) before the model is reported
+  loaded. A memory-mapped file only pages in on first touch, and a forward
+  pass touches essentially every weight byte — without this, the *first*
+  request after startup silently inherited that page-in cost (disk I/O, or on
+  Windows, real-time antivirus scanning of each mapped page) inside its own
+  TTFT instead of load time. For a one-shot CLI run this doesn't change total
+  wall-clock; for the HTTP server and REPL cases it means every request,
+  including the first, sees consistent latency instead of one random request
+  eating a multi-second page-in tax. Set `GOPHERLLM_NO_PREFAULT=1` to restore
+  pure lazy paging.
 
 ### Environment variables
 
@@ -522,11 +559,13 @@ details in the bullets they annotate):
 
 | Variable | Effect |
 |---|---|
-| `RUSTY_LLM_MODEL_DIR` | Default model directory when `--model-dir` is not given |
+| `GOPHERLLM_MODEL_DIR` | Default model directory when `--model-dir` is not given (`RUSTY_LLM_MODEL_DIR` remains a deprecated fallback) |
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
-| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q6_K matvecs (x86-64) |
+| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
+| `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
+| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of f16 (x86-64) |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
@@ -575,7 +614,7 @@ selection.
 
 | Area | Files |
 |---|---|
-| GGUF parsing + file mapping | `gguf.go`, `mmap.go` / `mmap_fallback.go` |
+| GGUF parsing + file mapping | `gguf.go`, `mmap.go` (Unix) / `mmap_windows.go` (Win32 file mapping) |
 | Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
 | Compute kernels + worker pool | `simd.go`; assembly in `*_amd64.s` / `*_arm64.s` behind `dot_f32_*.go`, `vector_ops_*.go`, `quant_*.go`, `q4k_q8_*.go` dispatch shims |
 | Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE) |
@@ -586,7 +625,11 @@ selection.
 | HTTP server | `server.go`, `web_ui/` |
 | CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
 
-The same map, with more detail, is in the package comment in `lib.go`. Every
+A full architecture walkthrough — load path, inference data flow, kernel
+dispatch tiers, and how to add a quant kernel / architecture / endpoint — is
+in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+The same map, with more detail, is in the package comment in `doc.go`. Every
 SIMD kernel has a portable Go scalar reference implementation, and
 differential tests assert they agree — when touching a kernel, run the `Q4K`/
 `Q6K`/`DotF32`/`VectorOps` test groups first. Model-behavior research notes

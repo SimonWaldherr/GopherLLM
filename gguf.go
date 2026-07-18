@@ -239,6 +239,9 @@ func (v MetaValue) AsBool() (bool, bool) {
 }
 
 func (v MetaValue) AsStringArray() ([]string, bool) {
+	if s, ok := v.Value.([]string); ok {
+		return s, true
+	}
 	arr, ok := v.Value.([]MetaValue)
 	if !ok {
 		return nil, false
@@ -255,6 +258,9 @@ func (v MetaValue) AsStringArray() ([]string, bool) {
 // AsBoolArray decodes an array of bools (e.g. Gemma 4's per-layer
 // attention.sliding_window_pattern).
 func (v MetaValue) AsBoolArray() ([]bool, bool) {
+	if b, ok := v.Value.([]bool); ok {
+		return b, true
+	}
 	arr, ok := v.Value.([]MetaValue)
 	if !ok {
 		return nil, false
@@ -271,6 +277,9 @@ func (v MetaValue) AsBoolArray() ([]bool, bool) {
 }
 
 func (v MetaValue) AsF32Array() ([]float32, bool) {
+	if f, ok := v.Value.([]float32); ok {
+		return f, true
+	}
 	arr, ok := v.Value.([]MetaValue)
 	if !ok {
 		return nil, false
@@ -522,6 +531,43 @@ func (c *cursor) value(t uint32) (MetaValue, error) {
 		count, err := c.u64()
 		if err != nil {
 			return MetaValue{}, err
+		}
+		// Typed fast paths for the huge tokenizer arrays (100k+ vocab
+		// strings, scores, per-layer bool maps): storing a typed slice
+		// avoids boxing every element into a MetaValue interface, which
+		// dominated model-load time. The As*Array accessors understand
+		// both representations.
+		switch elem {
+		case 8: // str
+			out := make([]string, 0, int(count))
+			for range int(count) {
+				s, err := c.str()
+				if err != nil {
+					return MetaValue{}, err
+				}
+				out = append(out, s)
+			}
+			return MetaValue{"array", out}, nil
+		case 6: // f32
+			out := make([]float32, 0, int(count))
+			for range int(count) {
+				v, err := c.u32()
+				if err != nil {
+					return MetaValue{}, err
+				}
+				out = append(out, math.Float32frombits(v))
+			}
+			return MetaValue{"array", out}, nil
+		case 7: // bool
+			out := make([]bool, 0, int(count))
+			for range int(count) {
+				v, err := c.u8()
+				if err != nil {
+					return MetaValue{}, err
+				}
+				out = append(out, v != 0)
+			}
+			return MetaValue{"array", out}, nil
 		}
 		arr := make([]MetaValue, 0, int(count))
 		for range int(count) {

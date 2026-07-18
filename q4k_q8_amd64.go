@@ -98,10 +98,37 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 		rowBytes = blocks * 144
 		sumsPerTok = blocks * 8
 		kernel = q4kDotQ8KRow
+	case GGMLTypeQ5_K:
+		rowBytes = blocks * 176
+		sumsPerTok = blocks * 8
+		kernel = q5kDotQ8KRow
 	case GGMLTypeQ6_K:
 		rowBytes = blocks * 210
 		sumsPerTok = blocks * 16
 		kernel = q6kDotQ8KRow
+	case GGMLTypeQ8_0:
+		rowBytes = blocks * 272
+		// Q8_0 is symmetric (no dmin/offset term), so it needs no xsums;
+		// keep one slot per token so the shared indexing stays valid.
+		sumsPerTok = 1
+		kernel = func(row *byte, q8 *int8, xsc *float32, _ *float32, blocks int) float32 {
+			return q8_0DotQ8KRow(row, q8, xsc, blocks)
+		}
+	case GGMLTypeQ4_0:
+		rowBytes = blocks * 144 // 8 x 18-byte legacy blocks per superchunk
+		sumsPerTok = blocks * 8
+		kernel = q4_0DotQ8KRow
+	case GGMLTypeQ4_1:
+		rowBytes = blocks * 160 // 8 x 20-byte legacy blocks per superchunk
+		sumsPerTok = blocks * 8
+		kernel = q4_1DotQ8KRow
+	case GGMLTypeMXFP4:
+		rowBytes = blocks * 136 // 8 x 17-byte blocks per superchunk
+		// Symmetric like Q8_0: no offset term, one dummy xsums slot per token.
+		sumsPerTok = 1
+		kernel = func(row *byte, q8 *int8, xsc *float32, _ *float32, blocks int) float32 {
+			return mxfp4DotQ8KRow(row, q8, xsc, blocks)
+		}
 	default:
 		return false
 	}
@@ -124,9 +151,10 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 	for t := range p {
 		q8kQuantize(&xs[t][0], &q8All[t*cols], &xscAll[t*blocks], blocks)
 		sub := xsumsAll[t*sumsPerTok : (t+1)*sumsPerTok : (t+1)*sumsPerTok]
-		if w.Type == GGMLTypeQ4_K {
+		switch w.Type {
+		case GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ4_0, GGMLTypeQ4_1:
 			fillQ4KXSums(xs[t], cols, &sub)
-		} else {
+		case GGMLTypeQ6_K:
 			fillQ6KXSums16(xs[t], cols, &sub)
 			ScaleF32(sub, 32)
 		}
