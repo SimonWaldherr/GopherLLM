@@ -57,8 +57,9 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 ```
 
 That default is resolved in this order: the `--model-dir <path>` flag (highest
-priority), then the `RUSTY_LLM_MODEL_DIR` environment variable, then the
-built-in default above. `MODEL_DIR` is a separate thing: it's a *Makefile*
+priority), then the `GOPHERLLM_MODEL_DIR` environment variable (with
+`RUSTY_LLM_MODEL_DIR`, the project's pre-rename spelling, still honored as a
+deprecated fallback), then the built-in default above. `MODEL_DIR` is a separate thing: it's a *Makefile*
 variable (see [Make Targets](#make-targets)) that `make` targets use to fill in
 `--model-dir` for you — it isn't read by the `gopherllm` binary itself, so
 `MODEL_DIR=... bin/gopherllm ...` (without `make`) has no effect.
@@ -491,7 +492,7 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
 - On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K, Q5_K, Q6_K,
-  and Q8_0 matvecs default to int8-activation full-row kernels: the activation
+  Q8_0, Q4_0, Q4_1, and MXFP4 matvecs default to int8-activation full-row kernels: the activation
   vector is quantized once per matvec to int8 with one scale per 256-element
   block (llama.cpp's Q8_K convention, `q8kQuantize`), and each weight row is
   processed by a single assembly call (`q4kDotQ8KRow` / `q5kDotQ8KRow` /
@@ -549,11 +550,11 @@ details in the bullets they annotate):
 
 | Variable | Effect |
 |---|---|
-| `RUSTY_LLM_MODEL_DIR` | Default model directory when `--model-dir` is not given |
+| `GOPHERLLM_MODEL_DIR` | Default model directory when `--model-dir` is not given (`RUSTY_LLM_MODEL_DIR` remains a deprecated fallback) |
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
-| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0 matvecs (x86-64) |
+| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
@@ -614,7 +615,11 @@ selection.
 | HTTP server | `server.go`, `web_ui/` |
 | CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
 
-The same map, with more detail, is in the package comment in `lib.go`. Every
+A full architecture walkthrough — load path, inference data flow, kernel
+dispatch tiers, and how to add a quant kernel / architecture / endpoint — is
+in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+The same map, with more detail, is in the package comment in `doc.go`. Every
 SIMD kernel has a portable Go scalar reference implementation, and
 differential tests assert they agree — when touching a kernel, run the `Q4K`/
 `Q6K`/`DotF32`/`VectorOps` test groups first. Model-behavior research notes

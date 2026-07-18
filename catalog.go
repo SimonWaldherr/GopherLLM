@@ -40,9 +40,15 @@ func (m ModelEntry) Status() string {
 }
 
 // DefaultModelDir returns the directory scanned when --model-dir is not
-// given: $RUSTY_LLM_MODEL_DIR if set, else the LM Studio community models
-// directory under $HOME. (MODEL_DIR is a Makefile variable, not read here.)
+// given: $GOPHERLLM_MODEL_DIR if set, else the deprecated $RUSTY_LLM_MODEL_DIR
+// (the project's pre-rename spelling, kept so existing environments keep
+// working), else the LM Studio community models directory under $HOME.
+// (MODEL_DIR is a Makefile variable, not read here.)
 func DefaultModelDir() string {
+	if path := strings.TrimSpace(os.Getenv("GOPHERLLM_MODEL_DIR")); path != "" {
+		return path
+	}
+	// Deprecated fallback: prefer GOPHERLLM_MODEL_DIR.
 	if path := strings.TrimSpace(os.Getenv("RUSTY_LLM_MODEL_DIR")); path != "" {
 		return path
 	}

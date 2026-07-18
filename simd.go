@@ -214,6 +214,20 @@ func MatvecQ4_0(data []byte, x []float32, rows, cols int) []float32 {
 func MatvecQ4_0Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 32) * 18
 	ensureLenNoClear(out, rows)
+	// The per-32-element activation sums carry Q4_0's -8 offset term exactly,
+	// like Q4_K's dmin term (see q4_0DotQ8KRow).
+	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ4KXSums(x, cols, scratch)
+		q8, xsc, release := acquireQ8(x, cols)
+		parallelRows(rows, func(start, end int) {
+			dotQ4_0RowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
+		})
+		release()
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return
+	}
 	parallelRows(rows, func(start, end int) {
 		for r := start; r < end; r++ {
 			off := r * rowBytes
@@ -594,6 +608,16 @@ func dotQ6KF32SIMDWithXSums(row []byte, x, xsums []float32, cols int) float32 {
 func MatvecMXFP4Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 32) * 17
 	ensureLenNoClear(out, rows)
+	// MXFP4 is symmetric (no offset term), so the int8 path needs only the
+	// per-256-block activation scales, no xsums (see mxfp4DotQ8KRow).
+	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		q8, xsc, release := acquireQ8(x, cols)
+		parallelRows(rows, func(start, end int) {
+			dotMXFP4RowsQ8(data, q8, xsc, cols, rowBytes, start, end, *out)
+		})
+		release()
+		return
+	}
 	parallelRows(rows, func(start, end int) {
 		for r := start; r < end; r++ {
 			off := r * rowBytes

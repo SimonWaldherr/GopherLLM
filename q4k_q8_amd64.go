@@ -114,6 +114,21 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 		kernel = func(row *byte, q8 *int8, xsc *float32, _ *float32, blocks int) float32 {
 			return q8_0DotQ8KRow(row, q8, xsc, blocks)
 		}
+	case GGMLTypeQ4_0:
+		rowBytes = blocks * 144 // 8 x 18-byte legacy blocks per superchunk
+		sumsPerTok = blocks * 8
+		kernel = q4_0DotQ8KRow
+	case GGMLTypeQ4_1:
+		rowBytes = blocks * 160 // 8 x 20-byte legacy blocks per superchunk
+		sumsPerTok = blocks * 8
+		kernel = q4_1DotQ8KRow
+	case GGMLTypeMXFP4:
+		rowBytes = blocks * 136 // 8 x 17-byte blocks per superchunk
+		// Symmetric like Q8_0: no offset term, one dummy xsums slot per token.
+		sumsPerTok = 1
+		kernel = func(row *byte, q8 *int8, xsc *float32, _ *float32, blocks int) float32 {
+			return mxfp4DotQ8KRow(row, q8, xsc, blocks)
+		}
 	default:
 		return false
 	}
@@ -137,7 +152,7 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 		q8kQuantize(&xs[t][0], &q8All[t*cols], &xscAll[t*blocks], blocks)
 		sub := xsumsAll[t*sumsPerTok : (t+1)*sumsPerTok : (t+1)*sumsPerTok]
 		switch w.Type {
-		case GGMLTypeQ4_K, GGMLTypeQ5_K:
+		case GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ4_0, GGMLTypeQ4_1:
 			fillQ4KXSums(xs[t], cols, &sub)
 		case GGMLTypeQ6_K:
 			fillQ6KXSums16(xs[t], cols, &sub)

@@ -29,6 +29,18 @@ func dotQ5KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 	panic("dotQ5KRowsQ8 is amd64-only")
 }
 
+func dotQ4_0RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
+	panic("dotQ4_0RowsQ8 is amd64-only")
+}
+
+func dotQ4_1RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
+	panic("dotQ4_1RowsQ8 is amd64-only")
+}
+
+func dotMXFP4RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
+	panic("dotMXFP4RowsQ8 is amd64-only")
+}
+
 func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 	return false
 }

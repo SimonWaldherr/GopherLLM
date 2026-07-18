@@ -106,10 +106,23 @@ func TestPromptModelSelectionCanAbort(t *testing.T) {
 }
 
 func TestDefaultModelDirPrefersEnvironment(t *testing.T) {
-	t.Setenv("RUSTY_LLM_MODEL_DIR", "  /models/custom  ")
+	t.Setenv("GOPHERLLM_MODEL_DIR", "  /models/custom  ")
+	t.Setenv("RUSTY_LLM_MODEL_DIR", "")
 	if got := DefaultModelDir(); got != "/models/custom" {
 		t.Fatalf("DefaultModelDir() = %q", got)
 	}
+	// The deprecated pre-rename spelling still works as a fallback...
+	t.Setenv("GOPHERLLM_MODEL_DIR", "")
+	t.Setenv("RUSTY_LLM_MODEL_DIR", "/models/legacy")
+	if got := DefaultModelDir(); got != "/models/legacy" {
+		t.Fatalf("DefaultModelDir() deprecated fallback = %q", got)
+	}
+	// ...but the preferred GOPHERLLM_MODEL_DIR wins when both are set.
+	t.Setenv("GOPHERLLM_MODEL_DIR", "/models/new")
+	if got := DefaultModelDir(); got != "/models/new" {
+		t.Fatalf("DefaultModelDir() with both set = %q", got)
+	}
+	t.Setenv("GOPHERLLM_MODEL_DIR", "")
 	t.Setenv("RUSTY_LLM_MODEL_DIR", "")
 	t.Setenv("HOME", "/home/tester")
 	if got := DefaultModelDir(); got != filepath.Join("/home/tester", lmStudioCommunitySubdir) {
