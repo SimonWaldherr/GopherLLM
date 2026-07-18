@@ -70,8 +70,10 @@ type GenerationOptions struct {
 	// convention (native for Mistral, a generic <tool_call> JSON convention
 	// otherwise).
 	Tools []ToolDefinition
-	// ToolChoice controls whether tools are offered at all. "none" suppresses
-	// tool rendering for this request; any other value (including the default
+	// ToolChoice controls which of Tools are offered. "none" suppresses tool
+	// rendering entirely; a value of the form "function:<name>" (as produced
+	// by an OpenAI-style tool_choice object naming one function) narrows
+	// offering to just that tool; any other value (including the default
 	// "auto") offers all of Tools.
 	ToolChoice string
 	// ctx, when set (by the Model API's context-first methods), cancels
@@ -96,10 +98,19 @@ func DefaultGenerationOptions() GenerationOptions {
 }
 
 // activeTools returns the tools that should actually be offered to the model
-// for this request, honoring ToolChoice: "none".
+// for this request, honoring ToolChoice: "none" (suppress) and
+// "function:<name>" (narrow to the single named tool, degrading back to all
+// of Tools if no such name exists).
 func (o GenerationOptions) activeTools() []ToolDefinition {
 	if o.ToolChoice == "none" {
 		return nil
+	}
+	if name, ok := strings.CutPrefix(o.ToolChoice, "function:"); ok {
+		for _, t := range o.Tools {
+			if t.Function.Name == name {
+				return []ToolDefinition{t}
+			}
+		}
 	}
 	return o.Tools
 }
@@ -229,13 +240,22 @@ func RunnerFromGGUFBytesWithOptions(data []byte, options LoadOptions) (*Runner, 
 }
 
 func runnerFromGGUFBytes(data []byte, borrowQuantized bool, options LoadOptions) (*Runner, error) {
-	logw := options.LogWriter
-	if logw == nil {
-		logw = io.Discard
-	}
 	gguf, err := ParseGGUF(data)
 	if err != nil {
 		return nil, err
+	}
+	return runnerFromParsedGGUF(data, gguf, borrowQuantized, options)
+}
+
+// runnerFromParsedGGUF builds a Runner from an already-parsed GGUFFile plus
+// the byte slice its Tensors' Offsets are relative to (via DataOffset). It is
+// split out from runnerFromGGUFBytes so the split-file loader (gguf_split.go)
+// can hand in a synthetic GGUFFile assembled from multiple shard files
+// without needing a real single-file byte stream to re-parse.
+func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, options LoadOptions) (*Runner, error) {
+	logw := options.LogWriter
+	if logw == nil {
+		logw = io.Discard
 	}
 	fmt.Fprintf(logw, "GGUF v%d - %d tensors, %d metadata entries\n", gguf.Version, len(gguf.Tensors), len(gguf.Metadata))
 	arch, ok := gguf.GetString("general.architecture")
@@ -294,6 +314,15 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	mmap, err := OpenMmap(path)
 	if err != nil {
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
+	}
+	if header, herr := ParseGGUFQuiet(mmap.Bytes()); herr == nil {
+		if _, count, ok := splitInfo(header); ok && count > 1 {
+			r, mergedBytes, err := loadSplitRunner(path, header, mmap, options)
+			if err != nil {
+				return nil, LoadInfo{}, err
+			}
+			return r, LoadInfo{FileSizeBytes: int(mergedBytes), LoadTime: time.Since(t0)}, nil
+		}
 	}
 	// Only an actual mmap may be retained by Metal with bytesNoCopy. If mmap
 	// fell back to os.ReadFile, copy quantized weights so no C object keeps a

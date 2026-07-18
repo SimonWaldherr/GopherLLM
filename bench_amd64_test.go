@@ -59,3 +59,61 @@ func BenchmarkDotQ6KQ8KRow_4096(b *testing.B) {
 		_ = q6kDotQ8KRow(&row[0], &q8[0], &sc[0], &xs[0], 4096/256)
 	}
 }
+
+func BenchmarkDotQ5KQ8KRow_4096(b *testing.B) {
+	if !hasAVX2 || !hasF16C {
+		b.Skip("AVX2+F16C required")
+	}
+	rng := rand.New(rand.NewSource(10))
+	row := randomQ5KRow(rng, 4096)
+	x := randomVec(rng, 4096)
+	scratch := []float32{}
+	xs := fillQ4KXSums(x, 4096, &scratch)
+	q8 := make([]int8, 4096)
+	sc := make([]float32, 4096/256)
+	q8kQuantize(&x[0], &q8[0], &sc[0], 4096/256)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row)))
+	for b.Loop() {
+		_ = q5kDotQ8KRow(&row[0], &q8[0], &sc[0], &xs[0], 4096/256)
+	}
+}
+
+func BenchmarkDotQ5KF32Float_4096(b *testing.B) {
+	rng := rand.New(rand.NewSource(10))
+	row := randomQ5KRow(rng, 4096)
+	x := randomVec(rng, 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row)))
+	for b.Loop() {
+		_ = DotQ5KF32(row, x, 4096)
+	}
+}
+
+func BenchmarkDotQ8_0Q8KRow_4096(b *testing.B) {
+	if !hasAVX2 || !hasF16C {
+		b.Skip("AVX2+F16C required")
+	}
+	rng := rand.New(rand.NewSource(9))
+	row := randomQ8_0Row(rng, 4096)
+	x := randomVec(rng, 4096)
+	q8 := make([]int8, 4096)
+	sc := make([]float32, 4096/256)
+	q8kQuantize(&x[0], &q8[0], &sc[0], 4096/256)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row)))
+	for b.Loop() {
+		_ = q8_0DotQ8KRow(&row[0], &q8[0], &sc[0], 4096/256)
+	}
+}
+
+func BenchmarkDotQ8_0F32Float_4096(b *testing.B) {
+	rng := rand.New(rand.NewSource(9))
+	row := randomQ8_0Row(rng, 4096)
+	x := randomVec(rng, 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(row)))
+	for b.Loop() {
+		_ = DotQ8_0F32(row, x, 4096)
+	}
+}

@@ -187,6 +187,16 @@ func MatvecQ8_0(data []byte, x []float32, rows, cols int) []float32 {
 func MatvecQ8_0Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 32) * 34
 	ensureLenNoClear(out, rows)
+	// (cols/32)*34 == (cols/256)*272 exactly when cols%256==0, so rowBytes
+	// already matches the int8-activation path's 8-block-per-256 grouping.
+	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		q8, xsc, release := acquireQ8(x, cols)
+		parallelRows(rows, func(start, end int) {
+			dotQ8_0RowsQ8(data, q8, xsc, cols, rowBytes, start, end, *out)
+		})
+		release()
+		return
+	}
 	parallelRows(rows, func(start, end int) {
 		for r := start; r < end; r++ {
 			off := r * rowBytes
@@ -347,6 +357,20 @@ func dotQ4KRowsWithXSums(data []byte, x, xsums []float32, cols, rowBytes, start,
 func MatvecQ5KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 256) * 176
 	ensureLenNoClear(out, rows)
+	// Q5_K shares Q4_K's per-sub-block scale/min structure, so the same
+	// per-32-element activation sums feed its dmin term.
+	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ4KXSums(x, cols, scratch)
+		q8, xsc, release := acquireQ8(x, cols)
+		parallelRows(rows, func(start, end int) {
+			dotQ5KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
+		})
+		release()
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return
+	}
 	parallelRows(rows, func(start, end int) {
 		for r := start; r < end; r++ {
 			off := r * rowBytes

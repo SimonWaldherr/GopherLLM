@@ -25,6 +25,9 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 
 - Pure Go runtime with optional ARM64 (NEON) and x86-64 (AVX2 + FMA) assembly kernels.
 - Memory-mapped GGUF loading for fast startup and lower copy pressure.
+- Split/sharded GGUF loading: point at any one shard of a
+  `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
+  and merged automatically (see [Performance Notes](#performance-notes)).
 - Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1,
   Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/BF16 loaded directly
   (BF16 covers QAT-derived and modern full-precision GGUFs).
@@ -484,18 +487,22 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   kernels remain as the fallback for small projections and Metal failures. The
   path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
-- On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K and Q6_K matvecs
-  default to int8-activation full-row kernels: the activation vector is quantized
-  once per matvec to int8 with one scale per 256-element block (llama.cpp's Q8_K
-  convention, `q8kQuantize`), and each weight row is processed by a single
-  assembly call (`q4kDotQ8KRow` / `q6kDotQ8KRow`) that decodes block scales
-  in-register, dots 32 weights per `VPMADDUBSW`, applies scales via `VPMADDWD`,
-  and reduces horizontally once per row. Versus the previous per-block float
-  kernels this is ~2.5x (Q4_K) to ~6x (Q6_K) per-row and roughly 4x end-to-end
-  decode on a Ministral 3B Q4_K_M. Set `GOPHERLLM_Q8_ACTIVATIONS=0` to force the
-  exact float kernels (bit-reproducible against the scalar reference; the int8
-  path stays within cosine 0.999 of it — the same accuracy tradeoff llama.cpp
-  makes by default). `GOPHERLLM_DISABLE_SIMD=1` still forces portable scalar
+- On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K, Q5_K, Q6_K,
+  and Q8_0 matvecs default to int8-activation full-row kernels: the activation
+  vector is quantized once per matvec to int8 with one scale per 256-element
+  block (llama.cpp's Q8_K convention, `q8kQuantize`), and each weight row is
+  processed by a single assembly call (`q4kDotQ8KRow` / `q5kDotQ8KRow` /
+  `q6kDotQ8KRow` / `q8_0DotQ8KRow`) that decodes block scales in-register,
+  dots 32 weights per `VPMADDUBSW` (Q8_0's own signed weights use the
+  abs/sign-restore identity so the same unsigned-operand instruction applies),
+  applies scales via `VPMADDWD`, and reduces horizontally once per row. Versus
+  the previous per-block float kernels this is ~2.5x (Q4_K) to ~6x (Q6_K and
+  Q8_0) per-row — and >20x for Q5_K, which previously had no SIMD fast path at
+  all — and roughly 4x end-to-end decode on a Ministral 3B Q4_K_M. Set
+  `GOPHERLLM_Q8_ACTIVATIONS=0` to force the exact float kernels
+  (bit-reproducible against the scalar reference; the int8 path stays within
+  cosine 0.999 of it — the same accuracy tradeoff llama.cpp makes by default).
+  `GOPHERLLM_DISABLE_SIMD=1` still forces portable scalar
   kernels everywhere.
 - Prompt processing (prefill) is batched. With the int8 path active, each raw
   quantized weight row is streamed from memory exactly once per prompt chunk and
@@ -514,6 +521,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   is over-chunked so performance cores absorb efficiency-core stragglers.
 - Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
   it.
+- Split GGUFs (llama.cpp's `gguf-split` naming convention,
+  `<name>-00001-of-00005.gguf`) are detected from any one shard's
+  `split.count` metadata; every sibling is located next to it, and their
+  tensor data is merged into one in-memory buffer before loading. This costs
+  one full copy of the model's weights at load time — true zero-copy mmap
+  borrowing only applies to single-file GGUFs — but needs no other opt-in.
 
 ### Environment variables
 

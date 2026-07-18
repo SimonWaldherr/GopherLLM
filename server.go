@@ -1,7 +1,9 @@
 package gopherllm
 
 import (
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -200,7 +202,8 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
 			if body.Stream {
-				streamOpenAIChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills)
+				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
+				streamOpenAIChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, includeUsage)
 				return
 			}
 			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
@@ -280,13 +283,21 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
+			if streamEnabled(body.Stream) {
+				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills)
+				return
+			}
 			result, err := RunAgenticChat(r, []ChatMessage{UserMessage(body.Prompt)}, options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			writeJSON(w, map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "response": result.Text, "done": true, "prompt_eval_count": result.Stats.PromptTokens, "eval_count": result.Stats.GeneratedTokens})
+			resp := map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "response": result.Text, "done": true, "done_reason": finishReasonOrDefault(result.FinishReason)}
+			for k, v := range ollamaDurations(result.Stats) {
+				resp[k] = v
+			}
+			writeJSON(w, resp)
 		})
 	}))
 	mux.HandleFunc("/api/chat", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
@@ -300,13 +311,25 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		options = withRequestContext(options, req)
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
+			if streamEnabled(body.Stream) {
+				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills)
+				return
+			}
 			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/chat", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			writeJSON(w, map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "message": map[string]any{"role": "assistant", "content": result.Text}, "done": true, "prompt_eval_count": result.Stats.PromptTokens, "eval_count": result.Stats.GeneratedTokens})
+			message := map[string]any{"role": "assistant", "content": result.Text}
+			if len(result.ToolCalls) > 0 {
+				message["tool_calls"] = result.ToolCalls
+			}
+			resp := map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "message": message, "done": true, "done_reason": finishReasonOrDefault(result.FinishReason)}
+			for k, v := range ollamaDurations(result.Stats) {
+				resp[k] = v
+			}
+			writeJSON(w, resp)
 		})
 	}))
 	mux.HandleFunc("/api/embeddings", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
@@ -331,6 +354,87 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			writeJSON(w, map[string]any{"embedding": emb.Embedding})
 		})
 	}))
+	mux.HandleFunc("/api/embed", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		var body OllamaEmbedRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		inputs := body.Inputs()
+		embeddings := make([][]float32, 0, len(inputs))
+		state.withRunner(func(r *Runner) {
+			model := modelID(r)
+			promptTokens := 0
+			for _, input := range inputs {
+				emb, err := r.Embed(input)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				promptTokens += emb.TokenCount
+				embeddings = append(embeddings, emb.Embedding)
+			}
+			writeJSON(w, map[string]any{"model": model, "embeddings": embeddings, "prompt_eval_count": promptTokens})
+		})
+	}))
+	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{"models": ollamaTagEntries(state, opts.ModelDir)})
+	})
+	mux.HandleFunc("/api/ps", func(w http.ResponseWriter, _ *http.Request) {
+		r := state.get()
+		if r == nil {
+			writeJSON(w, map[string]any{"models": []any{}})
+			return
+		}
+		name := modelID(r)
+		a := AnalyzeGGUF(r.GGUF(), r.Tokenizer())
+		writeJSON(w, map[string]any{"models": []any{map[string]any{
+			"name":       name,
+			"model":      name,
+			"size":       a.FileBytes,
+			"size_vram":  a.FileBytes,
+			"digest":     modelDigest(state.getPath()),
+			"details":    ollamaModelDetails(a),
+			"expires_at": time.Now().Add(5 * time.Minute).Format(time.RFC3339Nano),
+		}}})
+	})
+	mux.HandleFunc("/api/show", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+			Name  string `json:"name"`
+		}
+		if req.Body != nil {
+			_ = json.NewDecoder(req.Body).Decode(&body)
+		}
+		requested := body.Model
+		if requested == "" {
+			requested = body.Name
+		}
+		a, ok := resolveModelAnalysis(state, opts.ModelDir, requested)
+		if !ok {
+			http.Error(w, "model not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"modelfile":  "",
+			"parameters": "",
+			"template":   "",
+			"details":    ollamaModelDetails(a),
+			"model_info": map[string]any{
+				"general.architecture": a.Architecture,
+				"general.parameter_count": a.Params,
+				a.Architecture + ".context_length": a.ContextLength,
+				a.Architecture + ".embedding_length": a.Dim,
+				a.Architecture + ".block_count": a.Layers,
+				a.Architecture + ".attention.head_count": a.Heads,
+				a.Architecture + ".attention.head_count_kv": a.KVHeads,
+			},
+			"capabilities": []string{"completion"},
+		})
+	}))
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]any{"version": "gopherllm-ollama-compat"})
+	})
 	mux.HandleFunc("/models", func(w http.ResponseWriter, _ *http.Request) {
 		type modelInfo struct {
 			ID           string  `json:"id"`
@@ -488,7 +592,10 @@ func apiMessages(items []APIMessage) []ChatMessage {
 	for _, item := range items {
 		role := ChatRoleUser
 		switch strings.ToLower(item.Role) {
-		case "system":
+		case "system", "developer":
+			// "developer" is the OpenAI o1/gpt-oss-era replacement for
+			// "system"; GopherLLM has no separate developer-instruction
+			// channel, so it renders the same as a system message.
 			role = ChatRoleSystem
 		case "assistant":
 			role = ChatRoleAssistant
@@ -506,14 +613,31 @@ func alwaysContinue(string) bool { return true }
 
 // normalizeToolChoice extracts the OpenAI-compatible "tool_choice" value's
 // meaning that this server actually acts on. A literal "none" suppresses tool
-// offering; every other form (the default "auto", "required", or an object
-// forcing a specific tool) is treated as "offer the tools" since GopherLLM
-// has no constrained decoding to force a specific one.
+// offering; "auto"/"required" pass through unchanged (GopherLLM has no
+// constrained decoding, so both just mean "offer the tools"); an object
+// naming one function (`{"type":"function","function":{"name":"..."}}`)
+// becomes "function:<name>", which GenerationOptions.activeTools narrows
+// offering to. An object missing a usable name degrades to "" (== auto).
 func normalizeToolChoice(raw any) string {
-	if s, ok := raw.(string); ok {
-		return s
+	switch v := raw.(type) {
+	case string:
+		return v
+	case map[string]any:
+		if v["type"] != "function" {
+			return ""
+		}
+		fn, ok := v["function"].(map[string]any)
+		if !ok {
+			return ""
+		}
+		name, ok := fn["name"].(string)
+		if !ok || name == "" {
+			return ""
+		}
+		return "function:" + name
+	default:
+		return ""
 	}
-	return ""
 }
 
 func contentText(v any) string {
@@ -539,21 +663,29 @@ func contentText(v any) string {
 }
 
 type OpenAIChatRequest struct {
-	Model               string           `json:"model"`
-	Messages            []APIMessage     `json:"messages"`
-	Stream              bool             `json:"stream"`
-	MaxTokens           *int             `json:"max_tokens"`
-	MaxCompletionTokens *int             `json:"max_completion_tokens"`
-	Temperature         *float32         `json:"temperature"`
-	TopP                *float32         `json:"top_p"`
-	TopK                *int             `json:"top_k"`
-	MinP                *float32         `json:"min_p"`
-	RepeatPenalty       *float32         `json:"repeat_penalty"`
-	Seed                *uint64          `json:"seed"`
-	SystemPrompt        *string          `json:"system_prompt"`
-	Stop                any              `json:"stop"`
-	Tools               []ToolDefinition `json:"tools"`
-	ToolChoice          any              `json:"tool_choice"`
+	Model               string             `json:"model"`
+	Messages            []APIMessage       `json:"messages"`
+	Stream              bool               `json:"stream"`
+	StreamOptions       *OpenAIStreamOpts  `json:"stream_options"`
+	MaxTokens           *int               `json:"max_tokens"`
+	MaxCompletionTokens *int               `json:"max_completion_tokens"`
+	Temperature         *float32           `json:"temperature"`
+	TopP                *float32           `json:"top_p"`
+	TopK                *int               `json:"top_k"`
+	MinP                *float32           `json:"min_p"`
+	RepeatPenalty       *float32           `json:"repeat_penalty"`
+	Seed                *uint64            `json:"seed"`
+	SystemPrompt        *string            `json:"system_prompt"`
+	Stop                any                `json:"stop"`
+	Tools               []ToolDefinition   `json:"tools"`
+	ToolChoice          any                `json:"tool_choice"`
+}
+
+// OpenAIStreamOpts is the OpenAI "stream_options" object; IncludeUsage gates
+// whether the final SSE chunk carries a "usage" field (off by default, per
+// spec — unlike a non-streaming response, which always includes usage).
+type OpenAIStreamOpts struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
@@ -629,7 +761,7 @@ type OllamaGenerateRequest struct {
 	Model   string        `json:"model"`
 	Prompt  string        `json:"prompt"`
 	System  string        `json:"system"`
-	Stream  bool          `json:"stream"`
+	Stream  *bool         `json:"stream"`
 	Options OllamaOptions `json:"options"`
 	Stop    any           `json:"stop"`
 }
@@ -645,9 +777,16 @@ func (o OllamaGenerateRequest) GenerationOptions(def GenerationOptions) Generati
 type OllamaChatRequest struct {
 	Model    string           `json:"model"`
 	Messages []OllamaMessage  `json:"messages"`
-	Stream   bool             `json:"stream"`
+	Stream   *bool            `json:"stream"`
 	Options  OllamaOptions    `json:"options"`
 	Tools    []ToolDefinition `json:"tools"`
+}
+
+// streamEnabled implements Ollama's default-true streaming semantics: the
+// request only turns streaming off when the "stream" field is explicitly
+// present and false; omitting it (nil) streams, matching real Ollama.
+func streamEnabled(b *bool) bool {
+	return b == nil || *b
 }
 
 func (o OllamaChatRequest) GenerationOptions(def GenerationOptions) GenerationOptions {
@@ -668,6 +807,11 @@ type OllamaMessage struct {
 }
 
 type OllamaOptions struct {
+	// NumCtx is accepted for wire compatibility (real Ollama clients set it
+	// routinely) but not actionable here: a Runner's KV cache is sized once
+	// from the loaded GGUF's context_length at model-load time, and this
+	// server has no per-request context-window resize.
+	NumCtx        *int     `json:"num_ctx"`
 	NumPredict    *int     `json:"num_predict"`
 	Temperature   *float32 `json:"temperature"`
 	TopP          *float32 `json:"top_p"`
@@ -685,6 +829,17 @@ type OllamaEmbeddingRequest struct {
 }
 
 func (o OllamaEmbeddingRequest) Inputs() []string {
+	return EmbeddingsRequest{Input: o.Input}.Inputs()
+}
+
+// OllamaEmbedRequest is the request body for /api/embed, the batched
+// successor to the deprecated single-prompt /api/embeddings.
+type OllamaEmbedRequest struct {
+	Model string `json:"model"`
+	Input any    `json:"input"`
+}
+
+func (o OllamaEmbedRequest) Inputs() []string {
 	return EmbeddingsRequest{Input: o.Input}.Inputs()
 }
 
@@ -863,7 +1018,7 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 // terminal chunk carrying finish_reason, usage, and — when present —
 // reasoning_content and tool_calls, computed from the authoritative final
 // GenerationResult rather than reconstructed from what was streamed.
-func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill) {
+func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -911,10 +1066,20 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	if len(result.ToolCalls) > 0 {
 		finalDelta["tool_calls"] = result.ToolCalls
 	}
-	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason), "usage": usage(result)})
+	extra := map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason)}
+	if includeUsage {
+		extra["usage"] = usage(result)
+	}
+	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra)
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
+
+// systemFingerprint is a static stand-in for OpenAI's build-identifying
+// system_fingerprint field: GopherLLM has no server-side config permutations
+// that would make it vary per request, but clients (agent frameworks,
+// caching layers) expect the field to be present.
+const systemFingerprint = "fp_gopherllm"
 
 func writeOpenAIStreamChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, delta map[string]any, extra map[string]any) error {
 	choice := map[string]any{"index": 0, "delta": delta}
@@ -922,11 +1087,12 @@ func writeOpenAIStreamChunk(w http.ResponseWriter, flusher http.Flusher, id, mod
 		choice[k] = v
 	}
 	return writeSSE(w, flusher, "", map[string]any{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []any{choice},
+		"id":                 id,
+		"object":             "chat.completion.chunk",
+		"created":            created,
+		"model":              model,
+		"system_fingerprint": systemFingerprint,
+		"choices":            []any{choice},
 	})
 }
 
@@ -945,6 +1111,263 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, v any) 
 	}
 	flusher.Flush()
 	return nil
+}
+
+// writeNDJSON writes one newline-delimited JSON object and flushes — Ollama's
+// streaming wire format, distinct from OpenAI's "data: "-prefixed SSE.
+func writeNDJSON(w http.ResponseWriter, flusher http.Flusher, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write(append(data, '\n')); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+// ollamaDurations reports GenerationStats using Ollama's nanosecond duration
+// field names. load_duration is always 0: GopherLLM has no separate
+// model-load phase inside a request (the model is already resident).
+func ollamaDurations(stats GenerationStats) map[string]any {
+	return map[string]any{
+		"total_duration":       stats.TotalTime.Nanoseconds(),
+		"load_duration":        int64(0),
+		"prompt_eval_count":    stats.PromptTokens,
+		"prompt_eval_duration": stats.PrefillTime.Nanoseconds(),
+		"eval_count":           stats.GeneratedTokens,
+		"eval_duration":        stats.DecodeTime.Nanoseconds(),
+	}
+}
+
+// streamOllamaGenerate streams /api/generate as NDJSON: one {"done":false}
+// line per token, then a final {"done":true} line carrying finish reason and
+// timing, mirroring real Ollama's wire shape.
+func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model, prompt string, options GenerationOptions, skills []Skill) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("content-type", "application/x-ndjson")
+
+	var streamErr error
+	result, err := RunAgenticChat(r, []ChatMessage{UserMessage(prompt)}, options, skills, func(text string) bool {
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			streamErr = ctxErr
+			return false
+		}
+		if err := writeNDJSON(w, flusher, map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "response": text, "done": false}); err != nil {
+			streamErr = err
+			return false
+		}
+		return true
+	})
+	if streamErr != nil {
+		logInferenceResult(logw, requestID, "/api/generate", model, true, result, streamErr)
+		return
+	}
+	logInferenceResult(logw, requestID, "/api/generate", model, true, result, err)
+	if err != nil {
+		if errors.Is(err, ErrGenerationCanceled) {
+			return
+		}
+		_ = writeNDJSON(w, flusher, map[string]string{"error": err.Error()})
+		return
+	}
+	final := map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "response": "", "done": true, "done_reason": finishReasonOrDefault(result.FinishReason)}
+	for k, v := range ollamaDurations(result.Stats) {
+		final[k] = v
+	}
+	_ = writeNDJSON(w, flusher, final)
+}
+
+// streamOllamaChat streams /api/chat as NDJSON, surfacing tool_calls on the
+// final message the same way the non-streaming path does (previously dropped
+// entirely on this endpoint).
+func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("content-type", "application/x-ndjson")
+
+	var streamErr error
+	result, err := RunAgenticChat(r, messages, options, skills, func(text string) bool {
+		if ctxErr := req.Context().Err(); ctxErr != nil {
+			streamErr = ctxErr
+			return false
+		}
+		if err := writeNDJSON(w, flusher, map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "message": map[string]any{"role": "assistant", "content": text}, "done": false}); err != nil {
+			streamErr = err
+			return false
+		}
+		return true
+	})
+	if streamErr != nil {
+		logInferenceResult(logw, requestID, "/api/chat", model, true, result, streamErr)
+		return
+	}
+	logInferenceResult(logw, requestID, "/api/chat", model, true, result, err)
+	if err != nil {
+		if errors.Is(err, ErrGenerationCanceled) {
+			return
+		}
+		_ = writeNDJSON(w, flusher, map[string]string{"error": err.Error()})
+		return
+	}
+	message := map[string]any{"role": "assistant", "content": ""}
+	if len(result.ToolCalls) > 0 {
+		message["tool_calls"] = result.ToolCalls
+	}
+	final := map[string]any{"model": model, "created_at": time.Now().Format(time.RFC3339Nano), "message": message, "done": true, "done_reason": finishReasonOrDefault(result.FinishReason)}
+	for k, v := range ollamaDurations(result.Stats) {
+		final[k] = v
+	}
+	_ = writeNDJSON(w, flusher, final)
+}
+
+// analyzeModelFile parses a GGUF file's header only (mmap'd, no weight
+// bytes touched — the same cheap path DiscoverModels uses) into an Analysis,
+// for building Ollama-shaped model metadata without loading a full Runner.
+func analyzeModelFile(path string) (*Analysis, error) {
+	mmap, err := OpenMmap(path)
+	if err != nil {
+		return nil, err
+	}
+	defer mmap.Close()
+	gguf, err := ParseGGUFQuiet(mmap.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	return AnalyzeGGUF(gguf, nil), nil
+}
+
+// resolveModelAnalysis answers /api/show's "which model": empty/matching
+// name means the currently loaded Runner (full Analysis, tokenizer
+// included); any other name is looked up in ModelDir (if configured) and
+// header-analyzed on demand.
+func resolveModelAnalysis(state *runnerState, modelDir, requested string) (*Analysis, bool) {
+	r := state.get()
+	if r != nil && (requested == "" || requested == modelID(r)) {
+		return AnalyzeGGUF(r.GGUF(), r.Tokenizer()), true
+	}
+	if modelDir == "" {
+		return nil, false
+	}
+	entries, err := DiscoverModels(modelDir, io.Discard)
+	if err != nil {
+		return nil, false
+	}
+	entry, err := SelectModel(entries, requested)
+	if err != nil {
+		return nil, false
+	}
+	a, err := analyzeModelFile(entry.Path)
+	if err != nil {
+		return nil, false
+	}
+	return a, true
+}
+
+// ollamaTagEntries builds /api/tags' model list: every entry under ModelDir
+// (header-analyzed, cheap) if configured, else just the currently loaded
+// model.
+func ollamaTagEntries(state *runnerState, modelDir string) []map[string]any {
+	if modelDir == "" {
+		r := state.get()
+		if r == nil {
+			return []map[string]any{}
+		}
+		name := modelID(r)
+		a := AnalyzeGGUF(r.GGUF(), r.Tokenizer())
+		return []map[string]any{ollamaTagEntry(name, state.getPath(), a.FileBytes, a)}
+	}
+	entries, err := DiscoverModels(modelDir, io.Discard)
+	if err != nil {
+		return []map[string]any{}
+	}
+	tags := make([]map[string]any, 0, len(entries))
+	for _, e := range entries {
+		if e.IsProjector || !e.IsSupported {
+			continue
+		}
+		name := e.ModelName
+		if name == "" {
+			name = e.FileName
+		}
+		a, err := analyzeModelFile(e.Path)
+		if err != nil {
+			continue
+		}
+		tags = append(tags, ollamaTagEntry(name, e.Path, e.SizeBytes, a))
+	}
+	return tags
+}
+
+func ollamaTagEntry(name, path string, sizeBytes int64, a *Analysis) map[string]any {
+	return map[string]any{
+		"name":        name,
+		"model":       name,
+		"modified_at": time.Now().Format(time.RFC3339Nano),
+		"size":        sizeBytes,
+		"digest":      modelDigest(path),
+		"details":     ollamaModelDetails(a),
+	}
+}
+
+// ollamaModelDetails builds Ollama's "details" object from a header Analysis.
+func ollamaModelDetails(a *Analysis) map[string]any {
+	quant := "unknown"
+	if len(a.DTypes) > 0 {
+		quant = a.DTypes[0].Type.String()
+	}
+	family := a.Architecture
+	if family == "" {
+		family = "unknown"
+	}
+	return map[string]any{
+		"parent_model":       "",
+		"format":             "gguf",
+		"family":             family,
+		"families":           []string{family},
+		"parameter_size":     humanParamSize(a.Params),
+		"quantization_level": quant,
+	}
+}
+
+// humanParamSize formats a parameter count the way Ollama's "parameter_size"
+// field does (e.g. "3.3B", "125M").
+func humanParamSize(params int64) string {
+	switch {
+	case params >= 1_000_000_000:
+		return fmt.Sprintf("%.1fB", float64(params)/1_000_000_000)
+	case params >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(params)/1_000_000)
+	default:
+		return fmt.Sprintf("%d", params)
+	}
+}
+
+// modelDigest returns a stable, cheap-to-compute "sha256:"-prefixed
+// identifier for a model file: real Ollama content-addresses the whole blob,
+// but sha256-ing a multi-gigabyte GGUF on every /api/tags or /api/show
+// request would be far too slow. This hashes the path, size, and first 1MiB
+// only — good enough as an opaque, stable client-facing id, not a real
+// content hash.
+func modelDigest(path string) string {
+	h := sha256.New()
+	io.WriteString(h, path)
+	if st, err := os.Stat(path); err == nil {
+		fmt.Fprintf(h, "%d", st.Size())
+		if f, err := os.Open(path); err == nil {
+			defer f.Close()
+			_, _ = io.CopyN(h, f, 1<<20)
+		}
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 func generateResponse(result GenerationResult) map[string]any {
@@ -969,7 +1392,7 @@ func openAIChatResponse(model string, result GenerationResult) map[string]any {
 	if result.ReasoningText != "" {
 		message["reasoning_content"] = result.ReasoningText
 	}
-	return map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
+	return map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "system_fingerprint": systemFingerprint, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
 }
 
 // finishReasonOrDefault falls back to "stop" for callers of GenerateResult
