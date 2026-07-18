@@ -324,10 +324,17 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 			return r, LoadInfo{FileSizeBytes: int(mergedBytes), LoadTime: time.Since(t0)}, nil
 		}
 	}
-	// Only an actual mmap may be retained by Metal with bytesNoCopy. If mmap
-	// fell back to os.ReadFile, copy quantized weights so no C object keeps a
-	// pointer into Go-managed heap memory.
-	r, err := runnerFromGGUFBytes(mmap.Bytes(), mmap.mmap, options)
+	if mmap.mmap {
+		prefaultPages(mmap.Bytes())
+	}
+	// Quantized weights borrow sub-slices of the file buffer instead of
+	// copying (multi-gigabyte models load without a second copy). The one
+	// case that must copy: Metal builds where mmap fell back to os.ReadFile —
+	// only an actual OS mapping may be retained by Metal with bytesNoCopy, a
+	// C object must never keep a pointer into Go-managed heap memory. Without
+	// Metal, borrowing from the heap buffer is plain Go slice aliasing and
+	// always safe.
+	r, err := runnerFromGGUFBytes(mmap.Bytes(), mmap.mmap || !options.UseMetal, options)
 	if err != nil {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, err

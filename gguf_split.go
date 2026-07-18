@@ -58,6 +58,25 @@ var splitKeys = []string{"split.no", "split.count", "split.tensors.count"}
 // path turns out to be (avoiding opening it twice) and closed, along with
 // every other shard's mapping, once their tensor bytes are copied out.
 func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, options LoadOptions) (*Runner, int64, error) {
+	// This function owns firstMmap and every shard mapping it opens: all of
+	// them are closed on every path (success copies the tensor bytes into
+	// the merged buffer first). Leaving one mapped would keep the file
+	// locked on Windows.
+	type shard struct {
+		gguf *GGUFFile
+		mmap *MmapFile
+		no   int
+	}
+	var shards []shard
+	defer func() {
+		for _, s := range shards {
+			if s.mmap != nil && s.mmap != firstMmap {
+				_ = s.mmap.Close()
+			}
+		}
+		_ = firstMmap.Close()
+	}()
+
 	firstNo, count, _ := splitInfo(firstGGUF)
 
 	m := splitFilePattern.FindStringSubmatch(path)
@@ -67,12 +86,7 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 	}
 	prefix := m[1]
 
-	type shard struct {
-		gguf *GGUFFile
-		mmap *MmapFile
-		no   int
-	}
-	shards := make([]shard, count)
+	shards = make([]shard, count)
 	for i := 1; i <= count; i++ {
 		shardPath := splitShardPath(prefix, i, count)
 		var mm *MmapFile
@@ -82,24 +96,12 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 			var err error
 			mm, err = OpenMmap(shardPath)
 			if err != nil {
-				for _, s := range shards {
-					if s.mmap != nil && s.mmap != firstMmap {
-						_ = s.mmap.Close()
-					}
-				}
 				return nil, 0, fmt.Errorf("split model: failed to open shard %d/%d (%s): %w", i, count, shardPath, err)
 			}
 		}
+		shards[i-1].mmap = mm
 		g, err := ParseGGUFQuiet(mm.Bytes())
 		if err != nil {
-			if mm != firstMmap {
-				_ = mm.Close()
-			}
-			for _, s := range shards {
-				if s.mmap != nil && s.mmap != firstMmap {
-					_ = s.mmap.Close()
-				}
-			}
 			return nil, 0, fmt.Errorf("split model: failed to parse shard %d/%d (%s): %w", i, count, shardPath, err)
 		}
 		no, shardCount, ok := splitInfo(g)
@@ -108,14 +110,6 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 		}
 		shards[i-1] = shard{gguf: g, mmap: mm, no: no}
 	}
-	defer func() {
-		for _, s := range shards {
-			if s.mmap != nil && s.mmap != firstMmap {
-				_ = s.mmap.Close()
-			}
-		}
-		_ = firstMmap.Close()
-	}()
 
 	// Order shards by their declared split.no (0-based) rather than trusting
 	// filename order alone, in case a producer numbered them unconventionally.
@@ -157,10 +151,11 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 	}
 
 	combined := &GGUFFile{Metadata: metadata, Tensors: mergedTensors, DataOffset: 0, Version: firstGGUF.Version}
-	// The merged buffer is a fresh Go allocation, not an OS mmap, so it does
-	// not qualify for Metal's bytesNoCopy borrowing (see the caller's mmap.mmap
-	// gate) — always load it as owned/copied.
-	r, err := runnerFromParsedGGUF(merged, combined, false, options)
+	// The merged buffer is a fresh Go allocation the returned Runner's
+	// weights keep alive by reference, so borrowing from it is safe — except
+	// under Metal, which must never retain a C pointer into Go heap memory
+	// (only real OS mappings qualify for bytesNoCopy).
+	r, err := runnerFromParsedGGUF(merged, combined, !options.UseMetal, options)
 	if err != nil {
 		return nil, 0, err
 	}

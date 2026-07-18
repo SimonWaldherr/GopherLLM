@@ -24,7 +24,10 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 ## Features
 
 - Pure Go runtime with optional ARM64 (NEON) and x86-64 (AVX2 + FMA) assembly kernels.
-- Memory-mapped GGUF loading for fast startup and lower copy pressure.
+- Memory-mapped GGUF loading for fast startup and lower copy pressure, on
+  every platform (Unix `mmap`, Windows `CreateFileMapping`/`MapViewOfFile`):
+  weights page in on demand and quantized tensors borrow the mapping
+  zero-copy.
 - Split/sharded GGUF loading: point at any one shard of a
   `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
   and merged automatically (see [Performance Notes](#performance-notes)).
@@ -527,6 +530,17 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   tensor data is merged into one in-memory buffer before loading. This costs
   one full copy of the model's weights at load time — true zero-copy mmap
   borrowing only applies to single-file GGUFs — but needs no other opt-in.
+- After mmap'ing a single-file GGUF, every page is touched once up front
+  across all worker threads (`prefaultPages`) before the model is reported
+  loaded. A memory-mapped file only pages in on first touch, and a forward
+  pass touches essentially every weight byte — without this, the *first*
+  request after startup silently inherited that page-in cost (disk I/O, or on
+  Windows, real-time antivirus scanning of each mapped page) inside its own
+  TTFT instead of load time. For a one-shot CLI run this doesn't change total
+  wall-clock; for the HTTP server and REPL cases it means every request,
+  including the first, sees consistent latency instead of one random request
+  eating a multi-second page-in tax. Set `GOPHERLLM_NO_PREFAULT=1` to restore
+  pure lazy paging.
 
 ### Environment variables
 
@@ -539,7 +553,8 @@ details in the bullets they annotate):
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
-| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q6_K matvecs (x86-64) |
+| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0 matvecs (x86-64) |
+| `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
@@ -588,7 +603,7 @@ selection.
 
 | Area | Files |
 |---|---|
-| GGUF parsing + file mapping | `gguf.go`, `mmap.go` / `mmap_fallback.go` |
+| GGUF parsing + file mapping | `gguf.go`, `mmap.go` (Unix) / `mmap_windows.go` (Win32 file mapping) |
 | Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
 | Compute kernels + worker pool | `simd.go`; assembly in `*_amd64.s` / `*_arm64.s` behind `dot_f32_*.go`, `vector_ops_*.go`, `quant_*.go`, `q4k_q8_*.go` dispatch shims |
 | Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE) |
