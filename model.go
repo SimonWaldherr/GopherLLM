@@ -67,6 +67,20 @@ type Config struct {
 	AttnLogitSoftcap  float32
 	FinalLogitSoftcap float32
 	SWAPattern        []bool
+	// Nemotron-H / Soofi S hybrid Mamba-2 configuration. These fields are
+	// unused by the standard transformer path. A zero-valued per-layer entry
+	// means that the layer does not expose that component.
+	LayerHeads            []int
+	LayerKVHeads          []int
+	LayerFFNDim           []int
+	SSMConv               int
+	SSMInner              int
+	SSMState              int
+	SSMHeads              int
+	SSMGroups             int
+	ExpertWeightsNorm     bool
+	ExpertWeightsScale    float32
+	ExpertWeightsNormClip float32
 }
 
 // gemmaFamily reports whether arch is a Gemma generation, all of which share
@@ -141,7 +155,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	if logitScale == 0 {
 		logitScale = 1
 	}
-	return Config{
+	cfg := Config{
 		Arch:                      p,
 		Dim:                       dim,
 		HiddenDim:                 int(gguf.GetU32(p+".feed_forward_length", 0)),
@@ -176,6 +190,32 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
+	if p == "nemotron_h" || p == "nemotron_h_moe" {
+		cfg.LayerHeads = u32ArrayAsInts(gguf, p+".attention.head_count")
+		cfg.LayerKVHeads = u32ArrayAsInts(gguf, p+".attention.head_count_kv")
+		cfg.LayerFFNDim = u32ArrayAsInts(gguf, p+".feed_forward_length")
+		cfg.SSMConv = int(gguf.GetU32(p+".ssm.conv_kernel", 0))
+		cfg.SSMInner = int(gguf.GetU32(p+".ssm.inner_size", 0))
+		cfg.SSMState = int(gguf.GetU32(p+".ssm.state_size", 0))
+		cfg.SSMHeads = int(gguf.GetU32(p+".ssm.time_step_rank", 0))
+		cfg.SSMGroups = int(gguf.GetU32(p+".ssm.group_count", 0))
+		cfg.ExpertWeightsNorm, _ = gguf.Metadata[p+".expert_weights_norm"].AsBool()
+		cfg.ExpertWeightsScale = gguf.GetF32(p+".expert_weights_scale", 1)
+		cfg.ExpertWeightsNormClip = gguf.GetF32(p+".expert_weights_norm_clip", 0)
+	}
+	return cfg
+}
+
+func u32ArrayAsInts(gguf *GGUFFile, key string) []int {
+	v, ok := gguf.GetU32Array(key)
+	if !ok {
+		return nil
+	}
+	out := make([]int, len(v))
+	for i, n := range v {
+		out[i] = int(n)
+	}
+	return out
 }
 
 // swaPattern determines which layers use the sliding window. Priority:
@@ -544,8 +584,11 @@ type KVCache struct {
 	// and attention converts rows in-register (see kv_f16.go). Halves the
 	// cache's memory footprint and the bytes attention streams per token.
 	F16 bool
-	K16 [][]uint16
-	V16 [][]uint16
+	// Nemotron is present only for hybrid Mamba-2 architectures. K/V remains
+	// in this cache; the companion stores the recurrent convolution/SSM state.
+	Nemotron *NemotronHCache
+	K16      [][]uint16
+	V16      [][]uint16
 }
 
 // NewKVCache allocates an f32 cache for `layers` layers of maxLen positions
@@ -649,6 +692,17 @@ type DecodeBuffer struct {
 	RopeMscale              float32
 	RopeGptOssInvFreq       []float32
 	RopeGptOssConcentration float32
+	MambaIn                 []float32
+	MambaConv               []float32
+	MambaZ                  []float32
+	MambaX                  []float32
+	MambaB                  []float32
+	MambaC                  []float32
+	MambaDT                 []float32
+	MambaY                  []float32
+	MambaKernel             []float32
+	ExpertRow               []float32
+	ExpertHidden            []float32
 	batch                   batchDecodeBuffer
 }
 

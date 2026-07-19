@@ -1,6 +1,9 @@
 package gopherllm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExtractThinkBasic(t *testing.T) {
 	content, reasoning := extractThink("<think>let me work this out</think>The answer is 4.")
@@ -38,6 +41,73 @@ func TestExtractThinkUnterminated(t *testing.T) {
 	}
 	if reasoning != "still thinking and it never ends" {
 		t.Fatalf("reasoning = %q", reasoning)
+	}
+}
+
+func TestThinkStreamSplitterSeparatesTagsAcrossChunks(t *testing.T) {
+	s := newThinkStreamSplitter(false)
+	var content, reasoning strings.Builder
+	emit := func(isReasoning bool, text string) bool {
+		if isReasoning {
+			reasoning.WriteString(text)
+		} else {
+			content.WriteString(text)
+		}
+		return true
+	}
+	for _, chunk := range []string{"Before <thi", "nk>work it ", "out</th", "ink> after"} {
+		if !s.Push(chunk, emit) {
+			t.Fatal("splitter stopped unexpectedly")
+		}
+	}
+	if !s.Flush(emit) {
+		t.Fatal("splitter flush stopped unexpectedly")
+	}
+	if got := content.String(); got != "Before  after" {
+		t.Fatalf("content = %q", got)
+	}
+	if got := reasoning.String(); got != "work it out" {
+		t.Fatalf("reasoning = %q", got)
+	}
+}
+
+func TestThinkStreamSplitterPreservesIncompleteTagLiterally(t *testing.T) {
+	s := newThinkStreamSplitter(false)
+	var content strings.Builder
+	emit := func(isReasoning bool, text string) bool {
+		if isReasoning {
+			t.Fatalf("unexpected reasoning: %q", text)
+		}
+		content.WriteString(text)
+		return true
+	}
+	if !s.Push("a <thi", emit) || !s.Flush(emit) {
+		t.Fatal("splitter stopped unexpectedly")
+	}
+	if got := content.String(); got != "a <thi" {
+		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestThinkStreamSplitterCanStartInsidePromptThinkBlock(t *testing.T) {
+	s := newThinkStreamSplitter(true)
+	var content, reasoning strings.Builder
+	emit := func(isReasoning bool, text string) bool {
+		if isReasoning {
+			reasoning.WriteString(text)
+		} else {
+			content.WriteString(text)
+		}
+		return true
+	}
+	if !s.Push("work</think>answer", emit) || !s.Flush(emit) {
+		t.Fatal("splitter stopped unexpectedly")
+	}
+	if got := reasoning.String(); got != "work" {
+		t.Fatalf("reasoning = %q", got)
+	}
+	if got := content.String(); got != "answer" {
+		t.Fatalf("content = %q", got)
 	}
 }
 

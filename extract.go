@@ -80,6 +80,74 @@ func extractThink(text string) (content, reasoning string) {
 	return strings.TrimSpace(contentBuf.String()), strings.TrimSpace(strings.Join(reasoningParts, "\n\n"))
 }
 
+// thinkStreamSplitter separates <think> blocks while text is still arriving
+// in arbitrary-sized chunks. Tokens need not align with tags, so a short
+// suffix is retained until it can no longer be the beginning of a marker.
+// It deliberately preserves whitespace: the final GenerationResult remains
+// the canonical trimmed representation, while stream consumers receive each
+// character exactly once.
+type thinkStreamSplitter struct {
+	inReasoning bool
+	pending     string
+}
+
+func newThinkStreamSplitter(initialReasoning bool) thinkStreamSplitter {
+	return thinkStreamSplitter{inReasoning: initialReasoning}
+}
+
+// Push accepts another raw model-text chunk. emit receives whether the text
+// belongs to the reasoning channel; returning false stops processing.
+func (s *thinkStreamSplitter) Push(text string, emit func(reasoning bool, text string) bool) bool {
+	s.pending += text
+	for {
+		marker := "<think>"
+		if s.inReasoning {
+			marker = "</think>"
+		}
+		if i := strings.Index(s.pending, marker); i >= 0 {
+			if i > 0 && !emit(s.inReasoning, s.pending[:i]) {
+				return false
+			}
+			s.pending = s.pending[i+len(marker):]
+			s.inReasoning = !s.inReasoning
+			continue
+		}
+
+		// Keep only the longest suffix that could become a complete marker
+		// when the next token arrives (for example, "<thi").
+		keep := markerPrefixSuffixLen(s.pending, marker)
+		if n := len(s.pending) - keep; n > 0 {
+			if !emit(s.inReasoning, s.pending[:n]) {
+				return false
+			}
+			s.pending = s.pending[n:]
+		}
+		return true
+	}
+}
+
+// Flush emits a final partial marker literally. That mirrors extractThink:
+// incomplete tag text is ordinary content unless it follows an actual
+// opening <think> marker.
+func (s *thinkStreamSplitter) Flush(emit func(reasoning bool, text string) bool) bool {
+	if s.pending == "" {
+		return true
+	}
+	text := s.pending
+	s.pending = ""
+	return emit(s.inReasoning, text)
+}
+
+func markerPrefixSuffixLen(text, marker string) int {
+	maxLen := min(len(text), len(marker)-1)
+	for n := maxLen; n > 0; n-- {
+		if strings.HasSuffix(text, marker[:n]) {
+			return n
+		}
+	}
+	return 0
+}
+
 // extractToolCallsMistral parses Mistral's native tool-calling convention, per
 // its actual gguf chat_template (verified directly against the Ministral
 // model, not just documentation): each call is rendered as

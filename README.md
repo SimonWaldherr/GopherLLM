@@ -576,7 +576,7 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen3,
-gpt-oss, gemma, gemma2, gemma4
+gpt-oss, gemma, gemma2, gemma4, nemotron_h, nemotron_h_moe
 ```
 
 qwen3 (including the DeepSeek-R1 Qwen3 distills) adds per-head QK-norm on top
@@ -590,6 +590,12 @@ leaves the turn open so generation continues it.
 Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
 scaling when the GGUF declares it.
+
+`nemotron_h_moe` is the native hybrid Mamba-2 / attention / sparse-MoE graph
+used by Soofi S Isar. It retains Mamba convolution and SSM state locally and
+does not rely on a llama.cpp process. Prompt prefill is deliberately
+per-token for this architecture because its recurrent state makes the regular
+batched transformer prefill invalid.
 
 Gemma-family support (`gemma`/`gemma2`/`gemma4`, including the Gemma QAT
 GGUFs) is **experimental**: the dense Gemma graph is implemented — hardcoded

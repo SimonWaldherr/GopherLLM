@@ -1015,9 +1015,10 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 // winning turn and calls onToken once with the final, already-classified
 // content, so raw tool-call syntax never leaks into a content delta (see
 // RunAgenticChat's doc comment). Either way, the connection ends with one
-// terminal chunk carrying finish_reason, usage, and — when present —
-// reasoning_content and tool_calls, computed from the authoritative final
-// GenerationResult rather than reconstructed from what was streamed.
+// terminal chunk carrying finish_reason, usage, and tool_calls. <think>
+// reasoning is separated into reasoning_content deltas as soon as its tokens
+// arrive; the final GenerationResult remains authoritative for tool calls and
+// for the buffered agentic path.
 func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1036,31 +1037,52 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	}
 
 	var streamErr error
+	// Soofi Isar's native template opens <think> in the prompt, so its first
+	// generated characters are reasoning and the first marker received is the
+	// closing tag. Other models emit the opening marker themselves.
+	thinkSplitter := newThinkStreamSplitter(r.arch == "nemotron_h_moe")
+	streamedReasoning := false
+	emit := func(reasoning bool, text string) bool {
+		if text == "" {
+			return true
+		}
+		field := "content"
+		if reasoning {
+			field = "reasoning_content"
+			streamedReasoning = true
+		}
+		if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{field: text}, nil); err != nil {
+			streamErr = err
+			return false
+		}
+		return true
+	}
 	result, err := RunAgenticChat(r, messages, options, skills, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
 		}
-		if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{"content": text}, nil); err != nil {
-			streamErr = err
-			return false
-		}
-		return true
+		return thinkSplitter.Push(text, emit)
 	})
 	if streamErr != nil {
 		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, streamErr)
 		return
 	}
-	logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, err)
 	if err != nil {
+		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, err)
 		if errors.Is(err, ErrGenerationCanceled) {
 			return
 		}
 		writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
 		return
 	}
+	if !thinkSplitter.Flush(emit) {
+		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, streamErr)
+		return
+	}
+	logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, nil)
 	finalDelta := map[string]any{}
-	if result.ReasoningText != "" {
+	if result.ReasoningText != "" && !streamedReasoning {
 		finalDelta["reasoning_content"] = result.ReasoningText
 	}
 	if len(result.ToolCalls) > 0 {

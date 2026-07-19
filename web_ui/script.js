@@ -108,6 +108,55 @@ function prettyJSON(v) {
   try { return JSON.stringify(JSON.parse(v), null, 2); } catch (_) { return v; }
 }
 
+/* Split DeepSeek/QwQ-style thought blocks from visible text. The server now
+   streams reasoning_content separately, but this remains a compatibility
+   fallback for older servers and interrupted streams. */
+function splitThinkText(raw) {
+  const openTag = "<think>";
+  const closeTag = "</think>";
+  let rest = raw || "";
+  let answer = "";
+  const reasoning = [];
+  let hasThink = false;
+  let isThinking = false;
+
+  // Some templates place <think> in the prompt, so generation starts inside
+  // the block and its first marker is a closing tag.
+  const firstClose = rest.indexOf(closeTag);
+  const firstOpen = rest.indexOf(openTag);
+  if (firstClose >= 0 && (firstOpen < 0 || firstClose < firstOpen)) {
+    hasThink = true;
+    reasoning.push(rest.slice(0, firstClose));
+    rest = rest.slice(firstClose + closeTag.length);
+  }
+
+  while (true) {
+    const openAt = rest.indexOf(openTag);
+    if (openAt < 0) {
+      answer += rest;
+      break;
+    }
+    hasThink = true;
+    answer += rest.slice(0, openAt);
+    rest = rest.slice(openAt + openTag.length);
+    const closeAt = rest.indexOf(closeTag);
+    if (closeAt < 0) {
+      reasoning.push(rest);
+      isThinking = true;
+      break;
+    }
+    reasoning.push(rest.slice(0, closeAt));
+    rest = rest.slice(closeAt + closeTag.length);
+  }
+
+  return {
+    answer: answer.trim(),
+    reasoning: reasoning.join("\n\n").trim(),
+    hasThink,
+    isThinking
+  };
+}
+
 (function initChat() {
   const form          = document.getElementById("form");
   const promptEl      = document.getElementById("prompt");
@@ -241,25 +290,39 @@ function prettyJSON(v) {
     return el;
   }
 
+  function upsertReasoning(el, text, isThinking) {
+    let details = el.querySelector(":scope > .reasoning");
+    if (!text && !isThinking) {
+      if (details) details.remove();
+      return;
+    }
+    if (!details) {
+      details = document.createElement("details");
+      details.className = "reasoning";
+      const summary = document.createElement("summary");
+      const body = document.createElement("div");
+      body.className = "reasoning-body";
+      details.appendChild(summary);
+      details.appendChild(body);
+      el.insertBefore(details, el.querySelector(".content"));
+    }
+    details.classList.toggle("reasoning-live", isThinking);
+    details.querySelector("summary").textContent = isThinking ? "Thinking…" : "Reasoning";
+    details.querySelector(".reasoning-body").textContent = text;
+  }
+
   /* Finalizes an assistant bubble: reasoning block, markdown content,
      tool-call cards, and a subtle stats line. */
   function finalizeAssistant(el, result) {
     const content = el.querySelector(".content");
     content.classList.remove("streaming");
-    el.dataset.raw = result.answer || "";
-
-    if (result.reasoning) {
-      const details = document.createElement("details");
-      details.className = "reasoning";
-      const summary = document.createElement("summary");
-      summary.textContent = "Reasoning";
-      const body = document.createElement("div");
-      body.className = "reasoning-body";
-      body.textContent = result.reasoning;
-      details.appendChild(summary);
-      details.appendChild(body);
-      el.insertBefore(details, content);
-    }
+    const parsed = splitThinkText(result.answer || "");
+    // Prefer the server's final structured field, but still extract the
+    // streamed raw text so it cannot be rendered as a second answer.
+    result.answer = parsed.hasThink ? parsed.answer : (result.answer || "");
+    result.reasoning = result.reasoning || parsed.reasoning;
+    el.dataset.raw = result.answer;
+    upsertReasoning(el, result.reasoning, false);
 
     const toolCalls = result.toolCalls || [];
     if (result.answer) {
@@ -322,8 +385,8 @@ function prettyJSON(v) {
 
   /* ── SSE stream reader ──
      Collects content deltas plus everything the terminal chunk carries:
-     finish_reason and usage live on choices[0]; reasoning_content and
-     tool_calls arrive in the final delta. */
+     finish_reason and usage live on choices[0]; content and
+     reasoning_content may arrive independently in any delta. */
   async function readChatStream(response, onToken) {
     if (!response.body) throw new Error("Streaming response has no body");
     const reader = response.body.getReader();
@@ -341,11 +404,14 @@ function prettyJSON(v) {
       if (choice.finish_reason) out.finishReason = choice.finish_reason;
       if (choice.usage) out.usage = choice.usage;
       const delta = choice.delta || {};
-      if (delta.reasoning_content) out.reasoning += delta.reasoning_content;
+      if (delta.reasoning_content) {
+        out.reasoning += delta.reasoning_content;
+        onToken(out.answer, out.reasoning, true);
+      }
       if (delta.tool_calls) out.toolCalls = (out.toolCalls || []).concat(delta.tool_calls);
       if (delta.content) {
         out.answer += delta.content;
-        onToken(out.answer);
+        onToken(out.answer, out.reasoning, false);
       }
     }
 
@@ -425,23 +491,31 @@ function prettyJSON(v) {
     const startedAt = performance.now();
     let firstTokenAt = 0;
     let latest = "";
+    let latestReasoning = "";
+    let latestIsThinking = false;
+    let streamFinished = false;
     let renderPending = false;
     // Streamed chunks are painted as plain text at most once per animation
     // frame (re-rendering the whole Markdown tree per token was the observed
     // bottleneck); full Markdown rendering happens once, after the stream.
-    function onToken(answer) {
-      latest = answer;
-      assistantEl.dataset.raw = answer;
+    function onToken(rawAnswer, streamedReasoning = "", streamedIsThinking = false) {
+      const display = splitThinkText(rawAnswer);
+      latest = display.answer;
+      latestReasoning = streamedReasoning || display.reasoning;
+      latestIsThinking = streamedIsThinking || display.isThinking;
+      assistantEl.dataset.raw = latest;
       if (!firstTokenAt) {
         firstTokenAt = performance.now();
-        setStatus("Generating…");
         contentEl.classList.add("streaming");
       }
+      setStatus(display.isThinking ? "Thinking…" : "Generating…");
       if (renderPending) return;
       renderPending = true;
       requestAnimationFrame(() => {
         renderPending = false;
+        if (streamFinished) return;
         contentEl.textContent = latest;
+        upsertReasoning(assistantEl, latestReasoning, latestIsThinking);
         scrollToBottom(false);
       });
     }
@@ -483,17 +557,19 @@ function prettyJSON(v) {
           finishReason: choice.finish_reason || ""
         };
       }
+      streamFinished = true;
       result.decodeMS = (firstTokenAt ? performance.now() - firstTokenAt : performance.now() - startedAt);
       finalizeAssistant(assistantEl, result);
       const assistantMessage = { role: "assistant", content: result.answer };
       if (result.toolCalls && result.toolCalls.length) assistantMessage.tool_calls = result.toolCalls;
       history.push(userMessage, assistantMessage);
     } catch (err) {
+      streamFinished = true;
       const partial = assistantEl.dataset.raw || "";
       if (err.name === "AbortError") {
         if (partial) {
           finalizeAssistant(assistantEl, {
-            answer: partial, reasoning: "", toolCalls: null, usage: null,
+            answer: partial, reasoning: latestReasoning, toolCalls: null, usage: null,
             finishReason: "stopped", decodeMS: 0
           });
           history.push(userMessage, { role: "assistant", content: partial });
@@ -504,7 +580,7 @@ function prettyJSON(v) {
       } else {
         if (partial) {
           finalizeAssistant(assistantEl, {
-            answer: partial, reasoning: "", toolCalls: null, usage: null,
+            answer: partial, reasoning: latestReasoning, toolCalls: null, usage: null,
             finishReason: "interrupted", decodeMS: 0
           });
           history.push(userMessage, { role: "assistant", content: partial });

@@ -295,6 +295,20 @@ kbd {
   list-style-position: inside;
 }
 .reasoning summary:hover { color: var(--ink); }
+.reasoning.reasoning-live {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+.reasoning.reasoning-live summary::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+  vertical-align: middle;
+}
 .reasoning-body {
   padding: 2px 12px 10px;
   white-space: pre-wrap;

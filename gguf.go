@@ -293,6 +293,28 @@ func (v MetaValue) AsF32Array() ([]float32, bool) {
 	return out, true
 }
 
+// AsU32Array decodes an integer metadata array. GGUF writers use different
+// integer widths for per-layer architecture fields, so accept every value
+// that AsU32 accepts.
+func (v MetaValue) AsU32Array() ([]uint32, bool) {
+	if a, ok := v.Value.([]uint32); ok {
+		return a, true
+	}
+	arr, ok := v.Value.([]MetaValue)
+	if !ok {
+		return nil, false
+	}
+	out := make([]uint32, len(arr))
+	for i, item := range arr {
+		n, ok := item.AsU32()
+		if !ok {
+			return nil, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
 // TensorInfo describes one tensor from the GGUF header. Dims follow GGUF's
 // convention of fastest-varying dimension first, so for a 2-D weight
 // Dims[0] is the input (column) count and Dims[1] the output (row) count.
@@ -321,6 +343,15 @@ type GGUFFile struct {
 	Tensors    []TensorInfo
 	DataOffset int
 	Version    uint32
+}
+
+// GetU32Array returns an integer metadata array, if present.
+func (g *GGUFFile) GetU32Array(key string) ([]uint32, bool) {
+	v, ok := g.Metadata[key]
+	if !ok {
+		return nil, false
+	}
+	return v.AsU32Array()
 }
 
 // ParseGGUF parses a GGUF header, logging a one-line summary to stderr.

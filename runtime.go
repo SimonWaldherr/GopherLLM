@@ -184,6 +184,7 @@ const (
 	loadedStandard loadedKind = iota
 	loadedGptOss
 	loadedGemma4
+	loadedNemotronH
 )
 
 // Runner is a fully loaded model ready to generate: parsed GGUF header,
@@ -201,6 +202,7 @@ type Runner struct {
 	standard       ModelWeights
 	gptOss         GptOssWeights
 	gemma4         Gemma4Weights
+	nemotronH      NemotronHWeights
 	genLock        sync.Mutex
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
@@ -221,7 +223,7 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen3", "gpt-oss", "gemma", "gemma2", "gemma4":
+		"qwen2", "qwen3", "gpt-oss", "gemma", "gemma2", "gemma4", "nemotron_h", "nemotron_h_moe":
 		return true
 	default:
 		return false
@@ -271,6 +273,12 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 	}
 	r := &Runner{gguf: gguf, arch: arch, tok: tok}
 	switch arch {
+	case "nemotron_h", "nemotron_h_moe":
+		config, weights, err := LoadNemotronHModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		if err != nil {
+			return nil, err
+		}
+		r.config, r.nemotronH, r.kind = config, weights, loadedNemotronH
 	case "gpt-oss":
 		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
 		if err != nil {
@@ -589,6 +597,11 @@ func validUTF8PrefixLen(b []byte) int {
 }
 
 func (r *Runner) cacheDims() (int, int, int, int, int) {
+	if r.kind == loadedNemotronH {
+		// Soofi uses a shared attention shape on its six attention blocks;
+		// Mamba/MoE blocks have no K/V entries but retain their layer index.
+		return r.config.NKVHeads * r.config.HeadDim, r.config.KVDim, r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
+	}
 	if r.kind == loadedGemma4 {
 		maxHD, maxKV, maxVal := r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
 		for _, l := range r.gemma4.Layers {
@@ -624,6 +637,14 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 			r.workspaceCache = cache
 		}
 	}
+	if r.kind == loadedNemotronH {
+		if !cache.Nemotron.compatible(r.config) {
+			cache.Nemotron = newNemotronHCache(r.config)
+		}
+		// Unlike attention K/V, recurrent state is read before a position can
+		// overwrite it, so a reused workspace must start every request at zero.
+		cache.Nemotron.reset()
+	}
 	if r.workspaceBuf == nil {
 		r.workspaceBuf = NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
 	}
@@ -632,6 +653,8 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 
 func (r *Runner) forwardTokenInto(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) {
 	switch r.kind {
+	case loadedNemotronH:
+		ForwardNemotronHInto(r.config, r.nemotronH, cache, buf, token, pos, logits)
 	case loadedGptOss:
 		ForwardGptOssInto(r.config, r.gptOss, cache, buf, token, pos, logits)
 	case loadedGemma4:
@@ -650,6 +673,12 @@ func (r *Runner) canGreedyOutputFastPath(options GenerationOptions) bool {
 
 func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) (uint32, bool) {
 	switch r.kind {
+	case loadedNemotronH:
+		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
+		if next, ok := argmaxOutputTokenInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, logits); ok {
+			return next, true
+		}
+		ProjectLogitsInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, logits)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenInto(r.config, r.gptOss.Standard, buf, logits); ok {
@@ -674,6 +703,8 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 
 func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {
 	switch r.kind {
+	case loadedNemotronH:
+		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
@@ -757,6 +788,8 @@ func prefillChunkSize(config Config) int {
 
 func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {
 	switch r.kind {
+	case loadedNemotronH:
+		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
 	case loadedGptOss:
 		ForwardPrefill(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
@@ -818,6 +851,12 @@ func (r *Runner) isStopToken(token uint32) bool {
 func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) []uint32 {
 	if r.arch == "gpt-oss" {
 		return r.renderGptOssMessages(messages, systemPrompt)
+	}
+	if r.arch == "nemotron_h_moe" {
+		generic, genericSystem := injectGenericTools(messages, systemPrompt, tools)
+		if tokens, ok := r.renderSoofiIsarMessages(generic, genericSystem); ok {
+			return tokens
+		}
 	}
 	if r.chatTemplateKind() == "mistral-inst" {
 		if tokens, ok := r.renderMistralInstMessages(messages, systemPrompt, tools); ok {
@@ -1240,6 +1279,46 @@ func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt strin
 	}
 	tokens = append(tokens, imStart)
 	tokens = append(tokens, r.tok.EncodeWithoutBOS("assistant\n")...)
+	return tokens, true
+}
+
+// renderSoofiIsarMessages mirrors the text-only portion of the embedded
+// Soofi-S-Isar Jinja template. In particular, it provides the model identity
+// prompt and deliberately opens the assistant's <think> section; generic
+// ChatML would omit both and produces a markedly weaker, non-reasoning turn.
+func (r *Runner) renderSoofiIsarMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	imStart, ok1 := r.tok.SpecialID("<|im_start|>")
+	imEnd, ok2 := r.tok.SpecialID("<|im_end|>")
+	if !(ok1 && ok2) {
+		return nil, false
+	}
+	const defaultSystem = "You are Soofi (Sovereign Open Source Foundation Models), an open-source AI assistant built for reasoning, developed by a German research consortium.\n\nArchitecture: Hybrid Mixture-of-Experts (MoE) with 23 Mamba-2/MoE layers and 6 Attention layers. 128 experts + 1 shared expert per MoE layer, 6 activated per token. 3.5B active parameters, 30B total.\n\nTraining: Trained from scratch on 25 trillion freely available tokens. Primary languages: English and German. Limited capability in French, Italian, and Spanish. English is the pivot language.\n\nBehaviour:\n- Answer identity questions naturally as Soofi.\n- For non-identity questions, respond normally and helpfully.\n- Match the language the user writes in.\n- Knowledge cutoff: 2025-12"
+	tokens := []uint32{}
+	appendTurn := func(role, content string, close bool) {
+		tokens = append(tokens, imStart)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(role+"\n"+strings.TrimSpace(content))...)
+		if close {
+			tokens = append(tokens, imEnd)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+		}
+	}
+	appendTurn("system", strings.TrimSpace(defaultSystem+"\n\n"+systemPrompt), true)
+	for _, message := range messages {
+		role := "user"
+		if message.Role == ChatRoleAssistant {
+			role = "assistant"
+			// The Isar template keeps a closed empty thought section in history
+			// when callers supplied only visible assistant content.
+			if !strings.Contains(message.Content, "<think>") && !strings.Contains(message.Content, "</think>") {
+				message.Content = "<think></think>" + message.Content
+			}
+		} else if message.Role == ChatRoleSystem {
+			role = "system"
+		}
+		appendTurn(role, message.Content, true)
+	}
+	tokens = append(tokens, imStart)
+	tokens = append(tokens, r.tok.EncodeWithoutBOS("assistant\n<think>\n")...)
 	return tokens, true
 }
 
