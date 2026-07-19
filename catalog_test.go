@@ -153,8 +153,8 @@ func TestCatalogHelpers(t *testing.T) {
 	if got := modelMenuIndex(entries, ModelEntry{ID: "missing"}); got != 0 {
 		t.Fatalf("missing modelMenuIndex = %d", got)
 	}
-	if got := modelDirFromEntries(entries); got != "/models" {
-		t.Fatalf("modelDirFromEntries = %q", got)
+	if want, got := filepath.Dir(entries[0].Path), modelDirFromEntries(entries); got != want {
+		t.Fatalf("modelDirFromEntries = %q, want %q", got, want)
 	}
 	if got := modelDirFromEntries(nil); got != "the model directory" {
 		t.Fatalf("empty modelDirFromEntries = %q", got)
