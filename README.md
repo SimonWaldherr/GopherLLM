@@ -295,7 +295,7 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | POST | `/api/chat` | Ollama-compatible chat (accepts tools) |
 | POST | `/api/embeddings` | Ollama-compatible embeddings |
 | GET | `/models` | Scan `--model-dir` and list all discovered GGUFs |
-| POST | `/models/load` | Hot-swap the loaded model (`{"path": "..."}`) |
+| POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; a catalog path remains accepted for older clients) |
 | GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |
 
 ## Tool Use / Agentic

@@ -117,6 +117,34 @@ func TestGenerationWorkspaceReusesAndGrowsBuffers(t *testing.T) {
 	}
 }
 
+func TestGenerationCacheLenCapsBeforeMaxTokensCanOverflow(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	if got := generationCacheLen(1024, 128, maxInt); got != 1024 {
+		t.Fatalf("overflow-safe cache len = %d, want 1024", got)
+	}
+	if got := generationCacheLen(1024, 128, 5); got != 134 {
+		t.Fatalf("ordinary cache len = %d, want 134", got)
+	}
+}
+
+func TestRecentTokenWindowKeepsOnlyTrailingTokens(t *testing.T) {
+	tokens := make([]uint32, repeatPenaltyWindow+8)
+	for i := range tokens {
+		tokens[i] = uint32(i)
+	}
+	recent := recentTokenWindow(tokens)
+	if len(recent) != repeatPenaltyWindow {
+		t.Fatalf("window length = %d, want %d", len(recent), repeatPenaltyWindow)
+	}
+	if recent[0] != 8 || recent[len(recent)-1] != uint32(len(tokens)-1) {
+		t.Fatalf("window = %v...%v, want 8...%d", recent[0], recent[len(recent)-1], len(tokens)-1)
+	}
+	tokens[len(tokens)-1] = 999
+	if recent[len(recent)-1] == 999 {
+		t.Fatal("recent window aliases the full prompt token slice")
+	}
+}
+
 func TestValidUTF8PrefixLenKeepsIncompleteRuneBuffered(t *testing.T) {
 	b := []byte{'H', 'i', ' ', 0xe2, 0x82}
 	if got := validUTF8PrefixLen(b); got != 3 {

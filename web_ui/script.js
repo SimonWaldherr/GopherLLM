@@ -212,7 +212,7 @@ function splitThinkText(raw) {
       modelSelectEl.innerHTML = "";
       for (const m of models) {
         const opt = document.createElement("option");
-        opt.value = m.path;
+        opt.value = m.id;
         const label = m.name || m.id;
         const arch = m.architecture ? ` [${m.architecture}]` : "";
         const size = m.size_gb ? ` — ${m.size_gb.toFixed(1)} GB` : "";
@@ -235,8 +235,8 @@ function splitThinkText(raw) {
   }
 
   modelSelectEl.addEventListener("change", async () => {
-    const path = modelSelectEl.value;
-    if (!path || busy) return;
+    const model = modelSelectEl.value;
+    if (!model || busy) return;
     const prev = [...modelSelectEl.options].find((o) => o.dataset.loaded === "true")?.value || "";
     modelSelectEl.disabled = true;
     setStatus("Loading model…");
@@ -245,7 +245,7 @@ function splitThinkText(raw) {
       const res = await fetch("/models/load", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path })
+        body: JSON.stringify({ model })
       });
       if (!res.ok) {
         const err = await res.text();
@@ -258,7 +258,7 @@ function splitThinkText(raw) {
       setModelName(data.model);
       setStatus("Ready — " + (data.model || "model loaded"));
       [...modelSelectEl.options].forEach((o) => delete o.dataset.loaded);
-      const loaded = [...modelSelectEl.options].find((o) => o.value === path);
+      const loaded = [...modelSelectEl.options].find((o) => o.value === model);
       if (loaded) loaded.dataset.loaded = "true";
     } catch (err) {
       setStatus("Error loading model");

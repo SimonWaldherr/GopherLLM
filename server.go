@@ -84,8 +84,9 @@ type HandlerOptions struct {
 	MaxConcurrentRequests int
 	// ChatUI serves the embedded browser chat at /chat (plus its assets).
 	ChatUI bool
-	// ModelDir enables GET /models discovery and POST /models/load hot-swap
-	// within that directory.
+	// ModelDir enables GET /models discovery and POST /models/load hot-swap.
+	// A load request is resolved against this directory's discovered,
+	// supported GGUF files; arbitrary filesystem paths are never loaded.
 	ModelDir string
 	// ModelPath is the initially loaded model's path (reported by /models).
 	ModelPath string
@@ -96,6 +97,24 @@ type HandlerOptions struct {
 	// LogWriter receives handler diagnostics (skill load notes). Defaults to
 	// io.Discard.
 	LogWriter io.Writer
+}
+
+// modelLoadRequest accepts the model catalog ID used by the browser UI and
+// API clients. Path remains for compatibility with older clients, but is
+// treated only as a selector for a model already discovered in ModelDir.
+type modelLoadRequest struct {
+	Model string `json:"model"`
+	ID    string `json:"id"`
+	Path  string `json:"path"`
+}
+
+func (r modelLoadRequest) selector() string {
+	for _, value := range []string{r.Model, r.ID, r.Path} {
+		if selector := strings.TrimSpace(value); selector != "" {
+			return selector
+		}
+	}
+	return ""
 }
 
 // ServeOptions is HandlerOptions plus the listen address, for the Serve
@@ -151,6 +170,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 	if logw == nil {
 		logw = io.Discard
 	}
+	opts.ModelDir = strings.TrimSpace(opts.ModelDir)
 	if opts.MaxConcurrentRequests <= 0 {
 		opts.MaxConcurrentRequests = 8
 	}
@@ -481,24 +501,37 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		var body struct {
-			Path string `json:"path"`
+		if opts.ModelDir == "" {
+			http.Error(w, "model hot-swap is disabled: configure HandlerOptions.ModelDir", http.StatusNotFound)
+			return
 		}
+		var body modelLoadRequest
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if body.Path == "" {
-			http.Error(w, "missing path", http.StatusBadRequest)
+		selector := body.selector()
+		if selector == "" {
+			http.Error(w, "missing model selector", http.StatusBadRequest)
 			return
 		}
-		newRunner, _, err := RunnerFromPath(body.Path)
+		entries, err := DiscoverModels(opts.ModelDir, io.Discard)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		entry, err := SelectModel(entries, selector)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		state.swap(newRunner, body.Path)
-		writeJSON(w, map[string]any{"ok": true, "model": modelID(newRunner)})
+		newRunner, _, err := RunnerFromPath(entry.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		state.swap(newRunner, entry.Path)
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner)})
 	}))
 	if opts.ChatUI {
 		mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -916,7 +949,11 @@ func firstStop(a, b any) any {
 
 func withLimit(sem chan struct{}, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-r.Context().Done():
+			return
+		}
 		defer func() { <-sem }()
 		h(w, r)
 	}

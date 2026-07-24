@@ -17,6 +17,12 @@ import (
 
 var ErrGenerationCanceled = errors.New("generation canceled")
 
+// repeatPenaltyWindow bounds the prompt and output history considered by the
+// sampler's repeat penalty. Keeping the same window from the first sampled
+// token avoids a long-prompt allocation and an O(prompt length) first-token
+// penalty pass.
+const repeatPenaltyWindow = 64
+
 type EmbeddingResult struct {
 	Embedding  []float32
 	TokenCount int
@@ -432,14 +438,17 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if len(tokens) == 0 {
 		return GenerationResult{}, fmt.Errorf("prompt rendered to zero tokens")
 	}
+	if r.config.MaxSeqLen <= 0 {
+		return GenerationResult{}, fmt.Errorf("model has an invalid context length (%d)", r.config.MaxSeqLen)
+	}
 	// The KV cache is sized to r.config.MaxSeqLen; without this check a prompt
 	// at or beyond that length (easily reached once a request injects a large
 	// tool listing) would silently overflow it deeper in the forward pass
 	// instead of failing here with a clear error.
-	if r.config.MaxSeqLen > 0 && len(tokens) >= r.config.MaxSeqLen {
+	if len(tokens) >= r.config.MaxSeqLen {
 		return GenerationResult{}, fmt.Errorf("prompt (%d tokens) leaves no room to generate within the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
-	cacheLen := min(r.config.MaxSeqLen, len(tokens)+options.MaxTokens+1)
+	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
 	cache, buf := r.generationWorkspace(cacheLen)
 	seed := options.Seed
 	if seed == 0 {
@@ -507,7 +516,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return true
 	}
 	generated := []uint32{}
-	recent := append([]uint32(nil), tokens...)
+	recent := recentTokenWindow(tokens)
 	pos := len(tokens)
 	finishReason := "length"
 	greedyFastPath := r.canGreedyOutputFastPath(options)
@@ -563,8 +572,8 @@ decode:
 		}
 		generated = append(generated, token)
 		recent = append(recent, token)
-		if len(recent) > 64 {
-			recent = recent[len(recent)-64:]
+		if len(recent) > repeatPenaltyWindow {
+			recent = recent[len(recent)-repeatPenaltyWindow:]
 		}
 		if len(generated) >= options.MaxTokens || pos >= cacheLen {
 			break
@@ -582,6 +591,23 @@ decode:
 		return buildResult(), ErrGenerationCanceled
 	}
 	return buildResult(), nil
+}
+
+// generationCacheLen returns the cache length for a prompt with a positive
+// model context. It performs the context cap before adding MaxTokens so an
+// untrusted large max_tokens value cannot overflow an int and turn into a
+// negative cache allocation.
+func generationCacheLen(maxSeqLen, promptTokens, maxTokens int) int {
+	remaining := maxSeqLen - promptTokens
+	if maxTokens >= remaining-1 {
+		return maxSeqLen
+	}
+	return promptTokens + maxTokens + 1
+}
+
+func recentTokenWindow(tokens []uint32) []uint32 {
+	start := max(0, len(tokens)-repeatPenaltyWindow)
+	return append([]uint32(nil), tokens[start:]...)
 }
 
 func validUTF8PrefixLen(b []byte) int {

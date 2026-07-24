@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestNewHandlerServesEndToEnd mounts the handler on an httptest server (no
@@ -94,6 +97,124 @@ func TestNewHandlerMountsUnderPrefix(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("prefixed health status = %d", resp.StatusCode)
+	}
+}
+
+func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
+	modelDir := t.TempDir()
+	allowedPath := filepath.Join(modelDir, "catalog", "allowed.gguf")
+	if err := os.MkdirAll(filepath.Dir(allowedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(allowedPath, buildTinyLlamaGGUF(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsidePath := filepath.Join(t.TempDir(), "outside.gguf")
+	if err := os.WriteFile(outsidePath, buildTinyLlamaGGUF(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	runner, _, err := RunnerFromPath(allowedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Close()
+	srv := httptest.NewServer(NewHandler(runner, HandlerOptions{
+		ModelDir:  " " + modelDir + " ", // whitespace is normalized at the boundary.
+		ModelPath: allowedPath,
+	}))
+	defer srv.Close()
+
+	post := func(payload map[string]string) *http.Response {
+		t.Helper()
+		body, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(srv.URL+"/models/load", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := post(map[string]string{"path": outsidePath})
+	if resp.StatusCode != http.StatusBadRequest {
+		body := readAll(t, resp)
+		t.Fatalf("outside model status = %d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Get(srv.URL + "/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed struct {
+		Models []struct {
+			ID     string `json:"id"`
+			Loaded bool   `json:"loaded"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if len(listed.Models) != 1 || listed.Models[0].ID != filepath.Join("catalog", "allowed") || !listed.Models[0].Loaded {
+		t.Fatalf("catalog after rejected load = %+v", listed.Models)
+	}
+
+	resp = post(map[string]string{"model": filepath.Join("catalog", "allowed")})
+	if resp.StatusCode != http.StatusOK {
+		body := readAll(t, resp)
+		t.Fatalf("catalog id load status = %d body=%s", resp.StatusCode, body)
+	}
+	var loaded struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&loaded); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if loaded.ID != filepath.Join("catalog", "allowed") {
+		t.Fatalf("loaded id = %q", loaded.ID)
+	}
+
+	// Older clients send a path. It remains supported only when it resolves
+	// to an entry in the configured catalog.
+	resp = post(map[string]string{"path": allowedPath})
+	if resp.StatusCode != http.StatusOK {
+		body := readAll(t, resp)
+		t.Fatalf("catalog path load status = %d body=%s", resp.StatusCode, body)
+	}
+	resp.Body.Close()
+}
+
+func TestWithLimitStopsWaitingWhenRequestIsCanceled(t *testing.T) {
+	sem := make(chan struct{}, 1)
+	sem <- struct{}{}
+	called := make(chan struct{})
+	handler := withLimit(sem, func(http.ResponseWriter, *http.Request) {
+		close(called)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("limited handler kept waiting after request cancellation")
+	}
+	select {
+	case <-called:
+		t.Fatal("limited handler ran after request cancellation")
+	default:
 	}
 }
 
