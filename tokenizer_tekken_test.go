@@ -29,6 +29,24 @@ func TestPretokenizeTekken(t *testing.T) {
 	}
 }
 
+func TestTokenizerModeDetectsTekken(t *testing.T) {
+	// A Tekken GGUF whose tokenizer.ggml.model is not literally "gpt2" must
+	// still be classified as GPT2BPE — otherwise it falls through to
+	// SentencePiece and mis-tokenizes.
+	meta := map[string]MetaValue{
+		"tokenizer.ggml.tokens": {Kind: "arr", Value: []string{"<unk>", "<s>", "</s>"}},
+		"tokenizer.ggml.model":  {Kind: "str", Value: "llama"},
+		"tokenizer.ggml.pre":    {Kind: "str", Value: "tekken"},
+	}
+	tok, err := TokenizerFromMetadata(meta)
+	if err != nil {
+		t.Fatalf("TokenizerFromMetadata: %v", err)
+	}
+	if tok.Mode != TokenizerGPT2BPE {
+		t.Fatalf("Mode = %v, want TokenizerGPT2BPE for a tekken pre-tokenizer", tok.Mode)
+	}
+}
+
 func TestPretokenizeDispatch(t *testing.T) {
 	tek := &Tokenizer{Pre: "tekken"}
 	if got := tek.pretokenize("a1"); !reflect.DeepEqual(got, []string{"a", "1"}) {

@@ -90,7 +90,11 @@ func TokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
 	}
 	mode := TokenizerSentencePiece
 	preLower := strings.ToLower(pre)
-	if strings.EqualFold(model, "gpt2") || strings.Contains(preLower, "qwen") || strings.Contains(preLower, "gpt") {
+	// Tekken (Mistral/Ministral) is a GPT-2 BPE family whose pre-tokenizer path
+	// keys on Pre containing "tekken"; classify it as GPT2BPE explicitly rather
+	// than relying on model being literally "gpt2", which not every Tekken GGUF
+	// sets — otherwise it would silently fall through to SentencePiece.
+	if strings.EqualFold(model, "gpt2") || strings.Contains(preLower, "qwen") || strings.Contains(preLower, "gpt") || strings.Contains(preLower, "tekken") {
 		mode = TokenizerGPT2BPE
 	}
 	enc, dec := buildByteMaps()
