@@ -240,6 +240,30 @@ type tunerConfig struct {
 	prefillChunk int
 }
 
+// RuntimeTuning is an opaque snapshot of the process-wide runtime knobs that
+// Auto Mode may change. Hosts that tune after initialization can capture it
+// first and restore it when switching to an uncalibrated model.
+//
+// The snapshot deliberately includes the raw prefill override rather than its
+// resolved value, preserving environment and model-aware defaults on restore.
+type RuntimeTuning struct {
+	config tunerConfig
+	valid  bool
+}
+
+// CaptureRuntimeTuning captures the current process-wide runtime settings.
+func CaptureRuntimeTuning() RuntimeTuning {
+	return RuntimeTuning{config: captureTunerConfig(Config{}), valid: true}
+}
+
+// Apply restores a captured runtime tuning. The zero value is a no-op so
+// callers may safely leave an optional baseline unset.
+func (t RuntimeTuning) Apply() {
+	if t.valid {
+		t.config.apply()
+	}
+}
+
 func captureTunerConfig(Config) tunerConfig {
 	return tunerConfig{
 		threads:       numThreads(),
@@ -831,11 +855,13 @@ func medianFloat(v []float64) float64 {
 // runs only when both the model geometry/quantization and the hardware match.
 func (r *Runner) autoTuneKey() string {
 	h := sha256.New()
-	fmt.Fprintf(h, "v1|%s|%s|dim=%d|layers=%d|heads=%d/%d|hidden=%d|vocab=%d|out=%v|embd=%v|%s",
+	fmt.Fprintf(h, "v1|%s|%s|dim=%d|layers=%d|heads=%d/%d|hidden=%d|vocab=%d|out=%v|embd=%v|metal=%t|prepared=%t|%s",
 		r.arch, hostFingerprint(),
 		r.config.Dim, r.config.NLayers, r.config.NHeads, r.config.NKVHeads,
 		r.config.HiddenDim, r.config.VocabSize,
-		r.standard.Output.Type, r.standard.TokenEmbd.Type, quantMixFingerprint(r))
+		r.standard.Output.Type, r.standard.TokenEmbd.Type,
+		r.standard.Output.Metal != nil, r.standard.Output.Prepared != nil,
+		quantMixFingerprint(r))
 	return hex.EncodeToString(h.Sum(nil))[:24]
 }
 
@@ -893,6 +919,41 @@ func SaveAutoTune(res AutoTuneResult) error {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+// ValidAutoTuneEffort reports whether effort is an accepted public calibration
+// level. An empty value means the default balanced profile.
+func ValidAutoTuneEffort(effort string) bool {
+	switch effort {
+	case "", "quick", "balanced", "thorough":
+		return true
+	default:
+		return false
+	}
+}
+
+// AutoTuneOptionsForEffort maps a calibration effort level onto AutoTuneOptions.
+// It is the single source of truth for what "quick", "balanced", and
+// "thorough" mean, shared by the CLI's --auto-effort flag and the HTTP API's
+// POST /autotune/run so the two surfaces can never silently drift apart.
+// Unrecognized values (including "") fall back to "balanced".
+//
+// Measured on a 3B Q4_K_M model: quick ~10-20s, balanced ~75s, thorough
+// several minutes. The extra time buys interleaved rounds, which is exactly
+// what helps on a machine whose clock swings under sustained load.
+func AutoTuneOptionsForEffort(effort string) AutoTuneOptions {
+	switch effort {
+	case "quick":
+		// Decode knobs only: a prefill sample costs a whole chunk of prompt
+		// processing, which is seconds on a multi-billion-parameter model.
+		return AutoTuneOptions{Rounds: 2, DecodeSteps: 1, Context: 512, MinGain: 0.06}
+	case "thorough":
+		return AutoTuneOptions{Rounds: 5, DecodeSteps: 3, Context: 2048, MinGain: 0.02,
+			TunePrefill: true, PrefillRounds: 3, MaxPrefillChunk: 256}
+	default:
+		return AutoTuneOptions{Rounds: 3, DecodeSteps: 2, Context: 512, MinGain: 0.03,
+			TunePrefill: true, PrefillRounds: 2, MaxPrefillChunk: 128}
+	}
 }
 
 // AutoTuneOrCached applies a cached result when one exists, otherwise measures

@@ -38,6 +38,7 @@ type chatTemplateData struct {
 	Temperature   float32
 	TopP          float32
 	TopK          int
+	MinP          float32
 	RepeatPenalty float32
 }
 
@@ -45,6 +46,15 @@ type runnerState struct {
 	mu   sync.RWMutex
 	r    *Runner
 	path string
+	// baseline is captured before any server-side auto tuning. A model switch
+	// restores it when the replacement has not been explicitly tuned, so
+	// process-wide knobs measured for the previous model do not leak across.
+	baseline RuntimeTuning
+	// autoTune is the tuning result actually applied to r during this process
+	// (nil if none has been). It is distinct from Runner.LoadAutoTune, which
+	// only reports what is cached on disk and may not reflect what is
+	// currently active if the server started without --auto.
+	autoTune *AutoTuneResult
 }
 
 func (s *runnerState) get() *Runner {
@@ -65,6 +75,12 @@ func (s *runnerState) swap(r *Runner, path string) {
 	old = s.r
 	s.r = r
 	s.path = path
+	// A hot-swapped model has not had a model-specific calibration applied.
+	// Restore the pre-auto baseline while holding the writer lock: all inference
+	// paths hold its read lock for their whole run, so no generation observes a
+	// mixture of old and restored process-global knobs.
+	s.baseline.Apply()
+	s.autoTune = nil
 	s.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
@@ -75,6 +91,35 @@ func (s *runnerState) getPath() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.path
+}
+
+// runAutoTune serializes calibration with model hot-swaps and all inference.
+// AutoTuneResult.Apply changes process-wide settings, so holding the writer
+// lock is intentional: inference paths hold a read lock for the entire run.
+func (s *runnerState) runAutoTune(opts AutoTuneOptions, refresh bool) (AutoTuneResult, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, cached, err := s.r.AutoTuneOrCached(opts, refresh)
+	if err == nil {
+		s.autoTune = &res
+	}
+	return res, cached, err
+}
+
+// autoTuneStatus reports what GET /autotune needs to render the web UI's
+// panel: whether a tuning is active this session, whether one is persisted on
+// disk for the current model+host, and the most relevant result to show.
+func (s *runnerState) autoTuneStatus() map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.autoTune != nil {
+		_, cached := s.r.LoadAutoTune()
+		return map[string]any{"active": true, "cached": cached, "result": s.autoTune}
+	}
+	if cached, ok := s.r.LoadAutoTune(); ok {
+		return map[string]any{"active": false, "cached": true, "result": cached}
+	}
+	return map[string]any{"active": false, "cached": false}
 }
 
 // HandlerOptions configures the mountable HTTP API handler.
@@ -97,6 +142,15 @@ type HandlerOptions struct {
 	// files (see skills.go). Every chat/generate endpoint offers a load_skill
 	// tool and resolves it server-side via RunAgenticChat.
 	SkillsDir string
+	// AppliedAutoTune, if set, is a tuning already applied to initialRunner
+	// before the handler was built (e.g. by the CLI's --auto flag). GET
+	// /autotune reports it as active from the very first request, rather than
+	// only after someone hits POST /autotune/run through the web UI.
+	AppliedAutoTune *AutoTuneResult
+	// BaselineRuntimeTuning is the process-wide configuration to restore after
+	// a hot-swap to an uncalibrated model. When absent, NewHandler captures the
+	// settings visible at construction time.
+	BaselineRuntimeTuning *RuntimeTuning
 	// LogWriter receives handler diagnostics (skill load notes). Defaults to
 	// io.Discard.
 	LogWriter io.Writer
@@ -133,6 +187,12 @@ type ServeOptions struct {
 	ModelDir                 string
 	ModelPath                string
 	SkillsDir                string
+	// AppliedAutoTune carries forward a tuning already applied before Serve
+	// was called (e.g. by --auto), so GET /autotune reports it from the start.
+	AppliedAutoTune *AutoTuneResult
+	// BaselineRuntimeTuning forwards the pre-auto runtime settings captured by
+	// a host such as the CLI, so a later model hot-swap can restore them.
+	BaselineRuntimeTuning *RuntimeTuning
 	// LogWriter receives startup and handler diagnostics; Serve defaults it
 	// to os.Stderr (CLI behavior), unlike NewHandler's io.Discard.
 	LogWriter io.Writer
@@ -156,6 +216,8 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 		ModelDir:              opts.ModelDir,
 		ModelPath:             opts.ModelPath,
 		SkillsDir:             opts.SkillsDir,
+		AppliedAutoTune:       opts.AppliedAutoTune,
+		BaselineRuntimeTuning: opts.BaselineRuntimeTuning,
 		LogWriter:             logw,
 	})
 	server := &http.Server{Addr: opts.Addr, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
@@ -187,8 +249,13 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		fmt.Fprintf(logw, "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
-	state := &runnerState{r: initialRunner, path: opts.ModelPath}
+	baseline := CaptureRuntimeTuning()
+	if opts.BaselineRuntimeTuning != nil {
+		baseline = *opts.BaselineRuntimeTuning
+	}
+	state := &runnerState{r: initialRunner, path: opts.ModelPath, baseline: baseline, autoTune: opts.AppliedAutoTune}
 	sem := make(chan struct{}, opts.MaxConcurrentRequests)
+	var autoTuneMu sync.Mutex
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get())})
@@ -538,6 +605,48 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		state.swap(newRunner, entry.Path)
 		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.config.MaxSeqLen})
 	}))
+	mux.HandleFunc("/autotune", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, state.autoTuneStatus())
+	})
+	mux.HandleFunc("/autotune/run", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Effort  string `json:"effort"`
+			Refresh bool   `json:"refresh"`
+		}
+		if req.Body != nil {
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil && err != io.EOF {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
+		if !autoTuneMu.TryLock() {
+			http.Error(w, "auto-tuning is already running", http.StatusConflict)
+			return
+		}
+		defer autoTuneMu.Unlock()
+		body.Effort = strings.TrimSpace(body.Effort)
+		if !ValidAutoTuneEffort(body.Effort) {
+			http.Error(w, "effort must be quick, balanced, or thorough", http.StatusBadRequest)
+			return
+		}
+		runOpts := AutoTuneOptionsForEffort(body.Effort)
+		runOpts.LogWriter = logw
+		res, cached, err := state.runAutoTune(runOpts, body.Refresh)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintf(logw, "Auto-tune via web UI: %s\n", res.SettingsLine())
+		writeJSON(w, map[string]any{"cached": cached, "result": res})
+	}))
 	if opts.ChatUI {
 		mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 			if req.URL.Path != "/" {
@@ -556,6 +665,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 				Temperature:   opts.Defaults.Sampler.Temperature,
 				TopP:          opts.Defaults.Sampler.TopP,
 				TopK:          opts.Defaults.Sampler.TopK,
+				MinP:          opts.Defaults.Sampler.MinP,
 				RepeatPenalty: opts.Defaults.Sampler.RepeatPenalty,
 			}
 			if err := chatTemplate.Execute(w, data); err != nil {

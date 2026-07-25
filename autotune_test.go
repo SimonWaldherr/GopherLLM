@@ -482,3 +482,33 @@ func TestHostFingerprintIsStable(t *testing.T) {
 		}
 	}
 }
+
+func TestAutoTuneKeyIncludesLoadTimeState(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatalf("load synthetic model: %v", err)
+	}
+	defer r.Close()
+
+	plain := r.autoTuneKey()
+	r.standard.Output.Prepared = &PreparedQuantizedWeight{}
+	if got := r.autoTuneKey(); got == plain {
+		t.Fatal("prepared-quant state must produce a separate auto-tune cache key")
+	}
+	r.standard.Output.Prepared = nil
+	r.standard.Output.Metal = &MetalWeight{}
+	if got := r.autoTuneKey(); got == plain {
+		t.Fatal("Metal state must produce a separate auto-tune cache key")
+	}
+}
+
+func TestValidAutoTuneEffort(t *testing.T) {
+	for _, effort := range []string{"", "quick", "balanced", "thorough"} {
+		if !ValidAutoTuneEffort(effort) {
+			t.Fatalf("ValidAutoTuneEffort(%q) = false", effort)
+		}
+	}
+	if ValidAutoTuneEffort("turbo") {
+		t.Fatal("unknown effort was accepted")
+	}
+}

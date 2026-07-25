@@ -209,17 +209,22 @@ func run() error {
 	fmt.Fprintf(os.Stderr, "Architecture: %s\n", runner.Architecture())
 	// Auto-tuning runs before every generation path (one-shot, REPL, server,
 	// bench) so all of them share the measured configuration.
+	var appliedAutoTune *gopherllm.AutoTuneResult
+	var baselineRuntimeTuning *gopherllm.RuntimeTuning
 	if cfg.autoTune {
-		done, err := runAutoTune(runner, cfg)
+		baseline := gopherllm.CaptureRuntimeTuning()
+		baselineRuntimeTuning = &baseline
+		res, done, err := runAutoTune(runner, cfg)
 		if err != nil {
 			return err
 		}
 		if done {
 			return nil
 		}
+		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return gopherllm.Serve(runner, gopherllm.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir})
+		return gopherllm.Serve(runner, gopherllm.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -278,19 +283,19 @@ func run() error {
 // It reports whether the command is finished (--auto-json prints the result and
 // exits). A cached tuning is reused unless --auto-refresh was passed, so the
 // startup cost is paid once per model+hardware combination rather than per run.
-func runAutoTune(runner *gopherllm.Runner, cfg cliConfig) (bool, error) {
+func runAutoTune(runner *gopherllm.Runner, cfg cliConfig) (gopherllm.AutoTuneResult, bool, error) {
 	opts := autoTuneOptions(cfg.autoTuneEffort)
 	if !cfg.autoTuneJSON {
 		opts.LogWriter = os.Stderr
 	}
 	res, cached, err := runner.AutoTuneOrCached(opts, cfg.autoTuneRefresh)
 	if err != nil {
-		return false, err
+		return res, false, err
 	}
 	if cfg.autoTuneJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return true, enc.Encode(res)
+		return res, true, enc.Encode(res)
 	}
 	if cached {
 		fmt.Fprintf(os.Stderr, "Auto: reusing tuning measured %s (--auto-refresh re-measures)\n",
@@ -302,26 +307,14 @@ func runAutoTune(runner *gopherllm.Runner, cfg cliConfig) (bool, error) {
 	if g := res.GainsLine(); g != "" {
 		fmt.Fprintf(os.Stderr, "  %s\n", g)
 	}
-	return false, nil
+	return res, false, nil
 }
 
-// autoTuneOptions maps the effort level onto calibration cost. Measured on a 3B
-// Q4_K_M model: quick ~10-20s, balanced ~75s, thorough several minutes. The
-// extra time buys interleaved rounds, which is exactly what helps on a machine
-// whose clock swings under sustained load.
+// autoTuneOptions maps the effort level onto calibration cost; see
+// gopherllm.AutoTuneOptionsForEffort, which the HTTP API's POST /autotune/run
+// shares so the CLI and the web UI can never silently drift apart.
 func autoTuneOptions(effort string) gopherllm.AutoTuneOptions {
-	switch effort {
-	case "quick":
-		// Decode knobs only: a prefill sample costs a whole chunk of prompt
-		// processing, which is seconds on a multi-billion-parameter model.
-		return gopherllm.AutoTuneOptions{Rounds: 2, DecodeSteps: 1, Context: 512, MinGain: 0.06}
-	case "thorough":
-		return gopherllm.AutoTuneOptions{Rounds: 5, DecodeSteps: 3, Context: 2048, MinGain: 0.02,
-			TunePrefill: true, PrefillRounds: 3, MaxPrefillChunk: 256}
-	default:
-		return gopherllm.AutoTuneOptions{Rounds: 3, DecodeSteps: 2, Context: 512, MinGain: 0.03,
-			TunePrefill: true, PrefillRounds: 2, MaxPrefillChunk: 128}
-	}
+	return gopherllm.AutoTuneOptionsForEffort(effort)
 }
 
 // printReasoningAndToolCalls surfaces the parts of a gopherllm.GenerationResult that the

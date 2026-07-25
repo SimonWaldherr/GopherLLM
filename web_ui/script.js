@@ -70,22 +70,22 @@ function renderMarkdown(raw) {
   return out.replace(/^(<br>)+/, "").replace(/(<br>)+$/, "");
 }
 
-function notify(text) {
-  document.dispatchEvent(new CustomEvent("gopherllm:notice", { detail: String(text) }));
+function notify(text, kind) {
+  document.dispatchEvent(new CustomEvent("gopherllm:notice", { detail: { text: String(text), kind } }));
 }
 
 function bindCopy(button, getText) {
   const label = button.textContent;
   button.addEventListener("click", () => {
     if (!navigator.clipboard || !navigator.clipboard.writeText) {
-      notify("Clipboard access is unavailable in this browser.");
+      notify("Clipboard access is unavailable in this browser.", "error");
       return;
     }
     navigator.clipboard.writeText(getText()).then(() => {
       button.textContent = "Copied";
-      notify("Copied to clipboard");
+      notify("Copied to clipboard", "success");
       setTimeout(() => { button.textContent = label; }, 1400);
-    }).catch(() => notify("Could not copy to the clipboard."));
+    }).catch(() => notify("Could not copy to the clipboard.", "error"));
   });
 }
 
@@ -253,8 +253,10 @@ function cleanSettings(value, defaults) {
     temperature: boundedNumber(value.temperature, defaults.temperature, 0, 2, false),
     topP: boundedNumber(value.topP, defaults.topP, 0, 1, false),
     topK: boundedNumber(value.topK, defaults.topK, 0, 200, true),
+    minP: boundedNumber(value.minP, defaults.minP, 0, 1, false),
     repeatPenalty: boundedNumber(value.repeatPenalty, defaults.repeatPenalty, 0, 3, false),
-    seed: value.seed == null ? "" : String(value.seed).slice(0, 20)
+    seed: value.seed == null ? "" : String(value.seed).slice(0, 20),
+    stopSequences: typeof value.stopSequences === "string" ? value.stopSequences.slice(0, 2000) : ""
   };
 }
 
@@ -337,11 +339,18 @@ function toMarkdown(chat) {
   const tempValueEl = $("tempValue");
   const topPEl = $("topP");
   const topKEl = $("topK");
+  const minPEl = $("minP");
   const repeatPenaltyEl = $("repeatPenalty");
   const seedEl = $("seed");
+  const stopSequencesEl = $("stopSequences");
   const personaEl = $("personaSelect");
   const systemPromptEl = $("systemPrompt");
   const settingsEl = $("settings");
+  const settingsCloseEl = $("settingsClose");
+  const skillsNoteEl = $("skillsNote");
+  const autoTuneEffortEl = $("autoTuneEffort");
+  const autoTuneRunEl = $("autoTuneRun");
+  const autoTuneStatusEl = $("autoTuneStatus");
   const settingsToggleEl = $("settingsToggle");
   const scrollEl = $("scroll");
   const jumpLatestEl = $("jumpLatest");
@@ -373,6 +382,7 @@ function toMarkdown(chat) {
     temperature: boundedNumber(temperatureEl.value, .7, 0, 2, false),
     topP: boundedNumber(topPEl.value, .9, 0, 1, false),
     topK: boundedNumber(topKEl.value, 40, 0, 200, true),
+    minP: boundedNumber(minPEl.value, 0, 0, 1, false),
     repeatPenalty: boundedNumber(repeatPenaltyEl.value, 1.1, 0, 3, false)
   };
   const MAX_CHATS = 100;
@@ -380,6 +390,8 @@ function toMarkdown(chat) {
   let activeID = "";
   let preferences = { theme: "system" };
   let busy = false;
+  let tuning = false;
+  let loadingModel = false;
   let controller = null;
   let editingIndex = null;
   let draftBeforeEdit = "";
@@ -400,7 +412,7 @@ function toMarkdown(chat) {
   function save() {
     const snapshot = workspace();
     saveQueue = saveQueue.catch(() => {}).then(async () => {
-      if (!await writeWorkspace(snapshot)) showToast("Chat history could not be saved in this browser.");
+      if (!await writeWorkspace(snapshot)) showToast("Chat history could not be saved in this browser.", "error");
     });
     return saveQueue;
   }
@@ -414,13 +426,14 @@ function toMarkdown(chat) {
     if (chat) chat.updatedAt = Date.now();
   }
 
-  function showToast(text) {
+  function showToast(text, kind) {
     clearTimeout(toastTimer);
     toastEl.textContent = text;
+    toastEl.className = "toast" + (kind ? " toast-" + kind : "");
     toastEl.hidden = false;
     toastTimer = setTimeout(() => { toastEl.hidden = true; }, 2600);
   }
-  document.addEventListener("gopherllm:notice", (event) => showToast(event.detail));
+  document.addEventListener("gopherllm:notice", (event) => showToast(event.detail.text, event.detail.kind));
 
   function setStatus(text) {
     statusTextEl.textContent = text;
@@ -531,7 +544,7 @@ function toMarkdown(chat) {
     const warning = contextLimit && estimate >= contextLimit * .85 ? " · near context limit" : "";
     contextEstimateEl.textContent = count + " message" + (count === 1 ? "" : "s") + " · ~" + estimate + " input tokens" + context + warning;
     if (!busy) {
-      sendEl.disabled = !promptEl.value.trim();
+      sendEl.disabled = tuning || !promptEl.value.trim();
       sendLabelEl.textContent = editingIndex === null ? "Send" : "Save & retry";
     }
   }
@@ -554,8 +567,10 @@ function toMarkdown(chat) {
     tempValueEl.textContent = Number(chat.settings.temperature).toFixed(2);
     topPEl.value = Number(chat.settings.topP).toFixed(2);
     topKEl.value = chat.settings.topK;
+    minPEl.value = Number(chat.settings.minP).toFixed(2);
     repeatPenaltyEl.value = Number(chat.settings.repeatPenalty).toFixed(2);
     seedEl.value = chat.settings.seed;
+    stopSequencesEl.value = chat.settings.stopSequences;
     personaEl.value = Object.prototype.hasOwnProperty.call(PERSONAS, chat.persona) ? chat.persona : "custom";
     systemPromptEl.value = chat.systemPrompt;
     updateComposer(false);
@@ -775,7 +790,7 @@ function toMarkdown(chat) {
     const title = window.prompt("Name this chat", chat.title);
     if (title === null) return;
     if (!title.trim()) {
-      showToast("A chat name cannot be empty.");
+      showToast("A chat name cannot be empty.", "error");
       return;
     }
     chat.title = title.trim().slice(0, 160);
@@ -801,7 +816,7 @@ function toMarkdown(chat) {
     editStateEl.hidden = true;
     renderWorkspace(true);
     save();
-    showToast("Chat deleted");
+    showToast("Chat deleted", "success");
   }
 
   function manageChat(id) {
@@ -814,7 +829,7 @@ function toMarkdown(chat) {
       return;
     }
     if (!choice.trim()) {
-      showToast("Type DELETE to remove a chat.");
+      showToast("Type DELETE to remove a chat.", "error");
       return;
     }
     chat.title = choice.trim().slice(0, 160);
@@ -909,6 +924,7 @@ function toMarkdown(chat) {
   function requestFor(chat) {
     const settings = chat.settings;
     const seed = /^\d+$/.test(settings.seed || "") ? Number(settings.seed) : undefined;
+    const stop = (settings.stopSequences || "").split(",").map((s) => s.trim()).filter(Boolean);
     return {
       messages: chat.messages.map((message) => {
         const out = { role: message.role, content: message.content };
@@ -921,9 +937,11 @@ function toMarkdown(chat) {
       temperature: settings.temperature,
       top_p: settings.topP,
       top_k: settings.topK,
+      min_p: settings.minP,
       repeat_penalty: settings.repeatPenalty,
       seed,
-      system_prompt: chat.systemPrompt.trim() || undefined
+      system_prompt: chat.systemPrompt.trim() || undefined,
+      stop: stop.length ? stop : undefined
     };
   }
 
@@ -1021,7 +1039,7 @@ function toMarkdown(chat) {
         assistantEl.remove();
         const errorEl = addMessage("error", "Error: " + (error && error.message ? error.message : "Request failed"));
         addRetryAction(errorEl);
-        showToast("The answer could not be generated. Retry the last message.");
+        showToast("The answer could not be generated. Retry the last message.", "error");
       }
     } finally {
       controller = null;
@@ -1033,7 +1051,7 @@ function toMarkdown(chat) {
   }
 
   async function submitPrompt() {
-    if (busy) return;
+    if (busy || tuning) return;
     const text = promptEl.value.trim();
     const chat = activeChat();
     if (!text || !chat) return;
@@ -1059,7 +1077,7 @@ function toMarkdown(chat) {
 
   function retryMessage(index) {
     const chat = activeChat();
-    if (!chat || busy || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
+    if (!chat || busy || tuning || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
     if (!chat.messages.slice(0, index).some((message) => message.role === "user")) return;
     chat.messages = chat.messages.slice(0, index);
     touch(chat);
@@ -1074,7 +1092,8 @@ function toMarkdown(chat) {
     if (!chat) return;
     chat.settings = cleanSettings({
       maxTokens: maxTokensEl.value, temperature: temperatureEl.value, topP: topPEl.value,
-      topK: topKEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim()
+      topK: topKEl.value, minP: minPEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim(),
+      stopSequences: stopSequencesEl.value
     }, defaults);
     chat.systemPrompt = systemPromptEl.value.slice(0, 100000);
     chat.persona = Object.prototype.hasOwnProperty.call(PERSONAS, personaEl.value) ? personaEl.value : "custom";
@@ -1105,7 +1124,8 @@ function toMarkdown(chat) {
       data.models.forEach((model) => {
         const option = document.createElement("option");
         option.value = model.id;
-        option.textContent = (model.name || model.id) + (model.architecture ? " [" + model.architecture + "]" : "") + (model.size_gb ? " — " + model.size_gb.toFixed(1) + " GB" : "") + (!model.supported ? " (unsupported)" : "");
+        const context = model.context_length ? " · " + (model.context_length >= 1000 ? Math.round(model.context_length / 1000) + "K" : model.context_length) + " ctx" : "";
+        option.textContent = (model.name || model.id) + (model.architecture ? " [" + model.architecture + "]" : "") + context + (model.size_gb ? " — " + model.size_gb.toFixed(1) + " GB" : "") + (!model.supported ? " (unsupported)" : "");
         if (model.loaded) {
           option.selected = true;
           option.dataset.loaded = "true";
@@ -1121,11 +1141,53 @@ function toMarkdown(chat) {
     }
   }
 
+  async function loadSkills() {
+    try {
+      const response = await fetch("/v1/skills");
+      if (!response.ok) return;
+      const data = await response.json();
+      const list = Array.isArray(data.skills) ? data.skills.filter((skill) => skill && skill.name) : [];
+      if (!list.length) return;
+      skillsNoteEl.textContent = "Skills available to the model: " + list.map((skill) => skill.name).join(", ");
+      skillsNoteEl.title = list.map((skill) => skill.name + (skill.description ? " — " + skill.description : "")).join("\n");
+      skillsNoteEl.hidden = false;
+    } catch (_) {
+      /* Skills are an optional server feature; leave the note hidden. */
+    }
+  }
+
+  function formatAutoTuneStatus(data) {
+    if (!data || !data.result) return "Not tuned for this model and machine yet.";
+    const r = data.result;
+    const bits = ["threads=" + r.threads, "q8=" + (r.q8_activations ? "on" : "off"), "kv-f16=" + (r.kv_cache_f16 ? "on" : "off"), "prefill-chunk=" + r.prefill_chunk];
+    const gains = [];
+    if (r.baseline_decode_ms > 0 && r.tuned_decode_ms > 0) gains.push((r.baseline_decode_ms / r.tuned_decode_ms).toFixed(2) + "x decode");
+    if (r.baseline_prefill_tokens_per_second > 0 && r.tuned_prefill_tokens_per_second > 0) {
+      gains.push((r.tuned_prefill_tokens_per_second / r.baseline_prefill_tokens_per_second).toFixed(2) + "x prefill");
+    }
+    let text = (data.active ? "Active: " : "Measured previously, not applied this session: ") + bits.join(" ");
+    if (gains.length) text += " · " + gains.join(", ") + " faster";
+    return text;
+  }
+
+  async function loadAutoTuneStatus() {
+    try {
+      const response = await fetch("/autotune");
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      autoTuneStatusEl.textContent = formatAutoTuneStatus(await response.json());
+    } catch (_) {
+      autoTuneStatusEl.textContent = "Could not check tuning status.";
+    }
+  }
+
   modelSelectEl.addEventListener("change", async () => {
     const model = modelSelectEl.value;
-    if (!model || busy) return;
+    if (!model || busy || tuning || loadingModel) return;
+    loadingModel = true;
     const previous = Array.from(modelSelectEl.options).find((option) => option.dataset.loaded === "true");
     modelSelectEl.disabled = true;
+    autoTuneRunEl.disabled = true;
+    autoTuneEffortEl.disabled = true;
     statusEl.classList.add("busy");
     setStatus("Loading model…");
     try {
@@ -1145,14 +1207,55 @@ function toMarkdown(chat) {
       renderChatList();
       save();
       setStatus("Ready");
-      showToast("Model loaded. Your chats were kept.");
+      showToast("Model loaded. Your chats were kept.", "success");
+      loadAutoTuneStatus();
     } catch (error) {
       if (previous) modelSelectEl.value = previous.value;
       setStatus("Error loading model");
       addMessage("error", "Failed to load model: " + (error.message || error));
     } finally {
+      loadingModel = false;
       statusEl.classList.remove("busy");
       modelSelectEl.disabled = false;
+      autoTuneRunEl.disabled = false;
+      autoTuneEffortEl.disabled = false;
+    }
+  });
+
+  autoTuneRunEl.addEventListener("click", async () => {
+    if (busy || tuning || loadingModel) return;
+    tuning = true;
+    autoTuneRunEl.disabled = true;
+    autoTuneEffortEl.disabled = true;
+    const modelSelectWasDisabled = modelSelectEl.disabled;
+    modelSelectEl.disabled = true;
+    updateComposer(false);
+    statusEl.classList.add("busy");
+    const effort = autoTuneEffortEl.value;
+    const eta = effort === "quick" ? "quick, ~10-20s" : effort === "thorough" ? "thorough, several minutes" : "balanced, ~1-2 min";
+    setStatus("Tuning (" + eta + ")…");
+    autoTuneStatusEl.textContent = "Tuning now (" + eta + ") — generation is paused until this finishes.";
+    try {
+      const response = await fetch("/autotune/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ effort })
+      });
+      if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
+      const data = await response.json();
+      autoTuneStatusEl.textContent = formatAutoTuneStatus({ active: true, result: data.result });
+      showToast(data.cached ? "Applied a previously measured tuning." : "Auto-tuning complete.", "success");
+    } catch (error) {
+      autoTuneStatusEl.textContent = "Auto-tuning failed: " + (error.message || error);
+      showToast("Auto-tuning failed: " + (error.message || error), "error");
+    } finally {
+      tuning = false;
+      autoTuneRunEl.disabled = false;
+      autoTuneEffortEl.disabled = false;
+      modelSelectEl.disabled = modelSelectWasDisabled;
+      statusEl.classList.remove("busy");
+      setStatus("Ready");
+      updateComposer(false);
     }
   });
 
@@ -1196,10 +1299,24 @@ function toMarkdown(chat) {
   chatSearchEl.addEventListener("input", renderChatList);
   sidebarToggleEl.addEventListener("click", () => setSidebar(!sidebarEl.classList.contains("is-open")));
   sidebarScrimEl.addEventListener("click", () => setSidebar(false));
+  function openSettings() {
+    settingsEl.hidden = false;
+    settingsToggleEl.setAttribute("aria-expanded", "true");
+    settingsCloseEl.focus();
+  }
+  function closeSettings() {
+    if (settingsEl.hidden) return;
+    settingsEl.hidden = true;
+    settingsToggleEl.setAttribute("aria-expanded", "false");
+    settingsToggleEl.focus();
+  }
   settingsToggleEl.addEventListener("click", () => {
-    const open = settingsEl.hidden;
-    settingsEl.hidden = !open;
-    settingsToggleEl.setAttribute("aria-expanded", String(open));
+    if (settingsEl.hidden) openSettings();
+    else closeSettings();
+  });
+  settingsCloseEl.addEventListener("click", closeSettings);
+  settingsEl.addEventListener("click", (event) => {
+    if (event.target === settingsEl) closeSettings();
   });
   document.querySelectorAll(".suggestion").forEach((button) => {
     button.addEventListener("click", () => {
@@ -1209,7 +1326,7 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
-  [maxTokensEl, temperatureEl, topPEl, topKEl, repeatPenaltyEl, seedEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });
@@ -1229,7 +1346,7 @@ function toMarkdown(chat) {
     textFileInputEl.value = "";
     if (!file || busy) return;
     if (file.size > 500000) {
-      showToast("Text files are limited to 500 KB.");
+      showToast("Text files are limited to 500 KB.", "error");
       return;
     }
     try {
@@ -1239,22 +1356,22 @@ function toMarkdown(chat) {
       resizePrompt();
       updateComposer(true);
       promptEl.focus();
-      showToast("Added " + file.name + " as local text.");
+      showToast("Added " + file.name + " as local text.", "success");
     } catch (_) {
-      showToast("Could not read that text file.");
+      showToast("Could not read that text file.", "error");
     }
   });
 
   exportChatsEl.addEventListener("click", () => {
     download("gopherllm-chats-" + new Date().toISOString().slice(0, 10) + ".json", "application/json", JSON.stringify(Object.assign(workspace(), { exportedAt: new Date().toISOString() }), null, 2));
-    showToast("Saved chat archive");
+    showToast("Saved chat archive", "success");
   });
   exportMarkdownEl.addEventListener("click", () => {
     const chat = activeChat();
     if (!chat) return;
     const name = chat.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "chat";
     download(name + ".md", "text/markdown;charset=utf-8", toMarkdown(chat));
-    showToast("Saved this chat as Markdown");
+    showToast("Saved this chat as Markdown", "success");
   });
   importChatsEl.addEventListener("click", () => importInputEl.click());
   importInputEl.addEventListener("change", async () => {
@@ -1278,9 +1395,9 @@ function toMarkdown(chat) {
       editStateEl.hidden = true;
       renderWorkspace(true);
       save();
-      showToast(incoming.length + " chat" + (incoming.length === 1 ? "" : "s") + " imported");
+      showToast(incoming.length + " chat" + (incoming.length === 1 ? "" : "s") + " imported", "success");
     } catch (_) {
-      showToast("That file is not a valid GopherLLM chat archive.");
+      showToast("That file is not a valid GopherLLM chat archive.", "error");
     }
   });
   themeSelectEl.addEventListener("change", () => {
@@ -1294,6 +1411,7 @@ function toMarkdown(chat) {
       chatSearchEl.focus();
     }
     if (event.key === "Escape" && sidebarEl.classList.contains("is-open")) setSidebar(false);
+    if (event.key === "Escape" && !settingsEl.hidden) closeSettings();
   });
   window.addEventListener("beforeunload", save);
 
@@ -1317,4 +1435,6 @@ function toMarkdown(chat) {
   applyTheme(preferences.theme);
   renderWorkspace(true);
   loadModels();
+  loadSkills();
+  loadAutoTuneStatus();
 }());

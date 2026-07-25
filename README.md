@@ -306,6 +306,8 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | POST | `/api/embeddings` | Ollama-compatible embeddings |
 | GET | `/models` | Scan `--model-dir` and list discovered GGUFs, including each model's context length |
 | POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; response includes the loaded context length) |
+| GET | `/autotune` | Report Auto Mode status: whether a tuning is active this session, whether one is cached on disk for this model+machine, and the result either way |
+| POST | `/autotune/run` | Run (or apply a cached) tuning for the loaded model, same effort levels as `--auto-effort` (`{"effort": "quick\|balanced\|thorough", "refresh": false}`) |
 | GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |
 
 ## Tool Use / Agentic
@@ -424,10 +426,49 @@ only the first run pays for calibration. It applies to every mode — one-shot,
 | `--auto-refresh` | Re-measure and overwrite the cached result |
 | `--auto-json` | Print the full result — including every candidate's median — and exit |
 
+### From the web UI
+
+Auto Mode isn't just a startup flag: the embedded chat UI (`--chat`) has a
+"Performance" panel in Settings with an effort selector and a **Tune now**
+button, backed by `GET /autotune` and `POST /autotune/run` (see the endpoint
+table above). It reports whether a tuning is *active* this session versus
+merely *cached* on disk from an earlier run — useful when the server was
+started without `--auto` but a previous `--auto` run (or an earlier click of
+Tune now) already measured this model on this machine. Triggering a tune
+pauses generation until it finishes, same as the CLI: measurement and
+generation share the same runner lock.
+
+### Makefile workflow
+
+The generation, REPL, server, and model-benchmark targets accept `AUTO=1`, so
+the same cached tuning is used regardless of how the model is started:
+
+```sh
+# Fast first-pass calibration, then generate.
+make run MODEL="my-model.gguf" AUTO=1 AUTO_EFFORT=quick
+
+# Calibrate before exposing the local chat UI.
+make serve MODEL="my-model.gguf" CHAT=1 AUTO=1
+make serve-metal MODEL="my-model.gguf" CHAT=1 AUTO=1
+
+# Inspect the cached result (or force a fresh calibration) as JSON and exit.
+make autotune MODEL="my-model.gguf"
+make autotune MODEL="my-model.gguf" AUTO_REFRESH=1
+```
+
+`AUTO_EFFORT` accepts `quick`, `balanced` (the default), or `thorough`.
+`AUTO_REFRESH=1` bypasses the cache. `AUTO_JSON=1` can be used with any of
+those Make targets, but it prints the tuning report and exits before generation
+or serving; `make autotune` is the convenient report-only target. The
+`run-auto`, `run-auto-metal`, `serve-auto`, and `serve-auto-metal` targets are
+shortcuts for their corresponding command with `AUTO=1`.
+
 What it tunes: thread count, the int8-activation matvec kernels, the f16 KV
 cache, worker-dispatch oversubscription, and the prefill chunk size. Load-time
 choices (`--metal`, `--prepare-quant`) are *not* tuned, because changing them
 means reloading the weights; `--auto-json` reports whether they were active.
+They are nevertheless part of the cache key, so a Metal or prepared-quant
+run never reuses a CPU-only calibration.
 
 ### Why it is built the way it is
 
@@ -514,6 +555,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - `make run-prep MODEL=...` runs the prompt with `--prepare-quant`.
 - `make build-metal` builds `bin/gopherllm-metal` with CGO and the `metal` tag.
 - `make run-metal MODEL=...` runs with experimental `--metal` enabled.
+- `make run-auto MODEL=...` and `make run-auto-metal MODEL=...` tune (or reuse
+  a cached tuning) before generating; set `AUTO_EFFORT=quick|balanced|thorough`
+  to select calibration depth.
 - `make run-full MODEL=...` and `make run-full-prep MODEL=...` run 256-token
   prompt checks without and with `--prepare-quant`.
 - `make run-full-metal MODEL=...` and `make run-full-metal-prep MODEL=...`
@@ -525,6 +569,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - `make serve-metal MODEL=... CHAT=1 THREADS=8` starts the Metal server with
   prepared CPU fallback kernels enabled by default (`PREPARE_QUANT=0` disables
   preparation).
+- `make serve-auto MODEL=... CHAT=1` and `make serve-auto-metal MODEL=...`
+  perform startup tuning before accepting requests. Equivalently, add `AUTO=1`
+  to `run`, `repl`, `serve`, or any model benchmark target.
+- `make autotune MODEL=...` prints the cached or newly measured tuning result
+  as JSON and exits; add `AUTO_REFRESH=1` to force a fresh measurement. Use
+  `make autotune-metal MODEL=...` to report a Metal-enabled load.
 - `make list-models` scans `MODEL_DIR`.
 - `make inspect MODEL=...` prints model metadata summary.
 - `make list-tensors MODEL=...` prints the tensor inventory.

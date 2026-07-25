@@ -27,18 +27,6 @@
     </label>
     <div id="chatList" class="chat-list" role="navigation" aria-label="Chat history"></div>
     <div class="sidebar-footer">
-      <label class="theme-picker">Appearance
-        <select id="themeSelect" aria-label="Appearance">
-          <option value="system">System</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
-      </label>
-      <div class="sidebar-actions">
-        <button id="exportChats" class="text-button" type="button">Export JSON</button>
-        <button id="importChats" class="text-button" type="button">Import</button>
-        <input id="importInput" type="file" accept="application/json,.json" hidden>
-      </div>
       <p class="local-note"><span aria-hidden="true">●</span> Saved only in this browser</p>
     </div>
   </aside>
@@ -60,16 +48,11 @@
         </div>
       </div>
       <div class="top">
-        <label class="model-picker">
-          <span>Model</span>
-          <select id="modelSelect" aria-label="Select model">
-            <option value="">{{.Model}}</option>
-          </select>
-        </label>
         <div id="status" class="status" role="status" aria-live="polite">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="statusText">Ready</span>
         </div>
+        <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><span aria-hidden="true">⚙</span></button>
       </div>
     </header>
 
@@ -119,12 +102,29 @@
           <span id="editState" class="edit-state" hidden>Editing earlier message <button id="cancelEdit" type="button">Cancel</button></span>
         </div>
         <div class="composer-tools-end">
-          <button id="exportMarkdown" class="text-button" type="button">Export chat</button>
           <button id="clear" class="text-button" type="button" aria-label="Start a new conversation">New chat</button>
-          <button id="settingsToggle" class="text-button" type="button" aria-expanded="false" aria-controls="settings">Settings <span aria-hidden="true">⌄</span></button>
         </div>
       </div>
-      <div id="settings" class="settings" hidden>
+    </form>
+  </div>
+</div>
+
+<div id="settings" class="settings" hidden>
+  <div class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="settings-panel-head">
+      <h2 id="settingsTitle">Settings</h2>
+      <button id="settingsClose" class="icon-button" type="button" aria-label="Close settings"><span aria-hidden="true">✕</span></button>
+    </div>
+    <div class="settings-panel-body">
+      <section class="settings-section">
+        <h3>Model</h3>
+        <select id="modelSelect" aria-label="Select model">
+          <option value="">{{.Model}}</option>
+        </select>
+      </section>
+
+      <section class="settings-section">
+        <h3>This chat</h3>
         <div class="settings-grid">
           <label>Persona
             <select id="personaSelect">
@@ -148,19 +148,64 @@
           <label>Top K
             <input id="topK" type="number" min="0" max="200" step="1" value="{{.TopK}}" inputmode="numeric" autocomplete="off">
           </label>
+          <label>Min P
+            <input id="minP" type="number" min="0" max="1" step="0.05" value="{{.MinP}}" inputmode="decimal" autocomplete="off">
+          </label>
           <label>Repeat penalty
             <input id="repeatPenalty" type="number" min="0" max="3" step="0.05" value="{{.RepeatPenalty}}" inputmode="decimal" autocomplete="off">
           </label>
           <label>Seed <span class="field-note">optional</span>
             <input id="seed" type="number" min="0" step="1" placeholder="Random" inputmode="numeric" autocomplete="off">
           </label>
+          <label class="wide-setting">Stop sequences <span class="field-note">optional, comma-separated</span>
+            <input id="stopSequences" type="text" placeholder="e.g. \n\nUser:, ###" autocomplete="off">
+          </label>
           <label class="wide-setting">Instructions
             <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
           </label>
         </div>
-        <p class="settings-note">Settings and instructions belong to this chat. Token estimate is approximate; the model enforces its own context limit.</p>
-      </div>
-    </form>
+        <p class="settings-note">Settings and instructions above belong to this chat. Token estimate is approximate; the model enforces its own context limit.</p>
+      </section>
+
+      <section class="settings-section autotune">
+        <div class="autotune-head">
+          <span class="autotune-title">Performance <span class="field-note">this server, not just this chat</span></span>
+          <label class="autotune-effort">
+            <span class="sr-only">Calibration effort</span>
+            <select id="autoTuneEffort" aria-label="Calibration effort">
+              <option value="quick">Quick (~10-20s)</option>
+              <option value="balanced" selected>Balanced (~1-2 min)</option>
+              <option value="thorough">Thorough (several min)</option>
+            </select>
+          </label>
+          <button id="autoTuneRun" class="autotune-run" type="button">Tune now</button>
+        </div>
+        <p id="autoTuneStatus" class="autotune-status">Checking current tuning…</p>
+      </section>
+
+      <p id="skillsNote" class="skills-note" hidden></p>
+
+      <section class="settings-section">
+        <h3>Data</h3>
+        <div class="settings-actions">
+          <button id="exportMarkdown" class="text-button" type="button">Export this chat</button>
+          <button id="exportChats" class="text-button" type="button">Export all chats (JSON)</button>
+          <button id="importChats" class="text-button" type="button">Import</button>
+          <input id="importInput" type="file" accept="application/json,.json" hidden>
+        </div>
+      </section>
+
+      <section class="settings-section">
+        <h3>Appearance</h3>
+        <label class="theme-picker">Theme
+          <select id="themeSelect" aria-label="Appearance">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </label>
+      </section>
+    </div>
   </div>
 </div>
 
