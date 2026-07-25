@@ -421,12 +421,12 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			"template":   "",
 			"details":    ollamaModelDetails(a),
 			"model_info": map[string]any{
-				"general.architecture": a.Architecture,
-				"general.parameter_count": a.Params,
-				a.Architecture + ".context_length": a.ContextLength,
-				a.Architecture + ".embedding_length": a.Dim,
-				a.Architecture + ".block_count": a.Layers,
-				a.Architecture + ".attention.head_count": a.Heads,
+				"general.architecture":                      a.Architecture,
+				"general.parameter_count":                   a.Params,
+				a.Architecture + ".context_length":          a.ContextLength,
+				a.Architecture + ".embedding_length":        a.Dim,
+				a.Architecture + ".block_count":             a.Layers,
+				a.Architecture + ".attention.head_count":    a.Heads,
 				a.Architecture + ".attention.head_count_kv": a.KVHeads,
 			},
 			"capabilities": []string{"completion"},
@@ -663,22 +663,22 @@ func contentText(v any) string {
 }
 
 type OpenAIChatRequest struct {
-	Model               string             `json:"model"`
-	Messages            []APIMessage       `json:"messages"`
-	Stream              bool               `json:"stream"`
-	StreamOptions       *OpenAIStreamOpts  `json:"stream_options"`
-	MaxTokens           *int               `json:"max_tokens"`
-	MaxCompletionTokens *int               `json:"max_completion_tokens"`
-	Temperature         *float32           `json:"temperature"`
-	TopP                *float32           `json:"top_p"`
-	TopK                *int               `json:"top_k"`
-	MinP                *float32           `json:"min_p"`
-	RepeatPenalty       *float32           `json:"repeat_penalty"`
-	Seed                *uint64            `json:"seed"`
-	SystemPrompt        *string            `json:"system_prompt"`
-	Stop                any                `json:"stop"`
-	Tools               []ToolDefinition   `json:"tools"`
-	ToolChoice          any                `json:"tool_choice"`
+	Model               string            `json:"model"`
+	Messages            []APIMessage      `json:"messages"`
+	Stream              bool              `json:"stream"`
+	StreamOptions       *OpenAIStreamOpts `json:"stream_options"`
+	MaxTokens           *int              `json:"max_tokens"`
+	MaxCompletionTokens *int              `json:"max_completion_tokens"`
+	Temperature         *float32          `json:"temperature"`
+	TopP                *float32          `json:"top_p"`
+	TopK                *int              `json:"top_k"`
+	MinP                *float32          `json:"min_p"`
+	RepeatPenalty       *float32          `json:"repeat_penalty"`
+	Seed                *uint64           `json:"seed"`
+	SystemPrompt        *string           `json:"system_prompt"`
+	Stop                any               `json:"stop"`
+	Tools               []ToolDefinition  `json:"tools"`
+	ToolChoice          any               `json:"tool_choice"`
 }
 
 // OpenAIStreamOpts is the OpenAI "stream_options" object; IncludeUsage gates
