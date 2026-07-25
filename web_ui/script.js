@@ -256,7 +256,11 @@ function cleanSettings(value, defaults) {
     minP: boundedNumber(value.minP, defaults.minP, 0, 1, false),
     repeatPenalty: boundedNumber(value.repeatPenalty, defaults.repeatPenalty, 0, 3, false),
     seed: value.seed == null ? "" : String(value.seed).slice(0, 20),
-    stopSequences: typeof value.stopSequences === "string" ? value.stopSequences.slice(0, 2000) : ""
+    stopSequences: typeof value.stopSequences === "string" ? value.stopSequences.slice(0, 2000) : "",
+    // The UI opts into bounded recent-turn context by default. Full history
+    // remains available per chat, and external OpenAI-compatible callers are
+    // unaffected unless they send GopherLLM's extension explicitly.
+    contextWindowMode: value.contextWindowMode === "full" ? "full" : "recent"
   };
 }
 
@@ -343,6 +347,8 @@ function toMarkdown(chat) {
   const repeatPenaltyEl = $("repeatPenalty");
   const seedEl = $("seed");
   const stopSequencesEl = $("stopSequences");
+  const contextWindowModeEl = $("contextWindowMode");
+  const contextWindowStatusEl = $("contextWindowStatus");
   const personaEl = $("personaSelect");
   const systemPromptEl = $("systemPrompt");
   const settingsEl = $("settings");
@@ -397,6 +403,7 @@ function toMarkdown(chat) {
   let draftBeforeEdit = "";
   let followStream = true;
   let contextLimit = 0;
+  let lastContextWindow = null;
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
@@ -531,6 +538,49 @@ function toMarkdown(chat) {
     return chars ? Math.max(1, Math.ceil(chars / 4)) : 0;
   }
 
+  function currentContextWindow(chat) {
+    if (!lastContextWindow || !chat || lastContextWindow.chatID !== chat.id) return null;
+    // The server sees the user's new message but not the assistant message it
+    // is about to produce. After a reply we therefore accept exactly either
+    // that input count or one additional stored assistant message.
+    if (chat.messages.length !== lastContextWindow.inputMessages && chat.messages.length !== lastContextWindow.inputMessages + 1) return null;
+    return lastContextWindow;
+  }
+
+  function updateContextWindowStatus() {
+    const chat = activeChat();
+    if (!chat) return;
+    if (chat.settings.contextWindowMode === "full") {
+      contextWindowStatusEl.textContent = "Full history is sent with every reply. The server stops with a clear error if it no longer fits.";
+      return;
+    }
+    const info = currentContextWindow(chat);
+    if (!info) {
+      contextWindowStatusEl.textContent = "Smart context keeps the complete chat in this browser and sends the newest complete turns when the history gets too large.";
+      return;
+    }
+    const retained = info.retainedMessages + " of " + info.inputMessages + " message" + (info.inputMessages === 1 ? "" : "s");
+    let text = "Last reply sent " + retained + " (" + info.promptTokens + "/" + info.promptBudget + " exact prompt tokens).";
+    if (info.droppedMessages > 0) text += " " + info.droppedMessages + " earlier message" + (info.droppedMessages === 1 ? " remains" : "s remain") + " saved locally.";
+    contextWindowStatusEl.textContent = text;
+  }
+
+  function contextWindowFromValue(value, chat) {
+    if (!value || value.mode !== "recent") return null;
+    const number = (name) => {
+      const numberValue = Number(value[name]);
+      return Number.isInteger(numberValue) && numberValue >= 0 ? numberValue : null;
+    };
+    const contextLength = number("context_length");
+    const promptBudget = number("prompt_budget");
+    const promptTokens = number("prompt_tokens");
+    const inputMessages = number("input_messages");
+    const retainedMessages = number("retained_messages");
+    const droppedMessages = number("dropped_messages");
+    if ([contextLength, promptBudget, promptTokens, inputMessages, retainedMessages, droppedMessages].some((value) => value === null)) return null;
+    return { chatID: chat.id, contextLength, promptBudget, promptTokens, inputMessages, retainedMessages, droppedMessages };
+  }
+
   function updateComposer(storeDraft) {
     const chat = activeChat();
     if (!chat) return;
@@ -542,7 +592,10 @@ function toMarkdown(chat) {
     const estimate = tokenEstimate(chat);
     const context = contextLimit ? " / " + contextLimit + " context" : "";
     const warning = contextLimit && estimate >= contextLimit * .85 ? " · near context limit" : "";
-    contextEstimateEl.textContent = count + " message" + (count === 1 ? "" : "s") + " · ~" + estimate + " input tokens" + context + warning;
+    const info = currentContextWindow(chat);
+    const retained = info ? " · last sent " + info.retainedMessages + "/" + info.inputMessages + " messages" : "";
+    contextEstimateEl.textContent = count + " message" + (count === 1 ? "" : "s") + " · ~" + estimate + " input tokens" + context + warning + retained;
+    updateContextWindowStatus();
     if (!busy) {
       sendEl.disabled = tuning || !promptEl.value.trim();
       sendLabelEl.textContent = editingIndex === null ? "Send" : "Save & retry";
@@ -571,6 +624,7 @@ function toMarkdown(chat) {
     repeatPenaltyEl.value = Number(chat.settings.repeatPenalty).toFixed(2);
     seedEl.value = chat.settings.seed;
     stopSequencesEl.value = chat.settings.stopSequences;
+    contextWindowModeEl.value = chat.settings.contextWindowMode;
     personaEl.value = Object.prototype.hasOwnProperty.call(PERSONAS, chat.persona) ? chat.persona : "custom";
     systemPromptEl.value = chat.systemPrompt;
     updateComposer(false);
@@ -883,7 +937,7 @@ function toMarkdown(chat) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    const out = { answer: "", reasoning: "", toolCalls: null, usage: null, finishReason: "" };
+    const out = { answer: "", reasoning: "", toolCalls: null, usage: null, finishReason: "", contextWindow: null };
     const applyChunk = (payload) => {
       if (!payload || payload === "[DONE]") return;
       const event = JSON.parse(payload);
@@ -893,6 +947,7 @@ function toMarkdown(chat) {
       if (!choice) return;
       if (choice.finish_reason) out.finishReason = choice.finish_reason;
       if (choice.usage) out.usage = choice.usage;
+      if (choice.gopherllm_context) out.contextWindow = choice.gopherllm_context;
       const delta = choice.delta || {};
       if (delta.reasoning_content) {
         out.reasoning += delta.reasoning_content;
@@ -940,6 +995,7 @@ function toMarkdown(chat) {
       min_p: settings.minP,
       repeat_penalty: settings.repeatPenalty,
       seed,
+      gopherllm_context_mode: settings.contextWindowMode,
       system_prompt: chat.systemPrompt.trim() || undefined,
       stop: stop.length ? stop : undefined
     };
@@ -948,6 +1004,8 @@ function toMarkdown(chat) {
   async function generate() {
     const chat = activeChat();
     if (!chat || !chat.messages.some((message) => message.role === "user")) return;
+    lastContextWindow = null;
+    updateContextWindowStatus();
     const assistantEl = addMessage("assistant", "");
     followStream = true;
     setBusy(true);
@@ -1004,7 +1062,8 @@ function toMarkdown(chat) {
         const message = choice.message || {};
         result = {
           answer: message.content || "", reasoning: message.reasoning_content || "",
-          toolCalls: message.tool_calls || null, usage: data.usage || null, finishReason: choice.finish_reason || ""
+          toolCalls: message.tool_calls || null, usage: data.usage || null, finishReason: choice.finish_reason || "",
+          contextWindow: data.gopherllm_context || null
         };
       }
       streamFinished = true;
@@ -1019,9 +1078,12 @@ function toMarkdown(chat) {
       touch(chat);
       renderChatList();
       save();
+      lastContextWindow = contextWindowFromValue(result.contextWindow, chat);
+      updateComposer(false);
       setStatus("Ready");
     } catch (error) {
       streamFinished = true;
+      lastContextWindow = null;
       const partial = assistantEl.dataset.raw || "";
       if (error && error.name === "AbortError") {
         if (partial || reasoning) {
@@ -1093,8 +1155,12 @@ function toMarkdown(chat) {
     chat.settings = cleanSettings({
       maxTokens: maxTokensEl.value, temperature: temperatureEl.value, topP: topPEl.value,
       topK: topKEl.value, minP: minPEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim(),
-      stopSequences: stopSequencesEl.value
+      stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value
     }, defaults);
+    // A changed system prompt, output reserve, or model-side sampler setting
+    // means the prior reply's exact accounting should not be presented as the
+    // next request's budget.
+    lastContextWindow = null;
     chat.systemPrompt = systemPromptEl.value.slice(0, 100000);
     chat.persona = Object.prototype.hasOwnProperty.call(PERSONAS, personaEl.value) ? personaEl.value : "custom";
     tempValueEl.textContent = Number(chat.settings.temperature).toFixed(2);
@@ -1183,6 +1249,7 @@ function toMarkdown(chat) {
   modelSelectEl.addEventListener("change", async () => {
     const model = modelSelectEl.value;
     if (!model || busy || tuning || loadingModel) return;
+    lastContextWindow = null;
     loadingModel = true;
     const previous = Array.from(modelSelectEl.options).find((option) => option.dataset.loaded === "true");
     modelSelectEl.disabled = true;
@@ -1326,7 +1393,7 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
-  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });

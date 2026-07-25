@@ -72,6 +72,10 @@ type GenerationOptions struct {
 	Seed          uint64
 	SystemPrompt  string
 	StopSequences []string
+	// ContextWindowMode controls whether an oversized chat history fails as it
+	// historically did (full, the zero-value behavior) or is reduced to the
+	// newest complete turns before rendering (recent).
+	ContextWindowMode ContextWindowMode
 	// Tools lists the functions the model may call. When non-empty, it is
 	// rendered into the prompt using the active chat template's tool-calling
 	// convention (native for Mistral, a generic <tool_call> JSON convention
@@ -126,6 +130,9 @@ func (o GenerationOptions) Validate() error {
 	if o.MaxTokens <= 0 {
 		return fmt.Errorf("max_tokens must be greater than 0")
 	}
+	if !o.ContextWindowMode.valid() {
+		return fmt.Errorf("context_window_mode must be full or recent")
+	}
 	if !finite32(o.Sampler.Temperature) || o.Sampler.Temperature < 0 {
 		return fmt.Errorf("temperature must be a finite number >= 0")
 	}
@@ -172,6 +179,10 @@ type GenerationResult struct {
 	// non-empty).
 	FinishReason string
 	Stats        GenerationStats
+	// ContextWindow is populated for recent-context requests with the exact
+	// rendered prompt selected for this particular generation call. Agentic
+	// callers receive the final loop iteration's value.
+	ContextWindow *ContextWindowInfo
 }
 
 type LoadInfo struct {
@@ -435,6 +446,19 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return GenerationResult{}, fmt.Errorf("no prompt provided")
 	}
 	totalStart := time.Now()
+	var contextWindow *ContextWindowInfo
+	// Do this at the shared generation entry point rather than only in the
+	// HTTP handler. Agentic requests append assistant tool calls and tool
+	// results between iterations; each subsequent model call must be budgeted
+	// against those effective messages and active tools as well.
+	if normalizedContextWindowMode(options.ContextWindowMode) == ContextWindowRecent {
+		prepared, info, err := r.PrepareChatContext(messages, options)
+		if err != nil {
+			return GenerationResult{}, err
+		}
+		messages = prepared
+		contextWindow = &info
+	}
 	tokens := r.renderMessages(messages, options.SystemPrompt, options.activeTools())
 	if len(tokens) == 0 {
 		return GenerationResult{}, fmt.Errorf("prompt rendered to zero tokens")
@@ -530,7 +554,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		if len(calls) > 0 {
 			reason = "tool_calls"
 		}
-		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats}
+		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats, ContextWindow: contextWindow}
 	}
 decode:
 	for range options.MaxTokens {

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -287,22 +288,43 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		contextMode, err := body.ContextWindowMode()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		options := body.Options(opts.Defaults)
+		options.ContextWindowMode = contextMode
 		options = withRequestContext(options, req)
+		messages := body.ChatMessages()
 		state.withRunner(func(r *Runner) {
 			model := modelID(r)
+			if contextMode == ContextWindowRecent {
+				effectiveOptions, _ := agenticOptionsFor(options, skills)
+				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
+				if err != nil {
+					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, GenerationResult{}, err)
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+			}
 			if body.Stream {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
-				streamOpenAIChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, includeUsage)
+				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skills, includeUsage)
 				return
 			}
-			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
+			result, err := RunAgenticChat(r, messages, options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			writeJSON(w, openAIChatResponse(model, result))
+			response := openAIChatResponse(model, result)
+			if result.ContextWindow != nil {
+				writeContextWindowHeaders(w, *result.ContextWindow)
+				response["gopherllm_context"] = result.ContextWindow
+			}
+			writeJSON(w, response)
 		})
 	}))
 	mux.HandleFunc("/v1/completions", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
@@ -843,6 +865,9 @@ type OpenAIChatRequest struct {
 	Stop                any               `json:"stop"`
 	Tools               []ToolDefinition  `json:"tools"`
 	ToolChoice          any               `json:"tool_choice"`
+	// GopherLLMContextMode is an opt-in extension for local clients. Omitting
+	// it preserves normal OpenAI-compatible full-history semantics.
+	GopherLLMContextMode string `json:"gopherllm_context_mode"`
 }
 
 // OpenAIStreamOpts is the OpenAI "stream_options" object; IncludeUsage gates
@@ -858,6 +883,20 @@ func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
 		maxTokens = o.MaxCompletionTokens
 	}
 	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop, o.Tools, normalizeToolChoice(o.ToolChoice))
+}
+
+// ContextWindowMode parses GopherLLM's local context-window extension. It is
+// deliberately separate from Options so existing callers that use Options
+// directly retain the zero-value (full history) behavior.
+func (o OpenAIChatRequest) ContextWindowMode() (ContextWindowMode, error) {
+	mode := ContextWindowMode(strings.ToLower(strings.TrimSpace(o.GopherLLMContextMode)))
+	if mode == "" || mode == ContextWindowFull {
+		return ContextWindowFull, nil
+	}
+	if mode == ContextWindowRecent {
+		return ContextWindowRecent, nil
+	}
+	return "", fmt.Errorf("gopherllm_context_mode must be full or recent")
 }
 
 func (o OpenAIChatRequest) ChatMessages() []ChatMessage { return apiMessages(o.Messages) }
@@ -1095,6 +1134,19 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeContextWindowHeaders exposes the exact rendered prompt accounting to
+// the bundled web UI without changing OpenAI's streaming event schema. They
+// are only emitted for the explicit recent-context extension.
+func writeContextWindowHeaders(w http.ResponseWriter, info ContextWindowInfo) {
+	w.Header().Set("X-GopherLLM-Context-Mode", string(info.Mode))
+	w.Header().Set("X-GopherLLM-Context-Length", strconv.Itoa(info.ContextLength))
+	w.Header().Set("X-GopherLLM-Context-Budget", strconv.Itoa(info.PromptBudget))
+	w.Header().Set("X-GopherLLM-Context-Prompt-Tokens", strconv.Itoa(info.PromptTokens))
+	w.Header().Set("X-GopherLLM-Context-Input-Messages", strconv.Itoa(info.InputMessages))
+	w.Header().Set("X-GopherLLM-Context-Retained-Messages", strconv.Itoa(info.RetainedMessages))
+	w.Header().Set("X-GopherLLM-Context-Dropped-Messages", strconv.Itoa(info.DroppedMessages))
+}
+
 func ensureRequestID(w http.ResponseWriter, req *http.Request) string {
 	id := strings.TrimSpace(req.Header.Get("X-Request-ID"))
 	if id == "" {
@@ -1259,6 +1311,13 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	extra := map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason)}
 	if includeUsage {
 		extra["usage"] = usage(result)
+	}
+	// Headers are already committed once an SSE stream begins. Put the final
+	// loop iteration's context accounting in the terminal choice instead, so a
+	// skill/tool loop cannot leave the UI reporting the initial prompt as if it
+	// were the final one.
+	if result.ContextWindow != nil {
+		extra["gopherllm_context"] = result.ContextWindow
 	}
 	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra)
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")

@@ -45,7 +45,8 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - CLI generation, REPL mode, embeddings, metadata inspection, and tensor listing.
 - HTTP API with `/generate`, `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`, `/v1/skills`, `/api/generate`, `/api/chat`, and `/api/embeddings`.
-- Optional browser chat UI served from the embedded `web_ui` assets.
+- Optional browser chat UI served from the embedded `web_ui` assets, with
+  persistent local conversations and a template-aware smart context window.
 - Model discovery for LM Studio community model directories.
 
 ## Requirements
@@ -275,6 +276,34 @@ export. Nothing is synced to a third party; exported archives are the portable
 backup format. The UI assets use no-store and same-origin security headers, so
 start the server on a trusted local address unless you add your own network
 security in front of it.
+
+### Smart context for long chats
+
+The browser UI defaults to **Smart — recent complete turns**. It retains the
+entire conversation in IndexedDB, but when sending a reply it asks the server
+to select the newest complete turns that fit the loaded model's *actual* chat
+template and token budget. Leading system instructions stay pinned; an
+assistant tool call and its tool results stay with the user turn that caused
+them. The latest turn is never cut mid-message: if it alone cannot fit after
+reserving `max_tokens`, the request returns a clear error instead.
+
+The Settings panel reports the exact prompt token count and how many earlier
+messages remain saved locally. Choose **Full history — stop when full** for a
+strict, untrimmed transcript. This is also the default for normal API clients;
+the local extension is opt-in on `/v1/chat/completions`:
+
+```json
+{
+  "gopherllm_context_mode": "recent"
+}
+```
+
+For a non-streaming recent-context request, the response includes
+`X-GopherLLM-Context-*` headers (`Mode`, `Budget`, `Prompt-Tokens`,
+input/retained/dropped message counts) and a `gopherllm_context` object. For
+streaming requests, that object is carried by the terminal SSE choice instead,
+so it always describes the final model call even after an internal skill/tool
+loop. Allowed values are `recent` and `full`.
 
 Minimal OpenAI-compatible chat request:
 
