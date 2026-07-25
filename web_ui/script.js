@@ -166,11 +166,16 @@ function splitThinkText(raw) {
   const statusEl      = document.getElementById("status");
   const statusTextEl  = document.getElementById("statusText");
   const sendEl        = document.getElementById("send");
+  const sendLabelEl   = sendEl.querySelector(".send-label");
   const clearEl       = document.getElementById("clear");
+  const settingsToggleEl = document.getElementById("settingsToggle");
+  const settingsEl    = document.getElementById("settings");
   const maxTokensEl   = document.getElementById("maxTokens");
   const temperatureEl = document.getElementById("temperature");
   const tempValueEl   = document.getElementById("tempValue");
   const scrollEl      = document.getElementById("scroll");
+  const jumpLatestEl  = document.getElementById("jumpLatest");
+  const charCountEl   = document.getElementById("charCount");
   const modelSelectEl = document.getElementById("modelSelect");
   const modelNameEl   = document.getElementById("modelName");
 
@@ -184,17 +189,35 @@ function splitThinkText(raw) {
   function isNearBottom() {
     return scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 60;
   }
-  scrollEl.addEventListener("scroll", () => { followStream = isNearBottom(); }, { passive: true });
+  scrollEl.addEventListener("scroll", () => {
+    followStream = isNearBottom();
+    jumpLatestEl.hidden = followStream || !messagesEl.querySelector(".msg");
+  }, { passive: true });
   function scrollToBottom(force) {
-    if (force || followStream) scrollEl.scrollTop = scrollEl.scrollHeight;
+    if (force || followStream) {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+      jumpLatestEl.hidden = true;
+    }
   }
+  jumpLatestEl.addEventListener("click", () => {
+    followStream = true;
+    scrollToBottom(true);
+  });
 
   function setStatus(text) { statusTextEl.textContent = text; }
+
+  function updateComposer() {
+    const count = promptEl.value.length;
+    charCountEl.textContent = count + " character" + (count === 1 ? "" : "s");
+    if (!busy) sendEl.disabled = promptEl.value.trim().length === 0;
+  }
 
   function setBusy(b) {
     busy = b;
     modelSelectEl.disabled = b;
-    sendEl.textContent = b ? "Stop" : "Send";
+    if (b) sendEl.disabled = false;
+    else updateComposer();
+    sendLabelEl.textContent = b ? "Stop" : "Send";
     sendEl.classList.toggle("stop", b);
     sendEl.setAttribute("aria-label", b ? "Stop generating" : "Send message");
     statusEl.classList.toggle("busy", b);
@@ -231,6 +254,7 @@ function splitThinkText(raw) {
   function setModelName(name) {
     if (!name) return;
     modelNameEl.textContent = name;
+    modelNameEl.title = name;
     if (emptyModelEl) emptyModelEl.textContent = name;
   }
 
@@ -445,11 +469,12 @@ function splitThinkText(raw) {
   promptEl.addEventListener("input", () => {
     promptEl.style.height = "auto";
     promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + "px";
+    updateComposer();
   });
 
-  // Enter sends, Shift+Enter inserts a newline (Ctrl/Cmd+Enter also sends).
+  // Enter sends, Shift+Enter inserts a newline; Ctrl/Cmd+Enter always sends.
   promptEl.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey || !e.shiftKey) && !e.isComposing) {
       e.preventDefault();
       form.requestSubmit();
     }
@@ -467,10 +492,26 @@ function splitThinkText(raw) {
     history.length = 0;
     messagesEl.querySelectorAll(".msg").forEach((n) => n.remove());
     emptyEl.hidden = false;
+    jumpLatestEl.hidden = true;
     promptEl.focus();
   });
 
+  settingsToggleEl.addEventListener("click", () => {
+    const open = settingsEl.hidden;
+    settingsEl.hidden = !open;
+    settingsToggleEl.setAttribute("aria-expanded", String(open));
+  });
+
+  document.querySelectorAll(".suggestion").forEach((button) => {
+    button.addEventListener("click", () => {
+      promptEl.value = button.dataset.prompt || "";
+      promptEl.dispatchEvent(new Event("input"));
+      promptEl.focus();
+    });
+  });
+
   loadModelList();
+  updateComposer();
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -480,6 +521,7 @@ function splitThinkText(raw) {
 
     promptEl.value = "";
     promptEl.style.height = "";
+    updateComposer();
     const userMessage = { role: "user", content: text };
     addMessage("user", text);
     followStream = true;
