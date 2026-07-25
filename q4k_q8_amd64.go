@@ -66,6 +66,52 @@ func dotQ6KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 	}
 }
 
+// argmaxQ6KRowsQ8 finds argmax(W·x) over a Q6_K matrix using the same
+// int8-activation row kernel as the materializing matvec, without writing the
+// logits vector. xsums must be the per-16-element sums pre-scaled by 32.
+// Returns false when the int8 path is unavailable so callers keep the exact
+// float kernel. Without this, the greedy fast path was the ONLY Q6_K matvec
+// still on the old per-block float kernel: 131k rows took 51 ms instead of the
+// 17 ms the int8 kernel needs, making "skip the logits writeback" a 3x loss.
+func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, release := acquireQ8(x, cols)
+	// The dot runs in the inner loop directly rather than through an
+	// argmaxMatvecRows closure: a func-value call per row costs ~50 ns against
+	// the kernel's ~127 ns, which measured as 25 ms vs 17 ms over 131k rows.
+	q8p, xscp, xsumsp := &q8[0], &xsc[0], &xsums[0]
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			// Rows are scanned ascending, so a strict > keeps the lowest token
+			// id on ties, matching argmaxMatvecRows and argmaxFiniteToken.
+			v := q6kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	release()
+	return uint32(bestToken), true
+}
+
 type batchQ8Scratch struct {
 	q8    []int8
 	xsc   []float32

@@ -44,3 +44,7 @@ func dotMXFP4RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, st
 func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 	return false
 }
+
+func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	return 0, false
+}

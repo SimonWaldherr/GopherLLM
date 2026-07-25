@@ -359,10 +359,13 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ6KXSums16(x, w.Cols, scratch)
 		ScaleF32(xs, 32)
-		tok := argmaxMatvecRows(w.Rows, func(row int) float32 {
-			off := row * rowBytes
-			return dotQ6KF32SIMDWithXSums(w.Raw[off:off+rowBytes], x, xs, w.Cols)
-		})
+		tok, ok := argmaxQ6KRowsQ8(w.Raw, x, xs, w.Rows, w.Cols, rowBytes)
+		if !ok {
+			tok = argmaxMatvecRows(w.Rows, func(row int) float32 {
+				off := row * rowBytes
+				return dotQ6KF32SIMDWithXSums(w.Raw[off:off+rowBytes], x, xs, w.Cols)
+			})
+		}
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return tok, true
