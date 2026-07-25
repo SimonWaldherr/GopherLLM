@@ -55,6 +55,11 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --kernel-bench-runs <N>   Number of kernel benchmark runs (default: 25)")
 	fmt.Fprintln(os.Stderr, "  --kernel-bench-layer <N>  Transformer layer to benchmark (default: 0)")
 	fmt.Fprintln(os.Stderr, "  --timeout <duration>      Abort generation or each benchmark run after a duration, e.g. 2m")
+	fmt.Fprintln(os.Stderr, "  --auto                    Measure this model on this machine at startup and use the fastest settings")
+	fmt.Fprintln(os.Stderr, "                            (result is cached per model+hardware, so later runs start instantly)")
+	fmt.Fprintln(os.Stderr, "  --auto-effort <level>     Calibration depth: quick | balanced | thorough (default: balanced)")
+	fmt.Fprintln(os.Stderr, "  --auto-refresh            Re-measure even if a cached tuning exists")
+	fmt.Fprintln(os.Stderr, "  --auto-json               Print the tuning result as JSON and exit")
 	fmt.Fprintln(os.Stderr, "  --cpuprofile <path>       Write a CPU profile for the full command run")
 	fmt.Fprintln(os.Stderr, "  --inspect                 Inspect GGUF metadata and compatibility without loading weights")
 	fmt.Fprintln(os.Stderr, "  --list-metadata           Print GGUF metadata with --inspect")
@@ -87,6 +92,10 @@ type cliConfig struct {
 	kernelBenchLayer int
 	timeout          time.Duration
 	cpuProfile       string
+	autoTune         bool
+	autoTuneJSON     bool
+	autoTuneRefresh  bool
+	autoTuneEffort   string
 	useMetal         bool
 	prepareQuant     bool
 	inspect          bool
@@ -198,6 +207,17 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
 	}
 	fmt.Fprintf(os.Stderr, "Architecture: %s\n", runner.Architecture())
+	// Auto-tuning runs before every generation path (one-shot, REPL, server,
+	// bench) so all of them share the measured configuration.
+	if cfg.autoTune {
+		done, err := runAutoTune(runner, cfg)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
 	if cfg.serveAddr != "" {
 		return gopherllm.Serve(runner, gopherllm.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir})
 	}
@@ -252,6 +272,56 @@ func run() error {
 	printReasoningAndToolCalls(result)
 	printStats(result.Stats)
 	return nil
+}
+
+// runAutoTune calibrates the runtime settings for this model on this machine.
+// It reports whether the command is finished (--auto-json prints the result and
+// exits). A cached tuning is reused unless --auto-refresh was passed, so the
+// startup cost is paid once per model+hardware combination rather than per run.
+func runAutoTune(runner *gopherllm.Runner, cfg cliConfig) (bool, error) {
+	opts := autoTuneOptions(cfg.autoTuneEffort)
+	if !cfg.autoTuneJSON {
+		opts.LogWriter = os.Stderr
+	}
+	res, cached, err := runner.AutoTuneOrCached(opts, cfg.autoTuneRefresh)
+	if err != nil {
+		return false, err
+	}
+	if cfg.autoTuneJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return true, enc.Encode(res)
+	}
+	if cached {
+		fmt.Fprintf(os.Stderr, "Auto: reusing tuning measured %s (--auto-refresh re-measures)\n",
+			res.MeasuredAt.Local().Format("2006-01-02 15:04"))
+	} else {
+		fmt.Fprintf(os.Stderr, "Auto: calibrated in %.1fs\n", res.ElapsedMs/1000)
+	}
+	fmt.Fprintf(os.Stderr, "  %s\n", res.SettingsLine())
+	if g := res.GainsLine(); g != "" {
+		fmt.Fprintf(os.Stderr, "  %s\n", g)
+	}
+	return false, nil
+}
+
+// autoTuneOptions maps the effort level onto calibration cost. Measured on a 3B
+// Q4_K_M model: quick ~10-20s, balanced ~75s, thorough several minutes. The
+// extra time buys interleaved rounds, which is exactly what helps on a machine
+// whose clock swings under sustained load.
+func autoTuneOptions(effort string) gopherllm.AutoTuneOptions {
+	switch effort {
+	case "quick":
+		// Decode knobs only: a prefill sample costs a whole chunk of prompt
+		// processing, which is seconds on a multi-billion-parameter model.
+		return gopherllm.AutoTuneOptions{Rounds: 2, DecodeSteps: 1, Context: 512, MinGain: 0.06}
+	case "thorough":
+		return gopherllm.AutoTuneOptions{Rounds: 5, DecodeSteps: 3, Context: 2048, MinGain: 0.02,
+			TunePrefill: true, PrefillRounds: 3, MaxPrefillChunk: 256}
+	default:
+		return gopherllm.AutoTuneOptions{Rounds: 3, DecodeSteps: 2, Context: 512, MinGain: 0.03,
+			TunePrefill: true, PrefillRounds: 2, MaxPrefillChunk: 128}
+	}
 }
 
 // printReasoningAndToolCalls surfaces the parts of a gopherllm.GenerationResult that the
@@ -446,6 +516,26 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.timeout = v
+		case "--auto":
+			cfg.autoTune = true
+		case "--auto-refresh":
+			cfg.autoTune = true
+			cfg.autoTuneRefresh = true
+		case "--auto-json":
+			cfg.autoTune = true
+			cfg.autoTuneJSON = true
+		case "--auto-effort":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			switch v {
+			case "quick", "balanced", "thorough":
+			default:
+				return cfg, fmt.Errorf("--auto-effort must be quick, balanced, or thorough")
+			}
+			cfg.autoTune = true
+			cfg.autoTuneEffort = v
 		case "--cpuprofile":
 			v, err := next(arg)
 			if err != nil {

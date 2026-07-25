@@ -46,13 +46,60 @@ func TestParseCLIServeAndStops(t *testing.T) {
 	}
 }
 
+func TestParseCLIAutoFlags(t *testing.T) {
+	// Each of the auto sub-flags implies --auto, so none of them can be passed
+	// without actually turning tuning on.
+	for _, tc := range []struct {
+		args    []string
+		refresh bool
+		json    bool
+		effort  string
+	}{
+		{args: []string{"m", "--auto"}},
+		{args: []string{"m", "--auto-refresh"}, refresh: true},
+		{args: []string{"m", "--auto-json"}, json: true},
+		{args: []string{"m", "--auto-effort", "thorough"}, effort: "thorough"},
+		{args: []string{"m", "--auto-effort", "quick"}, effort: "quick"},
+	} {
+		cfg, err := parseCLI(tc.args)
+		if err != nil {
+			t.Fatalf("parseCLI(%v): %v", tc.args, err)
+		}
+		if !cfg.autoTune {
+			t.Fatalf("parseCLI(%v) did not enable auto tuning", tc.args)
+		}
+		if cfg.autoTuneRefresh != tc.refresh || cfg.autoTuneJSON != tc.json || cfg.autoTuneEffort != tc.effort {
+			t.Fatalf("parseCLI(%v) = refresh:%v json:%v effort:%q, want %v/%v/%q",
+				tc.args, cfg.autoTuneRefresh, cfg.autoTuneJSON, cfg.autoTuneEffort,
+				tc.refresh, tc.json, tc.effort)
+		}
+	}
+	// Every effort level must map to usable, non-zero calibration options.
+	for _, effort := range []string{"", "quick", "balanced", "thorough"} {
+		o := autoTuneOptions(effort)
+		if o.Rounds < 1 || o.DecodeSteps < 1 || o.Context < 1 || o.MinGain <= 0 {
+			t.Fatalf("autoTuneOptions(%q) = %+v, want usable values", effort, o)
+		}
+	}
+	// quick deliberately skips prefill tuning: one prefill sample costs a whole
+	// chunk of prompt processing.
+	if autoTuneOptions("quick").TunePrefill {
+		t.Fatal("quick effort should not tune prefill")
+	}
+	if !autoTuneOptions("balanced").TunePrefill {
+		t.Fatal("balanced effort should tune prefill")
+	}
+}
+
 func TestParseCLIErrors(t *testing.T) {
 	cases := [][]string{
-		{"--unknown-flag"},          // unknown option
-		{"m", "--temp"},             // missing value
-		{"m", "--max-tokens", "xx"}, // invalid int
-		{"m", "--temp", "notanum"},  // invalid float
-		{"--chat"},                  // --chat without --serve
+		{"--unknown-flag"},              // unknown option
+		{"m", "--temp"},                 // missing value
+		{"m", "--max-tokens", "xx"},     // invalid int
+		{"m", "--temp", "notanum"},      // invalid float
+		{"--chat"},                      // --chat without --serve
+		{"m", "--auto-effort", "turbo"}, // unknown effort level
+		{"m", "--auto-effort"},          // missing effort value
 	}
 	for _, args := range cases {
 		if _, err := parseCLI(args); err == nil {

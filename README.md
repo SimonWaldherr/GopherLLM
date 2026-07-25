@@ -15,6 +15,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - [GGUF Analyzer](#gguf-analyzer)
 - [Server](#server)
 - [Tool Use / Agentic](#tool-use--agentic)
+- [Auto Mode (hardware autotuning)](#auto-mode-hardware-autotuning)
 - [Benchmarking and Profiling](#benchmarking-and-profiling)
 - [Make Targets](#make-targets)
 - [Performance Notes](#performance-notes)
@@ -379,6 +380,77 @@ skills' names and descriptions. Tool calls for anything else (i.e. tools the
 *caller* supplied) are returned to the caller as usual, even with skills
 configured. `--skills-dir` works the same way in one-shot/`--repl` CLI mode.
 
+## Auto Mode (hardware autotuning)
+
+`--auto` measures **this model on this machine** at startup and runs it with the
+fastest settings it can find, instead of trusting a default that was tuned on
+somebody else's hardware:
+
+```sh
+bin/gopherllm /path/to/model.gguf --auto --prompt "Explain local inference."
+```
+
+```
+Auto-tuning mistral3 on amd64+avx2+f16c (12 CPUs)...
+  q8-activations on
+  threads        12
+  oversubscribe  on (was off)
+  kv-cache-f16   on
+  verify: oversubscribe wins, 145.2 -> 132.9 ms/token
+Auto: calibrated in 7.9s
+  threads=12 q8-activations=true kv-f16=true oversubscribe=true prefill-chunk=128
+  decode 145.2 -> 132.9 ms/token (1.09x)
+```
+
+The result is **cached per model + hardware** under the user cache directory, so
+only the first run pays for calibration. It applies to every mode — one-shot,
+`--repl`, `--serve`, and `--bench`.
+
+| Flag | Effect |
+| --- | --- |
+| `--auto` | Tune (or reuse a cached tuning) before generating |
+| `--auto-effort quick` | Decode knobs only, ~8s. Prefill samples cost a whole chunk of prompt processing, so they are skipped here |
+| `--auto-effort balanced` | Default. Adds prefill chunk tuning, ~1-2 min on a 3B model |
+| `--auto-effort thorough` | More interleaved rounds and a 2048-token probe context; minutes, but the most reliable on a noisy machine |
+| `--auto-refresh` | Re-measure and overwrite the cached result |
+| `--auto-json` | Print the full result — including every candidate's median — and exit |
+
+What it tunes: thread count, the int8-activation matvec kernels, the f16 KV
+cache, worker-dispatch oversubscription, and the prefill chunk size. Load-time
+choices (`--metal`, `--prepare-quant`) are *not* tuned, because changing them
+means reloading the weights; `--auto-json` reports whether they were active.
+
+### Why it is built the way it is
+
+The measurement methodology is the substance here, not the knob list. Naively
+timing candidate A and then candidate B produces garbage on any thermally
+limited machine: this repo's dev laptop drops from ~4 GHz burst to ~1.2 GHz
+sustained, so two runs of *identical* code can differ by 2-3x — far more than
+any real tuning gain. The tuner therefore:
+
+- **interleaves candidates in serpentine order** (`A B C`, then `C B A`). Plain
+  round-robin is not enough: under a steady thermal ramp, whichever candidate is
+  visited first each round is always measured at the coolest moment and wins
+  systematically. Alternating direction cancels that gradient.
+- **reports medians**, never means or minimums.
+- **requires two independent hurdles** to change a setting: beat the incumbent's
+  median by a margin *and* win a majority of individual rounds. A single lucky
+  sample during a clock spike clears neither.
+- **treats coordinate descent as a hypothesis, not an answer.** After the cheap
+  per-knob exploration, one final interleaved sweep judges the starting config,
+  the full proposed set, and each proposed change *in isolation*. So a set that
+  only looked good because two knobs each got a lucky sample is rejected, while
+  a single genuine win inside a losing set is still kept — and since the starting
+  config is always a candidate, auto mode can never leave the model slower than
+  it found it.
+- **repeats probes until they are measurable.** A single forward pass through a
+  small model times as exactly zero against the Windows clock's granularity,
+  which would leave every candidate tied.
+
+Expect run-to-run variation in *which* knobs it changes on a noisy machine —
+that is the honest reflection of the hardware, and `--auto-effort thorough`
+buys more rounds where it matters.
+
 ## Benchmarking and Profiling
 
 Run synthetic Go microbenchmarks:
@@ -471,6 +543,40 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 
 ## Performance Notes
 
+- Prefer `--auto` over hand-tuning the flags below: it measures them on the
+  actual machine and caches the result. See
+  [Auto Mode](#auto-mode-hardware-autotuning).
+- **Decode is at the memory-bandwidth roofline, and that bounds what any further
+  kernel work can achieve.** Measured on the dev laptop (i7-10850H, DDR4-2933
+  dual channel) with Ministral-3 3B Q4_K_M, which streams ~2.2 GB of weights per
+  generated token:
+
+  | Measurement | Throughput |
+  | --- | --- |
+  | `MatvecQ6KInto`, 330 MB DRAM-resident, 12 threads | ~22-25 GB/s |
+  | Pure read of the same footprint, no weight decode | ~28-33 GB/s |
+  | Same int8 row kernel on L2-resident weights, 12 threads | ~52-58 GB/s |
+
+  So the kernels already run at ~75-80% of the achievable *streaming* rate,
+  while having ~2.1x of idle compute capacity behind the memory wall. Two
+  consequences worth knowing before optimizing:
+  - Making the row kernels faster cannot help decode; they are already waiting
+    on DRAM. Reducing *bytes per token* is the only lever.
+  - Thread count barely matters once past ~6 threads: 12, 8, and 6 threads all
+    measured within noise of each other (4 was clearly worse). This is why
+    `--threads` is not the tuning knob it looks like.
+- **Batching amortizes only ~1.7x, which is why speculative decoding does not
+  pay here.** With a DRAM-resident weight, `matvecBatchQ8`'s cost per token falls
+  from ~18 ms at p=1 to ~11 ms and then flattens — each extra position in a batch
+  still costs ~0.6-0.7 of a full pass, because the int8 kernel re-decodes the
+  weight row per token rather than register-blocking across tokens. A 3-position
+  verification batch therefore costs ~2.4 passes, capping any speculative scheme
+  at ~1.2x even with *perfect* draft acceptance. (An n-gram/prompt-lookup drafter
+  was built and measured: it produced bit-identical output but ran at 0.81x,
+  since real acceptance was ~39% on a 17% drafter hit rate.) Making batching
+  genuinely cheap needs a kernel that dots one decoded weight row against N
+  activation vectors; that would speed up prefill directly and only then make
+  speculation viable.
 - Use `--threads <N>` to set both GopherLLM worker threads and `GOMAXPROCS`.
   Make targets expose the same setting as `THREADS=<N>`; 8 was fastest in the
   measured M2 Max setup, but should be re-benchmarked on each target Mac.
@@ -569,6 +675,9 @@ details in the bullets they annotate):
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
+
+Settings chosen by `--auto` override the corresponding environment variables for
+the rest of the process.
 
 ## Supported Architectures
 
