@@ -3,3 +3,6 @@ bin/
 gopherllm
 *.gguf
 scratch/p.prof
+/rag
+/data
+/archive-web
