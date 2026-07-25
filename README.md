@@ -267,6 +267,15 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
 
 Open `http://127.0.0.1:8080/chat` for the browser UI.
 
+The chat UI is a local workspace rather than a thin request form: conversations,
+drafts, per-chat instructions, sampling settings, and the selected appearance
+are saved in the browser's IndexedDB. It supports chat search, rename/delete,
+editing and retrying messages, local text-file insertion, and JSON/Markdown
+export. Nothing is synced to a third party; exported archives are the portable
+backup format. The UI assets use no-store and same-origin security headers, so
+start the server on a trusted local address unless you add your own network
+security in front of it.
+
 Minimal OpenAI-compatible chat request:
 
 ```sh
@@ -295,8 +304,8 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | POST | `/api/generate` | Ollama-compatible generation |
 | POST | `/api/chat` | Ollama-compatible chat (accepts tools) |
 | POST | `/api/embeddings` | Ollama-compatible embeddings |
-| GET | `/models` | Scan `--model-dir` and list all discovered GGUFs |
-| POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; a catalog path remains accepted for older clients) |
+| GET | `/models` | Scan `--model-dir` and list discovered GGUFs, including each model's context length |
+| POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; response includes the loaded context length) |
 | GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |
 
 ## Tool Use / Agentic

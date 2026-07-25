@@ -32,10 +32,13 @@ var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
 var inferenceRequestSeq atomic.Uint64
 
 type chatTemplateData struct {
-	Title       string
-	Model       string
-	MaxTokens   int
-	Temperature float32
+	Title         string
+	Model         string
+	MaxTokens     int
+	Temperature   float32
+	TopP          float32
+	TopK          int
+	RepeatPenalty float32
 }
 
 type runnerState struct {
@@ -457,13 +460,14 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 	})
 	mux.HandleFunc("/models", func(w http.ResponseWriter, _ *http.Request) {
 		type modelInfo struct {
-			ID           string  `json:"id"`
-			Name         string  `json:"name"`
-			Path         string  `json:"path"`
-			Architecture string  `json:"architecture"`
-			SizeGB       float64 `json:"size_gb"`
-			Supported    bool    `json:"supported"`
-			Loaded       bool    `json:"loaded"`
+			ID            string  `json:"id"`
+			Name          string  `json:"name"`
+			Path          string  `json:"path"`
+			Architecture  string  `json:"architecture"`
+			ContextLength int     `json:"context_length"`
+			SizeGB        float64 `json:"size_gb"`
+			Supported     bool    `json:"supported"`
+			Loaded        bool    `json:"loaded"`
 		}
 		if opts.ModelDir == "" {
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
@@ -485,13 +489,14 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 				name = e.FileName
 			}
 			models = append(models, modelInfo{
-				ID:           e.ID,
-				Name:         name,
-				Path:         e.Path,
-				Architecture: e.Architecture,
-				SizeGB:       float64(e.SizeBytes) / (1024 * 1024 * 1024),
-				Supported:    e.IsSupported,
-				Loaded:       e.Path == loadedPath,
+				ID:            e.ID,
+				Name:          name,
+				Path:          e.Path,
+				Architecture:  e.Architecture,
+				ContextLength: e.ContextLength,
+				SizeGB:        float64(e.SizeBytes) / (1024 * 1024 * 1024),
+				Supported:     e.IsSupported,
+				Loaded:        e.Path == loadedPath,
 			})
 		}
 		writeJSON(w, map[string]any{"models": models})
@@ -531,7 +536,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			return
 		}
 		state.swap(newRunner, entry.Path)
-		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner)})
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.config.MaxSeqLen})
 	}))
 	if opts.ChatUI {
 		mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
@@ -542,27 +547,43 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			http.Redirect(w, req, "/chat", http.StatusFound)
 		})
 		mux.HandleFunc("/chat", func(w http.ResponseWriter, _ *http.Request) {
+			setChatUIHeaders(w)
 			w.Header().Set("content-type", "text/html; charset=utf-8")
 			data := chatTemplateData{
-				Title:       "GopherLLM Chat",
-				Model:       modelID(state.get()),
-				MaxTokens:   opts.Defaults.MaxTokens,
-				Temperature: opts.Defaults.Sampler.Temperature,
+				Title:         "GopherLLM Chat",
+				Model:         modelID(state.get()),
+				MaxTokens:     opts.Defaults.MaxTokens,
+				Temperature:   opts.Defaults.Sampler.Temperature,
+				TopP:          opts.Defaults.Sampler.TopP,
+				TopK:          opts.Defaults.Sampler.TopK,
+				RepeatPenalty: opts.Defaults.Sampler.RepeatPenalty,
 			}
 			if err := chatTemplate.Execute(w, data); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}
 		})
 		mux.HandleFunc("/style.css", func(w http.ResponseWriter, _ *http.Request) {
+			setChatUIHeaders(w)
 			w.Header().Set("content-type", "text/css; charset=utf-8")
 			fmt.Fprint(w, chatCSS)
 		})
 		mux.HandleFunc("/script.js", func(w http.ResponseWriter, _ *http.Request) {
+			setChatUIHeaders(w)
 			w.Header().Set("content-type", "text/javascript; charset=utf-8")
 			fmt.Fprint(w, chatJS)
 		})
 	}
 	return mux
+}
+
+// setChatUIHeaders keeps the local browser workspace private to this origin:
+// chat HTML and its assets are never cached and cannot load third-party code.
+func setChatUIHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "same-origin")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'")
 }
 
 func displayServerURL(addr string, chatUI bool) string {

@@ -143,13 +143,13 @@
             <span id="tempValue" class="temp-value">{{.Temperature}}</span>
           </label>
           <label>Top P
-            <input id="topP" type="number" min="0" max="1" step="0.05" value="0.90" inputmode="decimal" autocomplete="off">
+            <input id="topP" type="number" min="0" max="1" step="0.05" value="{{.TopP}}" inputmode="decimal" autocomplete="off">
           </label>
           <label>Top K
-            <input id="topK" type="number" min="0" max="200" step="1" value="40" inputmode="numeric" autocomplete="off">
+            <input id="topK" type="number" min="0" max="200" step="1" value="{{.TopK}}" inputmode="numeric" autocomplete="off">
           </label>
           <label>Repeat penalty
-            <input id="repeatPenalty" type="number" min="0" max="3" step="0.05" value="1.10" inputmode="decimal" autocomplete="off">
+            <input id="repeatPenalty" type="number" min="0" max="3" step="0.05" value="{{.RepeatPenalty}}" inputmode="decimal" autocomplete="off">
           </label>
           <label>Seed <span class="field-note">optional</span>
             <input id="seed" type="number" min="0" step="1" placeholder="Random" inputmode="numeric" autocomplete="off">

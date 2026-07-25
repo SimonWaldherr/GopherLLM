@@ -18,15 +18,16 @@ const lmStudioCommunitySubdir = ".cache/lm-studio/models/lmstudio-community"
 // what --list-models prints); IsProjector marks multimodal companion files
 // (mmproj-*/clip) that must not be offered for text generation.
 type ModelEntry struct {
-	ID           string
-	Repository   string
-	FileName     string
-	Path         string
-	SizeBytes    int64
-	Architecture string
-	ModelName    string
-	IsProjector  bool
-	IsSupported  bool
+	ID            string
+	Repository    string
+	FileName      string
+	Path          string
+	SizeBytes     int64
+	Architecture  string
+	ContextLength int
+	ModelName     string
+	IsProjector   bool
+	IsSupported   bool
 }
 
 func (m ModelEntry) Status() string {
@@ -338,9 +339,10 @@ func inspectModel(root, path string) (ModelEntry, error) {
 	}
 	arch, _ := gguf.GetString("general.architecture")
 	modelName, _ := gguf.GetString("general.name")
+	contextLength := ConfigFromGGUF(gguf).MaxSeqLen
 	lower := strings.ToLower(fileName)
 	isProjector := strings.HasPrefix(lower, "mmproj-") || strings.Contains(lower, "mmproj") || strings.EqualFold(arch, "clip")
-	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ModelName: modelName, IsProjector: isProjector, IsSupported: ArchitectureSupported(arch)}, nil
+	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ContextLength: contextLength, ModelName: modelName, IsProjector: isProjector, IsSupported: ArchitectureSupported(arch)}, nil
 }
 
 func matchingEntries(entries []ModelEntry, selector string) []ModelEntry {

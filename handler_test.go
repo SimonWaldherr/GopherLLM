@@ -151,15 +151,16 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 	}
 	var listed struct {
 		Models []struct {
-			ID     string `json:"id"`
-			Loaded bool   `json:"loaded"`
+			ID            string `json:"id"`
+			Loaded        bool   `json:"loaded"`
+			ContextLength int    `json:"context_length"`
 		} `json:"models"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&listed); err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(listed.Models) != 1 || listed.Models[0].ID != filepath.Join("catalog", "allowed") || !listed.Models[0].Loaded {
+	if len(listed.Models) != 1 || listed.Models[0].ID != filepath.Join("catalog", "allowed") || !listed.Models[0].Loaded || listed.Models[0].ContextLength != 1024 {
 		t.Fatalf("catalog after rejected load = %+v", listed.Models)
 	}
 
@@ -169,14 +170,15 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 		t.Fatalf("catalog id load status = %d body=%s", resp.StatusCode, body)
 	}
 	var loaded struct {
-		ID string `json:"id"`
+		ID            string `json:"id"`
+		ContextLength int    `json:"context_length"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&loaded); err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if loaded.ID != filepath.Join("catalog", "allowed") {
-		t.Fatalf("loaded id = %q", loaded.ID)
+	if loaded.ID != filepath.Join("catalog", "allowed") || loaded.ContextLength != 1024 {
+		t.Fatalf("loaded response = %+v", loaded)
 	}
 
 	// Older clients send a path. It remains supported only when it resolves

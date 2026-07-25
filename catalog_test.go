@@ -179,7 +179,7 @@ func TestDiscoverModelsAndResolveModelPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].ID != filepath.Join("repo", "tiny") || entries[0].ModelName != "tiny" || !entries[0].IsSupported {
+	if len(entries) != 1 || entries[0].ID != filepath.Join("repo", "tiny") || entries[0].ModelName != "tiny" || entries[0].ContextLength != 1024 || !entries[0].IsSupported {
 		t.Fatalf("entries = %+v", entries)
 	}
 	if !strings.Contains(logs.String(), "Skipping") {
