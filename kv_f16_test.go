@@ -36,15 +36,15 @@ func TestF32ToF16RoundsToNearestEven(t *testing.T) {
 		{0, 0x0000},
 		{1, 0x3c00},
 		{-2, 0xc000},
-		{65504, 0x7bff},           // f16 max
-		{65520, 0x7c00},           // rounds up to +inf
-		{1e9, 0x7c00},             // overflow -> +inf
+		{65504, 0x7bff}, // f16 max
+		{65520, 0x7c00}, // rounds up to +inf
+		{1e9, 0x7c00},   // overflow -> +inf
 		{float32(math.Inf(-1)), 0xfc00},
-		{5.9604645e-8, 0x0001},    // smallest subnormal
-		{1e-10, 0x0000},           // underflow -> zero
-		{1.0009765625, 0x3c01},    // 1 + 1ulp(f16)
-		{1.00048828125, 0x3c00},   // exact tie 1 + 0.5ulp -> even (down)
-		{1.00146484375, 0x3c02},   // exact tie 3rd -> even (up)
+		{5.9604645e-8, 0x0001},  // smallest subnormal
+		{1e-10, 0x0000},         // underflow -> zero
+		{1.0009765625, 0x3c01},  // 1 + 1ulp(f16)
+		{1.00048828125, 0x3c00}, // exact tie 1 + 0.5ulp -> even (down)
+		{1.00146484375, 0x3c02}, // exact tie 3rd -> even (up)
 	}
 	for _, c := range cases {
 		if got := F32ToF16(c.in); got != c.want {
@@ -192,9 +192,9 @@ func TestOnlineAttentionMatchesNaiveReference(t *testing.T) {
 	values := randomVec(rng, ctx*headDim)
 	scale := float32(1 / math.Sqrt(headDim))
 	for _, tc := range []struct {
-		name           string
-		startT, endT   int
-		softcap        float32
+		name         string
+		startT, endT int
+		softcap      float32
 	}{
 		{"full", 0, ctx - 1, 0},
 		{"slidingWindow", 64, ctx - 1, 0},
