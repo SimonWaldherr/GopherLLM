@@ -521,7 +521,7 @@ function toMarkdown(chat) {
   /* Caches the char count of everything except the live draft (system prompt +
      message history), so typing in the composer doesn't re-walk the whole
      conversation on every keystroke. Invalidated by message count / system
-     prompt identity, which covers pushes, truncation (edit/retry), and edits
+     prompt identity, which covers pushes, new edit/retry branches, and edits
      to the instructions field. */
   const historyCharsCache = new Map();
   function historyChars(chat) {
@@ -584,7 +584,9 @@ function toMarkdown(chat) {
   function updateComposer(storeDraft) {
     const chat = activeChat();
     if (!chat) return;
-    if (storeDraft) {
+    // An edit is a temporary branch proposal. Do not persist its text in the
+    // source chat before the user actually submits it.
+    if (storeDraft && editingIndex === null) {
       chat.draft = promptEl.value;
       saveSoon();
     }
@@ -755,12 +757,12 @@ function toMarkdown(chat) {
     action.className = "message-action";
     action.type = "button";
     if (message.role === "user") {
-      action.textContent = "Edit";
-      action.setAttribute("aria-label", "Edit this message");
+      action.textContent = "Edit & branch";
+      action.setAttribute("aria-label", "Edit this message in a new branch");
       action.addEventListener("click", () => editMessage(index));
     } else {
-      action.textContent = "Retry";
-      action.setAttribute("aria-label", "Regenerate this answer");
+      action.textContent = "Retry in branch";
+      action.setAttribute("aria-label", "Regenerate this answer in a new branch");
       action.addEventListener("click", () => retryMessage(index));
     }
     wrap.appendChild(action);
@@ -808,12 +810,60 @@ function toMarkdown(chat) {
     renderConversation(true);
   }
 
+  function limitChats(keepIDs) {
+    if (chats.length <= MAX_CHATS) return;
+    const keep = new Set(keepIDs || []);
+    const remove = chats.filter((chat) => !keep.has(chat.id))
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(0, chats.length - MAX_CHATS);
+    const removeIDs = new Set(remove.map((chat) => chat.id));
+    if (!removeIDs.size) return;
+    chats = chats.filter((chat) => !removeIDs.has(chat.id));
+    removeIDs.forEach((id) => historyCharsCache.delete(id));
+  }
+
+  function branchTitle(title, kind) {
+    const suffix = " · " + kind;
+    const base = String(title || "New chat").trim() || "New chat";
+    return base.slice(0, Math.max(1, 160 - suffix.length)).trimEnd() + suffix;
+  }
+
+  function copyMessage(message) {
+    // Stored messages come from JSON responses or JSON imports, so this makes
+    // branch history independent without changing the portable workspace format.
+    return cleanMessage(JSON.parse(JSON.stringify(message)));
+  }
+
+  function createBranch(source, messages, kind) {
+    const now = Date.now();
+    const branch = {
+      id: makeID(),
+      title: branchTitle(source.title, kind),
+      titleManual: true,
+      createdAt: now,
+      updatedAt: now,
+      model: source.model,
+      persona: source.persona,
+      systemPrompt: source.systemPrompt,
+      draft: "",
+      settings: cleanSettings(source.settings, defaults),
+      messages: messages.map(copyMessage).filter(Boolean)
+    };
+    chats.unshift(branch);
+    // A branch is useful only when the original stays available for comparison.
+    limitChats([source.id, branch.id]);
+    activeID = branch.id;
+    lastContextWindow = null;
+    return branch;
+  }
+
   function createChat() {
     if (busy) return;
+    if (editingIndex !== null) cancelEdit();
     const chat = newChat(defaults);
     chat.model = modelNameEl.textContent || "";
     chats.unshift(chat);
-    chats = chats.slice(0, MAX_CHATS);
+    limitChats([chat.id]);
     activeID = chat.id;
     editingIndex = null;
     editStateEl.hidden = true;
@@ -829,6 +879,7 @@ function toMarkdown(chat) {
       return;
     }
     if (!chats.some((chat) => chat.id === id)) return;
+    if (editingIndex !== null) cancelEdit();
     activeID = id;
     editingIndex = null;
     editStateEl.hidden = true;
@@ -908,13 +959,14 @@ function toMarkdown(chat) {
   }
 
   function editMessage(index) {
+    if (busy) return;
+    if (editingIndex !== null) cancelEdit();
     const chat = activeChat();
     const message = chat && chat.messages[index];
-    if (!message || message.role !== "user" || busy) return;
+    if (!message || message.role !== "user") return;
     draftBeforeEdit = chat.draft;
     editingIndex = index;
     promptEl.value = message.content;
-    chat.draft = message.content;
     editStateEl.hidden = false;
     resizePrompt();
     updateComposer(true);
@@ -1046,10 +1098,11 @@ function toMarkdown(chat) {
       });
       if (!response.ok) {
         const body = await response.text();
-        let message = "HTTP " + response.status;
+        const fallback = body.trim();
+        let message = fallback || "HTTP " + response.status;
         try {
           const json = JSON.parse(body);
-          message = (json.error && (json.error.message || json.error)) || message;
+          message = (json.error && (json.error.message || json.error)) || fallback || message;
         } catch (_) {}
         throw new Error(message);
       }
@@ -1115,11 +1168,19 @@ function toMarkdown(chat) {
   async function submitPrompt() {
     if (busy || tuning) return;
     const text = promptEl.value.trim();
-    const chat = activeChat();
+    let chat = activeChat();
     if (!text || !chat) return;
     if (editingIndex !== null) {
-      chat.messages = chat.messages.slice(0, editingIndex);
-      cancelEdit();
+      const source = chat;
+      const index = editingIndex;
+      source.draft = draftBeforeEdit;
+      editingIndex = null;
+      draftBeforeEdit = "";
+      editStateEl.hidden = true;
+      chat = createBranch(source, source.messages.slice(0, index), "edit");
+      syncControls(false);
+      renderChatList();
+      showToast("Created an edit branch. The original chat is unchanged.", "success");
     }
     chat.messages.push({ role: "user", content: text, reasoning: "", tool_calls: null, usage: null, finishReason: "" });
     if (!chat.titleManual && chat.messages.filter((message) => message.role === "user").length === 1) {
@@ -1138,14 +1199,15 @@ function toMarkdown(chat) {
   }
 
   function retryMessage(index) {
+    if (busy || tuning) return;
+    if (editingIndex !== null) cancelEdit();
     const chat = activeChat();
-    if (!chat || busy || tuning || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
+    if (!chat || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
     if (!chat.messages.slice(0, index).some((message) => message.role === "user")) return;
-    chat.messages = chat.messages.slice(0, index);
-    touch(chat);
-    renderConversation(true);
-    renderChatList();
+    createBranch(chat, chat.messages.slice(0, index), "retry");
+    renderWorkspace(true);
     save();
+    showToast("Created a retry branch. The original chat is unchanged.", "success");
     generate();
   }
 

@@ -271,11 +271,13 @@ Open `http://127.0.0.1:8080/chat` for the browser UI.
 The chat UI is a local workspace rather than a thin request form: conversations,
 drafts, per-chat instructions, sampling settings, and the selected appearance
 are saved in the browser's IndexedDB. It supports chat search, rename/delete,
-editing and retrying messages, local text-file insertion, and JSON/Markdown
-export. Nothing is synced to a third party; exported archives are the portable
-backup format. The UI assets use no-store and same-origin security headers, so
-start the server on a trusted local address unless you add your own network
-security in front of it.
+non-destructive edit and retry branches, local text-file insertion, and
+JSON/Markdown export. Editing an earlier prompt or retrying an answer opens a
+new local branch while retaining the original conversation for comparison.
+Nothing is synced to a third party; exported archives are the portable backup
+format. The UI assets use no-store and same-origin security headers, so start
+the server on a trusted local address unless you add your own network security
+in front of it.
 
 ### Smart context for long chats
 
