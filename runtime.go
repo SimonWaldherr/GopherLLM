@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -785,15 +786,45 @@ func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *Decode
 	return nil
 }
 
-// prefillChunkSize keeps a conservative default for larger models while using
+// prefillChunkOverride, when positive, wins over both the env var and the
+// model-aware default. The autotuner sets it after measuring the real batched
+// forward on the real hardware, which beats any static heuristic.
+var prefillChunkOverride atomic.Int64
+
+// SetPrefillChunk pins the prompt-prefill chunk size; 0 restores the default
+// (env var, else the model-aware heuristic).
+func SetPrefillChunk(n int) {
+	if n < 0 {
+		n = 0
+	}
+	prefillChunkOverride.Store(int64(n))
+}
+
+// prefillChunkSize resolves the chunk size actually used: an explicit override
+// (set by the autotuner) wins, otherwise the env var, otherwise the
+// model-aware default.
+func prefillChunkSize(config Config) int {
+	if n := int(prefillChunkOverride.Load()); n > 0 {
+		return n
+	}
+	return prefillChunkDefault(config)
+}
+
+// prefillChunkOverrideValue reports the raw override, 0 when unset. Callers that
+// save and restore the setting must use this rather than prefillChunkSize:
+// re-applying a resolved value would pin it as an explicit override and thereby
+// suppress the env var and the model-aware default.
+func prefillChunkOverrideValue() int { return int(prefillChunkOverride.Load()) }
+
+// prefillChunkDefault keeps a conservative default for larger models while using
 // larger chunks on small dense models such as Ministral-3-3B. Bottleneck:
 // prompt prefill is chunk-size sensitive because larger chunks amortize
 // dequantization but grow activation working sets. Change: small models default
 // to 128 after real Ministral measurement; GOPHERLLM_PREFILL_CHUNK can override
 // it for A/B testing. Expected effect: lower TTFT on 3B-class models. Risk:
 // too-large chunks can regress cache locality on bigger models. Rollback: set
-// GOPHERLLM_PREFILL_CHUNK=32.
-func prefillChunkSize(config Config) int {
+// GOPHERLLM_PREFILL_CHUNK=32. --auto measures this instead of guessing it.
+func prefillChunkDefault(config Config) int {
 	const def = 32
 	raw := strings.TrimSpace(os.Getenv("GOPHERLLM_PREFILL_CHUNK"))
 	if raw == "" {

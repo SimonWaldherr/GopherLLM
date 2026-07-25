@@ -84,36 +84,10 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 		return 0
 	}
 	if config.Temperature < 1e-6 {
-		if config.RepeatPenalty != 1 {
-			for _, tok := range recent {
-				if int(tok) < n {
-					v := logits[tok]
-					if !finiteLogit(v) {
-						logits[tok] = negInf32
-					} else if v > 0 {
-						logits[tok] = v / config.RepeatPenalty
-					} else {
-						logits[tok] = v * config.RepeatPenalty
-					}
-				}
-			}
-		}
+		applyRepeatPenalty(logits, recent, config.RepeatPenalty)
 		return argmaxFiniteToken(logits)
 	}
-	if config.RepeatPenalty != 1 {
-		for _, tok := range recent {
-			if int(tok) < n {
-				v := logits[tok]
-				if !finiteLogit(v) {
-					logits[tok] = negInf32
-				} else if v > 0 {
-					logits[tok] = v / config.RepeatPenalty
-				} else {
-					logits[tok] = v * config.RepeatPenalty
-				}
-			}
-		}
-	}
+	applyRepeatPenalty(logits, recent, config.RepeatPenalty)
 	invTemp := 1 / config.Temperature
 	if config.TopK > 0 && config.TopK < n {
 		if config.TopK == 1 {
@@ -153,6 +127,29 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 		logits[i] /= sum
 	}
 	return sampleFromProbs(logits, rng)
+}
+
+// applyRepeatPenalty divides positive logits and multiplies negative ones for
+// every token in the recent window (the llama.cpp convention), and forces any
+// non-finite logit to -Inf. A penalty of 1 is a no-op. logits is mutated in
+// place; out-of-range token ids in recent are skipped.
+func applyRepeatPenalty(logits []float32, recent []uint32, penalty float32) {
+	if penalty == 1 {
+		return
+	}
+	n := len(logits)
+	for _, tok := range recent {
+		if int(tok) < n {
+			v := logits[tok]
+			if !finiteLogit(v) {
+				logits[tok] = negInf32
+			} else if v > 0 {
+				logits[tok] = v / penalty
+			} else {
+				logits[tok] = v * penalty
+			}
+		}
+	}
 }
 
 // sampleFromProbs draws from an already-normalized distribution.
