@@ -180,6 +180,11 @@ func (r AutoTuneResult) PrefillSpeedup() float64 {
 
 // Apply installs a (possibly cached) tuning result into the process. Settings
 // the running build cannot support are ignored rather than forced.
+//
+// This mutates process-global kernel selection, so it must not run concurrently
+// with an in-flight generation — call it during startup, before serving
+// requests. Runner.AutoTune and Runner.AutoTuneOrCached hold the generation lock
+// and are safe to call at any time; prefer those.
 func (r AutoTuneResult) Apply() {
 	if r.Threads > 0 {
 		SetNumThreads(r.Threads)
@@ -280,6 +285,18 @@ type autoTuner struct {
 	// sample. Toggling the f16 KV setting rebuilds the cache, which shows up
 	// here as a new pointer and triggers a re-prime.
 	primedCache *KVCache
+	// decodeProbeFn overrides the decode measurement. Nil means the real probe;
+	// tests substitute scripted timings so the accept/reject logic can be
+	// verified deterministically instead of through noisy hardware.
+	decodeProbeFn func() float64
+}
+
+// measureDecode is the decode metric every knob is judged on.
+func (t *autoTuner) measureDecode() float64 {
+	if t.decodeProbeFn != nil {
+		return t.decodeProbeFn()
+	}
+	return t.decodeProbe()
 }
 
 // workspace returns the probe workspace at a fixed size. Every probe asks for
@@ -385,85 +402,61 @@ func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
 // laptop that drops from ~4 GHz to ~1.2 GHz under load that difference dwarfs
 // any real tuning gain.
 func (t *autoTuner) finalizeDecode(origin, proposed tunerConfig) (tunerConfig, float64, float64) {
-	cands := []struct {
-		label string
-		cfg   tunerConfig
-	}{{"defaults", origin}}
 	changes := singleDecodeChanges(origin, proposed)
+	// Candidate 0 is always the starting config, so "keep the defaults" is a
+	// possible outcome and the tuner can never end up slower than it began.
+	configs := []decodeChange{{"defaults", origin}}
 	if len(changes) > 1 {
-		cands = append(cands, struct {
-			label string
-			cfg   tunerConfig
-		}{"all", proposed})
+		// Only worth measuring the combination when there is more than one
+		// change; with exactly one it is the same config as that change alone.
+		configs = append(configs, decodeChange{"all", proposed})
 	}
-	for _, c := range changes {
-		cands = append(cands, struct {
-			label string
-			cfg   tunerConfig
-		}{c.name, c.cfg})
-	}
-	if len(cands) == 1 {
+	configs = append(configs, changes...)
+
+	if len(configs) == 1 {
 		// Nothing changed; still measure once so the report has a real number.
-		s := t.sweep(1, 1, func(int) { origin.apply() }, t.decodeProbe)
-		m := medianFloat(s[0])
+		m := medianFloat(t.sweep(1, 1, func(int) { origin.apply() }, t.measureDecode)[0])
 		fmt.Fprintf(t.opts.LogWriter, "  verify: defaults already best (%.1f ms/token)\n", m)
 		return origin, m, m
 	}
 
-	samples := t.sweep(t.opts.Rounds, len(cands), func(i int) { cands[i].cfg.apply() }, t.decodeProbe)
-	meds := make([]float64, len(cands))
-	trial := AutoTuneTrial{Knob: "verify", Metric: "ms/token", Incumbent: "defaults"}
-	for i := range cands {
-		meds[i] = medianFloat(samples[i])
-		trial.Candidates = append(trial.Candidates, AutoTuneSample{Value: cands[i].label, MedianMs: meds[i]})
+	cands := make([]candidate, len(configs))
+	for i, c := range configs {
+		cfg := c.cfg
+		cands[i] = candidate{label: c.name, apply: func() { cfg.apply() }}
 	}
-	best := 0
-	for i := 1; i < len(cands); i++ {
-		if meds[i] <= 0 {
-			continue
-		}
-		if betterBy(meds[i], meds[best], true) > t.opts.MinGain &&
-			winsMajority(samples[i], samples[best], true) {
-			best = i
-		}
-	}
-	trial.Chosen = cands[best].label
-	t.trials = append(t.trials, trial)
+	best, meds := t.evaluate("verify", "ms/token", cands, 0, t.opts.Rounds, true, t.measureDecode)
 
 	if best == 0 {
 		fmt.Fprintf(t.opts.LogWriter,
 			"  verify: no change beat the defaults (%.1f ms/token) — keeping them\n", meds[0])
-		// Carry over the prefill chunk, which is judged separately on prefill
-		// throughput and has no effect on decode.
-		out := origin
-		out.prefillChunk = proposed.prefillChunk
-		return out, meds[0], meds[0]
+	} else {
+		fmt.Fprintf(t.opts.LogWriter, "  verify: %s wins, %.1f -> %.1f ms/token\n",
+			configs[best].name, meds[0], meds[best])
 	}
-	fmt.Fprintf(t.opts.LogWriter, "  verify: %s wins, %.1f -> %.1f ms/token\n",
-		cands[best].label, meds[0], meds[best])
-	out := cands[best].cfg
+	// Carry over the prefill chunk either way: it is judged separately on prefill
+	// throughput and has no effect on decode.
+	out := configs[best].cfg
 	out.prefillChunk = proposed.prefillChunk
 	return out, meds[0], meds[best]
+}
+
+// decodeChange is one candidate configuration for the verification sweep: a
+// label for the report and the config it stands for.
+type decodeChange struct {
+	name string
+	cfg  tunerConfig
 }
 
 // singleDecodeChanges enumerates the proposed changes that affect decode, each
 // applied to the starting config in isolation. The prefill chunk is excluded: it
 // does not affect decode and is judged on prefill throughput instead.
-func singleDecodeChanges(origin, proposed tunerConfig) []struct {
-	name string
-	cfg  tunerConfig
-} {
-	var out []struct {
-		name string
-		cfg  tunerConfig
-	}
+func singleDecodeChanges(origin, proposed tunerConfig) []decodeChange {
+	var out []decodeChange
 	add := func(name string, mutate func(*tunerConfig)) {
 		c := origin
 		mutate(&c)
-		out = append(out, struct {
-			name string
-			cfg  tunerConfig
-		}{name, c})
+		out = append(out, decodeChange{name, c})
 	}
 	if proposed.q8 != origin.q8 {
 		add("q8-activations", func(c *tunerConfig) { c.q8 = proposed.q8 })
@@ -571,20 +564,35 @@ func (t *autoTuner) sweep(rounds, n int, apply func(int), measure func() float64
 	return samples
 }
 
-// choose runs an interleaved comparison over candidates and returns the index of
-// the winner. lowerIsBetter selects the metric direction. apply(i) installs
-// candidate i; measure() returns one sample.
-func (t *autoTuner) choose(knob, metric string, values []string, incumbent int, lowerIsBetter bool,
-	apply func(int), measure func() float64) int {
-	if len(values) < 2 {
-		return incumbent
-	}
-	samples := t.sweep(t.opts.Rounds, len(values), apply, measure)
-	meds := make([]float64, len(values))
-	trial := AutoTuneTrial{Knob: knob, Metric: metric, Incumbent: values[incumbent]}
-	for i := range values {
+// candidate is one setting under test: a label for the report, and the closure
+// that installs it.
+type candidate struct {
+	label string
+	apply func()
+}
+
+// evaluate measures every candidate in one interleaved sweep, records the trial,
+// installs the winner, and returns its index alongside every candidate's median.
+//
+// This is the ONLY place the acceptance rule lives, so every knob — and the
+// final verification pass — is judged by identical criteria. A candidate must
+// clear two independent hurdles to displace the incumbent:
+//
+//  1. beat the incumbent's median by more than MinGain, and
+//  2. win in at least half the individual rounds.
+//
+// A genuinely faster setting clears both; one that got a single lucky sample
+// during a clock spike clears neither reliably, and on a machine whose clock
+// swings 2-3x under load that distinction is the difference between tuning and
+// rolling dice.
+func (t *autoTuner) evaluate(knob, metric string, cands []candidate, incumbent, rounds int,
+	lowerIsBetter bool, measure func() float64) (int, []float64) {
+	samples := t.sweep(rounds, len(cands), func(i int) { cands[i].apply() }, measure)
+	meds := make([]float64, len(cands))
+	trial := AutoTuneTrial{Knob: knob, Metric: metric, Incumbent: cands[incumbent].label}
+	for i := range cands {
 		meds[i] = medianFloat(samples[i])
-		s := AutoTuneSample{Value: values[i]}
+		s := AutoTuneSample{Value: cands[i].label}
 		if lowerIsBetter {
 			s.MedianMs = meds[i]
 		} else {
@@ -593,24 +601,33 @@ func (t *autoTuner) choose(knob, metric string, values []string, incumbent int, 
 		trial.Candidates = append(trial.Candidates, s)
 	}
 	best := incumbent
-	for i := range values {
+	for i := range cands {
 		if i == incumbent || meds[i] <= 0 {
 			continue
 		}
-		// Two independent hurdles, because a single noisy sample can otherwise
-		// flip a setting that is really a tie:
-		//   1. beat the incumbent's median by more than MinGain, and
-		//   2. win in at least half the individual rounds.
-		// A candidate that is genuinely faster clears both; one that got a
-		// single lucky sample during a clock spike clears neither reliably.
 		if betterBy(meds[i], meds[best], lowerIsBetter) > t.opts.MinGain &&
 			winsMajority(samples[i], samples[best], lowerIsBetter) {
 			best = i
 		}
 	}
-	trial.Chosen = values[best]
+	trial.Chosen = cands[best].label
 	t.trials = append(t.trials, trial)
-	apply(best)
+	cands[best].apply()
+	return best, meds
+}
+
+// choose is evaluate for a simple decode knob: string-labelled values, the
+// decode probe, and a one-line report.
+func (t *autoTuner) choose(knob string, values []string, incumbent int, apply func(int)) int {
+	if len(values) < 2 {
+		return incumbent
+	}
+	cands := make([]candidate, len(values))
+	for i, v := range values {
+		i := i
+		cands[i] = candidate{label: v, apply: func() { apply(i) }}
+	}
+	best, _ := t.evaluate(knob, "ms/token", cands, incumbent, t.opts.Rounds, true, t.measureDecode)
 	fmt.Fprintf(t.opts.LogWriter, "  %-14s %s", knob, values[best])
 	if best != incumbent {
 		fmt.Fprintf(t.opts.LogWriter, " (was %s)", values[incumbent])
@@ -647,18 +664,22 @@ func winsMajority(a, b []float64, lowerIsBetter bool) bool {
 	return wins*2 >= n
 }
 
+// chooseToggle compares a boolean knob as "on" versus "off". Candidate 0 is
+// always "on", so the on/off ordering and the incumbent index are decided in one
+// place rather than re-derived (and previously inverted) per knob.
+func (t *autoTuner) chooseToggle(knob string, current bool, set func(bool)) {
+	incumbent := 0
+	if !current {
+		incumbent = 1
+	}
+	t.choose(knob, []string{"on", "off"}, incumbent, func(i int) { set(i == 0) })
+}
+
 func (t *autoTuner) tuneQ8Activations() {
 	if !q8ActivationsAvailable() {
 		return
 	}
-	vals := []string{"on", "off"}
-	incumbent := 0
-	if !q8ActivationsEnabled() {
-		incumbent = 1
-	}
-	t.choose("q8-activations", "ms/token", vals, incumbent, true,
-		func(i int) { setQ8Activations(i == 0) },
-		t.decodeProbe)
+	t.chooseToggle("q8-activations", q8ActivationsEnabled(), setQ8Activations)
 }
 
 func (t *autoTuner) tuneThreads() {
@@ -675,9 +696,7 @@ func (t *autoTuner) tuneThreads() {
 			incumbent = i
 		}
 	}
-	t.choose("threads", "ms/token", vals, incumbent, true,
-		func(i int) { SetNumThreads(cands[i]); runtime.GOMAXPROCS(cands[i]) },
-		t.decodeProbe)
+	t.choose("threads", vals, incumbent, func(i int) { SetNumThreads(cands[i]); runtime.GOMAXPROCS(cands[i]) })
 }
 
 // threadCandidates covers the range where memory-bandwidth saturation
@@ -700,28 +719,15 @@ func threadCandidates(nproc int) []int {
 }
 
 func (t *autoTuner) tuneDispatch() {
-	vals := []string{"off", "on"}
-	incumbent := 0
-	if oversubscribeDispatch {
-		incumbent = 1
-	}
-	t.choose("oversubscribe", "ms/token", vals, incumbent, true,
-		func(i int) { oversubscribeDispatch = i == 1 },
-		t.decodeProbe)
+	t.chooseToggle("oversubscribe", oversubscribeDispatch,
+		func(on bool) { oversubscribeDispatch = on })
 }
 
 func (t *autoTuner) tuneKVF16() {
 	if !kvF16Available() {
 		return
 	}
-	vals := []string{"on", "off"}
-	incumbent := 0
-	if !kvF16Enabled() {
-		incumbent = 1
-	}
-	t.choose("kv-cache-f16", "ms/token", vals, incumbent, true,
-		func(i int) { setKVF16(i == 0) },
-		t.decodeProbe)
+	t.chooseToggle("kv-cache-f16", kvF16Enabled(), setKVF16)
 }
 
 // tunePrefillChunk picks the prompt-prefill chunk size and returns the
@@ -760,32 +766,16 @@ func (t *autoTuner) tunePrefillChunk() (float64, float64) {
 	SetPrefillChunk(largest)
 	t.prefillProbe(largest)
 
-	rounds := t.opts.Rounds
-	t.opts.Rounds = t.opts.PrefillRounds
 	chunk := cands[incumbent]
-	samples := t.sweep(t.opts.PrefillRounds, len(cands), func(i int) { chunk = cands[i]; SetPrefillChunk(cands[i]) },
+	probes := make([]candidate, len(cands))
+	for i, n := range cands {
+		n := n
+		probes[i] = candidate{label: fmt.Sprint(n), apply: func() { chunk = n; SetPrefillChunk(n) }}
+	}
+	// Throughput, so higher is better — the one knob measured in tok/s rather
+	// than ms/token.
+	best, meds := t.evaluate("prefill-chunk", "tok/s", probes, incumbent, t.opts.PrefillRounds, false,
 		func() float64 { return t.prefillProbe(chunk) })
-	t.opts.Rounds = rounds
-
-	meds := make([]float64, len(cands))
-	trial := AutoTuneTrial{Knob: "prefill-chunk", Metric: "tok/s", Incumbent: fmt.Sprint(cands[incumbent])}
-	for i := range cands {
-		meds[i] = medianFloat(samples[i])
-		trial.Candidates = append(trial.Candidates, AutoTuneSample{Value: fmt.Sprint(cands[i]), TokPerSec: meds[i]})
-	}
-	best := incumbent
-	for i := range cands {
-		if i == incumbent || meds[i] <= 0 {
-			continue
-		}
-		if betterBy(meds[i], meds[best], false) > t.opts.MinGain &&
-			winsMajority(samples[i], samples[best], false) {
-			best = i
-		}
-	}
-	trial.Chosen = fmt.Sprint(cands[best])
-	t.trials = append(t.trials, trial)
-	SetPrefillChunk(cands[best])
 
 	fmt.Fprintf(t.opts.LogWriter, "  %-14s %d", "prefill-chunk", cands[best])
 	if best != incumbent {
@@ -910,7 +900,11 @@ func SaveAutoTune(res AutoTuneResult) error {
 func (r *Runner) AutoTuneOrCached(opts AutoTuneOptions, refresh bool) (AutoTuneResult, bool, error) {
 	if !refresh {
 		if res, ok := r.LoadAutoTune(); ok {
+			// Under the generation lock, like AutoTune, so installing a cached
+			// result cannot race a request that is already running.
+			r.genLock.Lock()
 			res.Apply()
+			r.genLock.Unlock()
 			return res, true, nil
 		}
 	}

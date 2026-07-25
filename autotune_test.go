@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -135,6 +136,92 @@ func TestSweepIsSerpentine(t *testing.T) {
 	for i, s := range samples {
 		if len(s) != 3 {
 			t.Fatalf("candidate %d got %d samples, want 3", i, len(s))
+		}
+	}
+}
+
+// TestEvaluateAcceptanceRule pins the one place every knob's accept/reject
+// decision is made. Feeding it scripted samples exercises the two hurdles
+// directly, which is otherwise only observable through noisy real timings.
+func TestEvaluateAcceptanceRule(t *testing.T) {
+	// scripted returns candidates whose measurements come from a fixed table:
+	// series[i][round] is candidate i's sample in that round.
+	run := func(series [][]float64, incumbent int, lowerIsBetter bool, minGain float64) (int, []float64) {
+		tn := &autoTuner{opts: AutoTuneOptions{Rounds: len(series[0]), MinGain: minGain}.withDefaults()}
+		cur := 0
+		round := make([]int, len(series))
+		cands := make([]candidate, len(series))
+		for i := range series {
+			i := i
+			cands[i] = candidate{label: fmt.Sprint(i), apply: func() { cur = i }}
+		}
+		return tn.evaluate("k", "m", cands, incumbent, len(series[0]), lowerIsBetter, func() float64 {
+			v := series[cur][round[cur]]
+			round[cur]++
+			return v
+		})
+	}
+
+	// Candidate 1 is clearly and consistently faster: accept.
+	if best, _ := run([][]float64{{100, 100, 100}, {80, 80, 80}}, 0, true, 0.03); best != 1 {
+		t.Fatalf("consistent 20%% win rejected, chose %d", best)
+	}
+	// Candidate 1 has a better median but wins only one round of three — one
+	// lucky sample must not flip the knob.
+	if best, _ := run([][]float64{{100, 100, 100}, {40, 101, 101}}, 0, true, 0.03); best != 0 {
+		t.Fatalf("single lucky round accepted, chose %d", best)
+	}
+	// Candidate 1 wins every round but by less than MinGain: too small to trust.
+	if best, _ := run([][]float64{{100, 100, 100}, {99, 99, 99}}, 0, true, 0.03); best != 0 {
+		t.Fatalf("sub-threshold win accepted, chose %d", best)
+	}
+	// Higher-is-better metric (prefill throughput).
+	if best, _ := run([][]float64{{10, 10}, {20, 20}}, 0, false, 0.03); best != 1 {
+		t.Fatalf("throughput win rejected, chose %d", best)
+	}
+	// A non-zero incumbent must be respected as the thing to beat.
+	if best, _ := run([][]float64{{80, 80}, {100, 100}}, 1, true, 0.03); best != 0 {
+		t.Fatalf("faster candidate rejected against incumbent 1, chose %d", best)
+	}
+	// Unmeasurable candidates (zero) are skipped rather than winning by default.
+	if best, _ := run([][]float64{{100, 100}, {0, 0}}, 0, true, 0.03); best != 0 {
+		t.Fatalf("zero-measurement candidate accepted, chose %d", best)
+	}
+	// The trial record must carry the evidence, in the right metric field.
+	tn := &autoTuner{opts: AutoTuneOptions{Rounds: 1}.withDefaults()}
+	cands := []candidate{{label: "a", apply: func() {}}, {label: "b", apply: func() {}}}
+	tn.evaluate("knob", "ms/token", cands, 0, 1, true, func() float64 { return 5 })
+	if len(tn.trials) != 1 {
+		t.Fatalf("expected one recorded trial, got %d", len(tn.trials))
+	}
+	tr := tn.trials[0]
+	if tr.Knob != "knob" || tr.Incumbent != "a" || tr.Chosen != "a" || len(tr.Candidates) != 2 {
+		t.Fatalf("trial not recorded faithfully: %+v", tr)
+	}
+	if tr.Candidates[0].MedianMs != 5 || tr.Candidates[0].TokPerSec != 0 {
+		t.Fatalf("lower-is-better metric should land in MedianMs: %+v", tr.Candidates[0])
+	}
+}
+
+// TestChooseToggleMapsIncumbent guards the on/off index convention, which was
+// previously spelled two different ways in adjacent knobs.
+func TestChooseToggleMapsIncumbent(t *testing.T) {
+	for _, current := range []bool{true, false} {
+		tn := &autoTuner{opts: AutoTuneOptions{Rounds: 1}.withDefaults()}
+		var applied []bool
+		// Both candidates measure identically, so the incumbent must survive and
+		// be the value that ends up installed.
+		tn.decodeProbeFn = func() float64 { return 1 }
+		tn.chooseToggle("k", current, func(on bool) { applied = append(applied, on) })
+		if len(applied) == 0 {
+			t.Fatal("chooseToggle never applied a value")
+		}
+		if got := applied[len(applied)-1]; got != current {
+			t.Fatalf("current=%v: tie should keep the incumbent, installed %v", current, got)
+		}
+		if tn.trials[0].Chosen != tn.trials[0].Incumbent {
+			t.Fatalf("current=%v: tie changed the setting (%s -> %s)",
+				current, tn.trials[0].Incumbent, tn.trials[0].Chosen)
 		}
 	}
 }
