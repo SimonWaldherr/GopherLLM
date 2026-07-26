@@ -179,22 +179,53 @@ function bindCopy(button, getText) {
       return;
     }
     navigator.clipboard.writeText(getText()).then(() => {
-      button.textContent = "Copied";
+      button.textContent = button.dataset.copiedLabel || "Copied";
       notify("Copied to clipboard", "success");
       setTimeout(() => { button.textContent = label; }, 1400);
     }).catch(() => notify("Could not copy to the clipboard.", "error"));
   });
 }
 
+function messageControls(el) {
+  let controls = el.querySelector(":scope > .message-controls");
+  if (!controls) {
+    controls = document.createElement("div");
+    controls.className = "message-controls";
+    controls.setAttribute("aria-label", "Message actions");
+    el.appendChild(controls);
+  }
+  return controls;
+}
+
 function attachCopyButton(el) {
-  if (el.querySelector(":scope > .copy-btn")) return;
+  if (el.querySelector(".copy-btn")) return;
   const button = document.createElement("button");
-  button.className = "copy-btn";
+  button.className = "message-icon-button copy-btn";
   button.type = "button";
-  button.textContent = "Copy";
+  button.textContent = "⧉";
+  button.dataset.copiedLabel = "✓";
   button.setAttribute("aria-label", "Copy message to clipboard");
+  button.title = "Copy message";
   bindCopy(button, () => el.dataset.raw || "");
-  el.appendChild(button);
+  messageControls(el).appendChild(button);
+}
+
+function attachDetailsButton(el, meta) {
+  const button = document.createElement("button");
+  button.className = "message-icon-button message-details-toggle";
+  button.type = "button";
+  button.textContent = "ⓘ";
+  button.title = "Answer details";
+  button.setAttribute("aria-label", "Show answer details");
+  button.setAttribute("aria-expanded", "false");
+  button.addEventListener("click", () => {
+    const open = meta.hidden;
+    meta.hidden = !open;
+    button.setAttribute("aria-expanded", String(open));
+    button.setAttribute("aria-label", open ? "Hide answer details" : "Show answer details");
+    button.title = open ? "Hide details" : "Answer details";
+  });
+  messageControls(el).appendChild(button);
 }
 
 function addCodeCopyButtons(container) {
@@ -358,7 +389,8 @@ function cleanSettings(value, defaults) {
     // remains available per chat, and external OpenAI-compatible callers are
     // unaffected unless they send GopherLLM's extension explicitly.
     contextWindowMode: value.contextWindowMode === "full" || value.contextWindowMode === "autoCompress" ? value.contextWindowMode : "recent",
-    ragMode: value.ragMode === true
+    ragMode: value.ragMode === true,
+    wikimediaTools: value.wikimediaTools === true
   };
 }
 
@@ -640,12 +672,14 @@ function toMarkdown(chat) {
   const stopSequencesEl = $("stopSequences");
   const contextWindowModeEl = $("contextWindowMode");
   const ragModeEl = $("ragMode");
+  const wikimediaToolsEl = $("wikimediaTools");
   const ragModelEl = $("ragModel");
   const ragStatusEl = $("ragStatus");
   const contextWindowStatusEl = $("contextWindowStatus");
   const composerContextWindowEl = $("composerContextWindow");
   const composerMaxTokensEl = $("composerMaxTokens");
   const composerPowerCommandsEl = $("composerPowerCommands");
+  const composerWikimediaToolsEl = $("composerWikimediaTools");
   const composerProToggleEl = $("composerProToggle");
   const composerProPanelEl = $("composerProPanel");
   const composerSettingsEl = $("composerSettings");
@@ -653,6 +687,7 @@ function toMarkdown(chat) {
   const systemPromptEl = $("systemPrompt");
   const briefingEl = $("briefing");
   const briefChatEl = $("briefChat");
+  const shareChatEl = $("shareChat");
   const briefCloseEl = $("briefClose");
   const briefCloseDoneEl = $("briefCloseDone");
   const briefIncludeTurnLogEl = $("briefIncludeTurnLog");
@@ -1095,13 +1130,13 @@ function toMarkdown(chat) {
       chat.draft = promptEl.value;
       saveSoon();
     }
-    const count = chat.messages.length;
     const estimate = tokenEstimate(chat);
-    const context = contextLimit ? " / " + contextLimit + " context" : "";
-    const warning = contextLimit && estimate >= contextLimit * .85 ? " · near context limit" : "";
+    const compactContext = contextLimit ? " / " + compactCount(contextLimit) : "";
+    const warning = contextLimit && estimate >= contextLimit * .85 ? " · near limit" : "";
     const info = currentContextWindow(chat);
-    const retained = info ? " · last sent " + info.retainedMessages + "/" + info.inputMessages + " messages" : "";
-    contextEstimateEl.textContent = count + " message" + (count === 1 ? "" : "s") + " · ~" + estimate + " input tokens" + context + warning + retained;
+    const retained = info ? "; last sent " + info.retainedMessages + " of " + info.inputMessages + " messages" : "";
+    contextEstimateEl.textContent = "~" + compactCount(estimate) + compactContext + warning;
+    contextEstimateEl.title = chat.messages.length + " message" + (chat.messages.length === 1 ? "" : "s") + "; ~" + estimate + " input tokens" + (contextLimit ? " / " + contextLimit + " context" : "") + retained;
     updateContextWindowStatus();
     updatePromptCacheStatus();
     if (!busy) {
@@ -1137,6 +1172,8 @@ function toMarkdown(chat) {
     composerMaxTokensEl.value = chat.settings.maxTokens;
     composerPowerCommandsEl.checked = preferences.power;
     ragModeEl.checked = chat.settings.ragMode;
+    wikimediaToolsEl.checked = chat.settings.wikimediaTools;
+    composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
     personaEl.value = Object.prototype.hasOwnProperty.call(PERSONAS, chat.persona) ? chat.persona : "custom";
     systemPromptEl.value = chat.systemPrompt;
     updateComposer(false);
@@ -1150,6 +1187,7 @@ function toMarkdown(chat) {
     deleteChatEl.disabled = value;
     attachFileEl.disabled = value;
     briefChatEl.disabled = value;
+    shareChatEl.disabled = value;
     composerProToggleEl.disabled = value;
     exportChatsEl.disabled = value;
     exportMarkdownEl.disabled = value;
@@ -1260,7 +1298,9 @@ function toMarkdown(chat) {
       const meta = document.createElement("div");
       meta.className = "meta";
       meta.textContent = parts.join(" · ");
+      meta.hidden = true;
       el.appendChild(meta);
+      attachDetailsButton(el, meta);
     }
     if (result.answer) attachCopyButton(el);
   }
@@ -1277,9 +1317,13 @@ function toMarkdown(chat) {
       action.setAttribute("aria-label", "Edit this message in a new branch");
       action.addEventListener("click", () => editMessage(index));
     } else {
-      action.textContent = "Retry in branch";
+      action.className = "message-icon-button message-retry";
+      action.textContent = "↻";
       action.setAttribute("aria-label", "Regenerate this answer in a new branch");
+      action.title = "Retry in new branch";
       action.addEventListener("click", () => retryMessage(index));
+      messageControls(el).appendChild(action);
+      return;
     }
     wrap.appendChild(action);
     el.appendChild(wrap);
@@ -1647,6 +1691,7 @@ function toMarkdown(chat) {
       stream: true,
       stream_options: { include_usage: true },
       gopherllm_context_mode: chat.settings.contextWindowMode,
+      gopherllm_wikimedia: chat.settings.wikimediaTools === true,
       system_prompt: [chat.systemPrompt.trim(), ragContext].filter(Boolean).join("\n\n") || undefined
     });
   }
@@ -1663,7 +1708,8 @@ function toMarkdown(chat) {
         messages,
         stream: true,
         stream_options: { include_usage: true },
-        system_prompt: (systemPrompt || "").trim() || undefined
+        system_prompt: (systemPrompt || "").trim() || undefined,
+        gopherllm_wikimedia: settings.wikimediaTools === true
       }))
     });
     if (!response.ok) {
@@ -1715,6 +1761,40 @@ function toMarkdown(chat) {
     briefGenerateEl.disabled = briefingBusy || busy || tuning || batchRunning;
     briefCopyEl.disabled = briefingBusy || !hasOutput;
     briefChatEl.disabled = briefingBusy || busy;
+  }
+
+  function shareFilename(chat) {
+    const base = chat.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "chat";
+    return base + "-gopherllm-chat.md";
+  }
+
+  async function shareActiveChat() {
+    const chat = activeChat();
+    if (!chat || !chat.messages.length) {
+      showToast("Add at least one message before sharing this chat.", "error");
+      return;
+    }
+    const content = toMarkdown(chat);
+    const filename = shareFilename(chat);
+    if (navigator.share) {
+      let file = null;
+      try {
+        file = new File([content], filename, { type: "text/markdown;charset=utf-8" });
+      } catch (_) {
+        /* The text fallback below still works in older browsers. */
+      }
+      const filePayload = file ? { title: chat.title, text: "Shared from GopherLLM", files: [file] } : null;
+      const canShareFile = filePayload && (!navigator.canShare || navigator.canShare(filePayload));
+      try {
+        await navigator.share(canShareFile ? filePayload : { title: chat.title, text: content });
+        showToast("Chat shared.", "success");
+        return;
+      } catch (error) {
+        if (error && error.name === "AbortError") return;
+      }
+    }
+    download(filename, "text/markdown;charset=utf-8", content);
+    showToast("Saved a shareable Markdown file.", "success");
   }
 
   function openBriefing() {
@@ -1954,7 +2034,8 @@ function toMarkdown(chat) {
     chat.settings = cleanSettings({
       maxTokens: maxTokensEl.value, temperature: temperatureEl.value, topP: topPEl.value,
       topK: topKEl.value, minP: minPEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim(),
-      stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, ragMode: ragModeEl.checked
+      stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, ragMode: ragModeEl.checked,
+      wikimediaTools: wikimediaToolsEl.checked
     }, defaults);
     // A changed system prompt, output reserve, or model-side sampler setting
     // means the prior reply's exact accounting should not be presented as the
@@ -1965,6 +2046,7 @@ function toMarkdown(chat) {
     tempValueEl.textContent = Number(chat.settings.temperature).toFixed(2);
     composerContextWindowEl.value = chat.settings.contextWindowMode;
     composerMaxTokensEl.value = chat.settings.maxTokens;
+    composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
     touch(chat);
     updateComposer(false);
     saveSoon();
@@ -2606,6 +2688,7 @@ function toMarkdown(chat) {
   clearEl.addEventListener("click", createChat);
   renameChatEl.addEventListener("click", () => renameChat(activeID));
   deleteChatEl.addEventListener("click", () => deleteChat(activeID));
+  shareChatEl.addEventListener("click", shareActiveChat);
   briefChatEl.addEventListener("click", openBriefing);
   briefCloseEl.addEventListener("click", closeBriefing);
   briefCloseDoneEl.addEventListener("click", closeBriefing);
@@ -2646,7 +2729,7 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
-  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });
@@ -2692,6 +2775,10 @@ function toMarkdown(chat) {
   composerPowerCommandsEl.addEventListener("change", () => {
     applyPowerPreference(composerPowerCommandsEl.checked);
     save();
+  });
+  composerWikimediaToolsEl.addEventListener("change", () => {
+    wikimediaToolsEl.checked = composerWikimediaToolsEl.checked;
+    updateSettings();
   });
   composerProToggleEl.addEventListener("click", () => {
     setComposerProOpen(composerProPanelEl.hidden);
@@ -2747,7 +2834,7 @@ function toMarkdown(chat) {
     powerCommandsEl.checked = preferences.power;
     composerPowerCommandsEl.checked = preferences.power;
     powerOptionsEl.hidden = !preferences.power;
-    promptHintEl.textContent = preferences.power ? "Local chat · / for commands" : "Local chat · ↵ sends";
+    promptHintEl.textContent = preferences.power ? "/ commands" : "↵ send";
     if (!preferences.power) closeCommandMenu();
   }
 
@@ -2755,7 +2842,7 @@ function toMarkdown(chat) {
     preferences.composerPro = !!open;
     composerProPanelEl.hidden = !preferences.composerPro;
     composerProToggleEl.setAttribute("aria-expanded", String(preferences.composerPro));
-    composerProToggleEl.textContent = preferences.composerPro ? "Hide pro tools" : "Pro tools";
+    composerProToggleEl.textContent = preferences.composerPro ? "Hide options" : "Options";
   }
   powerCommandsEl.addEventListener("change", () => {
     applyPowerPreference(powerCommandsEl.checked);

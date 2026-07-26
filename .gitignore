@@ -1,8 +1,11 @@
 bin/
 .cache/
+/.DS_Store
 /gopherllm
 *.gguf
 scratch/p.prof
+/prof*.pprof
 /rag
 /data
 /archive-web
+*.pprof

@@ -8,6 +8,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 
 - [Features](#features)
 - [Requirements](#requirements)
+- [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
 - [Use as a Go Library](#use-as-a-go-library)
 - [Build](#build)
@@ -38,6 +39,8 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
 - OpenAI-compatible tool/function calling, with a native prompt format for
   Mistral-family models and a generic convention for everything else.
+- Optional Wikipedia and Wikidata research tools, including bounded read-only
+  SPARQL queries, resolved server-side into the model's answer.
 - Chain-of-thought extraction (`<think>` blocks, gpt-oss channels) into a
   separate `reasoning_content` field instead of leaving it in the answer text.
 - Skills: point `--skills-dir` at a folder of `SKILL.md` files and the server
@@ -65,6 +68,21 @@ deprecated fallback), then the built-in default above. `MODEL_DIR` is a separate
 variable (see [Make Targets](#make-targets)) that `make` targets use to fill in
 `--model-dir` for you — it isn't read by the `gopherllm` binary itself, so
 `MODEL_DIR=... bin/gopherllm ...` (without `make`) has no effect.
+
+## Dependency policy and layout
+
+The checked-in Go module intentionally has no third-party dependencies: its
+`go.mod` contains only this module and the Go version, and `make deps-check`
+enforces that policy. The embedded chat UI is also self-contained; it does not
+load packages, fonts, or scripts from a CDN.
+
+The module-root Go files form the public `gopherllm` package, so they remain
+there to preserve the stable import path
+`github.com/SimonWaldherr/GopherLLM`. Executable entry points live in `cmd/`,
+HTTP code and UI assets in `server/`, implementation details in `internal/`,
+and test-only fixtures—including preserved profiling captures—in `testdata/`.
+Build output and local model/RAG data are ignored and are not part of the
+repository.
 
 ## Quickstart
 
@@ -514,6 +532,31 @@ internal `load_skill` call. A `GET /v1/skills` endpoint lists the configured
 skills' names and descriptions. Tool calls for anything else (i.e. tools the
 *caller* supplied) are returned to the caller as usual, even with skills
 configured. `--skills-dir` works the same way in one-shot/`--repl` CLI mode.
+
+### Wikipedia and Wikidata research
+
+The browser chat can opt into **Wikipedia & Wikidata research** from
+**Options** (or the chat settings). The setting is saved per chat and defaults
+to off: when enabled, only a search term, article title, Wikidata Q-ID, or
+read-only SPARQL query requested by the model is sent to Wikimedia. The full
+chat transcript is never sent to Wikimedia.
+
+The server executes four bounded tools and feeds their JSON results back into
+the same agentic turn, so the model can use the data in its final response:
+
+- `wikipedia_search` uses Wikipedia's REST search endpoint.
+- `wikipedia_summary` retrieves a concise article summary and canonical URL.
+- `wikidata_entity` retrieves labels, descriptions, and a small set of claims
+  for one Q-ID through the Wikidata Action API.
+- `wikidata_sparql` runs read-only `SELECT`/`ASK` queries against the Wikidata
+  Query Service; updates and `SERVICE` calls are rejected, responses are
+  capped at 25 rows.
+
+API clients enable the same integration per request with
+`"gopherllm_wikimedia": true` on `/v1/chat/completions`, `/generate`,
+`/api/chat`, or `/api/generate`. Set `tool_choice` to `none` to suppress it.
+Results include their Wikimedia source URL or query endpoint; answers should
+attribute factual claims to those results.
 
 ## Auto Mode (hardware autotuning)
 

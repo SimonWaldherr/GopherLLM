@@ -54,6 +54,7 @@
           <span id="statusText">Ready</span>
         </div>
         <button id="briefChat" class="header-brief" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="briefing">Briefing</button>
+        <button id="shareChat" class="header-share" type="button">Share</button>
         <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><span aria-hidden="true">⚙</span></button>
       </div>
     </header>
@@ -86,22 +87,23 @@
             placeholder="Message GopherLLM…"
             autofocus
             autocomplete="off"
-            aria-describedby="promptHint"
+            aria-describedby="promptHint contextEstimate"
             aria-required="true"
           ></textarea>
           <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
           <div class="prompt-footer">
             <div class="prompt-footer-start">
-              <button id="attachFile" class="composer-button" type="button">Attach file</button>
+              <button id="attachFile" class="composer-button" type="button">Attach</button>
               <input id="fileInput" type="file" multiple hidden>
-              <span id="promptHint">Local chat · <kbd>↵</kbd> sends</span>
+              <span id="promptHint"><kbd>↵</kbd> send</span>
             </div>
             <div class="prompt-footer-end">
-              <button id="composerProToggle" class="composer-button" type="button" aria-expanded="false" aria-controls="composerProPanel">Pro tools</button>
-              <span id="contextEstimate">0 messages · ~0 input tokens</span>
+              <span id="contextEstimate">~0 tokens</span>
+              <button id="composerProToggle" class="composer-button" type="button" aria-expanded="false" aria-controls="composerProPanel">Options</button>
+              <button id="clear" class="text-button" type="button" aria-label="Start a new conversation">New chat</button>
             </div>
           </div>
-          <span id="promptCacheStatus" class="prompt-cache-status" aria-live="polite" hidden></span>
+          <span id="promptCacheStatus" class="sr-only" aria-live="polite" hidden></span>
         </div>
         <div class="actions">
           <button id="send" type="submit" aria-label="Send message" disabled><span aria-hidden="true">↑</span><span class="send-label">Send</span></button>
@@ -119,14 +121,12 @@
           <input id="composerMaxTokens" type="number" min="1" max="4096" inputmode="numeric" autocomplete="off">
         </label>
         <label class="composer-power"><input id="composerPowerCommands" type="checkbox"> Enable slash commands</label>
+        <label class="composer-power"><input id="composerWikimediaTools" type="checkbox"> Wikipedia &amp; Wikidata research</label>
         <button id="composerSettings" class="composer-button" type="button">All settings</button>
       </div>
       <div class="composer-tools">
         <div class="composer-tools-start">
           <span id="editState" class="edit-state" hidden>Editing earlier message <button id="cancelEdit" type="button">Cancel</button></span>
-        </div>
-        <div class="composer-tools-end">
-          <button id="clear" class="text-button" type="button" aria-label="Start a new conversation">New chat</button>
         </div>
       </div>
     </form>
@@ -222,6 +222,10 @@
           <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
         </label>
         <p id="contextWindowStatus" class="settings-note" aria-live="polite"></p>
+        <label class="toggle-row">
+          <input id="wikimediaTools" type="checkbox">
+          <span>Wikipedia &amp; Wikidata research <span class="field-note">sends only model-requested search queries to Wikimedia</span></span>
+        </label>
         <details class="settings-disclosure">
           <summary><span>Memory &amp; retrieval</span><small>Search relevant messages from saved chats</small></summary>
           <div class="settings-disclosure-body">

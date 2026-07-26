@@ -1,9 +1,39 @@
 package gopherllm
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
+
+func TestResolveInternalToolCallsExecutesOnlyServerTools(t *testing.T) {
+	tool := AgenticTool{
+		Definition: ToolDefinition{Type: "function", Function: ToolFunctionDef{Name: "lookup"}},
+		Execute: func(_ context.Context, call ToolCall) (string, error) {
+			return "result for " + call.Function.Arguments, nil
+		},
+	}
+	calls := []ToolCall{{ID: "id1", Function: ToolCallFunction{Name: "lookup", Arguments: `{"q":"Berlin"}`}}}
+	msgs, ok := resolveInternalToolCalls(context.Background(), calls, nil, []AgenticTool{tool})
+	if !ok || len(msgs) != 2 || msgs[1].Content != `result for {"q":"Berlin"}` {
+		t.Fatalf("resolved = %#v, ok = %v", msgs, ok)
+	}
+	if _, ok := resolveInternalToolCalls(context.Background(), append(calls, ToolCall{ID: "id2", Function: ToolCallFunction{Name: "caller_tool"}}), nil, []AgenticTool{tool}); ok {
+		t.Fatal("mixed server/caller calls must stay with the caller")
+	}
+}
+
+func TestAgenticOptionsForToolsHonorsOptOut(t *testing.T) {
+	tool := AgenticTool{Definition: ToolDefinition{Type: "function", Function: ToolFunctionDef{Name: "lookup"}}, Execute: func(context.Context, ToolCall) (string, error) { return "", nil }}
+	options, active := AgenticOptionsForTools(GenerationOptions{}, nil, []AgenticTool{tool})
+	if !active || len(options.Tools) != 1 || options.Tools[0].Function.Name != "lookup" {
+		t.Fatalf("options = %#v, active = %v", options, active)
+	}
+	_, active = AgenticOptionsForTools(GenerationOptions{ToolChoice: "none"}, nil, []AgenticTool{tool})
+	if active {
+		t.Fatal("tool_choice=none must disable server tools")
+	}
+}
 
 func TestResolveSkillCallsAllKnown(t *testing.T) {
 	skills := []Skill{{Name: "pdf-fill", Body: "fill instructions"}, {Name: "git-review", Body: "review instructions"}}

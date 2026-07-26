@@ -72,6 +72,7 @@ func TestChatUIAssetsArePrivateAndSelfContained(t *testing.T) {
 	}{
 		{path: "/chat", contentType: "text/html", marker: `id="chatList"`},
 		{path: "/chat", contentType: "text/html", marker: `id="briefChat"`},
+		{path: "/chat", contentType: "text/html", marker: `id="shareChat"`},
 		{path: "/style.css", contentType: "text/css", marker: ".sidebar"},
 		{path: "/script.js", contentType: "text/javascript", marker: "IndexedDB"},
 	} {

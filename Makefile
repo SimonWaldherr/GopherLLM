@@ -71,7 +71,7 @@ _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p 
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
-.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check test test-race test-small-models vet check coverage coverage-html clean help
+.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -252,6 +252,15 @@ fmt-check:
 		exit 1; \
 	fi
 
+deps-check:
+	@$(GO) mod verify
+	@module_count="$$( $(GO) list -m all | wc -l | tr -d '[:space:]' )"; \
+	if [ "$$module_count" -ne 1 ]; then \
+		echo "external Go modules are not allowed"; \
+		$(GO) list -m all; \
+		exit 1; \
+	fi
+
 test:
 	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
 	$(GO) test $(GOFLAGS) $(TEST_FLAGS) ./...
@@ -268,7 +277,7 @@ vet:
 	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
 	$(GO) vet $(GOFLAGS) ./...
 
-check: fmt-check test vet
+check: fmt-check deps-check test vet
 
 coverage:
 	@mkdir -p $(GOCACHE) $(GOMODCACHE) $(TMP_DIR) $(dir $(COVER_PROFILE))
@@ -325,7 +334,7 @@ help:
 	@printf "  make kernel-bench-metal MODEL=...    Run isolated kernel benchmark with --metal\n"
 	@printf "  make compare-kernel-bench MODEL=...  Kernel-benchmark normal and --prepare-quant\n"
 	@printf "  make compare-kernel-bench-metal MODEL=...  Kernel-benchmark normal and --metal\n"
-	@printf "  make fmt/test/vet/check              Format, test, vet, or all three\n"
+	@printf "  make fmt/deps-check/test/vet/check   Format, verify dependency policy, test, vet, or all checks\n"
 	@printf "  make coverage                        Run tests and print per-function coverage\n"
 	@printf "  make coverage-html                   Run tests and open an HTML coverage report\n"
 	@printf "  make test-small-models               Run local <5GB model prompt sweep\n"

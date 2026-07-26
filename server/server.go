@@ -307,6 +307,13 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		}
 		fmt.Fprintf(logw, "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
+	wikimediaTools := newWikimediaClient(nil).tools()
+	agenticToolsFor := func(enabled bool) []gopherllm.AgenticTool {
+		if !enabled {
+			return nil
+		}
+		return wikimediaTools
+	}
 	baseline := gopherllm.CaptureRuntimeTuning()
 	if opts.BaselineRuntimeTuning != nil {
 		baseline = *opts.BaselineRuntimeTuning
@@ -369,7 +376,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		options = withRequestContext(options, req)
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			result, err := gopherllm.RunAgenticChat(r, messages, options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
 			logInferenceResult(logw, requestID, "/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -397,7 +404,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if contextMode != gopherllm.ContextWindowFull {
-				effectiveOptions, _ := gopherllm.AgenticOptionsFor(options, skills)
+				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, skills, agenticToolsFor(body.Wikimedia))
 				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
 				if err != nil {
 					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, gopherllm.GenerationResult{}, err)
@@ -407,10 +414,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			}
 			if body.Stream {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
-				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skills, includeUsage)
+				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skills, agenticToolsFor(body.Wikimedia), includeUsage)
 				return
 			}
-			result, err := gopherllm.RunAgenticChat(r, messages, options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
 			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -497,10 +504,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
-				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills)
+				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills, agenticToolsFor(body.Wikimedia))
 				return
 			}
-			result, err := gopherllm.RunAgenticChat(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -525,10 +532,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
-				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills)
+				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia))
 				return
 			}
-			result, err := gopherllm.RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/chat", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -980,6 +987,7 @@ type GenerateRequest struct {
 	Stop          any                        `json:"stop"`
 	Tools         []gopherllm.ToolDefinition `json:"tools"`
 	ToolChoice    any                        `json:"tool_choice"`
+	Wikimedia     bool                       `json:"gopherllm_wikimedia"`
 }
 
 func (g GenerateRequest) ToMessagesAndOptions(def gopherllm.GenerationOptions) ([]gopherllm.ChatMessage, gopherllm.GenerationOptions) {
@@ -1093,6 +1101,7 @@ type OpenAIChatRequest struct {
 	// GopherLLMContextMode is an opt-in extension for local clients. Omitting
 	// it preserves normal OpenAI-compatible full-history semantics.
 	GopherLLMContextMode string `json:"gopherllm_context_mode"`
+	Wikimedia            bool   `json:"gopherllm_wikimedia"`
 }
 
 // OpenAIStreamOpts is the OpenAI "stream_options" object; IncludeUsage gates
@@ -1189,12 +1198,13 @@ func (e EmbeddingsRequest) Inputs() []string {
 }
 
 type OllamaGenerateRequest struct {
-	Model   string        `json:"model"`
-	Prompt  string        `json:"prompt"`
-	System  string        `json:"system"`
-	Stream  *bool         `json:"stream"`
-	Options OllamaOptions `json:"options"`
-	Stop    any           `json:"stop"`
+	Model     string        `json:"model"`
+	Prompt    string        `json:"prompt"`
+	System    string        `json:"system"`
+	Stream    *bool         `json:"stream"`
+	Options   OllamaOptions `json:"options"`
+	Stop      any           `json:"stop"`
+	Wikimedia bool          `json:"gopherllm_wikimedia"`
 }
 
 func (o OllamaGenerateRequest) GenerationOptions(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
@@ -1206,11 +1216,12 @@ func (o OllamaGenerateRequest) GenerationOptions(def gopherllm.GenerationOptions
 }
 
 type OllamaChatRequest struct {
-	Model    string                     `json:"model"`
-	Messages []OllamaMessage            `json:"messages"`
-	Stream   *bool                      `json:"stream"`
-	Options  OllamaOptions              `json:"options"`
-	Tools    []gopherllm.ToolDefinition `json:"tools"`
+	Model     string                     `json:"model"`
+	Messages  []OllamaMessage            `json:"messages"`
+	Stream    *bool                      `json:"stream"`
+	Options   OllamaOptions              `json:"options"`
+	Tools     []gopherllm.ToolDefinition `json:"tools"`
+	Wikimedia bool                       `json:"gopherllm_wikimedia"`
 }
 
 // streamEnabled implements Ollama's default-true streaming semantics: the
@@ -1475,7 +1486,7 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 // reasoning is separated into reasoning_content deltas as soon as its tokens
 // arrive; the final gopherllm.GenerationResult remains authoritative for tool calls and
 // for the buffered agentic path.
-func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, includeUsage bool) {
+func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1513,7 +1524,7 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		}
 		return true
 	}
-	result, err := gopherllm.RunAgenticChat(r, messages, options, skills, func(text string) bool {
+	result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, tools, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
@@ -1632,7 +1643,7 @@ func ollamaDurations(stats gopherllm.GenerationStats) map[string]any {
 // streamOllamaGenerate streams /api/generate as NDJSON: one {"done":false}
 // line per token, then a final {"done":true} line carrying finish reason and
 // timing, mirroring real Ollama's wire shape.
-func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model, prompt string, options gopherllm.GenerationOptions, skills []gopherllm.Skill) {
+func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model, prompt string, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1641,7 +1652,7 @@ func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writ
 	w.Header().Set("content-type", "application/x-ndjson")
 
 	var streamErr error
-	result, err := gopherllm.RunAgenticChat(r, []gopherllm.ChatMessage{gopherllm.UserMessage(prompt)}, options, skills, func(text string) bool {
+	result, err := gopherllm.RunAgenticChatWithTools(r, []gopherllm.ChatMessage{gopherllm.UserMessage(prompt)}, options, skills, tools, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
@@ -1674,7 +1685,7 @@ func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writ
 // streamOllamaChat streams /api/chat as NDJSON, surfacing tool_calls on the
 // final message the same way the non-streaming path does (previously dropped
 // entirely on this endpoint).
-func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill) {
+func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1683,7 +1694,7 @@ func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	w.Header().Set("content-type", "application/x-ndjson")
 
 	var streamErr error
-	result, err := gopherllm.RunAgenticChat(r, messages, options, skills, func(text string) bool {
+	result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, tools, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
