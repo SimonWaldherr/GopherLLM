@@ -122,14 +122,36 @@ ids := model.Tokenize("hello")
 gopherllm.AnalyzeGGUF(model.GGUF(), model.Tokenizer()).WriteText(os.Stdout)
 ```
 
+### Package layout
+
+The root package is inference only. HTTP serving and the embedded web UI live
+in the `server` subpackage, so importing GopherLLM to run a model does not pull
+in `net/http`, `html/template`, or the web assets:
+
+| Import | You get | Transitive deps |
+|---|---|---|
+| `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 102 |
+| `github.com/SimonWaldherr/GopherLLM/server` | the above **plus** the OpenAI-/Ollama-compatible HTTP API and the `/chat` web UI | 194 |
+
+A minimal inference-only binary is ~3.4 MB against ~9.1 MB for the full CLI.
+`TestInferencePackageStaysFreeOfServerDependencies` enforces the boundary
+against the real dependency graph, so it cannot regress silently.
+
 For applications that expose the model over HTTP themselves, the entire
 OpenAI-/Ollama-compatible API mounts as a plain `http.Handler` — under any
 router, prefix, or middleware stack:
 
 ```go
+import "github.com/SimonWaldherr/GopherLLM/server"
+
 mux.Handle("/llm/", http.StripPrefix("/llm",
-    model.HTTPHandler(gopherllm.HandlerOptions{Defaults: gopherllm.DefaultGenerationOptions()})))
+    server.HandlerForModel(model, server.HandlerOptions{Defaults: gopherllm.DefaultGenerationOptions()})))
 ```
+
+> **Moved in this release.** `gopherllm.Serve`, `gopherllm.NewHandler`,
+> `gopherllm.HandlerOptions`/`ServeOptions` and the request/response types are
+> now `server.*`, and `model.HTTPHandler(opts)` is now
+> `server.HandlerForModel(model, opts)`. Inference APIs are unchanged.
 
 The library never writes to stdout/stderr on its own; pass
 `gopherllm.WithLogWriter(os.Stderr)` (or `HandlerOptions.LogWriter`) to opt
@@ -268,6 +290,36 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
 
 Open `http://127.0.0.1:8080/chat` for the browser UI.
 
+You can also start without loading any weights and choose a discovered GGUF
+later in the browser's model picker (or with `POST /models/load`):
+
+```sh
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
+  --serve 127.0.0.1:8080 --chat
+```
+
+Until a model is chosen, catalog and UI routes remain available while inference
+routes return `503 Service Unavailable` with a clear explanation.
+
+### OpenAI-compatible remote APIs
+
+As a lower-priority alternative to a local GGUF, the server can proxy its chat
+endpoint to an OpenAI-compatible API. This covers OpenAI and local compatible
+servers such as Ollama, llama.cpp, and LM Studio. Configure it on the trusted
+local server; the key is kept only in server memory and is never returned by
+the configuration endpoint:
+
+```sh
+curl http://127.0.0.1:8080/remote \
+  -H 'Content-Type: application/json' \
+  -d '{"base_url":"http://127.0.0.1:11434","model":"llama3.2"}'
+```
+
+For OpenAI, use `{"base_url":"https://api.openai.com/v1","api_key":"…","model":"…"}`.
+The configured remote becomes the target for `/v1/chat/completions`; use
+`DELETE /remote` to switch back to the local model. `GET /remote/models`
+lists models advertised by the remote service.
+
 The chat UI is a local workspace rather than a thin request form: conversations,
 drafts, per-chat instructions, sampling settings, and the selected appearance
 are saved in the browser's IndexedDB. It supports chat search, rename/delete,
@@ -355,6 +407,8 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | POST | `/api/embeddings` | Ollama-compatible embeddings |
 | GET | `/models` | Scan `--model-dir` and list discovered GGUFs, including each model's context length |
 | POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; response includes the loaded context length) |
+| GET / POST / DELETE | `/remote` | Inspect, configure, or clear an OpenAI-compatible chat proxy (the API key is write-only) |
+| GET | `/remote/models` | List models advertised by the configured remote API |
 | GET | `/autotune` | Report Auto Mode status: whether a tuning is active this session, whether one is cached on disk for this model+machine, and the result either way |
 | POST | `/autotune/run` | Run (or apply a cached) tuning for the loaded model, same effort levels as `--auto-effort` (`{"effort": "quick\|balanced\|thorough", "refresh": false}`) |
 | GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |

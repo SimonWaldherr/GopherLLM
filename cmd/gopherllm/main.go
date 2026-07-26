@@ -2,6 +2,7 @@ package main
 
 import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/server"
 
 	"bufio"
 	"context"
@@ -31,6 +32,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
 	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
+	fmt.Fprintln(os.Stderr, "                           With --serve, a model is optional: choose one later in the Web UI")
 	fmt.Fprintln(os.Stderr, "  --max-connections <N>     Max concurrent server connections")
 	fmt.Fprintln(os.Stderr, "  --max-tokens <N>          Max tokens to generate (default: 256)")
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
@@ -154,6 +156,25 @@ func run() error {
 	if cfg.kernelBenchRuns <= 0 {
 		return fmt.Errorf("--kernel-bench-runs must be greater than 0")
 	}
+	// A server with a model catalog is useful before any weights are loaded:
+	// the browser can show its model picker immediately and POST /models/load
+	// performs the first load. Non-server commands retain the existing model
+	// picker behavior below.
+	if cfg.modelSelector == nil && cfg.serveAddr != "" {
+		if cfg.inspect || cfg.listTensors || cfg.listMetadata || cfg.analyze || cfg.findToken != "" || cfg.tokenNeighbors != "" || cfg.embed || cfg.bench || cfg.kernelBench || cfg.repl || cfg.prompt != "" || cfg.autoTune {
+			return fmt.Errorf("this command needs a model selector; start only --serve (optionally --chat) to choose a model later")
+		}
+		fmt.Fprintln(os.Stderr, "No model loaded. Choose one in the Web UI or POST /models/load.")
+		return server.Serve(nil, server.ServeOptions{
+			Addr:                     cfg.serveAddr,
+			Defaults:                 cfg.options,
+			MaxConcurrentConnections: cfg.maxConn,
+			ChatUI:                   cfg.chatUI,
+			ChatHistoryLock:          &sync.Mutex{},
+			ModelDir:                 cfg.modelDir,
+			SkillsDir:                cfg.skillsDir,
+		})
+	}
 	stopProfile, err := startCPUProfile(cfg.cpuProfile)
 	if err != nil {
 		return err
@@ -224,7 +245,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return gopherllm.Serve(runner, gopherllm.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning})
+		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)

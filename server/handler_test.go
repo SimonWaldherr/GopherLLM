@@ -1,6 +1,8 @@
-package gopherllm
+package server
 
 import (
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+
 	"context"
 	"encoding/json"
 	"net/http"
@@ -17,19 +19,19 @@ import (
 // and skills endpoints against the tiny synthetic model — proving the HTTP
 // surface works as a plain mountable http.Handler.
 func TestNewHandlerServesEndToEnd(t *testing.T) {
-	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())
+	m, err := gopherllm.OpenBytes(context.Background(), buildTinyLlamaGGUF())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
-	defaults := DefaultGenerationOptions()
+	defaults := gopherllm.DefaultGenerationOptions()
 	defaults.MaxTokens = 4
 	defaults.SystemPrompt = ""
 	defaults.Sampler.Temperature = 0
 	defaults.Sampler.TopK = 1
 
-	srv := httptest.NewServer(m.HTTPHandler(HandlerOptions{Defaults: defaults}))
+	srv := httptest.NewServer(HandlerForModel(m, HandlerOptions{Defaults: defaults}))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/health")
@@ -79,14 +81,14 @@ func TestNewHandlerServesEndToEnd(t *testing.T) {
 // TestNewHandlerMountsUnderPrefix proves the handler composes with a host
 // application's mux via StripPrefix, the pattern the docs recommend.
 func TestNewHandlerMountsUnderPrefix(t *testing.T) {
-	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())
+	m, err := gopherllm.OpenBytes(context.Background(), buildTinyLlamaGGUF())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
 	hostMux := http.NewServeMux()
-	hostMux.Handle("/llm/", http.StripPrefix("/llm", m.HTTPHandler(HandlerOptions{})))
+	hostMux.Handle("/llm/", http.StripPrefix("/llm", HandlerForModel(m, HandlerOptions{})))
 	srv := httptest.NewServer(hostMux)
 	defer srv.Close()
 
@@ -114,7 +116,7 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner, _, err := RunnerFromPath(allowedPath)
+	runner, _, err := gopherllm.RunnerFromPath(allowedPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +205,7 @@ func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	runner, _, err := RunnerFromPath(chatPath)
+	runner, _, err := gopherllm.RunnerFromPath(chatPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,20 +275,20 @@ func TestWithLimitStopsWaitingWhenRequestIsCanceled(t *testing.T) {
 }
 
 func TestHandlerLogsInferenceMetricsWithRequestID(t *testing.T) {
-	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())
+	m, err := gopherllm.OpenBytes(context.Background(), buildTinyLlamaGGUF())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
-	defaults := DefaultGenerationOptions()
+	defaults := gopherllm.DefaultGenerationOptions()
 	defaults.MaxTokens = 2
 	defaults.SystemPrompt = ""
 	defaults.Sampler.Temperature = 0
 	defaults.Sampler.TopK = 1
 
 	var logs strings.Builder
-	handler := m.HTTPHandler(HandlerOptions{Defaults: defaults, LogWriter: &logs})
+	handler := HandlerForModel(m, HandlerOptions{Defaults: defaults, LogWriter: &logs})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"a b c"}],"max_tokens":2}`))
 	req.Header.Set("X-Request-ID", "req-test-123")
 	rec := httptest.NewRecorder()
@@ -320,14 +322,14 @@ func TestHandlerLogsInferenceMetricsWithRequestID(t *testing.T) {
 }
 
 func TestHandlerLogsInferenceErrors(t *testing.T) {
-	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())
+	m, err := gopherllm.OpenBytes(context.Background(), buildTinyLlamaGGUF())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
 	var logs strings.Builder
-	handler := m.HTTPHandler(HandlerOptions{LogWriter: &logs})
+	handler := HandlerForModel(m, HandlerOptions{LogWriter: &logs})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"a"}],"max_tokens":0}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)

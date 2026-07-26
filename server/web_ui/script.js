@@ -7,67 +7,164 @@ function escapeHTML(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function renderInline(s) {
-  s = escapeHTML(s);
-  const inlineCode = new RegExp(TICK + "([^" + TICK + "]+)" + TICK, "g");
-  s = s.replace(inlineCode, "<code>$1</code>");
-  s = s.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
-  s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-  return s.replace(/\*([^\s*](?:[^*]*[^\s*])?)\*/g, "<em>$1</em>");
+/* Only these schemes may appear in a rendered link. Model output is untrusted
+   text: javascript:, data:, and vbscript: URLs would execute on click, so
+   anything not explicitly allowed is rendered as plain text instead. */
+function safeURL(raw) {
+  const url = String(raw).trim();
+  if (/[\s\u0000-\u001f]/.test(url)) return "";
+  return /^(https?:\/\/|mailto:|#|\/)/i.test(url) ? url : "";
 }
 
+function renderInline(s) {
+  s = escapeHTML(s);
+  // Inline code first, and its content is protected from every later rule by
+  // placeholder substitution — otherwise `a_b_c` or `**x**` inside code would
+  // get mangled into emphasis.
+  const spans = [];
+  const inlineCode = new RegExp(TICK + "([^" + TICK + "]+)" + TICK, "g");
+  s = s.replace(inlineCode, (whole, code) => {
+    spans.push("<code>" + code + "</code>");
+    return "\u0000" + (spans.length - 1) + "\u0000";
+  });
+  // Images before links: the syntax differs only by the leading "!".
+  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (whole, alt, url) => {
+    const safe = safeURL(url);
+    return safe ? '<img src="' + safe + '" alt="' + alt + '" loading="lazy">' : whole;
+  });
+  s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (whole, text, url) => {
+    const safe = safeURL(url);
+    return safe ? '<a href="' + safe + '" target="_blank" rel="noopener noreferrer nofollow">' + text + "</a>" : whole;
+  });
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (whole, lead, url) =>
+    lead + '<a href="' + url + '" target="_blank" rel="noopener noreferrer nofollow">' + url + "</a>");
+  s = s.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
+  s = s.replace(/___(.+?)___/g, "<strong><em>$1</em></strong>");
+  s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__(.+?)__/g, "<strong>$1</strong>");
+  s = s.replace(/~~(.+?)~~/g, "<del>$1</del>");
+  s = s.replace(/\*([^\s*](?:[^*]*[^\s*])?)\*/g, "<em>$1</em>");
+  s = s.replace(/(^|\W)_([^\s_](?:[^_]*[^\s_])?)_(?=\W|$)/g, "$1<em>$2</em>");
+  return s.replace(/\u0000(\d+)\u0000/g, (whole, i) => spans[Number(i)]);
+}
+
+/* A GFM-shaped subset: fenced code (with Mermaid singled out), tables,
+   blockquotes, ATX headings, thematic breaks, and indent-nested lists.
+   Deliberately hand-rolled rather than pulled from a CDN — the chat page runs
+   under a strict CSP with no external script origin. */
 function renderMarkdown(raw) {
   const lines = String(raw || "").split("\n");
-  let out = "", inCode = false, codeLines = [], codeLang = "", inUL = false, inOL = false;
-  const closeLists = () => {
-    if (inUL) { out += "</ul>"; inUL = false; }
-    if (inOL) { out += "</ol>"; inOL = false; }
+  const out = [];
+  const listStack = []; // "ul" | "ol", innermost last
+  let i = 0;
+
+  const closeListsTo = (depth) => {
+    while (listStack.length > depth) out.push("</" + listStack.pop() + ">");
   };
-  const flushCode = () => {
-    out += '<div class="codeblock">' + (codeLang ? '<span class="code-lang">' + escapeHTML(codeLang) + "</span>" : "")
-      + "<pre><code>" + escapeHTML(codeLines.join("\n")) + "</code></pre></div>";
-    inCode = false;
-    codeLines = [];
-    codeLang = "";
+  const isDivider = (s) => /^ {0,3}([-*_])(\s*\1){2,}\s*$/.test(s);
+
+  const renderCode = (lang, body) => {
+    // Mermaid is emitted as-is for the optional diagram pass; without a
+    // renderer present it still reads as a labelled source block.
+    if (/^mermaid$/i.test(lang)) {
+      return '<div class="codeblock mermaid-block"><span class="code-lang">mermaid</span>'
+        + '<pre class="mermaid-src">' + escapeHTML(body) + "</pre></div>";
+    }
+    return '<div class="codeblock">' + (lang ? '<span class="code-lang">' + escapeHTML(lang) + "</span>" : "")
+      + "<pre><code>" + escapeHTML(body) + "</code></pre></div>";
   };
-  for (const line of lines) {
-    if (!inCode && line.startsWith(FENCE)) {
-      closeLists();
-      inCode = true;
-      codeLang = line.slice(FENCE.length).trim();
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (line.trimStart().startsWith(FENCE)) {
+      closeListsTo(0);
+      const lang = line.trim().slice(FENCE.length).trim();
+      const body = [];
+      i++;
+      while (i < lines.length && !lines[i].trimStart().startsWith(FENCE)) body.push(lines[i++]);
+      i++; // consume the closing fence (absent at end of a stream: harmless)
+      out.push(renderCode(lang, body.join("\n")));
       continue;
     }
-    if (inCode) {
-      if (line.startsWith(FENCE)) flushCode();
-      else codeLines.push(line);
-      continue;
-    }
-    const heading = line.match(/^(#{1,3}) (.+)/);
+
+    if (!line.trim()) { closeListsTo(0); i++; continue; }
+
+    if (isDivider(line)) { closeListsTo(0); out.push("<hr>"); i++; continue; }
+
+    const heading = line.match(/^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
     if (heading) {
-      closeLists();
-      out += "<h" + heading[1].length + ">" + renderInline(heading[2]) + "</h" + heading[1].length + ">";
+      closeListsTo(0);
+      const level = heading[1].length;
+      out.push("<h" + level + ">" + renderInline(heading[2]) + "</h" + level + ">");
+      i++;
       continue;
     }
-    const unordered = line.match(/^[*-] (.+)/);
-    if (unordered) {
-      if (inOL) { out += "</ol>"; inOL = false; }
-      if (!inUL) { out += "<ul>"; inUL = true; }
-      out += "<li>" + renderInline(unordered[1]) + "</li>";
+
+    // Table: a header row followed by a |---|---| delimiter row.
+    if (line.includes("|") && i + 1 < lines.length && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1]) && lines[i + 1].includes("-")) {
+      closeListsTo(0);
+      const cells = (s) => s.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+      const aligns = cells(lines[i + 1]).map((c) =>
+        c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : "");
+      const head = cells(line);
+      let table = '<div class="table-wrap"><table><thead><tr>';
+      head.forEach((c, n) => {
+        table += "<th" + (aligns[n] ? ' style="text-align:' + aligns[n] + '"' : "") + ">" + renderInline(c) + "</th>";
+      });
+      table += "</tr></thead><tbody>";
+      i += 2;
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        const row = cells(lines[i]);
+        table += "<tr>";
+        for (let n = 0; n < head.length; n++) {
+          table += "<td" + (aligns[n] ? ' style="text-align:' + aligns[n] + '"' : "") + ">" + renderInline(row[n] || "") + "</td>";
+        }
+        table += "</tr>";
+        i++;
+      }
+      out.push(table + "</tbody></table></div>");
       continue;
     }
-    const ordered = line.match(/^\d+\. (.+)/);
-    if (ordered) {
-      if (inUL) { out += "</ul>"; inUL = false; }
-      if (!inOL) { out += "<ol>"; inOL = true; }
-      out += "<li>" + renderInline(ordered[1]) + "</li>";
+
+    if (/^ {0,3}>/.test(line)) {
+      closeListsTo(0);
+      const quoted = [];
+      while (i < lines.length && /^ {0,3}>/.test(lines[i])) quoted.push(lines[i++].replace(/^ {0,3}>\s?/, ""));
+      out.push("<blockquote>" + renderMarkdown(quoted.join("\n")) + "</blockquote>");
       continue;
     }
-    closeLists();
-    out += line.trim() ? renderInline(line) + "<br>" : "<br>";
+
+    const item = line.match(/^(\s*)([*+-]|\d+[.)])\s+(.*)$/);
+    if (item) {
+      const kind = /^\d/.test(item[2]) ? "ol" : "ul";
+      // Two spaces of indent per level, which is what models actually emit.
+      const depth = Math.floor(item[1].replace(/\t/g, "  ").length / 2) + 1;
+      closeListsTo(depth);
+      while (listStack.length < depth) { out.push("<" + kind + ">"); listStack.push(kind); }
+      if (listStack[listStack.length - 1] !== kind) {
+        out.push("</" + listStack.pop() + ">", "<" + kind + ">");
+        listStack.push(kind);
+      }
+      const task = item[3].match(/^\[([ xX])\]\s+(.*)$/);
+      out.push(task
+        ? '<li class="task"><input type="checkbox" disabled' + (task[1] === " " ? "" : " checked") + "> " + renderInline(task[2]) + "</li>"
+        : "<li>" + renderInline(item[3]) + "</li>");
+      i++;
+      continue;
+    }
+
+    // Paragraph: consume until a blank line or the start of another block.
+    closeListsTo(0);
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !lines[i].trimStart().startsWith(FENCE)
+      && !/^ {0,3}(#{1,6}\s|>)/.test(lines[i]) && !/^(\s*)([*+-]|\d+[.)])\s+/.test(lines[i]) && !isDivider(lines[i])) {
+      para.push(lines[i++]);
+    }
+    out.push("<p>" + para.map(renderInline).join("<br>") + "</p>");
   }
-  if (inCode) flushCode();
-  closeLists();
-  return out.replace(/^(<br>)+/, "").replace(/(<br>)+$/, "");
+  closeListsTo(0);
+  return out.join("");
 }
 
 function notify(text, kind) {
@@ -647,8 +744,11 @@ function toMarkdown(chat) {
     statusTextEl.textContent = text;
   }
 
+  /* "system" means: set no data-theme at all, so the prefers-color-scheme
+     media query in the stylesheet is what decides. */
+  const THEMES = ["light", "dark", "sepia", "nord", "contrast", "classic"];
   function applyTheme(theme) {
-    const value = theme === "light" || theme === "dark" ? theme : "system";
+    const value = THEMES.includes(theme) ? theme : "system";
     preferences.theme = value;
     if (value === "system") delete document.body.dataset.theme;
     else document.body.dataset.theme = value;
@@ -1709,8 +1809,17 @@ function toMarkdown(chat) {
     }
   }
 
+  /* Metal is decided at build time, so auto-tuning can never switch it on.
+     A build without it silently runs ~1.8x slower on Apple Silicon, so say so
+     rather than letting that stay invisible. */
+  function metalNote(data) {
+    if (!data || data.metal_available !== false || !data.metal_hint) return "";
+    if (!/macOS/i.test(data.metal_hint)) return "";
+    return " · Metal off in this build (" + data.metal_hint + ") — rebuilding with `make serve-metal` decodes roughly 1.8x faster.";
+  }
+
   function formatAutoTuneStatus(data) {
-    if (!data || !data.result) return "Not tuned for this model and machine yet.";
+    if (!data || !data.result) return "Not tuned for this model and machine yet." + metalNote(data);
     const r = data.result;
     const bits = ["threads=" + r.threads, "q8=" + (r.q8_activations ? "on" : "off"), "kv-f16=" + (r.kv_cache_f16 ? "on" : "off"), "prefill-chunk=" + r.prefill_chunk];
     const gains = [];
@@ -1720,7 +1829,7 @@ function toMarkdown(chat) {
     }
     let text = (data.active ? "Active: " : "Measured previously, not applied this session: ") + bits.join(" ");
     if (gains.length) text += " · " + gains.join(", ") + " faster";
-    return text;
+    return text + metalNote(data);
   }
 
   async function loadAutoTuneStatus() {

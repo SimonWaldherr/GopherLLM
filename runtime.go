@@ -104,15 +104,24 @@ func (o GenerationOptions) generationContext() context.Context {
 	return context.Background()
 }
 
+// WithContext returns a copy of the options bound to ctx, so generation is
+// cancelled between prefill chunks and decoded tokens when ctx is done. The
+// context field itself stays unexported (it must not be JSON-decoded from a
+// request body); this is how out-of-package servers attach a request context.
+func (o GenerationOptions) WithContext(ctx context.Context) GenerationOptions {
+	o.ctx = ctx
+	return o
+}
+
 func DefaultGenerationOptions() GenerationOptions {
 	return GenerationOptions{MaxTokens: 256, Sampler: DefaultSamplerConfig(), SystemPrompt: "You are a helpful assistant."}
 }
 
-// activeTools returns the tools that should actually be offered to the model
+// ActiveTools returns the tools that should actually be offered to the model
 // for this request, honoring ToolChoice: "none" (suppress) and
 // "function:<name>" (narrow to the single named tool, degrading back to all
 // of Tools if no such name exists).
-func (o GenerationOptions) activeTools() []ToolDefinition {
+func (o GenerationOptions) ActiveTools() []ToolDefinition {
 	if o.ToolChoice == "none" {
 		return nil
 	}
@@ -483,7 +492,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		messages = prepared
 		contextWindow = &info
 	}
-	tokens := r.renderMessages(messages, options.SystemPrompt, options.activeTools())
+	tokens := r.renderMessages(messages, options.SystemPrompt, options.ActiveTools())
 	if len(tokens) == 0 {
 		return GenerationResult{}, fmt.Errorf("prompt rendered to zero tokens")
 	}
@@ -608,7 +617,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	var nextToken uint32
 	buildResult := func() GenerationResult {
 		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
-		content, reasoning, calls := r.classifyOutput(output.String(), options.activeTools(), rng)
+		content, reasoning, calls := r.classifyOutput(output.String(), options.ActiveTools(), rng)
 		reason := finishReason
 		if len(calls) > 0 {
 			reason = "tool_calls"

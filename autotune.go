@@ -256,6 +256,11 @@ func CaptureRuntimeTuning() RuntimeTuning {
 	return RuntimeTuning{config: captureTunerConfig(Config{}), valid: true}
 }
 
+// PrefillChunk reports the captured raw prefill-chunk setting, where 0 means
+// "no override, resolve the default at use time". Exported so out-of-package
+// callers can tell two captured tunings apart without reaching into internals.
+func (t RuntimeTuning) PrefillChunk() int { return t.config.prefillChunk }
+
 // Apply restores a captured runtime tuning. The zero value is a no-op so
 // callers may safely leave an optional baseline unset.
 func (t RuntimeTuning) Apply() {

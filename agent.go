@@ -33,7 +33,7 @@ const maxAgenticIterations = 6
 // GenerateChatStreamUntil with full incremental streaming — the common case
 // is unaffected.
 func RunAgenticChat(r *Runner, messages []ChatMessage, options GenerationOptions, skills []Skill, onToken func(string) bool) (GenerationResult, error) {
-	loopOptions, agentic := agenticOptionsFor(options, skills)
+	loopOptions, agentic := AgenticOptionsFor(options, skills)
 	if !agentic {
 		return r.GenerateChatStreamUntil(messages, options, onToken)
 	}
@@ -61,13 +61,13 @@ func RunAgenticChat(r *Runner, messages []ChatMessage, options GenerationOptions
 	return result, err
 }
 
-// agenticOptionsFor returns the effective generation settings for the next
+// AgenticOptionsFor returns the effective generation settings for the next
 // agent loop iteration. Keeping this separate lets the HTTP handler measure a
 // recent-context request against the same tool definition that the model will
 // actually see before it starts an SSE response.
-func agenticOptionsFor(options GenerationOptions, skills []Skill) (GenerationOptions, bool) {
+func AgenticOptionsFor(options GenerationOptions, skills []Skill) (GenerationOptions, bool) {
 	offerSkills := len(skills) > 0 && options.ToolChoice != "none"
-	activeTools := options.activeTools()
+	activeTools := options.ActiveTools()
 	if !offerSkills && len(activeTools) == 0 {
 		return options, false
 	}

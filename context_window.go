@@ -70,7 +70,7 @@ func (r *Runner) PrepareChatContext(messages []ChatMessage, options GenerationOp
 
 	if mode == ContextWindowFull {
 		info.PromptBudget = r.config.MaxSeqLen
-		info.PromptTokens = len(r.renderMessages(messages, options.SystemPrompt, options.activeTools()))
+		info.PromptTokens = len(r.renderMessages(messages, options.SystemPrompt, options.ActiveTools()))
 		info.RetainedMessages = len(messages)
 		return messages, info, nil
 	}
@@ -89,7 +89,7 @@ func (r *Runner) PrepareChatContext(messages []ChatMessage, options GenerationOp
 	var kept []ChatMessage
 	for first := newestUserTurn; first >= 0; first-- {
 		candidate := joinChatContextTurns(pinned, turns[first:])
-		tokens := r.renderMessages(candidate, options.SystemPrompt, options.activeTools())
+		tokens := r.renderMessages(candidate, options.SystemPrompt, options.ActiveTools())
 		if len(tokens) > info.PromptBudget {
 			if first == newestUserTurn {
 				info.PromptTokens = len(tokens)

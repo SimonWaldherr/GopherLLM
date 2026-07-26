@@ -14,6 +14,7 @@ import (
 	"os"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/server"
 )
 
 func main() {
@@ -62,6 +63,8 @@ func main() {
 	}
 	fmt.Printf("embedding: %d dims\n", len(emb.Embedding))
 
-	// The HTTP surface mounts as a plain handler (not started here).
-	var _ http.Handler = model.HTTPHandler(gopherllm.HandlerOptions{})
+	// The HTTP surface lives in the server subpackage, so importing the
+	// root package for inference alone never pulls in net/http or the
+	// embedded web UI. Mounts as a plain handler (not started here).
+	var _ http.Handler = server.HandlerForModel(model, server.HandlerOptions{})
 }

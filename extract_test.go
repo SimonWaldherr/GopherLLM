@@ -45,7 +45,7 @@ func TestExtractThinkUnterminated(t *testing.T) {
 }
 
 func TestThinkStreamSplitterSeparatesTagsAcrossChunks(t *testing.T) {
-	s := newThinkStreamSplitter(false)
+	s := NewThinkStreamSplitter(false)
 	var content, reasoning strings.Builder
 	emit := func(isReasoning bool, text string) bool {
 		if isReasoning {
@@ -72,7 +72,7 @@ func TestThinkStreamSplitterSeparatesTagsAcrossChunks(t *testing.T) {
 }
 
 func TestThinkStreamSplitterPreservesIncompleteTagLiterally(t *testing.T) {
-	s := newThinkStreamSplitter(false)
+	s := NewThinkStreamSplitter(false)
 	var content strings.Builder
 	emit := func(isReasoning bool, text string) bool {
 		if isReasoning {
@@ -90,7 +90,7 @@ func TestThinkStreamSplitterPreservesIncompleteTagLiterally(t *testing.T) {
 }
 
 func TestThinkStreamSplitterCanStartInsidePromptThinkBlock(t *testing.T) {
-	s := newThinkStreamSplitter(true)
+	s := NewThinkStreamSplitter(true)
 	var content, reasoning strings.Builder
 	emit := func(isReasoning bool, text string) bool {
 		if isReasoning {

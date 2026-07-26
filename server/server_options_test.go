@@ -1,12 +1,16 @@
-package gopherllm
+package server
 
-import "testing"
+import (
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+
+	"testing"
+)
 
 func f32p(v float32) *float32 { return &v }
 func intp(v int) *int         { return &v }
 
 func TestGenerateRequestToMessagesAndOptions(t *testing.T) {
-	def := DefaultGenerationOptions()
+	def := gopherllm.DefaultGenerationOptions()
 	req := GenerateRequest{
 		Prompt:        "hi",
 		MaxTokens:     intp(9),
@@ -17,7 +21,7 @@ func TestGenerateRequestToMessagesAndOptions(t *testing.T) {
 		RepeatPenalty: f32p(1.2),
 	}
 	msgs, opts := req.ToMessagesAndOptions(def)
-	if len(msgs) != 1 || msgs[0].Content != "hi" || msgs[0].Role != ChatRoleUser {
+	if len(msgs) != 1 || msgs[0].Content != "hi" || msgs[0].Role != gopherllm.ChatRoleUser {
 		t.Fatalf("messages = %+v", msgs)
 	}
 	if opts.MaxTokens != 9 || opts.Sampler.Temperature != 0.3 || opts.Sampler.TopP != 0.8 ||
@@ -27,7 +31,7 @@ func TestGenerateRequestToMessagesAndOptions(t *testing.T) {
 }
 
 func TestOpenAIChatMaxCompletionFallbackAndMinP(t *testing.T) {
-	def := DefaultGenerationOptions()
+	def := gopherllm.DefaultGenerationOptions()
 	req := OpenAIChatRequest{
 		Messages:            []APIMessage{{Role: "user", Content: "hi"}},
 		MaxCompletionTokens: intp(12),
@@ -46,7 +50,7 @@ func TestOpenAIChatMaxCompletionFallbackAndMinP(t *testing.T) {
 }
 
 func TestOllamaRequestOptions(t *testing.T) {
-	def := DefaultGenerationOptions()
+	def := gopherllm.DefaultGenerationOptions()
 	req := OllamaGenerateRequest{
 		Prompt:  "hi",
 		System:  "sys",
@@ -59,7 +63,7 @@ func TestOllamaRequestOptions(t *testing.T) {
 }
 
 func TestApplyRequestOptionsOverridesSampler(t *testing.T) {
-	def := DefaultGenerationOptions()
+	def := gopherllm.DefaultGenerationOptions()
 	got := applyRequestOptions(def, intp(3), f32p(0.4), f32p(0.7), intp(9), f32p(0.15), f32p(1.3), nil, nil, nil, nil, "")
 	if got.MaxTokens != 3 || got.Sampler.Temperature != 0.4 || got.Sampler.TopP != 0.7 ||
 		got.Sampler.TopK != 9 || got.Sampler.MinP != 0.15 || got.Sampler.RepeatPenalty != 1.3 {
@@ -74,7 +78,7 @@ func TestApiMessagesRoleMapping(t *testing.T) {
 		{Role: "user", Content: "u"},
 		{Role: "other", Content: "o"},
 	})
-	want := []ChatRole{ChatRoleSystem, ChatRoleAssistant, ChatRoleUser, ChatRoleUser}
+	want := []gopherllm.ChatRole{gopherllm.ChatRoleSystem, gopherllm.ChatRoleAssistant, gopherllm.ChatRoleUser, gopherllm.ChatRoleUser}
 	if len(msgs) != len(want) {
 		t.Fatalf("len = %d", len(msgs))
 	}

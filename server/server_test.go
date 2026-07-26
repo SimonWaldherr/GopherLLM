@@ -1,6 +1,8 @@
-package gopherllm
+package server
 
 import (
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+
 	"encoding/json"
 	"io"
 	"net/http"
@@ -99,8 +101,32 @@ func TestChatUIAssetsArePrivateAndSelfContained(t *testing.T) {
 	}
 }
 
+func TestHandlerStartsWithoutModel(t *testing.T) {
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ChatUI: true}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/chat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chat status = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp, err = http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("chat without model status = %d body=%s", resp.StatusCode, body)
+	}
+}
+
 func TestApplyRequestOptionsPreservesDefaultStopsWhenStopOmitted(t *testing.T) {
-	def := DefaultGenerationOptions()
+	def := gopherllm.DefaultGenerationOptions()
 	def.StopSequences = []string{"</s>"}
 
 	got := applyRequestOptions(def, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "")
@@ -110,7 +136,7 @@ func TestApplyRequestOptionsPreservesDefaultStopsWhenStopOmitted(t *testing.T) {
 }
 
 func TestApplyRequestOptionsOverridesStopsWhenProvided(t *testing.T) {
-	def := DefaultGenerationOptions()
+	def := gopherllm.DefaultGenerationOptions()
 	def.StopSequences = []string{"</s>"}
 
 	got := applyRequestOptions(def, nil, nil, nil, nil, nil, nil, nil, nil, []any{"END", "STOP"}, nil, "")
@@ -123,10 +149,10 @@ func TestApplyRequestOptionsOverridesStopsWhenProvided(t *testing.T) {
 // auto-tune integration end to end: GET /autotune before anything has run,
 // POST /autotune/run measuring and applying a tuning, GET /autotune
 // reflecting it as active, and a model hot-swap clearing "active" (a fresh
-// Runner has had no tuning applied to it this session) while "cached" still
+// gopherllm.Runner has had no tuning applied to it this session) while "cached" still
 // reports the on-disk result from before the swap.
 func TestAutoTuneEndpointsReportStatusAndInvalidateOnSwap(t *testing.T) {
-	baseline := CaptureRuntimeTuning()
+	baseline := gopherllm.CaptureRuntimeTuning()
 	defer baseline.Apply()
 
 	cacheDir := t.TempDir()
@@ -143,7 +169,7 @@ func TestAutoTuneEndpointsReportStatusAndInvalidateOnSwap(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	runner, _, err := RunnerFromPath(modelPath)
+	runner, _, err := gopherllm.RunnerFromPath(modelPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,14 +259,14 @@ func TestAutoTuneEndpointsReportStatusAndInvalidateOnSwap(t *testing.T) {
 	// Make a runtime setting visibly differ from the captured baseline. The
 	// hot-swap below must restore the baseline rather than leave any setting
 	// that was active while the previous model was tuned.
-	changedChunk := baseline.config.prefillChunk + 1
+	changedChunk := baseline.PrefillChunk() + 1
 	if changedChunk < 1 {
 		changedChunk = 1
 	}
-	SetPrefillChunk(changedChunk)
+	gopherllm.SetPrefillChunk(changedChunk)
 
 	// Hot-swap to a runner built from the same catalog file. Even though the
-	// tuning cache key ends up identical, the newly loaded Runner itself has
+	// tuning cache key ends up identical, the newly loaded gopherllm.Runner itself has
 	// never had a tuning applied, so "active" must go back to false while
 	// "cached" keeps reporting the on-disk result from before the swap.
 	loadBody, _ := json.Marshal(map[string]string{"path": modelPath})
@@ -258,7 +284,7 @@ func TestAutoTuneEndpointsReportStatusAndInvalidateOnSwap(t *testing.T) {
 	} else if !s.Cached {
 		t.Fatalf("status after hot-swap should still report the on-disk cache, got %+v", s)
 	}
-	if got := CaptureRuntimeTuning(); got != baseline {
-		t.Fatalf("hot-swap runtime tuning = %+v, want captured baseline %+v", got.config, baseline.config)
+	if got := gopherllm.CaptureRuntimeTuning(); got != baseline {
+		t.Fatalf("hot-swap runtime tuning = %+v, want captured baseline %+v", got.PrefillChunk(), baseline.PrefillChunk())
 	}
 }

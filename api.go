@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 )
 
@@ -256,12 +255,9 @@ func (m *Model) Embed(ctx context.Context, text string) (EmbeddingResult, error)
 	return m.r.Embed(text)
 }
 
-// HTTPHandler returns the model's OpenAI/Ollama-compatible HTTP API as a
-// mountable handler (see NewHandler). The handler shares this Model's
-// underlying Runner; generation requests serialize with direct Model calls.
-func (m *Model) HTTPHandler(opts HandlerOptions) http.Handler {
-	return NewHandler(m.r, opts)
-}
+// HTTP serving lives in the server subpackage so that importing this one for
+// inference alone does not pull in net/http, html/template, or the embedded
+// web UI. Use server.HandlerForModel(m, opts) instead of a method here.
 
 // Tokenize encodes text with the model's tokenizer (including BOS when the
 // model declares it). Detokenize is its inverse over generated ids.

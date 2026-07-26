@@ -1,6 +1,8 @@
-package gopherllm
+package server
 
 import (
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+
 	"bufio"
 	"context"
 	"encoding/json"
@@ -12,19 +14,19 @@ import (
 
 func newTestServer(t *testing.T, opts HandlerOptions) *httptest.Server {
 	t.Helper()
-	m, err := OpenBytes(context.Background(), buildTinyLlamaGGUF())
+	m, err := gopherllm.OpenBytes(context.Background(), buildTinyLlamaGGUF())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
 	if opts.Defaults.MaxTokens == 0 {
-		opts.Defaults = DefaultGenerationOptions()
+		opts.Defaults = gopherllm.DefaultGenerationOptions()
 		opts.Defaults.MaxTokens = 4
 		opts.Defaults.SystemPrompt = ""
 		opts.Defaults.Sampler.Temperature = 0
 		opts.Defaults.Sampler.TopK = 1
 	}
-	srv := httptest.NewServer(m.HTTPHandler(opts))
+	srv := httptest.NewServer(HandlerForModel(m, opts))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -171,7 +173,7 @@ func TestOllamaGenerateNonStreamingWhenStreamFalse(t *testing.T) {
 
 func TestOpenAIDeveloperRoleMapsToSystem(t *testing.T) {
 	msgs := apiMessages([]APIMessage{{Role: "developer", Content: "be terse"}})
-	if len(msgs) != 1 || msgs[0].Role != ChatRoleSystem {
+	if len(msgs) != 1 || msgs[0].Role != gopherllm.ChatRoleSystem {
 		t.Fatalf("developer role mapping = %+v", msgs)
 	}
 }
@@ -184,21 +186,21 @@ func TestNormalizeToolChoiceForcesNamedFunction(t *testing.T) {
 }
 
 func TestActiveToolsNarrowsToForcedFunction(t *testing.T) {
-	tools := []ToolDefinition{
-		{Type: "function", Function: ToolFunctionDef{Name: "get_weather"}},
-		{Type: "function", Function: ToolFunctionDef{Name: "get_time"}},
+	tools := []gopherllm.ToolDefinition{
+		{Type: "function", Function: gopherllm.ToolFunctionDef{Name: "get_weather"}},
+		{Type: "function", Function: gopherllm.ToolFunctionDef{Name: "get_time"}},
 	}
-	opts := GenerationOptions{Tools: tools, ToolChoice: "function:get_time"}
-	active := opts.activeTools()
+	opts := gopherllm.GenerationOptions{Tools: tools, ToolChoice: "function:get_time"}
+	active := opts.ActiveTools()
 	if len(active) != 1 || active[0].Function.Name != "get_time" {
-		t.Fatalf("activeTools = %+v", active)
+		t.Fatalf("ActiveTools = %+v", active)
 	}
 
 	// Unknown forced name degrades to offering everything rather than nothing.
 	opts.ToolChoice = "function:does_not_exist"
-	active = opts.activeTools()
+	active = opts.ActiveTools()
 	if len(active) != 2 {
-		t.Fatalf("activeTools (unknown forced name) = %+v", active)
+		t.Fatalf("ActiveTools (unknown forced name) = %+v", active)
 	}
 }
 

@@ -80,24 +80,24 @@ func extractThink(text string) (content, reasoning string) {
 	return strings.TrimSpace(contentBuf.String()), strings.TrimSpace(strings.Join(reasoningParts, "\n\n"))
 }
 
-// thinkStreamSplitter separates <think> blocks while text is still arriving
+// ThinkStreamSplitter separates <think> blocks while text is still arriving
 // in arbitrary-sized chunks. Tokens need not align with tags, so a short
 // suffix is retained until it can no longer be the beginning of a marker.
 // It deliberately preserves whitespace: the final GenerationResult remains
 // the canonical trimmed representation, while stream consumers receive each
 // character exactly once.
-type thinkStreamSplitter struct {
+type ThinkStreamSplitter struct {
 	inReasoning bool
 	pending     string
 }
 
-func newThinkStreamSplitter(initialReasoning bool) thinkStreamSplitter {
-	return thinkStreamSplitter{inReasoning: initialReasoning}
+func NewThinkStreamSplitter(initialReasoning bool) ThinkStreamSplitter {
+	return ThinkStreamSplitter{inReasoning: initialReasoning}
 }
 
 // Push accepts another raw model-text chunk. emit receives whether the text
 // belongs to the reasoning channel; returning false stops processing.
-func (s *thinkStreamSplitter) Push(text string, emit func(reasoning bool, text string) bool) bool {
+func (s *ThinkStreamSplitter) Push(text string, emit func(reasoning bool, text string) bool) bool {
 	s.pending += text
 	for {
 		marker := "<think>"
@@ -129,7 +129,7 @@ func (s *thinkStreamSplitter) Push(text string, emit func(reasoning bool, text s
 // Flush emits a final partial marker literally. That mirrors extractThink:
 // incomplete tag text is ordinary content unless it follows an actual
 // opening <think> marker.
-func (s *thinkStreamSplitter) Flush(emit func(reasoning bool, text string) bool) bool {
+func (s *ThinkStreamSplitter) Flush(emit func(reasoning bool, text string) bool) bool {
 	if s.pending == "" {
 		return true
 	}

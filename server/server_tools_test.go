@@ -1,6 +1,8 @@
-package gopherllm
+package server
 
 import (
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+
 	"encoding/json"
 	"strings"
 	"testing"
@@ -13,13 +15,13 @@ func TestApiMessagesMapsToolRole(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("len = %d", len(msgs))
 	}
-	if msgs[0].Role != ChatRoleTool || msgs[0].ToolCallID != "abc123XYZ" || msgs[0].Name != "get_weather" {
+	if msgs[0].Role != gopherllm.ChatRoleTool || msgs[0].ToolCallID != "abc123XYZ" || msgs[0].Name != "get_weather" {
 		t.Fatalf("msg = %+v", msgs[0])
 	}
 }
 
 func TestApiMessagesCarriesAssistantToolCalls(t *testing.T) {
-	calls := []ToolCall{{ID: "id1", Type: "function", Function: ToolCallFunction{Name: "get_weather", Arguments: "{}"}}}
+	calls := []gopherllm.ToolCall{{ID: "id1", Type: "function", Function: gopherllm.ToolCallFunction{Name: "get_weather", Arguments: "{}"}}}
 	msgs := apiMessages([]APIMessage{{Role: "assistant", ToolCalls: calls}})
 	if len(msgs) != 1 || len(msgs[0].ToolCalls) != 1 || msgs[0].ToolCalls[0].Function.Name != "get_weather" {
 		t.Fatalf("msgs = %+v", msgs)
@@ -42,10 +44,10 @@ func TestNormalizeToolChoice(t *testing.T) {
 }
 
 func TestOpenAIChatResponseIncludesToolCallsAndFinishReason(t *testing.T) {
-	result := GenerationResult{
+	result := gopherllm.GenerationResult{
 		Text:         "",
 		FinishReason: "tool_calls",
-		ToolCalls:    []ToolCall{{ID: "id1", Type: "function", Function: ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Berlin"}`}}},
+		ToolCalls:    []gopherllm.ToolCall{{ID: "id1", Type: "function", Function: gopherllm.ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Berlin"}`}}},
 	}
 	resp := openAIChatResponse("test-model", result)
 	b, err := json.Marshal(resp)
@@ -65,7 +67,7 @@ func TestOpenAIChatResponseIncludesToolCallsAndFinishReason(t *testing.T) {
 }
 
 func TestOpenAIChatResponseIncludesReasoningContent(t *testing.T) {
-	result := GenerationResult{Text: "42", ReasoningText: "let me think", FinishReason: "stop"}
+	result := gopherllm.GenerationResult{Text: "42", ReasoningText: "let me think", FinishReason: "stop"}
 	resp := openAIChatResponse("test-model", result)
 	b, _ := json.Marshal(resp)
 	if !strings.Contains(string(b), "let me think") {
@@ -74,7 +76,7 @@ func TestOpenAIChatResponseIncludesReasoningContent(t *testing.T) {
 }
 
 func TestOpenAIChatResponseDefaultsFinishReason(t *testing.T) {
-	resp := openAIChatResponse("m", GenerationResult{Text: "hi"})
+	resp := openAIChatResponse("m", gopherllm.GenerationResult{Text: "hi"})
 	choices := resp["choices"].([]any)
 	choice := choices[0].(map[string]any)
 	if choice["finish_reason"] != "stop" {
@@ -83,10 +85,10 @@ func TestOpenAIChatResponseDefaultsFinishReason(t *testing.T) {
 }
 
 func TestGenerateResponseIncludesToolCallsAndReasoning(t *testing.T) {
-	result := GenerationResult{
+	result := gopherllm.GenerationResult{
 		Text:          "",
 		ReasoningText: "thinking",
-		ToolCalls:     []ToolCall{{ID: "id1", Function: ToolCallFunction{Name: "f", Arguments: "{}"}}},
+		ToolCalls:     []gopherllm.ToolCall{{ID: "id1", Function: gopherllm.ToolCallFunction{Name: "f", Arguments: "{}"}}},
 		FinishReason:  "tool_calls",
 	}
 	resp := generateResponse(result)
@@ -96,7 +98,7 @@ func TestGenerateResponseIncludesToolCallsAndReasoning(t *testing.T) {
 	if resp["finish_reason"] != "tool_calls" {
 		t.Fatalf("finish_reason = %v", resp["finish_reason"])
 	}
-	calls, ok := resp["tool_calls"].([]ToolCall)
+	calls, ok := resp["tool_calls"].([]gopherllm.ToolCall)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("tool_calls = %v", resp["tool_calls"])
 	}

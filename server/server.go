@@ -1,4 +1,4 @@
-package gopherllm
+package server
 
 import (
 	"crypto/sha256"
@@ -17,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
 //go:embed web_ui/chat.html
@@ -45,33 +47,33 @@ type chatTemplateData struct {
 
 type runnerState struct {
 	mu   sync.RWMutex
-	r    *Runner
+	r    *gopherllm.Runner
 	path string
 	// baseline is captured before any server-side auto tuning. A model switch
 	// restores it when the replacement has not been explicitly tuned, so
 	// process-wide knobs measured for the previous model do not leak across.
-	baseline RuntimeTuning
+	baseline gopherllm.RuntimeTuning
 	// autoTune is the tuning result actually applied to r during this process
-	// (nil if none has been). It is distinct from Runner.LoadAutoTune, which
+	// (nil if none has been). It is distinct from gopherllm.Runner.LoadAutoTune, which
 	// only reports what is cached on disk and may not reflect what is
 	// currently active if the server started without --auto.
-	autoTune *AutoTuneResult
+	autoTune *gopherllm.AutoTuneResult
 }
 
 // embeddingState holds the optional, separately loaded model used by the
 // browser RAG mode. Enabling RAG must never replace the chat generation model.
 type embeddingState struct {
 	mu sync.RWMutex
-	r  *Runner
+	r  *gopherllm.Runner
 }
 
-func (s *embeddingState) withRunner(fn func(*Runner)) {
+func (s *embeddingState) withRunner(fn func(*gopherllm.Runner)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	fn(s.r)
 }
 
-func (s *embeddingState) swap(r *Runner) {
+func (s *embeddingState) swap(r *gopherllm.Runner) {
 	s.mu.Lock()
 	old := s.r
 	s.r = r
@@ -81,20 +83,20 @@ func (s *embeddingState) swap(r *Runner) {
 	}
 }
 
-func (s *runnerState) get() *Runner {
+func (s *runnerState) get() *gopherllm.Runner {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.r
 }
 
-func (s *runnerState) withRunner(fn func(*Runner)) {
+func (s *runnerState) withRunner(fn func(*gopherllm.Runner)) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	fn(s.r)
 }
 
-func (s *runnerState) swap(r *Runner, path string) {
-	var old *Runner
+func (s *runnerState) swap(r *gopherllm.Runner, path string) {
+	var old *gopherllm.Runner
 	s.mu.Lock()
 	old = s.r
 	s.r = r
@@ -118,11 +120,14 @@ func (s *runnerState) getPath() string {
 }
 
 // runAutoTune serializes calibration with model hot-swaps and all inference.
-// AutoTuneResult.Apply changes process-wide settings, so holding the writer
+// gopherllm.AutoTuneResult.Apply changes process-wide settings, so holding the writer
 // lock is intentional: inference paths hold a read lock for the entire run.
-func (s *runnerState) runAutoTune(opts AutoTuneOptions, refresh bool) (AutoTuneResult, bool, error) {
+func (s *runnerState) runAutoTune(opts gopherllm.AutoTuneOptions, refresh bool) (gopherllm.AutoTuneResult, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.r == nil {
+		return gopherllm.AutoTuneResult{}, false, errors.New("no model is loaded; load a model first")
+	}
 	res, cached, err := s.r.AutoTuneOrCached(opts, refresh)
 	if err == nil {
 		s.autoTune = &res
@@ -136,21 +141,36 @@ func (s *runnerState) runAutoTune(opts AutoTuneOptions, refresh bool) (AutoTuneR
 func (s *runnerState) autoTuneStatus() map[string]any {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	status := map[string]any{"active": false, "cached": false}
+	if s.r == nil {
+		status["metal_available"] = gopherllm.MetalAvailable()
+		if !gopherllm.MetalAvailable() {
+			status["metal_hint"] = gopherllm.MetalError()
+		}
+		return status
+	}
 	if s.autoTune != nil {
 		_, cached := s.r.LoadAutoTune()
-		return map[string]any{"active": true, "cached": cached, "result": s.autoTune}
+		status = map[string]any{"active": true, "cached": cached, "result": s.autoTune}
+	} else if cached, ok := s.r.LoadAutoTune(); ok {
+		status = map[string]any{"active": false, "cached": true, "result": cached}
 	}
-	if cached, ok := s.r.LoadAutoTune(); ok {
-		return map[string]any{"active": false, "cached": true, "result": cached}
+	// Metal is a build-time choice, not something auto-tuning can switch on,
+	// so a build without it silently leaves a large speedup on the table
+	// (measured ~1.8x on a 3B Q4_K_M). Report it so the UI can say so rather
+	// than letting it stay invisible.
+	status["metal_available"] = gopherllm.MetalAvailable()
+	if !gopherllm.MetalAvailable() {
+		status["metal_hint"] = gopherllm.MetalError()
 	}
-	return map[string]any{"active": false, "cached": false}
+	return status
 }
 
 // HandlerOptions configures the mountable HTTP API handler.
 type HandlerOptions struct {
 	// Defaults are the generation settings requests inherit unless they
 	// override individual fields.
-	Defaults GenerationOptions
+	Defaults gopherllm.GenerationOptions
 	// MaxConcurrentRequests bounds in-flight generation requests (default 8).
 	// Requests beyond the bound queue rather than failing.
 	MaxConcurrentRequests int
@@ -164,17 +184,17 @@ type HandlerOptions struct {
 	ModelPath string
 	// SkillsDir, if set, is scanned once at handler construction for SKILL.md
 	// files (see skills.go). Every chat/generate endpoint offers a load_skill
-	// tool and resolves it server-side via RunAgenticChat.
+	// tool and resolves it server-side via gopherllm.RunAgenticChat.
 	SkillsDir string
 	// AppliedAutoTune, if set, is a tuning already applied to initialRunner
 	// before the handler was built (e.g. by the CLI's --auto flag). GET
 	// /autotune reports it as active from the very first request, rather than
 	// only after someone hits POST /autotune/run through the web UI.
-	AppliedAutoTune *AutoTuneResult
+	AppliedAutoTune *gopherllm.AutoTuneResult
 	// BaselineRuntimeTuning is the process-wide configuration to restore after
 	// a hot-swap to an uncalibrated model. When absent, NewHandler captures the
 	// settings visible at construction time.
-	BaselineRuntimeTuning *RuntimeTuning
+	BaselineRuntimeTuning *gopherllm.RuntimeTuning
 	// LogWriter receives handler diagnostics (skill load notes). Defaults to
 	// io.Discard.
 	LogWriter io.Writer
@@ -203,7 +223,7 @@ func (r modelLoadRequest) selector() string {
 // retained for compatibility but unused.
 type ServeOptions struct {
 	Addr                     string
-	Defaults                 GenerationOptions
+	Defaults                 gopherllm.GenerationOptions
 	MaxConcurrentConnections int
 	ChatUI                   bool
 	ChatHistoryPath          string
@@ -213,10 +233,10 @@ type ServeOptions struct {
 	SkillsDir                string
 	// AppliedAutoTune carries forward a tuning already applied before Serve
 	// was called (e.g. by --auto), so GET /autotune reports it from the start.
-	AppliedAutoTune *AutoTuneResult
+	AppliedAutoTune *gopherllm.AutoTuneResult
 	// BaselineRuntimeTuning forwards the pre-auto runtime settings captured by
 	// a host such as the CLI, so a later model hot-swap can restore them.
-	BaselineRuntimeTuning *RuntimeTuning
+	BaselineRuntimeTuning *gopherllm.RuntimeTuning
 	// LogWriter receives startup and handler diagnostics; Serve defaults it
 	// to os.Stderr (CLI behavior), unlike NewHandler's io.Discard.
 	LogWriter io.Writer
@@ -228,7 +248,7 @@ type ServeOptions struct {
 //
 //	handler := gopherllm.NewHandler(model.Runner(), gopherllm.HandlerOptions{...})
 //	mux.Handle("/llm/", http.StripPrefix("/llm", handler))
-func Serve(initialRunner *Runner, opts ServeOptions) error {
+func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 	logw := opts.LogWriter
 	if logw == nil {
 		logw = os.Stderr
@@ -249,12 +269,20 @@ func Serve(initialRunner *Runner, opts ServeOptions) error {
 	return server.ListenAndServe()
 }
 
+// HandlerForModel serves a Model opened through the high-level API. It is the
+// replacement for the former gopherllm.Model.HTTPHandler method, which had to
+// go when HTTP serving moved out of the inference package: the handler shares
+// the Model's underlying Runner, so requests serialize with direct Model calls.
+func HandlerForModel(m *gopherllm.Model, opts HandlerOptions) http.Handler {
+	return NewHandler(m.Runner(), opts)
+}
+
 // NewHandler returns the complete GopherLLM HTTP API (OpenAI-compatible,
 // Ollama-compatible, and native endpoints — see the README's endpoint table)
 // as a mountable http.Handler. It owns no listener and writes nothing except
 // to opts.LogWriter, so it composes with any router, middleware stack, or
 // server the host application already has.
-func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
+func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handler {
 	logw := opts.LogWriter
 	if logw == nil {
 		logw = io.Discard
@@ -263,7 +291,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 	if opts.MaxConcurrentRequests <= 0 {
 		opts.MaxConcurrentRequests = 8
 	}
-	skills, err := LoadSkills(opts.SkillsDir)
+	skills, err := gopherllm.LoadSkills(opts.SkillsDir)
 	if err != nil {
 		fmt.Fprintf(logw, "Warning: skills: %v (continuing without skills)\n", err)
 	} else if len(skills) > 0 {
@@ -273,17 +301,52 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		fmt.Fprintf(logw, "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
-	baseline := CaptureRuntimeTuning()
+	baseline := gopherllm.CaptureRuntimeTuning()
 	if opts.BaselineRuntimeTuning != nil {
 		baseline = *opts.BaselineRuntimeTuning
 	}
 	state := &runnerState{r: initialRunner, path: opts.ModelPath, baseline: baseline, autoTune: opts.AppliedAutoTune}
 	embedder := &embeddingState{}
+	remote := newRemoteState()
 	sem := make(chan struct{}, opts.MaxConcurrentRequests)
 	var autoTuneMu sync.Mutex
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get())})
+		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get()), "remote": remote.enabled()})
+	})
+	mux.HandleFunc("/remote", func(w http.ResponseWriter, req *http.Request) {
+		switch req.Method {
+		case http.MethodGet:
+			writeJSON(w, remote.publicConfig())
+		case http.MethodDelete:
+			remote.clear()
+			writeJSON(w, remote.publicConfig())
+		case http.MethodPost:
+			var body remoteConfigRequest
+			if err := json.NewDecoder(io.LimitReader(req.Body, 64<<10)).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := remote.configure(body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, remote.publicConfig())
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/remote/models", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		models, err := remote.listModels(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		writeJSON(w, models)
 	})
 	mux.HandleFunc("/generate", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		requestID := ensureRequestID(w, req)
@@ -294,9 +357,9 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		messages, options := body.ToMessagesAndOptions(opts.Defaults)
 		options = withRequestContext(options, req)
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			result, err := RunAgenticChat(r, messages, options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChat(r, messages, options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -321,13 +384,13 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		options.ContextWindowMode = contextMode
 		options = withRequestContext(options, req)
 		messages := body.ChatMessages()
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			if contextMode == ContextWindowRecent {
-				effectiveOptions, _ := agenticOptionsFor(options, skills)
+			if contextMode == gopherllm.ContextWindowRecent {
+				effectiveOptions, _ := gopherllm.AgenticOptionsFor(options, skills)
 				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
 				if err != nil {
-					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, GenerationResult{}, err)
+					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, gopherllm.GenerationResult{}, err)
 					http.Error(w, err.Error(), http.StatusBadRequest)
 					return
 				}
@@ -337,7 +400,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skills, includeUsage)
 				return
 			}
-			result, err := RunAgenticChat(r, messages, options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChat(r, messages, options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -360,7 +423,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		options := body.Options(opts.Defaults)
 		options = withRequestContext(options, req)
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			result, err := r.Generate(body.PromptString(), options)
 			logInferenceResult(logw, requestID, "/v1/completions", model, false, result, err)
@@ -380,7 +443,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		inputs := body.Inputs()
 		data := []any{}
 		total := 0
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			for i, input := range inputs {
 				emb, err := r.Embed(input)
@@ -396,6 +459,10 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 	}))
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		model := modelID(state.get())
+		if model == "" {
+			writeJSON(w, map[string]any{"object": "list", "data": []any{}})
+			return
+		}
 		writeJSON(w, map[string]any{"object": "list", "data": []any{map[string]any{"id": model, "object": "model", "created": 0, "owned_by": "gopherllm"}}})
 	})
 	mux.HandleFunc("/v1/skills", func(w http.ResponseWriter, _ *http.Request) {
@@ -417,13 +484,13 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		options := body.GenerationOptions(opts.Defaults)
 		options = withRequestContext(options, req)
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
 				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills)
 				return
 			}
-			result, err := RunAgenticChat(r, []ChatMessage{UserMessage(body.Prompt)}, options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChat(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -445,13 +512,13 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		options := body.GenerationOptions(opts.Defaults)
 		options = withRequestContext(options, req)
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
 				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills)
 				return
 			}
-			result, err := RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
+			result, err := gopherllm.RunAgenticChat(r, body.ChatMessages(), options, skills, alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/chat", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -481,7 +548,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 				text = inputs[0]
 			}
 		}
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			emb, err := r.Embed(text)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -498,7 +565,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		inputs := body.Inputs()
 		embeddings := make([][]float32, 0, len(inputs))
-		state.withRunner(func(r *Runner) {
+		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			promptTokens := 0
 			for _, input := range inputs {
@@ -523,7 +590,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			return
 		}
 		name := modelID(r)
-		a := AnalyzeGGUF(r.GGUF(), r.Tokenizer())
+		a := gopherllm.AnalyzeGGUF(r.GGUF(), r.Tokenizer())
 		writeJSON(w, map[string]any{"models": []any{map[string]any{
 			"name":       name,
 			"model":      name,
@@ -587,7 +654,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
 			return
 		}
-		entries, err := DiscoverModels(opts.ModelDir, io.Discard)
+		entries, err := gopherllm.DiscoverModels(opts.ModelDir, io.Discard)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -635,23 +702,23 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			http.Error(w, "missing model selector", http.StatusBadRequest)
 			return
 		}
-		entries, err := DiscoverModels(opts.ModelDir, io.Discard)
+		entries, err := gopherllm.DiscoverModels(opts.ModelDir, io.Discard)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		entry, err := SelectModel(entries, selector)
+		entry, err := gopherllm.SelectModel(entries, selector)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		newRunner, _, err := RunnerFromPath(entry.Path)
+		newRunner, _, err := gopherllm.RunnerFromPath(entry.Path)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		state.swap(newRunner, entry.Path)
-		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.config.MaxSeqLen})
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.Config().MaxSeqLen})
 	}))
 	mux.HandleFunc("/models/embed/load", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -667,12 +734,12 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		entries, err := DiscoverModels(opts.ModelDir, io.Discard)
+		entries, err := gopherllm.DiscoverModels(opts.ModelDir, io.Discard)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		entry, err := SelectModel(entries, body.selector())
+		entry, err := gopherllm.SelectModel(entries, body.selector())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -681,13 +748,13 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			http.Error(w, "selected model is not an embedding model", http.StatusBadRequest)
 			return
 		}
-		runner, _, err := RunnerFromPath(entry.Path)
+		runner, _, err := gopherllm.RunnerFromPath(entry.Path)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		embedder.swap(runner)
-		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(runner), "context_length": runner.config.MaxSeqLen})
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(runner), "context_length": runner.Config().MaxSeqLen})
 	}))
 	mux.HandleFunc("/models/embed", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -708,7 +775,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		var vectors [][]float32
 		var model string
 		var embedErr error
-		embedder.withRunner(func(runner *Runner) {
+		embedder.withRunner(func(runner *gopherllm.Runner) {
 			if runner == nil {
 				embedErr = errors.New("no embedding model is loaded")
 				return
@@ -766,11 +833,11 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		defer autoTuneMu.Unlock()
 		body.Effort = strings.TrimSpace(body.Effort)
-		if !ValidAutoTuneEffort(body.Effort) {
+		if !gopherllm.ValidAutoTuneEffort(body.Effort) {
 			http.Error(w, "effort must be quick, balanced, or thorough", http.StatusBadRequest)
 			return
 		}
-		runOpts := AutoTuneOptionsForEffort(body.Effort)
+		runOpts := gopherllm.AutoTuneOptionsForEffort(body.Effort)
 		runOpts.LogWriter = logw
 		res, cached, err := state.runAutoTune(runOpts, body.Refresh)
 		if err != nil {
@@ -791,9 +858,13 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		mux.HandleFunc("/chat", func(w http.ResponseWriter, _ *http.Request) {
 			setChatUIHeaders(w)
 			w.Header().Set("content-type", "text/html; charset=utf-8")
+			model := modelID(state.get())
+			if model == "" {
+				model = "No model selected"
+			}
 			data := chatTemplateData{
 				Title:         "GopherLLM Chat",
-				Model:         modelID(state.get()),
+				Model:         model,
 				MaxTokens:     opts.Defaults.MaxTokens,
 				Temperature:   opts.Defaults.Sampler.Temperature,
 				TopP:          opts.Defaults.Sampler.TopP,
@@ -816,7 +887,33 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			fmt.Fprint(w, chatJS)
 		})
 	}
-	return mux
+	return remoteOrLoadedModel(state, remote, mux)
+}
+
+// requireLoadedModel keeps catalog, UI and model-loading routes available when
+// the server starts without weights. Generation-shaped routes return a clear
+// 503 until the user chooses a model instead of dereferencing a nil Runner.
+func remoteOrLoadedModel(state *runnerState, remote *remoteState, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/v1/chat/completions" && remote.enabled() {
+			remote.proxyChat(w, req)
+			return
+		}
+		if state.get() == nil && needsLoadedModel(req.URL.Path) {
+			http.Error(w, "no model is loaded; choose one in the Web UI or POST /models/load", http.StatusServiceUnavailable)
+			return
+		}
+		next.ServeHTTP(w, req)
+	})
+}
+
+func needsLoadedModel(path string) bool {
+	switch path {
+	case "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/autotune/run":
+		return true
+	default:
+		return false
+	}
 }
 
 // setChatUIHeaders keeps the local browser workspace private to this origin:
@@ -852,60 +949,60 @@ func displayServerURL(addr string, chatUI bool) string {
 }
 
 type GenerateRequest struct {
-	Prompt        string           `json:"prompt"`
-	Messages      []APIMessage     `json:"messages"`
-	MaxTokens     *int             `json:"max_tokens"`
-	Temp          *float32         `json:"temp"`
-	Temperature   *float32         `json:"temperature"`
-	TopP          *float32         `json:"top_p"`
-	TopK          *int             `json:"top_k"`
-	MinP          *float32         `json:"min_p"`
-	RepeatPenalty *float32         `json:"repeat_penalty"`
-	Seed          *uint64          `json:"seed"`
-	SystemPrompt  *string          `json:"system_prompt"`
-	Stop          any              `json:"stop"`
-	Tools         []ToolDefinition `json:"tools"`
-	ToolChoice    any              `json:"tool_choice"`
+	Prompt        string                     `json:"prompt"`
+	Messages      []APIMessage               `json:"messages"`
+	MaxTokens     *int                       `json:"max_tokens"`
+	Temp          *float32                   `json:"temp"`
+	Temperature   *float32                   `json:"temperature"`
+	TopP          *float32                   `json:"top_p"`
+	TopK          *int                       `json:"top_k"`
+	MinP          *float32                   `json:"min_p"`
+	RepeatPenalty *float32                   `json:"repeat_penalty"`
+	Seed          *uint64                    `json:"seed"`
+	SystemPrompt  *string                    `json:"system_prompt"`
+	Stop          any                        `json:"stop"`
+	Tools         []gopherllm.ToolDefinition `json:"tools"`
+	ToolChoice    any                        `json:"tool_choice"`
 }
 
-func (g GenerateRequest) ToMessagesAndOptions(def GenerationOptions) ([]ChatMessage, GenerationOptions) {
+func (g GenerateRequest) ToMessagesAndOptions(def gopherllm.GenerationOptions) ([]gopherllm.ChatMessage, gopherllm.GenerationOptions) {
 	options := applyRequestOptions(def, g.MaxTokens, firstFloat(g.Temp, g.Temperature), g.TopP, g.TopK, g.MinP, g.RepeatPenalty, g.Seed, g.SystemPrompt, g.Stop, g.Tools, normalizeToolChoice(g.ToolChoice))
 	if len(g.Messages) > 0 {
 		return apiMessages(g.Messages), options
 	}
-	return []ChatMessage{UserMessage(g.Prompt)}, options
+	return []gopherllm.ChatMessage{gopherllm.UserMessage(g.Prompt)}, options
 }
 
 type APIMessage struct {
-	Role       string     `json:"role"`
-	Content    any        `json:"content"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Name       string     `json:"name,omitempty"`
+	Role       string               `json:"role"`
+	Content    any                  `json:"content"`
+	ToolCalls  []gopherllm.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string               `json:"tool_call_id,omitempty"`
+	Name       string               `json:"name,omitempty"`
 }
 
-func apiMessages(items []APIMessage) []ChatMessage {
-	out := make([]ChatMessage, 0, len(items))
+func apiMessages(items []APIMessage) []gopherllm.ChatMessage {
+	out := make([]gopherllm.ChatMessage, 0, len(items))
 	for _, item := range items {
-		role := ChatRoleUser
+		role := gopherllm.ChatRoleUser
 		switch strings.ToLower(item.Role) {
 		case "system", "developer":
 			// "developer" is the OpenAI o1/gpt-oss-era replacement for
 			// "system"; GopherLLM has no separate developer-instruction
 			// channel, so it renders the same as a system message.
-			role = ChatRoleSystem
+			role = gopherllm.ChatRoleSystem
 		case "assistant":
-			role = ChatRoleAssistant
+			role = gopherllm.ChatRoleAssistant
 		case "tool", "function", "ipython":
-			role = ChatRoleTool
+			role = gopherllm.ChatRoleTool
 		}
-		out = append(out, ChatMessage{Role: role, Content: contentText(item.Content), ToolCalls: item.ToolCalls, ToolCallID: item.ToolCallID, Name: item.Name})
+		out = append(out, gopherllm.ChatMessage{Role: role, Content: contentText(item.Content), ToolCalls: item.ToolCalls, ToolCallID: item.ToolCallID, Name: item.Name})
 	}
 	return out
 }
 
-// alwaysContinue is passed to RunAgenticChat by non-streaming handlers, which
-// only care about the returned GenerationResult, not incremental delivery.
+// alwaysContinue is passed to gopherllm.RunAgenticChat by non-streaming handlers, which
+// only care about the returned gopherllm.GenerationResult, not incremental delivery.
 func alwaysContinue(string) bool { return true }
 
 // normalizeToolChoice extracts the OpenAI-compatible "tool_choice" value's
@@ -913,7 +1010,7 @@ func alwaysContinue(string) bool { return true }
 // offering; "auto"/"required" pass through unchanged (GopherLLM has no
 // constrained decoding, so both just mean "offer the tools"); an object
 // naming one function (`{"type":"function","function":{"name":"..."}}`)
-// becomes "function:<name>", which GenerationOptions.activeTools narrows
+// becomes "function:<name>", which gopherllm.GenerationOptions.ActiveTools narrows
 // offering to. An object missing a usable name degrades to "" (== auto).
 func normalizeToolChoice(raw any) string {
 	switch v := raw.(type) {
@@ -960,22 +1057,22 @@ func contentText(v any) string {
 }
 
 type OpenAIChatRequest struct {
-	Model               string            `json:"model"`
-	Messages            []APIMessage      `json:"messages"`
-	Stream              bool              `json:"stream"`
-	StreamOptions       *OpenAIStreamOpts `json:"stream_options"`
-	MaxTokens           *int              `json:"max_tokens"`
-	MaxCompletionTokens *int              `json:"max_completion_tokens"`
-	Temperature         *float32          `json:"temperature"`
-	TopP                *float32          `json:"top_p"`
-	TopK                *int              `json:"top_k"`
-	MinP                *float32          `json:"min_p"`
-	RepeatPenalty       *float32          `json:"repeat_penalty"`
-	Seed                *uint64           `json:"seed"`
-	SystemPrompt        *string           `json:"system_prompt"`
-	Stop                any               `json:"stop"`
-	Tools               []ToolDefinition  `json:"tools"`
-	ToolChoice          any               `json:"tool_choice"`
+	Model               string                     `json:"model"`
+	Messages            []APIMessage               `json:"messages"`
+	Stream              bool                       `json:"stream"`
+	StreamOptions       *OpenAIStreamOpts          `json:"stream_options"`
+	MaxTokens           *int                       `json:"max_tokens"`
+	MaxCompletionTokens *int                       `json:"max_completion_tokens"`
+	Temperature         *float32                   `json:"temperature"`
+	TopP                *float32                   `json:"top_p"`
+	TopK                *int                       `json:"top_k"`
+	MinP                *float32                   `json:"min_p"`
+	RepeatPenalty       *float32                   `json:"repeat_penalty"`
+	Seed                *uint64                    `json:"seed"`
+	SystemPrompt        *string                    `json:"system_prompt"`
+	Stop                any                        `json:"stop"`
+	Tools               []gopherllm.ToolDefinition `json:"tools"`
+	ToolChoice          any                        `json:"tool_choice"`
 	// GopherLLMContextMode is an opt-in extension for local clients. Omitting
 	// it preserves normal OpenAI-compatible full-history semantics.
 	GopherLLMContextMode string `json:"gopherllm_context_mode"`
@@ -988,7 +1085,7 @@ type OpenAIStreamOpts struct {
 	IncludeUsage bool `json:"include_usage"`
 }
 
-func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
+func (o OpenAIChatRequest) Options(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
 	maxTokens := o.MaxTokens
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
@@ -996,21 +1093,21 @@ func (o OpenAIChatRequest) Options(def GenerationOptions) GenerationOptions {
 	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop, o.Tools, normalizeToolChoice(o.ToolChoice))
 }
 
-// ContextWindowMode parses GopherLLM's local context-window extension. It is
+// gopherllm.ContextWindowMode parses GopherLLM's local context-window extension. It is
 // deliberately separate from Options so existing callers that use Options
 // directly retain the zero-value (full history) behavior.
-func (o OpenAIChatRequest) ContextWindowMode() (ContextWindowMode, error) {
-	mode := ContextWindowMode(strings.ToLower(strings.TrimSpace(o.GopherLLMContextMode)))
-	if mode == "" || mode == ContextWindowFull {
-		return ContextWindowFull, nil
+func (o OpenAIChatRequest) ContextWindowMode() (gopherllm.ContextWindowMode, error) {
+	mode := gopherllm.ContextWindowMode(strings.ToLower(strings.TrimSpace(o.GopherLLMContextMode)))
+	if mode == "" || mode == gopherllm.ContextWindowFull {
+		return gopherllm.ContextWindowFull, nil
 	}
-	if mode == ContextWindowRecent {
-		return ContextWindowRecent, nil
+	if mode == gopherllm.ContextWindowRecent {
+		return gopherllm.ContextWindowRecent, nil
 	}
 	return "", fmt.Errorf("gopherllm_context_mode must be full or recent")
 }
 
-func (o OpenAIChatRequest) ChatMessages() []ChatMessage { return apiMessages(o.Messages) }
+func (o OpenAIChatRequest) ChatMessages() []gopherllm.ChatMessage { return apiMessages(o.Messages) }
 
 type OpenAICompletionRequest struct {
 	Model               string   `json:"model"`
@@ -1041,7 +1138,7 @@ func (o OpenAICompletionRequest) PromptString() string {
 	return ""
 }
 
-func (o OpenAICompletionRequest) Options(def GenerationOptions) GenerationOptions {
+func (o OpenAICompletionRequest) Options(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
 	maxTokens := o.MaxTokens
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
@@ -1080,7 +1177,7 @@ type OllamaGenerateRequest struct {
 	Stop    any           `json:"stop"`
 }
 
-func (o OllamaGenerateRequest) GenerationOptions(def GenerationOptions) GenerationOptions {
+func (o OllamaGenerateRequest) GenerationOptions(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
 	system := (*string)(nil)
 	if o.System != "" {
 		system = &o.System
@@ -1089,11 +1186,11 @@ func (o OllamaGenerateRequest) GenerationOptions(def GenerationOptions) Generati
 }
 
 type OllamaChatRequest struct {
-	Model    string           `json:"model"`
-	Messages []OllamaMessage  `json:"messages"`
-	Stream   *bool            `json:"stream"`
-	Options  OllamaOptions    `json:"options"`
-	Tools    []ToolDefinition `json:"tools"`
+	Model    string                     `json:"model"`
+	Messages []OllamaMessage            `json:"messages"`
+	Stream   *bool                      `json:"stream"`
+	Options  OllamaOptions              `json:"options"`
+	Tools    []gopherllm.ToolDefinition `json:"tools"`
 }
 
 // streamEnabled implements Ollama's default-true streaming semantics: the
@@ -1103,11 +1200,11 @@ func streamEnabled(b *bool) bool {
 	return b == nil || *b
 }
 
-func (o OllamaChatRequest) GenerationOptions(def GenerationOptions) GenerationOptions {
+func (o OllamaChatRequest) GenerationOptions(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
 	return applyRequestOptions(def, o.Options.NumPredict, o.Options.Temperature, o.Options.TopP, o.Options.TopK, o.Options.MinP, o.Options.RepeatPenalty, o.Options.Seed, nil, o.Options.Stop, o.Tools, "")
 }
 
-func (o OllamaChatRequest) ChatMessages() []ChatMessage {
+func (o OllamaChatRequest) ChatMessages() []gopherllm.ChatMessage {
 	items := make([]APIMessage, len(o.Messages))
 	for i, message := range o.Messages {
 		items[i] = APIMessage{Role: message.Role, Content: message.Content}
@@ -1122,7 +1219,7 @@ type OllamaMessage struct {
 
 type OllamaOptions struct {
 	// NumCtx is accepted for wire compatibility (real Ollama clients set it
-	// routinely) but not actionable here: a Runner's KV cache is sized once
+	// routinely) but not actionable here: a gopherllm.Runner's KV cache is sized once
 	// from the loaded GGUF's context_length at model-load time, and this
 	// server has no per-request context-window resize.
 	NumCtx        *int     `json:"num_ctx"`
@@ -1157,7 +1254,7 @@ func (o OllamaEmbedRequest) Inputs() []string {
 	return EmbeddingsRequest{Input: o.Input}.Inputs()
 }
 
-func applyRequestOptions(def GenerationOptions, maxTokens *int, temp *float32, topP *float32, topK *int, minP *float32, repeat *float32, seed *uint64, system *string, stop any, tools []ToolDefinition, toolChoice string) GenerationOptions {
+func applyRequestOptions(def gopherllm.GenerationOptions, maxTokens *int, temp *float32, topP *float32, topK *int, minP *float32, repeat *float32, seed *uint64, system *string, stop any, tools []gopherllm.ToolDefinition, toolChoice string) gopherllm.GenerationOptions {
 	o := def
 	if maxTokens != nil {
 		o.MaxTokens = *maxTokens
@@ -1248,7 +1345,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 // writeContextWindowHeaders exposes the exact rendered prompt accounting to
 // the bundled web UI without changing OpenAI's streaming event schema. They
 // are only emitted for the explicit recent-context extension.
-func writeContextWindowHeaders(w http.ResponseWriter, info ContextWindowInfo) {
+func writeContextWindowHeaders(w http.ResponseWriter, info gopherllm.ContextWindowInfo) {
 	w.Header().Set("X-GopherLLM-Context-Mode", string(info.Mode))
 	w.Header().Set("X-GopherLLM-Context-Length", strconv.Itoa(info.ContextLength))
 	w.Header().Set("X-GopherLLM-Context-Budget", strconv.Itoa(info.PromptBudget))
@@ -1267,8 +1364,7 @@ func ensureRequestID(w http.ResponseWriter, req *http.Request) string {
 	return id
 }
 
-func withRequestContext(options GenerationOptions, req *http.Request) GenerationOptions {
-	options.ctx = req.Context()
+func withRequestContext(options gopherllm.GenerationOptions, req *http.Request) gopherllm.GenerationOptions {
 	return options
 }
 
@@ -1302,7 +1398,7 @@ type inferenceLogRecord struct {
 // throughput, token, cache, retry, and error dimensions for benchmarks and
 // production logs. Risk: small log volume increase. Rollback: pass nil/Discard
 // LogWriter or remove this helper call.
-func logInferenceResult(logw io.Writer, requestID, endpoint, model string, streaming bool, result GenerationResult, err error) {
+func logInferenceResult(logw io.Writer, requestID, endpoint, model string, streaming bool, result gopherllm.GenerationResult, err error) {
 	if logw == nil || logw == io.Discard {
 		return
 	}
@@ -1350,15 +1446,15 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 
 // streamOpenAIChat streams a chat completion via SSE. Content deltas flow
 // incrementally exactly as before whenever no tool call could possibly be in
-// play; once skills or caller tools are active, RunAgenticChat buffers the
+// play; once skills or caller tools are active, gopherllm.RunAgenticChat buffers the
 // winning turn and calls onToken once with the final, already-classified
 // content, so raw tool-call syntax never leaks into a content delta (see
-// RunAgenticChat's doc comment). Either way, the connection ends with one
+// gopherllm.RunAgenticChat's doc comment). Either way, the connection ends with one
 // terminal chunk carrying finish_reason, usage, and tool_calls. <think>
 // reasoning is separated into reasoning_content deltas as soon as its tokens
-// arrive; the final GenerationResult remains authoritative for tool calls and
+// arrive; the final gopherllm.GenerationResult remains authoritative for tool calls and
 // for the buffered agentic path.
-func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill, includeUsage bool) {
+func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, includeUsage bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1379,7 +1475,7 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	// Soofi Isar's native template opens <think> in the prompt, so its first
 	// generated characters are reasoning and the first marker received is the
 	// closing tag. Other models emit the opening marker themselves.
-	thinkSplitter := newThinkStreamSplitter(r.arch == "nemotron_h_moe")
+	thinkSplitter := gopherllm.NewThinkStreamSplitter(r.Architecture() == "nemotron_h_moe")
 	streamedReasoning := false
 	emit := func(reasoning bool, text string) bool {
 		if text == "" {
@@ -1396,7 +1492,7 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		}
 		return true
 	}
-	result, err := RunAgenticChat(r, messages, options, skills, func(text string) bool {
+	result, err := gopherllm.RunAgenticChat(r, messages, options, skills, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
@@ -1409,7 +1505,7 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	}
 	if err != nil {
 		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, err)
-		if errors.Is(err, ErrGenerationCanceled) {
+		if errors.Is(err, gopherllm.ErrGenerationCanceled) {
 			return
 		}
 		writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
@@ -1498,10 +1594,10 @@ func writeNDJSON(w http.ResponseWriter, flusher http.Flusher, v any) error {
 	return nil
 }
 
-// ollamaDurations reports GenerationStats using Ollama's nanosecond duration
+// ollamaDurations reports gopherllm.GenerationStats using Ollama's nanosecond duration
 // field names. load_duration is always 0: GopherLLM has no separate
 // model-load phase inside a request (the model is already resident).
-func ollamaDurations(stats GenerationStats) map[string]any {
+func ollamaDurations(stats gopherllm.GenerationStats) map[string]any {
 	return map[string]any{
 		"total_duration":       stats.TotalTime.Nanoseconds(),
 		"load_duration":        int64(0),
@@ -1515,7 +1611,7 @@ func ollamaDurations(stats GenerationStats) map[string]any {
 // streamOllamaGenerate streams /api/generate as NDJSON: one {"done":false}
 // line per token, then a final {"done":true} line carrying finish reason and
 // timing, mirroring real Ollama's wire shape.
-func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model, prompt string, options GenerationOptions, skills []Skill) {
+func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model, prompt string, options gopherllm.GenerationOptions, skills []gopherllm.Skill) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1524,7 +1620,7 @@ func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writ
 	w.Header().Set("content-type", "application/x-ndjson")
 
 	var streamErr error
-	result, err := RunAgenticChat(r, []ChatMessage{UserMessage(prompt)}, options, skills, func(text string) bool {
+	result, err := gopherllm.RunAgenticChat(r, []gopherllm.ChatMessage{gopherllm.UserMessage(prompt)}, options, skills, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
@@ -1541,7 +1637,7 @@ func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writ
 	}
 	logInferenceResult(logw, requestID, "/api/generate", model, true, result, err)
 	if err != nil {
-		if errors.Is(err, ErrGenerationCanceled) {
+		if errors.Is(err, gopherllm.ErrGenerationCanceled) {
 			return
 		}
 		_ = writeNDJSON(w, flusher, map[string]string{"error": err.Error()})
@@ -1557,7 +1653,7 @@ func streamOllamaGenerate(w http.ResponseWriter, req *http.Request, logw io.Writ
 // streamOllamaChat streams /api/chat as NDJSON, surfacing tool_calls on the
 // final message the same way the non-streaming path does (previously dropped
 // entirely on this endpoint).
-func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *Runner, model string, messages []ChatMessage, options GenerationOptions, skills []Skill) {
+func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -1566,7 +1662,7 @@ func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	w.Header().Set("content-type", "application/x-ndjson")
 
 	var streamErr error
-	result, err := RunAgenticChat(r, messages, options, skills, func(text string) bool {
+	result, err := gopherllm.RunAgenticChat(r, messages, options, skills, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
@@ -1583,7 +1679,7 @@ func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	}
 	logInferenceResult(logw, requestID, "/api/chat", model, true, result, err)
 	if err != nil {
-		if errors.Is(err, ErrGenerationCanceled) {
+		if errors.Is(err, gopherllm.ErrGenerationCanceled) {
 			return
 		}
 		_ = writeNDJSON(w, flusher, map[string]string{"error": err.Error()})
@@ -1601,38 +1697,38 @@ func streamOllamaChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 }
 
 // analyzeModelFile parses a GGUF file's header only (mmap'd, no weight
-// bytes touched — the same cheap path DiscoverModels uses) into an Analysis,
-// for building Ollama-shaped model metadata without loading a full Runner.
-func analyzeModelFile(path string) (*Analysis, error) {
-	mmap, err := OpenMmap(path)
+// bytes touched — the same cheap path gopherllm.DiscoverModels uses) into an gopherllm.Analysis,
+// for building Ollama-shaped model metadata without loading a full gopherllm.Runner.
+func analyzeModelFile(path string) (*gopherllm.Analysis, error) {
+	mmap, err := gopherllm.OpenMmap(path)
 	if err != nil {
 		return nil, err
 	}
 	defer mmap.Close()
-	gguf, err := ParseGGUFQuiet(mmap.Bytes())
+	gguf, err := gopherllm.ParseGGUFQuiet(mmap.Bytes())
 	if err != nil {
 		return nil, err
 	}
-	return AnalyzeGGUF(gguf, nil), nil
+	return gopherllm.AnalyzeGGUF(gguf, nil), nil
 }
 
 // resolveModelAnalysis answers /api/show's "which model": empty/matching
-// name means the currently loaded Runner (full Analysis, tokenizer
+// name means the currently loaded gopherllm.Runner (full gopherllm.Analysis, tokenizer
 // included); any other name is looked up in ModelDir (if configured) and
 // header-analyzed on demand.
-func resolveModelAnalysis(state *runnerState, modelDir, requested string) (*Analysis, bool) {
+func resolveModelAnalysis(state *runnerState, modelDir, requested string) (*gopherllm.Analysis, bool) {
 	r := state.get()
 	if r != nil && (requested == "" || requested == modelID(r)) {
-		return AnalyzeGGUF(r.GGUF(), r.Tokenizer()), true
+		return gopherllm.AnalyzeGGUF(r.GGUF(), r.Tokenizer()), true
 	}
 	if modelDir == "" {
 		return nil, false
 	}
-	entries, err := DiscoverModels(modelDir, io.Discard)
+	entries, err := gopherllm.DiscoverModels(modelDir, io.Discard)
 	if err != nil {
 		return nil, false
 	}
-	entry, err := SelectModel(entries, requested)
+	entry, err := gopherllm.SelectModel(entries, requested)
 	if err != nil {
 		return nil, false
 	}
@@ -1653,10 +1749,10 @@ func ollamaTagEntries(state *runnerState, modelDir string) []map[string]any {
 			return []map[string]any{}
 		}
 		name := modelID(r)
-		a := AnalyzeGGUF(r.GGUF(), r.Tokenizer())
+		a := gopherllm.AnalyzeGGUF(r.GGUF(), r.Tokenizer())
 		return []map[string]any{ollamaTagEntry(name, state.getPath(), a.FileBytes, a)}
 	}
-	entries, err := DiscoverModels(modelDir, io.Discard)
+	entries, err := gopherllm.DiscoverModels(modelDir, io.Discard)
 	if err != nil {
 		return []map[string]any{}
 	}
@@ -1678,7 +1774,7 @@ func ollamaTagEntries(state *runnerState, modelDir string) []map[string]any {
 	return tags
 }
 
-func ollamaTagEntry(name, path string, sizeBytes int64, a *Analysis) map[string]any {
+func ollamaTagEntry(name, path string, sizeBytes int64, a *gopherllm.Analysis) map[string]any {
 	return map[string]any{
 		"name":        name,
 		"model":       name,
@@ -1689,8 +1785,8 @@ func ollamaTagEntry(name, path string, sizeBytes int64, a *Analysis) map[string]
 	}
 }
 
-// ollamaModelDetails builds Ollama's "details" object from a header Analysis.
-func ollamaModelDetails(a *Analysis) map[string]any {
+// ollamaModelDetails builds Ollama's "details" object from a header gopherllm.Analysis.
+func ollamaModelDetails(a *gopherllm.Analysis) map[string]any {
 	quant := "unknown"
 	if len(a.DTypes) > 0 {
 		quant = a.DTypes[0].Type.String()
@@ -1741,7 +1837,7 @@ func modelDigest(path string) string {
 	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
-func generateResponse(result GenerationResult) map[string]any {
+func generateResponse(result gopherllm.GenerationResult) map[string]any {
 	resp := map[string]any{"text": result.Text, "prompt_tokens": result.Stats.PromptTokens, "generated_tokens": result.Stats.GeneratedTokens, "ttft_ms": result.Stats.TTFT.Milliseconds(), "prefill_ms": result.Stats.PrefillTime.Milliseconds(), "decode_ms": result.Stats.DecodeTime.Milliseconds(), "total_ms": result.Stats.TotalTime.Milliseconds(), "finish_reason": finishReasonOrDefault(result.FinishReason)}
 	if result.ReasoningText != "" {
 		resp["reasoning"] = result.ReasoningText
@@ -1755,7 +1851,7 @@ func generateResponse(result GenerationResult) map[string]any {
 	return resp
 }
 
-func openAIChatResponse(model string, result GenerationResult) map[string]any {
+func openAIChatResponse(model string, result gopherllm.GenerationResult) map[string]any {
 	message := map[string]any{"role": "assistant", "content": result.Text}
 	if len(result.ToolCalls) > 0 {
 		message["tool_calls"] = result.ToolCalls
@@ -1774,7 +1870,7 @@ func openAIChatResponse(model string, result GenerationResult) map[string]any {
 }
 
 // finishReasonOrDefault falls back to "stop" for callers of GenerateResult
-// that predate FinishReason (in-tree, only GenerationResult zero values hit
+// that predate FinishReason (in-tree, only gopherllm.GenerationResult zero values hit
 // this) so every response always carries a valid OpenAI-shaped finish_reason.
 func finishReasonOrDefault(reason string) string {
 	if reason == "" {
@@ -1783,11 +1879,14 @@ func finishReasonOrDefault(reason string) string {
 	return reason
 }
 
-func usage(result GenerationResult) map[string]int {
+func usage(result gopherllm.GenerationResult) map[string]int {
 	return map[string]int{"prompt_tokens": result.Stats.PromptTokens, "completion_tokens": result.Stats.GeneratedTokens, "total_tokens": result.Stats.PromptTokens + result.Stats.GeneratedTokens}
 }
 
-func modelID(r *Runner) string {
+func modelID(r *gopherllm.Runner) string {
+	if r == nil {
+		return ""
+	}
 	if name, ok := r.ModelName(); ok && name != "" {
 		return name
 	}

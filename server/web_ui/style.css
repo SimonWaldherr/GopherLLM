@@ -1,10 +1,15 @@
 /* ════════════════════════════════
    Design tokens
    ════════════════════════════════ */
+/* Every theme is one block of the same token set. Light lives on :root, so
+   it is both the default and what data-theme="light" resolves to; the
+   media query below only applies to a body that has made no explicit
+   choice, which is why picking Light still wins on a dark desktop. */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --sidebar: 272px;
   --bg: #f6f7f8;
   --panel: #ffffff;
   --panel-2: #eff2f3;
@@ -21,37 +26,17 @@
   --error-line: #e9b2b2;
   --ok: #2b9b68;
   --stop: #b3423a;
-  --sidebar: 272px;
   --shadow: 0 2px 8px rgba(21, 33, 31, .055);
 }
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121417;
-    --panel: #1c1f23;
-    --panel-2: #23272c;
-    --ink: #e8eaed;
-    --muted: #99a1aa;
-    --line: #333940;
-    --accent: #58d0ad;
-    --accent-ink: #08281f;
-    --user-bg: #133c31;
-    --user-line: #27614f;
-    --code-bg: #0c0e11;
-    --code-ink: #dfe3e8;
-    --error-bg: #3a1d1f;
-    --error-line: #7a3b3f;
-    --ok: #58c07e;
-    --stop: #d0655d;
+  body:not([data-theme]) {
+    color-scheme: dark;
+    --bg: #121417; --panel: #1c1f23; --panel-2: #23272c; --ink: #e8eaed;
+    --muted: #99a1aa; --line: #333940; --accent: #58d0ad; --accent-ink: #08281f;
+    --user-bg: #133c31; --user-line: #27614f; --code-bg: #0c0e11; --code-ink: #dfe3e8;
+    --error-bg: #3a1d1f; --error-line: #7a3b3f; --ok: #58c07e; --stop: #d0655d;
     --shadow: 0 1px 3px rgba(0, 0, 0, .45);
   }
-}
-body[data-theme="light"] {
-  color-scheme: light;
-  --bg: #f6f7f8; --panel: #ffffff; --panel-2: #eff2f3; --ink: #15211f;
-  --muted: #66716f; --line: #dbe2e0; --accent: #087f6b; --accent-ink: #ffffff;
-  --user-bg: #dff3ed; --user-line: #b7e2d5; --code-bg: #14181c; --code-ink: #e8eaed;
-  --error-bg: #fdecec; --error-line: #e9b2b2; --ok: #2b9b68; --stop: #b3423a;
-  --shadow: 0 2px 8px rgba(21, 33, 31, .055);
 }
 body[data-theme="dark"] {
   color-scheme: dark;
@@ -61,6 +46,183 @@ body[data-theme="dark"] {
   --error-bg: #3a1d1f; --error-line: #7a3b3f; --ok: #58c07e; --stop: #d0655d;
   --shadow: 0 1px 3px rgba(0, 0, 0, .45);
 }
+/* Warm paper tones for long reading sessions. */
+body[data-theme="sepia"] {
+  color-scheme: light;
+  --bg: #f4ecd8; --panel: #fcf7ea; --panel-2: #ebe0c6; --ink: #3b3128;
+  --muted: #7a6a55; --line: #dccfb2; --accent: #8a5424; --accent-ink: #fffaf0;
+  --user-bg: #ebdfc1; --user-line: #cdb98f; --code-bg: #2f2820; --code-ink: #f0e6d2;
+  --error-bg: #f7ddd7; --error-line: #cf9d8c; --ok: #5f7233; --stop: #a4432b;
+  --shadow: 0 2px 8px rgba(59, 49, 40, .09);
+}
+/* Cool, low-glare dark palette. */
+body[data-theme="nord"] {
+  color-scheme: dark;
+  --bg: #2e3440; --panel: #3b4252; --panel-2: #434c5e; --ink: #eceff4;
+  --muted: #9aa5b8; --line: #4c566a; --accent: #88c0d0; --accent-ink: #2e3440;
+  --user-bg: #3b4a5c; --user-line: #5e81ac; --code-bg: #262b35; --code-ink: #e5e9f0;
+  --error-bg: #4a3134; --error-line: #bf616a; --ok: #a3be8c; --stop: #d08770;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .5);
+}
+/* Maximum legibility: pure black on white, solid borders, no tinted fills. */
+body[data-theme="contrast"] {
+  color-scheme: light;
+  --bg: #ffffff; --panel: #ffffff; --panel-2: #ededed; --ink: #000000;
+  --muted: #333333; --line: #000000; --accent: #00468c; --accent-ink: #ffffff;
+  --user-bg: #e6eefb; --user-line: #00468c; --code-bg: #000000; --code-ink: #ffffff;
+  --error-bg: #ffe4e4; --error-line: #a30000; --ok: #005c1f; --stop: #a30000;
+  --shadow: none;
+}
+/* An original early-2000s desktop treatment: square controls, bevelled
+   surfaces and a blue title strip. It deliberately uses no third-party
+   icons, logos, or copied operating-system artwork. */
+body[data-theme="classic"] {
+  color-scheme: light;
+  --sans: Arial, Helvetica, sans-serif;
+  --mono: "Courier New", Courier, monospace;
+  --bg: #d4d0c8;
+  --panel: #ece9d8;
+  --panel-2: #d4d0c8;
+  --ink: #000000;
+  --muted: #404040;
+  --line: #808080;
+  --accent: #0a5fa5;
+  --accent-ink: #ffffff;
+  --user-bg: #fffde8;
+  --user-line: #808080;
+  --code-bg: #1b1b1b;
+  --code-ink: #f5f5f5;
+  --error-bg: #ffe5e5;
+  --error-line: #a00000;
+  --ok: #008000;
+  --stop: #a00000;
+  --shadow: none;
+  background: #3a6ea5;
+}
+body[data-theme="classic"] .sidebar {
+  gap: 8px;
+  padding: 7px;
+  border: 2px solid #fff;
+  border-right-color: #404040;
+  border-bottom-color: #404040;
+  background: #d4d0c8;
+}
+body[data-theme="classic"] .sidebar-brand {
+  min-height: 27px;
+  padding: 3px 5px;
+  background: linear-gradient(90deg, #0a5fa5, #4d9cda);
+  color: #fff;
+  font-size: 12px;
+  letter-spacing: 0;
+}
+body[data-theme="classic"] .logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 0;
+  border: 1px solid #fff;
+  background: #dcb30b;
+  color: #102a4b;
+  font-size: 13px;
+}
+body[data-theme="classic"] .local-badge {
+  border: 0;
+  border-radius: 0;
+  color: #fff;
+  font-size: 9px;
+}
+body[data-theme="classic"] header {
+  min-height: 43px;
+  padding: 7px 10px;
+  border: 2px solid #fff;
+  border-bottom-color: #404040;
+  background: linear-gradient(90deg, #0a5fa5, #4d9cda 74%, #a6cff2);
+  color: #fff;
+}
+body[data-theme="classic"] header .model-name,
+body[data-theme="classic"] header .status { color: #fff; text-shadow: 1px 1px #174a78; }
+body[data-theme="classic"] header .status-dot { background: #f1e05a; border: 1px solid #fff; }
+body[data-theme="classic"] .workspace {
+  border-right: 2px solid #404040;
+  border-bottom: 2px solid #404040;
+  background: var(--bg);
+}
+body[data-theme="classic"] :is(.new-chat, .icon-button, .suggestion, .message-action, .copy-btn, .code-copy, .chat-menu, .chat-delete, .rename-chat, .delete-chat, .autotune-run, .text-button, .edit-state button, #batchPick) {
+  border: 1px solid #fff;
+  border-right-color: #404040;
+  border-bottom-color: #404040;
+  border-radius: 0;
+  background: #d4d0c8;
+  box-shadow: inset 1px 1px #fff, inset -1px -1px #808080;
+  color: #000;
+  text-shadow: none;
+}
+body[data-theme="classic"] :is(.new-chat, .icon-button, .suggestion, .message-action, .copy-btn, .code-copy, .chat-menu, .chat-delete, .rename-chat, .delete-chat, .autotune-run, .text-button, .edit-state button, #batchPick):active {
+  border-color: #404040 #fff #fff #404040;
+  box-shadow: inset 1px 1px #808080;
+  transform: translate(1px, 1px);
+}
+body[data-theme="classic"] .new-chat { min-height: 30px; font-size: 12px; }
+body[data-theme="classic"] #send {
+  border: 1px solid #fff;
+  border-right-color: #173d6b;
+  border-bottom-color: #173d6b;
+  border-radius: 0;
+  background: linear-gradient(#4d9cda, #0a5fa5);
+  box-shadow: inset 1px 1px rgba(255, 255, 255, .65), inset -1px -1px #174a78;
+  color: #fff;
+}
+body[data-theme="classic"] #send:active { transform: translate(1px, 1px); box-shadow: inset 1px 1px #174a78; }
+body[data-theme="classic"] .chat-search,
+body[data-theme="classic"] .settings input,
+body[data-theme="classic"] .settings select,
+body[data-theme="classic"] .settings textarea,
+body[data-theme="classic"] .prompt-wrap {
+  border: 2px solid #808080;
+  border-right-color: #fff;
+  border-bottom-color: #fff;
+  border-radius: 0;
+  background: #fff;
+  box-shadow: inset 1px 1px #404040;
+}
+body[data-theme="classic"] .chat-search input,
+body[data-theme="classic"] #prompt { border-radius: 0; }
+body[data-theme="classic"] .chat-row,
+body[data-theme="classic"] .chat-select { border-radius: 0; }
+body[data-theme="classic"] .chat-row.active,
+body[data-theme="classic"] .chat-select:hover { background: #0a5fa5; }
+body[data-theme="classic"] .chat-row.active .chat-select,
+body[data-theme="classic"] .chat-select:hover { color: #fff; font-weight: 400; }
+body[data-theme="classic"] main { background: #fff; }
+body[data-theme="classic"] .msg,
+body[data-theme="classic"] .settings-panel,
+body[data-theme="classic"] .command-menu,
+body[data-theme="classic"] .batch-results,
+body[data-theme="classic"] .autotune,
+body[data-theme="classic"] .skills-note,
+body[data-theme="classic"] .tool-call,
+body[data-theme="classic"] .reasoning {
+  border: 2px solid #808080;
+  border-right-color: #fff;
+  border-bottom-color: #fff;
+  border-radius: 0;
+  box-shadow: none;
+}
+body[data-theme="classic"] .msg.assistant { background: #fff; }
+body[data-theme="classic"] .msg.user { background: #fffde8; border-color: #808080 #fff #fff #808080; }
+body[data-theme="classic"] .settings-panel-head {
+  padding: 6px 8px;
+  border-bottom: 0;
+  background: linear-gradient(90deg, #0a5fa5, #4d9cda);
+  color: #fff;
+}
+body[data-theme="classic"] .settings-panel-head h2 { color: #fff; }
+body[data-theme="classic"] .settings-panel-head .icon-button { background: #d4d0c8; color: #000; }
+body[data-theme="classic"] .suggestions { gap: 5px; }
+body[data-theme="classic"] .suggestion,
+body[data-theme="classic"] .jump-latest,
+body[data-theme="classic"] .tool-badge { border-radius: 0; }
+body[data-theme="classic"] .jump-latest { border: 2px outset #d4d0c8; background: #d4d0c8; box-shadow: none; }
+body[data-theme="classic"] kbd { border-radius: 0; background: #fff; }
 
 /* ════════════════════════════════
    Reset, workspace and sidebar
@@ -266,7 +428,29 @@ kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; b
 .message-action:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 
 /* ── Rich assistant content ── */
-.msg h1, .msg h2, .msg h3 { margin: 10px 0 4px; font-size: 1em; font-weight: 700; }
+.msg h1, .msg h2, .msg h3, .msg h4, .msg h5, .msg h6 { margin: 12px 0 4px; font-size: 1em; font-weight: 700; }
+.msg h1 { font-size: 1.15em; }
+.msg h2 { font-size: 1.08em; }
+.msg > :first-child { margin-top: 0; }
+.msg p { margin: 0 0 8px; }
+.msg p:last-child { margin-bottom: 0; }
+.msg a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.msg blockquote { margin: 8px 0; padding: 2px 0 2px 11px; border-left: 3px solid color-mix(in srgb, var(--accent) 45%, var(--line)); color: var(--muted); }
+.msg blockquote p:last-child { margin-bottom: 0; }
+.msg hr { margin: 12px 0; border: 0; border-top: 1px solid var(--line); }
+.msg img { max-width: 100%; height: auto; border-radius: 8px; }
+.msg del { opacity: .65; }
+.msg li.task { list-style: none; margin-left: -18px; }
+.msg li.task input { margin-right: 6px; accent-color: var(--accent); }
+/* Wide tables scroll inside the bubble instead of stretching it. */
+.table-wrap { margin: 9px 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+.msg table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.msg th, .msg td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.msg thead th { background: var(--panel-2); font-weight: 700; white-space: nowrap; }
+.msg tbody tr:last-child td { border-bottom: 0; }
+.mermaid-block .mermaid-src { margin: 0; padding: 26px 14px 12px; overflow-x: auto; border-radius: 10px; background: var(--code-bg); color: var(--code-ink); font: 12.5px/1.55 var(--mono); white-space: pre; }
+.mermaid-block[data-rendered="true"] .mermaid-src { padding: 12px; background: var(--panel-2); color: var(--ink); text-align: center; }
+.mermaid-block svg { max-width: 100%; height: auto; }
 .msg ul, .msg ol { margin: 4px 0; padding-left: 22px; }
 .msg li { margin: 2px 0; }
 .msg strong { font-weight: 700; }

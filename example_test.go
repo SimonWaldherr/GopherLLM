@@ -12,6 +12,7 @@ import (
 	"os"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/server"
 )
 
 // Example demonstrates the simplest possible use: load a model, generate a
@@ -121,7 +122,7 @@ func ExampleNewHandler() {
 	defer model.Close()
 
 	mux := http.NewServeMux()
-	mux.Handle("/llm/", http.StripPrefix("/llm", model.HTTPHandler(gopherllm.HandlerOptions{
+	mux.Handle("/llm/", http.StripPrefix("/llm", server.HandlerForModel(model, server.HandlerOptions{
 		Defaults: gopherllm.DefaultGenerationOptions(),
 	})))
 	// mux also serves the application's own routes...
