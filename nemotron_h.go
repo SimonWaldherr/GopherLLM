@@ -52,16 +52,6 @@ type NemotronMambaWeights struct {
 	Out      Weight
 }
 
-// ExpertWeight retains the third GGUF tensor dimension. Weight itself stores
-// two-dimensional matrices, while the expert tensors are laid out as
-// [input, output, expert].
-type ExpertWeight struct {
-	Weight  Weight
-	Input   int
-	Output  int
-	Experts int
-}
-
 type NemotronMoEWeights struct {
 	Router     Weight
 	RouterBias []float32
@@ -188,6 +178,19 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 		}
 		return &w, nil
 	}
+	optionalWeightAlias := func(names ...string) (*Weight, string, error) {
+		for _, name := range names {
+			if _, ok := tensors[name]; !ok {
+				continue
+			}
+			w, err := load(name)
+			if err != nil {
+				return nil, "", err
+			}
+			return &w, name, nil
+		}
+		return nil, "", nil
+	}
 	token, err := load("token_embd.weight")
 	if err != nil {
 		return cfg, NemotronHWeights{}, err
@@ -270,29 +273,74 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 				layer.Kind = nemotronMoE
 				layer.MoE.Router, err = load(prefix + "ffn_gate_inp.weight")
 				if err == nil {
-					layer.MoE.Up, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow, prepareQuantized, useMetal)
+					info := tensors[prefix+"ffn_gate_inp.weight"]
+					if len(info.Dims) != 2 || int(info.Dims[0]) != cfg.Dim || int(info.Dims[1]) != cfg.ExpertCount {
+						err = fmt.Errorf("router dimensions %v, want [%d %d]", info.Dims, cfg.Dim, cfg.ExpertCount)
+					}
+				}
+				var latentInName, latentOutName string
+				if err == nil {
+					layer.MoE.LatentIn, latentInName, err = optionalWeightAlias(prefix+"ffn_latent_down.weight", prefix+"ffn_latent_in.weight")
 				}
 				if err == nil {
-					layer.MoE.Down, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow, prepareQuantized, useMetal)
+					layer.MoE.LatentOut, latentOutName, err = optionalWeightAlias(prefix+"ffn_latent_up.weight", prefix+"ffn_latent_out.weight")
+				}
+				if err == nil && ((layer.MoE.LatentIn == nil) != (layer.MoE.LatentOut == nil)) {
+					err = fmt.Errorf("latent MoE projections must be paired (found %s %s)", latentInName, latentOutName)
+				}
+				if err == nil {
+					layer.MoE.Up, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow)
+				}
+				if err == nil {
+					layer.MoE.Down, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow)
 				}
 				if err != nil {
 					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE: %w", i, err)
 				}
-				layer.MoE.RouterBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"exp_probs_b.bias", tensors, inferred, cfg.ExpertCount)
-				if len(layer.MoE.RouterBias) == 0 {
-					layer.MoE.RouterBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"exp_probs_b", tensors, inferred, cfg.ExpertCount)
+				if layer.MoE.RouterBias, err = loadOptionalMoEVec(data, gguf.DataOffset, prefix+"exp_probs_b.bias", tensors, inferred, cfg.ExpertCount); err != nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE router bias: %w", i, err)
 				}
-				if layer.MoE.LatentIn, err = optionalWeight(prefix + "ffn_latent_in.weight"); err != nil {
-					return cfg, NemotronHWeights{}, err
-				}
-				if layer.MoE.LatentOut, err = optionalWeight(prefix + "ffn_latent_out.weight"); err != nil {
-					return cfg, NemotronHWeights{}, err
+				if layer.MoE.RouterBias == nil {
+					if layer.MoE.RouterBias, err = loadOptionalMoEVec(data, gguf.DataOffset, prefix+"exp_probs_b", tensors, inferred, cfg.ExpertCount); err != nil {
+						return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE router bias: %w", i, err)
+					}
 				}
 				if layer.MoE.SharedUp, err = optionalWeight(prefix + "ffn_up_shexp.weight"); err != nil {
 					return cfg, NemotronHWeights{}, err
 				}
 				if layer.MoE.SharedDown, err = optionalWeight(prefix + "ffn_down_shexp.weight"); err != nil {
 					return cfg, NemotronHWeights{}, err
+				}
+				if (layer.MoE.SharedUp == nil) != (layer.MoE.SharedDown == nil) {
+					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE shared expert projections must be paired", i)
+				}
+				expertInput := cfg.Dim
+				if layer.MoE.LatentIn != nil {
+					info := tensors[latentInName]
+					if len(info.Dims) != 2 || int(info.Dims[0]) != cfg.Dim {
+						return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE latent input dimensions %v, want input %d", i, info.Dims, cfg.Dim)
+					}
+					expertInput = int(info.Dims[1])
+				}
+				if err := validateExpertWeight(prefix+"ffn_up_exps.weight", layer.MoE.Up, expertInput, ffnDim, cfg.ExpertCount); err != nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE: %w", i, err)
+				}
+				expertOutput := cfg.Dim
+				if layer.MoE.LatentOut != nil {
+					info := tensors[latentOutName]
+					if len(info.Dims) != 2 || int(info.Dims[1]) != cfg.Dim {
+						return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE latent output dimensions %v, want output %d", i, info.Dims, cfg.Dim)
+					}
+					expertOutput = int(info.Dims[0])
+				}
+				if err := validateExpertWeight(prefix+"ffn_down_exps.weight", layer.MoE.Down, ffnDim, expertOutput, cfg.ExpertCount); err != nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE: %w", i, err)
+				}
+				if layer.MoE.SharedUp != nil {
+					upInfo, downInfo := tensors[prefix+"ffn_up_shexp.weight"], tensors[prefix+"ffn_down_shexp.weight"]
+					if len(upInfo.Dims) != 2 || len(downInfo.Dims) != 2 || int(upInfo.Dims[0]) != cfg.Dim || int(downInfo.Dims[0]) != int(upInfo.Dims[1]) || int(downInfo.Dims[1]) != cfg.Dim {
+						return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE has inconsistent shared-expert dimensions", i)
+					}
 				}
 			}
 		default:
@@ -334,21 +382,6 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 		break
 	}
 	return cfg, weights, nil
-}
-
-func loadExpertWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool) (ExpertWeight, error) {
-	info, ok := tensors[name]
-	if !ok {
-		return ExpertWeight{}, fmt.Errorf("missing tensor: %s", name)
-	}
-	if len(info.Dims) != 3 || info.Dims[0] == 0 || info.Dims[1] == 0 || info.Dims[2] == 0 {
-		return ExpertWeight{}, fmt.Errorf("tensor %s must have [input, output, expert] dimensions, got %v", name, info.Dims)
-	}
-	w, err := loadWeight(data, dataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal)
-	if err != nil {
-		return ExpertWeight{}, err
-	}
-	return ExpertWeight{Weight: w, Input: int(info.Dims[0]), Output: int(info.Dims[1]), Experts: int(info.Dims[2])}, nil
 }
 
 func nemotronSoftplus(x float32) float32 {
@@ -546,32 +579,34 @@ func nemotronMoEForward(cfg Config, w NemotronMoEWeights, x []float32, buf *Deco
 		if i < len(w.RouterBias) {
 			score += w.RouterBias[i]
 		}
-		if i < cfg.ExpertUsedCount {
-			buf.TopExperts[i] = ExpertScore{Index: i, Score: score}
-			continue
-		}
-		minAt := 0
-		for j := 1; j < cfg.ExpertUsedCount; j++ {
-			if buf.TopExperts[j].Score < buf.TopExperts[minAt].Score {
-				minAt = j
-			}
-		}
-		if score > buf.TopExperts[minAt].Score {
-			buf.TopExperts[minAt] = ExpertScore{Index: i, Score: score}
-		}
+		// Keep the unbiased sigmoid values in ExpertProbs for mixture weights;
+		// the optional bias only affects which experts enter top-k.
+		buf.RouterLogits[i] = score
 	}
+	selected := selectTopExperts(buf.RouterLogits, cfg.ExpertUsedCount, &buf.TopExperts)
 	weightSum := float32(0)
-	for _, selected := range buf.TopExperts {
-		weightSum += buf.ExpertProbs[selected.Index]
+	for _, choice := range selected {
+		weightSum += buf.ExpertProbs[choice.Index]
 	}
-	clear(buf.Proj[:cfg.Dim])
+	if weightSum < moeWeightFloor {
+		weightSum = moeWeightFloor
+	}
+	moeOutputDim := w.Down.Output
+	if moeOutputDim <= 0 || (w.LatentOut == nil && moeOutputDim != cfg.Dim) {
+		panic("Nemotron-H MoE has an invalid output shape")
+	}
+	ensureLenNoClear(&buf.Proj, moeOutputDim)
+	clear(buf.Proj[:moeOutputDim])
 	routed := x
 	if w.LatentIn != nil {
-		w.LatentIn.MatvecInto(x, &buf.MOE)
-		routed = buf.MOE
+		// MOE is reused for every expert's down projection below. Keeping the
+		// latent input in a distinct buffer is essential when top-k > 1: the
+		// first expert output must not become the second expert's input.
+		w.LatentIn.MatvecInto(x, &buf.MoELatent)
+		routed = buf.MoELatent
 	}
-	for _, selected := range buf.TopExperts {
-		expertMatvecInto(w.Up, selected.Index, routed, &buf.ExpertHidden, &buf.ExpertRow)
+	for _, choice := range selected {
+		expertMatvecInto(w.Up, choice.Index, routed, &buf.ExpertHidden, &buf.ExpertRow)
 		for i, v := range buf.ExpertHidden {
 			if v < 0 {
 				buf.ExpertHidden[i] = 0
@@ -579,16 +614,20 @@ func nemotronMoEForward(cfg Config, w NemotronMoEWeights, x []float32, buf *Deco
 				buf.ExpertHidden[i] = v * v
 			}
 		}
-		expertMatvecInto(w.Down, selected.Index, buf.ExpertHidden, &buf.MOE, &buf.ExpertRow)
-		routing := buf.ExpertProbs[selected.Index]
-		if cfg.ExpertWeightsNorm && weightSum > 6.103515625e-5 {
+		expertMatvecInto(w.Down, choice.Index, buf.ExpertHidden, &buf.MOE, &buf.ExpertRow)
+		routing := buf.ExpertProbs[choice.Index]
+		if cfg.ExpertWeightsNorm {
 			routing /= weightSum
 		}
 		routing *= cfg.ExpertWeightsScale
-		AxpyF32(buf.Proj[:cfg.Dim], routing, buf.MOE)
+		AxpyF32(buf.Proj[:moeOutputDim], routing, buf.MOE)
 	}
 	if w.LatentOut != nil {
-		w.LatentOut.MatvecInto(buf.Proj[:cfg.Dim], &buf.MOE)
+		w.LatentOut.MatvecInto(buf.Proj[:moeOutputDim], &buf.MOE)
+		if len(buf.MOE) != cfg.Dim {
+			panic("Nemotron-H latent output has an invalid shape")
+		}
+		ensureLenNoClear(&buf.Proj, cfg.Dim)
 		copy(buf.Proj[:cfg.Dim], buf.MOE)
 	}
 	if w.SharedUp != nil && w.SharedDown != nil {
@@ -605,19 +644,44 @@ func nemotronMoEForward(cfg Config, w NemotronMoEWeights, x []float32, buf *Deco
 	}
 }
 
-func expertMatvecInto(w ExpertWeight, expert int, x []float32, out *[]float32, row *[]float32) {
-	if expert < 0 || expert >= w.Experts || len(x) != w.Input {
-		panic("invalid Nemotron-H expert matvec")
-	}
-	ensureLenNoClear(out, w.Output)
-	if w.Weight.F32 != nil {
-		base := expert * w.Output * w.Input
-		MatvecF32Into(w.Weight.F32[base:base+w.Output*w.Input], x, w.Output, w.Input, out)
+// releaseNemotronHMetalWeights releases every optional Metal backing buffer
+// owned by the hybrid graph. Expert planes intentionally do not get prepared
+// as Metal matrices (they are selected dynamically), but keeping them in this
+// traversal makes the ownership rule explicit and protects future kernels.
+func releaseNemotronHMetalWeights(weights *NemotronHWeights) {
+	if weights == nil {
 		return
 	}
-	ensureLenNoClear(row, w.Input)
-	for r := range w.Output {
-		w.Weight.RowInto(expert*w.Output+r, w.Input, row)
-		(*out)[r] = DotF32(*row, x)
+	seen := map[*MetalWeight]bool{}
+	release := func(w *Weight) {
+		if w == nil || w.Metal == nil {
+			return
+		}
+		if !seen[w.Metal] {
+			releaseMetalWeight(w.Metal)
+			seen[w.Metal] = true
+		}
+		w.Metal = nil
+	}
+	release(&weights.TokenEmbd)
+	release(&weights.Output)
+	for i := range weights.Layers {
+		layer := &weights.Layers[i]
+		release(&layer.Attention.Q)
+		release(&layer.Attention.K)
+		release(&layer.Attention.V)
+		release(&layer.Attention.O)
+		release(&layer.Mamba.In)
+		release(&layer.Mamba.Conv)
+		release(&layer.Mamba.Out)
+		release(&layer.MoE.Router)
+		release(&layer.MoE.Up.Weight)
+		release(&layer.MoE.Down.Weight)
+		release(layer.MoE.LatentIn)
+		release(layer.MoE.LatentOut)
+		release(layer.MoE.SharedUp)
+		release(layer.MoE.SharedDown)
+		release(&layer.DenseFFN.Up)
+		release(&layer.DenseFFN.Down)
 	}
 }

@@ -81,6 +81,13 @@ func f32ToF16RowScalar(dst []uint16, src []float32, start int) {
 // two-pass structure (see onlineAttention's doc comment), with the cached
 // rows converted to f32 inside the fused kernels rather than materialized.
 func onlineAttentionF16(query []float32, keys, values []uint16, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	onlineAttentionF16WithSink(query, keys, values, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, false, out)
+}
+
+// onlineAttentionF16WithSink is the f16-KV counterpart of
+// onlineAttentionWithSink. A learned attention sink participates only in the
+// normalizing denominator, so no additional f16 value row is needed.
+func onlineAttentionF16WithSink(query []float32, keys, values []uint16, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
 	span := endT - startT + 1
 	if span <= 0 {
 		return
@@ -98,6 +105,6 @@ func onlineAttentionF16(query []float32, keys, values []uint16, keyStride, value
 		scores[n] = dotF32F16(query, keys[kOff:kOff+keyHeadDim]) * scale
 		n++
 	}
-	weightedVSumEither(scores[:n], nil, values, valueStride, valueHeadDim, startT, softcap, out)
+	weightedVSumEitherWithSink(scores[:n], nil, values, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
 	attnScoresPool.Put(scratch)
 }

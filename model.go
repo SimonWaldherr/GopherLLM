@@ -99,6 +99,20 @@ func gemmaFamily(arch string) bool {
 	}
 }
 
+// defaultExpertWeightsNorm follows the reference graphs for the sparse-MoE
+// families handled by the standard decoder. Mixtral/Llama and Qwen3 normalize
+// the selected weights; Qwen2-MoE intentionally retains their mass from the
+// full router softmax. Nemotron-H has a separate graph and keeps its historic
+// metadata-driven default.
+func defaultExpertWeightsNorm(arch string) bool {
+	switch arch {
+	case "qwen2moe", "nemotron_h", "nemotron_h_moe", "mamba2":
+		return false
+	default:
+		return true
+	}
+}
+
 // layerUsesSWA reports whether layer il attends with the sliding window (true)
 // or over the full context (false, or when no window is configured).
 func (c Config) layerUsesSWA(il int) bool {
@@ -190,6 +204,9 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		SlidingWindow:             int(gguf.GetU32(p+".attention.sliding_window", 0)),
 		ExpertCount:               int(gguf.GetU32(p+".expert_count", 0)),
 		ExpertUsedCount:           int(gguf.GetU32(p+".expert_used_count", 0)),
+		ExpertWeightsNorm:         defaultExpertWeightsNorm(p),
+		ExpertWeightsScale:        gguf.GetF32(p+".expert_weights_scale", 1),
+		ExpertWeightsNormClip:     gguf.GetF32(p+".expert_weights_norm_clip", 0),
 		RopeDimensionCount:        int(gguf.GetU32(p+".rope.dimension_count", uint32(max(1, headDim)))),
 		RopeScalingFactor:         gguf.GetF32(p+".rope.scaling.factor", 1),
 		RopeAttentionFactor:       gguf.GetF32(p+".rope.scaling.attn_factor", 1),
@@ -214,9 +231,11 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		cfg.SSMState = int(gguf.GetU32(p+".ssm.state_size", 0))
 		cfg.SSMHeads = int(gguf.GetU32(p+".ssm.time_step_rank", 0))
 		cfg.SSMGroups = int(gguf.GetU32(p+".ssm.group_count", 0))
-		cfg.ExpertWeightsNorm, _ = gguf.Metadata[p+".expert_weights_norm"].AsBool()
-		cfg.ExpertWeightsScale = gguf.GetF32(p+".expert_weights_scale", 1)
-		cfg.ExpertWeightsNormClip = gguf.GetF32(p+".expert_weights_norm_clip", 0)
+	}
+	if v, ok := gguf.Metadata[p+".expert_weights_norm"]; ok {
+		if norm, ok := v.AsBool(); ok {
+			cfg.ExpertWeightsNorm = norm
+		}
 	}
 	return cfg
 }
@@ -251,6 +270,11 @@ func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
 		period = 2
 	case "gemma3", "gemma4":
 		period = 6
+	case "gpt-oss":
+		// GPT-OSS alternates local attention on even layers with full
+		// attention on odd layers. The generic pattern below marks the first
+		// period-1 layer as local, which is exactly that 1:1 schedule.
+		period = 2
 	}
 	if period == 0 || nLayers <= 0 {
 		return nil
@@ -565,6 +589,17 @@ func releaseModelMetalWeights(weights *ModelWeights) {
 		release(&layer.W2)
 		release(&layer.W3)
 		release(&layer.WGateUp)
+		if layer.MoE != nil {
+			moe := layer.MoE
+			release(&moe.Router)
+			release(&moe.Gate.Weight)
+			release(&moe.Up.Weight)
+			release(&moe.Down.Weight)
+			release(moe.SharedGateIn)
+			release(moe.SharedGate)
+			release(moe.SharedUp)
+			release(moe.SharedDown)
+		}
 	}
 }
 
@@ -592,6 +627,7 @@ type LayerWeights struct {
 	WQKV         Weight
 	HasQKV       bool
 	WO           Weight
+	BO           []float32
 	FFNNorm      []float32
 	FFNNormBias  []float32
 	W1           Weight
@@ -599,6 +635,9 @@ type LayerWeights struct {
 	W3           Weight
 	WGateUp      Weight
 	HasGateUp    bool
+	// MoE replaces the dense FFN tensors above for sparse decoder blocks.
+	// It is nil for ordinary SwiGLU layers.
+	MoE *SparseMoEWeights
 	// Optional Gemma-family norms, nil when the tensors are absent:
 	// AttnQNorm/AttnKNorm are per-head RMS norms of length HeadDim applied
 	// after the Q/K projections (before RoPE); PostAttnNorm/PostFFNNorm are
@@ -608,6 +647,9 @@ type LayerWeights struct {
 	AttnKNorm    []float32
 	PostAttnNorm []float32
 	PostFFNNorm  []float32
+	// Learned no-value attention sink used by GPT-OSS; nil for ordinary
+	// attention. Each entry corresponds to one query head.
+	AttnSinks []float32
 }
 
 type ModelWeights struct {
@@ -727,13 +769,20 @@ func (c *KVCache) storeKV(l, pos int, k, v []float32) {
 // attendHead runs online attention for one query head against this cache's
 // rows, dispatching to the storage format's kernel set.
 func (c *KVCache) attendHead(l, kvH int, query []float32, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	c.attendHeadWithSink(l, kvH, query, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, false, out)
+}
+
+// attendHeadWithSink is attendHead with an optional learned no-value sink
+// logit. GPT-OSS appends that logit to each head's softmax denominator without
+// adding a value row, which dampens attention when the learned sink wins.
+func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
 	if c.F16 {
-		onlineAttentionF16(query, c.K16[l][kvH*keyHeadDim:], c.V16[l][kvH*valueHeadDim:],
-			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+		onlineAttentionF16WithSink(query, c.K16[l][kvH*keyHeadDim:], c.V16[l][kvH*valueHeadDim:],
+			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
 		return
 	}
-	onlineAttention(query, c.K[l][kvH*keyHeadDim:], c.V[l][kvH*valueHeadDim:],
-		c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+	onlineAttentionWithSink(query, c.K[l][kvH*keyHeadDim:], c.V[l][kvH*valueHeadDim:],
+		c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
 }
 
 // DecodeBuffer is reusable request scratch for single-token decode and batched
@@ -745,21 +794,24 @@ func (c *KVCache) attendHead(l, kvH int, query []float32, keyHeadDim, valueHeadD
 // token and prefill reuses its activation slabs. Not safe for concurrent use;
 // Runner.genLock serializes requests.
 type DecodeBuffer struct {
-	X                       []float32
-	XN                      []float32
-	XN2                     []float32
-	Q                       []float32
-	K                       []float32
-	V                       []float32
-	QKV                     []float32
-	AttnOut                 []float32
-	Proj                    []float32
-	AttnProj                []float32
-	Gate                    []float32
-	Up                      []float32
-	GateUp                  []float32
-	Hidden                  []float32
-	MOE                     []float32
+	X        []float32
+	XN       []float32
+	XN2      []float32
+	Q        []float32
+	K        []float32
+	V        []float32
+	QKV      []float32
+	AttnOut  []float32
+	Proj     []float32
+	AttnProj []float32
+	Gate     []float32
+	Up       []float32
+	GateUp   []float32
+	Hidden   []float32
+	MOE      []float32
+	// MoELatent keeps Nemotron-H's optional projected expert input alive
+	// while each selected expert reuses MOE for its output.
+	MoELatent               []float32
 	RouterLogits            []float32
 	TopExperts              []ExpertScore
 	ExpertProbs             []float32
@@ -809,6 +861,7 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		GateUp:                  make([]float32, config.HiddenDim*2),
 		Hidden:                  make([]float32, config.HiddenDim),
 		MOE:                     make([]float32, config.Dim),
+		MoELatent:               make([]float32, config.Dim),
 		RouterLogits:            make([]float32, config.ExpertCount),
 		SamplerCandidates:       make([]TokenProb, 0, 64),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
@@ -982,7 +1035,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	kRows := config.NKVHeads * config.HeadDim
 	vRows := config.NKVHeads * config.ValueDim
 	for l := range config.NLayers {
-		layer, err := loadLayer(data, gguf.DataOffset, l, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, qRows, kRows, vRows)
+		layer, err := loadLayer(data, gguf.DataOffset, l, config, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, qRows, kRows, vRows)
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
@@ -1063,7 +1116,7 @@ func validateGemma4DenseLayout(config Config, tensors map[string]TensorInfo) err
 	return nil
 }
 
-func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool, qRows, kRows, vRows int) (LayerWeights, error) {
+func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool, qRows, kRows, vRows int) (LayerWeights, error) {
 	prefix := fmt.Sprintf("blk.%d.", l)
 	attnNorm, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
 	if err != nil {
@@ -1099,27 +1152,39 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 	if err != nil {
 		return LayerWeights{}, err
 	}
-	w2, err := loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
-	if err != nil {
-		return LayerWeights{}, err
-	}
-	var w1, w3, wGateUp Weight
+	var w1, w2, w3, wGateUp Weight
 	hasGateUp := false
-	if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
-		w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+	var moe *SparseMoEWeights
+	if _, isMoE := tensors[prefix+"ffn_gate_inp.weight"]; isMoE {
+		moe, err = loadSparseMoEWeights(data, dataOffset, prefix, config, tensors, inferred, borrow, prepareQuantized, useMetal)
 		if err != nil {
-			return LayerWeights{}, err
-		}
-		w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
-		if err != nil {
-			return LayerWeights{}, err
+			return LayerWeights{}, fmt.Errorf("layer %d MoE: %w", l, err)
 		}
 	} else {
-		wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		w2, err = loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		hasGateUp = true
+		if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
+			w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+			if err != nil {
+				return LayerWeights{}, err
+			}
+			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+			if err != nil {
+				return LayerWeights{}, err
+			}
+		} else {
+			wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+			if err != nil {
+				return LayerWeights{}, err
+			}
+			hasGateUp = true
+		}
+	}
+	attnSinks, err := loadOptionalMoEVec(data, dataOffset, prefix+"attn_sinks.weight", tensors, inferred, config.NHeads)
+	if err != nil {
+		return LayerWeights{}, err
 	}
 	return LayerWeights{
 		AttnNorm:     attnNorm,
@@ -1133,6 +1198,7 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 		WQKV:         wqkv,
 		HasQKV:       hasQKV,
 		WO:           wo,
+		BO:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_output.bias", tensors, inferred, config.Dim),
 		FFNNorm:      ffnNorm,
 		FFNNormBias:  loadOptionalF32Vec(data, dataOffset, prefix+"ffn_norm.bias", tensors, inferred, len(ffnNorm)),
 		W1:           w1,
@@ -1140,6 +1206,7 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 		W3:           w3,
 		WGateUp:      wGateUp,
 		HasGateUp:    hasGateUp,
+		MoE:          moe,
 		// Unlike the biases above (where a zero-filled default is inert),
 		// these must stay nil when absent: applying an all-zero norm would
 		// zero the activations.
@@ -1147,6 +1214,7 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 		AttnKNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_k_norm.weight", tensors, inferred),
 		PostAttnNorm: loadOptionalF32VecNil(data, dataOffset, prefix+"post_attention_norm.weight", tensors, inferred),
 		PostFFNNorm:  loadOptionalF32VecNil(data, dataOffset, prefix+"post_ffw_norm.weight", tensors, inferred),
+		AttnSinks:    attnSinks,
 	}, nil
 }
 
@@ -1461,7 +1529,13 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	dim := config.Dim
 	headDim := config.HeadDim
 	kvMul := max(1, config.KVMul)
-	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
+	ropeInvFreq, ropeMscale := buf.RopeInvFreq, buf.RopeMscale
+	if config.Arch == "gpt-oss" && len(buf.RopeGptOssInvFreq) > 0 {
+		// GPT-OSS uses its own YaRN concentration rule, precomputed alongside
+		// the regular table in NewDecodeBuffer.
+		ropeInvFreq, ropeMscale = buf.RopeGptOssInvFreq, buf.RopeGptOssConcentration
+	}
+	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, ropeInvFreq, ropeMscale, &buf.RopeSin, &buf.RopeCos)
 	ropeIsInterleaved := ropeInterleaved(config.Arch)
 	weights.TokenEmbd.RowInto(int(token), dim, &buf.X)
 	if config.EmbeddingScale != 1 {
@@ -1514,8 +1588,12 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 				kvH := h / kvMul
 				qOff := h * headDim
 				outOff := h * config.ValueDim
-				cache.attendHead(l, kvH, buf.Q[qOff:qOff+headDim], headDim, config.ValueDim,
-					attnStart, pos, scale, config.AttnLogitSoftcap,
+				sink, hasSink := float32(0), h < len(layer.AttnSinks)
+				if hasSink {
+					sink = layer.AttnSinks[h]
+				}
+				cache.attendHeadWithSink(l, kvH, buf.Q[qOff:qOff+headDim], headDim, config.ValueDim,
+					attnStart, pos, scale, config.AttnLogitSoftcap, sink, hasSink,
 					buf.AttnOut[outOff:outOff+config.ValueDim])
 			}
 		}
@@ -1527,6 +1605,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			attnHeads(0, config.NHeads)
 		}
 		layer.WO.MatvecInto(buf.AttnOut, &buf.Proj)
+		addInPlace(buf.Proj, layer.BO)
 		if layer.PostAttnNorm != nil {
 			rmsNormInto(buf.Proj, layer.PostAttnNorm, config.RMSNormEps, &buf.Proj)
 		}
@@ -1540,44 +1619,48 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		}
 
 		normalizeDecoderInto(config, buf.X, layer.FFNNorm, layer.FFNNormBias, &buf.XN2)
-		// Decode bottleneck: the selective Metal path previously synchronized and
-		// copied Gate/Up to the CPU for SiLU, then copied Hidden back for Down.
-		// Keep all three stages in one command buffer when the measured
-		// Q4_K/Q4_K/Q6_K shape matches. Any unsupported shape or GPU failure falls
-		// through to the unchanged CPU/GPU path; removing this branch is rollback.
-		fusedMetalFFN := !layer.HasGateUp && !config.UseGELU &&
-			matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
-		if !fusedMetalFFN {
-			if layer.HasGateUp {
-				layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
-				ensureLenNoClear(&buf.Gate, config.HiddenDim)
-				ensureLenNoClear(&buf.Up, config.HiddenDim)
-				copy(buf.Gate, buf.GateUp[:config.HiddenDim])
-				copy(buf.Up, buf.GateUp[config.HiddenDim:2*config.HiddenDim])
-			} else {
-				if !tryMatvec2Into(layer.W1, layer.W3, buf.XN2, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
-					layer.W1.MatvecInto(buf.XN2, &buf.Gate)
-					layer.W3.MatvecInto(buf.XN2, &buf.Up)
-				}
-			}
-			hDim := config.HiddenDim
-			ensureLenNoClear(&buf.Hidden, hDim)
-			if hDim > 0 {
-				gate := buf.Gate
-				up := buf.Up
-				hidden := buf.Hidden
-				_ = gate[hDim-1]
-				_ = up[hDim-1]
-				_ = hidden[hDim-1]
-				if config.UseGELU {
-					for i := 0; i < hDim; i++ {
-						hidden[i] = geluTanh(gate[i]) * up[i]
-					}
+		if layer.MoE != nil {
+			sparseMoEForward(layer.MoE, buf.XN2, buf)
+		} else {
+			// Decode bottleneck: the selective Metal path previously synchronized and
+			// copied Gate/Up to the CPU for SiLU, then copied Hidden back for Down.
+			// Keep all three stages in one command buffer when the measured
+			// Q4_K/Q4_K/Q6_K shape matches. Any unsupported shape or GPU failure falls
+			// through to the unchanged CPU/GPU path; removing this branch is rollback.
+			fusedMetalFFN := !layer.HasGateUp && !config.UseGELU &&
+				matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
+			if !fusedMetalFFN {
+				if layer.HasGateUp {
+					layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
+					ensureLenNoClear(&buf.Gate, config.HiddenDim)
+					ensureLenNoClear(&buf.Up, config.HiddenDim)
+					copy(buf.Gate, buf.GateUp[:config.HiddenDim])
+					copy(buf.Up, buf.GateUp[config.HiddenDim:2*config.HiddenDim])
 				} else {
-					siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
+					if !tryMatvec2Into(layer.W1, layer.W3, buf.XN2, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+						layer.W1.MatvecInto(buf.XN2, &buf.Gate)
+						layer.W3.MatvecInto(buf.XN2, &buf.Up)
+					}
 				}
+				hDim := config.HiddenDim
+				ensureLenNoClear(&buf.Hidden, hDim)
+				if hDim > 0 {
+					gate := buf.Gate
+					up := buf.Up
+					hidden := buf.Hidden
+					_ = gate[hDim-1]
+					_ = up[hDim-1]
+					_ = hidden[hDim-1]
+					if config.UseGELU {
+						for i := 0; i < hDim; i++ {
+							hidden[i] = geluTanh(gate[i]) * up[i]
+						}
+					} else {
+						siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
+					}
+				}
+				layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
 			}
-			layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
 		}
 		if layer.PostFFNNorm != nil {
 			rmsNormInto(buf.Proj, layer.PostFFNNorm, config.RMSNormEps, &buf.Proj)
@@ -2009,6 +2092,10 @@ var attnScoresPool = sync.Pool{New: func() any { s := make([]float32, 0, 4096); 
 // on the dev laptop the two-pass form is ~1.15x faster at 4k-16k context
 // and numerically it uses the true maximum rather than a running one.
 func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	onlineAttentionWithSink(query, keys, values, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, false, out)
+}
+
+func onlineAttentionWithSink(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
 	span := endT - startT + 1
 	if span <= 0 {
 		return
@@ -2026,7 +2113,7 @@ func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyH
 		scores[n] = DotF32(query, keys[kOff:kOff+keyHeadDim]) * scale
 		n++
 	}
-	weightedVSum(scores[:n], values, valueStride, valueHeadDim, startT, softcap, out)
+	weightedVSumWithSink(scores[:n], values, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
 	attnScoresPool.Put(scratch)
 }
 
@@ -2034,10 +2121,18 @@ func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyH
 // variants: optional softcap, max-stabilized softmax weights in place, then
 // out += sum(w_i * V_row_i) / denom. values16 is used when values is nil.
 func weightedVSum(scores []float32, values []float32, valueStride, valueHeadDim, startT int, softcap float32, out []float32) {
-	weightedVSumEither(scores, values, nil, valueStride, valueHeadDim, startT, softcap, out)
+	weightedVSumWithSink(scores, values, valueStride, valueHeadDim, startT, softcap, 0, false, out)
+}
+
+func weightedVSumWithSink(scores []float32, values []float32, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {
+	weightedVSumEitherWithSink(scores, values, nil, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
 }
 
 func weightedVSumEither(scores []float32, values []float32, values16 []uint16, valueStride, valueHeadDim, startT int, softcap float32, out []float32) {
+	weightedVSumEitherWithSink(scores, values, values16, valueStride, valueHeadDim, startT, softcap, 0, false, out)
+}
+
+func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []uint16, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {
 	n := len(scores)
 	if n == 0 {
 		return
@@ -2053,11 +2148,17 @@ func weightedVSumEither(scores []float32, values []float32, values16 []uint16, v
 			maxScore = s
 		}
 	}
+	if hasSink && sink > maxScore {
+		maxScore = sink
+	}
 	var denom float32
 	for i, s := range scores {
 		w := float32(math.Exp(float64(s - maxScore)))
 		scores[i] = w
 		denom += w
+	}
+	if hasSink {
+		denom += float32(math.Exp(float64(sink - maxScore)))
 	}
 	for i := 0; i < n; i++ {
 		vOff := (startT + i) * valueStride

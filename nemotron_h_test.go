@@ -171,3 +171,37 @@ func TestNemotronDenseFFNUsesReLUSquaredAndBiases(t *testing.T) {
 		t.Fatalf("dense FFN result = %v, want [2.5 0.5]", buf.Proj)
 	}
 }
+
+func TestNemotronMoELatentProjectionPreservesInputForAllExperts(t *testing.T) {
+	// The latent path has a different expert input/output width than the model
+	// width. With two selected experts this also verifies that one expert's
+	// output cannot overwrite the latent input used by the next one.
+	cfg := Config{
+		Dim:                2,
+		ExpertCount:        2,
+		ExpertUsedCount:    2,
+		ExpertWeightsNorm:  true,
+		ExpertWeightsScale: 1,
+	}
+	w := NemotronMoEWeights{
+		Router:    Weight{F32: []float32{0, 0, 0, 0}},
+		LatentIn:  &Weight{F32: []float32{1, 1}}, // [1, 2] => latent [3]
+		LatentOut: &Weight{F32: []float32{1, 2}}, // latent [22.5] => [22.5, 45]
+		Up: ExpertWeight{
+			Weight: Weight{F32: []float32{1, 2}}, // expert outputs [3], [6]
+			Input:  1, Output: 1, Experts: 2,
+		},
+		Down: ExpertWeight{
+			Weight: Weight{F32: []float32{1, 1}},
+			Input:  1, Output: 1, Experts: 2,
+		},
+	}
+	buf := &DecodeBuffer{}
+	nemotronMoEForward(cfg, w, []float32{1, 2}, buf)
+	// ReLU²([3]) and ReLU²([6]) are 9 and 36; equal sigmoid routing
+	// probabilities normalize to 0.5, yielding (9+36)/2 = 22.5 before
+	// the latent-up projection.
+	if len(buf.Proj) != 2 || math.Abs(float64(buf.Proj[0]-22.5)) > 1e-5 || math.Abs(float64(buf.Proj[1]-45)) > 1e-5 {
+		t.Fatalf("latent MoE output = %v, want [22.5 45]", buf.Proj)
+	}
+}

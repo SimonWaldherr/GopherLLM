@@ -282,7 +282,7 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen3", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
+		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
 		return true
 	default:
 		return false
@@ -458,6 +458,8 @@ func (r *Runner) releaseMetalWeights() {
 		releaseModelMetalWeights(&r.gptOss.Standard)
 	case loadedGemma4:
 		releaseModelMetalWeights(&r.gemma4.Standard)
+	case loadedNemotronH:
+		releaseNemotronHMetalWeights(&r.nemotronH)
 	case loadedMamba2:
 		releaseMamba2MetalWeights(&r.mamba2)
 	default:
@@ -1007,7 +1009,7 @@ func (r *Runner) canBatchPrefill() bool {
 	// StableLM's parallel attention/FFN residual. Gemma-family mechanisms
 	// such as QK/post norms still fall back to the per-token path.
 	for _, l := range r.standard.Layers {
-		if l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
+		if l.MoE != nil || l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
 			return false
 		}
 	}

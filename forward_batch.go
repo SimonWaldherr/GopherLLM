@@ -328,6 +328,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 
 		matvecBatch(layer.WO, AttnOut, Proj)
 		for t := 0; t < p; t++ {
+			addInPlace(Proj[t], layer.BO)
 			if config.ResidualScale != 1 {
 				ScaleF32(Proj[t], config.ResidualScale)
 			}
