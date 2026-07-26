@@ -24,6 +24,12 @@ func recentContextWindowOptions() GenerationOptions {
 	return opts
 }
 
+func autoCompressContextWindowOptions() GenerationOptions {
+	opts := recentContextWindowOptions()
+	opts.ContextWindowMode = ContextWindowAutoCompress
+	return opts
+}
+
 // contextWindowLimitFor makes the supplied messages fit exactly in the
 // recent-mode input budget. It deliberately uses the loaded tiny GGUF's real
 // tokenizer and renderer, rather than assuming a character-to-token ratio.
@@ -208,5 +214,48 @@ func TestPrepareChatContextRecentRejectsTooLargeLatestTurn(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("messages = %#v, want nil on an unfit latest turn", got)
+	}
+}
+
+func TestAutoCompressUsesTechnicalAbbreviationsWithoutTouchingOpaquePayloads(t *testing.T) {
+	messages := []ChatMessage{
+		UserMessage("Please explain the application programming interface, for example its context window."),
+		ToolResultMessage("call-1", "lookup", `{"kind":"application programming interface"}`),
+		AssistantMessage("```text\napplication programming interface\n```"),
+	}
+	got, changed := autoCompressChatMessages(messages)
+	if changed != 1 {
+		t.Fatalf("compressed messages = %d, want 1", changed)
+	}
+	if got[0].Content != "explain the API, e.g. its ctx window." {
+		t.Fatalf("compressed user message = %q", got[0].Content)
+	}
+	if got[1].Content != messages[1].Content || got[2].Content != messages[2].Content {
+		t.Fatalf("opaque payload was rewritten: %#v", got)
+	}
+}
+
+func TestPrepareChatContextAutoCompressUsesCompressedHistory(t *testing.T) {
+	r := newContextWindowTestRunner(t)
+	opts := autoCompressContextWindowOptions()
+	messages := []ChatMessage{UserMessage("please " + strings.Repeat("application programming interface ", 64) + "implementation details")}
+	compressed, changed := autoCompressChatMessages(messages)
+	if changed != 1 {
+		t.Fatalf("compressed messages = %d, want 1", changed)
+	}
+	r.config.MaxSeqLen = contextWindowLimitFor(r, compressed, opts)
+	if original := len(r.renderMessages(messages, opts.SystemPrompt, opts.ActiveTools())); original <= r.config.MaxSeqLen-opts.MaxTokens-contextWindowSafetyTokens {
+		t.Fatal("test setup: original history unexpectedly fits")
+	}
+
+	got, info, err := r.PrepareChatContext(messages, opts)
+	if err != nil {
+		t.Fatalf("PrepareChatContext(autoCompress) error = %v", err)
+	}
+	if !reflect.DeepEqual(got, compressed) {
+		t.Fatalf("auto-compressed context:\n got: %#v\nwant: %#v", got, compressed)
+	}
+	if info.Mode != ContextWindowAutoCompress || info.CompressedMessages != 1 || info.DroppedMessages != 0 {
+		t.Fatalf("auto-compress info = %+v", info)
 	}
 }

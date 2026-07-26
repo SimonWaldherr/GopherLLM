@@ -335,6 +335,16 @@ format. The UI assets use no-store and same-origin security headers, so start
 the server on a trusted local address unless you add your own network security
 in front of it.
 
+The composer keeps the default path deliberately small: write a message,
+attach files, and send. **Pro tools** reveals quick controls for context mode,
+output length, and slash commands; the complete configuration remains in
+Settings. Any file type can be attached. Text files up to 500 KB are included
+as text in the model request; non-text files (images, audio, video, PDFs,
+archives, and other binaries) stay local to the browser and are shown as
+attachment cards. With the built-in text-only server, their filename, type,
+and size are sent as metadata rather than pretending that binary content was
+analysed.
+
 ### Smart context for long chats
 
 The browser UI defaults to **Smart — recent complete turns**. It retains the
@@ -346,13 +356,19 @@ them. The latest turn is never cut mid-message: if it alone cannot fit after
 reserving `max_tokens`, the request returns a clear error instead.
 
 The Settings panel reports the exact prompt token count and how many earlier
-messages remain saved locally. Choose **Full history — stop when full** for a
+messages remain saved locally. **Auto-compress — dense technical context**
+first condenses ordinary user, system, and assistant text with conservative
+terminology/abbreviation substitutions (for example, `application programming
+interface` → `API` and `zum Beispiel` → `z. B.`). It uses the condensed form
+only when the active model's tokenizer confirms that it is shorter, preserves
+tool payloads and fenced code unchanged, then applies the same complete-turn
+selection as Smart context. Choose **Full history — stop when full** for a
 strict, untrimmed transcript. This is also the default for normal API clients;
 the local extension is opt-in on `/v1/chat/completions`:
 
 ```json
 {
-  "gopherllm_context_mode": "recent"
+  "gopherllm_context_mode": "autoCompress"
 }
 ```
 
@@ -361,7 +377,7 @@ For a non-streaming recent-context request, the response includes
 input/retained/dropped message counts) and a `gopherllm_context` object. For
 streaming requests, that object is carried by the terminal SSE choice instead,
 so it always describes the final model call even after an internal skill/tool
-loop. Allowed values are `recent` and `full`.
+loop. Allowed values are `recent`, `autoCompress`, and `full`.
 
 ### Model context cache
 
@@ -411,6 +427,7 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | POST | `/api/embeddings` | Ollama-compatible embeddings |
 | GET | `/models` | Scan `--model-dir` and list discovered GGUFs, including each model's context length |
 | POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; response includes the loaded context length) |
+| POST | `/models/embed/load` | Load a compatible embedding GGUF for history RAG (`{"model": "<catalog-id>"}`); BERT, Nomic-BERT, and Granite Embedding models are supported |
 | GET / POST / DELETE | `/remote` | Inspect, configure, or clear an OpenAI-compatible chat proxy (the API key is write-only) |
 | GET | `/remote/models` | List models advertised by the configured remote API |
 | GET | `/autotune` | Report Auto Mode status: whether a tuning is active this session, whether one is cached on disk for this model+machine, and the result either way |
@@ -851,7 +868,7 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen3,
-gpt-oss, gemma, gemma2, gemma4, nemotron_h, nemotron_h_moe
+gpt-oss, gemma, gemma2, gemma4, nemotron_h, nemotron_h_moe, bert, nomic-bert
 ```
 
 qwen3 (including the DeepSeek-R1 Qwen3 distills) adds per-head QK-norm on top
@@ -888,6 +905,11 @@ QAT specifics, and per-family recommended sampling settings (e.g. Gemma:
 
 Projector files such as `mmproj-*` are detected and excluded from text-model
 selection.
+
+`bert` and `nomic-bert` are encoder-only architectures: they are available as
+embedding models for `/v1/embeddings` and history RAG, but intentionally cannot
+be selected for chat generation. This covers BERT-format Granite Embedding
+GGUFs as well as Nomic Embed GGUFs carrying `general.architecture = nomic-bert`.
 
 ## Development
 

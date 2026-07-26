@@ -53,6 +53,7 @@
           <span class="status-dot" aria-hidden="true"></span>
           <span id="statusText">Ready</span>
         </div>
+        <button id="briefChat" class="header-brief" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="briefing">Briefing</button>
         <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><span aria-hidden="true">⚙</span></button>
       </div>
     </header>
@@ -88,9 +89,17 @@
             aria-describedby="promptHint"
             aria-required="true"
           ></textarea>
+          <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
           <div class="prompt-footer">
-            <span id="promptHint">Local chat · <kbd>↵</kbd> sends</span>
-            <span id="contextEstimate">0 messages · ~0 input tokens</span>
+            <div class="prompt-footer-start">
+              <button id="attachFile" class="composer-button" type="button">Attach file</button>
+              <input id="fileInput" type="file" multiple hidden>
+              <span id="promptHint">Local chat · <kbd>↵</kbd> sends</span>
+            </div>
+            <div class="prompt-footer-end">
+              <button id="composerProToggle" class="composer-button" type="button" aria-expanded="false" aria-controls="composerProPanel">Pro tools</button>
+              <span id="contextEstimate">0 messages · ~0 input tokens</span>
+            </div>
           </div>
           <span id="promptCacheStatus" class="prompt-cache-status" aria-live="polite" hidden></span>
         </div>
@@ -98,10 +107,22 @@
           <button id="send" type="submit" aria-label="Send message" disabled><span aria-hidden="true">↑</span><span class="send-label">Send</span></button>
         </div>
       </div>
+      <div id="composerProPanel" class="composer-pro" hidden>
+        <label>Context
+          <select id="composerContextWindow" aria-label="Context window mode">
+            <option value="recent">Smart recent turns</option>
+            <option value="autoCompress">Auto-compress context</option>
+            <option value="full">Full history</option>
+          </select>
+        </label>
+        <label>Max output
+          <input id="composerMaxTokens" type="number" min="1" max="4096" inputmode="numeric" autocomplete="off">
+        </label>
+        <label class="composer-power"><input id="composerPowerCommands" type="checkbox"> Enable slash commands</label>
+        <button id="composerSettings" class="composer-button" type="button">All settings</button>
+      </div>
       <div class="composer-tools">
         <div class="composer-tools-start">
-          <button id="attachText" class="text-button" type="button">Add text file</button>
-          <input id="textFileInput" type="file" accept=".txt,.md,.markdown,.json,.csv,.go,.py,.js,.ts,.tsx,.jsx,.html,.css,.xml,.yaml,.yml,.toml,.log,text/plain,text/markdown,application/json,text/csv" hidden>
           <span id="editState" class="edit-state" hidden>Editing earlier message <button id="cancelEdit" type="button">Cancel</button></span>
         </div>
         <div class="composer-tools-end">
@@ -112,23 +133,70 @@
   </div>
 </div>
 
+<div id="briefing" class="settings" hidden>
+  <div class="settings-panel briefing-panel" role="dialog" aria-modal="true" aria-labelledby="briefingTitle">
+    <div class="settings-panel-head">
+      <div>
+        <h2 id="briefingTitle">Chat briefing</h2>
+        <p>A compact, paste-ready handoff for another AI or teammate.</p>
+      </div>
+      <button id="briefClose" class="icon-button" type="button" aria-label="Close chat briefing"><span aria-hidden="true">✕</span></button>
+    </div>
+    <div class="settings-panel-body">
+      <section class="briefing-intro">
+        <span class="settings-card-title">Transfer, not transcript</span>
+        <p>It captures goals, relevant facts, decisions, results, and open work. It does not change or add to this chat.</p>
+      </section>
+      <label class="toggle-row briefing-turn-toggle">
+        <input id="briefIncludeTurnLog" type="checkbox">
+        <span>Include a compact turn list <span class="field-note">useful for audits; off keeps the handoff concise</span></span>
+      </label>
+      <div class="briefing-output-wrap">
+        <label for="briefOutput">Generated briefing</label>
+        <textarea id="briefOutput" rows="14" readonly placeholder="Create a briefing when you are ready to hand this chat to another system."></textarea>
+        <p id="briefStatus" class="settings-note" aria-live="polite">Uses the active local chat model once. Nothing is sent outside this server.</p>
+      </div>
+    </div>
+    <div class="settings-panel-foot briefing-foot">
+      <button id="briefCopy" class="text-button" type="button" disabled>Copy briefing</button>
+      <div>
+        <button id="briefCloseDone" class="text-button" type="button">Close</button>
+        <button id="briefGenerate" class="autotune-run" type="button">Create briefing</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="settings" class="settings" hidden>
   <div class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
     <div class="settings-panel-head">
-      <h2 id="settingsTitle">Settings</h2>
+      <div>
+        <h2 id="settingsTitle">Settings</h2>
+        <p>Changes are saved to this chat automatically.</p>
+      </div>
       <button id="settingsClose" class="icon-button" type="button" aria-label="Close settings"><span aria-hidden="true">✕</span></button>
     </div>
     <div class="settings-panel-body">
-      <section class="settings-section">
-        <h3>Model</h3>
+      <section class="settings-section settings-model-section">
+        <div class="settings-section-head">
+          <div>
+            <h3>Model</h3>
+            <p>Choose the local model for this server.</p>
+          </div>
+        </div>
         <select id="modelSelect" aria-label="Select model">
           <option value="">{{.Model}}</option>
         </select>
       </section>
 
       <section class="settings-section">
-        <h3>This chat</h3>
-        <div class="settings-grid">
+        <div class="settings-section-head">
+          <div>
+            <h3>This chat</h3>
+            <p>Set the assistant’s role, response budget, and memory strategy.</p>
+          </div>
+        </div>
+        <div class="settings-primary-grid">
           <label>Persona
             <select id="personaSelect">
               <option value="custom">Custom</option>
@@ -144,94 +212,105 @@
           <label>Context window
             <select id="contextWindowMode">
               <option value="recent">Smart — recent complete turns</option>
+              <option value="autoCompress">Auto-compress — dense technical context</option>
               <option value="full">Full history — stop when full</option>
             </select>
           </label>
-          <label class="temperature-setting">Temperature
-            <input id="temperature" type="range" min="0" max="2" step="0.05" value="{{.Temperature}}">
-            <span id="tempValue" class="temp-value">{{.Temperature}}</span>
-          </label>
-          <label>Top P
-            <input id="topP" type="number" min="0" max="1" step="0.05" value="{{.TopP}}" inputmode="decimal" autocomplete="off">
-          </label>
-          <label>Top K
-            <input id="topK" type="number" min="0" max="200" step="1" value="{{.TopK}}" inputmode="numeric" autocomplete="off">
-          </label>
-          <label>Min P
-            <input id="minP" type="number" min="0" max="1" step="0.05" value="{{.MinP}}" inputmode="decimal" autocomplete="off">
-          </label>
-          <label>Repeat penalty
-            <input id="repeatPenalty" type="number" min="0" max="3" step="0.05" value="{{.RepeatPenalty}}" inputmode="decimal" autocomplete="off">
-          </label>
-          <label>Seed <span class="field-note">optional</span>
-            <input id="seed" type="number" min="0" step="1" placeholder="Random" inputmode="numeric" autocomplete="off">
-          </label>
-          <label class="wide-setting">Stop sequences <span class="field-note">optional, comma-separated</span>
-            <input id="stopSequences" type="text" placeholder="e.g. \n\nUser:, ###" autocomplete="off">
-          </label>
-          <label class="wide-setting">Instructions
-            <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
-          </label>
-          <label class="wide-setting rag-setting">
-            <span class="toggle-row">
-              <input id="ragMode" type="checkbox">
-              <span>RAG history search <span class="field-note">adds relevant saved messages as context</span></span>
-            </span>
-            <select id="ragModel" aria-label="Embedding model" disabled>
-              <option value="">No embedding model found</option>
-            </select>
-          </label>
         </div>
+        <label class="settings-instructions">Instructions
+          <span>Optional guidance that applies only to this chat.</span>
+          <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
+        </label>
         <p id="contextWindowStatus" class="settings-note" aria-live="polite"></p>
-        <p id="ragStatus" class="settings-note" hidden></p>
-        <p class="settings-note">Settings and instructions above belong to this chat. Token estimate is approximate; the model enforces its own context limit.</p>
+        <details class="settings-disclosure">
+          <summary><span>Memory &amp; retrieval</span><small>Search relevant messages from saved chats</small></summary>
+          <div class="settings-disclosure-body">
+            <div class="settings-memory">
+              <div>
+                <span class="settings-card-title">Memory search</span>
+                <p>Add relevant saved messages to the next reply.</p>
+              </div>
+              <label class="toggle-row">
+                <input id="ragMode" type="checkbox">
+                <span>Use RAG</span>
+              </label>
+              <select id="ragModel" aria-label="Embedding model" disabled>
+                <option value="">No compatible embedding model found</option>
+              </select>
+            </div>
+            <p id="ragStatus" class="settings-note" hidden></p>
+          </div>
+        </details>
+        <details class="settings-disclosure">
+          <summary><span>Advanced generation</span><small>Sampling, seed, and stop sequences</small></summary>
+          <div class="settings-grid settings-advanced-grid">
+            <label class="temperature-setting">Temperature
+              <input id="temperature" type="range" min="0" max="2" step="0.05" value="{{.Temperature}}">
+              <span id="tempValue" class="temp-value">{{.Temperature}}</span>
+            </label>
+            <label>Top P
+              <input id="topP" type="number" min="0" max="1" step="0.05" value="{{.TopP}}" inputmode="decimal" autocomplete="off">
+            </label>
+            <label>Top K
+              <input id="topK" type="number" min="0" max="200" step="1" value="{{.TopK}}" inputmode="numeric" autocomplete="off">
+            </label>
+            <label>Min P
+              <input id="minP" type="number" min="0" max="1" step="0.05" value="{{.MinP}}" inputmode="decimal" autocomplete="off">
+            </label>
+            <label>Repeat penalty
+              <input id="repeatPenalty" type="number" min="0" max="3" step="0.05" value="{{.RepeatPenalty}}" inputmode="decimal" autocomplete="off">
+            </label>
+            <label>Seed <span class="field-note">optional</span>
+              <input id="seed" type="number" min="0" step="1" placeholder="Random" inputmode="numeric" autocomplete="off">
+            </label>
+            <label class="wide-setting">Stop sequences <span class="field-note">optional, comma-separated</span>
+              <input id="stopSequences" type="text" placeholder="e.g. \n\nUser:, ###" autocomplete="off">
+            </label>
+          </div>
+        </details>
       </section>
 
-      <section class="settings-section autotune">
-        <div class="autotune-head">
-          <span class="autotune-title">Performance <span class="field-note">this server, not just this chat</span></span>
-          <label class="autotune-effort">
-            <span class="sr-only">Calibration effort</span>
-            <select id="autoTuneEffort" aria-label="Calibration effort">
-              <option value="quick">Quick (~10-20s)</option>
-              <option value="balanced" selected>Balanced (~1-2 min)</option>
-              <option value="thorough">Thorough (several min)</option>
-            </select>
-          </label>
-          <button id="autoTuneRun" class="autotune-run" type="button">Tune now</button>
-        </div>
-        <p id="autoTuneStatus" class="autotune-status">Checking current tuning…</p>
-      </section>
+      <details class="settings-disclosure settings-server-disclosure">
+        <summary><span>Performance</span><small>Server-wide tuning</small></summary>
+        <section class="autotune">
+          <div class="autotune-head">
+            <span class="autotune-title">Auto-tune <span class="field-note">affects this server, not just this chat</span></span>
+            <label class="autotune-effort">
+              <span class="sr-only">Calibration effort</span>
+              <select id="autoTuneEffort" aria-label="Calibration effort">
+                <option value="quick">Quick (~10-20s)</option>
+                <option value="balanced" selected>Balanced (~1-2 min)</option>
+                <option value="thorough">Thorough (several min)</option>
+              </select>
+            </label>
+            <button id="autoTuneRun" class="autotune-run" type="button">Tune now</button>
+          </div>
+          <p id="autoTuneStatus" class="autotune-status">Checking current tuning…</p>
+        </section>
+      </details>
 
       <p id="skillsNote" class="skills-note" hidden></p>
 
-      <section class="settings-section">
-        <h3>Data</h3>
-        <div class="settings-actions">
-          <button id="exportMarkdown" class="text-button" type="button">Export this chat</button>
-          <button id="exportChats" class="text-button" type="button">Export all chats (JSON)</button>
-          <button id="importChats" class="text-button" type="button">Import</button>
-          <input id="importInput" type="file" accept="application/json,.json" hidden>
-        </div>
-      </section>
-
-      <section class="settings-section">
-        <h3>Appearance</h3>
-        <label class="theme-picker">Theme
-          <select id="themeSelect" aria-label="Appearance">
-            <option value="system">System</option>
-            <option value="light">Light</option>
-            <option value="dark">Dark</option>
-            <option value="sepia">Sepia</option>
-            <option value="nord">Nord</option>
-            <option value="contrast">High contrast</option>
-            <option value="classic">Classic desktop</option>
-          </select>
-        </label>
-      </section>
-
-      <section class="settings-section">
-        <h3>Advanced</h3>
+      <details class="settings-disclosure">
+        <summary><span>Workspace &amp; appearance</span><small>Theme, exports, and power commands</small></summary>
+        <div class="settings-disclosure-body">
+          <label class="theme-picker">Theme
+            <select id="themeSelect" aria-label="Appearance">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+              <option value="sepia">Sepia</option>
+              <option value="nord">Nord</option>
+              <option value="contrast">High contrast</option>
+              <option value="classic">Classic desktop</option>
+            </select>
+          </label>
+          <div class="settings-actions">
+            <button id="exportMarkdown" class="text-button" type="button">Export this chat</button>
+            <button id="exportChats" class="text-button" type="button">Export all chats (JSON)</button>
+            <button id="importChats" class="text-button" type="button">Import</button>
+            <input id="importInput" type="file" accept="application/json,.json" hidden>
+          </div>
         <label class="toggle-row">
           <input id="powerCommands" type="checkbox">
           <span>Power commands <span class="field-note">type <kbd>/</kbd> in the message box</span></span>
@@ -246,7 +325,12 @@
             <input id="goalRounds" type="number" min="2" max="8" step="1" value="3" inputmode="numeric" autocomplete="off">
           </label>
         </div>
-      </section>
+        </div>
+      </details>
+    </div>
+    <div class="settings-panel-foot">
+      <span>Saved automatically</span>
+      <button id="settingsDone" class="autotune-run" type="button">Done</button>
     </div>
   </div>
 </div>

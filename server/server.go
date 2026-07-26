@@ -396,7 +396,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		messages := body.ChatMessages()
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			if contextMode == gopherllm.ContextWindowRecent {
+			if contextMode != gopherllm.ContextWindowFull {
 				effectiveOptions, _ := gopherllm.AgenticOptionsFor(options, skills)
 				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
 				if err != nil {
@@ -1121,7 +1121,10 @@ func (o OpenAIChatRequest) ContextWindowMode() (gopherllm.ContextWindowMode, err
 	if mode == gopherllm.ContextWindowRecent {
 		return gopherllm.ContextWindowRecent, nil
 	}
-	return "", fmt.Errorf("gopherllm_context_mode must be full or recent")
+	if mode == "autocompress" {
+		return gopherllm.ContextWindowAutoCompress, nil
+	}
+	return "", fmt.Errorf("gopherllm_context_mode must be full, recent, or autoCompress")
 }
 
 func (o OpenAIChatRequest) ChatMessages() []gopherllm.ChatMessage { return apiMessages(o.Messages) }
@@ -1361,7 +1364,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 // writeContextWindowHeaders exposes the exact rendered prompt accounting to
 // the bundled web UI without changing OpenAI's streaming event schema. They
-// are only emitted for the explicit recent-context extension.
+// are only emitted for explicit bounded-context extensions.
 func writeContextWindowHeaders(w http.ResponseWriter, info gopherllm.ContextWindowInfo) {
 	w.Header().Set("X-GopherLLM-Context-Mode", string(info.Mode))
 	w.Header().Set("X-GopherLLM-Context-Length", strconv.Itoa(info.ContextLength))
@@ -1370,6 +1373,7 @@ func writeContextWindowHeaders(w http.ResponseWriter, info gopherllm.ContextWind
 	w.Header().Set("X-GopherLLM-Context-Input-Messages", strconv.Itoa(info.InputMessages))
 	w.Header().Set("X-GopherLLM-Context-Retained-Messages", strconv.Itoa(info.RetainedMessages))
 	w.Header().Set("X-GopherLLM-Context-Dropped-Messages", strconv.Itoa(info.DroppedMessages))
+	w.Header().Set("X-GopherLLM-Context-Compressed-Messages", strconv.Itoa(info.CompressedMessages))
 }
 
 func ensureRequestID(w http.ResponseWriter, req *http.Request) string {

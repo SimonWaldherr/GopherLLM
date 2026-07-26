@@ -46,12 +46,12 @@ func TestSelectModelReportsAmbiguousTextMatches(t *testing.T) {
 }
 
 func TestArchitectureSupportedCoversImplementedLoaders(t *testing.T) {
-	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "qwen2", "gpt-oss", "gemma", "gemma2", "gemma4"} {
+	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "qwen2", "gpt-oss", "gemma", "gemma2", "gemma4", "bert", "nomic-bert"} {
 		if !ArchitectureSupported(arch) {
 			t.Fatalf("ArchitectureSupported(%q) = false, want true", arch)
 		}
 	}
-	for _, arch := range []string{"phi3", "deepseek2", "nomic-bert"} {
+	for _, arch := range []string{"phi3", "deepseek2"} {
 		if ArchitectureSupported(arch) {
 			t.Fatalf("ArchitectureSupported(%q) = true, want false", arch)
 		}

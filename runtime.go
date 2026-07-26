@@ -73,8 +73,9 @@ type GenerationOptions struct {
 	SystemPrompt  string
 	StopSequences []string
 	// ContextWindowMode controls whether an oversized chat history fails as it
-	// historically did (full, the zero-value behavior) or is reduced to the
-	// newest complete turns before rendering (recent).
+	// historically did (full, the zero-value behavior), is reduced to the
+	// newest complete turns before rendering (recent), or lexically condensed
+	// before applying that same complete-turn selection (autoCompress).
 	ContextWindowMode ContextWindowMode
 	// Tools lists the functions the model may call. When non-empty, it is
 	// rendered into the prompt using the active chat template's tool-calling
@@ -140,7 +141,7 @@ func (o GenerationOptions) Validate() error {
 		return fmt.Errorf("max_tokens must be greater than 0")
 	}
 	if !o.ContextWindowMode.valid() {
-		return fmt.Errorf("context_window_mode must be full or recent")
+		return fmt.Errorf("context_window_mode must be full, recent, or autoCompress")
 	}
 	if !finite32(o.Sampler.Temperature) || o.Sampler.Temperature < 0 {
 		return fmt.Errorf("temperature must be a finite number >= 0")
@@ -226,6 +227,7 @@ const (
 	loadedGptOss
 	loadedGemma4
 	loadedNemotronH
+	loadedBERT
 )
 
 // prefixCacheState owns no additional KV memory: it points at the retained
@@ -252,6 +254,7 @@ type Runner struct {
 	gptOss         GptOssWeights
 	gemma4         Gemma4Weights
 	nemotronH      NemotronHWeights
+	bert           BERTWeights
 	genLock        sync.Mutex
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
@@ -273,7 +276,7 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen3", "gpt-oss", "gemma", "gemma2", "gemma4", "nemotron_h", "nemotron_h_moe":
+		"qwen2", "qwen3", "gpt-oss", "gemma", "gemma2", "gemma4", "nemotron_h", "nemotron_h_moe", "bert", "nomic-bert":
 		return true
 	default:
 		return false
@@ -323,6 +326,12 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 	}
 	r := &Runner{gguf: gguf, arch: arch, tok: tok}
 	switch arch {
+	case "bert", "nomic-bert":
+		config, weights, err := LoadBERTModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		if err != nil {
+			return nil, err
+		}
+		r.config, r.bert, r.kind = config, weights, loadedBERT
 	case "nemotron_h", "nemotron_h_moe":
 		config, weights, err := LoadNemotronHModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
 		if err != nil {
@@ -430,6 +439,8 @@ func (r *Runner) releaseMetalWeights() {
 		return
 	}
 	switch r.kind {
+	case loadedBERT:
+		releaseBERTMetalWeights(&r.bert)
 	case loadedGptOss:
 		releaseModelMetalWeights(&r.gptOss.Standard)
 	case loadedGemma4:
@@ -472,6 +483,9 @@ func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOp
 func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
+	if r.kind == loadedBERT {
+		return GenerationResult{}, fmt.Errorf("%s is an embedding model and cannot generate chat completions", r.arch)
+	}
 	if err := options.Validate(); err != nil {
 		return GenerationResult{}, err
 	}
@@ -484,7 +498,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// HTTP handler. Agentic requests append assistant tool calls and tool
 	// results between iterations; each subsequent model call must be budgeted
 	// against those effective messages and active tools as well.
-	if normalizedContextWindowMode(options.ContextWindowMode) == ContextWindowRecent {
+	if normalizedContextWindowMode(options.ContextWindowMode) != ContextWindowFull {
 		prepared, info, err := r.PrepareChatContext(messages, options)
 		if err != nil {
 			return GenerationResult{}, err
@@ -1078,6 +1092,9 @@ func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token ui
 func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
+	if r.kind == loadedBERT {
+		return r.embedBERT(text)
+	}
 	// Embeddings reuse the same scratch KV workspace but have unrelated token
 	// positions, so they must never overwrite a live chat-prefix cache.
 	r.clearPrefixCache()

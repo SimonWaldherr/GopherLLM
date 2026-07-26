@@ -94,6 +94,17 @@ func TestOpenAIRecentContextIsOptIn(t *testing.T) {
 		t.Fatalf("non-streaming response omitted cache metadata: %s", recent.Body.String())
 	}
 
+	autoCompressed := post("autoCompress", false)
+	if autoCompressed.Code != http.StatusOK {
+		t.Fatalf("auto-compress request status = %d, want %d body=%s", autoCompressed.Code, http.StatusOK, autoCompressed.Body.String())
+	}
+	if got := autoCompressed.Header().Get("X-GopherLLM-Context-Mode"); got != "autoCompress" {
+		t.Fatalf("auto-compress context mode header = %q, want autoCompress", got)
+	}
+	if !strings.Contains(autoCompressed.Body.String(), `"compressed_messages"`) {
+		t.Fatalf("auto-compress response omitted compression metadata: %s", autoCompressed.Body.String())
+	}
+
 	stream := post("recent", true)
 	if stream.Code != http.StatusOK {
 		t.Fatalf("recent streaming request status = %d, want %d", stream.Code, http.StatusOK)

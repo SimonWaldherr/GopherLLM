@@ -1,6 +1,9 @@
 package gopherllm
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // ContextWindowMode controls how a request behaves when its rendered chat
 // history would crowd out the model's context window. The zero value keeps the
@@ -14,6 +17,10 @@ const (
 	// ContextWindowRecent retains the newest complete user turn(s), dropping
 	// older complete turns only when necessary to reserve room for generation.
 	ContextWindowRecent ContextWindowMode = "recent"
+	// ContextWindowAutoCompress first applies a loss-aware lexical compression
+	// to ordinary chat messages, then retains newest complete turns only when
+	// the compressed history still exceeds the context budget.
+	ContextWindowAutoCompress ContextWindowMode = "autoCompress"
 )
 
 // contextWindowSafetyTokens leaves room for template bookkeeping and the
@@ -24,17 +31,18 @@ const contextWindowSafetyTokens = 8
 // request. The UI uses it to explain that older messages remain saved locally
 // even when they were not sent to the model for this reply.
 type ContextWindowInfo struct {
-	Mode             ContextWindowMode `json:"mode"`
-	ContextLength    int               `json:"context_length"`
-	PromptBudget     int               `json:"prompt_budget"`
-	PromptTokens     int               `json:"prompt_tokens"`
-	InputMessages    int               `json:"input_messages"`
-	RetainedMessages int               `json:"retained_messages"`
-	DroppedMessages  int               `json:"dropped_messages"`
+	Mode               ContextWindowMode `json:"mode"`
+	ContextLength      int               `json:"context_length"`
+	PromptBudget       int               `json:"prompt_budget"`
+	PromptTokens       int               `json:"prompt_tokens"`
+	InputMessages      int               `json:"input_messages"`
+	RetainedMessages   int               `json:"retained_messages"`
+	DroppedMessages    int               `json:"dropped_messages"`
+	CompressedMessages int               `json:"compressed_messages"`
 }
 
 func (m ContextWindowMode) valid() bool {
-	return m == "" || m == ContextWindowFull || m == ContextWindowRecent
+	return m == "" || m == ContextWindowFull || m == ContextWindowRecent || m == ContextWindowAutoCompress
 }
 
 func normalizedContextWindowMode(m ContextWindowMode) ContextWindowMode {
@@ -45,8 +53,8 @@ func normalizedContextWindowMode(m ContextWindowMode) ContextWindowMode {
 }
 
 // PrepareChatContext selects the messages that fit the requested context mode
-// using the model's actual tokenizer and chat template. ContextWindowRecent
-// never splits a user turn: an assistant tool-call and all of its tool results
+// using the model's actual tokenizer and chat template. The bounded modes
+// never split a user turn: an assistant tool-call and all of its tool results
 // stay with the user message that caused them, so the model never receives an
 // orphaned tool result or a dangling tool call.
 //
@@ -62,7 +70,7 @@ func (r *Runner) PrepareChatContext(messages []ChatMessage, options GenerationOp
 		InputMessages: len(messages),
 	}
 	if !mode.valid() {
-		return nil, info, fmt.Errorf("context_window_mode must be full or recent")
+		return nil, info, fmt.Errorf("context_window_mode must be full, recent, or autoCompress")
 	}
 	if r.config.MaxSeqLen <= 0 {
 		return nil, info, fmt.Errorf("model has an invalid context length (%d)", r.config.MaxSeqLen)
@@ -75,15 +83,27 @@ func (r *Runner) PrepareChatContext(messages []ChatMessage, options GenerationOp
 		return messages, info, nil
 	}
 
+	working := messages
+	if mode == ContextWindowAutoCompress {
+		compressed, changed := autoCompressChatMessages(messages)
+		// Compression is only useful when the loaded model's actual tokenizer
+		// agrees that it saves prompt tokens. This avoids trading clear prose for
+		// abbreviations that happen to tokenize less efficiently.
+		if changed > 0 && len(r.renderMessages(compressed, options.SystemPrompt, options.ActiveTools())) < len(r.renderMessages(messages, options.SystemPrompt, options.ActiveTools())) {
+			working = compressed
+			info.CompressedMessages = changed
+		}
+	}
+
 	reserve := max(1, options.MaxTokens) + contextWindowSafetyTokens
 	info.PromptBudget = r.config.MaxSeqLen - reserve
 	if info.PromptBudget < 1 {
 		return nil, info, fmt.Errorf("context length %d cannot reserve %d completion tokens plus safety margin", r.config.MaxSeqLen, reserve)
 	}
 
-	pinned, turns, newestUserTurn := chatContextTurns(messages)
+	pinned, turns, newestUserTurn := chatContextTurns(working)
 	if newestUserTurn < 0 {
-		return nil, info, fmt.Errorf("recent context mode requires at least one user message")
+		return nil, info, fmt.Errorf("bounded context mode requires at least one user message")
 	}
 
 	var kept []ChatMessage
@@ -106,6 +126,66 @@ func (r *Runner) PrepareChatContext(messages []ChatMessage, options GenerationOp
 	info.RetainedMessages = len(kept)
 	info.DroppedMessages = len(messages) - len(kept)
 	return kept, info, nil
+}
+
+// autoCompressionTerms converts common long-form expressions into established
+// technical terms or abbreviations. This deliberately operates only on normal
+// conversational text; tool payloads and fenced code are opaque data whose
+// syntax must never be rewritten.
+var autoCompressionTerms = strings.NewReplacer(
+	"as soon as possible", "ASAP",
+	"for example", "e.g.",
+	"that is to say", "i.e.",
+	"in other words", "i.e.",
+	"application programming interface", "API",
+	"large language model", "LLM",
+	"retrieval augmented generation", "RAG",
+	"context window", "ctx window",
+	"zum Beispiel", "z. B.",
+	"das heißt", "d. h.",
+	"beziehungsweise", "bzw.",
+	"unter anderem", "u. a.",
+	"im Hinblick auf", "bzgl.",
+	"künstliche Intelligenz", "KI",
+	"maschinelles Lernen", "ML",
+	"großes Sprachmodell", "LLM",
+	"Anwendungsprogrammierschnittstelle", "API",
+)
+
+// autoCompressChatMessages returns a same-shaped history so existing turn and
+// tool-call grouping remains valid. It is intentionally conservative: a
+// transformed message must be shorter, and the caller additionally verifies
+// a real token reduction before using the returned history.
+func autoCompressChatMessages(messages []ChatMessage) ([]ChatMessage, int) {
+	compressed := append([]ChatMessage(nil), messages...)
+	changed := 0
+	for i, message := range messages {
+		if message.Role == ChatRoleTool || len(message.ToolCalls) != 0 || strings.Contains(message.Content, "```") {
+			continue
+		}
+		content := autoCompressMessage(message.Content)
+		if content != "" && len(content) < len(message.Content) {
+			compressed[i].Content = content
+			changed++
+		}
+	}
+	return compressed, changed
+}
+
+func autoCompressMessage(content string) string {
+	content = strings.Join(strings.Fields(content), " ")
+	if content == "" {
+		return ""
+	}
+	content = autoCompressionTerms.Replace(content)
+	for _, prefix := range []string{
+		"please ", "Please ", "could you ", "Could you ",
+		"I would like you to ", "Bitte ", "bitte ",
+		"Könntest du ", "könntest du ", "Ich möchte gerne, dass du ",
+	} {
+		content = strings.TrimPrefix(content, prefix)
+	}
+	return strings.TrimSpace(content)
 }
 
 // chatContextTurns keeps leading system instructions pinned. Every later user
