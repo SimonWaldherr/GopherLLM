@@ -290,16 +290,20 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
 
 Open `http://127.0.0.1:8080/chat` for the browser UI.
 
-You can also start without loading any weights and choose a discovered GGUF
-later in the browser's model picker (or with `POST /models/load`):
+The server remembers the last successfully loaded **local** GGUF (whether it
+was selected at startup or through the browser/API model picker). Restart it
+without `--model` and it automatically reloads that model:
 
 ```sh
 bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
   --serve 127.0.0.1:8080 --chat
 ```
 
-Until a model is chosen, catalog and UI routes remain available while inference
-routes return `503 Service Unavailable` with a clear explanation.
+An explicit `--model` overrides the remembered selection. If there is no saved
+model, or its file is no longer available, the server starts without weights so
+you can choose a discovered GGUF later in the browser's model picker (or with
+`POST /models/load`). Until then, catalog and UI routes remain available while
+inference routes return `503 Service Unavailable` with a clear explanation.
 
 ### OpenAI-compatible remote APIs
 

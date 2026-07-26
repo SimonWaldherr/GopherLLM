@@ -121,9 +121,13 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runner.Close()
+	var recorded []string
 	srv := httptest.NewServer(NewHandler(runner, HandlerOptions{
 		ModelDir:  " " + modelDir + " ", // whitespace is normalized at the boundary.
 		ModelPath: allowedPath,
+		ModelLoaded: func(path string) {
+			recorded = append(recorded, path)
+		},
 	}))
 	defer srv.Close()
 
@@ -191,6 +195,9 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 		t.Fatalf("catalog path load status = %d body=%s", resp.StatusCode, body)
 	}
 	resp.Body.Close()
+	if len(recorded) != 2 || recorded[0] != allowedPath || recorded[1] != allowedPath {
+		t.Fatalf("recorded loaded paths = %#v", recorded)
+	}
 }
 
 func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {

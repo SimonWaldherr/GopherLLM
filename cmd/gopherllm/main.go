@@ -32,7 +32,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
 	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
-	fmt.Fprintln(os.Stderr, "                           With --serve, a model is optional: choose one later in the Web UI")
+	fmt.Fprintln(os.Stderr, "                           With --serve, resumes the last local model unless --model is given")
 	fmt.Fprintln(os.Stderr, "  --max-connections <N>     Max concurrent server connections")
 	fmt.Fprintln(os.Stderr, "  --max-tokens <N>          Max tokens to generate (default: 256)")
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
@@ -156,6 +156,19 @@ func run() error {
 	if cfg.kernelBenchRuns <= 0 {
 		return fmt.Errorf("--kernel-bench-runs must be greater than 0")
 	}
+	// A model selected by a previous server session is a better default than an
+	// interactive picker: a restart should resume serving without intervention.
+	// An explicit --model always wins, and an unusable saved path leaves the
+	// server in its existing no-model state so the browser/API picker remains
+	// available.
+	if cfg.modelSelector == nil && cfg.serveAddr != "" {
+		if path, err := loadLastServerModel(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not resume the last server model: %v\n", err)
+		} else if path != "" {
+			cfg.modelSelector = &path
+			fmt.Fprintf(os.Stderr, "Resuming last server model: %s\n", path)
+		}
+	}
 	// A server with a model catalog is useful before any weights are loaded:
 	// the browser can show its model picker immediately and POST /models/load
 	// performs the first load. Non-server commands retain the existing model
@@ -245,7 +258,8 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning})
+		recordLastServerModel(modelPath)
+		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastServerModel})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)

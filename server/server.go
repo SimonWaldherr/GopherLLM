@@ -182,6 +182,10 @@ type HandlerOptions struct {
 	ModelDir string
 	// ModelPath is the initially loaded model's path (reported by /models).
 	ModelPath string
+	// ModelLoaded is called after a local model has been successfully loaded or
+	// hot-swapped. It is useful for hosts that persist the active selection.
+	// Callback failures are the host's responsibility and never undo a load.
+	ModelLoaded func(path string)
 	// SkillsDir, if set, is scanned once at handler construction for SKILL.md
 	// files (see skills.go). Every chat/generate endpoint offers a load_skill
 	// tool and resolves it server-side via gopherllm.RunAgenticChat.
@@ -230,6 +234,7 @@ type ServeOptions struct {
 	ChatHistoryLock          *sync.Mutex
 	ModelDir                 string
 	ModelPath                string
+	ModelLoaded              func(path string)
 	SkillsDir                string
 	// AppliedAutoTune carries forward a tuning already applied before Serve
 	// was called (e.g. by --auto), so GET /autotune reports it from the start.
@@ -259,6 +264,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		ChatUI:                opts.ChatUI,
 		ModelDir:              opts.ModelDir,
 		ModelPath:             opts.ModelPath,
+		ModelLoaded:           opts.ModelLoaded,
 		SkillsDir:             opts.SkillsDir,
 		AppliedAutoTune:       opts.AppliedAutoTune,
 		BaselineRuntimeTuning: opts.BaselineRuntimeTuning,
@@ -310,6 +316,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 	remote := newRemoteState()
 	sem := make(chan struct{}, opts.MaxConcurrentRequests)
 	var autoTuneMu sync.Mutex
+	// Serializes replacement plus its host callback. This prevents two nearly
+	// simultaneous hot-swaps from recording the models out of their actual
+	// swap order (for example, in a host that persists the active model).
+	var modelLoadMu sync.Mutex
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get()), "remote": remote.enabled()})
@@ -717,7 +727,14 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		state.swap(newRunner, entry.Path)
+		func() {
+			modelLoadMu.Lock()
+			defer modelLoadMu.Unlock()
+			state.swap(newRunner, entry.Path)
+			if opts.ModelLoaded != nil {
+				opts.ModelLoaded(entry.Path)
+			}
+		}()
 		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.Config().MaxSeqLen})
 	}))
 	mux.HandleFunc("/models/embed/load", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {

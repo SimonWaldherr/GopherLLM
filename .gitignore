@@ -1,6 +1,6 @@
 bin/
 .cache/
-gopherllm
+/gopherllm
 *.gguf
 scratch/p.prof
 /rag
