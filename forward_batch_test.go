@@ -210,10 +210,18 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 	}
 
 	q4kData := make([]byte, 0, rows*(cols/256)*144)
+	q5kData := make([]byte, rows*(cols/256)*176)
 	q6kData := make([]byte, 0, rows*(cols/256)*210)
 	for r := 0; r < rows; r++ {
 		q4kData = append(q4kData, randomQ4KRow(rng, cols)...)
 		q6kData = append(q6kData, randomQ6KRow(rng, cols)...)
+	}
+	for block := 0; block < len(q5kData)/176; block++ {
+		base := block * 176
+		q5kData[base+1] = 0x3c // f16 1.0 scale
+		for i := 4; i < 176; i++ {
+			q5kData[base+i] = byte(rng.Intn(256))
+		}
 	}
 	legacyData := func(blockBytes int) []byte {
 		out := make([]byte, rows*(cols/32)*blockBytes)
@@ -227,13 +235,38 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 		}
 		return out
 	}
+	iq4XSData := func() []byte {
+		out := make([]byte, rows*(cols/256)*136)
+		for block := 0; block < len(out)/136; block++ {
+			base := block * 136
+			out[base+1] = 0x3c // f16 1.0 base scale
+			for i := 2; i < 136; i++ {
+				out[base+i] = byte(rng.Intn(256))
+			}
+		}
+		return out
+	}
+	mxfp4Data := func() []byte {
+		out := make([]byte, rows*(cols/32)*17)
+		for block := 0; block < len(out)/17; block++ {
+			base := block * 17
+			for i := 0; i < 16; i++ {
+				out[base+i] = byte(rng.Intn(256))
+			}
+			out[base+16] = 127 // scale 1; avoids overflow in differential checks.
+		}
+		return out
+	}
 
 	weights := map[string]Weight{
-		"f32":  {F32: randomVec(rng, rows*cols)},
-		"q4_0": {Raw: legacyData(18), Type: GGMLTypeQ4_0, Rows: rows, Cols: cols},
-		"q8_0": {Raw: legacyData(34), Type: GGMLTypeQ8_0, Rows: rows, Cols: cols},
-		"q4k":  {Raw: q4kData, Type: GGMLTypeQ4_K, Rows: rows, Cols: cols},
-		"q6k":  {Raw: q6kData, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols},
+		"f32":   {F32: randomVec(rng, rows*cols)},
+		"q4_0":  {Raw: legacyData(18), Type: GGMLTypeQ4_0, Rows: rows, Cols: cols},
+		"q8_0":  {Raw: legacyData(34), Type: GGMLTypeQ8_0, Rows: rows, Cols: cols},
+		"iq4xs": {Raw: iq4XSData(), Type: GGMLTypeIQ4_XS, Rows: rows, Cols: cols},
+		"q4k":   {Raw: q4kData, Type: GGMLTypeQ4_K, Rows: rows, Cols: cols},
+		"q5k":   {Raw: q5kData, Type: GGMLTypeQ5_K, Rows: rows, Cols: cols},
+		"q6k":   {Raw: q6kData, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols},
+		"mxfp4": {Raw: mxfp4Data(), Type: GGMLTypeMXFP4, Rows: rows, Cols: cols},
 	}
 
 	for name, w := range weights {
@@ -261,6 +294,47 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSameTypeQ4_0FusionMatchesSeparateMatvecs(t *testing.T) {
+	rng := rand.New(rand.NewSource(41))
+	const cols = 64
+	makeWeight := func(rows int) Weight {
+		data := make([]byte, rows*(cols/32)*18)
+		for block := 0; block < len(data)/18; block++ {
+			base := block * 18
+			data[base+1] = 0x3c // f16 1.0
+			for i := 2; i < 18; i++ {
+				data[base+i] = byte(rng.Intn(256))
+			}
+		}
+		return Weight{Raw: data, Type: GGMLTypeQ4_0, Rows: rows, Cols: cols}
+	}
+	a, b, c := makeWeight(7), makeWeight(5), makeWeight(3)
+	x := randomVec(rng, cols)
+	withQ8Activations(false, func() {
+		wantA, wantB, wantC := a.Matvec(x), b.Matvec(x), c.Matvec(x)
+		gotA, gotB, gotC := []float32{}, []float32{}, []float32{}
+		if !tryMatvec3Into(a, b, c, x, &[]float32{}, &gotA, &gotB, &gotC) {
+			t.Fatal("same-type Q4_0 fusion declined valid weights")
+		}
+		for name, got := range map[string][]float32{"a": gotA, "b": gotB, "c": gotC} {
+			var want []float32
+			switch name {
+			case "a":
+				want = wantA
+			case "b":
+				want = wantB
+			default:
+				want = wantC
+			}
+			for i := range want {
+				if d := math.Abs(float64(got[i] - want[i])); d > 1e-5*math.Max(1, math.Abs(float64(want[i]))) {
+					t.Fatalf("%s[%d]: fused=%v separate=%v", name, i, got[i], want[i])
+				}
+			}
+		}
+	})
 }
 
 func buildTinyFusedLlamaGGUF() []byte {

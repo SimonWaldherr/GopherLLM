@@ -1541,6 +1541,13 @@ func DequantRowQ4KInto(row []byte, cols int, out []float32) {
 
 func DequantRowQ5K(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ5KInto(row, cols, out)
+	return out
+}
+
+// DequantRowQ5KInto decodes a Q5_K row into caller-owned storage. Token
+// embedding lookup and batched prefill use it to avoid a throwaway row slice.
+func DequantRowQ5KInto(row []byte, cols int, out []float32) {
 	for b := range cols / 256 {
 		base := b * 176
 		if base+176 > len(row) {
@@ -1580,7 +1587,6 @@ func DequantRowQ5K(row []byte, cols int) []float32 {
 			u2 <<= 2
 		}
 	}
-	return out
 }
 
 func DequantRowQ6K(row []byte, cols int) []float32 {
@@ -1621,6 +1627,13 @@ func DequantRowQ6KInto(row []byte, cols int, out []float32) {
 
 func DequantRowMXFP4(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowMXFP4Into(row, cols, out)
+	return out
+}
+
+// DequantRowMXFP4Into is the allocation-free MXFP4 row decoder used by
+// RowInto and prompt batching.
+func DequantRowMXFP4Into(row []byte, cols int, out []float32) {
 	for b := range cols / 32 {
 		base := b * 17
 		if base+17 > len(row) {
@@ -1637,7 +1650,6 @@ func DequantRowMXFP4(row []byte, cols int) []float32 {
 			outBlock[i*2+1] = scale * mxfp4LUT[v>>4]
 		}
 	}
-	return out
 }
 
 func getScaleMinK4(j int, q []byte) (byte, byte) {

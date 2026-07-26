@@ -71,9 +71,10 @@ type Config struct {
 	AttnLogitSoftcap  float32
 	FinalLogitSoftcap float32
 	SWAPattern        []bool
-	// Nemotron-H / Soofi S hybrid Mamba-2 configuration. These fields are
-	// unused by the standard transformer path. A zero-valued per-layer entry
-	// means that the layer does not expose that component.
+	// Mamba-2 configuration used by the pure Mamba2 and hybrid Nemotron-H
+	// paths. These fields are unused by the standard transformer path. A
+	// zero-valued per-layer entry means that the layer does not expose that
+	// component.
 	LayerHeads            []int
 	LayerKVHeads          []int
 	LayerFFNDim           []int
@@ -204,7 +205,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
-	if p == "nemotron_h" || p == "nemotron_h_moe" {
+	if p == "nemotron_h" || p == "nemotron_h_moe" || p == "mamba2" {
 		cfg.LayerHeads = u32ArrayAsInts(gguf, p+".attention.head_count")
 		cfg.LayerKVHeads = u32ArrayAsInts(gguf, p+".attention.head_count_kv")
 		cfg.LayerFFNDim = u32ArrayAsInts(gguf, p+".feed_forward_length")
@@ -303,6 +304,8 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeIQ4_NL:
 		MatvecIQ4NLInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ4_XS:
+		MatvecIQ4XSInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_1:
 		MatvecQ4_1Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ5_0:
@@ -379,10 +382,7 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 		ScaleF32(xs, 32)
 		tok, ok := argmaxQ6KRowsQ8(w.Raw, x, xs, w.Rows, w.Cols, rowBytes)
 		if !ok {
-			tok = argmaxMatvecRows(w.Rows, func(row int) float32 {
-				off := row * rowBytes
-				return dotQ6KF32SIMDWithXSums(w.Raw[off:off+rowBytes], x, xs, w.Cols)
-			})
+			tok = argmaxQ6KRowsWithXSums(w.Raw, x, xs, w.Rows, w.Cols, rowBytes)
 		}
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
@@ -390,6 +390,51 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// argmaxQ6KRowsWithXSums is the f32-activation counterpart of the amd64
+// Q8-activation greedy path. It keeps the Q6_K row dot directly in the loop
+// instead of passing it through argmaxMatvecRows' function value: on ARM64
+// that removes an indirect call for every vocabulary row while preserving the
+// exact floating-point dot product, finite-value filtering, and lowest-token
+// tie behavior. xsums must already include the Q6_K offset factor (×32).
+func argmaxQ6KRowsWithXSums(data []byte, x, xsums []float32, rows, cols, rowBytes int) uint32 {
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for row := start; row < end; row++ {
+			off := row * rowBytes
+			var v float32
+			if hasQuantSIMD {
+				v = dotQ6KF32SIMDWithXSums(data[off:off+rowBytes], x, xsums, cols)
+			} else {
+				v = DotQ6KF32(data[off:off+rowBytes], x, cols)
+			}
+			if !finiteLogit(v) {
+				continue
+			}
+			// Rows are visited in ascending order; strict > retains the
+			// lowest row index within a worker. The reduction below retains it
+			// globally too, matching argmaxFiniteToken.
+			if !localFound || v > localValue {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken)
 }
 
 func argmaxMatvecRows(rows int, dot func(row int) float32) uint32 {
@@ -444,13 +489,16 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	switch w.Type {
 	case GGMLTypeQ8_0:
 		rowBytes := (cols / 32) * 34
-		copy(*out, DequantRowQ8_0(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+		DequantRowQ8_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_0:
 		rowBytes := (cols / 32) * 18
-		copy(*out, DequantRowQ4_0(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+		DequantRowQ4_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeIQ4_NL:
 		rowBytes := (cols / 32) * 18
 		DequantRowIQ4NLInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ4_XS:
+		rowBytes := (cols / 256) * 136
+		DequantRowIQ4XSInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_1:
 		rowBytes := (cols / 32) * 20
 		DequantRowQ4_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
@@ -474,16 +522,16 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 		DequantRowQ3KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_K:
 		rowBytes := (cols / 256) * 144
-		copy(*out, DequantRowQ4K(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+		DequantRowQ4KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ5_K:
 		rowBytes := (cols / 256) * 176
-		copy(*out, DequantRowQ5K(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+		DequantRowQ5KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ6_K:
 		rowBytes := (cols / 256) * 210
-		copy(*out, DequantRowQ6K(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+		DequantRowQ6KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeMXFP4:
 		rowBytes := (cols / 32) * 17
-		copy(*out, DequantRowMXFP4(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+		DequantRowMXFP4Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	default:
 		panic(fmt.Sprintf("unsupported quantized row extraction: %v", w.Type))
 	}
@@ -614,8 +662,8 @@ type KVCache struct {
 	// and attention converts rows in-register (see kv_f16.go). Halves the
 	// cache's memory footprint and the bytes attention streams per token.
 	F16 bool
-	// Nemotron is present only for hybrid Mamba-2 architectures. K/V remains
-	// in this cache; the companion stores the recurrent convolution/SSM state.
+	// Nemotron is the shared recurrent cache for Mamba-2 graphs. Hybrid
+	// Nemotron-H also uses K/V rows; pure Mamba2 leaves those dimensions empty.
 	Nemotron *NemotronHCache
 	K16      [][]uint16
 	V16      [][]uint16
@@ -1253,7 +1301,7 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			f[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
 		}
 		return Weight{F32: f}, nil
-	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
+	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeIQ4_XS, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
 		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
 		if forceF32 {
 			f, ok := dequantTensor(info.DType, raw, numel)
@@ -1299,6 +1347,8 @@ func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
 		return DequantRowQ4_0(raw, numel), true
 	case GGMLTypeIQ4_NL:
 		return DequantRowIQ4NL(raw, numel), true
+	case GGMLTypeIQ4_XS:
+		return DequantRowIQ4XS(raw, numel), true
 	case GGMLTypeQ4_1:
 		return DequantRowQ4_1(raw, numel), true
 	case GGMLTypeQ5_0:
@@ -1764,7 +1814,7 @@ func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v
 	case GGMLTypeQ6_K:
 		return MatvecQ6K3Into(wq.Raw, wq.Rows, wq.Cols, wk.Raw, wk.Rows, wk.Cols, wv.Raw, wv.Rows, wv.Cols, x, q, k, v)
 	default:
-		return false
+		return matvecSameType3Into(wq, wk, wv, x, q, k, v)
 	}
 }
 
@@ -1824,7 +1874,110 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 	case GGMLTypeQ6_K:
 		return MatvecQ6K2Into(a.Raw, a.Rows, a.Cols, b.Raw, b.Rows, b.Cols, x, aOut, bOut)
 	default:
+		return matvecSameType2Into(a, b, x, aOut, bOut)
+	}
+}
+
+// matvecSameType{2,3}Into fuse ordinary same-format projections into one
+// worker-pool dispatch. Unlike the Q4_K/Q6_K specializations above they do
+// not share activation preprocessing; they avoid only the repeated channel
+// dispatch. That is still valuable for Q4_0-heavy StableLM/InternLM GGUFs,
+// whose Q/K/V and gate/up projections otherwise launch independently.
+func matvecSameType2Into(a, b Weight, x []float32, aOut, bOut *[]float32) bool {
+	dot, rowBytes, ok := sameTypeQuantDot(a, b, x)
+	if !ok {
 		return false
+	}
+	ensureLenNoClear(aOut, a.Rows)
+	ensureLenNoClear(bOut, b.Rows)
+	total := a.Rows + b.Rows
+	parallelRows(total, func(start, end int) {
+		if as, ae := clippedRange(start, end, 0, a.Rows); as < ae {
+			matvecDotRows(a.Raw, rowBytes, x, as, ae, *aOut, dot)
+		}
+		if bs, be := clippedRange(start, end, a.Rows, total); bs < be {
+			matvecDotRows(b.Raw, rowBytes, x, bs-a.Rows, be-a.Rows, *bOut, dot)
+		}
+	})
+	return true
+}
+
+func matvecSameType3Into(a, b, c Weight, x []float32, aOut, bOut, cOut *[]float32) bool {
+	dot, rowBytes, ok := sameTypeQuantDot(a, b, x)
+	if !ok || c.F32 != nil || c.Type != a.Type || c.Cols != a.Cols || c.Rows < 0 || len(c.Raw) < c.Rows*rowBytes {
+		return false
+	}
+	ensureLenNoClear(aOut, a.Rows)
+	ensureLenNoClear(bOut, b.Rows)
+	ensureLenNoClear(cOut, c.Rows)
+	ab := a.Rows + b.Rows
+	total := ab + c.Rows
+	parallelRows(total, func(start, end int) {
+		if as, ae := clippedRange(start, end, 0, a.Rows); as < ae {
+			matvecDotRows(a.Raw, rowBytes, x, as, ae, *aOut, dot)
+		}
+		if bs, be := clippedRange(start, end, a.Rows, ab); bs < be {
+			matvecDotRows(b.Raw, rowBytes, x, bs-a.Rows, be-a.Rows, *bOut, dot)
+		}
+		if cs, ce := clippedRange(start, end, ab, total); cs < ce {
+			matvecDotRows(c.Raw, rowBytes, x, cs-ab, ce-ab, *cOut, dot)
+		}
+	})
+	return true
+}
+
+type quantRowDot func(row []byte, x []float32, cols int) float32
+
+func sameTypeQuantDot(a, b Weight, x []float32) (quantRowDot, int, bool) {
+	if a.F32 != nil || b.F32 != nil || a.Type != b.Type || a.Cols <= 0 || a.Cols != b.Cols || a.Cols != len(x) || a.Rows < 0 || b.Rows < 0 {
+		return nil, 0, false
+	}
+	rowBytes, ok := a.Type.DataSize(a.Cols)
+	if !ok || rowBytes <= 0 || len(a.Raw) < a.Rows*rowBytes || len(b.Raw) < b.Rows*rowBytes {
+		return nil, 0, false
+	}
+	var dot quantRowDot
+	switch a.Type {
+	case GGMLTypeQ8_0:
+		dot = DotQ8_0F32
+	case GGMLTypeQ4_0:
+		dot = DotQ4_0F32
+	case GGMLTypeIQ4_NL:
+		dot = DotIQ4NLF32
+	case GGMLTypeIQ4_XS:
+		dot = DotIQ4XSF32
+	case GGMLTypeQ4_1:
+		dot = DotQ4_1F32
+	case GGMLTypeQ5_0:
+		dot = DotQ5_0F32
+	case GGMLTypeQ5_1:
+		dot = DotQ5_1F32
+	case GGMLTypeQ8_1:
+		dot = DotQ8_1F32
+	case GGMLTypeQ8_K:
+		dot = DotQ8KF32
+	case GGMLTypeQ2_K:
+		dot = DotQ2KF32
+	case GGMLTypeQ3_K:
+		dot = DotQ3KF32
+	case GGMLTypeQ4_K:
+		dot = DotQ4KF32
+	case GGMLTypeQ5_K:
+		dot = DotQ5KF32
+	case GGMLTypeQ6_K:
+		dot = DotQ6KF32
+	case GGMLTypeMXFP4:
+		dot = DotMXFP4F32
+	default:
+		return nil, 0, false
+	}
+	return dot, rowBytes, true
+}
+
+func matvecDotRows(data []byte, rowBytes int, x []float32, start, end int, out []float32, dot quantRowDot) {
+	for r := start; r < end; r++ {
+		off := r * rowBytes
+		out[r] = dot(data[off:off+rowBytes], x, len(x))
 	}
 }
 

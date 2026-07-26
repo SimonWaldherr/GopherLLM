@@ -31,6 +31,29 @@ type BERTLayerWeights struct {
 	OutputNorm, OutputBias       []float32
 }
 
+// bertEmbeddingScratch retains the encoder activation slabs for Runner.Embed.
+// A Runner serializes embeddings with genLock, so these are safe to reuse and
+// avoid re-allocating several MiB for every repeated API embedding request.
+// The exported EmbedBERT function supplies a short-lived instance instead.
+type bertEmbeddingScratch struct {
+	XFlat, QFlat, KFlat, VFlat, HiddenFlat, GateFlat []float32
+	X, Q, K, V, Hidden, Gate                         [][]float32
+	Position, RopeSin, RopeCos, Scores               []float32
+}
+
+const maxReusableBERTScratchBytes int64 = 128 << 20
+
+func reusableBERTScratch(n, dim, hidden int, useGate bool) bool {
+	if n <= 0 || dim <= 0 || hidden < 0 {
+		return false
+	}
+	values := int64(n) * (int64(dim)*4 + int64(hidden))
+	if useGate {
+		values += int64(n) * int64(hidden)
+	}
+	return values*4 <= maxReusableBERTScratchBytes
+}
+
 // LoadBERTModel loads an encoder-only BERT or Nomic-BERT GGUF. Both use the
 // same canonical tensor names; their architecture-specific metadata namespace
 // is read from ConfigFromGGUF. This makes Nomic and Granite embedding models
@@ -150,13 +173,51 @@ func (r *Runner) embedBERT(text string) (EmbeddingResult, error) {
 	if r.config.MaxSeqLen > 0 && len(tokens) > r.config.MaxSeqLen {
 		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
-	return EmbedBERT(r.config, r.bert, tokens)
+	var scratch *bertEmbeddingScratch
+	if reusableBERTScratch(len(tokens), r.config.Dim, r.config.HiddenDim, r.bert.UseRoPE) {
+		scratch = &r.bertScratch
+	}
+	return embedBERTWithScratch(r.config, r.bert, tokens, matvecBERTBatch, scratch)
+}
+
+// bertBatchMatvec lets the BERT graph use one batched matrix traversal per
+// projection while retaining a serial reference implementation for numerical
+// regression tests and Metal-only fallbacks.
+type bertBatchMatvec func(Weight, [][]float32, [][]float32)
+
+func matvecBERTSequential(w Weight, xs, outs [][]float32) {
+	for i := range xs {
+		w.MatvecInto(xs[i], &outs[i])
+	}
+}
+
+// matvecBERTBatch keeps a direct Metal projection on its established
+// single-token route because the Metal backend currently exposes matvec, not
+// matmul. CPU quantized and F32 weights use the batched prefill kernel, which
+// dequantizes/streams every row once for the whole embedding sequence.
+func matvecBERTBatch(w Weight, xs, outs [][]float32) {
+	if len(xs) < 2 || metalWeightUsesDirect(w.Metal) {
+		matvecBERTSequential(w, xs, outs)
+		return
+	}
+	matvecBatch(w, xs, outs)
 }
 
 // EmbedBERT executes one full bidirectional BERT encoder pass and applies the
 // GGUF pooling mode (mean=1, CLS=2). It intentionally has no KV cache: every
 // token needs to see all other tokens in the input.
 func EmbedBERT(config Config, weights BERTWeights, tokens []uint32) (EmbeddingResult, error) {
+	return embedBERTWithScratch(config, weights, tokens, matvecBERTBatch, nil)
+}
+
+// embedBERTWithMatvec keeps the encoder graph independent from its projection
+// strategy. The production path batches F32/quantized rows; tests use the
+// single-token projection strategy as an exact graph-level regression oracle.
+func embedBERTWithMatvec(config Config, weights BERTWeights, tokens []uint32, matvec bertBatchMatvec) (EmbeddingResult, error) {
+	return embedBERTWithScratch(config, weights, tokens, matvec, nil)
+}
+
+func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, matvec bertBatchMatvec, scratch *bertEmbeddingScratch) (EmbeddingResult, error) {
 	n := len(tokens)
 	if n == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: no tokens")
@@ -165,13 +226,21 @@ func EmbedBERT(config Config, weights BERTWeights, tokens []uint32) (EmbeddingRe
 	if !weights.UseRoPE && weights.PositionEmbd.F32 != nil && len(weights.PositionEmbd.F32) < n*dim {
 		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds position embeddings", n)
 	}
-	x := make([][]float32, n)
+	if scratch == nil {
+		scratch = &bertEmbeddingScratch{}
+	}
+	x := reuseBatchViews(&scratch.XFlat, &scratch.X, n, dim)
+	ensureLenNoClear(&scratch.Position, dim)
+	position := scratch.Position
 	for i, token := range tokens {
-		x[i] = make([]float32, dim)
 		weights.TokenEmbd.RowInto(int(token), dim, &x[i])
 		if !weights.UseRoPE {
-			position := weights.PositionEmbd.Row(i, dim)
-			addInPlace(x[i], position)
+			if weights.PositionEmbd.F32 != nil {
+				addInPlace(x[i], weights.PositionEmbd.F32[i*dim:(i+1)*dim])
+			} else {
+				weights.PositionEmbd.RowInto(i, dim, &position)
+				addInPlace(x[i], position)
+			}
 		}
 		if len(weights.TokenTypes) >= dim {
 			addInPlace(x[i], weights.TokenTypes[:dim])
@@ -181,34 +250,40 @@ func EmbedBERT(config Config, weights BERTWeights, tokens []uint32) (EmbeddingRe
 
 	headDim := config.HeadDim
 	scale := float32(1 / math.Sqrt(float64(headDim)))
-	ropeInv, ropeMscale := buildRopeInvFreq(config, headDim)
-	var ropeSin, ropeCos []float32
+	var ropeInv []float32
+	ropeMscale := float32(1)
+	if weights.UseRoPE {
+		ropeInv, ropeMscale = buildRopeInvFreq(config, headDim)
+	}
+	q := reuseBatchViews(&scratch.QFlat, &scratch.Q, n, dim)
+	k := reuseBatchViews(&scratch.KFlat, &scratch.K, n, dim)
+	v := reuseBatchViews(&scratch.VFlat, &scratch.V, n, dim)
+	hidden := reuseBatchViews(&scratch.HiddenFlat, &scratch.Hidden, n, config.HiddenDim)
+	var gate [][]float32
+	if weights.UseRoPE {
+		gate = reuseBatchViews(&scratch.GateFlat, &scratch.Gate, n, config.HiddenDim)
+	}
 	for _, layer := range weights.Layers {
-		q := make([][]float32, n)
-		k := make([][]float32, n)
-		v := make([][]float32, n)
+		matvec(layer.Q, x, q)
+		matvec(layer.K, x, k)
+		matvec(layer.V, x, v)
 		for i := range n {
-			q[i] = layer.Q.Matvec(x[i])
-			k[i] = layer.K.Matvec(x[i])
-			v[i] = layer.V.Matvec(x[i])
 			addInPlace(q[i], layer.QB)
 			addInPlace(k[i], layer.KB)
 			addInPlace(v[i], layer.VB)
 			if weights.UseRoPE {
-				half, cached := prepareRopeScratch(i, headDim, config.RopeDimensionCount, ropeInv, ropeMscale, &ropeSin, &ropeCos)
-				applyPreparedRope(q[i], headDim, config.NHeads, half, cached, ropeSin, ropeCos, false)
-				applyPreparedRope(k[i], headDim, config.NHeads, half, cached, ropeSin, ropeCos, false)
+				half, cached := prepareRopeScratch(i, headDim, config.RopeDimensionCount, ropeInv, ropeMscale, &scratch.RopeSin, &scratch.RopeCos)
+				applyPreparedRope(q[i], headDim, config.NHeads, half, cached, scratch.RopeSin, scratch.RopeCos, false)
+				applyPreparedRope(k[i], headDim, config.NHeads, half, cached, scratch.RopeSin, scratch.RopeCos, false)
 			}
 		}
-		attention := make([][]float32, n)
-		for i := range n {
-			attention[i] = make([]float32, dim)
+		attendOne := func(i int, scores []float32) {
 			for h := range config.NHeads {
 				off := h * headDim
-				scores := make([]float32, n)
+				query := q[i][off : off+headDim]
 				maxScore := float32(-math.MaxFloat32)
 				for j := range n {
-					scores[j] = DotF32(q[i][off:off+headDim], k[j][off:off+headDim]) * scale
+					scores[j] = DotF32(query, k[j][off:off+headDim]) * scale
 					maxScore = max(maxScore, scores[j])
 				}
 				denom := float32(0)
@@ -216,36 +291,61 @@ func EmbedBERT(config Config, weights BERTWeights, tokens []uint32) (EmbeddingRe
 					scores[j] = float32(math.Exp(float64(scores[j] - maxScore)))
 					denom += scores[j]
 				}
+				// The old implementation started each attention output at zero.
+				// Clear only after the query has been fully consumed so the same
+				// zero-output behavior is retained for non-finite/degenerate rows.
+				clear(query)
 				if denom > 0 {
 					for j := range n {
-						AxpyF32(attention[i][off:off+headDim], scores[j]/denom, v[j][off:off+headDim])
+						AxpyF32(query, scores[j]/denom, v[j][off:off+headDim])
 					}
 				}
 			}
 		}
+		attend := func(start, end int) {
+			scores := make([]float32, n)
+			for i := start; i < end; i++ {
+				attendOne(i, scores)
+			}
+		}
+		if n >= 64 && config.NHeads > 1 {
+			parallelChunks(n, attend)
+		} else {
+			ensureLenNoClear(&scratch.Scores, n)
+			for i := range n {
+				attendOne(i, scratch.Scores)
+			}
+		}
+		// q now holds attention output. k is no longer needed, and v can
+		// safely receive the projected residual because all attention rows
+		// have consumed it.
+		matvec(layer.Output, q, v)
 		for i := range n {
-			projected := layer.Output.Matvec(attention[i])
-			addInPlace(projected, layer.OutputB)
-			addInPlace(projected, x[i])
-			layerNormInto(projected, layer.AttentionNorm, layer.AttentionBias, weights.Epsilon, &x[i])
+			addInPlace(v[i], layer.OutputB)
+			addInPlace(v[i], x[i])
+			layerNormInto(v[i], layer.AttentionNorm, layer.AttentionBias, weights.Epsilon, &x[i])
+		}
+		matvec(layer.FFNUp, x, hidden)
+		if weights.UseRoPE {
+			matvec(layer.FFNGate, x, gate)
 		}
 		for i := range n {
-			hidden := layer.FFNUp.Matvec(x[i])
-			addInPlace(hidden, layer.FFNUpB)
+			addInPlace(hidden[i], layer.FFNUpB)
 			if weights.UseRoPE {
-				gate := layer.FFNGate.Matvec(x[i])
-				for j := range hidden {
-					hidden[j] *= gate[j] / (1 + float32(math.Exp(float64(-gate[j]))))
+				for j := range hidden[i] {
+					hidden[i][j] *= gate[i][j] / (1 + float32(math.Exp(float64(-gate[i][j]))))
 				}
 			} else {
-				for j := range hidden {
-					hidden[j] = geluExact(hidden[j])
+				for j := range hidden[i] {
+					hidden[i][j] = geluExact(hidden[i][j])
 				}
 			}
-			output := layer.FFNDown.Matvec(hidden)
-			addInPlace(output, layer.FFNDownB)
-			addInPlace(output, x[i])
-			layerNormInto(output, layer.OutputNorm, layer.OutputBias, weights.Epsilon, &x[i])
+		}
+		matvec(layer.FFNDown, hidden, v)
+		for i := range n {
+			addInPlace(v[i], layer.FFNDownB)
+			addInPlace(v[i], x[i])
+			layerNormInto(v[i], layer.OutputNorm, layer.OutputBias, weights.Epsilon, &x[i])
 		}
 	}
 

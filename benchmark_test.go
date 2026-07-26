@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -123,6 +124,44 @@ func BenchmarkMatvecQ8K_1024x1024(b *testing.B) {
 	for b.Loop() {
 		MatvecQ8KInto(data, x, 1024, 1024, &out)
 	}
+}
+
+func BenchmarkMatvecQ4_0QKVFused_1024x1024(b *testing.B) {
+	data := benchQ4_0Data(1024, 1024)
+	wq := Weight{Raw: data, Type: GGMLTypeQ4_0, Rows: 1024, Cols: 1024}
+	wk := Weight{Raw: append([]byte(nil), data...), Type: GGMLTypeQ4_0, Rows: 1024, Cols: 1024}
+	wv := Weight{Raw: append([]byte(nil), data...), Type: GGMLTypeQ4_0, Rows: 1024, Cols: 1024}
+	x := benchFloatSlice(1024)
+	q, k, v, sums := []float32{}, []float32{}, []float32{}, []float32{}
+	b.ReportAllocs()
+	b.SetBytes(int64(3*len(data) + len(x)*4))
+	for b.Loop() {
+		if !tryMatvec3Into(wq, wk, wv, x, &sums, &q, &k, &v) {
+			b.Fatal("tryMatvec3Into declined Q4_0 weights")
+		}
+	}
+}
+
+func BenchmarkMatvecQ4_0QKVSeparate_1024x1024(b *testing.B) {
+	data := benchQ4_0Data(1024, 1024)
+	w := Weight{Raw: data, Type: GGMLTypeQ4_0, Rows: 1024, Cols: 1024}
+	x := benchFloatSlice(1024)
+	q, k, v := []float32{}, []float32{}, []float32{}
+	b.ReportAllocs()
+	b.SetBytes(int64(3*len(data) + len(x)*4))
+	for b.Loop() {
+		w.MatvecInto(x, &q)
+		w.MatvecInto(x, &k)
+		w.MatvecInto(x, &v)
+	}
+}
+
+func benchQ4_0Data(rows, cols int) []byte {
+	data := benchBytes(rows * (cols / 32) * 18)
+	for block := 0; block < len(data)/18; block++ {
+		data[block*18+1] = 0x3c // f16 1.0
+	}
+	return data
 }
 
 func BenchmarkMatvecPreparedQ4K_1024x1024(b *testing.B) {
@@ -389,6 +428,68 @@ func BenchmarkGenerationConfiguredModel(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkEmbeddingConfiguredModel is an opt-in end-to-end embedding
+// benchmark for a locally installed GGUF. BERT models additionally compare
+// batched projections with the single-token reference route; this makes a
+// real-model speedup reproducible without hard-coding a developer's model path.
+func BenchmarkEmbeddingConfiguredModel(b *testing.B) {
+	modelPath := os.Getenv("GOPHERLLM_BENCH_EMBED_MODEL")
+	if modelPath == "" {
+		b.Skip("set GOPHERLLM_BENCH_EMBED_MODEL=/path/to/embedding-model.gguf to benchmark embeddings")
+	}
+	runner, _, err := RunnerFromPath(modelPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer runner.Close()
+	// Tokenizer byte fallbacks can split each visible word into several IDs.
+	// Trim the sample for small-context embedding models rather than failing
+	// an otherwise useful local benchmark.
+	units := 16
+	prompt := ""
+	var tokens []uint32
+	for units >= 1 {
+		prompt = strings.Repeat("semantic retrieval benchmark ", units)
+		tokens = runner.tok.Encode(prompt)
+		if runner.config.MaxSeqLen <= 0 || len(tokens) <= runner.config.MaxSeqLen {
+			break
+		}
+		units /= 2
+	}
+	if runner.config.MaxSeqLen > 0 && len(tokens) > runner.config.MaxSeqLen {
+		b.Skip("benchmark prompt exceeds this model's context length")
+	}
+
+	b.Run("production", func(b *testing.B) {
+		if _, err := runner.Embed(prompt); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, err := runner.Embed(prompt); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	if runner.kind != loadedBERT {
+		return
+	}
+	b.Run("bert_serial_projections", func(b *testing.B) {
+		var scratch bertEmbeddingScratch
+		if _, err := embedBERTWithScratch(runner.config, runner.bert, tokens, matvecBERTSequential, &scratch); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, err := embedBERTWithScratch(runner.config, runner.bert, tokens, matvecBERTSequential, &scratch); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
 
 func benchFloatSlice(n int) []float32 {

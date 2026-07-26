@@ -151,6 +151,72 @@ func TestDequantRowQ4KUsesScalesAndMins(t *testing.T) {
 	}
 }
 
+func TestQuantizedRowIntoUsesCallerScratch(t *testing.T) {
+	q4LegacyRow := make([]byte, 18)
+	q4LegacyRow[1] = 0x3c
+	for i := range 16 {
+		q4LegacyRow[2+i] = byte(i<<4) | byte(15-i)
+	}
+	q8LegacyRow := make([]byte, 34)
+	q8LegacyRow[1] = 0x3c
+	for i := range 32 {
+		q8LegacyRow[2+i] = byte(int8(i - 16))
+	}
+	q4Row := make([]byte, 144)
+	q4Row[0], q4Row[1] = 0x00, 0x3c
+	copy(q4Row[4:16], []byte{1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1})
+	for i := range q4Row[16:] {
+		q4Row[16+i] = byte(i)
+	}
+	q6Row := make([]byte, 210)
+	for i := range 128 {
+		q6Row[i] = byte(i)
+	}
+	for i := range 64 {
+		q6Row[128+i] = byte(i * 3)
+	}
+	for i := range 16 {
+		q6Row[192+i] = byte(int8(i - 8))
+	}
+	q6Row[208], q6Row[209] = 0x00, 0x3c
+	q5Row := make([]byte, 176)
+	q5Row[1] = 0x3c
+	copy(q5Row[4:16], []byte{1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1})
+	for i := range q5Row[16:] {
+		q5Row[16+i] = byte(i * 5)
+	}
+	mxfp4Row := make([]byte, 17)
+	for i := range 16 {
+		mxfp4Row[i] = byte(i*7 + 3)
+	}
+	mxfp4Row[16] = 127
+
+	for _, tc := range []struct {
+		name string
+		w    Weight
+		cols int
+		want []float32
+	}{
+		{"q4_0", Weight{Raw: q4LegacyRow, Type: GGMLTypeQ4_0, Rows: 1, Cols: 32}, 32, DequantRowQ4_0(q4LegacyRow, 32)},
+		{"q8_0", Weight{Raw: q8LegacyRow, Type: GGMLTypeQ8_0, Rows: 1, Cols: 32}, 32, DequantRowQ8_0(q8LegacyRow, 32)},
+		{"q4_k", Weight{Raw: q4Row, Type: GGMLTypeQ4_K, Rows: 1, Cols: 256}, 256, DequantRowQ4K(q4Row, 256)},
+		{"q5_k", Weight{Raw: q5Row, Type: GGMLTypeQ5_K, Rows: 1, Cols: 256}, 256, DequantRowQ5K(q5Row, 256)},
+		{"q6_k", Weight{Raw: q6Row, Type: GGMLTypeQ6_K, Rows: 1, Cols: 256}, 256, DequantRowQ6K(q6Row, 256)},
+		{"mxfp4", Weight{Raw: mxfp4Row, Type: GGMLTypeMXFP4, Rows: 1, Cols: 32}, 32, DequantRowMXFP4(mxfp4Row, 32)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make([]float32, tc.cols)
+			tc.w.RowInto(0, tc.cols, &got)
+			assertFloatSlicesClose(t, "row", got, tc.want)
+			if allocs := testing.AllocsPerRun(100, func() {
+				tc.w.RowInto(0, tc.cols, &got)
+			}); allocs != 0 {
+				t.Fatalf("RowInto allocations = %v, want 0", allocs)
+			}
+		})
+	}
+}
+
 func TestDotQ4KMatchesDequantizedDot(t *testing.T) {
 	row := make([]byte, 144)
 	row[0], row[1] = 0x00, 0x3c
@@ -448,6 +514,22 @@ func TestQ6KArgmaxMatvecMatchesFullMatvec(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("argmax token = %d, want %d", got, want)
+	}
+}
+
+func TestQ6KArgmaxWithXSumsKeepsLowestTiedToken(t *testing.T) {
+	const cols = 256
+	rows := max(3, numThreads()*2+1) // Cross worker-range boundaries.
+	data := make([]byte, rows*210)   // Zero f16 scales make every logit 0.
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(i%11) - 5
+	}
+	scratch := []float32{}
+	xs := fillQ6KXSums16(x, cols, &scratch)
+	ScaleF32(xs, 32)
+	if got := argmaxQ6KRowsWithXSums(data, x, xs, rows, cols, 210); got != 0 {
+		t.Fatalf("argmax tied token = %d, want 0", got)
 	}
 }
 

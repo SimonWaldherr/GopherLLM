@@ -128,6 +128,86 @@ func TestLoadAndEmbedTinyNomicBERTModel(t *testing.T) {
 	}
 }
 
+func TestEmbedBERTBatchedMatchesSequential(t *testing.T) {
+	for _, arch := range []string{"bert", "nomic-bert"} {
+		t.Run(arch, func(t *testing.T) {
+			r, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithArch(arch))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The tiny tokenizer intentionally has no merges; use valid token
+			// IDs directly so this regression covers a genuinely batched pass.
+			tokens := []uint32{3, 4, 5, 6}
+			for _, pooling := range []uint32{1, 2} {
+				r.bert.PoolingType = pooling
+				want, err := embedBERTWithMatvec(r.config, r.bert, tokens, matvecBERTSequential)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := EmbedBERT(r.config, r.bert, tokens)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.TokenCount != want.TokenCount || len(got.Embedding) != len(want.Embedding) {
+					t.Fatalf("pooling=%d shape got=%d/%d want=%d/%d", pooling, got.TokenCount, len(got.Embedding), want.TokenCount, len(want.Embedding))
+				}
+				for i := range want.Embedding {
+					if d := math.Abs(float64(got.Embedding[i] - want.Embedding[i])); d > 1e-5 {
+						t.Fatalf("pooling=%d value %d: batched=%v sequential=%v", pooling, i, got.Embedding[i], want.Embedding[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerBERTEmbeddingScratchIsReused(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyBERTGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Embed("abc"); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.bertScratch.XFlat) == 0 {
+		t.Fatal("runner did not retain BERT embedding scratch")
+	}
+	first := &r.bertScratch.XFlat[0]
+	if _, err := r.Embed("abc"); err != nil {
+		t.Fatal(err)
+	}
+	if &r.bertScratch.XFlat[0] != first {
+		t.Fatal("same-shape embedding reallocated BERT scratch")
+	}
+}
+
+func TestEmbedBERTParallelAttentionMatchesSequential(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithArch("nomic-bert"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nomic-BERT uses RoPE and therefore has no absolute-position table to
+	// constrain this direct graph test. 64 tokens crosses the parallel
+	// attention threshold and verifies each worker owns its score scratch.
+	tokens := make([]uint32, 64)
+	for i := range tokens {
+		tokens[i] = uint32(3 + i%6)
+	}
+	want, err := embedBERTWithMatvec(r.config, r.bert, tokens, matvecBERTSequential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := EmbedBERT(r.config, r.bert, tokens)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want.Embedding {
+		if d := math.Abs(float64(got.Embedding[i] - want.Embedding[i])); d > 1e-5 {
+			t.Fatalf("value %d: batched=%v sequential=%v", i, got.Embedding[i], want.Embedding[i])
+		}
+	}
+}
+
 func TestEmbedBERTPoolingModes(t *testing.T) {
 	config := Config{Dim: 2, NHeads: 1, HeadDim: 2}
 	weights := BERTWeights{

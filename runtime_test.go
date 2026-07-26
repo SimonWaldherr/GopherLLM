@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -22,6 +23,56 @@ func TestL2NormalizeProducesUnitVector(t *testing.T) {
 	norm := math.Sqrt(float64(v[0]*v[0] + v[1]*v[1]))
 	if math.Abs(norm-1) > 1e-6 {
 		t.Fatalf("norm = %v, want 1", norm)
+	}
+}
+
+func sequentialDecoderEmbeddingForTest(r *Runner, tokens []uint32) []float32 {
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	sum := make([]float32, r.config.Dim)
+	for pos, token := range tokens {
+		h := r.forwardHiddenToken(cache, buf, token, pos)
+		addInPlace(sum, h)
+	}
+	meanPoolInPlace(sum, len(tokens))
+	l2NormalizeInPlace(sum)
+	return sum
+}
+
+func TestEmbedBatchedMatchesSequentialMultiChunk(t *testing.T) {
+	oldChunk := prefillChunkOverrideValue()
+	SetPrefillChunk(7)
+	defer SetPrefillChunk(oldChunk)
+
+	prompt := strings.Repeat("a b c ", 30)
+	for _, arch := range []string{"llama", "stablelm"} {
+		t.Run(arch, func(t *testing.T) {
+			r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF(arch))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !r.canBatchPrefill() {
+				t.Fatal("expected batched embedding prefill")
+			}
+			tokens := r.tok.Encode(prompt)
+			if len(tokens) <= 7 {
+				t.Fatalf("need multiple chunks, got %d tokens", len(tokens))
+			}
+			want := sequentialDecoderEmbeddingForTest(r, tokens)
+			got, err := r.Embed(prompt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.TokenCount != len(tokens) || len(got.Embedding) != len(want) {
+				t.Fatalf("embedding shape got=%d/%d want=%d/%d", got.TokenCount, len(got.Embedding), len(tokens), len(want))
+			}
+			for i := range want {
+				if d := math.Abs(float64(got.Embedding[i] - want[i])); d > 1e-3*math.Max(1, math.Abs(float64(want[i]))) {
+					t.Fatalf("value %d: batched=%v sequential=%v", i, got.Embedding[i], want[i])
+				}
+			}
+		})
 	}
 }
 

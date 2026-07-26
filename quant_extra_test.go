@@ -43,6 +43,37 @@ func TestDequantRowIQ4NLKnownValues(t *testing.T) {
 	}
 }
 
+func TestDequantRowIQ4XSKnownValues(t *testing.T) {
+	row := make([]byte, 136)
+	putF16One(row)
+	// Exercise every signed 6-bit sub-block scale, including the split
+	// low-nibble / high-two-bit representation.
+	codes := []byte{0, 1, 15, 16, 31, 32, 47, 63}
+	var hi uint16
+	for ib, code := range codes {
+		hi |= uint16(code>>4) << (2 * ib)
+		if ib&1 == 0 {
+			row[4+ib/2] |= code & 0x0f
+		} else {
+			row[4+ib/2] |= (code & 0x0f) << 4
+		}
+		for i := 0; i < 16; i++ {
+			row[8+ib*16+i] = 0x0f // low=15, high=0
+		}
+	}
+	binary.LittleEndian.PutUint16(row[2:], hi)
+	got := DequantRowIQ4XS(row, 256)
+	for ib, code := range codes {
+		scale := float32(int(code) - 32)
+		for i := 0; i < 16; i++ {
+			lo, high := got[ib*32+i], got[ib*32+16+i]
+			if lo != scale*iq4NLValues[15] || high != scale*iq4NLValues[0] {
+				t.Fatalf("IQ4_XS block %d value %d = %v/%v, want %v/%v", ib, i, lo, high, scale*iq4NLValues[15], scale*iq4NLValues[0])
+			}
+		}
+	}
+}
+
 func TestDequantRowQ5_0KnownValues(t *testing.T) {
 	row := make([]byte, 22)
 	putF16One(row[0:])
@@ -207,6 +238,7 @@ func TestExtraQuantDotMatchesDequantizedDot(t *testing.T) {
 		dequant func(row []byte, cols int) []float32
 	}{
 		{"IQ4_NL", 64, randRow(2 * 18), func(r []byte) { saneF16(r, 18, 0) }, DotIQ4NLF32, DequantRowIQ4NL},
+		{"IQ4_XS", 512, randRow(2 * 136), func(r []byte) { saneF16(r, 136, 0) }, DotIQ4XSF32, DequantRowIQ4XS},
 		{"Q4_1", 64, randRow(2 * 20), func(r []byte) { saneF16(r, 20, 0, 2) }, DotQ4_1F32, DequantRowQ4_1},
 		{"Q5_0", 64, randRow(2 * 22), func(r []byte) { saneF16(r, 22, 0) }, DotQ5_0F32, DequantRowQ5_0},
 		{"Q5_1", 64, randRow(2 * 24), func(r []byte) { saneF16(r, 24, 0, 2) }, DotQ5_1F32, DequantRowQ5_1},
@@ -243,6 +275,7 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 	}
 	cases := []mv{
 		{"IQ4_NL", 64, 2 * 18, []int{0}, MatvecIQ4NLInto, DotIQ4NLF32},
+		{"IQ4_XS", 256, 136, []int{0}, MatvecIQ4XSInto, DotIQ4XSF32},
 		{"Q4_1", 64, 2 * 20, []int{0, 2}, MatvecQ4_1Into, DotQ4_1F32},
 		{"Q5_0", 64, 2 * 22, []int{0}, MatvecQ5_0Into, DotQ5_0F32},
 		{"Q5_1", 64, 2 * 24, []int{0, 2}, MatvecQ5_1Into, DotQ5_1F32},
@@ -278,6 +311,47 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 			if math.Abs(float64(out[r]-want)) > 1e-3*math.Max(1, math.Abs(float64(want))) {
 				t.Fatalf("%s row %d: matvec = %v, dot = %v", c.name, r, out[r], want)
 			}
+		}
+	}
+}
+
+func TestIQ4XSLoadAndForceF32(t *testing.T) {
+	raw := make([]byte, 136)
+	putF16One(raw)
+	for i := 0; i < 8; i++ {
+		raw[4+i/2] |= byte(32+i) << (4 * (i & 1))
+		for j := 0; j < 16; j++ {
+			raw[8+i*16+j] = byte(j) | byte(15-j)<<4
+		}
+	}
+	data := buildGGUF(3, []ggufKV{{"general.architecture", ggufStr, "llama"}},
+		[]ggufTensor{{name: "t", dims: []uint64{256, 1}, dtype: GGMLTypeIQ4_XS, data: raw}})
+	g, err := ParseGGUFQuiet(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, inferred := indexTensors(g), inferTensorSizes(data, g)
+	w, err := loadWeight(data, g.DataOffset, "t", idx, inferred, false, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Type != GGMLTypeIQ4_XS || len(w.Raw) != len(raw) {
+		t.Fatalf("loaded IQ4_XS = %+v", w)
+	}
+	got := w.Row(0, 256)
+	want := DequantRowIQ4XS(raw, 256)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("row[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+	dense, err := loadWeight(data, g.DataOffset, "t", idx, inferred, true, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want {
+		if dense.F32[i] != want[i] {
+			t.Fatalf("force_f32[%d] = %v, want %v", i, dense.F32[i], want[i])
 		}
 	}
 }

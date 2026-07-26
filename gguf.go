@@ -42,6 +42,7 @@ const (
 	GGMLTypeQ6_K    GGMLType = 14
 	GGMLTypeQ8_K    GGMLType = 15
 	GGMLTypeIQ4_NL  GGMLType = 20
+	GGMLTypeIQ4_XS  GGMLType = 23
 	GGMLTypeF64     GGMLType = 28
 	GGMLTypeBF16    GGMLType = 30
 	GGMLTypeMXFP4   GGMLType = 39
@@ -55,7 +56,7 @@ func ggmlTypeFromUint32(v uint32) GGMLType {
 	switch GGMLType(v) {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
-		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeF64, GGMLTypeBF16, GGMLTypeMXFP4:
+		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeIQ4_XS, GGMLTypeF64, GGMLTypeBF16, GGMLTypeMXFP4:
 		return GGMLType(v)
 	default:
 		return GGMLTypeUnknown
@@ -94,6 +95,8 @@ func (t GGMLType) String() string {
 		return "Q8_K"
 	case GGMLTypeIQ4_NL:
 		return "IQ4_NL"
+	case GGMLTypeIQ4_XS:
+		return "IQ4_XS"
 	case GGMLTypeF64:
 		return "F64"
 	case GGMLTypeBF16:
@@ -106,12 +109,15 @@ func (t GGMLType) String() string {
 }
 
 // BlockSize returns how many elements one quantization block encodes (1 for
-// the plain float types). Note the K-quants (Q4_K/Q5_K/Q6_K) actually use
-// 256-element superblocks; this legacy accessor is only used with the 32-wide
-// simple quants, and DataSize handles the K-quant sizes explicitly.
+// the plain float types). Most legacy simple quants are 32-wide; the K-quants
+// and IQ4_XS use 256-element superblocks. DataSize remains the authoritative
+// byte-size accessor for every format.
 func (t GGMLType) BlockSize() int {
 	if t == GGMLTypeF32 || t == GGMLTypeF16 || t == GGMLTypeF64 {
 		return 1
+	}
+	if t == GGMLTypeIQ4_XS {
+		return 256
 	}
 	return 32
 }
@@ -163,6 +169,8 @@ func (t GGMLType) BlockBytes() (int, bool) {
 //	Q5_K: 176 B / 256 elems = Q4_K layout + 32 B of 5th-bit planes
 //	Q6_K: 210 B / 256 elems = 128 B low nibbles + 64 B 2-bit highs +
 //	       16 int8 sub-block scales + f16 d
+//	IQ4_XS: 136 B / 256 elems = f16 d + 16-bit high scales + 4-byte low
+//	       scales + 128 non-linear nibble-packed values
 //	MXFP4: 17 B / 32 elems  = 16 nibble-packed FP4 values + 1 shared
 //	       power-of-two exponent byte
 //
@@ -194,6 +202,8 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 		// The sums accelerate mixed-quant dot products; dequantization only
 		// needs the scale and values.
 		return (n / 256) * 292, true
+	case GGMLTypeIQ4_XS:
+		return (n / 256) * 136, true
 	case GGMLTypeMXFP4:
 		return (n / 32) * 17, true
 	default:

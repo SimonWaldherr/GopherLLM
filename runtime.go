@@ -227,6 +227,7 @@ const (
 	loadedGptOss
 	loadedGemma4
 	loadedNemotronH
+	loadedMamba2
 	loadedBERT
 )
 
@@ -254,10 +255,12 @@ type Runner struct {
 	gptOss         GptOssWeights
 	gemma4         Gemma4Weights
 	nemotronH      NemotronHWeights
+	mamba2         Mamba2Weights
 	bert           BERTWeights
 	genLock        sync.Mutex
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
+	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
 	mappedFile     *MmapFile
 }
@@ -279,7 +282,7 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen3", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "bert", "nomic-bert":
+		"qwen2", "qwen3", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
 		return true
 	default:
 		return false
@@ -341,6 +344,12 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 			return nil, err
 		}
 		r.config, r.nemotronH, r.kind = config, weights, loadedNemotronH
+	case "mamba2":
+		config, weights, err := LoadMamba2Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		if err != nil {
+			return nil, err
+		}
+		r.config, r.mamba2, r.kind = config, weights, loadedMamba2
 	case "gpt-oss":
 		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
 		if err != nil {
@@ -428,6 +437,7 @@ func (r *Runner) Close() error {
 	r.releaseMetalWeights()
 	r.workspaceCache = nil
 	r.workspaceBuf = nil
+	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
 	if r.mappedFile == nil {
 		return nil
@@ -448,6 +458,8 @@ func (r *Runner) releaseMetalWeights() {
 		releaseModelMetalWeights(&r.gptOss.Standard)
 	case loadedGemma4:
 		releaseModelMetalWeights(&r.gemma4.Standard)
+	case loadedMamba2:
+		releaseMamba2MetalWeights(&r.mamba2)
 	default:
 		releaseModelMetalWeights(&r.standard)
 	}
@@ -739,6 +751,11 @@ func validUTF8PrefixLen(b []byte) int {
 }
 
 func (r *Runner) cacheDims() (int, int, int, int, int) {
+	if r.kind == loadedMamba2 {
+		// Pure Mamba2 has no attention graph. Keep an empty KVCache shell so
+		// generation's common workspace lifecycle can own its recurrent state.
+		return 0, 0, 0, 0, 0
+	}
 	if r.kind == loadedNemotronH {
 		// Soofi uses a shared attention shape on its six attention blocks;
 		// Mamba/MoE blocks have no K/V entries but retain their layer index.
@@ -824,9 +841,9 @@ func (r *Runner) clearPrefixCache() {
 }
 
 func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
-	// Nemotron-H also carries recurrent Mamba state. Reusing only its attention
-	// K/V rows would be incorrect, so leave it on the safe full-prefill path.
-	return r.kind != loadedNemotronH && cache != nil && cache == r.workspaceCache
+	// Recurrent Mamba state must be replayed from the beginning. Reusing only
+	// the attention K/V rows (or none at all for pure Mamba2) would be wrong.
+	return r.kind != loadedNemotronH && r.kind != loadedMamba2 && cache != nil && cache == r.workspaceCache
 }
 
 // prefixReuse returns the exact number of resident KV positions that can be
@@ -876,7 +893,7 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.F16)
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
-			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH {
+			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 {
 				if copied := copyKVPrefix(cache, old, len(r.prefixCache.tokens)); copied == len(r.prefixCache.tokens) {
 					r.prefixCache.cache = cache
 				} else {
@@ -889,7 +906,7 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 			r.clearPrefixCache()
 		}
 	}
-	if r.kind == loadedNemotronH {
+	if r.kind == loadedNemotronH || r.kind == loadedMamba2 {
 		if !cache.Nemotron.compatible(r.config) {
 			cache.Nemotron = newNemotronHCache(r.config)
 		}
@@ -907,6 +924,8 @@ func (r *Runner) forwardTokenInto(cache *KVCache, buf *DecodeBuffer, token uint3
 	switch r.kind {
 	case loadedNemotronH:
 		ForwardNemotronHInto(r.config, r.nemotronH, cache, buf, token, pos, logits)
+	case loadedMamba2:
+		ForwardMamba2Into(r.config, r.mamba2, cache, buf, token, pos, logits)
 	case loadedGptOss:
 		ForwardGptOssInto(r.config, r.gptOss, cache, buf, token, pos, logits)
 	case loadedGemma4:
@@ -931,6 +950,12 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, logits)
+	case loadedMamba2:
+		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
+		if next, ok := argmaxOutputTokenInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, logits); ok {
+			return next, true
+		}
+		ProjectLogitsInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, logits)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenInto(r.config, r.gptOss.Standard, buf, logits); ok {
@@ -957,6 +982,8 @@ func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uin
 	switch r.kind {
 	case loadedNemotronH:
 		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
+	case loadedMamba2:
+		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
@@ -1075,6 +1102,8 @@ func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token ui
 	switch r.kind {
 	case loadedNemotronH:
 		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
+	case loadedMamba2:
+		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
 	case loadedGptOss:
 		ForwardPrefill(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
@@ -1107,10 +1136,21 @@ func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+1)
 	cache, buf := r.generationWorkspace(cacheLen)
 	sum := make([]float32, r.config.Dim)
-	for pos, tok := range tokens {
-		h := r.forwardHiddenToken(cache, buf, tok, pos)
-		for i, v := range h {
-			sum[i] += v
+	if r.canBatchPrefill() {
+		// Mean pooling needs every final hidden state, not just the last
+		// prompt logit. The batched path streams each projection weight once
+		// per chunk and accumulates those states before its scratch is reused.
+		chunk := prefillChunkSize(r.config)
+		for start := 0; start < len(tokens); start += chunk {
+			end := min(start+chunk, len(tokens))
+			forwardBatchPoolInto(r.config, r.standard, cache, buf, tokens[start:end], start, sum)
+		}
+	} else {
+		for pos, tok := range tokens {
+			h := r.forwardHiddenToken(cache, buf, tok, pos)
+			for i, v := range h {
+				sum[i] += v
+			}
 		}
 	}
 	meanPoolInPlace(sum, len(tokens))

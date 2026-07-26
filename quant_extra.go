@@ -74,6 +74,77 @@ func MatvecIQ4NLInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	})
 }
 
+// --- IQ4_XS: 8 × 32 non-linear nibble blocks share one f16 base scale. Each
+// sub-block's signed 6-bit multiplier is split between four low-nibble bytes
+// and a uint16 high-bit plane. The quant-value codebook is the same IQ4_NL
+// table above.
+
+func iq4XSSubblockScale(block []byte, ib int) float32 {
+	scalesH := uint16(block[2]) | uint16(block[3])<<8
+	low := (block[4+ib/2] >> (4 * (ib & 1))) & 0x0f
+	scale := int(low) | int((scalesH>>(2*ib))&0x03)<<4
+	return F16ToF32(binaryLE16(block)) * float32(scale-32)
+}
+
+func DequantRowIQ4XSInto(row []byte, cols int, out []float32) {
+	for b := 0; b < cols/256; b++ {
+		base := b * 136
+		if base+136 > len(row) {
+			break
+		}
+		block := row[base : base+136]
+		for ib := 0; ib < 8; ib++ {
+			scale := iq4XSSubblockScale(block, ib)
+			q := block[8+ib*16 : 8+(ib+1)*16]
+			dst := out[b*256+ib*32 : b*256+(ib+1)*32]
+			for i, packed := range q {
+				dst[i] = scale * iq4NLValues[packed&0x0f]
+				dst[16+i] = scale * iq4NLValues[packed>>4]
+			}
+		}
+	}
+}
+
+func DequantRowIQ4XS(row []byte, cols int) []float32 {
+	out := make([]float32, cols)
+	DequantRowIQ4XSInto(row, cols, out)
+	return out
+}
+
+func DotIQ4XSF32(row []byte, x []float32, cols int) float32 {
+	var sum float32
+	for b := 0; b < cols/256; b++ {
+		base := b * 136
+		if base+136 > len(row) {
+			break
+		}
+		block := row[base : base+136]
+		for ib := 0; ib < 8; ib++ {
+			scale := iq4XSSubblockScale(block, ib)
+			q := block[8+ib*16 : 8+(ib+1)*16]
+			xBlock := x[b*256+ib*32 : b*256+(ib+1)*32]
+			_ = xBlock[31]
+			var dot float32
+			for i, packed := range q {
+				dot += iq4NLValues[packed&0x0f]*xBlock[i] + iq4NLValues[packed>>4]*xBlock[16+i]
+			}
+			sum += scale * dot
+		}
+	}
+	return sum
+}
+
+func MatvecIQ4XSInto(data []byte, x []float32, rows, cols int, out *[]float32) {
+	rowBytes := (cols / 256) * 136
+	ensureLenNoClear(out, rows)
+	parallelRows(rows, func(start, end int) {
+		for r := start; r < end; r++ {
+			off := r * rowBytes
+			(*out)[r] = DotIQ4XSF32(data[off:min(off+rowBytes, len(data))], x, cols)
+		}
+	})
+}
+
 func DequantRowQ4_1Into(row []byte, cols int, out []float32) {
 	for b := 0; b < cols/32; b++ {
 		base := b * 20

@@ -23,8 +23,10 @@ type batchDecodeBuffer struct {
 	AttnOutFlat, ProjFlat, AttnProjFlat     []float32
 	GateFlat, UpFlat, HiddenFlat            []float32
 	QKVFlat, GateUpFlat                     []float32
+	RopeSinFlat, RopeCosFlat                []float32
 	X, XN, Q, K, V, AttnOut, Proj, AttnProj [][]float32
 	Gate, Up, Hidden, QKV, GateUp           [][]float32
+	RopeSin, RopeCos                        [][]float32
 }
 
 func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]float32 {
@@ -123,6 +125,10 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 		if cols%32 == 0 {
 			return DequantRowIQ4NLInto
 		}
+	case GGMLTypeIQ4_XS:
+		if cols%256 == 0 {
+			return DequantRowIQ4XSInto
+		}
 	case GGMLTypeQ4_1:
 		if cols%32 == 0 {
 			return DequantRowQ4_1Into
@@ -151,6 +157,10 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 		if cols%256 == 0 {
 			return DequantRowQ4KInto
 		}
+	case GGMLTypeQ5_K:
+		if cols%256 == 0 {
+			return DequantRowQ5KInto
+		}
 	case GGMLTypeQ6_K:
 		if cols%256 == 0 {
 			return DequantRowQ6KInto
@@ -158,6 +168,10 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 	case GGMLTypeQ8_K:
 		if cols%256 == 0 {
 			return DequantRowQ8KInto
+		}
+	case GGMLTypeMXFP4:
+		if cols%32 == 0 {
+			return DequantRowMXFP4Into
 		}
 	}
 	return nil
@@ -169,6 +183,26 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 // whole chunk. When computeLast is set, the final token's logits are written to
 // logits. Only the non-fused standard path is supported (callers must check).
 func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, computeLast bool, logits *[]float32) {
+	forwardBatchInto(config, weights, cache, buf, tokens, startPos, computeLast, logits, nil)
+}
+
+// forwardBatchPoolInto is the embedding counterpart of ForwardBatchInto. It
+// adds the output-normalized hidden state for every token in the chunk to sum.
+// Keeping pooling inside the batched graph avoids re-streaming model weights
+// once per token just to obtain the intermediate states needed for mean pooling.
+// sum must have config.Dim elements; it is intentionally internal because the
+// caller owns aggregation across chunks and final L2 normalization.
+func forwardBatchPoolInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, sum []float32) {
+	if len(sum) != config.Dim {
+		panic("gopherllm: batch embedding sum has wrong dimension")
+	}
+	forwardBatchInto(config, weights, cache, buf, tokens, startPos, false, nil, sum)
+}
+
+// forwardBatchInto is the common batched transformer implementation. poolSum,
+// when non-nil, requests final hidden states for all tokens; otherwise the
+// normal generation path only normalizes/projects the final token.
+func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, computeLast bool, logits *[]float32, poolSum []float32) {
 	p := len(tokens)
 	if p == 0 {
 		return
@@ -209,12 +243,30 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 	}
 
+	// RoPE depends on position, but not on layer. Computing its sin/cos pairs
+	// here instead of inside every layer avoids NLayers identical Sincos sweeps
+	// during prompt prefill. The tables share DecodeBuffer's bounded batch
+	// scratch and are overwritten by the next chunk.
+	ropeDim := config.RopeDimensionCount
+	if ropeDim <= 0 || ropeDim > headDim {
+		ropeDim = headDim
+	}
+	ropeDim -= ropeDim % 2
+	ropeHalf := ropeDim / 2
+	ropePairs := min(ropeHalf, len(buf.RopeInvFreq))
+	var ropeSin, ropeCos [][]float32
+	if ropePairs > 0 {
+		ropeSin = reuseBatchViews(&b.RopeSinFlat, &b.RopeSin, p, ropePairs)
+		ropeCos = reuseBatchViews(&b.RopeCosFlat, &b.RopeCos, p, ropePairs)
+		for t := 0; t < p; t++ {
+			prepareRopeScratch(startPos+t, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &ropeSin[t], &ropeCos[t])
+		}
+	}
+
 	scale := config.AttentionScale
 	if scale == 0 {
 		scale = float32(1 / math.Sqrt(float64(headDim)))
 	}
-	var sinS, cosS []float32
-
 	for l := 0; l < config.NLayers; l++ {
 		layer := weights.Layers[l]
 		for t := 0; t < p; t++ {
@@ -243,9 +295,10 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			addInPlace(K[t], layer.BK)
 			addInPlace(V[t], layer.BV)
 			pos := startPos + t
-			half, nCache := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &sinS, &cosS)
-			applyPreparedRope(Q[t], headDim, config.NHeads, half, nCache, sinS, cosS, interleaved)
-			applyPreparedRope(K[t], headDim, config.NKVHeads, half, nCache, sinS, cosS, interleaved)
+			if ropePairs > 0 {
+				applyPreparedRope(Q[t], headDim, config.NHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
+				applyPreparedRope(K[t], headDim, config.NKVHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
+			}
 			cache.storeKV(l, pos, K[t], V[t])
 		}
 
@@ -327,6 +380,12 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 	}
 
+	if poolSum != nil {
+		for t := 0; t < p; t++ {
+			normalizeDecoderInto(config, X[t], weights.OutputNorm, weights.OutputNormBias, &XN[t])
+			addInPlace(poolSum, XN[t])
+		}
+	}
 	if computeLast {
 		last := p - 1
 		normalizeDecoderInto(config, X[last], weights.OutputNorm, weights.OutputNormBias, &buf.XN)

@@ -110,6 +110,7 @@ func TestGGMLTypeDataSize(t *testing.T) {
 		{GGMLTypeF16, 10, 20},
 		{GGMLTypeQ8_0, 32, 34},
 		{GGMLTypeIQ4_NL, 32, 18},
+		{GGMLTypeIQ4_XS, 256, 136},
 		{GGMLTypeQ4_K, 256, 144},
 		{GGMLTypeQ6_K, 256, 210},
 		{GGMLTypeQ8_K, 256, 292},

@@ -33,7 +33,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Split/sharded GGUF loading: point at any one shard of a
   `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
   and merged automatically (see [Performance Notes](#performance-notes)).
-- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL,
+- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS,
   Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/F64/BF16 load
   directly (BF16 covers QAT-derived and modern full-precision GGUFs).
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
@@ -847,6 +847,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   With `GOPHERLLM_Q8_ACTIVATIONS=0` the older dequantize-once-per-chunk f32 path
   runs instead. ARM64 reuses per-worker dequantization rows and dispatches one
   coarse batch range per worker to avoid allocation and scheduling overhead.
+  The same path now covers StableLM's LayerNorm plus parallel-residual block;
+  Q4_0/Q8_0 rows also use the dequantize-once path, which is important for
+  Stable Code and other legacy-Q4 GGUFs on Apple Silicon.
   Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token path (A/B
   benchmarking / debugging), or `GOPHERLLM_PREFILL_CHUNK=<N>` to tune the chunk
   size on the deployment machine.
@@ -912,7 +915,7 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 ```text
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen3,
 phi3, granite (dense), exaone, internlm2, stablelm, gpt-oss, gemma, gemma2, gemma3, gemma4,
-nemotron_h, nemotron_h_moe, bert, nomic-bert
+nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
 ```
 
 qwen3 (including the DeepSeek-R1 Qwen3 distills) adds per-head QK-norm on top
@@ -934,11 +937,18 @@ Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
 scaling when the GGUF declares it.
 
-`nemotron_h_moe` is the native hybrid Mamba-2 / attention / sparse-MoE graph
-used by Soofi S Isar. It retains Mamba convolution and SSM state locally and
-does not rely on a llama.cpp process. Prompt prefill is deliberately
-per-token for this architecture because its recurrent state makes the regular
-batched transformer prefill invalid.
+`nemotron_h` and `nemotron_h_moe` are native hybrid Mamba-2 / attention
+graphs. The dense variant (including NVIDIA Nemotron 3 Nano 4B) uses
+`ffn_up → ReLU² → ffn_down`; the MoE variant retains its sparse router. Both
+retain Mamba convolution and SSM state locally and do not rely on a llama.cpp
+process. Prompt prefill is deliberately per-token for these architectures
+because recurrent state makes the regular batched transformer prefill invalid.
+
+Pure `mamba2` GGUFs (including the canonical 2.7B/7B family) run through a
+native convolution/SSM recurrence with no fabricated attention cache. The
+canonical `RMSNorm(y · SiLU(z))` gate is distinct from Nemotron-H's gate;
+Mamba2 variants with an additional MLP branch are rejected explicitly rather
+than being evaluated with an incompatible graph.
 
 Gemma-family support (`gemma`/`gemma2`/`gemma3`/`gemma4`, including the Gemma QAT
 GGUFs) is **experimental**: the dense Gemma graph is implemented — hardcoded
