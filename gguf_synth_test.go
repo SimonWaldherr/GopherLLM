@@ -173,7 +173,11 @@ func onesF32(n int) []float32 {
 
 // buildTinyLlamaGGUF builds a minimal but structurally complete 1-layer llama
 // model (F32 weights) that RunnerFromGGUFBytes can load and run.
-func buildTinyLlamaGGUF() []byte {
+func buildTinyLlamaGGUF() []byte { return buildTinyStandardGGUF("llama") }
+
+// buildTinyStandardGGUF is the shared pre-norm RoPE/GQA/SwiGLU graph used by
+// Llama and the compatible decoder families exercised in runtime tests.
+func buildTinyStandardGGUF(arch string) []byte {
 	const (
 		dim    = 8
 		heads  = 2
@@ -194,25 +198,28 @@ func buildTinyLlamaGGUF() []byte {
 		scores[i] = float32(0)
 	}
 	kvs := []ggufKV{
-		{"general.architecture", ggufStr, "llama"},
+		{"general.architecture", ggufStr, arch},
 		{"general.name", ggufStr, "tiny"},
-		{"llama.embedding_length", ggufU32, uint32(dim)},
-		{"llama.block_count", ggufU32, uint32(1)},
-		{"llama.attention.head_count", ggufU32, uint32(heads)},
-		{"llama.attention.head_count_kv", ggufU32, uint32(kv)},
-		{"llama.attention.key_length", ggufU32, uint32(hdim)},
-		{"llama.attention.value_length", ggufU32, uint32(hdim)},
-		{"llama.feed_forward_length", ggufU32, uint32(hidden)},
-		{"llama.context_length", ggufU32, uint32(1024)},
-		{"llama.attention.layer_norm_rms_epsilon", ggufF32, float32(1e-5)},
-		{"llama.rope.freq_base", ggufF32, float32(10000)},
-		{"llama.rope.dimension_count", ggufU32, uint32(hdim)},
+		{arch + ".embedding_length", ggufU32, uint32(dim)},
+		{arch + ".block_count", ggufU32, uint32(1)},
+		{arch + ".attention.head_count", ggufU32, uint32(heads)},
+		{arch + ".attention.head_count_kv", ggufU32, uint32(kv)},
+		{arch + ".attention.key_length", ggufU32, uint32(hdim)},
+		{arch + ".attention.value_length", ggufU32, uint32(hdim)},
+		{arch + ".feed_forward_length", ggufU32, uint32(hidden)},
+		{arch + ".context_length", ggufU32, uint32(1024)},
+		{arch + ".attention.layer_norm_rms_epsilon", ggufF32, float32(1e-5)},
+		{arch + ".rope.freq_base", ggufF32, float32(10000)},
+		{arch + ".rope.dimension_count", ggufU32, uint32(hdim)},
 		{"tokenizer.ggml.model", ggufStr, "llama"},
 		{"tokenizer.ggml.tokens", ggufArr, ggufArray{ggufStr, toks}},
 		{"tokenizer.ggml.scores", ggufArr, ggufArray{ggufF32, scores}},
 		{"tokenizer.ggml.bos_token_id", ggufU32, uint32(1)},
 		{"tokenizer.ggml.eos_token_id", ggufU32, uint32(2)},
 		{"tokenizer.ggml.add_bos_token", ggufBool, true},
+	}
+	if arch == "stablelm" {
+		kvs = append(kvs, ggufKV{arch + ".use_parallel_residual", ggufBool, true})
 	}
 	f32t := func(name string, rows, cols, seed int) ggufTensor {
 		// GGUF stores dims as [cols(in), rows(out)].

@@ -20,13 +20,25 @@ const (
 	nemotronMamba nemotronLayerKind = iota
 	nemotronAttention
 	nemotronMoE
+	nemotronDenseFFN
 )
 
 type NemotronAttentionWeights struct {
-	Q Weight
-	K Weight
-	V Weight
-	O Weight
+	Q     Weight
+	K     Weight
+	V     Weight
+	O     Weight
+	OBias []float32
+}
+
+// NemotronDenseFFNWeights is the non-expert feed-forward block used by dense
+// Nemotron-H models: up -> ReLU squared -> down. It has no router and does
+// not use the SwiGLU graph of llama-style layers.
+type NemotronDenseFFNWeights struct {
+	Up       Weight
+	Down     Weight
+	UpBias   []float32
+	DownBias []float32
 }
 
 type NemotronMambaWeights struct {
@@ -67,6 +79,7 @@ type NemotronHLayerWeights struct {
 	Attention NemotronAttentionWeights
 	Mamba     NemotronMambaWeights
 	MoE       NemotronMoEWeights
+	DenseFFN  NemotronDenseFFNWeights
 }
 
 type NemotronHWeights struct {
@@ -150,10 +163,11 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 	if cfg.SSMInner%cfg.SSMHeads != 0 || cfg.SSMHeads%cfg.SSMGroups != 0 {
 		return cfg, NemotronHWeights{}, fmt.Errorf("%s: invalid Mamba dimensions inner=%d heads=%d groups=%d", cfg.Arch, cfg.SSMInner, cfg.SSMHeads, cfg.SSMGroups)
 	}
-	if cfg.ExpertCount <= 0 || cfg.ExpertUsedCount <= 0 || cfg.ExpertUsedCount > cfg.ExpertCount {
+	if (cfg.ExpertCount == 0) != (cfg.ExpertUsedCount == 0) || cfg.ExpertUsedCount > cfg.ExpertCount {
 		return cfg, NemotronHWeights{}, fmt.Errorf("%s: invalid MoE metadata experts=%d used=%d", cfg.Arch, cfg.ExpertCount, cfg.ExpertUsedCount)
 	}
-	if len(cfg.LayerKVHeads) != cfg.NLayers || len(cfg.LayerFFNDim) != cfg.NLayers {
+	if len(cfg.LayerKVHeads) != cfg.NLayers || len(cfg.LayerFFNDim) != cfg.NLayers ||
+		(len(cfg.LayerHeads) != 0 && len(cfg.LayerHeads) != cfg.NLayers) {
 		return cfg, NemotronHWeights{}, fmt.Errorf("%s: per-layer attention.head_count_kv and feed_forward_length metadata are required", cfg.Arch)
 	}
 	tensors := indexTensors(gguf)
@@ -239,33 +253,47 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 			if err != nil {
 				return cfg, NemotronHWeights{}, fmt.Errorf("layer %d attention: %w", i, err)
 			}
+			layer.Attention.OBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_output.bias", tensors, inferred, cfg.Dim)
 		case ffnDim > 0:
-			layer.Kind = nemotronMoE
-			layer.MoE.Router, err = load(prefix + "ffn_gate_inp.weight")
-			if err == nil {
-				layer.MoE.Up, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow, prepareQuantized, useMetal)
-			}
-			if err == nil {
-				layer.MoE.Down, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow, prepareQuantized, useMetal)
-			}
-			if err != nil {
-				return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE: %w", i, err)
-			}
-			layer.MoE.RouterBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"exp_probs_b.bias", tensors, inferred, cfg.ExpertCount)
-			if len(layer.MoE.RouterBias) == 0 {
-				layer.MoE.RouterBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"exp_probs_b", tensors, inferred, cfg.ExpertCount)
-			}
-			if layer.MoE.LatentIn, err = optionalWeight(prefix + "ffn_latent_in.weight"); err != nil {
-				return cfg, NemotronHWeights{}, err
-			}
-			if layer.MoE.LatentOut, err = optionalWeight(prefix + "ffn_latent_out.weight"); err != nil {
-				return cfg, NemotronHWeights{}, err
-			}
-			if layer.MoE.SharedUp, err = optionalWeight(prefix + "ffn_up_shexp.weight"); err != nil {
-				return cfg, NemotronHWeights{}, err
-			}
-			if layer.MoE.SharedDown, err = optionalWeight(prefix + "ffn_down_shexp.weight"); err != nil {
-				return cfg, NemotronHWeights{}, err
+			if cfg.ExpertCount == 0 {
+				layer.Kind = nemotronDenseFFN
+				layer.DenseFFN.Up, err = load(prefix + "ffn_up.weight")
+				if err == nil {
+					layer.DenseFFN.Down, err = load(prefix + "ffn_down.weight")
+				}
+				if err != nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d dense FFN: %w", i, err)
+				}
+				layer.DenseFFN.UpBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"ffn_up.bias", tensors, inferred, ffnDim)
+				layer.DenseFFN.DownBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"ffn_down.bias", tensors, inferred, cfg.Dim)
+			} else {
+				layer.Kind = nemotronMoE
+				layer.MoE.Router, err = load(prefix + "ffn_gate_inp.weight")
+				if err == nil {
+					layer.MoE.Up, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow, prepareQuantized, useMetal)
+				}
+				if err == nil {
+					layer.MoE.Down, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow, prepareQuantized, useMetal)
+				}
+				if err != nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE: %w", i, err)
+				}
+				layer.MoE.RouterBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"exp_probs_b.bias", tensors, inferred, cfg.ExpertCount)
+				if len(layer.MoE.RouterBias) == 0 {
+					layer.MoE.RouterBias = loadOptionalF32Vec(data, gguf.DataOffset, prefix+"exp_probs_b", tensors, inferred, cfg.ExpertCount)
+				}
+				if layer.MoE.LatentIn, err = optionalWeight(prefix + "ffn_latent_in.weight"); err != nil {
+					return cfg, NemotronHWeights{}, err
+				}
+				if layer.MoE.LatentOut, err = optionalWeight(prefix + "ffn_latent_out.weight"); err != nil {
+					return cfg, NemotronHWeights{}, err
+				}
+				if layer.MoE.SharedUp, err = optionalWeight(prefix + "ffn_up_shexp.weight"); err != nil {
+					return cfg, NemotronHWeights{}, err
+				}
+				if layer.MoE.SharedDown, err = optionalWeight(prefix + "ffn_down_shexp.weight"); err != nil {
+					return cfg, NemotronHWeights{}, err
+				}
 			}
 		default:
 			return cfg, NemotronHWeights{}, fmt.Errorf("layer %d: invalid Nemotron-H schedule kv_heads=%d ffn=%d", i, kvHeads, ffnDim)
@@ -288,7 +316,7 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 		if len(qInfo.Dims) < 2 || len(kInfo.Dims) < 2 || len(vInfo.Dims) < 2 {
 			return cfg, NemotronHWeights{}, fmt.Errorf("layer %d: malformed attention dimensions", i)
 		}
-		heads := 0
+		heads := cfg.NHeads
 		if i < len(cfg.LayerHeads) {
 			heads = cfg.LayerHeads[i]
 		}
@@ -360,6 +388,8 @@ func ForwardNemotronHBodyInto(cfg Config, weights NemotronHWeights, cache *KVCac
 			nemotronAttentionForward(cfg, layer.Attention, cache, buf.XN, i, pos, buf)
 		case nemotronMoE:
 			nemotronMoEForward(cfg, layer.MoE, buf.XN, buf)
+		case nemotronDenseFFN:
+			nemotronDenseFFNForward(layer.DenseFFN, buf.XN, buf)
 		default:
 			panic("unknown Nemotron-H layer kind")
 		}
@@ -385,6 +415,21 @@ func nemotronAttentionForward(cfg Config, w NemotronAttentionWeights, cache *KVC
 		cache.attendHead(layer, h/kvMul, buf.Q[qOff:qOff+headDim], headDim, cfg.ValueDim, 0, pos, scale, 0, buf.AttnOut[outOff:outOff+cfg.ValueDim])
 	}
 	w.O.MatvecInto(buf.AttnOut[:cfg.NHeads*cfg.ValueDim], &buf.Proj)
+	addInPlace(buf.Proj, w.OBias)
+}
+
+func nemotronDenseFFNForward(w NemotronDenseFFNWeights, x []float32, buf *DecodeBuffer) {
+	w.Up.MatvecInto(x, &buf.Hidden)
+	addInPlace(buf.Hidden, w.UpBias)
+	for i, v := range buf.Hidden {
+		if v <= 0 {
+			buf.Hidden[i] = 0
+		} else {
+			buf.Hidden[i] = v * v
+		}
+	}
+	w.Down.MatvecInto(buf.Hidden, &buf.Proj)
+	addInPlace(buf.Proj, w.DownBias)
 }
 
 func nemotronMambaForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, x []float32, layer int, buf *DecodeBuffer) {
@@ -407,7 +452,11 @@ func nemotronMambaForward(cfg Config, w NemotronMambaWeights, state *NemotronHCa
 	// The GGUF stores one kernel row per channel, ordered oldest to newest.
 	ensureLenNoClear(&buf.MambaKernel, cfg.SSMConv)
 	for ch := range channels {
-		w.Conv.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
+		if w.Conv.F32 != nil && (ch+1)*cfg.SSMConv <= len(w.Conv.F32) {
+			copy(buf.MambaKernel, w.Conv.F32[ch*cfg.SSMConv:(ch+1)*cfg.SSMConv])
+		} else {
+			w.Conv.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
+		}
 		off := state.convOffset(layer, ch)
 		v := float32(0)
 		for k := 0; k < state.ConvLen; k++ {

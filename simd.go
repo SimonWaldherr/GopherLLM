@@ -1462,6 +1462,13 @@ func DotMXFP4F32(row []byte, x []float32, cols int) float32 {
 
 func DequantRowQ8_0(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ8_0Into(row, cols, out)
+	return out
+}
+
+// DequantRowQ8_0Into is the allocation-free Q8_0 decoder used by batched
+// prefill, where one decoded weight row is shared across many prompt tokens.
+func DequantRowQ8_0Into(row []byte, cols int, out []float32) {
 	for b := range cols / 32 {
 		base := b * 34
 		if base+34 > len(row) {
@@ -1472,11 +1479,17 @@ func DequantRowQ8_0(row []byte, cols int) []float32 {
 			out[b*32+i] = scale * float32(int8(row[base+2+i]))
 		}
 	}
-	return out
 }
 
 func DequantRowQ4_0(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
+	DequantRowQ4_0Into(row, cols, out)
+	return out
+}
+
+// DequantRowQ4_0Into is the allocation-free Q4_0 decoder used by batched
+// prefill. Stable Code GGUFs commonly use this legacy format.
+func DequantRowQ4_0Into(row []byte, cols int, out []float32) {
 	for b := range cols / 32 {
 		base := b * 18
 		if base+18 > len(row) {
@@ -1489,7 +1502,6 @@ func DequantRowQ4_0(row []byte, cols int) []float32 {
 			out[b*32+16+i] = scale * float32(int((packed>>4)&0x0f)-8)
 		}
 	}
-	return out
 }
 
 func DequantRowQ4K(row []byte, cols int) []float32 {

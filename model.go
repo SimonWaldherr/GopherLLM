@@ -55,6 +55,10 @@ type Config struct {
 	RopeYarnLogMultiplier     float32
 	RopeFactorsLong           []float32
 	RopeFactorsShort          []float32
+	// StableLM uses mean-and-variance LayerNorm and can calculate attention
+	// and FFN from the same input before adding both residuals.
+	UseLayerNorm     bool
+	ParallelResidual bool
 	// Gemma-family mechanics (all inert at their zero values; see
 	// docs/INFERENCE_NOTES.md for the researched semantics):
 	// UseGELU switches the FFN activation from SiLU to tanh-approximated GELU.
@@ -155,6 +159,14 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	if logitScale == 0 {
 		logitScale = 1
 	}
+	parallelResidual := false
+	if v, ok := gguf.Metadata[p+".use_parallel_residual"]; ok {
+		parallelResidual, _ = v.AsBool()
+	}
+	normEps := gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5)
+	if p == "stablelm" {
+		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
+	}
 	cfg := Config{
 		Arch:                      p,
 		Dim:                       dim,
@@ -165,7 +177,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		VocabSize:                 vocab,
 		MaxSeqLen:                 int(gguf.GetU32(p+".context_length", 2048)),
 		RopeTheta:                 gguf.GetF32(p+".rope.freq_base", 10000),
-		RMSNormEps:                gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5),
+		RMSNormEps:                normEps,
 		AttentionScale:            gguf.GetF32(p+".attention.scale", 0),
 		EmbeddingScale:            embeddingScale,
 		ResidualScale:             residualScale,
@@ -185,6 +197,8 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
 		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
 		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
+		UseLayerNorm:              p == "stablelm",
+		ParallelResidual:          parallelResidual,
 		UseGELU:                   gemmaFamily(p),
 		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
@@ -287,6 +301,8 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ8_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_0:
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ4_NL:
+		MatvecIQ4NLInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_1:
 		MatvecQ4_1Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ5_0:
@@ -295,6 +311,8 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ5_1Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ8_1:
 		MatvecQ8_1Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ8_K:
+		MatvecQ8KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ2_K:
 		MatvecQ2KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ3_K:
@@ -430,6 +448,9 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeQ4_0:
 		rowBytes := (cols / 32) * 18
 		copy(*out, DequantRowQ4_0(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols))
+	case GGMLTypeIQ4_NL:
+		rowBytes := (cols / 32) * 18
+		DequantRowIQ4NLInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_1:
 		rowBytes := (cols / 32) * 20
 		DequantRowQ4_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
@@ -442,6 +463,9 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeQ8_1:
 		rowBytes := (cols / 32) * 36
 		DequantRowQ8_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ8_K:
+		rowBytes := (cols / 256) * 292
+		DequantRowQ8KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ2_K:
 		rowBytes := (cols / 256) * 84
 		DequantRowQ2KInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
@@ -509,22 +533,24 @@ func (w Weight) RowF32(row, cols int) []float32 {
 // (HasQKV); the SwiGLU FFN is likewise either split (W1 = gate, W3 = up,
 // W2 = down — llama.cpp naming) or fused gate+up in WGateUp (HasGateUp).
 type LayerWeights struct {
-	AttnNorm  []float32
-	WQ        Weight
-	BQ        []float32
-	WK        Weight
-	BK        []float32
-	WV        Weight
-	BV        []float32
-	WQKV      Weight
-	HasQKV    bool
-	WO        Weight
-	FFNNorm   []float32
-	W1        Weight
-	W2        Weight
-	W3        Weight
-	WGateUp   Weight
-	HasGateUp bool
+	AttnNorm     []float32
+	AttnNormBias []float32
+	WQ           Weight
+	BQ           []float32
+	WK           Weight
+	BK           []float32
+	WV           Weight
+	BV           []float32
+	WQKV         Weight
+	HasQKV       bool
+	WO           Weight
+	FFNNorm      []float32
+	FFNNormBias  []float32
+	W1           Weight
+	W2           Weight
+	W3           Weight
+	WGateUp      Weight
+	HasGateUp    bool
 	// Optional Gemma-family norms, nil when the tensors are absent:
 	// AttnQNorm/AttnKNorm are per-head RMS norms of length HeadDim applied
 	// after the Q/K projections (before RoPE); PostAttnNorm/PostFFNNorm are
@@ -537,10 +563,11 @@ type LayerWeights struct {
 }
 
 type ModelWeights struct {
-	TokenEmbd  Weight
-	OutputNorm []float32
-	Output     Weight
-	Layers     []LayerWeights
+	TokenEmbd      Weight
+	OutputNorm     []float32
+	OutputNormBias []float32
+	Output         Weight
+	Layers         []LayerWeights
 }
 
 type Gemma4LayerWeights struct {
@@ -679,6 +706,7 @@ type DecodeBuffer struct {
 	QKV                     []float32
 	AttnOut                 []float32
 	Proj                    []float32
+	AttnProj                []float32
 	Gate                    []float32
 	Up                      []float32
 	GateUp                  []float32
@@ -727,6 +755,7 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		QKV:                     make([]float32, config.NHeads*maxHeadDim+maxNKVHeads*maxHeadDim+maxNKVHeads*maxValueDim),
 		AttnOut:                 make([]float32, config.NHeads*maxValueDim),
 		Proj:                    make([]float32, config.Dim),
+		AttnProj:                make([]float32, config.Dim),
 		Gate:                    make([]float32, config.HiddenDim),
 		Up:                      make([]float32, config.HiddenDim),
 		GateUp:                  make([]float32, config.HiddenDim*2),
@@ -914,7 +943,11 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 			fmt.Fprintf(logw, "  Loaded layer %d/%d\n", l+1, config.NLayers)
 		}
 	}
-	return config, ModelWeights{TokenEmbd: tokenEmbd, OutputNorm: outputNorm, Output: output, Layers: layers}, nil
+	return config, ModelWeights{
+		TokenEmbd: tokenEmbd, OutputNorm: outputNorm,
+		OutputNormBias: loadOptionalF32Vec(data, gguf.DataOffset, "output_norm.bias", tensorIdx, inferred, config.Dim),
+		Output:         output, Layers: layers,
+	}, nil
 }
 
 func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, GptOssWeights, error) {
@@ -923,6 +956,12 @@ func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuanti
 }
 
 func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, Gemma4Weights, error) {
+	config := ConfigFromGGUF(gguf)
+	if config.Arch == "gemma4" {
+		if err := validateGemma4DenseLayout(config, indexTensors(gguf)); err != nil {
+			return config, Gemma4Weights{}, err
+		}
+	}
 	config, std, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw)
 	if err != nil {
 		return config, Gemma4Weights{}, err
@@ -936,6 +975,44 @@ func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuanti
 		}
 	}
 	return config, Gemma4Weights{TokenEmbd: std.TokenEmbd, OutputNorm: std.OutputNorm, Output: std.Output, Layers: layers, Standard: std}, nil
+}
+
+// validateGemma4DenseLayout rejects Gemma 4 variants that look like a normal
+// Gemma model in metadata but use mechanisms this runtime does not implement
+// (PLE, per-layer dimensions, cross-layer KV sharing, or MoE).  Without this
+// guard, an absent global feed_forward_length could reach the decode path and
+// produce a slice-bounds panic instead of a useful load-time diagnostic.
+func validateGemma4DenseLayout(config Config, tensors map[string]TensorInfo) error {
+	if config.Dim <= 0 || config.HiddenDim <= 0 {
+		return fmt.Errorf("gemma4 GGUF uses unsupported per-layer dimensions (embedding_length=%d, feed_forward_length=%d); Gemma 4 PLE/MoE layouts are not implemented", config.Dim, config.HiddenDim)
+	}
+	for l := range config.NLayers {
+		prefix := fmt.Sprintf("blk.%d.", l)
+		required := []string{
+			prefix + "attn_norm.weight", prefix + "attn_output.weight",
+			prefix + "ffn_norm.weight", prefix + "ffn_down.weight",
+		}
+		for _, name := range required {
+			if _, ok := tensors[name]; !ok {
+				return fmt.Errorf("gemma4 GGUF uses an unsupported layer layout (missing %s); Gemma 4 p-RoPE/PLE/MoE is not implemented", name)
+			}
+		}
+		if _, fused := tensors[prefix+"attn_qkv.weight"]; !fused {
+			for _, name := range []string{prefix + "attn_q.weight", prefix + "attn_k.weight", prefix + "attn_v.weight"} {
+				if _, ok := tensors[name]; !ok {
+					return fmt.Errorf("gemma4 GGUF uses an unsupported attention layout (missing %s); Gemma 4 p-RoPE/PLE/MoE is not implemented", name)
+				}
+			}
+		}
+		if _, split := tensors[prefix+"ffn_gate.weight"]; split {
+			if _, ok := tensors[prefix+"ffn_up.weight"]; !ok {
+				return fmt.Errorf("gemma4 GGUF uses an unsupported FFN layout (missing %s); Gemma 4 PLE/MoE is not implemented", prefix+"ffn_up.weight")
+			}
+		} else if _, fused := tensors[prefix+"ffn_up.weight"]; !fused {
+			return fmt.Errorf("gemma4 GGUF uses an unsupported FFN layout (missing %s); Gemma 4 PLE/MoE is not implemented", prefix+"ffn_gate.weight")
+		}
+	}
+	return nil
 }
 
 func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool, qRows, kRows, vRows int) (LayerWeights, error) {
@@ -997,22 +1074,24 @@ func loadLayer(data []byte, dataOffset, l int, tensors map[string]TensorInfo, in
 		hasGateUp = true
 	}
 	return LayerWeights{
-		AttnNorm:  attnNorm,
-		WQ:        wq,
-		BQ:        loadOptionalF32Vec(data, dataOffset, prefix+"attn_q.bias", tensors, inferred, qRows),
-		WK:        wk,
-		BK:        loadOptionalF32Vec(data, dataOffset, prefix+"attn_k.bias", tensors, inferred, kRows),
-		WV:        wv,
-		BV:        loadOptionalF32Vec(data, dataOffset, prefix+"attn_v.bias", tensors, inferred, vRows),
-		WQKV:      wqkv,
-		HasQKV:    hasQKV,
-		WO:        wo,
-		FFNNorm:   ffnNorm,
-		W1:        w1,
-		W2:        w2,
-		W3:        w3,
-		WGateUp:   wGateUp,
-		HasGateUp: hasGateUp,
+		AttnNorm:     attnNorm,
+		AttnNormBias: loadOptionalF32Vec(data, dataOffset, prefix+"attn_norm.bias", tensors, inferred, len(attnNorm)),
+		WQ:           wq,
+		BQ:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_q.bias", tensors, inferred, qRows),
+		WK:           wk,
+		BK:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_k.bias", tensors, inferred, kRows),
+		WV:           wv,
+		BV:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_v.bias", tensors, inferred, vRows),
+		WQKV:         wqkv,
+		HasQKV:       hasQKV,
+		WO:           wo,
+		FFNNorm:      ffnNorm,
+		FFNNormBias:  loadOptionalF32Vec(data, dataOffset, prefix+"ffn_norm.bias", tensors, inferred, len(ffnNorm)),
+		W1:           w1,
+		W2:           w2,
+		W3:           w3,
+		WGateUp:      wGateUp,
+		HasGateUp:    hasGateUp,
 		// Unlike the biases above (where a zero-filled default is inert),
 		// these must stay nil when absent: applying an all-zero norm would
 		// zero the activations.
@@ -1160,6 +1239,12 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			f[i] = F16ToF32(binary.LittleEndian.Uint16(raw[i*2:]))
 		}
 		return Weight{F32: f}, nil
+	case GGMLTypeF64:
+		f := make([]float32, numel)
+		for i := range numel {
+			f[i] = float32(math.Float64frombits(binary.LittleEndian.Uint64(raw[i*8:])))
+		}
+		return Weight{F32: f}, nil
 	case GGMLTypeBF16:
 		// bfloat16 is the top 16 bits of an IEEE float32 (QAT checkpoints and
 		// many recent full-precision GGUFs use it), so conversion is a shift.
@@ -1168,7 +1253,7 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			f[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
 		}
 		return Weight{F32: f}, nil
-	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1,
+	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
 		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
 		if forceF32 {
 			f, ok := dequantTensor(info.DType, raw, numel)
@@ -1212,6 +1297,8 @@ func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
 		return DequantRowQ8_0(raw, numel), true
 	case GGMLTypeQ4_0:
 		return DequantRowQ4_0(raw, numel), true
+	case GGMLTypeIQ4_NL:
+		return DequantRowIQ4NL(raw, numel), true
 	case GGMLTypeQ4_1:
 		return DequantRowQ4_1(raw, numel), true
 	case GGMLTypeQ5_0:
@@ -1220,6 +1307,8 @@ func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
 		return DequantRowQ5_1(raw, numel), true
 	case GGMLTypeQ8_1:
 		return DequantRowQ8_1(raw, numel), true
+	case GGMLTypeQ8_K:
+		return DequantRowQ8K(raw, numel), true
 	case GGMLTypeQ2_K:
 		return DequantRowQ2K(raw, numel), true
 	case GGMLTypeQ3_K:
@@ -1330,7 +1419,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	}
 	for l := range config.NLayers {
 		layer := weights.Layers[l]
-		rmsNormInto(buf.X, layer.AttnNorm, config.RMSNormEps, &buf.XN)
+		normalizeDecoderInto(config, buf.X, layer.AttnNorm, layer.AttnNormBias, &buf.XN)
 		if layer.HasQKV {
 			layer.WQKV.MatvecInto(buf.XN, &buf.QKV)
 			qLen := config.NHeads * headDim
@@ -1394,9 +1483,13 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		if config.ResidualScale != 1 {
 			ScaleF32(buf.Proj, config.ResidualScale)
 		}
-		addInPlace(buf.X[:dim], buf.Proj)
+		if config.ParallelResidual {
+			copy(buf.AttnProj[:dim], buf.Proj[:dim])
+		} else {
+			addInPlace(buf.X[:dim], buf.Proj)
+		}
 
-		rmsNormInto(buf.X, layer.FFNNorm, config.RMSNormEps, &buf.XN2)
+		normalizeDecoderInto(config, buf.X, layer.FFNNorm, layer.FFNNormBias, &buf.XN2)
 		// Decode bottleneck: the selective Metal path previously synchronized and
 		// copied Gate/Up to the CPU for SiLU, then copied Hidden back for Down.
 		// Keep all three stages in one command buffer when the measured
@@ -1443,8 +1536,19 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			ScaleF32(buf.Proj, config.ResidualScale)
 		}
 		addInPlace(buf.X[:dim], buf.Proj)
+		if config.ParallelResidual {
+			addInPlace(buf.X[:dim], buf.AttnProj[:dim])
+		}
 	}
-	rmsNormInto(buf.X, weights.OutputNorm, config.RMSNormEps, &buf.XN)
+	normalizeDecoderInto(config, buf.X, weights.OutputNorm, weights.OutputNormBias, &buf.XN)
+}
+
+func normalizeDecoderInto(config Config, x, weight, bias []float32, out *[]float32) {
+	if config.UseLayerNorm {
+		layerNormInto(x, weight, bias, config.RMSNormEps, out)
+		return
+	}
+	rmsNormInto(x, weight, config.RMSNormEps, out)
 }
 
 func ForwardHidden(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {

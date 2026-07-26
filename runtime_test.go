@@ -25,6 +25,26 @@ func TestL2NormalizeProducesUnitVector(t *testing.T) {
 	}
 }
 
+func TestCompatibleDenseDecoderArchitecturesLoadAndGenerate(t *testing.T) {
+	for _, arch := range []string{"phi3", "granite", "exaone", "internlm2", "stablelm"} {
+		t.Run(arch, func(t *testing.T) {
+			r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF(arch))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if arch == "stablelm" && (!r.config.UseLayerNorm || !r.config.ParallelResidual) {
+				t.Fatalf("stablelm config = %+v, want LayerNorm plus parallel residual", r.config)
+			}
+			opts := DefaultGenerationOptions()
+			opts.MaxTokens = 1
+			opts.Sampler.Temperature = 0
+			if _, err := r.Generate("hello", opts); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestCosineSimilarityRejectsInvalidInputs(t *testing.T) {
 	if _, err := CosineSimilarity(nil, nil); err == nil {
 		t.Fatal("empty vectors should fail")

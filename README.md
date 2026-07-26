@@ -33,9 +33,9 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Split/sharded GGUF loading: point at any one shard of a
   `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
   and merged automatically (see [Performance Notes](#performance-notes)).
-- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1,
-  Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/BF16 loaded directly
-  (BF16 covers QAT-derived and modern full-precision GGUFs).
+- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL,
+  Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/F64/BF16 load
+  directly (BF16 covers QAT-derived and modern full-precision GGUFs).
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
 - OpenAI-compatible tool/function calling, with a native prompt format for
   Mistral-family models and a generic convention for everything else.
@@ -911,7 +911,8 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen3,
-gpt-oss, gemma, gemma2, gemma4, nemotron_h, nemotron_h_moe, bert, nomic-bert
+phi3, granite (dense), exaone, internlm2, stablelm, gpt-oss, gemma, gemma2, gemma3, gemma4,
+nemotron_h, nemotron_h_moe, bert, nomic-bert
 ```
 
 qwen3 (including the DeepSeek-R1 Qwen3 distills) adds per-head QK-norm on top
@@ -921,6 +922,13 @@ and the newer forced-open templates whose output begins mid-reasoning).
 `deepseek2` (MLA attention) is not supported. Mistral-family models support
 assistant-message prefill: a conversation ending in an assistant message
 leaves the turn open so generation continues it.
+
+Phi-3 (including the Phi-3.5 GGUFs that declare `phi3`), dense Granite,
+EXAONE, and InternLM2 use GopherLLM's standard pre-norm RoPE/GQA/SwiGLU
+decoder path. StableLM adds LayerNorm, learned norm biases, and optionally its
+parallel residual branch. Sparse
+Granite MoE checkpoints remain intentionally rejected: their expert router and
+expert tensors require the separate MoE execution graph.
 
 Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
@@ -932,7 +940,7 @@ does not rely on a llama.cpp process. Prompt prefill is deliberately
 per-token for this architecture because its recurrent state makes the regular
 batched transformer prefill invalid.
 
-Gemma-family support (`gemma`/`gemma2`/`gemma4`, including the Gemma QAT
+Gemma-family support (`gemma`/`gemma2`/`gemma3`/`gemma4`, including the Gemma QAT
 GGUFs) is **experimental**: the dense Gemma graph is implemented — hardcoded
 `sqrt(dim)` embedding scaling, GELU FFN, QK-norm, post-attention/post-FFN
 norms, attention/final logit softcapping, the per-layer sliding-window map

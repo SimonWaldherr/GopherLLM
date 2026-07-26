@@ -78,6 +78,18 @@ func BenchmarkRMSNorm_4096(b *testing.B) {
 	}
 }
 
+func BenchmarkLayerNorm_4096(b *testing.B) {
+	x := benchFloatSlice(4096)
+	weight := benchFloatSlice(4096)
+	bias := benchFloatSlice(4096)
+	out := make([]float32, 4096)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(out) * 4 * 4))
+	for b.Loop() {
+		layerNormInto(x, weight, bias, 1e-5, &out)
+	}
+}
+
 func BenchmarkDotQ4K_4096(b *testing.B) {
 	row := benchBytes((4096 / 256) * 144)
 	x := benchFloatSlice(4096)
@@ -96,6 +108,20 @@ func BenchmarkMatvecQ4K_1024x1024(b *testing.B) {
 	b.SetBytes(int64(len(data) + len(x)*4))
 	for b.Loop() {
 		MatvecQ4KInto(data, x, 1024, 1024, &out)
+	}
+}
+
+func BenchmarkMatvecQ8K_1024x1024(b *testing.B) {
+	data := benchBytes(1024 * (1024 / 256) * 292)
+	for i := 0; i < len(data); i += 292 {
+		data[i], data[i+1], data[i+2], data[i+3] = 0, 0, 0, 0x3f // scale 0.5
+	}
+	x := benchFloatSlice(1024)
+	out := make([]float32, 1024)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data) + len(x)*4))
+	for b.Loop() {
+		MatvecQ8KInto(data, x, 1024, 1024, &out)
 	}
 }
 

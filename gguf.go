@@ -41,6 +41,8 @@ const (
 	GGMLTypeQ5_K    GGMLType = 13
 	GGMLTypeQ6_K    GGMLType = 14
 	GGMLTypeQ8_K    GGMLType = 15
+	GGMLTypeIQ4_NL  GGMLType = 20
+	GGMLTypeF64     GGMLType = 28
 	GGMLTypeBF16    GGMLType = 30
 	GGMLTypeMXFP4   GGMLType = 39
 	GGMLTypeUnknown GGMLType = 255
@@ -53,7 +55,7 @@ func ggmlTypeFromUint32(v uint32) GGMLType {
 	switch GGMLType(v) {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
-		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeBF16, GGMLTypeMXFP4:
+		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeF64, GGMLTypeBF16, GGMLTypeMXFP4:
 		return GGMLType(v)
 	default:
 		return GGMLTypeUnknown
@@ -88,6 +90,12 @@ func (t GGMLType) String() string {
 		return "Q5_K"
 	case GGMLTypeQ6_K:
 		return "Q6_K"
+	case GGMLTypeQ8_K:
+		return "Q8_K"
+	case GGMLTypeIQ4_NL:
+		return "IQ4_NL"
+	case GGMLTypeF64:
+		return "F64"
 	case GGMLTypeBF16:
 		return "BF16"
 	case GGMLTypeMXFP4:
@@ -102,7 +110,7 @@ func (t GGMLType) String() string {
 // 256-element superblocks; this legacy accessor is only used with the 32-wide
 // simple quants, and DataSize handles the K-quant sizes explicitly.
 func (t GGMLType) BlockSize() int {
-	if t == GGMLTypeF32 || t == GGMLTypeF16 {
+	if t == GGMLTypeF32 || t == GGMLTypeF16 || t == GGMLTypeF64 {
 		return 1
 	}
 	return 32
@@ -128,6 +136,8 @@ func (t GGMLType) BlockBytes() (int, bool) {
 		return 24, true
 	case GGMLTypeQ8_0:
 		return 34, true
+	case GGMLTypeIQ4_NL:
+		return 18, true
 	case GGMLTypeQ8_1:
 		return 36, true
 	default:
@@ -162,9 +172,11 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 	switch t {
 	case GGMLTypeF32:
 		return n * 4, true
+	case GGMLTypeF64:
+		return n * 8, true
 	case GGMLTypeF16, GGMLTypeBF16:
 		return n * 2, true
-	case GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_0, GGMLTypeQ8_1:
+	case GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeIQ4_NL:
 		b, _ := t.BlockBytes()
 		return (n / t.BlockSize()) * b, true
 	case GGMLTypeQ2_K:
@@ -177,6 +189,11 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 		return (n / 256) * 176, true
 	case GGMLTypeQ6_K:
 		return (n / 256) * 210, true
+	case GGMLTypeQ8_K:
+		// float32 scale + 256 int8 values + 16 int16 block sums.
+		// The sums accelerate mixed-quant dot products; dequantization only
+		// needs the scale and values.
+		return (n / 256) * 292, true
 	case GGMLTypeMXFP4:
 		return (n / 32) * 17, true
 	default:

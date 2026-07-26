@@ -150,6 +150,56 @@ func TestBatchedPrefillSupportsFusedQKVAndGateUp(t *testing.T) {
 	}
 }
 
+func TestBatchedPrefillMatchesPerTokenForStableLM(t *testing.T) {
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "32")
+	r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF("stablelm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.config.UseLayerNorm || !r.config.ParallelResidual || !r.canBatchPrefill() {
+		t.Fatalf("stablelm should use batched LayerNorm/parallel-residual prefill: %+v", r.config)
+	}
+	tokens := r.tok.Encode(strings.Repeat("abcdefghij", 10))
+	kDim, vDim, mh, mk, mv := r.cacheDims()
+	newRun := func() (*KVCache, *DecodeBuffer) {
+		return NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1), NewDecodeBuffer(r.config, mh, mk, mv)
+	}
+	c1, b1 := newRun()
+	ref := []float32{}
+	for pos, tok := range tokens {
+		if pos == len(tokens)-1 {
+			r.forwardTokenInto(c1, b1, tok, pos, &ref)
+		} else {
+			r.forwardPrefillToken(c1, b1, tok, pos)
+		}
+	}
+	c2, b2 := newRun()
+	got := []float32{}
+	if err := r.prefillBatched(context.Background(), c2, b2, tokens, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(ref) {
+		t.Fatalf("logit len %d vs %d", len(got), len(ref))
+	}
+	for i := range ref {
+		if d := math.Abs(float64(got[i] - ref[i])); d > 1e-3*math.Max(1, math.Abs(float64(ref[i]))) {
+			t.Fatalf("logit %d: batched=%v per-token=%v", i, got[i], ref[i])
+		}
+	}
+	for l := range c1.K {
+		for i := range c1.K[l] {
+			if d := math.Abs(float64(c2.K[l][i] - c1.K[l][i])); d > 1e-3 {
+				t.Fatalf("layer %d K[%d]: batched=%v per-token=%v", l, i, c2.K[l][i], c1.K[l][i])
+			}
+		}
+		for i := range c1.V[l] {
+			if d := math.Abs(float64(c2.V[l][i] - c1.V[l][i])); d > 1e-3 {
+				t.Fatalf("layer %d V[%d]: batched=%v per-token=%v", l, i, c2.V[l][i], c1.V[l][i])
+			}
+		}
+	}
+}
+
 func TestMatvecBatchMatchesPerToken(t *testing.T) {
 	rng := rand.New(rand.NewSource(5))
 	const rows, cols, P = 20, 512, 4
@@ -165,11 +215,25 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 		q4kData = append(q4kData, randomQ4KRow(rng, cols)...)
 		q6kData = append(q6kData, randomQ6KRow(rng, cols)...)
 	}
+	legacyData := func(blockBytes int) []byte {
+		out := make([]byte, rows*(cols/32)*blockBytes)
+		for block := 0; block < len(out)/blockBytes; block++ {
+			base := block * blockBytes
+			// f16 1.0 scale; arbitrary deterministic packed values thereafter.
+			out[base+1] = 0x3c
+			for i := 2; i < blockBytes; i++ {
+				out[base+i] = byte(rng.Intn(256))
+			}
+		}
+		return out
+	}
 
 	weights := map[string]Weight{
-		"f32": {F32: randomVec(rng, rows*cols)},
-		"q4k": {Raw: q4kData, Type: GGMLTypeQ4_K, Rows: rows, Cols: cols},
-		"q6k": {Raw: q6kData, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols},
+		"f32":  {F32: randomVec(rng, rows*cols)},
+		"q4_0": {Raw: legacyData(18), Type: GGMLTypeQ4_0, Rows: rows, Cols: cols},
+		"q8_0": {Raw: legacyData(34), Type: GGMLTypeQ8_0, Rows: rows, Cols: cols},
+		"q4k":  {Raw: q4kData, Type: GGMLTypeQ4_K, Rows: rows, Cols: cols},
+		"q6k":  {Raw: q6kData, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols},
 	}
 
 	for name, w := range weights {

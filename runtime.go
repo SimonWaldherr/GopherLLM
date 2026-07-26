@@ -270,13 +270,16 @@ type Runner struct {
 //     tensors and applies exactly as for Gemma 3/4.
 //   - deepseek2 (MLA attention) is NOT supported; DeepSeek-R1 distills ship
 //     as qwen2/qwen3/llama and work through those graphs.
+//   - Phi-3, dense Granite, EXAONE, and InternLM2 use the same pre-norm, RoPE, GQA and
+//     SwiGLU graph as the standard loader. Their architecture-specific scales
+//     are read from GGUF metadata by ConfigFromGGUF.
 //   - Devstral and Mistral-Small GGUFs usually declare llama or mistral3;
 //     their [INST]/Tekken behavior is picked up from tokenizer metadata, not
 //     the arch string.
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen3", "gpt-oss", "gemma", "gemma2", "gemma4", "nemotron_h", "nemotron_h_moe", "bert", "nomic-bert":
+		"qwen2", "qwen3", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "bert", "nomic-bert":
 		return true
 	default:
 		return false
@@ -344,7 +347,7 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 			return nil, err
 		}
 		r.config, r.gptOss, r.kind = config, weights, loadedGptOss
-	case "gemma", "gemma2", "gemma4":
+	case "gemma", "gemma2", "gemma3", "gemma4":
 		// The dense Gemma graph is implemented (sqrt(dim) embedding scaling,
 		// GELU FFN, QK-norm, post-attention/post-FFN norms, attention/final
 		// logit softcapping, per-layer sliding-window map, <start_of_turn>
@@ -973,13 +976,9 @@ func (r *Runner) canBatchPrefill() bool {
 	if os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
 		return false
 	}
-	// The batched graph implements the plain llama-style block, including
-	// fused QKV and fused gate/up tensors. Gemma-family mechanics (GELU,
-	// QK-norm, post-norms) fall back to the per-token path, which supports
-	// everything.
-	if r.config.UseGELU {
-		return false
-	}
+	// The batched graph implements both RMSNorm and LayerNorm, including
+	// StableLM's parallel attention/FFN residual. Gemma-family mechanisms
+	// such as QK/post norms still fall back to the per-token path.
 	for _, l := range r.standard.Layers {
 		if l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
 			return false

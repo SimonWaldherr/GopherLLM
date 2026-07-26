@@ -109,8 +109,11 @@ func TestGGMLTypeDataSize(t *testing.T) {
 		{GGMLTypeF32, 10, 40},
 		{GGMLTypeF16, 10, 20},
 		{GGMLTypeQ8_0, 32, 34},
+		{GGMLTypeIQ4_NL, 32, 18},
 		{GGMLTypeQ4_K, 256, 144},
 		{GGMLTypeQ6_K, 256, 210},
+		{GGMLTypeQ8_K, 256, 292},
+		{GGMLTypeF64, 10, 80},
 		{GGMLTypeMXFP4, 32, 17},
 	}
 	for _, c := range cases {
@@ -132,6 +135,7 @@ func TestGGMLTypeBlockBytes(t *testing.T) {
 		{GGMLTypeF32, 4},
 		{GGMLTypeF16, 2},
 		{GGMLTypeQ4_0, 18},
+		{GGMLTypeIQ4_NL, 18},
 		{GGMLTypeQ4_1, 20},
 		{GGMLTypeQ5_0, 22},
 		{GGMLTypeQ5_1, 24},

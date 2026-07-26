@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -9,7 +10,9 @@ import (
 // every Gemma-family mechanism the runtime implements: QK-norm and
 // post-attention/post-FFN norm tensors, softcapping metadata, a sliding
 // window, and the <start_of_turn>/<end_of_turn> chat vocabulary.
-func buildTinyGemmaGGUF() []byte {
+func buildTinyGemmaGGUF() []byte { return buildTinyGemmaGGUFWithArch("gemma2") }
+
+func buildTinyGemmaGGUFWithArch(arch string) []byte {
 	const (
 		dim    = 8
 		heads  = 2
@@ -30,22 +33,22 @@ func buildTinyGemmaGGUF() []byte {
 		scores[i] = float32(0)
 	}
 	kvs := []ggufKV{
-		{"general.architecture", ggufStr, "gemma2"},
+		{"general.architecture", ggufStr, arch},
 		{"general.name", ggufStr, "tiny-gemma"},
-		{"gemma2.embedding_length", ggufU32, uint32(dim)},
-		{"gemma2.block_count", ggufU32, uint32(2)},
-		{"gemma2.attention.head_count", ggufU32, uint32(heads)},
-		{"gemma2.attention.head_count_kv", ggufU32, uint32(kv)},
-		{"gemma2.attention.key_length", ggufU32, uint32(hdim)},
-		{"gemma2.attention.value_length", ggufU32, uint32(hdim)},
-		{"gemma2.feed_forward_length", ggufU32, uint32(hidden)},
-		{"gemma2.context_length", ggufU32, uint32(1024)},
-		{"gemma2.attention.layer_norm_rms_epsilon", ggufF32, float32(1e-6)},
-		{"gemma2.rope.freq_base", ggufF32, float32(10000)},
-		{"gemma2.rope.dimension_count", ggufU32, uint32(hdim)},
-		{"gemma2.attention.sliding_window", ggufU32, uint32(4)},
-		{"gemma2.attn_logit_softcapping", ggufF32, float32(50)},
-		{"gemma2.final_logit_softcapping", ggufF32, float32(30)},
+		{arch + ".embedding_length", ggufU32, uint32(dim)},
+		{arch + ".block_count", ggufU32, uint32(2)},
+		{arch + ".attention.head_count", ggufU32, uint32(heads)},
+		{arch + ".attention.head_count_kv", ggufU32, uint32(kv)},
+		{arch + ".attention.key_length", ggufU32, uint32(hdim)},
+		{arch + ".attention.value_length", ggufU32, uint32(hdim)},
+		{arch + ".feed_forward_length", ggufU32, uint32(hidden)},
+		{arch + ".context_length", ggufU32, uint32(1024)},
+		{arch + ".attention.layer_norm_rms_epsilon", ggufF32, float32(1e-6)},
+		{arch + ".rope.freq_base", ggufF32, float32(10000)},
+		{arch + ".rope.dimension_count", ggufU32, uint32(hdim)},
+		{arch + ".attention.sliding_window", ggufU32, uint32(4)},
+		{arch + ".attn_logit_softcapping", ggufF32, float32(50)},
+		{arch + ".final_logit_softcapping", ggufF32, float32(30)},
 		{"tokenizer.ggml.model", ggufStr, "llama"},
 		{"tokenizer.ggml.tokens", ggufArr, ggufArray{ggufStr, toks}},
 		{"tokenizer.ggml.scores", ggufArr, ggufArray{ggufF32, scores}},
@@ -160,6 +163,42 @@ func TestGemmaLoadsOptionalNormsAndGenerates(t *testing.T) {
 		if math.IsNaN(float64(v)) || v <= -30 || v >= 30 {
 			t.Fatalf("logit[%d] = %v, want finite in (-30, 30) under final softcap", i, v)
 		}
+	}
+}
+
+func TestGemma3LoadsDenseGraph(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyGemmaGGUFWithArch("gemma3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.kind != loadedGemma4 || r.config.Arch != "gemma3" {
+		t.Fatalf("runner = kind %v, arch %q", r.kind, r.config.Arch)
+	}
+}
+
+func TestGemma4RejectsUnsupportedLayoutsBeforeLoad(t *testing.T) {
+	valid, err := ParseGGUFQuiet(buildTinyGemmaGGUFWithArch("gemma4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGemma4DenseLayout(ConfigFromGGUF(valid), indexTensors(valid)); err != nil {
+		t.Fatalf("standard dense Gemma 4 layout rejected: %v", err)
+	}
+
+	config := Config{Arch: "gemma4", Dim: 8, HiddenDim: 16, NLayers: 1}
+	tensors := map[string]TensorInfo{}
+	for _, name := range []string{
+		"blk.0.attn_norm.weight", "blk.0.attn_q.weight", "blk.0.attn_k.weight",
+		"blk.0.attn_output.weight", "blk.0.ffn_norm.weight", "blk.0.ffn_gate.weight",
+		"blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
+	} {
+		tensors[name] = TensorInfo{}
+	}
+	if err := validateGemma4DenseLayout(config, tensors); err == nil || !strings.Contains(err.Error(), "attn_v.weight") {
+		t.Fatalf("missing V tensor error = %v, want clear layout diagnostic", err)
+	}
+	if err := validateGemma4DenseLayout(Config{Arch: "gemma4", NLayers: 1}, tensors); err == nil || !strings.Contains(err.Error(), "per-layer dimensions") {
+		t.Fatalf("zero dimensions error = %v, want clear layout diagnostic", err)
 	}
 }
 

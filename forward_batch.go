@@ -19,12 +19,12 @@ var batchDequantScratchPool = sync.Pool{New: func() any {
 // It hangs off DecodeBuffer so prompt chunks and subsequent requests reuse the
 // same backing arrays instead of feeding tens or hundreds of MiB to the GC.
 type batchDecodeBuffer struct {
-	XFlat, XNFlat, QFlat, KFlat, VFlat []float32
-	AttnOutFlat, ProjFlat              []float32
-	GateFlat, UpFlat, HiddenFlat       []float32
-	QKVFlat, GateUpFlat                []float32
-	X, XN, Q, K, V, AttnOut, Proj      [][]float32
-	Gate, Up, Hidden, QKV, GateUp      [][]float32
+	XFlat, XNFlat, QFlat, KFlat, VFlat      []float32
+	AttnOutFlat, ProjFlat, AttnProjFlat     []float32
+	GateFlat, UpFlat, HiddenFlat            []float32
+	QKVFlat, GateUpFlat                     []float32
+	X, XN, Q, K, V, AttnOut, Proj, AttnProj [][]float32
+	Gate, Up, Hidden, QKV, GateUp           [][]float32
 }
 
 func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]float32 {
@@ -111,6 +111,18 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 // if cols is incompatible or the type has no dequantizer.
 func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32) {
 	switch w.Type {
+	case GGMLTypeQ8_0:
+		if cols%32 == 0 {
+			return DequantRowQ8_0Into
+		}
+	case GGMLTypeQ4_0:
+		if cols%32 == 0 {
+			return DequantRowQ4_0Into
+		}
+	case GGMLTypeIQ4_NL:
+		if cols%32 == 0 {
+			return DequantRowIQ4NLInto
+		}
 	case GGMLTypeQ4_1:
 		if cols%32 == 0 {
 			return DequantRowQ4_1Into
@@ -143,6 +155,10 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 		if cols%256 == 0 {
 			return DequantRowQ6KInto
 		}
+	case GGMLTypeQ8_K:
+		if cols%256 == 0 {
+			return DequantRowQ8KInto
+		}
 	}
 	return nil
 }
@@ -167,7 +183,6 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	attnLen := config.NHeads * valueDim
 	hDim := config.HiddenDim
 	interleaved := ropeInterleaved(config.Arch)
-	eps := config.RMSNormEps
 
 	b := &buf.batch
 	X := reuseBatchViews(&b.XFlat, &b.X, p, dim)
@@ -177,6 +192,10 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	V := reuseBatchViews(&b.VFlat, &b.V, p, vLen)
 	AttnOut := reuseBatchViews(&b.AttnOutFlat, &b.AttnOut, p, attnLen)
 	Proj := reuseBatchViews(&b.ProjFlat, &b.Proj, p, dim)
+	var AttnProj [][]float32
+	if config.ParallelResidual {
+		AttnProj = reuseBatchViews(&b.AttnProjFlat, &b.AttnProj, p, dim)
+	}
 	Gate := reuseBatchViews(&b.GateFlat, &b.Gate, p, hDim)
 	Up := reuseBatchViews(&b.UpFlat, &b.Up, p, hDim)
 	QKV := [][]float32(nil)
@@ -199,7 +218,7 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	for l := 0; l < config.NLayers; l++ {
 		layer := weights.Layers[l]
 		for t := 0; t < p; t++ {
-			rmsNormInto(X[t], layer.AttnNorm, eps, &XN[t])
+			normalizeDecoderInto(config, X[t], layer.AttnNorm, layer.AttnNormBias, &XN[t])
 		}
 		if layer.HasQKV {
 			qkvLen := qLen + kLen + vLen
@@ -259,8 +278,12 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			if config.ResidualScale != 1 {
 				ScaleF32(Proj[t], config.ResidualScale)
 			}
-			addInPlace(X[t], Proj[t])
-			rmsNormInto(X[t], layer.FFNNorm, eps, &XN[t])
+			if config.ParallelResidual {
+				copy(AttnProj[t], Proj[t])
+			} else {
+				addInPlace(X[t], Proj[t])
+			}
+			normalizeDecoderInto(config, X[t], layer.FFNNorm, layer.FFNNormBias, &XN[t])
 		}
 		if layer.HasGateUp {
 			gateUpLen := hDim * 2
@@ -274,14 +297,23 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			matvecBatch(layer.W1, XN, Gate)
 			matvecBatch(layer.W3, XN, Up)
 		}
-		if p > 1 {
-			parallelChunks(p, func(ts, te int) {
-				for t := ts; t < te; t++ {
+		activateFFN := func(ts, te int) {
+			for t := ts; t < te; t++ {
+				if config.UseGELU {
+					for i := 0; i < hDim; i++ {
+						Hidden[t][i] = geluTanh(Gate[t][i]) * Up[t][i]
+					}
+				} else {
 					siluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])
 				}
+			}
+		}
+		if p > 1 {
+			parallelChunks(p, func(ts, te int) {
+				activateFFN(ts, te)
 			})
 		} else {
-			siluMulF32(Gate[0][:hDim], Up[0][:hDim], Hidden[0][:hDim])
+			activateFFN(0, 1)
 		}
 		matvecBatch(layer.W2, Hidden, Proj)
 		for t := 0; t < p; t++ {
@@ -289,12 +321,15 @@ func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				ScaleF32(Proj[t], config.ResidualScale)
 			}
 			addInPlace(X[t], Proj[t])
+			if config.ParallelResidual {
+				addInPlace(X[t], AttnProj[t])
+			}
 		}
 	}
 
 	if computeLast {
 		last := p - 1
-		rmsNormInto(X[last], weights.OutputNorm, eps, &buf.XN)
+		normalizeDecoderInto(config, X[last], weights.OutputNorm, weights.OutputNormBias, &buf.XN)
 		weights.Output.MatvecInto(buf.XN, logits)
 		if config.LogitScale != 1 {
 			ScaleF32(*logits, 1/config.LogitScale)

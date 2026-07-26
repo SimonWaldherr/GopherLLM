@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"encoding/binary"
 	"math"
 	"math/rand"
 	"testing"
@@ -24,6 +25,20 @@ func TestDequantRowQ4_1KnownValues(t *testing.T) {
 		}
 		if got[16+i] != 3.5 { // 1*3 + 0.5
 			t.Fatalf("got[%d] = %v, want 3.5", 16+i, got[16+i])
+		}
+	}
+}
+
+func TestDequantRowIQ4NLKnownValues(t *testing.T) {
+	row := make([]byte, 18)
+	putF16One(row)
+	for i := 0; i < 16; i++ {
+		row[2+i] = byte(i) | byte(15-i)<<4
+	}
+	got := DequantRowIQ4NL(row, 32)
+	for i := 0; i < 16; i++ {
+		if got[i] != iq4NLValues[i] || got[16+i] != iq4NLValues[15-i] {
+			t.Fatalf("IQ4_NL[%d] = %v/%v, want %v/%v", i, got[i], got[16+i], iq4NLValues[i], iq4NLValues[15-i])
 		}
 	}
 }
@@ -81,6 +96,21 @@ func TestDequantRowQ8_1KnownValues(t *testing.T) {
 	got := DequantRowQ8_1(row, 32)
 	for i := 0; i < 32; i++ {
 		want := 0.5 * float32(i-16)
+		if got[i] != want {
+			t.Fatalf("got[%d] = %v, want %v", i, got[i], want)
+		}
+	}
+}
+
+func TestDequantRowQ8KKnownValues(t *testing.T) {
+	row := make([]byte, 292)
+	binary.LittleEndian.PutUint32(row, math.Float32bits(0.25))
+	for i := 0; i < 256; i++ {
+		row[4+i] = byte(int8(i - 128))
+	}
+	got := DequantRowQ8K(row, 256)
+	for i := range got {
+		want := 0.25 * float32(i-128)
 		if got[i] != want {
 			t.Fatalf("got[%d] = %v, want %v", i, got[i], want)
 		}
@@ -176,10 +206,16 @@ func TestExtraQuantDotMatchesDequantizedDot(t *testing.T) {
 		dot     func(row []byte, x []float32, cols int) float32
 		dequant func(row []byte, cols int) []float32
 	}{
+		{"IQ4_NL", 64, randRow(2 * 18), func(r []byte) { saneF16(r, 18, 0) }, DotIQ4NLF32, DequantRowIQ4NL},
 		{"Q4_1", 64, randRow(2 * 20), func(r []byte) { saneF16(r, 20, 0, 2) }, DotQ4_1F32, DequantRowQ4_1},
 		{"Q5_0", 64, randRow(2 * 22), func(r []byte) { saneF16(r, 22, 0) }, DotQ5_0F32, DequantRowQ5_0},
 		{"Q5_1", 64, randRow(2 * 24), func(r []byte) { saneF16(r, 24, 0, 2) }, DotQ5_1F32, DequantRowQ5_1},
 		{"Q8_1", 64, randRow(2 * 36), func(r []byte) { saneF16(r, 36, 0) }, DotQ8_1F32, DequantRowQ8_1},
+		{"Q8_K", 512, randRow(2 * 292), func(r []byte) {
+			for b := 0; b < len(r); b += 292 {
+				binary.LittleEndian.PutUint32(r[b:], math.Float32bits(0.5))
+			}
+		}, DotQ8KF32, DequantRowQ8K},
 		{"Q2_K", 512, randRow(2 * 84), func(r []byte) { saneF16(r, 84, 80, 82) }, DotQ2KF32, DequantRowQ2K},
 		{"Q3_K", 512, randRow(2 * 110), func(r []byte) { saneF16(r, 110, 108) }, DotQ3KF32, DequantRowQ3K},
 	}
@@ -206,10 +242,12 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 		dot      func(row []byte, x []float32, cols int) float32
 	}
 	cases := []mv{
+		{"IQ4_NL", 64, 2 * 18, []int{0}, MatvecIQ4NLInto, DotIQ4NLF32},
 		{"Q4_1", 64, 2 * 20, []int{0, 2}, MatvecQ4_1Into, DotQ4_1F32},
 		{"Q5_0", 64, 2 * 22, []int{0}, MatvecQ5_0Into, DotQ5_0F32},
 		{"Q5_1", 64, 2 * 24, []int{0, 2}, MatvecQ5_1Into, DotQ5_1F32},
 		{"Q8_1", 64, 2 * 36, []int{0}, MatvecQ8_1Into, DotQ8_1F32},
+		{"Q8_K", 256, 292, nil, MatvecQ8KInto, DotQ8KF32},
 		{"Q2_K", 256, 84, []int{80, 82}, MatvecQ2KInto, DotQ2KF32},
 		{"Q3_K", 256, 110, []int{108}, MatvecQ3KInto, DotQ3KF32},
 	}
@@ -227,6 +265,11 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 				putF16Half(data[b+off:])
 			}
 		}
+		if c.name == "Q8_K" {
+			for b := 0; b+292 <= len(data); b += 292 {
+				binary.LittleEndian.PutUint32(data[b:], math.Float32bits(0.5))
+			}
+		}
 		x := randomVec(rng, c.cols)
 		out := []float32{}
 		c.matvec(data, x, rows, c.cols, &out)
@@ -235,6 +278,29 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 			if math.Abs(float64(out[r]-want)) > 1e-3*math.Max(1, math.Abs(float64(want))) {
 				t.Fatalf("%s row %d: matvec = %v, dot = %v", c.name, r, out[r], want)
 			}
+		}
+	}
+}
+
+func TestF64LoadConversion(t *testing.T) {
+	vals := []float64{1, -2.5, 0.25, math.Pi}
+	raw := make([]byte, 8*len(vals))
+	for i, v := range vals {
+		binary.LittleEndian.PutUint64(raw[i*8:], math.Float64bits(v))
+	}
+	data := buildGGUF(3, []ggufKV{{"general.architecture", ggufStr, "llama"}},
+		[]ggufTensor{{name: "t", dims: []uint64{uint64(len(vals))}, dtype: GGMLTypeF64, data: raw}})
+	g, err := ParseGGUFQuiet(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := loadWeight(data, g.DataOffset, "t", indexTensors(g), inferTensorSizes(data, g), false, false, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range vals {
+		if w.F32[i] != float32(v) {
+			t.Fatalf("w.F32[%d] = %v, want %v", i, w.F32[i], float32(v))
 		}
 	}
 }

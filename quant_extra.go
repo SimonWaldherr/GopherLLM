@@ -1,5 +1,10 @@
 package gopherllm
 
+import (
+	"encoding/binary"
+	"math"
+)
+
 // Compatibility kernels for the less-common GGUF quantization formats:
 // the legacy simple quants Q4_1/Q5_0/Q5_1/Q8_1 and the small K-quants
 // Q2_K/Q3_K. Block layouts are documented on GGMLType.DataSize and follow
@@ -11,6 +16,63 @@ package gopherllm
 // differential test in quant_extra_test.go.
 
 // --- Q4_1: val = d*q + m, q an unsigned nibble (low 16 then high 16) ---
+
+// iq4NLValues is GGML's non-linear 4-bit codebook. IQ4_NL stores the same
+// f16-scale + 16 packed-nibble layout as Q4_0, but indexes this table instead
+// of applying a linear q-8 offset.
+var iq4NLValues = [...]float32{-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
+
+func DequantRowIQ4NLInto(row []byte, cols int, out []float32) {
+	for b := 0; b < cols/32; b++ {
+		base := b * 18
+		if base+18 > len(row) {
+			break
+		}
+		d := F16ToF32(binaryLE16(row[base:]))
+		for i := 0; i < 16; i++ {
+			packed := row[base+2+i]
+			out[b*32+i] = d * iq4NLValues[packed&0x0f]
+			out[b*32+16+i] = d * iq4NLValues[packed>>4]
+		}
+	}
+}
+
+func DequantRowIQ4NL(row []byte, cols int) []float32 {
+	out := make([]float32, cols)
+	DequantRowIQ4NLInto(row, cols, out)
+	return out
+}
+
+func DotIQ4NLF32(row []byte, x []float32, cols int) float32 {
+	var sum float32
+	for b := 0; b < cols/32; b++ {
+		base := b * 18
+		if base+18 > len(row) {
+			break
+		}
+		d := F16ToF32(binaryLE16(row[base:]))
+		xBlock := x[b*32 : b*32+32]
+		_ = xBlock[31]
+		var dot float32
+		for i := 0; i < 16; i++ {
+			packed := row[base+2+i]
+			dot += iq4NLValues[packed&0x0f]*xBlock[i] + iq4NLValues[packed>>4]*xBlock[16+i]
+		}
+		sum += d * dot
+	}
+	return sum
+}
+
+func MatvecIQ4NLInto(data []byte, x []float32, rows, cols int, out *[]float32) {
+	rowBytes := (cols / 32) * 18
+	ensureLenNoClear(out, rows)
+	parallelRows(rows, func(start, end int) {
+		for r := start; r < end; r++ {
+			off := r * rowBytes
+			(*out)[r] = DotIQ4NLF32(data[off:min(off+rowBytes, len(data))], x, cols)
+		}
+	})
+}
 
 func DequantRowQ4_1Into(row []byte, cols int, out []float32) {
 	for b := 0; b < cols/32; b++ {
@@ -176,6 +238,30 @@ func DequantRowQ8_1Into(row []byte, cols int, out []float32) {
 func DequantRowQ8_1(row []byte, cols int) []float32 {
 	out := make([]float32, cols)
 	DequantRowQ8_1Into(row, cols, out)
+	return out
+}
+
+// --- Q8_K: val = d*q. Its trailing int16 block sums are used by ggml's
+// mixed-quant kernels, but are not part of the reconstructed values. ---
+
+func DequantRowQ8KInto(row []byte, cols int, out []float32) {
+	for b := 0; b < cols/256; b++ {
+		base := b * 292
+		if base+292 > len(row) {
+			break
+		}
+		d := math.Float32frombits(binary.LittleEndian.Uint32(row[base:]))
+		q := row[base+4 : base+4+256]
+		dst := out[b*256 : b*256+256]
+		for i, v := range q {
+			dst[i] = d * float32(int8(v))
+		}
+	}
+}
+
+func DequantRowQ8K(row []byte, cols int) []float32 {
+	out := make([]float32, cols)
+	DequantRowQ8KInto(row, cols, out)
 	return out
 }
 
@@ -428,6 +514,26 @@ func MatvecQ5_1Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 
 func MatvecQ8_1Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	matvecScalarRows((cols/32)*36, DotQ8_1F32)(data, x, rows, cols, out)
+}
+
+func DotQ8KF32(row []byte, x []float32, cols int) float32 {
+	var sum float32
+	for b := 0; b < cols/256; b++ {
+		base := b * 292
+		if base+292 > len(row) || (b+1)*256 > len(x) {
+			break
+		}
+		d := math.Float32frombits(binary.LittleEndian.Uint32(row[base:]))
+		q := row[base+4 : base+4+256]
+		for i, v := range q {
+			sum += d * float32(int8(v)) * x[b*256+i]
+		}
+	}
+	return sum
+}
+
+func MatvecQ8KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
+	matvecScalarRows((cols/256)*292, DotQ8KF32)(data, x, rows, cols, out)
 }
 
 func MatvecQ2KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
