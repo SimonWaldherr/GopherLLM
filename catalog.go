@@ -27,7 +27,11 @@ type ModelEntry struct {
 	ContextLength int
 	ModelName     string
 	IsProjector   bool
-	IsSupported   bool
+	// IsEmbedding identifies models named or tagged as embedding models. The
+	// runtime can pool hidden states from any supported model, but this flag
+	// keeps normal generation models out of the RAG model picker.
+	IsEmbedding bool
+	IsSupported bool
 }
 
 func (m ModelEntry) Status() string {
@@ -340,9 +344,24 @@ func inspectModel(root, path string) (ModelEntry, error) {
 	arch, _ := gguf.GetString("general.architecture")
 	modelName, _ := gguf.GetString("general.name")
 	contextLength := ConfigFromGGUF(gguf).MaxSeqLen
-	lower := strings.ToLower(fileName)
+	lower := strings.ToLower(fileName + " " + modelName)
 	isProjector := strings.HasPrefix(lower, "mmproj-") || strings.Contains(lower, "mmproj") || strings.EqualFold(arch, "clip")
-	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ContextLength: contextLength, ModelName: modelName, IsProjector: isProjector, IsSupported: ArchitectureSupported(arch)}, nil
+	_, hasPooling := gguf.Metadata[arch+".pooling_type"]
+	_, hasEmbedding := gguf.Metadata["general.embedding"]
+	isEmbedding := hasPooling || hasEmbedding || containsEmbeddingModelName(lower)
+	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ContextLength: contextLength, ModelName: modelName, IsProjector: isProjector, IsEmbedding: isEmbedding, IsSupported: ArchitectureSupported(arch)}, nil
+}
+
+// GGUF has no universally adopted "embedding model" metadata field. These
+// markers cover the common GGUF embedding model families while metadata above
+// handles exporters that provide an explicit pooling hint.
+func containsEmbeddingModelName(value string) bool {
+	for _, marker := range []string{"embed", "embedding", "bge", "e5-", "e5_", "nomic", "mxbai", "jina", "gte-", "gte_", "minilm", "arctic"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func matchingEntries(entries []ModelEntry, selector string) []ModelEntry {

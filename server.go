@@ -58,6 +58,29 @@ type runnerState struct {
 	autoTune *AutoTuneResult
 }
 
+// embeddingState holds the optional, separately loaded model used by the
+// browser RAG mode. Enabling RAG must never replace the chat generation model.
+type embeddingState struct {
+	mu sync.RWMutex
+	r  *Runner
+}
+
+func (s *embeddingState) withRunner(fn func(*Runner)) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	fn(s.r)
+}
+
+func (s *embeddingState) swap(r *Runner) {
+	s.mu.Lock()
+	old := s.r
+	s.r = r
+	s.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
 func (s *runnerState) get() *Runner {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -255,6 +278,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		baseline = *opts.BaselineRuntimeTuning
 	}
 	state := &runnerState{r: initialRunner, path: opts.ModelPath, baseline: baseline, autoTune: opts.AppliedAutoTune}
+	embedder := &embeddingState{}
 	sem := make(chan struct{}, opts.MaxConcurrentRequests)
 	var autoTuneMu sync.Mutex
 	mux := http.NewServeMux()
@@ -557,6 +581,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 			SizeGB        float64 `json:"size_gb"`
 			Supported     bool    `json:"supported"`
 			Loaded        bool    `json:"loaded"`
+			Embedding     bool    `json:"embedding"`
 		}
 		if opts.ModelDir == "" {
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
@@ -586,6 +611,7 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 				SizeGB:        float64(e.SizeBytes) / (1024 * 1024 * 1024),
 				Supported:     e.IsSupported,
 				Loaded:        e.Path == loadedPath,
+				Embedding:     e.IsEmbedding && e.IsSupported && !e.IsProjector,
 			})
 		}
 		writeJSON(w, map[string]any{"models": models})
@@ -626,6 +652,91 @@ func NewHandler(initialRunner *Runner, opts HandlerOptions) http.Handler {
 		}
 		state.swap(newRunner, entry.Path)
 		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.config.MaxSeqLen})
+	}))
+	mux.HandleFunc("/models/embed/load", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.ModelDir == "" {
+			http.Error(w, "embedding-model loading is disabled: configure HandlerOptions.ModelDir", http.StatusNotFound)
+			return
+		}
+		var body modelLoadRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		entries, err := DiscoverModels(opts.ModelDir, io.Discard)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		entry, err := SelectModel(entries, body.selector())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !entry.IsEmbedding {
+			http.Error(w, "selected model is not an embedding model", http.StatusBadRequest)
+			return
+		}
+		runner, _, err := RunnerFromPath(entry.Path)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		embedder.swap(runner)
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(runner), "context_length": runner.config.MaxSeqLen})
+	}))
+	mux.HandleFunc("/models/embed", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Input []string `json:"input"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(body.Input) == 0 || len(body.Input) > 256 {
+			http.Error(w, "input must contain between 1 and 256 texts", http.StatusBadRequest)
+			return
+		}
+		var vectors [][]float32
+		var model string
+		var embedErr error
+		embedder.withRunner(func(runner *Runner) {
+			if runner == nil {
+				embedErr = errors.New("no embedding model is loaded")
+				return
+			}
+			model = modelID(runner)
+			vectors = make([][]float32, 0, len(body.Input))
+			for _, input := range body.Input {
+				if strings.TrimSpace(input) == "" {
+					embedErr = errors.New("embedding input must not be empty")
+					return
+				}
+				result, err := runner.Embed(input)
+				if err != nil {
+					embedErr = err
+					return
+				}
+				vectors = append(vectors, result.Embedding)
+			}
+		})
+		if embedErr != nil {
+			status := http.StatusBadRequest
+			if embedErr.Error() == "no embedding model is loaded" {
+				status = http.StatusConflict
+			}
+			http.Error(w, embedErr.Error(), status)
+			return
+		}
+		writeJSON(w, map[string]any{"model": model, "embeddings": vectors})
 	}))
 	mux.HandleFunc("/autotune", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {

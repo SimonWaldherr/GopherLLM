@@ -42,6 +42,7 @@
             <div class="chat-heading">
               <h1 id="chatTitle">New chat</h1>
               <button id="renameChat" class="rename-chat" type="button" aria-label="Rename this chat" title="Rename chat">✎</button>
+              <button id="deleteChat" class="delete-chat" type="button" aria-label="Delete this chat" title="Delete chat">⌫</button>
             </div>
             <span id="modelName" class="model-name" title="{{.Model}}">{{.Model}}</span>
           </div>
@@ -76,6 +77,7 @@
     <form id="form" aria-label="Chat input" novalidate>
       <div class="composer">
         <div class="prompt-wrap">
+          <div id="commandMenu" class="command-menu" role="listbox" aria-label="Power commands" hidden></div>
           <textarea
             id="prompt"
             name="prompt"
@@ -170,8 +172,18 @@
           <label class="wide-setting">Instructions
             <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
           </label>
+          <label class="wide-setting rag-setting">
+            <span class="toggle-row">
+              <input id="ragMode" type="checkbox">
+              <span>RAG history search <span class="field-note">adds relevant saved messages as context</span></span>
+            </span>
+            <select id="ragModel" aria-label="Embedding model" disabled>
+              <option value="">No embedding model found</option>
+            </select>
+          </label>
         </div>
         <p id="contextWindowStatus" class="settings-note" aria-live="polite"></p>
+        <p id="ragStatus" class="settings-note" hidden></p>
         <p class="settings-note">Settings and instructions above belong to this chat. Token estimate is approximate; the model enforces its own context limit.</p>
       </section>
 
@@ -212,6 +224,78 @@
             <option value="dark">Dark</option>
           </select>
         </label>
+      </section>
+
+      <section class="settings-section">
+        <h3>Advanced</h3>
+        <label class="toggle-row">
+          <input id="powerCommands" type="checkbox">
+          <span>Power commands <span class="field-note">type <kbd>/</kbd> in the message box</span></span>
+        </label>
+        <div id="powerOptions" hidden>
+          <p class="settings-note">
+            <code>/batch</code> — run one prompt over every row, record, or chapter of a file.
+            <code>/goal</code> — let the model draft, critique, and improve its own answer.
+            <code>/help</code> — list the commands.
+          </p>
+          <label class="goal-rounds">Goal rounds
+            <input id="goalRounds" type="number" min="2" max="8" step="1" value="3" inputmode="numeric" autocomplete="off">
+          </label>
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="batch" class="settings" hidden>
+  <div class="settings-panel batch-panel" role="dialog" aria-modal="true" aria-labelledby="batchTitle">
+    <div class="settings-panel-head">
+      <h2 id="batchTitle">Batch — run one prompt over many items</h2>
+      <button id="batchClose" class="icon-button" type="button" aria-label="Close batch"><span aria-hidden="true">✕</span></button>
+    </div>
+    <div class="settings-panel-body">
+      <section class="settings-section">
+        <h3>1 · Data</h3>
+        <div class="batch-source">
+          <button id="batchPick" class="text-button" type="button">Choose file…</button>
+          <input id="batchFile" type="file" accept=".json,.csv,.tsv,.md,.markdown,.txt,.log,application/json,text/csv,text/markdown,text/plain" hidden>
+          <label class="batch-format">Format
+            <select id="batchFormat">
+              <option value="auto">Auto-detect</option>
+              <option value="json">JSON array</option>
+              <option value="csv">CSV / TSV</option>
+              <option value="markdown">Markdown chapters</option>
+              <option value="lines">One item per line</option>
+            </select>
+          </label>
+        </div>
+        <textarea id="batchInput" rows="5" placeholder="Paste JSON, CSV, or Markdown here — or choose a file above."></textarea>
+        <p id="batchSummary" class="batch-summary">No data yet.</p>
+      </section>
+
+      <section class="settings-section">
+        <h3>2 · Prompt for each item</h3>
+        <textarea id="batchTemplate" rows="4" placeholder="e.g. Summarize this support ticket in one sentence and label it bug/feature/question."></textarea>
+        <!-- Filled in by refreshBatchDataset with the placeholders this
+             dataset actually offers. Kept free of literal double braces so
+             Go's html/template does not try to parse them as actions. -->
+        <p id="batchPlaceholders" class="batch-placeholders">Load data to see the available placeholders.</p>
+      </section>
+
+      <section class="settings-section">
+        <h3>3 · Run</h3>
+        <div class="batch-run">
+          <button id="batchStart" class="autotune-run" type="button">Run batch</button>
+          <button id="batchStop" class="text-button" type="button" hidden>Stop</button>
+          <span id="batchProgress" class="batch-progress" aria-live="polite"></span>
+        </div>
+        <div id="batchResults" class="batch-results" hidden></div>
+        <div id="batchExports" class="settings-actions" hidden>
+          <button id="batchExportJSON" class="text-button" type="button">Export JSON</button>
+          <button id="batchExportCSV" class="text-button" type="button">Export CSV</button>
+          <button id="batchExportMD" class="text-button" type="button">Export Markdown</button>
+        </div>
+        <p class="settings-note">Items run one at a time against your local model — no per-token cost and nothing leaves this machine. Keep this tab open while it runs.</p>
       </section>
     </div>
   </div>

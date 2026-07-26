@@ -157,7 +157,7 @@ body.chat .app { grid-template-columns: var(--sidebar) minmax(0, 1fr); height: 1
 .chat-select {
   min-width: 0;
   flex: 1;
-  padding: 8px 30px 8px 9px;
+  padding: 8px 54px 8px 9px;
   border: 0;
   border-radius: 9px;
   background: transparent;
@@ -168,17 +168,19 @@ body.chat .app { grid-template-columns: var(--sidebar) minmax(0, 1fr); height: 1
 .chat-row.active .chat-select { color: var(--accent); font-weight: 680; }
 .chat-row-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; line-height: 1.25; }
 .chat-row-meta { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10.5px; line-height: 1.3; }
-.chat-menu {
+.chat-menu, .chat-delete {
   position: absolute;
-  top: 50%; right: 4px;
+  top: 50%; right: 29px;
   width: 25px; height: 25px; min-width: 0; min-height: 0;
   transform: translateY(-50%);
   border: 0; border-radius: 6px; background: transparent; color: var(--muted);
   font-size: 16px; line-height: 1;
   opacity: 0;
 }
-.chat-row:hover .chat-menu, .chat-menu:focus-visible { opacity: 1; }
+.chat-delete { right: 4px; font-size: 14px; }
+.chat-row:hover .chat-menu, .chat-menu:focus-visible, .chat-row:hover .chat-delete, .chat-delete:focus-visible { opacity: 1; }
 .chat-menu:hover { background: var(--panel-2); color: var(--ink); }
+.chat-delete:hover { background: color-mix(in srgb, var(--stop) 12%, var(--panel)); color: var(--stop); }
 .sidebar-footer { display: grid; gap: 9px; padding: 9px 5px 0; border-top: 1px solid var(--line); }
 .theme-picker { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; font-weight: 650; }
 .theme-picker select {
@@ -209,12 +211,13 @@ header {
 .titles { min-width: 0; }
 .chat-heading { display: flex; align-items: center; gap: 4px; min-width: 0; }
 h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 15px; font-weight: 750; line-height: 1.2; letter-spacing: -.01em; }
-.rename-chat {
+.rename-chat, .delete-chat {
   display: grid; place-items: center; flex: none;
   width: 23px; height: 23px; min-width: 0; min-height: 0;
   border: 0; border-radius: 5px; background: transparent; color: var(--muted); font-size: 14px;
 }
 .rename-chat:hover { background: var(--panel-2); color: var(--ink); }
+.delete-chat:hover { background: color-mix(in srgb, var(--stop) 12%, var(--panel)); color: var(--stop); }
 .model-name {
   display: block; max-width: min(45vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font: 10.5px/1.4 var(--mono); color: var(--muted);
@@ -299,7 +302,7 @@ kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; b
    ════════════════════════════════ */
 body.chat form { border-top: 1px solid var(--line); background: var(--panel); padding: 12px clamp(12px, 3vw, 28px) 11px; }
 body.chat .composer { width: min(880px, 100%); margin: 0 auto; display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: end; }
-.prompt-wrap { border: 1px solid var(--line); border-radius: 14px; background: var(--bg); transition: border-color .15s, box-shadow .15s; }
+.prompt-wrap { position: relative; border: 1px solid var(--line); border-radius: 14px; background: var(--bg); transition: border-color .15s, box-shadow .15s; }
 .prompt-wrap:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
 body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 200px; padding: 12px 14px 4px; resize: none; border: 0; border-radius: 14px; outline: none; background: transparent; color: var(--ink); font: inherit; }
 .prompt-footer { display: flex; justify-content: space-between; gap: 12px; padding: 3px 12px 8px 14px; color: var(--muted); font-size: 10.5px; }
@@ -346,6 +349,43 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .wide-setting { grid-column: 1 / -1; }
 .settings textarea { min-height: 74px; padding: 7px 8px; resize: vertical; line-height: 1.4; }
 .field-note { color: var(--muted); font-size: 9px; font-weight: 500; }
+
+/* ── Power commands (slash palette) ── */
+.command-menu {
+  position: absolute; bottom: calc(100% + 6px); left: 0; right: 0; z-index: 15;
+  overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--panel);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .22);
+}
+.command-item { display: flex; align-items: baseline; gap: 9px; width: 100%; padding: 8px 11px; border: 0; background: transparent; color: var(--ink); text-align: left; }
+.command-item + .command-item { border-top: 1px solid var(--line); }
+.command-item.active, .command-item:hover { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); }
+.command-name { flex: none; color: var(--accent); font: 700 12px/1.4 var(--mono); }
+.command-desc { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+.toggle-row { display: flex !important; align-items: center; gap: 8px; color: var(--ink) !important; font-size: 12px !important; }
+.toggle-row input[type="checkbox"] { width: auto !important; min-height: 0 !important; margin: 0; padding: 0; accent-color: var(--accent); }
+.rag-setting { gap: 7px !important; }
+.rag-setting > .toggle-row { width: 100%; }
+.goal-rounds { max-width: 150px; margin-top: 10px; }
+
+/* ── Batch mode ── */
+.batch-panel { width: min(680px, 100%); }
+.batch-source { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-bottom: 8px; }
+.batch-format { display: flex !important; align-items: center; gap: 7px; margin-left: auto; }
+.batch-format select { width: auto !important; }
+#batchInput, #batchTemplate { width: 100%; padding: 8px 9px; resize: vertical; line-height: 1.45; font: 12px/1.5 var(--mono); }
+.batch-summary { margin: 8px 0 0; color: var(--muted); font-size: 11px; }
+.batch-summary.ready { color: var(--accent); font-weight: 650; }
+.batch-summary.bad { color: var(--stop); }
+.batch-placeholders { margin: 7px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.6; }
+.batch-placeholders code { padding: 1px 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); font: 10.5px/1.5 var(--mono); }
+.batch-run { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.batch-progress { color: var(--muted); font-size: 11px; }
+.batch-results { max-height: 260px; margin-top: 10px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+.batch-row { padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.batch-row:last-child { border-bottom: 0; }
+.batch-row-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.batch-row-output { margin-top: 3px; color: var(--ink); font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.batch-row.failed .batch-row-output { color: var(--stop); }
 .autotune { margin: 10px 0 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
 .autotune-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .autotune-title { flex: 1; min-width: 140px; display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; color: var(--ink); font-size: 11.5px; font-weight: 700; }

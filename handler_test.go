@@ -191,6 +191,58 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {
+	modelDir := t.TempDir()
+	chatPath := filepath.Join(modelDir, "catalog", "chat.gguf")
+	embeddingPath := filepath.Join(modelDir, "catalog", "tiny-embedding.gguf")
+	if err := os.MkdirAll(filepath.Dir(chatPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{chatPath, embeddingPath} {
+		if err := os.WriteFile(path, buildTinyLlamaGGUF(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner, _, err := RunnerFromPath(chatPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Close()
+	srv := httptest.NewServer(NewHandler(runner, HandlerOptions{ModelDir: modelDir, ModelPath: chatPath}))
+	defer srv.Close()
+
+	body, err := json.Marshal(map[string]string{"model": filepath.Join("catalog", "tiny-embedding")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(srv.URL+"/models/embed/load", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("load embedding status = %d body=%s", resp.StatusCode, readAll(t, resp))
+	}
+	resp.Body.Close()
+
+	resp, err = http.Post(srv.URL+"/models/embed", "application/json", strings.NewReader(`{"input":["semantic search text"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("embed status = %d body=%s", resp.StatusCode, readAll(t, resp))
+	}
+	var got struct {
+		Embeddings [][]float32 `json:"embeddings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Embeddings) != 1 || len(got.Embeddings[0]) != runner.Config().Dim {
+		t.Fatalf("embeddings = %#v", got.Embeddings)
+	}
+}
+
 func TestWithLimitStopsWaitingWhenRequestIsCanceled(t *testing.T) {
 	sem := make(chan struct{}, 1)
 	sem <- struct{}{}
