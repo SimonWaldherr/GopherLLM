@@ -112,8 +112,187 @@ func TestGenerationWorkspaceReusesAndGrowsBuffers(t *testing.T) {
 	if cache3 == cache1 {
 		t.Fatal("KV cache did not grow for a larger request")
 	}
-	if cache3.MaxLen != 32 || buf3 != buf1 {
+	if cache3.MaxLen < 32 || cache3.MaxLen > r.config.MaxSeqLen || buf3 != buf1 {
 		t.Fatalf("grown workspace: cache len=%d buffer reused=%v", cache3.MaxLen, buf3 == buf1)
+	}
+}
+
+func TestCopyKVPrefixCopiesF32AndF16Rows(t *testing.T) {
+	for _, f16 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "f32", true: "f16"}[f16], func(t *testing.T) {
+			var src, dst *KVCache
+			if f16 {
+				src = NewKVCacheF16(2, 3, 2, 5)
+				dst = NewKVCacheF16(2, 3, 2, 5)
+				for layer := range src.K16 {
+					for i := range src.K16[layer] {
+						src.K16[layer][i] = uint16(i + 1 + layer*100)
+					}
+					for i := range src.V16[layer] {
+						src.V16[layer][i] = uint16(i + 1 + layer*100)
+					}
+				}
+			} else {
+				src = NewKVCache(2, 3, 2, 5)
+				dst = NewKVCache(2, 3, 2, 5)
+				for layer := range src.K {
+					for i := range src.K[layer] {
+						src.K[layer][i] = float32(i + 1 + layer*100)
+					}
+					for i := range src.V[layer] {
+						src.V[layer][i] = float32(i + 1 + layer*100)
+					}
+				}
+			}
+			if copied := copyKVPrefix(dst, src, 3); copied != 3 {
+				t.Fatalf("copied positions = %d, want 3", copied)
+			}
+			for layer := 0; layer < 2; layer++ {
+				if f16 {
+					for i := 0; i < 3*src.PerPosKDim; i++ {
+						if dst.K16[layer][i] != src.K16[layer][i] {
+							t.Fatalf("layer %d K16[%d] = %d, want %d", layer, i, dst.K16[layer][i], src.K16[layer][i])
+						}
+					}
+					if dst.K16[layer][3*src.PerPosKDim] != 0 {
+						t.Fatalf("layer %d copied a K16 suffix", layer)
+					}
+					for i := 0; i < 3*src.PerPosVDim; i++ {
+						if dst.V16[layer][i] != src.V16[layer][i] {
+							t.Fatalf("layer %d V16[%d] = %d, want %d", layer, i, dst.V16[layer][i], src.V16[layer][i])
+						}
+					}
+					continue
+				}
+				for i := 0; i < 3*src.PerPosKDim; i++ {
+					if dst.K[layer][i] != src.K[layer][i] {
+						t.Fatalf("layer %d K[%d] = %v, want %v", layer, i, dst.K[layer][i], src.K[layer][i])
+					}
+				}
+				if dst.K[layer][3*src.PerPosKDim] != 0 {
+					t.Fatalf("layer %d copied a K suffix", layer)
+				}
+				for i := 0; i < 3*src.PerPosVDim; i++ {
+					if dst.V[layer][i] != src.V[layer][i] {
+						t.Fatalf("layer %d V[%d] = %v, want %v", layer, i, dst.V[layer][i], src.V[layer][i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGenerateChatReusesKVPrefixForFollowup(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 1
+	opts.Seed = 7
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	initial := []ChatMessage{UserMessage("a b c")}
+	first, err := r.GenerateChat(initial, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PromptCache == nil || first.PromptCache.Mode != "prefix" || first.PromptCache.Hit {
+		t.Fatalf("first prompt cache = %+v, want a cold prefix cache", first.PromptCache)
+	}
+
+	followup := []ChatMessage{initial[0], AssistantMessage(first.Text), UserMessage("d e f")}
+	cached, err := r.GenerateChat(followup, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.PromptCache == nil || !cached.PromptCache.Hit || cached.PromptCache.ReusedTokens <= 0 {
+		t.Fatalf("follow-up prompt cache = %+v, want reused prefix", cached.PromptCache)
+	}
+	if cached.PromptCache.ReusedTokens > cached.Stats.PromptTokens {
+		t.Fatalf("reused %d of %d prompt tokens", cached.PromptCache.ReusedTokens, cached.Stats.PromptTokens)
+	}
+
+	cold, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := cold.GenerateChat(followup, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Text != want.Text {
+		t.Fatalf("cached follow-up = %q, cold = %q", cached.Text, want.Text)
+	}
+}
+
+func TestGenerateChatPrefixCacheKeepsSamplingDeterministic(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 4
+	opts.Seed = 37
+	// Keep the normal repeat penalty and stochastic sampler enabled: sampling
+	// mutates logits, so a prefix cache must never retain that altered vector.
+	opts.Sampler.Temperature = 0.8
+	opts.Sampler.TopK = 8
+	messages := []ChatMessage{UserMessage("a b c")}
+	if _, err := r.GenerateChat(messages, opts); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := r.GenerateChat(messages, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.PromptCache == nil || !cached.PromptCache.Hit || cached.PromptCache.ReusedTokens != cached.Stats.PromptTokens-1 {
+		t.Fatalf("same-prompt cache = %+v for %d tokens, want all but final token reused", cached.PromptCache, cached.Stats.PromptTokens)
+	}
+	cold, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := cold.GenerateChat(messages, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Text != want.Text {
+		t.Fatalf("cached same-prompt = %q, cold = %q", cached.Text, want.Text)
+	}
+}
+
+func TestEmbeddingInvalidatesKVPrefix(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 1
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+	if _, err := r.Generate("a b c", opts); err != nil {
+		t.Fatal(err)
+	}
+	if r.prefixCache.cache == nil {
+		t.Fatal("generation did not warm the prefix cache")
+	}
+	if _, err := r.Embed("a b c"); err != nil {
+		t.Fatal(err)
+	}
+	if r.prefixCache.cache != nil {
+		t.Fatal("embedding retained stale chat KV metadata")
+	}
+	result, err := r.Generate("a b c", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.PromptCache == nil || result.PromptCache.Hit {
+		t.Fatalf("prompt cache after embedding = %+v, want cold", result.PromptCache)
 	}
 }
 

@@ -304,6 +304,7 @@ body.chat .composer { width: min(880px, 100%); margin: 0 auto; display: grid; gr
 body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 200px; padding: 12px 14px 4px; resize: none; border: 0; border-radius: 14px; outline: none; background: transparent; color: var(--ink); font: inherit; }
 .prompt-footer { display: flex; justify-content: space-between; gap: 12px; padding: 3px 12px 8px 14px; color: var(--muted); font-size: 10.5px; }
 .prompt-footer kbd { padding: 0 3px; font-size: 9px; }
+.prompt-cache-status { display: block; padding: 0 12px 8px 14px; color: color-mix(in srgb, var(--accent) 76%, var(--muted)); font-size: 10.5px; font-weight: 600; }
 body.chat .actions { display: grid; gap: 8px; }
 body.chat #send { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 86px; min-height: 63px; height: 100%; border: 1px solid color-mix(in srgb, var(--accent) 55%, var(--line)); border-radius: 12px; background: var(--accent); color: var(--accent-ink); font-weight: 700; }
 body.chat #send > span:first-child { display: grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; background: color-mix(in srgb, currentColor 16%, transparent); font-size: 15px; line-height: 1; }

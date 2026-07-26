@@ -307,6 +307,24 @@ streaming requests, that object is carried by the terminal SSE choice instead,
 so it always describes the final model call even after an internal skill/tool
 loop. Allowed values are `recent` and `full`.
 
+### Model context cache
+
+While a local server stays running, it retains one bounded **KV prefix cache**
+for the most recently used rendered prompt. The browser still sends its normal
+chat history, preserving the stateless OpenAI-compatible API, but the runner
+compares the exact rendered token IDs and forwards only the changed suffix to
+the model. Consecutive long-chat turns therefore avoid reprocessing their
+unchanged context; edits and branches safely reuse only the unchanged prefix.
+
+The cache reuses the normal generation workspace, grows geometrically for
+follow-up turns, and is capped at 512 MiB rather than allocating one KV cache
+per saved chat. It is memory-only and naturally cold after a server/model
+restart (or when a context is too large to retain). Responses expose the
+measured result as `gopherllm_cache` with `mode`, `hit`, `reused_tokens`, and
+`prompt_tokens`; streaming responses carry it in the terminal SSE choice. The
+browser UI shows the same information as cache warming or reuse, separately
+from Smart Context's message-selection status.
+
 Minimal OpenAI-compatible chat request:
 
 ```sh

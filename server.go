@@ -1162,25 +1162,26 @@ func withRequestContext(options GenerationOptions, req *http.Request) Generation
 }
 
 type inferenceLogRecord struct {
-	Event            string `json:"event"`
-	RequestID        string `json:"request_id"`
-	Endpoint         string `json:"endpoint"`
-	Provider         string `json:"provider"`
-	Model            string `json:"model"`
-	Streaming        bool   `json:"streaming"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	TTFTMS           int64  `json:"ttft_ms"`
-	PrefillMS        int64  `json:"prefill_ms"`
-	DecodeMS         int64  `json:"decode_ms"`
-	TotalMS          int64  `json:"total_ms"`
-	TokensPerSecond  string `json:"tokens_per_second"`
-	Cache            string `json:"cache"`
-	CacheHit         bool   `json:"cache_hit"`
-	RetryCount       int    `json:"retry_count"`
-	FinishReason     string `json:"finish_reason"`
-	ErrorType        string `json:"error_type,omitempty"`
-	Error            string `json:"error,omitempty"`
+	Event              string `json:"event"`
+	RequestID          string `json:"request_id"`
+	Endpoint           string `json:"endpoint"`
+	Provider           string `json:"provider"`
+	Model              string `json:"model"`
+	Streaming          bool   `json:"streaming"`
+	PromptTokens       int    `json:"prompt_tokens"`
+	CompletionTokens   int    `json:"completion_tokens"`
+	TTFTMS             int64  `json:"ttft_ms"`
+	PrefillMS          int64  `json:"prefill_ms"`
+	DecodeMS           int64  `json:"decode_ms"`
+	TotalMS            int64  `json:"total_ms"`
+	TokensPerSecond    string `json:"tokens_per_second"`
+	Cache              string `json:"cache"`
+	CacheHit           bool   `json:"cache_hit"`
+	CachedPromptTokens int    `json:"cached_prompt_tokens"`
+	RetryCount         int    `json:"retry_count"`
+	FinishReason       string `json:"finish_reason"`
+	ErrorType          string `json:"error_type,omitempty"`
+	Error              string `json:"error,omitempty"`
 }
 
 // Inference logs are deliberately emitted through the existing handler
@@ -1203,26 +1204,33 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 	if result.Stats.DecodeTime > 0 {
 		tps = float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds()
 	}
+	cacheMode, cacheHit, cachedPromptTokens := "none", false, 0
+	if result.PromptCache != nil {
+		cacheMode = result.PromptCache.Mode
+		cacheHit = result.PromptCache.Hit
+		cachedPromptTokens = result.PromptCache.ReusedTokens
+	}
 	rec := inferenceLogRecord{
-		Event:            "inference",
-		RequestID:        requestID,
-		Endpoint:         endpoint,
-		Provider:         "local",
-		Model:            model,
-		Streaming:        streaming,
-		PromptTokens:     result.Stats.PromptTokens,
-		CompletionTokens: result.Stats.GeneratedTokens,
-		TTFTMS:           result.Stats.TTFT.Milliseconds(),
-		PrefillMS:        result.Stats.PrefillTime.Milliseconds(),
-		DecodeMS:         result.Stats.DecodeTime.Milliseconds(),
-		TotalMS:          result.Stats.TotalTime.Milliseconds(),
-		TokensPerSecond:  fmt.Sprintf("%.2f", tps),
-		Cache:            "none",
-		CacheHit:         false,
-		RetryCount:       0,
-		FinishReason:     finishReasonOrDefault(result.FinishReason),
-		ErrorType:        errorType,
-		Error:            errorText,
+		Event:              "inference",
+		RequestID:          requestID,
+		Endpoint:           endpoint,
+		Provider:           "local",
+		Model:              model,
+		Streaming:          streaming,
+		PromptTokens:       result.Stats.PromptTokens,
+		CompletionTokens:   result.Stats.GeneratedTokens,
+		TTFTMS:             result.Stats.TTFT.Milliseconds(),
+		PrefillMS:          result.Stats.PrefillTime.Milliseconds(),
+		DecodeMS:           result.Stats.DecodeTime.Milliseconds(),
+		TotalMS:            result.Stats.TotalTime.Milliseconds(),
+		TokensPerSecond:    fmt.Sprintf("%.2f", tps),
+		Cache:              cacheMode,
+		CacheHit:           cacheHit,
+		CachedPromptTokens: cachedPromptTokens,
+		RetryCount:         0,
+		FinishReason:       finishReasonOrDefault(result.FinishReason),
+		ErrorType:          errorType,
+		Error:              errorText,
 	}
 	if b, jsonErr := json.Marshal(rec); jsonErr == nil {
 		fmt.Fprintln(logw, string(b))
@@ -1318,6 +1326,9 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	// were the final one.
 	if result.ContextWindow != nil {
 		extra["gopherllm_context"] = result.ContextWindow
+	}
+	if result.PromptCache != nil {
+		extra["gopherllm_cache"] = result.PromptCache
 	}
 	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra)
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
@@ -1627,6 +1638,9 @@ func generateResponse(result GenerationResult) map[string]any {
 	if len(result.ToolCalls) > 0 {
 		resp["tool_calls"] = result.ToolCalls
 	}
+	if result.PromptCache != nil {
+		resp["gopherllm_cache"] = result.PromptCache
+	}
 	return resp
 }
 
@@ -1641,7 +1655,11 @@ func openAIChatResponse(model string, result GenerationResult) map[string]any {
 	if result.ReasoningText != "" {
 		message["reasoning_content"] = result.ReasoningText
 	}
-	return map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "system_fingerprint": systemFingerprint, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
+	response := map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "system_fingerprint": systemFingerprint, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
+	if result.PromptCache != nil {
+		response["gopherllm_cache"] = result.PromptCache
+	}
+	return response
 }
 
 // finishReasonOrDefault falls back to "stop" for callers of GenerateResult

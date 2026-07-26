@@ -164,6 +164,17 @@ type GenerationStats struct {
 	TotalTime       time.Duration
 }
 
+// PromptCacheInfo reports how much of a rendered prompt was already present
+// in the Runner's bounded KV prefix cache. It is deliberately about exact
+// token positions, not message count: templates, tool calls, and edited turns
+// can all change the rendered sequence without changing an obvious UI label.
+type PromptCacheInfo struct {
+	Mode         string `json:"mode"`
+	Hit          bool   `json:"hit"`
+	ReusedTokens int    `json:"reused_tokens"`
+	PromptTokens int    `json:"prompt_tokens"`
+}
+
 type GenerationResult struct {
 	Text string
 	// ReasoningText holds any chain-of-thought the model emitted separately
@@ -183,6 +194,9 @@ type GenerationResult struct {
 	// rendered prompt selected for this particular generation call. Agentic
 	// callers receive the final loop iteration's value.
 	ContextWindow *ContextWindowInfo
+	// PromptCache is populated for generation calls after the prompt has been
+	// rendered. It describes the actual KV-prefix reuse for this call.
+	PromptCache *PromptCacheInfo
 }
 
 type LoadInfo struct {
@@ -205,6 +219,14 @@ const (
 	loadedNemotronH
 )
 
+// prefixCacheState owns no additional KV memory: it points at the retained
+// generation workspace, and tokens are exactly the positions resident in it.
+// Runner.genLock protects the whole structure.
+type prefixCacheState struct {
+	cache  *KVCache
+	tokens []uint32
+}
+
 // Runner is a fully loaded model ready to generate: parsed GGUF header,
 // tokenizer, config, and weights (one of the three kind-specific sets).
 // Generations and embeddings are serialized by genLock — a Runner is safe to
@@ -224,6 +246,7 @@ type Runner struct {
 	genLock        sync.Mutex
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
+	prefixCache    prefixCacheState
 	mappedFile     *MmapFile
 }
 
@@ -384,6 +407,7 @@ func (r *Runner) Close() error {
 	r.releaseMetalWeights()
 	r.workspaceCache = nil
 	r.workspaceBuf = nil
+	r.prefixCache = prefixCacheState{}
 	if r.mappedFile == nil {
 		return nil
 	}
@@ -475,6 +499,15 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	}
 	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
 	cache, buf := r.generationWorkspace(cacheLen)
+	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
+	reusedTokens := 0
+	cacheEligible := r.prefixCacheSupported(cache)
+	if cacheEligible {
+		cacheInfo.Mode = "prefix"
+		reusedTokens = r.prefixReuse(cache, tokens)
+		cacheInfo.Hit = reusedTokens > 0
+		cacheInfo.ReusedTokens = reusedTokens
+	}
 	seed := options.Seed
 	if seed == 0 {
 		seed = uint64(time.Now().UnixNano())
@@ -484,25 +517,51 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if err := ctx.Err(); err != nil {
 		return GenerationResult{}, err
 	}
-	prefillStart := time.Now()
+	// Once this request writes into the shared workspace, prior metadata is no
+	// longer safe. The deferred replacement records only resident KV rows.
+	if cacheEligible {
+		r.clearPrefixCache()
+	}
+	prefillOffset := reusedTokens
+	if prefillOffset == len(tokens) {
+		prefillOffset = max(0, len(tokens)-1)
+		cacheInfo.Hit = prefillOffset > 0
+		cacheInfo.ReusedTokens = prefillOffset
+	}
+	prefillBegan := time.Now()
 	logits := []float32{}
-	if r.canBatchPrefill() {
-		if err := r.prefillBatched(ctx, cache, buf, tokens, &logits); err != nil {
-			return GenerationResult{}, err
+	residentTokens := []uint32(nil)
+	defer func() {
+		if !cacheEligible {
+			return
 		}
-	} else {
-		for pos, tok := range tokens {
-			if err := ctx.Err(); err != nil {
+		if len(residentTokens) == 0 {
+			r.clearPrefixCache()
+			return
+		}
+		state := prefixCacheState{cache: cache, tokens: append([]uint32(nil), residentTokens...)}
+		r.prefixCache = state
+	}()
+	if prefillOffset < len(tokens) {
+		if r.canBatchPrefill() {
+			if err := r.prefillBatchedAt(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, &logits); err != nil {
 				return GenerationResult{}, err
 			}
-			if pos == len(tokens)-1 {
-				r.forwardTokenInto(cache, buf, tok, pos, &logits)
-			} else {
-				r.forwardPrefillToken(cache, buf, tok, pos)
+		} else {
+			for pos := prefillOffset; pos < len(tokens); pos++ {
+				if err := ctx.Err(); err != nil {
+					return GenerationResult{}, err
+				}
+				if pos == len(tokens)-1 {
+					r.forwardTokenInto(cache, buf, tokens[pos], pos, &logits)
+				} else {
+					r.forwardPrefillToken(cache, buf, tokens[pos], pos)
+				}
 			}
 		}
 	}
-	prefillTime := time.Since(prefillStart)
+	residentTokens = append(residentTokens, tokens...)
+	prefillTime := time.Since(prefillBegan)
 	decodeStart := time.Now()
 	var ttft time.Duration
 	output := strings.Builder{}
@@ -554,7 +613,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		if len(calls) > 0 {
 			reason = "tool_calls"
 		}
-		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats, ContextWindow: contextWindow}
+		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats, ContextWindow: contextWindow, PromptCache: &cacheInfo}
 	}
 decode:
 	for range options.MaxTokens {
@@ -607,8 +666,14 @@ decode:
 			var ok bool
 			nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, &logits)
 			haveNextToken = ok
+			if cacheEligible {
+				residentTokens = append(residentTokens, token)
+			}
 		} else {
 			r.forwardTokenInto(cache, buf, token, pos, &logits)
+			if cacheEligible {
+				residentTokens = append(residentTokens, token)
+			}
 		}
 		pos++
 	}
@@ -667,25 +732,135 @@ func (r *Runner) cacheDims() (int, int, int, int, int) {
 
 const maxReusableKVCacheBytes int64 = 512 << 20
 
-// generationWorkspace reuses request scratch behind genLock. KV entries up to
-// the active position are always overwritten before attention reads them, so
-// stale suffix data is unreachable. Retaining at most 512 MiB avoids repeated
-// large allocations without pinning an unusually large one-off context.
+func kvCacheBytes(layers, kDim, vDim, cacheLen int, f16 bool) int64 {
+	elemBytes := int64(4)
+	if f16 {
+		elemBytes = 2
+	}
+	return int64(layers) * int64(kDim+vDim) * int64(cacheLen) * elemBytes
+}
+
+func grownKVCacheLen(current, required, limit int, config Config) int {
+	if current <= 0 {
+		return required
+	}
+	grown := current * 2
+	if grown < current { // integer overflow: the required size is safer.
+		grown = required
+	}
+	grown = max(grown, current+prefillChunkSize(config))
+	target := max(required, grown)
+	if limit > 0 {
+		target = min(target, limit)
+	}
+	return target
+}
+
+// copyKVPrefix transfers complete token rows between shape-compatible caches.
+// It intentionally excludes Nemotron-H's recurrent state; prefix reuse for
+// that hybrid architecture stays disabled until its state can be copied too.
+func copyKVPrefix(dst, src *KVCache, positions int) int {
+	if dst == nil || src == nil || positions <= 0 || dst.F16 != src.F16 ||
+		dst.PerPosKDim != src.PerPosKDim || dst.PerPosVDim != src.PerPosVDim ||
+		dst.layerCount() != src.layerCount() {
+		return 0
+	}
+	positions = min(positions, min(dst.MaxLen, src.MaxLen))
+	if positions <= 0 {
+		return 0
+	}
+	kLen := positions * dst.PerPosKDim
+	vLen := positions * dst.PerPosVDim
+	for layer := 0; layer < dst.layerCount(); layer++ {
+		if dst.F16 {
+			copy(dst.K16[layer][:kLen], src.K16[layer][:kLen])
+			copy(dst.V16[layer][:vLen], src.V16[layer][:vLen])
+			continue
+		}
+		copy(dst.K[layer][:kLen], src.K[layer][:kLen])
+		copy(dst.V[layer][:vLen], src.V[layer][:vLen])
+	}
+	return positions
+}
+
+func sharedTokenPrefix(a, b []uint32) int {
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		if a[i] != b[i] {
+			return i
+		}
+	}
+	return n
+}
+
+func (r *Runner) clearPrefixCache() {
+	r.prefixCache = prefixCacheState{}
+}
+
+func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
+	// Nemotron-H also carries recurrent Mamba state. Reusing only its attention
+	// K/V rows would be incorrect, so leave it on the safe full-prefill path.
+	return r.kind != loadedNemotronH && cache != nil && cache == r.workspaceCache
+}
+
+// prefixReuse returns the exact number of resident KV positions that can be
+// skipped. An identical prompt re-runs only its final token because sampling
+// mutates logits in place; retaining raw logits would otherwise make a retry
+// subtly diverge from a cold run.
+func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
+	state := r.prefixCache
+	if state.cache != cache || len(state.tokens) == 0 || cache == nil {
+		return 0
+	}
+	matched := min(sharedTokenPrefix(tokens, state.tokens), cache.MaxLen)
+	if matched == 0 {
+		return 0
+	}
+	if matched == len(tokens) {
+		return max(0, matched-1)
+	}
+	return matched
+}
+
+// generationWorkspace reuses request scratch behind genLock. The retained
+// cache also serves as a single bounded, token-verified prefix cache for the
+// most recent conversation. When it grows, copy known K/V rows geometrically
+// rather than re-prefilling prior turns. Retaining at most 512 MiB avoids
+// turning one unusually large context into a permanent memory commitment.
 func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	layers := r.config.NLayers
-	cache := r.workspaceCache
-	compatible := cache != nil && cache.layerCount() == layers && cache.F16 == useF16KVCache &&
-		cache.PerPosKDim == kDim && cache.PerPosVDim == vDim && cache.MaxLen >= cacheLen
+	old := r.workspaceCache
+	shapeCompatible := old != nil && old.layerCount() == layers && old.F16 == useF16KVCache &&
+		old.PerPosKDim == kDim && old.PerPosVDim == vDim
+	cache := old
+	compatible := shapeCompatible && old.MaxLen >= cacheLen
 	if !compatible {
-		cache = newKVCacheAuto(layers, kDim, vDim, cacheLen)
-		elemBytes := int64(4)
-		if cache.F16 {
-			elemBytes = 2
+		targetLen := cacheLen
+		if shapeCompatible {
+			targetLen = grownKVCacheLen(old.MaxLen, cacheLen, r.config.MaxSeqLen, r.config)
 		}
-		bytes := int64(layers) * int64(kDim+vDim) * int64(cacheLen) * elemBytes
+		// Geometric headroom is useful only while it stays within the same
+		// retention budget. Never make a one-off request allocate a larger
+		// temporary cache merely because the next growth step crossed 512 MiB.
+		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, useF16KVCache) > maxReusableKVCacheBytes {
+			targetLen = cacheLen
+		}
+		cache = newKVCacheAuto(layers, kDim, vDim, targetLen)
+		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.F16)
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
+			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH {
+				if copied := copyKVPrefix(cache, old, len(r.prefixCache.tokens)); copied == len(r.prefixCache.tokens) {
+					r.prefixCache.cache = cache
+				} else {
+					r.clearPrefixCache()
+				}
+			} else if r.prefixCache.cache == old {
+				r.clearPrefixCache()
+			}
+		} else if !shapeCompatible && r.prefixCache.cache == old {
+			r.clearPrefixCache()
 		}
 	}
 	if r.kind == loadedNemotronH {
@@ -798,6 +973,13 @@ func (r *Runner) canBatchPrefill() bool {
 // uses the model-aware default below. Deployment-specific A/B runs can override
 // either choice through GOPHERLLM_PREFILL_CHUNK.
 func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, logits *[]float32) error {
+	return r.prefillBatchedAt(ctx, cache, buf, tokens, 0, logits)
+}
+
+// prefillBatchedAt is prefillBatched with an absolute KV-cache offset. The
+// offset is what lets an append-only chat process only the new rendered-token
+// suffix while attention still reads the cached prefix rows.
+func (r *Runner) prefillBatchedAt(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
 	chunk := prefillChunkSize(r.config)
 	n := len(tokens)
 	for start := 0; start < n; start += chunk {
@@ -805,7 +987,7 @@ func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *Decode
 			return err
 		}
 		end := min(start+chunk, n)
-		ForwardBatchInto(r.config, r.standard, cache, buf, tokens[start:end], start, end == n, logits)
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens[start:end], startPos+start, end == n, logits)
 	}
 	return nil
 }
@@ -887,6 +1069,9 @@ func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token ui
 func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
+	// Embeddings reuse the same scratch KV workspace but have unrelated token
+	// positions, so they must never overwrite a live chat-prefix cache.
+	r.clearPrefixCache()
 	tokens := r.tok.Encode(text)
 	if len(tokens) == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: input tokenised to zero tokens")

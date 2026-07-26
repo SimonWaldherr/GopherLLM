@@ -262,7 +262,7 @@ func TestHandlerLogsInferenceMetricsWithRequestID(t *testing.T) {
 	if _, ok := row["ttft_ms"].(float64); !ok {
 		t.Fatalf("missing ttft_ms in %#v", row)
 	}
-	if row["cache"] != "none" || row["cache_hit"] != false || row["retry_count"].(float64) != 0 {
+	if row["cache"] != "prefix" || row["cache_hit"] != false || row["cached_prompt_tokens"].(float64) != 0 || row["retry_count"].(float64) != 0 {
 		t.Fatalf("cache/retry fields = %#v", row)
 	}
 }

@@ -272,6 +272,9 @@ func TestOpenAIRecentContextIsOptIn(t *testing.T) {
 	if !strings.Contains(recent.Body.String(), `"gopherllm_context"`) {
 		t.Fatalf("non-streaming response omitted context metadata: %s", recent.Body.String())
 	}
+	if !strings.Contains(recent.Body.String(), `"gopherllm_cache"`) {
+		t.Fatalf("non-streaming response omitted cache metadata: %s", recent.Body.String())
+	}
 
 	stream := post("recent", true)
 	if stream.Code != http.StatusOK {
@@ -282,6 +285,9 @@ func TestOpenAIRecentContextIsOptIn(t *testing.T) {
 	}
 	if !strings.Contains(stream.Body.String(), `"gopherllm_context"`) {
 		t.Fatalf("streaming response omitted terminal context metadata: %s", stream.Body.String())
+	}
+	if !strings.Contains(stream.Body.String(), `"gopherllm_cache"`) {
+		t.Fatalf("streaming response omitted terminal cache metadata: %s", stream.Body.String())
 	}
 
 	invalid := post("everything", false)

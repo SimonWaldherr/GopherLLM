@@ -264,6 +264,18 @@ function cleanSettings(value, defaults) {
   };
 }
 
+function cleanPromptCache(value) {
+  if (!value || typeof value !== "object" || (value.mode !== "prefix" && value.mode !== "disabled")) return null;
+  const count = (name) => {
+    const number = Number(value[name]);
+    return Number.isInteger(number) && number >= 0 && number <= 10000000 ? number : null;
+  };
+  const promptTokens = count("prompt_tokens");
+  const reusedTokens = count("reused_tokens");
+  if (promptTokens === null || reusedTokens === null || reusedTokens > promptTokens) return null;
+  return { mode: value.mode, hit: value.hit === true && reusedTokens > 0, reused_tokens: reusedTokens, prompt_tokens: promptTokens };
+}
+
 function cleanMessage(value) {
   if (!value || typeof value !== "object" || (value.role !== "user" && value.role !== "assistant") || typeof value.content !== "string") return null;
   return {
@@ -272,7 +284,8 @@ function cleanMessage(value) {
     reasoning: typeof value.reasoning === "string" ? value.reasoning.slice(0, 1000000) : "",
     tool_calls: Array.isArray(value.tool_calls) ? value.tool_calls : null,
     usage: value.usage && typeof value.usage === "object" ? value.usage : null,
-    finishReason: typeof value.finishReason === "string" ? value.finishReason : ""
+    finishReason: typeof value.finishReason === "string" ? value.finishReason : "",
+    prompt_cache: cleanPromptCache(value.prompt_cache)
   };
 }
 
@@ -361,6 +374,7 @@ function toMarkdown(chat) {
   const scrollEl = $("scroll");
   const jumpLatestEl = $("jumpLatest");
   const contextEstimateEl = $("contextEstimate");
+  const promptCacheStatusEl = $("promptCacheStatus");
   const modelSelectEl = $("modelSelect");
   const modelNameEl = $("modelName");
   const chatTitleEl = $("chatTitle");
@@ -547,6 +561,43 @@ function toMarkdown(chat) {
     return lastContextWindow;
   }
 
+  function compactCount(value) {
+    if (value < 1000) return String(value);
+    const rounded = value >= 10000 ? Math.round(value / 1000) : Math.round(value / 100) / 10;
+    return String(rounded).replace(/\.0$/, "") + "K";
+  }
+
+  function latestPromptCache(chat) {
+    if (!chat) return null;
+    for (let index = chat.messages.length - 1; index >= 0; index--) {
+      const message = chat.messages[index];
+      if (message.role === "assistant" && message.prompt_cache) return message.prompt_cache;
+    }
+    return null;
+  }
+
+  function promptCacheText(info, compact) {
+    if (!info) return "";
+    if (info.mode !== "prefix") return compact ? "context cache unavailable" : "Last reply: model context cache was unavailable for this context.";
+    if (!info.hit || !info.reused_tokens) return compact ? "context cache warming" : "Last reply warmed the model context cache — the next matching reply can reuse this prefix.";
+    const reused = compactCount(info.reused_tokens);
+    const prompt = compactCount(info.prompt_tokens);
+    return compact ? "context cache " + reused + "/" + prompt + " reused" : "Last reply: model context cache reused " + reused + " / " + prompt + " prompt tokens.";
+  }
+
+  function updatePromptCacheStatus() {
+    const chat = activeChat();
+    if (!chat || !promptCacheStatusEl) return;
+    if (busy) {
+      promptCacheStatusEl.textContent = "Model context cache is checking this conversation.";
+      promptCacheStatusEl.hidden = false;
+      return;
+    }
+    const text = promptCacheText(latestPromptCache(chat), false);
+    promptCacheStatusEl.textContent = text;
+    promptCacheStatusEl.hidden = !text;
+  }
+
   function updateContextWindowStatus() {
     const chat = activeChat();
     if (!chat) return;
@@ -598,6 +649,7 @@ function toMarkdown(chat) {
     const retained = info ? " · last sent " + info.retainedMessages + "/" + info.inputMessages + " messages" : "";
     contextEstimateEl.textContent = count + " message" + (count === 1 ? "" : "s") + " · ~" + estimate + " input tokens" + context + warning + retained;
     updateContextWindowStatus();
+    updatePromptCacheStatus();
     if (!busy) {
       sendEl.disabled = tuning || !promptEl.value.trim();
       sendLabelEl.textContent = editingIndex === null ? "Send" : "Save & retry";
@@ -739,6 +791,8 @@ function toMarkdown(chat) {
       parts.push(result.usage.completion_tokens + " tokens");
       if (typeof result.usage.prompt_tokens === "number") parts.push(result.usage.prompt_tokens + " prompt");
     }
+    const cacheText = promptCacheText(result.promptCache, true);
+    if (cacheText) parts.push(cacheText);
     if (result.finishReason && result.finishReason !== "stop") parts.push(result.finishReason);
     if (parts.length) {
       const meta = document.createElement("div");
@@ -791,7 +845,7 @@ function toMarkdown(chat) {
       if (message.role === "assistant") {
         finalizeAssistant(el, {
           answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
-          usage: message.usage, finishReason: message.finishReason, decodeMS: 0
+          usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache, decodeMS: 0
         });
       }
       addActions(el, message, index);
@@ -989,7 +1043,7 @@ function toMarkdown(chat) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    const out = { answer: "", reasoning: "", toolCalls: null, usage: null, finishReason: "", contextWindow: null };
+    const out = { answer: "", reasoning: "", toolCalls: null, usage: null, finishReason: "", contextWindow: null, promptCache: null };
     const applyChunk = (payload) => {
       if (!payload || payload === "[DONE]") return;
       const event = JSON.parse(payload);
@@ -1000,6 +1054,7 @@ function toMarkdown(chat) {
       if (choice.finish_reason) out.finishReason = choice.finish_reason;
       if (choice.usage) out.usage = choice.usage;
       if (choice.gopherllm_context) out.contextWindow = choice.gopherllm_context;
+      if (choice.gopherllm_cache) out.promptCache = cleanPromptCache(choice.gopherllm_cache);
       const delta = choice.delta || {};
       if (delta.reasoning_content) {
         out.reasoning += delta.reasoning_content;
@@ -1061,6 +1116,7 @@ function toMarkdown(chat) {
     const assistantEl = addMessage("assistant", "");
     followStream = true;
     setBusy(true);
+    updatePromptCacheStatus();
     controller = new AbortController();
     const startedAt = performance.now();
     let firstTokenAt = 0;
@@ -1116,7 +1172,7 @@ function toMarkdown(chat) {
         result = {
           answer: message.content || "", reasoning: message.reasoning_content || "",
           toolCalls: message.tool_calls || null, usage: data.usage || null, finishReason: choice.finish_reason || "",
-          contextWindow: data.gopherllm_context || null
+          contextWindow: data.gopherllm_context || null, promptCache: cleanPromptCache(data.gopherllm_cache)
         };
       }
       streamFinished = true;
@@ -1124,7 +1180,8 @@ function toMarkdown(chat) {
       finalizeAssistant(assistantEl, result);
       const stored = {
         role: "assistant", content: result.answer || "", reasoning: result.reasoning || "",
-        tool_calls: result.toolCalls || null, usage: result.usage || null, finishReason: result.finishReason || ""
+        tool_calls: result.toolCalls || null, usage: result.usage || null, finishReason: result.finishReason || "",
+        prompt_cache: cleanPromptCache(result.promptCache)
       };
       chat.messages.push(stored);
       addActions(assistantEl, stored, chat.messages.length - 1);

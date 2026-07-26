@@ -340,6 +340,9 @@ func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
 	opts = opts.withDefaults()
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
+	// Calibration writes probe tokens into the shared KV workspace and can also
+	// change its f16 representation. A chat prefix must be rebuilt afterward.
+	r.clearPrefixCache()
 
 	start := time.Now()
 	t := &autoTuner{r: r, opts: opts}
@@ -964,6 +967,7 @@ func (r *Runner) AutoTuneOrCached(opts AutoTuneOptions, refresh bool) (AutoTuneR
 			// Under the generation lock, like AutoTune, so installing a cached
 			// result cannot race a request that is already running.
 			r.genLock.Lock()
+			r.clearPrefixCache()
 			res.Apply()
 			r.genLock.Unlock()
 			return res, true, nil
