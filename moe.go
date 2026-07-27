@@ -42,33 +42,42 @@ func (b ExpertBias) addTo(expert int, dst []float32) {
 type SparseMoEWeights struct {
 	Router     Weight
 	RouterBias []float32
-	Gate       ExpertWeight
-	Up         ExpertWeight
-	Down       ExpertWeight
-	GateBias   ExpertBias
-	UpBias     ExpertBias
-	DownBias   ExpertBias
+	// RouterCorrectionBias is DeepSeek/Kimi's exp_probs_b. It changes only
+	// the top-k selection score; the routed probability remains sigmoid(router)
+	// as in the original noaux router.
+	RouterCorrectionBias []float32
+	Gate                 ExpertWeight
+	Up                   ExpertWeight
+	Down                 ExpertWeight
+	GateBias             ExpertBias
+	UpBias               ExpertBias
+	DownBias             ExpertBias
 
 	// NormalizeTopK changes full-router softmax weights into a softmax over
 	// just the selected experts. This is algebraically equivalent to
 	// softmax-all + selected-weight normalization, and avoids exponentiating
 	// every expert on Mixtral/Qwen3/GPT-OSS decode.
-	NormalizeTopK bool
-	Scale         float32
-	OAIActivation bool
-	ExpertUsed    int
+	NormalizeTopK  bool
+	Scale          float32
+	OAIActivation  bool
+	ExpertUsed     int
+	RoutingSigmoid bool
 
 	// Qwen2-MoE shared expert: sigmoid(SharedGateIn(x)) times a normal
-	// SwiGLU FFN. All four pointers are either present together or absent.
+	// SwiGLU FFN. For that layout all four pointers are present together;
+	// DeepSeek/Kimi instead sets the three FFN weights plus SharedAlways.
 	SharedGateIn *Weight
 	SharedGate   *Weight
 	SharedUp     *Weight
 	SharedDown   *Weight
+	// SharedAlways is DeepSeek-V2/V3/Kimi's always-on shared SwiGLU branch.
+	// Qwen2-MoE instead has SharedGateIn and gates its shared output.
+	SharedAlways bool
 }
 
 const moeWeightFloor = float32(6.103515625e-5) // smallest normalized F16
 
-func loadExpertWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, borrow bool) (ExpertWeight, error) {
+func loadExpertWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, borrow bool, lazyScalars ...bool) (ExpertWeight, error) {
 	info, ok := tensors[name]
 	if !ok {
 		return ExpertWeight{}, fmt.Errorf("missing tensor: %s", name)
@@ -80,7 +89,7 @@ func loadExpertWeight(data []byte, dataOffset int, name string, tensors map[stri
 	// tensor contains many such planes, so preparing it as a single plane is
 	// both wasteful and invalid. expertMatvecInto builds a lightweight plane
 	// view and reuses the CPU SIMD/int8-activation kernels instead.
-	w, err := loadWeight(data, dataOffset, name, tensors, inferred, false, borrow, false, false)
+	w, err := loadWeight(data, dataOffset, name, tensors, inferred, false, borrow, false, false, lazyScalars...)
 	if err != nil {
 		return ExpertWeight{}, err
 	}
@@ -135,7 +144,7 @@ func hasAnyTensor(tensors map[string]TensorInfo, names ...string) bool {
 	return false
 }
 
-func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool) (*SparseMoEWeights, error) {
+func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal, lazyScalarWeights bool) (*SparseMoEWeights, error) {
 	if cfg.ExpertCount <= 0 || cfg.ExpertUsedCount <= 0 || cfg.ExpertUsedCount > cfg.ExpertCount {
 		return nil, fmt.Errorf("%s: invalid MoE metadata experts=%d used=%d", cfg.Arch, cfg.ExpertCount, cfg.ExpertUsedCount)
 	}
@@ -148,18 +157,19 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 		return nil, fmt.Errorf("tensor %s has dimensions %v, want [%d %d]", routerName, routerInfo.Dims, cfg.Dim, cfg.ExpertCount)
 	}
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, dataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		return loadWeight(data, dataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 	}
 	router, err := load(routerName)
 	if err != nil {
 		return nil, err
 	}
 	w := &SparseMoEWeights{
-		Router:        router,
-		NormalizeTopK: cfg.ExpertWeightsNorm,
-		Scale:         cfg.ExpertWeightsScale,
-		OAIActivation: cfg.Arch == "gpt-oss",
-		ExpertUsed:    cfg.ExpertUsedCount,
+		Router:         router,
+		NormalizeTopK:  cfg.ExpertWeightsNorm,
+		Scale:          cfg.ExpertWeightsScale,
+		OAIActivation:  cfg.Arch == "gpt-oss",
+		ExpertUsed:     cfg.ExpertUsedCount,
+		RoutingSigmoid: deepSeek2Family(cfg.Arch) && cfg.ExpertGatingFunc == deepSeekExpertGatingSigmoid,
 	}
 	if w.Scale == 0 {
 		w.Scale = 1
@@ -167,13 +177,30 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 	if w.RouterBias, err = loadOptionalMoEVec(data, dataOffset, prefix+"ffn_gate_inp.bias", tensors, inferred, cfg.ExpertCount); err != nil {
 		return nil, err
 	}
-	if w.Gate, err = loadExpertWeight(data, dataOffset, prefix+"ffn_gate_exps.weight", tensors, inferred, borrow); err != nil {
+	if deepSeek2Family(cfg.Arch) {
+		if cfg.ExpertGatingFunc != 0 && cfg.ExpertGatingFunc != deepSeekExpertGatingSigmoid {
+			return nil, fmt.Errorf("%s: unsupported expert_gating_func=%d (supported: softmax=0, sigmoid/noaux=%d)", cfg.Arch, cfg.ExpertGatingFunc, deepSeekExpertGatingSigmoid)
+		}
+		// DeepSeek/Kimi's correction bias is not a normal router bias: it is
+		// added after sigmoid only to rank candidates for top-k selection.
+		w.RouterCorrectionBias, err = loadOptionalMoEVec(data, dataOffset, prefix+"exp_probs_b.bias", tensors, inferred, cfg.ExpertCount)
+		if err != nil {
+			return nil, err
+		}
+		if w.RouterCorrectionBias == nil {
+			w.RouterCorrectionBias, err = loadOptionalMoEVec(data, dataOffset, prefix+"exp_probs_b", tensors, inferred, cfg.ExpertCount)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if w.Gate, err = loadExpertWeight(data, dataOffset, prefix+"ffn_gate_exps.weight", tensors, inferred, borrow, lazyScalarWeights); err != nil {
 		return nil, err
 	}
-	if w.Up, err = loadExpertWeight(data, dataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow); err != nil {
+	if w.Up, err = loadExpertWeight(data, dataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow, lazyScalarWeights); err != nil {
 		return nil, err
 	}
-	if w.Down, err = loadExpertWeight(data, dataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow); err != nil {
+	if w.Down, err = loadExpertWeight(data, dataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow, lazyScalarWeights); err != nil {
 		return nil, err
 	}
 	if err := validateExpertWeight(prefix+"ffn_gate_exps.weight", w.Gate, cfg.Dim, w.Gate.Output, cfg.ExpertCount); err != nil {
@@ -185,6 +212,9 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 	if err := validateExpertWeight(prefix+"ffn_down_exps.weight", w.Down, w.Gate.Output, cfg.Dim, cfg.ExpertCount); err != nil {
 		return nil, err
 	}
+	if deepSeek2Family(cfg.Arch) && cfg.ExpertFeedForwardDim > 0 && w.Gate.Output != cfg.ExpertFeedForwardDim {
+		return nil, fmt.Errorf("%s: expert tensor width=%d, want expert_feed_forward_length=%d", cfg.Arch, w.Gate.Output, cfg.ExpertFeedForwardDim)
+	}
 	if w.GateBias, err = loadOptionalExpertBias(data, dataOffset, prefix+"ffn_gate_exps.bias", tensors, inferred, w.Gate.Output, cfg.ExpertCount); err != nil {
 		return nil, err
 	}
@@ -195,46 +225,94 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 		return nil, err
 	}
 
-	sharedNames := []string{
-		prefix + "ffn_gate_inp_shexp.weight",
-		prefix + "ffn_gate_shexp.weight",
-		prefix + "ffn_up_shexp.weight",
-		prefix + "ffn_down_shexp.weight",
-	}
-	if hasAnyTensor(tensors, sharedNames...) {
-		for _, name := range sharedNames {
-			if _, ok := tensors[name]; !ok {
-				return nil, fmt.Errorf("%s: unsupported partial shared-expert layout (missing %s)", cfg.Arch, name)
+	if deepSeek2Family(cfg.Arch) {
+		// Kimi and DeepSeek-V2/V3 use a plain, always-on shared SwiGLU expert.
+		// There is intentionally no ffn_gate_inp_shexp routing/gating tensor.
+		sharedNames := []string{prefix + "ffn_gate_shexp.weight", prefix + "ffn_up_shexp.weight", prefix + "ffn_down_shexp.weight"}
+		if cfg.ExpertSharedCount > 0 && !hasAnyTensor(tensors, sharedNames...) {
+			return nil, fmt.Errorf("%s: expert_shared_count=%d requires ffn_gate_shexp, ffn_up_shexp, and ffn_down_shexp", cfg.Arch, cfg.ExpertSharedCount)
+		}
+		if hasAnyTensor(tensors, sharedNames...) {
+			for _, name := range sharedNames {
+				if _, ok := tensors[name]; !ok {
+					return nil, fmt.Errorf("%s: partial DeepSeek/Kimi shared expert (missing %s)", cfg.Arch, name)
+				}
 			}
+			gateInfo, upInfo, downInfo := tensors[sharedNames[0]], tensors[sharedNames[1]], tensors[sharedNames[2]]
+			if len(gateInfo.Dims) != 2 || len(upInfo.Dims) != 2 || len(downInfo.Dims) != 2 ||
+				int(gateInfo.Dims[0]) != cfg.Dim || int(upInfo.Dims[0]) != cfg.Dim ||
+				gateInfo.Dims[1] != upInfo.Dims[1] || int(downInfo.Dims[0]) != int(gateInfo.Dims[1]) || int(downInfo.Dims[1]) != cfg.Dim {
+				return nil, fmt.Errorf("%s: inconsistent shared-expert dimensions", cfg.Arch)
+			}
+			sharedWidth := int(gateInfo.Dims[1])
+			if cfg.ExpertFeedForwardDim > 0 && sharedWidth != cfg.ExpertFeedForwardDim*max(1, cfg.ExpertSharedCount) {
+				return nil, fmt.Errorf("%s: shared expert width=%d, want expert_feed_forward_length*expert_shared_count=%d", cfg.Arch, sharedWidth, cfg.ExpertFeedForwardDim*max(1, cfg.ExpertSharedCount))
+			}
+			gate, err := load(sharedNames[0])
+			if err != nil {
+				return nil, err
+			}
+			up, err := load(sharedNames[1])
+			if err != nil {
+				return nil, err
+			}
+			down, err := load(sharedNames[2])
+			if err != nil {
+				return nil, err
+			}
+			w.SharedGate, w.SharedUp, w.SharedDown, w.SharedAlways = &gate, &up, &down, true
 		}
-		gateInInfo := tensors[sharedNames[0]]
-		if !((len(gateInInfo.Dims) == 1 && int(gateInInfo.Dims[0]) == cfg.Dim) ||
-			(len(gateInInfo.Dims) == 2 && int(gateInInfo.Dims[0]) == cfg.Dim && int(gateInInfo.Dims[1]) == 1)) {
-			return nil, fmt.Errorf("tensor %s has dimensions %v, want [%d] or [%d 1]", sharedNames[0], gateInInfo.Dims, cfg.Dim, cfg.Dim)
+	} else {
+		sharedNames := []string{
+			prefix + "ffn_gate_inp_shexp.weight",
+			prefix + "ffn_gate_shexp.weight",
+			prefix + "ffn_up_shexp.weight",
+			prefix + "ffn_down_shexp.weight",
 		}
-		gateIn, err := load(sharedNames[0])
-		if err != nil {
-			return nil, err
+		if hasAnyTensor(tensors, sharedNames...) {
+			for _, name := range sharedNames {
+				if _, ok := tensors[name]; !ok {
+					return nil, fmt.Errorf("%s: unsupported partial shared-expert layout (missing %s)", cfg.Arch, name)
+				}
+			}
+			gateInInfo := tensors[sharedNames[0]]
+			if !((len(gateInInfo.Dims) == 1 && int(gateInInfo.Dims[0]) == cfg.Dim) ||
+				(len(gateInInfo.Dims) == 2 && int(gateInInfo.Dims[0]) == cfg.Dim && int(gateInInfo.Dims[1]) == 1)) {
+				return nil, fmt.Errorf("tensor %s has dimensions %v, want [%d] or [%d 1]", sharedNames[0], gateInInfo.Dims, cfg.Dim, cfg.Dim)
+			}
+			gateIn, err := load(sharedNames[0])
+			if err != nil {
+				return nil, err
+			}
+			gate, err := load(sharedNames[1])
+			if err != nil {
+				return nil, err
+			}
+			up, err := load(sharedNames[2])
+			if err != nil {
+				return nil, err
+			}
+			down, err := load(sharedNames[3])
+			if err != nil {
+				return nil, err
+			}
+			gateInfo, upInfo, downInfo := tensors[sharedNames[1]], tensors[sharedNames[2]], tensors[sharedNames[3]]
+			if len(gateInfo.Dims) != 2 || len(upInfo.Dims) != 2 || len(downInfo.Dims) != 2 ||
+				int(gateInfo.Dims[0]) != cfg.Dim || int(upInfo.Dims[0]) != cfg.Dim ||
+				gateInfo.Dims[1] != upInfo.Dims[1] || int(downInfo.Dims[0]) != int(gateInfo.Dims[1]) || int(downInfo.Dims[1]) != cfg.Dim {
+				return nil, fmt.Errorf("%s: inconsistent shared-expert dimensions", cfg.Arch)
+			}
+			w.SharedGateIn, w.SharedGate, w.SharedUp, w.SharedDown = &gateIn, &gate, &up, &down
 		}
-		gate, err := load(sharedNames[1])
-		if err != nil {
-			return nil, err
+	}
+	if cfg.Arch == "qwen2moe" && w.SharedGateIn == nil {
+		return nil, fmt.Errorf("qwen2moe requires ffn_gate_inp_shexp, ffn_gate_shexp, ffn_up_shexp, and ffn_down_shexp")
+	}
+	if cfg.Arch == "gpt-oss" {
+		if len(w.RouterBias) != cfg.ExpertCount || len(w.GateBias.Values) != w.Gate.Output*cfg.ExpertCount ||
+			len(w.UpBias.Values) != w.Up.Output*cfg.ExpertCount || len(w.DownBias.Values) != cfg.Dim*cfg.ExpertCount {
+			return nil, fmt.Errorf("gpt-oss requires router and gate/up/down expert biases")
 		}
-		up, err := load(sharedNames[2])
-		if err != nil {
-			return nil, err
-		}
-		down, err := load(sharedNames[3])
-		if err != nil {
-			return nil, err
-		}
-		gateInfo, upInfo, downInfo := tensors[sharedNames[1]], tensors[sharedNames[2]], tensors[sharedNames[3]]
-		if len(gateInfo.Dims) != 2 || len(upInfo.Dims) != 2 || len(downInfo.Dims) != 2 ||
-			int(gateInfo.Dims[0]) != cfg.Dim || int(upInfo.Dims[0]) != cfg.Dim ||
-			gateInfo.Dims[1] != upInfo.Dims[1] || int(downInfo.Dims[0]) != int(gateInfo.Dims[1]) || int(downInfo.Dims[1]) != cfg.Dim {
-			return nil, fmt.Errorf("%s: inconsistent shared-expert dimensions", cfg.Arch)
-		}
-		w.SharedGateIn, w.SharedGate, w.SharedUp, w.SharedDown = &gateIn, &gate, &up, &down
 	}
 	return w, nil
 }
@@ -313,9 +391,34 @@ func sparseMoERoutingWeights(logits []float32, selected []ExpertScore, normalize
 	return weights
 }
 
+// sparseMoESigmoidRoutingWeights implements DeepSeek-V3/Kimi's noaux router.
+// selected contains indices ranked by score + exp_probs_b; scores deliberately
+// contains the *uncorrected* sigmoid(router) values used as mixture weights.
+func sparseMoESigmoidRoutingWeights(scores []float32, selected []ExpertScore, normalizeTopK bool, out *[]float32) []float32 {
+	ensureLenNoClear(out, len(selected))
+	weights := *out
+	var sum float32
+	for i, choice := range selected {
+		if choice.Index < 0 || choice.Index >= len(scores) {
+			panic("invalid sigmoid MoE expert selection")
+		}
+		weight := scores[choice.Index]
+		weights[i] = weight
+		sum += weight
+	}
+	if normalizeTopK {
+		if sum < moeWeightFloor {
+			sum = moeWeightFloor
+		}
+		ScaleF32(weights, 1/sum)
+	}
+	return weights
+}
+
 func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 	if w == nil || len(x) != w.Gate.Input || w.Gate.Experts <= 0 || w.ExpertUsed <= 0 || w.ExpertUsed > w.Gate.Experts ||
-		w.Gate.Experts != w.Up.Experts || w.Gate.Experts != w.Down.Experts {
+		w.Gate.Experts != w.Up.Experts || w.Gate.Experts != w.Down.Experts ||
+		(len(w.RouterCorrectionBias) != 0 && len(w.RouterCorrectionBias) != w.Gate.Experts) {
 		panic("invalid sparse MoE weights")
 	}
 	w.Router.MatvecInto(x, &buf.RouterLogits)
@@ -325,14 +428,33 @@ func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 	if len(w.RouterBias) != 0 {
 		addInPlace(buf.RouterLogits, w.RouterBias)
 	}
-	selected := selectTopExperts(buf.RouterLogits, w.ExpertUsed, &buf.TopExperts)
-	routing := sparseMoERoutingWeights(buf.RouterLogits, selected, w.NormalizeTopK, &buf.ExpertProbs)
+	var selected []ExpertScore
+	var routing []float32
+	if w.RoutingSigmoid {
+		ensureLenNoClear(&buf.RouterSelection, len(buf.RouterLogits))
+		for i, logit := range buf.RouterLogits {
+			score := nemotronSigmoid(logit)
+			buf.RouterLogits[i] = score
+			selection := score
+			if len(w.RouterCorrectionBias) != 0 {
+				selection += w.RouterCorrectionBias[i]
+			}
+			buf.RouterSelection[i] = selection
+		}
+		selected = selectTopExperts(buf.RouterSelection, w.ExpertUsed, &buf.TopExperts)
+		routing = sparseMoESigmoidRoutingWeights(buf.RouterLogits, selected, w.NormalizeTopK, &buf.ExpertProbs)
+	} else {
+		selected = selectTopExperts(buf.RouterLogits, w.ExpertUsed, &buf.TopExperts)
+		routing = sparseMoERoutingWeights(buf.RouterLogits, selected, w.NormalizeTopK, &buf.ExpertProbs)
+	}
 	ensureLenNoClear(&buf.Proj, w.Down.Output)
 	clear(buf.Proj[:w.Down.Output])
 	for i, choice := range selected {
-		expertMatvecInto(w.Gate, choice.Index, x, &buf.Gate, &buf.ExpertRow)
+		if !expertMatvec2Into(w.Gate, w.Up, choice.Index, x, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+			expertMatvecInto(w.Gate, choice.Index, x, &buf.Gate, &buf.ExpertRow)
+			expertMatvecInto(w.Up, choice.Index, x, &buf.Up, &buf.ExpertRow)
+		}
 		w.GateBias.addTo(choice.Index, buf.Gate)
-		expertMatvecInto(w.Up, choice.Index, x, &buf.Up, &buf.ExpertRow)
 		w.UpBias.addTo(choice.Index, buf.Up)
 		ensureLenNoClear(&buf.Hidden, w.Gate.Output)
 		if w.OAIActivation {
@@ -348,22 +470,102 @@ func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 		w.DownBias.addTo(choice.Index, buf.MOE)
 		AxpyF32(buf.Proj[:w.Down.Output], routing[i]*w.Scale, buf.MOE)
 	}
-	if w.SharedGateIn != nil {
+	if w.SharedGateIn != nil || w.SharedGate != nil || w.SharedUp != nil || w.SharedDown != nil {
 		if w.SharedGate == nil || w.SharedUp == nil || w.SharedDown == nil {
 			panic("partial shared MoE expert")
+		}
+		if !w.SharedAlways && w.SharedGateIn == nil {
+			panic("shared MoE expert is missing its gate")
 		}
 		w.SharedGate.MatvecInto(x, &buf.Gate)
 		w.SharedUp.MatvecInto(x, &buf.Up)
 		ensureLenNoClear(&buf.Hidden, len(buf.Gate))
 		siluMulF32(buf.Gate, buf.Up, buf.Hidden)
 		w.SharedDown.MatvecInto(buf.Hidden, &buf.MOE)
-		w.SharedGateIn.MatvecInto(x, &buf.RouterLogits)
-		if len(buf.RouterLogits) != 1 {
-			panic("shared MoE gate has an invalid shape")
+		if !w.SharedAlways {
+			w.SharedGateIn.MatvecInto(x, &buf.RouterLogits)
+			if len(buf.RouterLogits) != 1 {
+				panic("shared MoE gate has an invalid shape")
+			}
+			ScaleF32(buf.MOE, nemotronSigmoid(buf.RouterLogits[0]))
 		}
-		ScaleF32(buf.MOE, nemotronSigmoid(buf.RouterLogits[0]))
 		addInPlace(buf.Proj[:w.Down.Output], buf.MOE)
 	}
+}
+
+// expertMatvec2Into computes an expert's gate/up projections together when
+// their layout permits it. Gate and up always share x, so one worker dispatch
+// and one activation-sum preparation are enough for common Q4_K/Q6_K GGUFs.
+// Other type pairs deliberately fall back to the independently optimized
+// kernel rather than forcing an inferior generic path.
+func expertMatvec2Into(a, b ExpertWeight, expert int, x []float32, q4Sums *[]float32, aOut, bOut *[]float32) bool {
+	if expert < 0 || expert >= a.Experts || expert >= b.Experts || len(x) != a.Input || a.Input != b.Input || a.Output != b.Output {
+		return false
+	}
+	if a.Weight.F32 != nil && b.Weight.F32 != nil {
+		aBase := expert * a.Output * a.Input
+		bBase := expert * b.Output * b.Input
+		if aBase < 0 || bBase < 0 || aBase+a.Output*a.Input > len(a.Weight.F32) || bBase+b.Output*b.Input > len(b.Weight.F32) {
+			return false
+		}
+		aData := a.Weight.F32[aBase : aBase+a.Output*a.Input]
+		bData := b.Weight.F32[bBase : bBase+b.Output*b.Input]
+		ensureLenNoClear(aOut, a.Output)
+		ensureLenNoClear(bOut, b.Output)
+		totalRows := a.Output + b.Output
+		parallelRows(totalRows, func(start, end int) {
+			if as, ae := clippedRange(start, end, 0, a.Output); as < ae {
+				for r := as; r < ae; r++ {
+					(*aOut)[r] = DotF32(aData[r*a.Input:(r+1)*a.Input], x)
+				}
+			}
+			if bs, be := clippedRange(start, end, a.Output, totalRows); bs < be {
+				for r := bs; r < be; r++ {
+					br := r - a.Output
+					(*bOut)[br] = DotF32(bData[br*b.Input:(br+1)*b.Input], x)
+				}
+			}
+		})
+		return true
+	}
+	if a.Weight.F32 != nil || b.Weight.F32 != nil || a.Weight.Type != b.Weight.Type {
+		return false
+	}
+	aPlane, okA := expertPlaneWeight(a, expert)
+	bPlane, okB := expertPlaneWeight(b, expert)
+	if !okA || !okB {
+		return false
+	}
+	switch aPlane.Type {
+	case GGMLTypeQ4_K:
+		if q4Sums == nil {
+			scratch := []float32{}
+			q4Sums = &scratch
+		}
+		return MatvecQ4K2IntoWithXSums(aPlane.Raw, aPlane.Rows, aPlane.Cols, bPlane.Raw, bPlane.Rows, bPlane.Cols, x, q4Sums, aOut, bOut)
+	case GGMLTypeQ6_K:
+		return MatvecQ6K2Into(aPlane.Raw, aPlane.Rows, aPlane.Cols, bPlane.Raw, bPlane.Rows, bPlane.Cols, x, aOut, bOut)
+	default:
+		return false
+	}
+}
+
+func expertPlaneWeight(w ExpertWeight, expert int) (Weight, bool) {
+	if expert < 0 || expert >= w.Experts || w.Weight.F32 != nil {
+		return Weight{}, false
+	}
+	rowBytes, ok := w.Weight.Type.DataSize(w.Input)
+	if !ok || rowBytes <= 0 {
+		return Weight{}, false
+	}
+	planeBytes := w.Output * rowBytes
+	start := expert * planeBytes
+	if start < 0 || start+planeBytes > len(w.Weight.Raw) {
+		return Weight{}, false
+	}
+	// Prepared and Metal descriptors refer to the complete rank-3 tensor's
+	// first plane, so a selected expert must use this raw 2-D view instead.
+	return Weight{Raw: w.Weight.Raw[start : start+planeBytes], Type: w.Weight.Type, Rows: w.Output, Cols: w.Input}, true
 }
 
 // expertMatvecInto computes one expert plane against x. Quantized GGUF
@@ -381,14 +583,9 @@ func expertMatvecInto(w ExpertWeight, expert int, x []float32, out *[]float32, r
 		MatvecF32Into(w.Weight.F32[base:base+w.Output*w.Input], x, w.Output, w.Input, out)
 		return
 	}
-	if rowBytes, ok := w.Weight.Type.DataSize(w.Input); ok && rowBytes > 0 {
-		planeBytes := w.Output * rowBytes
-		start := expert * planeBytes
-		if start >= 0 && start+planeBytes <= len(w.Weight.Raw) {
-			plane := Weight{Raw: w.Weight.Raw[start : start+planeBytes], Type: w.Weight.Type, Rows: w.Output, Cols: w.Input}
-			plane.MatvecInto(x, out)
-			return
-		}
+	if plane, ok := expertPlaneWeight(w, expert); ok {
+		plane.MatvecInto(x, out)
+		return
 	}
 	ensureLenNoClear(row, w.Input)
 	for r := range w.Output {

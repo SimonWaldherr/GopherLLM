@@ -68,7 +68,9 @@ function renderMarkdown(raw) {
     // renderer present it still reads as a labelled source block.
     if (/^mermaid$/i.test(lang)) {
       return '<div class="codeblock mermaid-block"><span class="code-lang">mermaid</span>'
-        + '<pre class="mermaid-src">' + escapeHTML(body) + "</pre></div>";
+        + '<pre class="mermaid-src">' + escapeHTML(body) + "</pre>"
+        + '<div class="mermaid-hint" hidden>Diagrams are off. <button type="button" class="mermaid-enable">Turn them on in Settings</button></div>'
+        + "</div>";
     }
     return '<div class="codeblock">' + (lang ? '<span class="code-lang">' + escapeHTML(lang) + "</span>" : "")
       + "<pre><code>" + escapeHTML(body) + "</code></pre></div>";
@@ -228,6 +230,43 @@ function attachDetailsButton(el, meta) {
   messageControls(el).appendChild(button);
 }
 
+/* Renders any Mermaid sources in container, or — when no renderer was loaded —
+   reveals the one-click route to the Settings control that would load one. */
+let mermaidSeq = 0;
+function renderMermaid(container) {
+  const blocks = container.querySelectorAll(".mermaid-block");
+  if (!blocks.length) return;
+  const ready = typeof window.mermaid !== "undefined";
+  if (ready && !renderMermaid.initialised) {
+    // securityLevel "strict" makes Mermaid sanitize the diagram text, which
+    // matters because the diagram was written by a model.
+    window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+    renderMermaid.initialised = true;
+  }
+  blocks.forEach((block) => {
+    if (block.dataset.rendered === "true") return;
+    const source = block.querySelector(".mermaid-src");
+    const hint = block.querySelector(".mermaid-hint");
+    if (!ready || !source) {
+      if (hint) hint.hidden = false;
+      return;
+    }
+    const id = "mermaid-" + (++mermaidSeq);
+    window.mermaid.render(id, source.textContent).then(({ svg }) => {
+      source.innerHTML = svg;
+      block.dataset.rendered = "true";
+      if (hint) hint.hidden = true;
+    }).catch((error) => {
+      // A diagram the model got syntactically wrong should not blank the
+      // answer; leave the source visible and say why.
+      if (hint) {
+        hint.hidden = false;
+        hint.textContent = "Diagram could not be drawn: " + (error && error.message ? error.message : "invalid Mermaid syntax");
+      }
+    });
+  });
+}
+
 function addCodeCopyButtons(container) {
   container.querySelectorAll(".codeblock").forEach((block) => {
     if (block.querySelector(".code-copy")) return;
@@ -241,6 +280,113 @@ function addCodeCopyButtons(container) {
     bindCopy(button, () => code.textContent);
     block.appendChild(button);
   });
+}
+
+/* Folds the server's tool_start / tool_end pair into one timeline row, so a
+   running call shows up immediately and is completed in place rather than
+   appearing twice. Matching is by (iteration, tool, position) because a model
+   may call the same tool more than once in one round. */
+function mergeAgentEvent(timeline, event) {
+  if (!event || !event.kind) return timeline;
+  if (event.kind === "iteration") {
+    return timeline.concat({ kind: "iteration", iteration: event.iteration });
+  }
+  if (event.kind === "tool_start") {
+    return timeline.concat({
+      kind: "tool",
+      iteration: event.iteration,
+      tool: event.tool || "(unnamed tool)",
+      arguments: event.arguments || "",
+      running: true,
+      startedAt: Date.now()
+    });
+  }
+  if (event.kind === "tool_end") {
+    // Complete the newest still-running row for this tool.
+    for (let i = timeline.length - 1; i >= 0; i--) {
+      const row = timeline[i];
+      if (row.kind === "tool" && row.running && row.tool === event.tool) {
+        const done = Object.assign({}, row, {
+          running: false,
+          durationMS: typeof event.duration_ms === "number" ? event.duration_ms : Date.now() - row.startedAt,
+          result: event.result || "",
+          error: event.error || ""
+        });
+        return timeline.slice(0, i).concat(done, timeline.slice(i + 1));
+      }
+    }
+  }
+  return timeline;
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  if (ms < 1000) return Math.round(ms) + " ms";
+  return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + " s";
+}
+
+/* Renders the timeline into el, replacing any previous version. Kept as a
+   plain rebuild because the list is short and a running row has to re-render
+   on every tick anyway. */
+function renderAgentTimeline(el, timeline) {
+  el.replaceChildren();
+  if (!timeline || !timeline.length) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const tools = timeline.filter((row) => row.kind === "tool");
+  const finished = tools.filter((row) => !row.running);
+  const total = finished.reduce((sum, row) => sum + (row.durationMS || 0), 0);
+  const rounds = timeline.filter((row) => row.kind === "iteration").length + 1;
+
+  const head = document.createElement("div");
+  head.className = "agent-head";
+  const running = tools.some((row) => row.running);
+  head.textContent = running
+    ? "Working — " + tools.length + " tool call" + (tools.length === 1 ? "" : "s") + "…"
+    : tools.length + " tool call" + (tools.length === 1 ? "" : "s")
+      + (rounds > 1 ? " over " + rounds + " rounds" : "")
+      + (total ? " · " + formatDuration(total) + " in tools" : "");
+  if (running) head.classList.add("agent-running");
+  el.appendChild(head);
+
+  for (const row of tools) {
+    const item = document.createElement("div");
+    item.className = "agent-step" + (row.running ? " running" : "") + (row.error ? " failed" : "");
+
+    const name = document.createElement("span");
+    name.className = "agent-tool";
+    name.textContent = row.tool;
+
+    const timing = document.createElement("span");
+    timing.className = "agent-timing";
+    timing.textContent = row.running ? "running…" : formatDuration(row.durationMS);
+
+    const line = document.createElement("div");
+    line.className = "agent-step-head";
+    line.append(name, timing);
+    item.appendChild(line);
+
+    if (row.arguments) {
+      const args = document.createElement("div");
+      args.className = "agent-args";
+      args.textContent = row.arguments;
+      item.appendChild(args);
+    }
+    if (row.error || row.result) {
+      const detail = document.createElement("details");
+      detail.className = "agent-detail";
+      const summary = document.createElement("summary");
+      summary.textContent = row.error ? "Failed" : "Result";
+      const body = document.createElement("div");
+      body.className = "agent-detail-body";
+      body.textContent = row.error || row.result;
+      detail.append(summary, body);
+      item.appendChild(detail);
+    }
+    el.appendChild(item);
+  }
 }
 
 function prettyJSON(value) {
@@ -390,7 +536,8 @@ function cleanSettings(value, defaults) {
     // unaffected unless they send GopherLLM's extension explicitly.
     contextWindowMode: value.contextWindowMode === "full" || value.contextWindowMode === "autoCompress" ? value.contextWindowMode : "recent",
     ragMode: value.ragMode === true,
-    wikimediaTools: value.wikimediaTools === true
+    wikimediaTools: value.wikimediaTools === true,
+    skillsTools: value.skillsTools !== false
   };
 }
 
@@ -442,6 +589,7 @@ function cleanMessage(value) {
     usage: value.usage && typeof value.usage === "object" ? value.usage : null,
     finishReason: typeof value.finishReason === "string" ? value.finishReason : "",
     prompt_cache: cleanPromptCache(value.prompt_cache),
+    agent: Array.isArray(value.agent) ? value.agent.slice(0, 60) : null,
     attachments: Array.isArray(value.attachments) ? value.attachments.map(cleanAttachment).filter(Boolean).slice(0, 8) : []
   };
 }
@@ -673,6 +821,9 @@ function toMarkdown(chat) {
   const contextWindowModeEl = $("contextWindowMode");
   const ragModeEl = $("ragMode");
   const wikimediaToolsEl = $("wikimediaTools");
+  const skillsToolsEl = $("skillsTools");
+  const skillsToolsRowEl = $("skillsToolsRow");
+  const showAgentActivityEl = $("showAgentActivity");
   const ragModelEl = $("ragModel");
   const ragStatusEl = $("ragStatus");
   const contextWindowStatusEl = $("contextWindowStatus");
@@ -706,6 +857,7 @@ function toMarkdown(chat) {
   const powerCommandsEl = $("powerCommands");
   const powerOptionsEl = $("powerOptions");
   const goalRoundsEl = $("goalRounds");
+  const mermaidCDNEl = $("mermaidCDN");
   const commandMenuEl = $("commandMenu");
   const promptHintEl = $("promptHint");
   const batchEl = $("batch");
@@ -725,6 +877,18 @@ function toMarkdown(chat) {
   const batchExportJSONEl = $("batchExportJSON");
   const batchExportCSVEl = $("batchExportCSV");
   const batchExportMDEl = $("batchExportMD");
+  const agentosEl = $("agentos");
+  const agentosCloseEl = $("agentosClose");
+  const agentosInstructionEl = $("agentosInstruction");
+  const agentosProposeEl = $("agentosPropose");
+  const agentosPolicyNoteEl = $("agentosPolicyNote");
+  const agentosProposalSectionEl = $("agentosProposalSection");
+  const agentosProposalEl = $("agentosProposal");
+  const agentosApprovalEl = $("agentosApproval");
+  const agentosApproveEl = $("agentosApprove");
+  const agentosDenyEl = $("agentosDeny");
+  const agentosResultSectionEl = $("agentosResultSection");
+  const agentosResultEl = $("agentosResult");
   const scrollEl = $("scroll");
   const jumpLatestEl = $("jumpLatest");
   const contextEstimateEl = $("contextEstimate");
@@ -764,7 +928,7 @@ function toMarkdown(chat) {
   const MAX_CHATS = 100;
   let chats = [];
   let activeID = "";
-  let preferences = { theme: "system", power: false, composerPro: false, goalRounds: 3, embeddingModel: "" };
+  let preferences = { theme: "system", power: false, composerPro: false, goalRounds: 3, embeddingModel: "", mermaidCDN: "", showAgentActivity: true };
   let busy = false;
   let tuning = false;
   let loadingModel = false;
@@ -778,6 +942,11 @@ function toMarkdown(chat) {
   let briefController = null;
   let batchDataset = { items: [], columns: [], format: "auto" };
   let batchResults = [];
+  let agentOSEnabled = false;
+  let agentOSPolicy = "";
+  let agentOSAllowed = [];
+  let agentOSBusy = false;
+  let agentOSProposal = null;
   let editingIndex = null;
   let draftBeforeEdit = "";
   let followStream = true;
@@ -1173,6 +1342,7 @@ function toMarkdown(chat) {
     composerPowerCommandsEl.checked = preferences.power;
     ragModeEl.checked = chat.settings.ragMode;
     wikimediaToolsEl.checked = chat.settings.wikimediaTools;
+    if (skillsToolsEl) skillsToolsEl.checked = chat.settings.skillsTools !== false;
     composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
     personaEl.value = Object.prototype.hasOwnProperty.call(PERSONAS, chat.persona) ? chat.persona : "custom";
     systemPromptEl.value = chat.systemPrompt;
@@ -1251,10 +1421,22 @@ function toMarkdown(chat) {
     result.reasoning = result.reasoning || parsed.reasoning;
     el.dataset.raw = result.answer;
     upsertReasoning(el, result.reasoning, false);
+    // A stored timeline is re-rendered on reload, so an answer keeps its
+    // explanation of how it was produced. It is dropped, not just hidden, when
+    // the viewing preference is off.
+    const existingTimeline = el.querySelector(":scope > .agent-timeline");
+    if (existingTimeline) existingTimeline.remove();
+    if (preferences.showAgentActivity !== false && result.agent && result.agent.length) {
+      const timelineEl = document.createElement("div");
+      timelineEl.className = "agent-timeline";
+      renderAgentTimeline(timelineEl, result.agent);
+      el.insertBefore(timelineEl, content);
+    }
     const calls = result.toolCalls || [];
     if (result.answer) {
       content.innerHTML = renderMarkdown(result.answer);
       addCodeCopyButtons(content);
+      renderMermaid(content);
     } else if (calls.length) {
       content.remove();
     } else {
@@ -1351,7 +1533,8 @@ function toMarkdown(chat) {
       if (message.role === "assistant") {
         finalizeAssistant(el, {
           answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
-          usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache, decodeMS: 0
+          usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache,
+          agent: message.agent, decodeMS: 0
         });
       }
       addActions(el, message, index);
@@ -1542,7 +1725,7 @@ function toMarkdown(chat) {
     }
   }
 
-  async function readStream(response, onToken) {
+  async function readStream(response, onToken, onAgent) {
     if (!response.body) throw new Error("Streaming response has no body");
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1559,6 +1742,10 @@ function toMarkdown(chat) {
       if (choice.usage) out.usage = choice.usage;
       if (choice.gopherllm_context) out.contextWindow = choice.gopherllm_context;
       if (choice.gopherllm_cache) out.promptCache = cleanPromptCache(choice.gopherllm_cache);
+      if (choice.gopherllm_agent) {
+        out.agent = mergeAgentEvent(out.agent || [], choice.gopherllm_agent);
+        if (onAgent) onAgent(out.agent);
+      }
       const delta = choice.delta || {};
       if (delta.reasoning_content) {
         out.reasoning += delta.reasoning_content;
@@ -1692,6 +1879,7 @@ function toMarkdown(chat) {
       stream_options: { include_usage: true },
       gopherllm_context_mode: chat.settings.contextWindowMode,
       gopherllm_wikimedia: chat.settings.wikimediaTools === true,
+      gopherllm_skills: chat.settings.skillsTools !== false,
       system_prompt: [chat.systemPrompt.trim(), ragContext].filter(Boolean).join("\n\n") || undefined
     });
   }
@@ -1871,6 +2059,19 @@ function toMarkdown(chat) {
     setBusy(true);
     updatePromptCacheStatus();
     controller = new AbortController();
+    // Live tool timeline: created lazily so a turn without tool activity adds
+    // no chrome at all.
+    let agentEl = null;
+    const onAgentTimeline = (timeline) => {
+      if (!preferences.showAgentActivity) return;
+      if (!agentEl) {
+        agentEl = document.createElement("div");
+        agentEl.className = "agent-timeline";
+        assistantEl.insertBefore(agentEl, assistantEl.querySelector(".content"));
+      }
+      renderAgentTimeline(agentEl, timeline);
+      scrollToBottom(false);
+    };
     const startedAt = performance.now();
     let firstTokenAt = 0;
     let latest = "";
@@ -1917,7 +2118,7 @@ function toMarkdown(chat) {
       }
       let result;
       if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
-        result = await readStream(response, onToken);
+        result = await readStream(response, onToken, onAgentTimeline);
       } else {
         const data = await response.json();
         const choice = (data.choices && data.choices[0]) || {};
@@ -1934,7 +2135,8 @@ function toMarkdown(chat) {
       const stored = {
         role: "assistant", content: result.answer || "", reasoning: result.reasoning || "",
         tool_calls: result.toolCalls || null, usage: result.usage || null, finishReason: result.finishReason || "",
-        prompt_cache: cleanPromptCache(result.promptCache)
+        prompt_cache: cleanPromptCache(result.promptCache),
+        agent: result.agent && result.agent.length ? result.agent : null
       };
       chat.messages.push(stored);
       addActions(assistantEl, stored, chat.messages.length - 1);
@@ -2035,7 +2237,8 @@ function toMarkdown(chat) {
       maxTokens: maxTokensEl.value, temperature: temperatureEl.value, topP: topPEl.value,
       topK: topKEl.value, minP: minPEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim(),
       stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, ragMode: ragModeEl.checked,
-      wikimediaTools: wikimediaToolsEl.checked
+      wikimediaTools: wikimediaToolsEl.checked,
+      skillsTools: skillsToolsEl ? skillsToolsEl.checked : true
     }, defaults);
     // A changed system prompt, output reserve, or model-side sampler setting
     // means the prior reply's exact accounting should not be presented as the
@@ -2164,8 +2367,26 @@ function toMarkdown(chat) {
       skillsNoteEl.textContent = "Skills available to the model: " + list.map((skill) => skill.name).join(", ");
       skillsNoteEl.title = list.map((skill) => skill.name + (skill.description ? " — " + skill.description : "")).join("\n");
       skillsNoteEl.hidden = false;
+      if (skillsToolsRowEl) skillsToolsRowEl.hidden = false;
     } catch (_) {
       /* Skills are an optional server feature; leave the note hidden. */
+    }
+  }
+
+  /* The agentic OS-command feature only exists when an operator started the
+     server with --os-commands; otherwise /agentos/status reports disabled
+     and /os stays out of the power-command palette entirely, same as the
+     skills row above. */
+  async function loadAgentOSStatus() {
+    try {
+      const response = await fetch("/agentos/status");
+      if (!response.ok) return;
+      const data = await response.json();
+      agentOSEnabled = data && data.enabled === true;
+      agentOSPolicy = (data && data.policy) || "";
+      agentOSAllowed = (data && Array.isArray(data.allowed)) ? data.allowed : [];
+    } catch (_) {
+      agentOSEnabled = false;
     }
   }
 
@@ -2208,19 +2429,28 @@ function toMarkdown(chat) {
   const COMMANDS = [
     { name: "/batch", desc: "Run one prompt over every row, record, or chapter of a file", run: () => openBatch() },
     { name: "/goal", desc: "Draft, self-critique, and improve across several rounds", run: (rest) => runGoal(rest) },
+    // Hidden entirely unless the server was started with --os-commands: this
+    // is a well-hidden, opt-in feature, not something to advertise to a
+    // server that never enabled it.
+    { name: "/os", desc: "Propose a local shell command, then run it under the server's policy", run: (rest) => openAgentOS(rest), hidden: () => !agentOSEnabled },
     { name: "/help", desc: "Show what the power commands do", run: () => showCommandHelp() }
   ];
   let menuIndex = 0;
+
+  function activeCommands() {
+    return COMMANDS.filter((c) => !c.hidden || !c.hidden());
+  }
 
   function menuMatches() {
     if (!preferences.power || busy || tuning) return [];
     const value = promptEl.value;
     if (!value.startsWith("/")) return [];
     const typed = value.split(/\s/)[0].toLowerCase();
+    const commands = activeCommands();
     // Once a command is fully typed and followed by an argument, the palette
     // has done its job and should get out of the way.
-    if (value.length > typed.length && COMMANDS.some((c) => c.name === typed)) return [];
-    return COMMANDS.filter((c) => c.name.startsWith(typed));
+    if (value.length > typed.length && commands.some((c) => c.name === typed)) return [];
+    return commands.filter((c) => c.name.startsWith(typed));
   }
 
   function renderCommandMenu() {
@@ -2281,7 +2511,7 @@ function toMarkdown(chat) {
   }
 
   function showCommandHelp() {
-    const lines = ["**Power commands**", ""].concat(COMMANDS.map((c) => "- `" + c.name + "` — " + c.desc));
+    const lines = ["**Power commands**", ""].concat(activeCommands().map((c) => "- `" + c.name + "` — " + c.desc));
     const el = addMessage("assistant", "");
     finalizeAssistant(el, { answer: lines.join("\n"), reasoning: "", toolCalls: null, usage: null, finishReason: "stop", decodeMS: 0 });
     scrollToBottom(true);
@@ -2292,7 +2522,7 @@ function toMarkdown(chat) {
   function tryRunCommand(text) {
     if (!preferences.power || !text.startsWith("/")) return false;
     const head = text.split(/\s/)[0].toLowerCase();
-    const command = COMMANDS.find((c) => c.name === head);
+    const command = activeCommands().find((c) => c.name === head);
     if (!command) return false;
     const rest = text.slice(head.length).trim();
     if (command.name === "/goal" && !rest) {
@@ -2550,6 +2780,171 @@ function toMarkdown(chat) {
     return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
   }
 
+  /* ── /os: propose a local command, run it under the server's policy ──
+     The model's own "safe" self-rating is shown for context only; it never
+     decides anything here — that mirrors the agentos package's own rule that
+     Safe must not influence Evaluate. Whether a proposal needs a click
+     depends entirely on decision.auto_run, which the server computed from
+     its configured policy. */
+  function agentOSPolicyNote() {
+    if (agentOSPolicy === "deny") return "Server policy: deny — every command needs your approval.";
+    if (agentOSPolicy === "whitelist") {
+      return "Server policy: whitelist — auto-runs " + (agentOSAllowed.length ? agentOSAllowed.join(", ") : "nothing yet configured") + "; anything else needs your approval.";
+    }
+    if (agentOSPolicy === "allow") return "Server policy: allow — commands run automatically through a shell. Only use this on a machine where that is acceptable.";
+    return "";
+  }
+
+  function resetAgentOSPanels() {
+    agentosProposalSectionEl.hidden = true;
+    agentosResultSectionEl.hidden = true;
+    agentosApprovalEl.hidden = true;
+    agentosProposalEl.replaceChildren();
+    agentosResultEl.replaceChildren();
+    agentOSProposal = null;
+  }
+
+  function openAgentOS(prefill) {
+    agentosEl.hidden = false;
+    resetAgentOSPanels();
+    agentosPolicyNoteEl.textContent = agentOSPolicyNote();
+    if (prefill) agentosInstructionEl.value = prefill;
+    agentosInstructionEl.focus();
+  }
+
+  function closeAgentOS() {
+    if (agentOSBusy) return;
+    agentosEl.hidden = true;
+    promptEl.focus();
+  }
+
+  function agentOSField(label, value) {
+    const row = document.createElement("div");
+    row.className = "agentos-field";
+    const dt = document.createElement("span");
+    dt.className = "agentos-field-label";
+    dt.textContent = label;
+    const dd = document.createElement("span");
+    dd.className = "agentos-field-value";
+    dd.textContent = value;
+    row.append(dt, dd);
+    return row;
+  }
+
+  const SAFE_LABELS = { 0: "0 — destructive, networked, or privileged (model's own claim)", 1: "1 — writes or installs something (model's own claim)", 2: "2 — read-only and reversible (model's own claim)" };
+
+  function renderAgentOSProposal(proposal, decision) {
+    agentosProposalEl.replaceChildren();
+    const cmd = document.createElement("pre");
+    cmd.className = "agentos-cmd";
+    const code = document.createElement("code");
+    code.textContent = proposal.cmd || "";
+    cmd.appendChild(code);
+    agentosProposalEl.appendChild(cmd);
+    agentosProposalEl.appendChild(agentOSField("What it does", proposal.dsc || "(no description)"));
+    agentosProposalEl.appendChild(agentOSField("Model's self-rating", SAFE_LABELS[proposal.safe] || String(proposal.safe)));
+    if (decision) {
+      agentosProposalEl.appendChild(agentOSField(decision.blocked ? "Blocked" : decision.auto_run ? "Auto-approved" : "Needs your approval", decision.reason || ""));
+    }
+    agentosProposalSectionEl.hidden = false;
+  }
+
+  function renderAgentOSResult(result, errorText) {
+    agentosResultEl.replaceChildren();
+    if (errorText) {
+      agentosResultEl.appendChild(agentOSField("Error", errorText));
+      agentosResultSectionEl.hidden = false;
+      return;
+    }
+    if (!result) return;
+    const pre = document.createElement("pre");
+    pre.className = "agentos-output";
+    pre.textContent = (result.output || "").trim() || "(no output)";
+    agentosResultEl.appendChild(pre);
+    const bits = ["exit code " + result.exit_code, result.duration].filter(Boolean);
+    if (result.truncated) bits.push("output truncated");
+    if (result.timed_out) bits.push("timed out");
+    agentosResultEl.appendChild(agentOSField("Details", bits.join(" · ")));
+    agentosResultSectionEl.hidden = false;
+  }
+
+  async function proposeAgentOSCommand() {
+    const instruction = agentosInstructionEl.value.trim();
+    if (!instruction) {
+      showToast("Describe what you want to run first.", "error");
+      return;
+    }
+    agentOSBusy = true;
+    agentosProposeEl.disabled = true;
+    resetAgentOSPanels();
+    try {
+      const response = await fetch("/agentos/propose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instruction })
+      });
+      const body = await response.text();
+      if (!response.ok) {
+        showToast(body.trim() || "HTTP " + response.status, "error");
+        return;
+      }
+      const data = JSON.parse(body);
+      agentOSProposal = data.proposal;
+      renderAgentOSProposal(data.proposal, data.decision);
+      if (data.result || data.error) {
+        renderAgentOSResult(data.result, data.error);
+      } else if (data.decision && !data.decision.blocked && !data.decision.auto_run) {
+        agentosApprovalEl.hidden = false;
+      }
+    } catch (error) {
+      showToast("Propose failed: " + (error && error.message ? error.message : "request failed"), "error");
+    } finally {
+      agentOSBusy = false;
+      agentosProposeEl.disabled = false;
+    }
+  }
+
+  async function executeAgentOSProposal(approved) {
+    if (!agentOSProposal) return;
+    agentOSBusy = true;
+    agentosApproveEl.disabled = true;
+    agentosDenyEl.disabled = true;
+    try {
+      if (!approved) {
+        agentosApprovalEl.hidden = true;
+        renderAgentOSResult(null, "Denied — not run.");
+        return;
+      }
+      const response = await fetch("/agentos/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proposal: agentOSProposal, approved: true })
+      });
+      const body = await response.text();
+      agentosApprovalEl.hidden = true;
+      if (!response.ok) {
+        renderAgentOSResult(null, body.trim() || "Execution failed.");
+        return;
+      }
+      const data = JSON.parse(body);
+      renderAgentOSResult(data.result, data.error);
+    } catch (error) {
+      renderAgentOSResult(null, error && error.message ? error.message : "request failed");
+    } finally {
+      agentOSBusy = false;
+      agentosApproveEl.disabled = false;
+      agentosDenyEl.disabled = false;
+    }
+  }
+
+  agentosCloseEl.addEventListener("click", closeAgentOS);
+  agentosEl.addEventListener("click", (event) => {
+    if (event.target === agentosEl) closeAgentOS();
+  });
+  agentosProposeEl.addEventListener("click", proposeAgentOSCommand);
+  agentosApproveEl.addEventListener("click", () => executeAgentOSProposal(true));
+  agentosDenyEl.addEventListener("click", () => executeAgentOSProposal(false));
+
   modelSelectEl.addEventListener("change", async () => {
     const model = modelSelectEl.value;
     if (!model || busy || tuning || loadingModel) return;
@@ -2729,7 +3124,7 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
-  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, skillsToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });
@@ -2848,10 +3243,47 @@ function toMarkdown(chat) {
     applyPowerPreference(powerCommandsEl.checked);
     save();
   });
+  if (showAgentActivityEl) {
+    showAgentActivityEl.addEventListener("change", () => {
+      preferences.showAgentActivity = showAgentActivityEl.checked;
+      // Re-render so turning it off clears existing timelines immediately.
+      renderConversation(false);
+      save();
+    });
+  }
   goalRoundsEl.addEventListener("change", () => {
     preferences.goalRounds = boundedNumber(goalRoundsEl.value, 3, 2, 8, true);
     goalRoundsEl.value = preferences.goalRounds;
     save();
+  });
+
+  /* The CDN choice lives in the browser, but the CSP that permits it is a
+     response header — so applying it means reloading /chat with the choice as
+     a query parameter, which the server validates against its own list. */
+  function applyMermaidChoice(cdn, reload) {
+    const value = ["jsdelivr", "unpkg", "cdnjs"].includes(cdn) ? cdn : "";
+    preferences.mermaidCDN = value;
+    if (mermaidCDNEl) mermaidCDNEl.value = value;
+    if (!reload || value === ((document.body.dataset.mermaidCdn || ""))) return;
+    const url = new URL(window.location.href);
+    if (value) url.searchParams.set("mermaid", value);
+    else url.searchParams.delete("mermaid");
+    save().then(() => { window.location.replace(url.toString()); });
+  }
+  if (mermaidCDNEl) {
+    mermaidCDNEl.addEventListener("change", () => applyMermaidChoice(mermaidCDNEl.value, true));
+  }
+  // The hint under an unrendered diagram is the discovery path: it appears the
+  // first time a model emits Mermaid and leads straight to the control.
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest && event.target.closest(".mermaid-enable");
+    if (!button) return;
+    openSettings();
+    if (mermaidCDNEl) {
+      const section = mermaidCDNEl.closest("details");
+      if (section) section.open = true;
+      mermaidCDNEl.focus();
+    }
   });
 
   batchCloseEl.addEventListener("click", closeBatch);
@@ -2912,6 +3344,7 @@ function toMarkdown(chat) {
     if (event.key === "Escape" && sidebarEl.classList.contains("is-open")) setSidebar(false);
     if (event.key === "Escape" && !settingsEl.hidden) closeSettings();
     if (event.key === "Escape" && !batchEl.hidden) closeBatch();
+    if (event.key === "Escape" && !agentosEl.hidden) closeAgentOS();
   });
   window.addEventListener("beforeunload", save);
 
@@ -2929,7 +3362,9 @@ function toMarkdown(chat) {
         power: stored.preferences.power === true,
         composerPro: stored.preferences.composerPro === true,
         goalRounds: boundedNumber(stored.preferences.goalRounds, 3, 2, 8, true),
-        embeddingModel: typeof stored.preferences.embeddingModel === "string" ? stored.preferences.embeddingModel : ""
+        embeddingModel: typeof stored.preferences.embeddingModel === "string" ? stored.preferences.embeddingModel : "",
+        mermaidCDN: typeof stored.preferences.mermaidCDN === "string" ? stored.preferences.mermaidCDN : "",
+        showAgentActivity: stored.preferences.showAgentActivity !== false
       };
     }
     if (typeof stored.activeID === "string" && chats.some((chat) => chat.id === stored.activeID)) activeID = stored.activeID;
@@ -2942,10 +3377,13 @@ function toMarkdown(chat) {
   if (!activeID) activeID = chats.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0].id;
   applyTheme(preferences.theme);
   applyPowerPreference(preferences.power);
+  applyMermaidChoice(preferences.mermaidCDN, true);
+  if (showAgentActivityEl) showAgentActivityEl.checked = preferences.showAgentActivity !== false;
   setComposerProOpen(preferences.composerPro);
   goalRoundsEl.value = preferences.goalRounds;
   renderWorkspace(true);
   loadModels();
   loadSkills();
   loadAutoTuneStatus();
+  loadAgentOSStatus();
 }());

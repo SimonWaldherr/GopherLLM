@@ -474,6 +474,25 @@ kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; b
 .reasoning.reasoning-live { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
 .reasoning.reasoning-live summary::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 7px; border-radius: 50%; background: var(--accent); vertical-align: middle; animation: pulse 1.1s ease-in-out infinite; }
 .reasoning-body { max-height: 320px; padding: 2px 12px 10px; overflow-y: auto; color: var(--muted); white-space: pre-wrap; }
+/* ── Agent activity timeline ── */
+.agent-timeline { margin: 0 0 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); overflow: hidden; }
+.agent-head { padding: 6px 10px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; font-weight: 700; }
+.agent-head.agent-running { color: var(--accent); }
+.agent-head.agent-running::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 7px; border-radius: 50%; background: var(--accent); vertical-align: middle; animation: pulse 1.1s ease-in-out infinite; }
+.agent-step { padding: 7px 10px; border-bottom: 1px solid var(--line); }
+.agent-step:last-child { border-bottom: 0; }
+.agent-step-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.agent-tool { font: 600 12px/1.5 var(--mono); color: var(--ink); overflow-wrap: anywhere; }
+.agent-step.failed .agent-tool { color: var(--stop); }
+.agent-timing { flex: none; color: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.agent-step.running .agent-timing { color: var(--accent); }
+.agent-args { margin-top: 3px; color: var(--muted); font: 10.5px/1.5 var(--mono); overflow-wrap: anywhere; }
+.agent-detail { margin-top: 4px; }
+.agent-detail summary { color: var(--muted); font-size: 10.5px; cursor: pointer; user-select: none; }
+.agent-detail summary:hover { color: var(--ink); }
+.agent-detail-body { max-height: 180px; margin-top: 4px; padding: 6px 8px; overflow-y: auto; border-radius: 6px; background: var(--bg); color: var(--muted); font: 10.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-step.failed .agent-detail-body { color: var(--stop); }
+
 .tool-calls { display: grid; gap: 8px; margin-top: 10px; }
 .tool-call { overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
 .tool-head { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--line); }
@@ -633,6 +652,18 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .autotune-run:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 .autotune-status { margin: 7px 0 0; color: var(--muted); font-size: 10.5px; line-height: 1.5; }
 .skills-note { margin: 10px 0 0; padding: 7px 10px; border: 1px dashed color-mix(in srgb, var(--accent) 30%, var(--line)); border-radius: 8px; background: color-mix(in srgb, var(--accent) 6%, var(--panel)); color: var(--muted); font-size: 10.5px; }
+
+/* ── /os: agentic OS commands ── */
+.agentos-panel { width: min(560px, 100%); }
+#agentosInstruction { width: 100%; padding: 8px 9px; resize: vertical; line-height: 1.45; font: 12px/1.5 var(--mono); }
+.agentos-proposal { margin-top: 10px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+.agentos-cmd { margin: 0 0 8px; padding: 8px 9px; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font: 11.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.agentos-field { display: flex; gap: 8px; margin-top: 6px; font-size: 11px; line-height: 1.5; }
+.agentos-field:first-of-type { margin-top: 0; }
+.agentos-field-label { flex: none; min-width: 112px; color: var(--muted); font-weight: 700; }
+.agentos-field-value { color: var(--ink); overflow-wrap: anywhere; }
+.agentos-result { margin-top: 10px; }
+.agentos-output { margin: 0 0 8px; padding: 8px 9px; max-height: 220px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); font: 11.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .settings-note { margin: 10px 0 0; color: var(--muted); font-size: 10.5px; }
 .toast { position: fixed; z-index: 40; bottom: 20px; left: 50%; max-width: min(420px, calc(100vw - 32px)); padding: 8px 12px 8px 14px; transform: translateX(-50%); border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 9px; background: var(--ink); color: var(--panel); box-shadow: 0 8px 28px rgba(0, 0, 0, .22); font-size: 12px; }
 .toast-success { border-left-color: var(--ok); }

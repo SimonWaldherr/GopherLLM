@@ -280,6 +280,13 @@ func TestSparseMoELoaderRejectsMismatchedExpertGeometry(t *testing.T) {
 	}
 }
 
+func TestQwen2MoELoaderRejectsMissingSharedExpert(t *testing.T) {
+	_, err := RunnerFromGGUFBytes(buildTinySparseMoEGGUF("qwen2moe", false, 0))
+	if err == nil || !strings.Contains(err.Error(), "qwen2moe requires") {
+		t.Fatalf("error = %v, want missing shared-expert diagnostic", err)
+	}
+}
+
 func TestAttentionSinkChangesSoftmaxDenominator(t *testing.T) {
 	values := []float32{2}
 	without := []float32{0}
@@ -288,6 +295,9 @@ func TestAttentionSinkChangesSoftmaxDenominator(t *testing.T) {
 	weightedVSumWithSink([]float32{0}, values, 1, 1, 0, 0, 0, true, with)
 	closeMoEFloat(t, "no sink", without[0], 2)
 	closeMoEFloat(t, "zero-logit sink", with[0], 1)
+	f16With := []float32{0}
+	onlineAttentionF16WithSink([]float32{0}, []uint16{F32ToF16(0)}, []uint16{F32ToF16(2)}, 1, 1, 1, 1, 0, 0, 1, 0, 0, true, f16With)
+	closeMoEFloat(t, "f16 zero-logit sink", f16With[0], 1)
 
 	pattern := swaPattern(&GGUFFile{}, "gpt-oss", 4)
 	want := []bool{true, false, true, false}

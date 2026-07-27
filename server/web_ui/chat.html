@@ -9,7 +9,7 @@
   <meta name="color-scheme" content="light dark">
   <link rel="stylesheet" href="/style.css">
 </head>
-<body class="chat">
+<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}">
 
 <div class="app">
   <aside id="sidebar" class="sidebar" aria-label="Saved conversations">
@@ -226,6 +226,14 @@
           <input id="wikimediaTools" type="checkbox">
           <span>Wikipedia &amp; Wikidata research <span class="field-note">sends only model-requested search queries to Wikimedia</span></span>
         </label>
+        <label class="toggle-row" id="skillsToolsRow" hidden>
+          <input id="skillsTools" type="checkbox" checked>
+          <span>Skills <span class="field-note">let the model load SKILL.md files from this server</span></span>
+        </label>
+        <label class="toggle-row">
+          <input id="showAgentActivity" type="checkbox" checked>
+          <span>Show tool activity <span class="field-note">what ran, with which arguments, and how long it took</span></span>
+        </label>
         <details class="settings-disclosure">
           <summary><span>Memory &amp; retrieval</span><small>Search relevant messages from saved chats</small></summary>
           <div class="settings-disclosure-body">
@@ -309,6 +317,20 @@
               <option value="classic">Classic desktop</option>
             </select>
           </label>
+          <label class="goal-rounds">Render Mermaid diagrams via
+            <select id="mermaidCDN">
+              <option value="">Off — show the source</option>
+              <option value="jsdelivr">jsDelivr</option>
+              <option value="unpkg">unpkg</option>
+              <option value="cdnjs">cdnjs</option>
+            </select>
+          </label>
+          <p class="settings-note">
+            Mermaid is ~2.8 MB, so it is not bundled. Choosing a CDN reloads this
+            page and permits scripts from that one origin — the only case where
+            the chat page fetches anything off this machine. Pick whichever you
+            trust; "Off" keeps the strict same-origin policy.
+          </p>
           <div class="settings-actions">
             <button id="exportMarkdown" class="text-button" type="button">Export this chat</button>
             <button id="exportChats" class="text-button" type="button">Export all chats (JSON)</button>
@@ -393,12 +415,45 @@
   </div>
 </div>
 
+<div id="agentos" class="settings" hidden>
+  <div class="settings-panel agentos-panel" role="dialog" aria-modal="true" aria-labelledby="agentosTitle">
+    <div class="settings-panel-head">
+      <h2 id="agentosTitle">Run a local command</h2>
+      <button id="agentosClose" class="icon-button" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="settings-panel-body">
+      <section class="settings-section">
+        <h3>1 · What do you want to do?</h3>
+        <textarea id="agentosInstruction" rows="3" placeholder="e.g. list the files in the current directory"></textarea>
+        <div class="batch-run">
+          <button id="agentosPropose" class="autotune-run" type="button">Propose command</button>
+        </div>
+        <p id="agentosPolicyNote" class="settings-note"></p>
+      </section>
+      <section id="agentosProposalSection" class="settings-section" hidden>
+        <h3>2 · Proposal</h3>
+        <div id="agentosProposal" class="agentos-proposal"></div>
+        <div id="agentosApproval" class="batch-run" hidden>
+          <button id="agentosApprove" class="autotune-run" type="button">Approve &amp; run</button>
+          <button id="agentosDeny" class="text-button" type="button">Deny</button>
+        </div>
+      </section>
+      <section id="agentosResultSection" class="settings-section" hidden>
+        <h3>3 · Result</h3>
+        <div id="agentosResult" class="agentos-result"></div>
+      </section>
+      <p class="settings-note">The model proposes a command; its own claim of being "safe" never decides whether it runs. That is always the server's configured policy, plus your approval when the policy asks for it.</p>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
 <noscript>
   <p style="padding:2rem;text-align:center;">GopherLLM Chat requires JavaScript to be enabled.</p>
 </noscript>
 
+{{if .MermaidScript}}<script src="{{.MermaidScript}}"></script>{{end}}
 <script src="/script.js"></script>
 </body>
 </html>

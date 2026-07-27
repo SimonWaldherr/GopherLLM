@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -12,6 +13,11 @@ import (
 var prefaultSink atomic.Uint64
 
 const prefaultPageSize = 4096
+
+type mmapByteRange struct {
+	start int
+	end   int
+}
 
 // prefaultPages forces every page of an mmap'd region into the process's
 // working set before the model is reported ready, by reading one byte per
@@ -36,33 +42,74 @@ const prefaultPageSize = 4096
 // first. Risk: none beyond the already-necessary page-in cost happening
 // eagerly instead of lazily. Rollback: set GOPHERLLM_NO_PREFAULT=1.
 func prefaultPages(data []byte) {
-	if len(data) == 0 || os.Getenv("GOPHERLLM_NO_PREFAULT") != "" {
+	prefaultRanges(data, []mmapByteRange{{start: 0, end: len(data)}})
+}
+
+// prefaultRanges touches just the given mmap ranges. Ranges are normalized and
+// split into moderately sized jobs so one large tensor cannot leave most worker
+// threads idle. This is deliberately a best-effort warm-up: mmap remains the
+// owner of residency and the operating system may evict any page later.
+func prefaultRanges(data []byte, ranges []mmapByteRange) {
+	if len(data) == 0 || len(ranges) == 0 || os.Getenv("GOPHERLLM_NO_PREFAULT") != "" {
 		return
 	}
-	threads := numThreads()
-	if threads < 1 {
-		threads = 1
+	ranges = normalizeMmapRanges(len(data), ranges)
+	if len(ranges) == 0 {
+		return
 	}
-	if threads > len(data) {
-		threads = 1
+
+	// 16 MiB keeps the job list compact even for large GGUFs, yet gives the
+	// worker pool enough pieces to balance differently sized tensors.
+	const chunkBytes = 16 << 20
+	jobs := make([]mmapByteRange, 0, len(ranges))
+	for _, r := range ranges {
+		for start := r.start; start < r.end; start += chunkBytes {
+			jobs = append(jobs, mmapByteRange{start: start, end: min(start+chunkBytes, r.end)})
+		}
 	}
-	chunk := (len(data) + threads - 1) / threads
+	threads := min(max(1, numThreads()), len(jobs))
+	work := make(chan mmapByteRange)
 	var wg sync.WaitGroup
 	for t := 0; t < threads; t++ {
-		start := t * chunk
-		end := min(start+chunk, len(data))
-		if start >= end {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := range work {
+				var sink byte
+				for i := r.start; i < r.end; i += prefaultPageSize {
+					sink += data[i]
+				}
+				prefaultSink.Add(uint64(sink))
+			}
+		}()
+	}
+	for _, job := range jobs {
+		work <- job
+	}
+	close(work)
+	wg.Wait()
+}
+
+func normalizeMmapRanges(dataLen int, ranges []mmapByteRange) []mmapByteRange {
+	if dataLen <= 0 || len(ranges) == 0 {
+		return nil
+	}
+	// Tensor descriptors are in file order for normal GGUFs, but sorting keeps
+	// this safe for producers that do not preserve that convention.
+	ranges = append([]mmapByteRange(nil), ranges...)
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+	out := make([]mmapByteRange, 0, len(ranges))
+	for _, r := range ranges {
+		r.start = max(0, r.start)
+		r.end = min(dataLen, r.end)
+		if r.start >= r.end {
 			continue
 		}
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			var sink byte
-			for i := lo; i < hi; i += prefaultPageSize {
-				sink += data[i]
-			}
-			prefaultSink.Add(uint64(sink))
-		}(start, end)
+		if n := len(out); n > 0 && r.start <= out[n-1].end {
+			out[n-1].end = max(out[n-1].end, r.end)
+			continue
+		}
+		out = append(out, r)
 	}
-	wg.Wait()
+	return out
 }

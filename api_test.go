@@ -85,6 +85,20 @@ func TestLoadOptionsAndModelAccessors(t *testing.T) {
 	}
 }
 
+func TestOutOfCoreOptionsPropagate(t *testing.T) {
+	settings := applyLoadOptions([]Option{
+		WithOutOfCore(true),
+		WithMmapPrefault(MmapPrefaultNone),
+	})
+	if !settings.outOfCore || settings.prefault != MmapPrefaultNone {
+		t.Fatalf("settings = %+v", settings)
+	}
+	load := settings.loadOptions()
+	if !load.OutOfCore || load.Prefault != MmapPrefaultNone {
+		t.Fatalf("load options = %+v", load)
+	}
+}
+
 func TestOpenRejectsCanceledContextBeforeReadingFile(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

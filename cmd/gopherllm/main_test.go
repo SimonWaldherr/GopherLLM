@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/SimonWaldherr/GopherLLM/agentos"
+)
 
 func TestParseCLISamplerFlags(t *testing.T) {
 	cfg, err := parseCLI([]string{
@@ -43,6 +47,16 @@ func TestParseCLIServeAndStops(t *testing.T) {
 	}
 	if cfg.skillsDir != "/tmp/skills" {
 		t.Fatalf("skillsDir = %q", cfg.skillsDir)
+	}
+}
+
+func TestParseCLIOutOfCore(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--out-of-core"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.outOfCore {
+		t.Fatal("--out-of-core was not recorded")
 	}
 }
 
@@ -104,6 +118,75 @@ func TestParseCLIErrors(t *testing.T) {
 	for _, args := range cases {
 		if _, err := parseCLI(args); err == nil {
 			t.Fatalf("parseCLI(%v) expected error", args)
+		}
+	}
+}
+
+func TestParseCLIOSCommandsFlags(t *testing.T) {
+	cfg, err := parseCLI([]string{"m", "--os-commands", "whitelist", "--os-commands-allow", "ls, git ,cat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.osCommandsPolicy != "whitelist" || cfg.osCommandsAllow != "ls, git ,cat" {
+		t.Fatalf("policy=%q allow=%q", cfg.osCommandsPolicy, cfg.osCommandsAllow)
+	}
+}
+
+// Absent --os-commands must leave the feature entirely unconfigured: no flag,
+// no Runner, no endpoints — this is the "well-hidden by default" behavior the
+// feature was built around, not merely an unset field.
+func TestBuildAgentOSRunnerDisabledByDefault(t *testing.T) {
+	runner, err := buildAgentOSRunner(cliConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner != nil {
+		t.Fatalf("expected a nil Runner with no --os-commands flag, got %+v", runner)
+	}
+}
+
+func TestBuildAgentOSRunnerRejectsAnUnknownPolicy(t *testing.T) {
+	if _, err := buildAgentOSRunner(cliConfig{osCommandsPolicy: "yolo"}); err == nil {
+		t.Fatal("expected an error for an invalid policy name")
+	}
+}
+
+// Whitelist with no allow-list at all would auto-approve nothing yet still
+// silently enable the feature; that is more likely an operator mistake than
+// an intentional deny-everything whitelist, so it is rejected up front.
+func TestBuildAgentOSRunnerRequiresAnAllowListForWhitelist(t *testing.T) {
+	if _, err := buildAgentOSRunner(cliConfig{osCommandsPolicy: "whitelist"}); err == nil {
+		t.Fatal("expected an error for whitelist with an empty allow-list")
+	}
+}
+
+func TestBuildAgentOSRunnerParsesTheAllowList(t *testing.T) {
+	runner, err := buildAgentOSRunner(cliConfig{osCommandsPolicy: "whitelist", osCommandsAllow: "ls, git ,, cat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner == nil || runner.Policy != agentos.PolicyWhitelist {
+		t.Fatalf("runner = %+v", runner)
+	}
+	want := []string{"ls", "git", "cat"}
+	if len(runner.Allowed) != len(want) {
+		t.Fatalf("allowed = %v, want %v", runner.Allowed, want)
+	}
+	for i, name := range want {
+		if runner.Allowed[i] != name {
+			t.Fatalf("allowed[%d] = %q, want %q", i, runner.Allowed[i], name)
+		}
+	}
+}
+
+func TestBuildAgentOSRunnerAllowAndDenyNeedNoAllowList(t *testing.T) {
+	for _, policy := range []string{"deny", "allow"} {
+		runner, err := buildAgentOSRunner(cliConfig{osCommandsPolicy: policy})
+		if err != nil {
+			t.Fatalf("policy %q: %v", policy, err)
+		}
+		if runner == nil || string(runner.Policy) != policy {
+			t.Fatalf("policy %q: runner = %+v", policy, runner)
 		}
 	}
 }

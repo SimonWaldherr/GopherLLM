@@ -154,3 +154,19 @@ func TestLoadSplitGGUFRejectsNonConformingFilename(t *testing.T) {
 		t.Fatal("expected an error for a non-conforming split filename")
 	}
 }
+
+func TestOutOfCoreRejectsSplitGGUFWithoutCopyingShards(t *testing.T) {
+	dir := t.TempDir()
+	shard1, shard2 := splitTinyLlamaGGUF()
+	path1 := filepath.Join(dir, "tiny-split-00001-of-00002.gguf")
+	path2 := filepath.Join(dir, "tiny-split-00002-of-00002.gguf")
+	if err := os.WriteFile(path1, shard1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path2, shard2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RunnerFromPathWithOptions(path1, LoadOptions{OutOfCore: true}); err == nil {
+		t.Fatal("expected out-of-core split GGUF load to fail instead of merging shards into memory")
+	}
+}

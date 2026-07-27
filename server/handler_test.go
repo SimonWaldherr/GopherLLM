@@ -200,6 +200,42 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 	}
 }
 
+func TestHandlerHotSwapPropagatesOutOfCoreLoadOptions(t *testing.T) {
+	modelDir := t.TempDir()
+	path := filepath.Join(modelDir, "tiny.gguf")
+	if err := os.WriteFile(path, buildTinyLlamaGGUF(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial, _, err := gopherllm.RunnerFromPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer initial.Close()
+	srv := httptest.NewServer(NewHandler(initial, HandlerOptions{
+		ModelDir:         modelDir,
+		ModelPath:        path,
+		ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: true},
+	}))
+	defer srv.Close()
+	resp, err := http.Post(srv.URL+"/models/load", "application/json", strings.NewReader(`{"model":"tiny"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("out-of-core model load status = %d body=%s", resp.StatusCode, readAll(t, resp))
+	}
+	var got struct {
+		OutOfCore bool `json:"out_of_core"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OutOfCore {
+		t.Fatal("hot-swapped model did not retain out-of-core mode")
+	}
+}
+
 func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {
 	modelDir := t.TempDir()
 	chatPath := filepath.Join(modelDir, "catalog", "chat.gguf")

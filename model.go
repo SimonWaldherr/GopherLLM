@@ -86,6 +86,22 @@ type Config struct {
 	ExpertWeightsNorm     bool
 	ExpertWeightsScale    float32
 	ExpertWeightsNormClip float32
+	// DeepSeek-V2/V3/Kimi-K2 Multi-head Latent Attention (MLA).  HeadDim and
+	// ValueDim retain the compact cache widths from the GGUF header; the
+	// decompressed per-head Q/K and V widths live in MLAKeyDim/MLAValueDim.
+	// Keeping both representations explicit prevents an MLA model from being
+	// accidentally interpreted as ordinary GQA.
+	UsesMLA                bool
+	MLAQueryLoRARank       int
+	MLAKVLoRARank          int
+	MLAKeyDim              int
+	MLAValueDim            int
+	LeadingDenseBlockCount int
+	ExpertFeedForwardDim   int
+	ExpertSharedCount      int
+	ExpertGroupCount       int
+	ExpertGroupUsedCount   int
+	ExpertGatingFunc       int
 }
 
 // gemmaFamily reports whether arch is a Gemma generation, all of which share
@@ -113,6 +129,13 @@ func defaultExpertWeightsNorm(arch string) bool {
 	}
 }
 
+// deepSeek2Family covers the GGUF architecture emitted for DeepSeek-V2/V3
+// and Kimi K2.  Official Kimi GGUF conversions declare `deepseek2`; the
+// kimi_k2 alias is accepted for converters which retain the HF model type.
+func deepSeek2Family(arch string) bool {
+	return arch == "deepseek2" || arch == "kimi_k2"
+}
+
 // layerUsesSWA reports whether layer il attends with the sliding window (true)
 // or over the full context (false, or when no window is configured).
 func (c Config) layerUsesSWA(il int) bool {
@@ -133,7 +156,18 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	if !ok || arch == "" {
 		arch = "llama"
 	}
+	// A few Kimi converters preserve Hugging Face's `kimi_k2` architecture
+	// label but retain llama.cpp's `deepseek2.*` hparam namespace. Keep the
+	// public architecture label (it drives loader/template selection) while
+	// reading the namespace that is actually present in the GGUF.
 	p := arch
+	if arch == "kimi_k2" {
+		if _, hasKimiPrefix := gguf.Metadata[p+".embedding_length"]; !hasKimiPrefix {
+			if _, hasDeepSeekPrefix := gguf.Metadata["deepseek2.embedding_length"]; hasDeepSeekPrefix {
+				p = "deepseek2"
+			}
+		}
+	}
 	dim := int(gguf.GetU32(p+".embedding_length", 0))
 	nHeads := int(gguf.GetU32(p+".attention.head_count", 0))
 	nKVHeads := int(gguf.GetU32(p+".attention.head_count_kv", uint32(max(1, nHeads))))
@@ -183,7 +217,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
 	}
 	cfg := Config{
-		Arch:                      p,
+		Arch:                      arch,
 		Dim:                       dim,
 		HiddenDim:                 int(gguf.GetU32(p+".feed_forward_length", 0)),
 		NLayers:                   int(gguf.GetU32(p+".block_count", 0)),
@@ -204,9 +238,19 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		SlidingWindow:             int(gguf.GetU32(p+".attention.sliding_window", 0)),
 		ExpertCount:               int(gguf.GetU32(p+".expert_count", 0)),
 		ExpertUsedCount:           int(gguf.GetU32(p+".expert_used_count", 0)),
-		ExpertWeightsNorm:         defaultExpertWeightsNorm(p),
+		ExpertWeightsNorm:         defaultExpertWeightsNorm(arch),
 		ExpertWeightsScale:        gguf.GetF32(p+".expert_weights_scale", 1),
 		ExpertWeightsNormClip:     gguf.GetF32(p+".expert_weights_norm_clip", 0),
+		MLAQueryLoRARank:          int(gguf.GetU32(p+".attention.q_lora_rank", 0)),
+		MLAKVLoRARank:             int(gguf.GetU32(p+".attention.kv_lora_rank", 0)),
+		MLAKeyDim:                 int(gguf.GetU32(p+".attention.key_length_mla", 0)),
+		MLAValueDim:               int(gguf.GetU32(p+".attention.value_length_mla", 0)),
+		LeadingDenseBlockCount:    int(gguf.GetU32(p+".leading_dense_block_count", 0)),
+		ExpertFeedForwardDim:      int(gguf.GetU32(p+".expert_feed_forward_length", 0)),
+		ExpertSharedCount:         int(gguf.GetU32(p+".expert_shared_count", 0)),
+		ExpertGroupCount:          int(gguf.GetU32(p+".expert_group_count", 0)),
+		ExpertGroupUsedCount:      int(gguf.GetU32(p+".expert_group_used_count", 0)),
+		ExpertGatingFunc:          int(gguf.GetU32(p+".expert_gating_func", 0)),
 		RopeDimensionCount:        int(gguf.GetU32(p+".rope.dimension_count", uint32(max(1, headDim)))),
 		RopeScalingFactor:         gguf.GetF32(p+".rope.scaling.factor", 1),
 		RopeAttentionFactor:       gguf.GetF32(p+".rope.scaling.attn_factor", 1),
@@ -215,12 +259,18 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
 		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
 		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
-		UseLayerNorm:              p == "stablelm",
+		UseLayerNorm:              arch == "stablelm",
 		ParallelResidual:          parallelResidual,
-		UseGELU:                   gemmaFamily(p),
+		UseGELU:                   gemmaFamily(arch),
 		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
+	}
+	if deepSeek2Family(arch) {
+		// The compact K/V cache is only valid when all MLA dimensions are
+		// present.  The tensor loader performs the stricter per-layer shape
+		// validation and returns a useful diagnostic for malformed GGUFs.
+		cfg.UsesMLA = cfg.MLAKVLoRARank > 0 && cfg.MLAKeyDim > 0 && cfg.MLAValueDim > 0
 	}
 	if p == "nemotron_h" || p == "nemotron_h_moe" || p == "mamba2" {
 		cfg.LayerHeads = u32ArrayAsInts(gguf, p+".attention.head_count")
@@ -286,12 +336,12 @@ func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
 	return pattern
 }
 
-// Weight is one loaded tensor in exactly one of two states: F32 non-nil
-// (plain floats, converted at load time from F32/F16 storage) or Raw non-nil
-// (still-quantized bytes, usually borrowed zero-copy from the mmap'd file,
-// dequantized on the fly inside the matvec kernels). Rows/Cols only apply to
-// the quantized form; the F32 form infers rows from len(F32)/cols at the
-// call site.
+// Weight is one loaded tensor in one of three states: F32 non-nil (owned
+// float32 values), Raw quantized bytes, or Raw scalar F32/F16/BF16/F64 bytes.
+// The last state is used by out-of-core loads: it keeps a mmap-backed matrix
+// in its on-disk representation and converts only values used by a row dot.
+// Rows/Cols describe every Raw form; the owned F32 form infers rows from
+// len(F32)/cols at the call site for compatibility with existing callers.
 type Weight struct {
 	F32      []float32
 	Raw      []byte
@@ -319,6 +369,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 			rows = len(w.F32) / cols
 		}
 		MatvecF32Into(w.F32, x, rows, cols, out)
+		return
+	}
+	if w.rawScalarMatvecInto(x, out) {
 		return
 	}
 	switch w.Type {
@@ -388,6 +441,9 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 			off := row * len(x)
 			return DotF32(w.F32[off:off+len(x)], x)
 		}), true
+	}
+	if token, ok := w.rawScalarArgmaxMatvec(x); ok {
+		return token, true
 	}
 	if w.Rows <= 0 || w.Cols != len(x) {
 		return 0, false
@@ -510,6 +566,9 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 		copy(*out, w.F32[start:min(start+cols, len(w.F32))])
 		return
 	}
+	if w.rawScalarRowInto(row, cols, out) {
+		return
+	}
 	switch w.Type {
 	case GGMLTypeQ8_0:
 		rowBytes := (cols / 32) * 34
@@ -589,6 +648,14 @@ func releaseModelMetalWeights(weights *ModelWeights) {
 		release(&layer.W2)
 		release(&layer.W3)
 		release(&layer.WGateUp)
+		if layer.MLA != nil {
+			release(&layer.MLA.Q)
+			release(&layer.MLA.QA)
+			release(&layer.MLA.QB)
+			release(&layer.MLA.KVA)
+			release(&layer.MLA.KB.Weight)
+			release(&layer.MLA.VB.Weight)
+		}
 		if layer.MoE != nil {
 			moe := layer.MoE
 			release(&moe.Router)
@@ -604,11 +671,16 @@ func releaseModelMetalWeights(weights *ModelWeights) {
 }
 
 func (w Weight) RowF32(row, cols int) []float32 {
-	if w.F32 == nil {
-		panic("expected f32 row storage")
+	if w.F32 != nil {
+		start := row * cols
+		return w.F32[start : start+cols]
 	}
-	start := row * cols
-	return w.F32[start : start+cols]
+	if rawScalarWeight(w) {
+		// A raw scalar mapping has no stable []float32 view. Return a decoded
+		// row instead; RowF32 is a convenience accessor, not a mutation API.
+		return w.Row(row, cols)
+	}
+	panic("expected f32 row storage")
 }
 
 // LayerWeights holds one transformer block. Attention is either split
@@ -635,6 +707,11 @@ type LayerWeights struct {
 	W3           Weight
 	WGateUp      Weight
 	HasGateUp    bool
+	// MLA is set for DeepSeek-V2/V3 and Kimi-K2 attention blocks.  Those
+	// models cache compressed K/V latents and therefore cannot use WQ/WK/WV
+	// ordinary-GQA attention even though their surrounding residual/FFN graph
+	// is llama-like.
+	MLA *MLAAttentionWeights
 	// MoE replaces the dense FFN tensors above for sparse decoder blocks.
 	// It is nil for ordinary SwiGLU layers.
 	MoE *SparseMoEWeights
@@ -811,8 +888,16 @@ type DecodeBuffer struct {
 	MOE      []float32
 	// MoELatent keeps Nemotron-H's optional projected expert input alive
 	// while each selected expert reuses MOE for its output.
-	MoELatent               []float32
+	MoELatent []float32
+	// MLA scratch holds the Q LoRA intermediate, the compact KV projection,
+	// and a temporary RoPE/value expansion plane.  It is reused across all
+	// layers so Kimi/DeepSeek decode remains allocation-free.
+	MLAQ                    []float32
+	MLAKV                   []float32
+	MLATmp                  []float32
+	MLAValues               []float32
 	RouterLogits            []float32
+	RouterSelection         []float32
 	TopExperts              []ExpertScore
 	ExpertProbs             []float32
 	SamplerCandidates       []TokenProb
@@ -862,7 +947,12 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		Hidden:                  make([]float32, config.HiddenDim),
 		MOE:                     make([]float32, config.Dim),
 		MoELatent:               make([]float32, config.Dim),
+		MLAQ:                    make([]float32, max(1, config.MLAQueryLoRARank)),
+		MLAKV:                   make([]float32, max(1, config.MLAKVLoRARank+config.RopeDimensionCount)),
+		MLATmp:                  make([]float32, max(1, max(config.MLAKVLoRARank, config.RopeDimensionCount))),
+		MLAValues:               make([]float32, max(1, config.NHeads*config.MLAValueDim)),
 		RouterLogits:            make([]float32, config.ExpertCount),
+		RouterSelection:         make([]float32, config.ExpertCount),
 		SamplerCandidates:       make([]TokenProb, 0, 64),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
 		RopeInvFreq:             inv,
@@ -995,11 +1085,19 @@ func buildRopeInvFreqGptOss(config Config) ([]float32, float32) {
 // lifetime; without it they are copied into owned memory (the in-memory test
 // path). Models without a separate output.weight tie the output projection to
 // the token embeddings.
-func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, ModelWeights, error) {
+func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, ModelWeights, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
 	config := ConfigFromGGUF(gguf)
+	if deepSeek2Family(config.Arch) {
+		// DeepSeek-V2/V3 and Kimi-K2 use MLA rather than the ordinary
+		// Q/K/V matrices below.  Keep their loader isolated so an incomplete
+		// MLA checkpoint cannot accidentally fall through to a plausible but
+		// mathematically wrong GQA graph.
+		return LoadDeepSeek2Model(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
+	}
+	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
 	fmt.Fprintf(logw, "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
 		config.Dim, config.NLayers, config.NHeads, config.NKVHeads, config.HiddenDim, config.VocabSize, config.MaxSeqLen)
 	tensorIdx := indexTensors(gguf)
@@ -1012,7 +1110,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		config.RopeFactorsShort = loadOptionalF32Vec(data, gguf.DataOffset, "rope_factors_short.weight", tensorIdx, inferred, info.Numel())
 	}
 
-	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal)
+	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
 	if err != nil {
 		return config, ModelWeights{}, err
 	}
@@ -1022,7 +1120,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	}
 	output := tokenEmbd
 	if _, ok := tensorIdx["output.weight"]; ok {
-		output, err = loadWeight(data, gguf.DataOffset, "output.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal)
+		output, err = loadWeight(data, gguf.DataOffset, "output.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
@@ -1035,7 +1133,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	kRows := config.NKVHeads * config.HeadDim
 	vRows := config.NKVHeads * config.ValueDim
 	for l := range config.NLayers {
-		layer, err := loadLayer(data, gguf.DataOffset, l, config, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, qRows, kRows, vRows)
+		layer, err := loadLayer(data, gguf.DataOffset, l, config, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights, qRows, kRows, vRows)
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
@@ -1051,19 +1149,19 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	}, nil
 }
 
-func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, GptOssWeights, error) {
-	config, weights, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw)
+func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, GptOssWeights, error) {
+	config, weights, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
 	return config, GptOssWeights{Standard: weights}, err
 }
 
-func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, Gemma4Weights, error) {
+func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, Gemma4Weights, error) {
 	config := ConfigFromGGUF(gguf)
 	if config.Arch == "gemma4" {
 		if err := validateGemma4DenseLayout(config, indexTensors(gguf)); err != nil {
 			return config, Gemma4Weights{}, err
 		}
 	}
-	config, std, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw)
+	config, std, err := LoadModel(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
 	if err != nil {
 		return config, Gemma4Weights{}, err
 	}
@@ -1116,7 +1214,7 @@ func validateGemma4DenseLayout(config Config, tensors map[string]TensorInfo) err
 	return nil
 }
 
-func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal bool, qRows, kRows, vRows int) (LayerWeights, error) {
+func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal, lazyScalarWeights bool, qRows, kRows, vRows int) (LayerWeights, error) {
 	prefix := fmt.Sprintf("blk.%d.", l)
 	attnNorm, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
 	if err != nil {
@@ -1125,26 +1223,26 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	var wq, wk, wv, wqkv Weight
 	hasQKV := false
 	if _, ok := tensors[prefix+"attn_qkv.weight"]; ok {
-		wqkv, err = loadWeight(data, dataOffset, prefix+"attn_qkv.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		wqkv, err = loadWeight(data, dataOffset, prefix+"attn_qkv.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return LayerWeights{}, err
 		}
 		hasQKV = true
 	} else {
-		wq, err = loadWeight(data, dataOffset, prefix+"attn_q.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		wq, err = loadWeight(data, dataOffset, prefix+"attn_q.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		wk, err = loadWeight(data, dataOffset, prefix+"attn_k.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		wk, err = loadWeight(data, dataOffset, prefix+"attn_k.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		wv, err = loadWeight(data, dataOffset, prefix+"attn_v.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		wv, err = loadWeight(data, dataOffset, prefix+"attn_v.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return LayerWeights{}, err
 		}
 	}
-	wo, err := loadWeight(data, dataOffset, prefix+"attn_output.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+	wo, err := loadWeight(data, dataOffset, prefix+"attn_output.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 	if err != nil {
 		return LayerWeights{}, err
 	}
@@ -1156,26 +1254,26 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	hasGateUp := false
 	var moe *SparseMoEWeights
 	if _, isMoE := tensors[prefix+"ffn_gate_inp.weight"]; isMoE {
-		moe, err = loadSparseMoEWeights(data, dataOffset, prefix, config, tensors, inferred, borrow, prepareQuantized, useMetal)
+		moe, err = loadSparseMoEWeights(data, dataOffset, prefix, config, tensors, inferred, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return LayerWeights{}, fmt.Errorf("layer %d MoE: %w", l, err)
 		}
 	} else {
-		w2, err = loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		w2, err = loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 		if err != nil {
 			return LayerWeights{}, err
 		}
 		if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
-			w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+			w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 			if err != nil {
 				return LayerWeights{}, err
 			}
-			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 			if err != nil {
 				return LayerWeights{}, err
 			}
 		} else {
-			wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal)
+			wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 			if err != nil {
 				return LayerWeights{}, err
 			}
@@ -1185,6 +1283,28 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	attnSinks, err := loadOptionalMoEVec(data, dataOffset, prefix+"attn_sinks.weight", tensors, inferred, config.NHeads)
 	if err != nil {
 		return LayerWeights{}, err
+	}
+	attnQNorm := loadOptionalF32VecNil(data, dataOffset, prefix+"attn_q_norm.weight", tensors, inferred)
+	attnKNorm := loadOptionalF32VecNil(data, dataOffset, prefix+"attn_k_norm.weight", tensors, inferred)
+	postAttnNorm := loadOptionalF32VecNil(data, dataOffset, prefix+"post_attention_norm.weight", tensors, inferred)
+	postFFNNorm := loadOptionalF32VecNil(data, dataOffset, prefix+"post_ffw_norm.weight", tensors, inferred)
+	bo, err := loadOptionalMoEVec(data, dataOffset, prefix+"attn_output.bias", tensors, inferred, config.Dim)
+	if err != nil {
+		return LayerWeights{}, err
+	}
+	if bo == nil {
+		bo = make([]float32, config.Dim)
+	}
+	if (config.Arch == "qwen3" || config.Arch == "qwen3moe") && (len(attnQNorm) != config.HeadDim || len(attnKNorm) != config.HeadDim) {
+		return LayerWeights{}, fmt.Errorf("%s requires %d-element attn_q_norm and attn_k_norm tensors", config.Arch, config.HeadDim)
+	}
+	if config.Arch == "gpt-oss" {
+		if len(attnSinks) != config.NHeads {
+			return LayerWeights{}, fmt.Errorf("gpt-oss requires %d-element attn_sinks.weight", config.NHeads)
+		}
+		if _, ok := tensors[prefix+"attn_output.bias"]; !ok || len(bo) != config.Dim {
+			return LayerWeights{}, fmt.Errorf("gpt-oss requires %d-element attn_output.bias", config.Dim)
+		}
 	}
 	return LayerWeights{
 		AttnNorm:     attnNorm,
@@ -1198,7 +1318,7 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		WQKV:         wqkv,
 		HasQKV:       hasQKV,
 		WO:           wo,
-		BO:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_output.bias", tensors, inferred, config.Dim),
+		BO:           bo,
 		FFNNorm:      ffnNorm,
 		FFNNormBias:  loadOptionalF32Vec(data, dataOffset, prefix+"ffn_norm.bias", tensors, inferred, len(ffnNorm)),
 		W1:           w1,
@@ -1210,10 +1330,10 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		// Unlike the biases above (where a zero-filled default is inert),
 		// these must stay nil when absent: applying an all-zero norm would
 		// zero the activations.
-		AttnQNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_q_norm.weight", tensors, inferred),
-		AttnKNorm:    loadOptionalF32VecNil(data, dataOffset, prefix+"attn_k_norm.weight", tensors, inferred),
-		PostAttnNorm: loadOptionalF32VecNil(data, dataOffset, prefix+"post_attention_norm.weight", tensors, inferred),
-		PostFFNNorm:  loadOptionalF32VecNil(data, dataOffset, prefix+"post_ffw_norm.weight", tensors, inferred),
+		AttnQNorm:    attnQNorm,
+		AttnKNorm:    attnKNorm,
+		PostAttnNorm: postAttnNorm,
+		PostFFNNorm:  postFFNNorm,
 		AttnSinks:    attnSinks,
 	}, nil
 }
@@ -1307,11 +1427,13 @@ func inferAttentionShape(config *Config, tensors map[string]TensorInfo) {
 }
 
 // loadWeight materializes one named tensor as a Weight: F32/F16 storage is
-// converted to owned float32s; supported quantized types stay in their packed
-// byte form, borrowed from data when borrow is set or copied otherwise.
+// normally converted to owned float32s; with lazyScalars enabled for a borrowed
+// mmap it remains in its packed scalar representation. Supported quantized
+// types stay in their packed byte form, borrowed from data when borrow is set
+// or copied otherwise.
 // forceF32 additionally dequantizes Q8_0/Q4_0 at load (used for norm vectors
 // that must be plain floats).
-func loadWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, forceF32, borrow, prepareQuantized, useMetal bool) (Weight, error) {
+func loadWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, forceF32, borrow, prepareQuantized, useMetal bool, lazyScalars ...bool) (Weight, error) {
 	info, ok := tensors[name]
 	if !ok {
 		return Weight{}, fmt.Errorf("missing tensor: %s", name)
@@ -1342,26 +1464,44 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		raw = padded
 		borrow = false
 	}
+	keepRawScalars := len(lazyScalars) > 0 && lazyScalars[0] && borrow && !forceF32
+	rows, cols := 1, numel
+	if len(info.Dims) >= 2 {
+		rows = int(info.Dims[1])
+		cols = int(info.Dims[0])
+	}
 	switch info.DType {
 	case GGMLTypeF32:
+		if keepRawScalars {
+			return Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}, nil
+		}
 		f := make([]float32, numel)
 		for i := range numel {
 			f[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
 		}
 		return Weight{F32: f}, nil
 	case GGMLTypeF16:
+		if keepRawScalars {
+			return Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}, nil
+		}
 		f := make([]float32, numel)
 		for i := range numel {
 			f[i] = F16ToF32(binary.LittleEndian.Uint16(raw[i*2:]))
 		}
 		return Weight{F32: f}, nil
 	case GGMLTypeF64:
+		if keepRawScalars {
+			return Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}, nil
+		}
 		f := make([]float32, numel)
 		for i := range numel {
 			f[i] = float32(math.Float64frombits(binary.LittleEndian.Uint64(raw[i*8:])))
 		}
 		return Weight{F32: f}, nil
 	case GGMLTypeBF16:
+		if keepRawScalars {
+			return Weight{Raw: raw, Type: info.DType, Rows: rows, Cols: cols}, nil
+		}
 		// bfloat16 is the top 16 bits of an IEEE float32 (QAT checkpoints and
 		// many recent full-precision GGUFs use it), so conversion is a shift.
 		f := make([]float32, numel)
@@ -1377,11 +1517,6 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 				return Weight{}, fmt.Errorf("%s force_f32 dequantization not implemented for %s", info.DType, name)
 			}
 			return Weight{F32: f}, nil
-		}
-		rows, cols := 1, numel
-		if len(info.Dims) >= 2 {
-			rows = int(info.Dims[1])
-			cols = int(info.Dims[0])
 		}
 		if !borrow {
 			owned := make([]byte, len(raw))
@@ -1526,6 +1661,10 @@ func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffe
 // Q/K/V and gate/up matvecs go through the fused multi-matrix kernels when
 // the quant types allow (tryMatvec3Into/tryMatvec2Into).
 func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {
+	if config.UsesMLA {
+		ForwardDeepSeek2BodyInto(config, weights, cache, buf, token, pos)
+		return
+	}
 	dim := config.Dim
 	headDim := config.HeadDim
 	kvMul := max(1, config.KVMul)

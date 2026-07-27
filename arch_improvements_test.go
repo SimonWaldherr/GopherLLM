@@ -9,6 +9,10 @@ import (
 // llama graph plus per-head QK-norm tensors and a ChatML vocabulary — the
 // shape the DeepSeek-R1-0528 Qwen3 distills use.
 func buildTinyQwen3GGUF() []byte {
+	return buildTinyQwen3GGUFWithQKNorm(true)
+}
+
+func buildTinyQwen3GGUFWithQKNorm(withQKNorm bool) []byte {
 	const (
 		dim    = 8
 		heads  = 2
@@ -64,12 +68,16 @@ func buildTinyQwen3GGUF() []byte {
 		f32t("blk.0.attn_k.weight", kv*hdim, dim, 4),
 		f32t("blk.0.attn_v.weight", kv*hdim, dim, 5),
 		f32t("blk.0.attn_output.weight", dim, heads*hdim, 6),
-		vec("blk.0.attn_q_norm.weight", hdim), // the qwen3 signature
-		vec("blk.0.attn_k_norm.weight", hdim),
 		vec("blk.0.ffn_norm.weight", dim),
 		f32t("blk.0.ffn_gate.weight", hidden, dim, 7),
 		f32t("blk.0.ffn_up.weight", hidden, dim, 8),
 		f32t("blk.0.ffn_down.weight", dim, hidden, 9),
+	}
+	if withQKNorm {
+		tensors = append(tensors,
+			vec("blk.0.attn_q_norm.weight", hdim), // the qwen3 signature
+			vec("blk.0.attn_k_norm.weight", hdim),
+		)
 	}
 	return buildGGUF(3, kvs, tensors)
 }
@@ -114,6 +122,13 @@ func TestQwen3LoadsWithQKNormAndChatML(t *testing.T) {
 	}
 	if a.Text != b.Text {
 		t.Fatalf("qwen3 greedy not deterministic: %q vs %q", a.Text, b.Text)
+	}
+}
+
+func TestQwen3LoaderRejectsMissingQKNorm(t *testing.T) {
+	_, err := RunnerFromGGUFBytes(buildTinyQwen3GGUFWithQKNorm(false))
+	if err == nil || !strings.Contains(err.Error(), "qwen3 requires") {
+		t.Fatalf("error = %v, want missing qwen3 QK-norm diagnostic", err)
 	}
 }
 

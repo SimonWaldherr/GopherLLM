@@ -24,10 +24,11 @@ type Pair struct {
 //   - TokenizerSentencePiece (tokenizer.ggml.model = "llama"): text is mapped
 //     to "▁"-prefixed pieces and greedily merged by vocabulary Scores, with
 //     <0xNN> byte tokens as the fallback for uncovered bytes.
-//   - TokenizerGPT2BPE ("gpt2", incl. Mistral's Tekken and Qwen): text is
-//     pre-tokenized by a regex-equivalent splitter (Pre selects the Tekken
-//     variant), bytes are mapped through the GPT-2 printable-byte alphabet
-//     (ByteEncoder/ByteDecoder), and pieces are merged by MergeRanks.
+//   - TokenizerGPT2BPE ("gpt2", incl. Mistral's Tekken, Qwen, and Kimi):
+//     text is pre-tokenized by a regex-equivalent splitter (Pre selects the
+//     family-specific variant), bytes are mapped through the GPT-2
+//     printable-byte alphabet (ByteEncoder/ByteDecoder), and pieces are
+//     merged by MergeRanks.
 //
 // AddBOS mirrors tokenizer.ggml.add_bos_token: Encode prepends BOSID when
 // set, EncodeWithoutBOS never does (chat renderers place BOS themselves).
@@ -90,11 +91,11 @@ func TokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
 	}
 	mode := TokenizerSentencePiece
 	preLower := strings.ToLower(pre)
-	// Tekken (Mistral/Ministral) is a GPT-2 BPE family whose pre-tokenizer path
-	// keys on Pre containing "tekken"; classify it as GPT2BPE explicitly rather
-	// than relying on model being literally "gpt2", which not every Tekken GGUF
-	// sets — otherwise it would silently fall through to SentencePiece.
-	if strings.EqualFold(model, "gpt2") || strings.Contains(preLower, "qwen") || strings.Contains(preLower, "gpt") || strings.Contains(preLower, "tekken") {
+	// Several GPT-2 BPE families do not set tokenizer.ggml.model to the literal
+	// "gpt2". In particular, Kimi K2 GGUFs identify their tiktoken vocabulary
+	// through tokenizer.ggml.pre = "kimi-k2". Classify the pre-tokenizer rather
+	// than silently treating such vocabularies as SentencePiece.
+	if strings.EqualFold(model, "gpt2") || strings.Contains(preLower, "qwen") || strings.Contains(preLower, "gpt") || strings.Contains(preLower, "tekken") || strings.Contains(preLower, "kimi") {
 		mode = TokenizerGPT2BPE
 	}
 	enc, dec := buildByteMaps()
@@ -260,10 +261,171 @@ func (t *Tokenizer) decodeGPT2Bytes(raw string) string {
 }
 
 func (t *Tokenizer) pretokenize(text string) []string {
+	if strings.Contains(t.Pre, "kimi") {
+		return pretokenizeKimi(text)
+	}
 	if strings.Contains(t.Pre, "tekken") {
 		return pretokenizeTekken(text)
 	}
 	return pretokenizeGPT2(text)
+}
+
+// pretokenizeKimi implements the tiktoken pattern bundled with Kimi K2:
+//
+//	[\p{Han}]+|[^\r\n\p{L}\p{N}]?[upper]*[lower]+(?:'s|'t|'re|'ve|'m|'ll|'d)?
+//	|[^\r\n\p{L}\p{N}]?[upper]+[lower]*(?:'s|'t|'re|'ve|'m|'ll|'d)?
+//	|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+//
+// where upper/lower have the Unicode classes from Moonshot's
+// tokenization_kimi.py. It is intentionally separate from Tekken: Kimi groups
+// numbers in threes and treats Han runs as their own pieces, while Tekken
+// splits every numeric rune and has different punctuation handling.
+func pretokenizeKimi(text string) []string {
+	r := []rune(text)
+	n := len(r)
+	pieces := make([]string, 0, len(r)/3+1)
+	for i := 0; i < n; {
+		if isKimiHan(r[i]) {
+			end := i + 1
+			for end < n && isKimiHan(r[end]) {
+				end++
+			}
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if end, ok := matchKimiWord(r, n, i); ok {
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if unicode.IsNumber(r[i]) {
+			end := i + 1
+			for end < n && end-i < 3 && unicode.IsNumber(r[end]) {
+				end++
+			}
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if end, ok := matchKimiPunct(r, n, i); ok {
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if unicode.IsSpace(r[i]) {
+			end := kimiWhitespaceEnd(r, n, i)
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		pieces = append(pieces, string(r[i]))
+		i++
+	}
+	return pieces
+}
+
+func isKimiHan(c rune) bool { return unicode.Is(unicode.Han, c) }
+
+// kimiUpperClass and kimiLowerClass mirror the two case-aware tiktoken
+// alternatives. Lm/Lo/marks belong to both classes in the source pattern;
+// Han is deliberately excluded because it is handled by the first branch.
+func kimiUpperClass(c rune) bool {
+	return !isKimiHan(c) && (unicode.IsUpper(c) || unicode.IsTitle(c) || unicode.Is(unicode.Lm, c) || unicode.Is(unicode.Lo, c) || unicode.Is(unicode.M, c))
+}
+
+func kimiLowerClass(c rune) bool {
+	return !isKimiHan(c) && (unicode.IsLower(c) || unicode.Is(unicode.Lm, c) || unicode.Is(unicode.Lo, c) || unicode.Is(unicode.M, c))
+}
+
+func matchKimiWord(r []rune, n, i int) (int, bool) {
+	start := i
+	if start < n && r[start] != '\r' && r[start] != '\n' && !unicode.IsLetter(r[start]) && !unicode.IsNumber(r[start]) {
+		start++
+	}
+	// First alternative: [upper]*[lower]+.
+	k := start
+	for k < n && kimiUpperClass(r[k]) {
+		k++
+	}
+	lowerStart := k
+	for k < n && kimiLowerClass(r[k]) {
+		k++
+	}
+	if k > lowerStart {
+		return kimiContractionEnd(r, n, k), true
+	}
+	// Second alternative: [upper]+[lower]*.
+	k = start
+	for k < n && kimiUpperClass(r[k]) {
+		k++
+	}
+	if k > start {
+		for k < n && kimiLowerClass(r[k]) {
+			k++
+		}
+		return kimiContractionEnd(r, n, k), true
+	}
+	return i, false
+}
+
+func kimiContractionEnd(r []rune, n, i int) int {
+	if i >= n || r[i] != '\'' {
+		return i
+	}
+	for _, suffix := range []string{"re", "ve", "ll", "s", "t", "m", "d"} {
+		if i+1+len(suffix) > n {
+			continue
+		}
+		match := true
+		for j := range suffix {
+			c := r[i+1+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != rune(suffix[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i + 1 + len(suffix)
+		}
+	}
+	return i
+}
+
+func matchKimiPunct(r []rune, n, i int) (int, bool) {
+	j := i
+	if j < n && r[j] == ' ' {
+		j++
+	}
+	start := j
+	for j < n && !unicode.IsSpace(r[j]) && !unicode.IsLetter(r[j]) && !unicode.IsNumber(r[j]) {
+		j++
+	}
+	if j == start {
+		return i, false
+	}
+	for j < n && (r[j] == '\r' || r[j] == '\n') {
+		j++
+	}
+	return j, true
+}
+
+func kimiWhitespaceEnd(r []rune, n, i int) int {
+	j := i
+	lastNewline := -1
+	for j < n && unicode.IsSpace(r[j]) {
+		if r[j] == '\r' || r[j] == '\n' {
+			lastNewline = j
+		}
+		j++
+	}
+	if lastNewline >= 0 {
+		return lastNewline + 1
+	}
+	return j
 }
 
 // pretokenizeTekken splits text following Mistral's Tekken pre-tokenizer

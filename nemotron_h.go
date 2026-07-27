@@ -139,7 +139,7 @@ func (c *NemotronHCache) stateOffset(layer, head, dim int) int {
 	return (((layer*c.Heads)+head)*c.HeadDim + dim) * c.StateSize
 }
 
-func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useMetal bool, logw io.Writer) (Config, NemotronHWeights, error) {
+func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, NemotronHWeights, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
@@ -162,8 +162,9 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 	}
 	tensors := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
+	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 	}
 	loadVec := func(name string) ([]float32, error) {
 		return loadF32Vec(data, gguf.DataOffset, name, tensors, inferred)
@@ -289,10 +290,10 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 					err = fmt.Errorf("latent MoE projections must be paired (found %s %s)", latentInName, latentOutName)
 				}
 				if err == nil {
-					layer.MoE.Up, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow)
+					layer.MoE.Up, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow, lazyScalarWeights)
 				}
 				if err == nil {
-					layer.MoE.Down, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow)
+					layer.MoE.Down, err = loadExpertWeight(data, gguf.DataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow, lazyScalarWeights)
 				}
 				if err != nil {
 					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE: %w", i, err)
@@ -500,11 +501,7 @@ func mambaSSMForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, 
 	// The GGUF stores one kernel row per channel, ordered oldest to newest.
 	ensureLenNoClear(&buf.MambaKernel, cfg.SSMConv)
 	for ch := range channels {
-		if w.Conv.F32 != nil && (ch+1)*cfg.SSMConv <= len(w.Conv.F32) {
-			copy(buf.MambaKernel, w.Conv.F32[ch*cfg.SSMConv:(ch+1)*cfg.SSMConv])
-		} else {
-			w.Conv.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
-		}
+		w.Conv.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
 		off := state.convOffset(layer, ch)
 		v := float32(0)
 		for k := 0; k < state.ConvLen; k++ {

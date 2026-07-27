@@ -59,7 +59,7 @@ func reusableBERTScratch(n, dim, hidden int, useGate bool) bool {
 // is read from ConfigFromGGUF. This makes Nomic and Granite embedding models
 // usable by /embeddings and the history-RAG index without treating them as
 // chat models.
-func LoadBERTModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer) (Config, BERTWeights, error) {
+func LoadBERTModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, BERTWeights, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
@@ -72,8 +72,9 @@ func LoadBERTModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantize
 	}
 	tensors := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
+	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrowQuantized, prepareQuantized, useMetal)
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
 	}
 
 	tokenEmbd, err := load("token_embd.weight")
@@ -177,7 +178,14 @@ func (r *Runner) embedBERT(text string) (EmbeddingResult, error) {
 	if reusableBERTScratch(len(tokens), r.config.Dim, r.config.HiddenDim, r.bert.UseRoPE) {
 		scratch = &r.bertScratch
 	}
-	return embedBERTWithScratch(r.config, r.bert, tokens, matvecBERTBatch, scratch)
+	matvec := bertBatchMatvec(matvecBERTBatch)
+	if r.outOfCore {
+		// Batching trades more pages held concurrently for speed. The OOC path
+		// intentionally streams one activation at a time so the VM can evict
+		// cold model pages between projections.
+		matvec = matvecBERTSequential
+	}
+	return embedBERTWithScratch(r.config, r.bert, tokens, matvec, scratch)
 }
 
 // bertBatchMatvec lets the BERT graph use one batched matrix traversal per
@@ -223,8 +231,14 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 		return EmbeddingResult{}, fmt.Errorf("embed: no tokens")
 	}
 	dim := config.Dim
-	if !weights.UseRoPE && weights.PositionEmbd.F32 != nil && len(weights.PositionEmbd.F32) < n*dim {
-		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds position embeddings", n)
+	if !weights.UseRoPE {
+		positionRows := weights.PositionEmbd.Rows
+		if weights.PositionEmbd.F32 != nil && dim > 0 {
+			positionRows = len(weights.PositionEmbd.F32) / dim
+		}
+		if positionRows < n {
+			return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds position embeddings", n)
+		}
 	}
 	if scratch == nil {
 		scratch = &bertEmbeddingScratch{}
@@ -235,12 +249,8 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 	for i, token := range tokens {
 		weights.TokenEmbd.RowInto(int(token), dim, &x[i])
 		if !weights.UseRoPE {
-			if weights.PositionEmbd.F32 != nil {
-				addInPlace(x[i], weights.PositionEmbd.F32[i*dim:(i+1)*dim])
-			} else {
-				weights.PositionEmbd.RowInto(i, dim, &position)
-				addInPlace(x[i], position)
-			}
+			weights.PositionEmbd.RowInto(i, dim, &position)
+			addInPlace(x[i], position)
 		}
 		if len(weights.TokenTypes) >= dim {
 			addInPlace(x[i], weights.TokenTypes[:dim])

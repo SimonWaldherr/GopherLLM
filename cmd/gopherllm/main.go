@@ -2,6 +2,7 @@ package main
 
 import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/agentos"
 	"github.com/SimonWaldherr/GopherLLM/server"
 
 	"bufio"
@@ -44,9 +45,13 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
 	fmt.Fprintln(os.Stderr, "  --metal                   Use selective Metal Q4_K/Q6_K matvec offload when available")
 	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute supported quantized scale data during load for faster matvecs")
+	fmt.Fprintln(os.Stderr, "  --out-of-core             CPU-only mmap inference; keep sparse MoE experts and scalar weights demand-paged")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
 	fmt.Fprintln(os.Stderr, "  --skills-dir <path>       Directory of SKILL.md files offered via a load_skill tool")
+	fmt.Fprintln(os.Stderr, "  --os-commands <policy>    Enable /agentos endpoints: deny | whitelist | allow (default: disabled)")
+	fmt.Fprintln(os.Stderr, "                            deny still lets a model propose a command, but a human must approve every one")
+	fmt.Fprintln(os.Stderr, "  --os-commands-allow <l>   Comma-separated program names auto-approved under whitelist, e.g. ls,git,cat")
 	fmt.Fprintln(os.Stderr, "  --embed                   Embed prompt and print the vector")
 	fmt.Fprintln(os.Stderr, "  --bench                   Run a non-streaming generation benchmark")
 	fmt.Fprintln(os.Stderr, "  --bench-json              Run benchmark and emit machine-readable JSON")
@@ -99,7 +104,9 @@ type cliConfig struct {
 	autoTuneRefresh  bool
 	autoTuneEffort   string
 	useMetal         bool
+	metalExplicit    bool
 	prepareQuant     bool
+	outOfCore        bool
 	inspect          bool
 	listMetadata     bool
 	skillsDir        string
@@ -107,6 +114,13 @@ type cliConfig struct {
 	findToken        string
 	tokenNeighbors   string
 	neighborCount    int
+	// osCommandsPolicy is the raw --os-commands value: "" disables the
+	// agentic OS-command feature entirely (no endpoints registered); any
+	// other value must parse via agentos.ParsePolicy.
+	osCommandsPolicy string
+	// osCommandsAllow is a comma-separated program allow-list, only
+	// meaningful under the whitelist policy.
+	osCommandsAllow string
 }
 
 func main() {
@@ -156,6 +170,19 @@ func run() error {
 	if cfg.kernelBenchRuns <= 0 {
 		return fmt.Errorf("--kernel-bench-runs must be greater than 0")
 	}
+	if cfg.outOfCore && cfg.useMetal {
+		return fmt.Errorf("--out-of-core cannot be combined with --metal")
+	}
+	if cfg.outOfCore && cfg.prepareQuant {
+		return fmt.Errorf("--out-of-core cannot be combined with --prepare-quant")
+	}
+	if cfg.outOfCore && cfg.autoTune {
+		return fmt.Errorf("--out-of-core cannot be combined with --auto: calibration intentionally streams the full model")
+	}
+	agentOSRunner, err := buildAgentOSRunner(cfg)
+	if err != nil {
+		return err
+	}
 	// A model selected by a previous server session is a better default than an
 	// interactive picker: a restart should resume serving without intervention.
 	// An explicit --model always wins, and an unusable saved path leaves the
@@ -186,6 +213,8 @@ func run() error {
 			ChatHistoryLock:          &sync.Mutex{},
 			ModelDir:                 cfg.modelDir,
 			SkillsDir:                cfg.skillsDir,
+			ModelLoadOptions:         gopherllm.LoadOptions{OutOfCore: cfg.outOfCore},
+			AgentOS:                  agentOSRunner,
 		})
 	}
 	stopProfile, err := startCPUProfile(cfg.cpuProfile)
@@ -195,7 +224,9 @@ func run() error {
 	defer stopProfile()
 	fmt.Fprintf(os.Stderr, "System: %d threads\n", runtime.GOMAXPROCS(0))
 	metalAvailable := gopherllm.MetalAvailable()
-	if cfg.useMetal {
+	if cfg.outOfCore {
+		fmt.Fprintln(os.Stderr, "Out-of-core: enabled (CPU mmap; sparse experts stay demand-paged)")
+	} else if cfg.useMetal {
 		if !metalAvailable {
 			if errText := gopherllm.MetalError(); errText != "" {
 				return fmt.Errorf("Metal requested but unavailable: %s", errText)
@@ -203,8 +234,12 @@ func run() error {
 			return fmt.Errorf("Metal requested but unavailable")
 		}
 		fmt.Fprintln(os.Stderr, "Metal: enabled (selective Q4_K/Q6_K matvec offload)")
+	} else if metalAvailable && cfg.autoTune {
+		// Saying "pass --metal" here would be wrong: --auto is about to decide
+		// it by measurement, and may well turn it on.
+		fmt.Fprintln(os.Stderr, "Metal: available (--auto will measure whether to use it)")
 	} else if metalAvailable {
-		fmt.Fprintln(os.Stderr, "Metal: available (disabled; pass --metal)")
+		fmt.Fprintln(os.Stderr, "Metal: available (disabled; pass --metal or --auto to measure)")
 	} else {
 		fmt.Fprintln(os.Stderr, "Metal: unavailable (pure Go / no CGO)")
 	}
@@ -223,12 +258,31 @@ func run() error {
 		// even for multi-gigabyte files.
 		return analyzeGGUF(modelPath, cfg)
 	}
+	// Metal is fixed when the weights load, so auto-tuning (which runs against
+	// an already-loaded Runner) cannot reach it. Decide it here instead, by
+	// actually measuring both ways. An explicit --metal is the operator's call
+	// and is never second-guessed.
+	if cfg.autoTune && !cfg.metalExplicit && metalAvailable {
+		base := gopherllm.LoadOptions{PrepareQuantized: cfg.prepareQuant}
+		probe, cached, probeErr := gopherllm.ProbeMetalOrCached(modelPath, base, 0, cfg.autoTuneRefresh)
+		switch {
+		case probeErr != nil:
+			fmt.Fprintf(os.Stderr, "Auto: could not measure Metal (%v); leaving it off\n", probeErr)
+		case cached:
+			fmt.Fprintf(os.Stderr, "Auto: reusing Metal measurement — %s\n", probe.SummaryLine())
+			cfg.useMetal = probe.UseMetal
+		default:
+			fmt.Fprintf(os.Stderr, "Auto: %s\n", probe.SummaryLine())
+			cfg.useMetal = probe.UseMetal
+		}
+	}
 	model, err := gopherllm.Open(
 		context.Background(),
 		modelPath,
 		gopherllm.WithLogWriter(os.Stderr),
 		gopherllm.WithPrepareQuantized(cfg.prepareQuant),
 		gopherllm.WithMetal(cfg.useMetal),
+		gopherllm.WithOutOfCore(cfg.outOfCore),
 	)
 	if err != nil {
 		return err
@@ -259,7 +313,7 @@ func run() error {
 	}
 	if cfg.serveAddr != "" {
 		recordLastServerModel(modelPath)
-		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastServerModel})
+		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastServerModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -364,6 +418,30 @@ func printReasoningAndToolCalls(result gopherllm.GenerationResult) {
 	for _, call := range result.ToolCalls {
 		fmt.Fprintf(os.Stderr, "[tool_call] %s(%s) — no --skills-dir tool executor is configured to answer this\n", call.Function.Name, call.Function.Arguments)
 	}
+}
+
+// buildAgentOSRunner turns --os-commands/--os-commands-allow into a Runner
+// for the server, or nil if the flag was never given: the feature does not
+// exist on a server started without it, matching the operator-configured,
+// off-by-default gate the agentos package's threat model calls for.
+func buildAgentOSRunner(cfg cliConfig) (*agentos.Runner, error) {
+	if strings.TrimSpace(cfg.osCommandsPolicy) == "" {
+		return nil, nil
+	}
+	policy, err := agentos.ParsePolicy(cfg.osCommandsPolicy)
+	if err != nil {
+		return nil, err
+	}
+	var allowed []string
+	for _, name := range strings.Split(cfg.osCommandsAllow, ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			allowed = append(allowed, name)
+		}
+	}
+	if policy == agentos.PolicyWhitelist && len(allowed) == 0 {
+		return nil, fmt.Errorf("--os-commands whitelist needs --os-commands-allow with at least one program name")
+	}
+	return &agentos.Runner{Policy: policy, Allowed: allowed}, nil
 }
 
 func parseCLI(args []string) (cliConfig, error) {
@@ -485,8 +563,11 @@ func parseCLI(args []string) (cliConfig, error) {
 			runtime.GOMAXPROCS(v)
 		case "--metal":
 			cfg.useMetal = true
+			cfg.metalExplicit = true
 		case "--prepare-quant":
 			cfg.prepareQuant = true
+		case "--out-of-core":
+			cfg.outOfCore = true
 		case "--system-prompt":
 			v, err := next(arg)
 			if err != nil {
@@ -505,6 +586,18 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.skillsDir = v
+		case "--os-commands":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.osCommandsPolicy = v
+		case "--os-commands-allow":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.osCommandsAllow = v
 		case "--embed":
 			cfg.embed = true
 		case "--bench":

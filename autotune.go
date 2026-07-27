@@ -342,6 +342,9 @@ const maxProbePrefillChunk = 256
 // settings it finds. It holds the generation lock, so no request runs
 // concurrently. The returned result is already applied.
 func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
+	if r.outOfCore {
+		return AutoTuneResult{}, fmt.Errorf("auto-tuning is disabled for out-of-core models because calibration streams the full model")
+	}
 	opts = opts.withDefaults()
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
@@ -967,6 +970,9 @@ func AutoTuneOptionsForEffort(effort string) AutoTuneOptions {
 // AutoTuneOrCached applies a cached result when one exists, otherwise measures
 // and caches a new one. refresh forces re-measurement.
 func (r *Runner) AutoTuneOrCached(opts AutoTuneOptions, refresh bool) (AutoTuneResult, bool, error) {
+	if r.outOfCore {
+		return AutoTuneResult{}, false, fmt.Errorf("auto-tuning is disabled for out-of-core models because calibration streams the full model")
+	}
 	if !refresh {
 		if res, ok := r.LoadAutoTune(); ok {
 			// Under the generation lock, like AutoTune, so installing a cached

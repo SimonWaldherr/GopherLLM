@@ -29,7 +29,7 @@ type Mamba2Weights struct {
 // additional MLP branch intentionally fail here: that branch has a different
 // input projection layout and accepting it would produce plausible but wrong
 // logits.
-func LoadMamba2Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useMetal bool, logw io.Writer) (Config, Mamba2Weights, error) {
+func LoadMamba2Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, Mamba2Weights, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
@@ -49,8 +49,9 @@ func LoadMamba2Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 
 	tensors := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
+	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal)
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 	}
 	loadVec := func(name string) ([]float32, error) {
 		return loadF32Vec(data, gguf.DataOffset, name, tensors, inferred)

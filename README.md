@@ -809,6 +809,17 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
   scale/min data plus selected Q6_K scale data, then switches supported rows to
   prepared kernels.
+- Use `--out-of-core` when a single-file GGUF, especially a large sparse-MoE
+  model, does not fit comfortably in RAM or Apple unified memory. It keeps the
+  model CPU-only, disables Metal and prepared-quant copies, leaves F16/F32/BF16
+  matrices as mmap-backed scalar bytes, and does not prewarm the rank-3 expert
+  banks. The operating system pages selected experts in on demand; this is not
+  a hard RSS limit, so a cold expert can add SSD/page-fault latency and dense
+  models that are far larger than RAM can still thrash. It intentionally rejects
+  `--metal`, `--prepare-quant`, `--auto`, byte-backed loads, and split GGUFs
+  (current split support merges shards into RAM). Library users can use
+  `gopherllm.WithOutOfCore(true)` and optionally
+  `WithMmapPrefault(gopherllm.MmapPrefaultNone)` for fully lazy paging.
 - Use `--temp 0 --top-k 1` for deterministic greedy output.
 - Use `--min-p <F>` (e.g. `0.05`) for min-p nucleus sampling; `0` disables it.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
@@ -875,6 +886,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   score dots, then max-stabilized softmax weights and the weighted V
   accumulation), which measured ~1.15x over the previous online-softmax loop
   at 4k-16k context and uses the true score maximum for stability.
+  On non-amd64 systems the exact f32 cache remains the default; set
+  `GOPHERLLM_KV_F16=1` to opt into the scalar f16 cache when memory capacity
+  matters more than decode speed (for example, large Kimi contexts on a
+  unified-memory Mac).
 - After mmap'ing a single-file GGUF, every page is touched once up front
   across all worker threads (`prefaultPages`) before the model is reported
   loaded. A memory-mapped file only pages in on first touch, and a forward
@@ -900,7 +915,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
-| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of f16 (x86-64) |
+| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into the scalar f16 cache on non-amd64 to halve KV memory (may reduce speed) |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
@@ -913,16 +928,43 @@ the rest of the process.
 The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
-llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen3,
+llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, qwen3, qwen3moe,
+deepseek2, kimi_k2,
 phi3, granite (dense), exaone, internlm2, stablelm, gpt-oss, gemma, gemma2, gemma3, gemma4,
 nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
 ```
 
-qwen3 (including the DeepSeek-R1 Qwen3 distills) adds per-head QK-norm on top
-of the qwen2 graph; DeepSeek-R1 reasoning output is separated into
-`reasoning_content` in both template conventions (self-opened `<think>` blocks
-and the newer forced-open templates whose output begins mid-reasoning).
-`deepseek2` (MLA attention) is not supported. Mistral-family models support
+Sparse MoE is native for Mixtral-style GGUFs (including checkpoints that
+declare `llama`), `qwen2moe`, and `qwen3moe`. The loader validates the router
+and every `[input, output, expert]` tensor before loading; Mixtral/Qwen3 use
+top-k-renormalized routing, while Qwen2-MoE preserves its full-router mass and
+adds its gated shared expert. `gpt-oss` uses the same sparse foundation with
+its expert/router biases, OAI-SwiGLU activation, learned attention sinks, and
+alternating local/full-attention schedule. Sparse MoE prompt prefill stays
+per-token so the decode graph and its quantized expert kernels are shared.
+
+`qwen2` covers text-only Qwen2/Qwen2.5 GGUFs, including Qwen2.5-Coder,
+Qwen2.5-Math, and QwQ checkpoints when they declare that architecture;
+`qwen2moe` implements Qwen2-MoE's unnormalized selected-router mass and gated
+shared expert. `qwen3` covers dense text-only Qwen3 (including Qwen3-based
+DeepSeek-R1 distills) with mandatory per-head QK-norm. `qwen3moe` adds the
+matching normalized sparse routing and QK-norm required by Qwen3-MoE, including
+Qwen3-Coder GGUFs that declare `qwen3moe`. Qwen vision-language and hybrid
+families are deliberately outside this scope: `qwen2vl`, `qwen3vl`,
+`qwen3vlmoe`, `qwen3next`, `qwen35`, and `qwen35moe` need multimodal MRoPE,
+visual-feature injection, DeltaNet, or other non-standard graphs.
+
+`deepseek2` and `kimi_k2` provide a dedicated Multi-head Latent Attention
+(MLA) path for Kimi K2 and compatible single-group MLA GGUFs. It uses a
+compressed KV cache, the split `attn_k_b`/`attn_v_b` MLA tensors, and the
+sigmoid/noaux sparse router with its always-on shared expert. This path is
+currently CPU-only (`--metal` is rejected) and explicitly rejects grouped
+DeepSeek-MoE routing; it does not claim support for every DeepSeek-V2/V3 or
+legacy `attn_kv_b` GGUF.
+
+DeepSeek-R1 reasoning output is separated into `reasoning_content` in both
+template conventions (self-opened `<think>` blocks and the newer forced-open
+templates whose output begins mid-reasoning). Mistral-family models support
 assistant-message prefill: a conversation ending in an assistant message
 leaves the turn open so generation continues it.
 
@@ -943,6 +985,8 @@ graphs. The dense variant (including NVIDIA Nemotron 3 Nano 4B) uses
 retain Mamba convolution and SSM state locally and do not rely on a llama.cpp
 process. Prompt prefill is deliberately per-token for these architectures
 because recurrent state makes the regular batched transformer prefill invalid.
+The MoE variant also supports canonical `ffn_latent_down/up` projections and
+the optional shared ReLU² expert.
 
 Pure `mamba2` GGUFs (including the canonical 2.7B/7B family) run through a
 native convolution/SSM recurrence with no fabricated attention cache. The

@@ -212,12 +212,23 @@ type GenerationResult struct {
 type LoadInfo struct {
 	FileSizeBytes int
 	LoadTime      time.Duration
+	// OutOfCore reports whether this model was loaded through the CPU-only
+	// demand-paged path. It does not promise a fixed RSS cap: the OS controls
+	// mmap page residency and may retain or evict file-backed pages as needed.
+	OutOfCore bool
 }
 
 type LoadOptions struct {
 	PrepareQuantized bool
 	UseMetal         bool
-	LogWriter        io.Writer
+	// OutOfCore keeps scalar and quantized matrices as views of a real mmap,
+	// disables GPU/prepared copies, and avoids prewarming sparse expert banks.
+	// It requires a single-file GGUF opened from a filesystem path.
+	OutOfCore bool
+	// Prefault selects the mmap warm-up policy. The zero value preserves the
+	// historical full warm-up; OutOfCore changes its effective policy to core.
+	Prefault  MmapPrefaultMode
+	LogWriter io.Writer
 }
 
 type loadedKind int
@@ -263,6 +274,7 @@ type Runner struct {
 	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
 	mappedFile     *MmapFile
+	outOfCore      bool
 }
 
 // ArchitectureSupported reports whether the loader accepts this
@@ -271,8 +283,9 @@ type Runner struct {
 //   - qwen3 (incl. the DeepSeek-R1-0528 Qwen3 distills): the qwen2 graph plus
 //     per-head QK-norm, which loads via the optional attn_q_norm/attn_k_norm
 //     tensors and applies exactly as for Gemma 3/4.
-//   - deepseek2 (MLA attention) is NOT supported; DeepSeek-R1 distills ship
-//     as qwen2/qwen3/llama and work through those graphs.
+//   - Mixtral/Llama-MoE, qwen2moe, qwen3moe, gpt-oss, and DeepSeek/Kimi use
+//     sparse experts when their router tensors are present. deepseek2 uses a
+//     dedicated MLA attention path and its sigmoid/noaux shared-expert router.
 //   - Phi-3, dense Granite, EXAONE, and InternLM2 use the same pre-norm, RoPE, GQA and
 //     SwiGLU graph as the standard loader. Their architecture-specific scales
 //     are read from GGUF metadata by ConfigFromGGUF.
@@ -282,7 +295,7 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
+		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
 		return true
 	default:
 		return false
@@ -297,10 +310,19 @@ func RunnerFromGGUFBytes(data []byte) (*Runner, error) {
 }
 
 func RunnerFromGGUFBytesWithOptions(data []byte, options LoadOptions) (*Runner, error) {
+	if options.OutOfCore {
+		return nil, fmt.Errorf("out-of-core loading requires RunnerFromPathWithOptions: byte-backed models already reside in memory")
+	}
 	return runnerFromGGUFBytes(data, false, options)
 }
 
 func runnerFromGGUFBytes(data []byte, borrowQuantized bool, options LoadOptions) (*Runner, error) {
+	if err := validateLoadOptions(options); err != nil {
+		return nil, err
+	}
+	if options.OutOfCore && !borrowQuantized {
+		return nil, fmt.Errorf("out-of-core loading requires a memory-mapped model file")
+	}
 	gguf, err := ParseGGUF(data)
 	if err != nil {
 		return nil, err
@@ -314,6 +336,9 @@ func runnerFromGGUFBytes(data []byte, borrowQuantized bool, options LoadOptions)
 // can hand in a synthetic GGUFFile assembled from multiple shard files
 // without needing a real single-file byte stream to re-parse.
 func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, options LoadOptions) (*Runner, error) {
+	if err := validateLoadOptions(options); err != nil {
+		return nil, err
+	}
 	logw := options.LogWriter
 	if logw == nil {
 		logw = io.Discard
@@ -330,28 +355,31 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 	if err != nil {
 		return nil, err
 	}
-	r := &Runner{gguf: gguf, arch: arch, tok: tok}
+	r := &Runner{gguf: gguf, arch: arch, tok: tok, outOfCore: options.OutOfCore}
+	if options.OutOfCore {
+		fmt.Fprintln(logw, "Out-of-core: CPU mmap mode; sparse experts remain demand-paged (Metal and prepared quantization disabled)")
+	}
 	switch arch {
 	case "bert", "nomic-bert":
-		config, weights, err := LoadBERTModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		config, weights, err := LoadBERTModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.bert, r.kind = config, weights, loadedBERT
 	case "nemotron_h", "nemotron_h_moe":
-		config, weights, err := LoadNemotronHModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		config, weights, err := LoadNemotronHModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.nemotronH, r.kind = config, weights, loadedNemotronH
 	case "mamba2":
-		config, weights, err := LoadMamba2Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		config, weights, err := LoadMamba2Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.mamba2, r.kind = config, weights, loadedMamba2
 	case "gpt-oss":
-		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
 		}
@@ -366,13 +394,13 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		// embeddings, the 26B MoE) are still missing. See
 		// docs/INFERENCE_NOTES.md.
 		fmt.Fprintf(logw, "Warning: %s support is experimental (dense graph implemented, unvalidated against real weights; Gemma 4 p-RoPE/PLE/MoE missing — see docs/INFERENCE_NOTES.md)\n", arch)
-		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
 		}
 		r.config, r.gemma4, r.kind = config, weights, loadedGemma4
 	default:
-		config, weights, err := LoadModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw)
+		config, weights, err := LoadModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
 		}
@@ -389,22 +417,39 @@ func RunnerFromPath(path string) (*Runner, LoadInfo, error) {
 }
 
 func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadInfo, error) {
+	if err := validateLoadOptions(options); err != nil {
+		return nil, LoadInfo{}, err
+	}
 	t0 := time.Now()
 	mmap, err := OpenMmap(path)
 	if err != nil {
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
+	if options.OutOfCore && !mmap.mmap {
+		_ = mmap.Close()
+		return nil, LoadInfo{}, fmt.Errorf("out-of-core loading requires an OS memory map; this file fell back to an in-memory read")
+	}
 	if header, herr := ParseGGUFQuiet(mmap.Bytes()); herr == nil {
 		if _, count, ok := splitInfo(header); ok && count > 1 {
+			if options.OutOfCore {
+				_ = mmap.Close()
+				return nil, LoadInfo{}, fmt.Errorf("out-of-core loading does not support split GGUFs: shards are currently merged into memory; combine the shards first")
+			}
 			r, mergedBytes, err := loadSplitRunner(path, header, mmap, options)
 			if err != nil {
 				return nil, LoadInfo{}, err
 			}
-			return r, LoadInfo{FileSizeBytes: int(mergedBytes), LoadTime: time.Since(t0)}, nil
+			return r, LoadInfo{FileSizeBytes: int(mergedBytes), LoadTime: time.Since(t0), OutOfCore: false}, nil
 		}
-	}
-	if mmap.mmap {
-		prefaultPages(mmap.Bytes())
+		if mmap.mmap {
+			prefaultMappedModel(mmap.Bytes(), header, options)
+		}
+	} else if mmap.mmap {
+		// A malformed model will fail in the real parser below. Preserve the
+		// legacy full warm-up behavior when no trustworthy tensor map exists.
+		if effectivePrefaultMode(options) == MmapPrefaultAll {
+			prefaultPages(mmap.Bytes())
+		}
 	}
 	// Quantized weights borrow sub-slices of the file buffer instead of
 	// copying (multi-gigabyte models load without a second copy). The one
@@ -419,7 +464,7 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 		return nil, LoadInfo{}, err
 	}
 	r.mappedFile = mmap
-	return r, LoadInfo{FileSizeBytes: mmap.Len(), LoadTime: time.Since(t0)}, nil
+	return r, LoadInfo{FileSizeBytes: mmap.Len(), LoadTime: time.Since(t0), OutOfCore: options.OutOfCore}, nil
 }
 
 func (r *Runner) Architecture() string      { return r.arch }
@@ -427,6 +472,7 @@ func (r *Runner) Tokenizer() *Tokenizer     { return r.tok }
 func (r *Runner) GGUF() *GGUFFile           { return r.gguf }
 func (r *Runner) Config() Config            { return r.config }
 func (r *Runner) ModelName() (string, bool) { return r.gguf.GetString("general.name") }
+func (r *Runner) OutOfCore() bool           { return r != nil && r.outOfCore }
 
 func (r *Runner) Close() error {
 	if r == nil {
@@ -999,7 +1045,7 @@ func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uin
 // canBatchPrefill reports whether the model uses the standard non-fused
 // transformer path that ForwardBatchInto supports.
 func (r *Runner) canBatchPrefill() bool {
-	if r.kind != loadedStandard || len(r.standard.Layers) == 0 {
+	if r.outOfCore || r.kind != loadedStandard || r.config.UsesMLA || len(r.standard.Layers) == 0 {
 		return false
 	}
 	if os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
@@ -1164,6 +1210,13 @@ func (r *Runner) isStopToken(token uint32) bool {
 	if r.arch == "gpt-oss" {
 		return token == r.tok.EOSID || token == 200002 || token == 200007
 	}
+	if r.chatTemplateKind() == "kimi-chat" {
+		// Kimi K2 declares [EOS] as its tokenizer EOS, but its instruct
+		// generation configuration ends an assistant turn with <|im_end|>.
+		if id, ok := r.tok.SpecialID("<|im_end|>"); ok && token == id {
+			return true
+		}
+	}
 	if gemmaFamily(r.arch) {
 		// Gemma instruct models end assistant turns with <end_of_turn>, not
 		// the <eos> the GGUF declares as EOS.
@@ -1175,15 +1228,20 @@ func (r *Runner) isStopToken(token uint32) bool {
 }
 
 // renderMessages renders the conversation (and, if any, the tool listing) into
-// tokens using the active chat template. Mistral gets its native
-// [AVAILABLE_TOOLS]/[TOOL_CALLS]/[TOOL_RESULTS] convention; every other
-// template (and gpt-oss, for which tool calling is not yet implemented) uses
-// the generic <tool_call> JSON convention, applied uniformly by flattening
-// tool listings and tool-call history into ordinary system/user/assistant
-// text before delegating to the per-family renderer below.
+// tokens using the active chat template. Mistral and Kimi get their native
+// tool conventions; every other template (and gpt-oss, for which tool calling
+// is not yet implemented) uses the generic <tool_call> JSON convention,
+// applied uniformly by flattening tool listings and tool-call history into
+// ordinary system/user/assistant text before delegating to the per-family
+// renderer below.
 func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) []uint32 {
 	if r.arch == "gpt-oss" {
 		return r.renderGptOssMessages(messages, systemPrompt)
+	}
+	if r.chatTemplateKind() == "kimi-chat" {
+		if tokens, ok := r.renderKimiMessages(messages, systemPrompt, tools); ok {
+			return tokens
+		}
 	}
 	if r.arch == "nemotron_h_moe" {
 		generic, genericSystem := injectGenericTools(messages, systemPrompt, tools)
@@ -1579,6 +1637,151 @@ func (r *Runner) renderHeaderChatMessages(messages []ChatMessage, systemPrompt s
 	return tokens, true
 }
 
+const kimiDefaultSystemPrompt = "You are Kimi, an AI assistant created by Moonshot AI."
+
+// renderKimiMessages mirrors Moonshot's Kimi-K2-Instruct chat_template.jinja:
+//
+//	<|im_system|>system<|im_middle|>{system}<|im_end|>
+//	<|im_user|>user<|im_middle|>{user}<|im_end|>
+//	<|im_assistant|>assistant<|im_middle|>
+//
+// Kimi's role markers are distinct from ChatML's <|im_start|> convention.
+// Tool declarations, tool-call history, and tool results are rendered natively
+// rather than through the generic <tool_call> fallback, since K2 was trained
+// on its own control-token protocol.
+func (r *Runner) renderKimiMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, bool) {
+	systemTok, ok1 := r.tok.SpecialID("<|im_system|>")
+	userTok, ok2 := r.tok.SpecialID("<|im_user|>")
+	assistantTok, ok3 := r.tok.SpecialID("<|im_assistant|>")
+	middleTok, ok4 := r.tok.SpecialID("<|im_middle|>")
+	endTok, ok5 := r.tok.SpecialID("<|im_end|>")
+	if !(ok1 && ok2 && ok3 && ok4 && ok5) {
+		return nil, false
+	}
+
+	tokens := make([]uint32, 0, 32)
+	appendTurn := func(roleTok uint32, roleName, content string) {
+		tokens = append(tokens, roleTok)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(roleName)...)
+		tokens = append(tokens, middleTok)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
+		tokens = append(tokens, endTok)
+	}
+
+	if len(tools) > 0 {
+		payload, err := marshalKimiToolDefinitions(tools)
+		if err != nil {
+			return nil, false
+		}
+		appendTurn(systemTok, "tool_declare", string(payload))
+	}
+
+	hasSystem := false
+	for _, message := range messages {
+		if message.Role == ChatRoleSystem {
+			hasSystem = true
+			break
+		}
+	}
+	if !hasSystem {
+		system := strings.TrimSpace(systemPrompt)
+		if system == "" {
+			system = kimiDefaultSystemPrompt
+		}
+		appendTurn(systemTok, "system", system)
+	}
+
+	for _, message := range messages {
+		roleName := message.Name
+		if roleName == "" {
+			switch message.Role {
+			case ChatRoleSystem:
+				roleName = "system"
+			case ChatRoleAssistant:
+				roleName = "assistant"
+			case ChatRoleTool:
+				roleName = "tool"
+			default:
+				roleName = "user"
+			}
+		}
+
+		switch message.Role {
+		case ChatRoleAssistant:
+			tokens = append(tokens, assistantTok)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(roleName)...)
+			tokens = append(tokens, middleTok)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(message.Content)...)
+			if len(message.ToolCalls) > 0 {
+				callSectionStart, ok1 := r.tok.SpecialID("<|tool_calls_section_begin|>")
+				callStart, ok2 := r.tok.SpecialID("<|tool_call_begin|>")
+				argumentStart, ok3 := r.tok.SpecialID("<|tool_call_argument_begin|>")
+				callEnd, ok4 := r.tok.SpecialID("<|tool_call_end|>")
+				callSectionEnd, ok5 := r.tok.SpecialID("<|tool_calls_section_end|>")
+				if !(ok1 && ok2 && ok3 && ok4 && ok5) {
+					return nil, false
+				}
+				tokens = append(tokens, callSectionStart)
+				for index, call := range message.ToolCalls {
+					callID := call.ID
+					if _, _, ok := parseKimiToolCallID(callID); !ok {
+						callID = kimiToolCallID(call.Function.Name, index)
+					}
+					arguments := call.Function.Arguments
+					if strings.TrimSpace(arguments) == "" {
+						arguments = "{}"
+					}
+					tokens = append(tokens, callStart)
+					tokens = append(tokens, r.tok.EncodeWithoutBOS(callID)...)
+					tokens = append(tokens, argumentStart)
+					tokens = append(tokens, r.tok.EncodeWithoutBOS(arguments)...)
+					tokens = append(tokens, callEnd)
+				}
+				tokens = append(tokens, callSectionEnd)
+			}
+			tokens = append(tokens, endTok)
+		case ChatRoleTool:
+			appendTurn(systemTok, roleName, "## Return of "+message.ToolCallID+" "+message.Content)
+		case ChatRoleSystem:
+			appendTurn(systemTok, roleName, message.Content)
+		default:
+			appendTurn(userTok, roleName, message.Content)
+		}
+	}
+
+	// add_generation_prompt=True from the official template.
+	tokens = append(tokens, assistantTok)
+	tokens = append(tokens, r.tok.EncodeWithoutBOS("assistant")...)
+	tokens = append(tokens, middleTok)
+	return tokens, true
+}
+
+// marshalKimiToolDefinitions reproduces Kimi's `deep_sort_dict` plus compact
+// Jinja `tojson(separators=(',', ':'))` output. encoding/json sorts map keys,
+// including nested decoded parameter schemas, so the prompt is deterministic
+// and matches the official custom tokenizer's stable tool declaration form.
+func marshalKimiToolDefinitions(tools []ToolDefinition) ([]byte, error) {
+	payload := make([]map[string]any, 0, len(tools))
+	for _, tool := range tools {
+		function := map[string]any{"name": tool.Function.Name}
+		if tool.Function.Description != "" {
+			function["description"] = tool.Function.Description
+		}
+		if len(tool.Function.Parameters) > 0 {
+			var parameters any
+			if err := json.Unmarshal(tool.Function.Parameters, &parameters); err != nil {
+				return nil, fmt.Errorf("invalid parameters for Kimi tool %q: %w", tool.Function.Name, err)
+			}
+			function["parameters"] = parameters
+		}
+		payload = append(payload, map[string]any{
+			"function": function,
+			"type":     tool.Type,
+		})
+	}
+	return json.Marshal(payload)
+}
+
 func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
 	imStart, ok1 := r.tok.SpecialID("<|im_start|>")
 	imEnd, ok2 := r.tok.SpecialID("<|im_end|>")
@@ -1763,23 +1966,39 @@ func (r *Runner) renderGraniteMessages(messages []ChatMessage, systemPrompt stri
 }
 
 func (r *Runner) chatTemplateKind() string {
-	if v, ok := r.gguf.Metadata["tokenizer.chat_template"]; ok {
-		if s, ok := v.AsString(); ok {
-			switch {
-			case strings.Contains(s, "[INST]") && strings.Contains(s, "[/INST]"):
-				return "mistral-inst"
-			case strings.Contains(s, "<|start_header_id|>") && strings.Contains(s, "<|eot_id|>"):
-				return "header-chat"
-			case strings.Contains(s, "<|im_start|>") && strings.Contains(s, "<|im_end|>"):
-				return "chatml"
-			case strings.Contains(s, "<|user|>") && strings.Contains(s, "<|assistant|>") && strings.Contains(s, "<|end|>"):
-				return "phi-chat"
-			case strings.Contains(s, "<｜User｜>") && strings.Contains(s, "<｜Assistant｜>"):
-				return "deepseek-r1-qwen"
-			case strings.Contains(s, "<|start_of_role|>") && strings.Contains(s, "<|end_of_role|>"):
-				return "granite-chat"
-			case strings.Contains(s, "<start_of_turn>") && strings.Contains(s, "<end_of_turn>"):
-				return "gemma-chat"
+	if r == nil || r.tok == nil {
+		return ""
+	}
+	if r.gguf != nil {
+		if v, ok := r.gguf.Metadata["tokenizer.chat_template"]; ok {
+			if s, ok := v.AsString(); ok {
+				switch {
+				case strings.Contains(s, "[INST]") && strings.Contains(s, "[/INST]"):
+					return "mistral-inst"
+				case strings.Contains(s, "<|start_header_id|>") && strings.Contains(s, "<|eot_id|>"):
+					return "header-chat"
+				case strings.Contains(s, "<|im_user|>") && strings.Contains(s, "<|im_assistant|>") && strings.Contains(s, "<|im_middle|>") && strings.Contains(s, "<|im_end|>"):
+					return "kimi-chat"
+				case strings.Contains(s, "<|im_start|>") && strings.Contains(s, "<|im_end|>"):
+					return "chatml"
+				case strings.Contains(s, "<|user|>") && strings.Contains(s, "<|assistant|>") && strings.Contains(s, "<|end|>"):
+					return "phi-chat"
+				case strings.Contains(s, "<｜User｜>") && strings.Contains(s, "<｜Assistant｜>"):
+					return "deepseek-r1-qwen"
+				case strings.Contains(s, "<|start_of_role|>") && strings.Contains(s, "<|end_of_role|>"):
+					return "granite-chat"
+				case strings.Contains(s, "<start_of_turn>") && strings.Contains(s, "<end_of_turn>"):
+					return "gemma-chat"
+				}
+			}
+		}
+	}
+	if _, ok := r.tok.SpecialID("<|im_user|>"); ok {
+		if _, ok := r.tok.SpecialID("<|im_assistant|>"); ok {
+			if _, ok := r.tok.SpecialID("<|im_middle|>"); ok {
+				if _, ok := r.tok.SpecialID("<|im_end|>"); ok {
+					return "kimi-chat"
+				}
 			}
 		}
 	}

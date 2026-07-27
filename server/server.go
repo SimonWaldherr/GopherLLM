@@ -19,6 +19,7 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/agentos"
 )
 
 //go:embed web_ui/chat.html
@@ -43,6 +44,10 @@ type chatTemplateData struct {
 	TopK          int
 	MinP          float32
 	RepeatPenalty float32
+	// MermaidCDN is the validated CDN key ("" when diagrams are off) and
+	// MermaidScript the full script URL the page should load.
+	MermaidCDN    string
+	MermaidScript string
 }
 
 type runnerState struct {
@@ -182,6 +187,9 @@ type HandlerOptions struct {
 	ModelDir string
 	// ModelPath is the initially loaded model's path (reported by /models).
 	ModelPath string
+	// ModelLoadOptions are retained for catalog hot-swaps, so a server started
+	// in out-of-core mode does not accidentally load the next model eagerly.
+	ModelLoadOptions gopherllm.LoadOptions
 	// ModelLoaded is called after a local model has been successfully loaded or
 	// hot-swapped. It is useful for hosts that persist the active selection.
 	// Callback failures are the host's responsibility and never undo a load.
@@ -202,6 +210,13 @@ type HandlerOptions struct {
 	// LogWriter receives handler diagnostics (skill load notes). Defaults to
 	// io.Discard.
 	LogWriter io.Writer
+	// AgentOS enables the agentic OS-command feature (a model proposes a local
+	// shell command, this Runner's Policy decides whether it needs a human
+	// click before it runs) when non-nil. Nil, the default, registers no
+	// /agentos endpoints at all — the feature does not exist on this server
+	// unless an operator deliberately configured a policy for it. See the
+	// agentos package for the safety model.
+	AgentOS *agentos.Runner
 }
 
 // modelLoadRequest accepts the model catalog ID used by the browser UI and
@@ -234,6 +249,7 @@ type ServeOptions struct {
 	ChatHistoryLock          *sync.Mutex
 	ModelDir                 string
 	ModelPath                string
+	ModelLoadOptions         gopherllm.LoadOptions
 	ModelLoaded              func(path string)
 	SkillsDir                string
 	// AppliedAutoTune carries forward a tuning already applied before Serve
@@ -245,6 +261,8 @@ type ServeOptions struct {
 	// LogWriter receives startup and handler diagnostics; Serve defaults it
 	// to os.Stderr (CLI behavior), unlike NewHandler's io.Discard.
 	LogWriter io.Writer
+	// AgentOS enables the agentic OS-command feature; see HandlerOptions.AgentOS.
+	AgentOS *agentos.Runner
 }
 
 // Serve builds the API handler and runs a blocking http.Server on opts.Addr.
@@ -264,11 +282,13 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		ChatUI:                opts.ChatUI,
 		ModelDir:              opts.ModelDir,
 		ModelPath:             opts.ModelPath,
+		ModelLoadOptions:      opts.ModelLoadOptions,
 		ModelLoaded:           opts.ModelLoaded,
 		SkillsDir:             opts.SkillsDir,
 		AppliedAutoTune:       opts.AppliedAutoTune,
 		BaselineRuntimeTuning: opts.BaselineRuntimeTuning,
 		LogWriter:             logw,
+		AgentOS:               opts.AgentOS,
 	})
 	server := &http.Server{Addr: opts.Addr, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
 	fmt.Fprintf(logw, "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
@@ -308,6 +328,12 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		fmt.Fprintf(logw, "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
 	wikimediaTools := newWikimediaClient(nil).tools()
+	skillsFor := func(enabled bool) []gopherllm.Skill {
+		if !enabled {
+			return nil
+		}
+		return skills
+	}
 	agenticToolsFor := func(enabled bool) []gopherllm.AgenticTool {
 		if !enabled {
 			return nil
@@ -414,10 +440,12 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			}
 			if body.Stream {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
-				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skills, agenticToolsFor(body.Wikimedia), includeUsage)
+				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia), includeUsage)
 				return
 			}
-			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
+			var timeline []gopherllm.AgentEvent
+			observe := func(e gopherllm.AgentEvent) { timeline = append(timeline, e) }
+			result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia), alwaysContinue, observe)
 			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -428,6 +456,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 				writeContextWindowHeaders(w, *result.ContextWindow)
 				response["gopherllm_context"] = result.ContextWindow
 			}
+			response = withAgentTimeline(response, timeline)
 			writeJSON(w, response)
 		})
 	}))
@@ -729,7 +758,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		newRunner, _, err := gopherllm.RunnerFromPath(entry.Path)
+		newRunner, _, err := gopherllm.RunnerFromPathWithOptions(entry.Path, opts.ModelLoadOptions)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -742,7 +771,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 				opts.ModelLoaded(entry.Path)
 			}
 		}()
-		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.Config().MaxSeqLen})
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.Config().MaxSeqLen, "out_of_core": newRunner.OutOfCore()})
 	}))
 	mux.HandleFunc("/models/embed/load", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -772,13 +801,13 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			http.Error(w, "selected model is not an embedding model", http.StatusBadRequest)
 			return
 		}
-		runner, _, err := gopherllm.RunnerFromPath(entry.Path)
+		runner, _, err := gopherllm.RunnerFromPathWithOptions(entry.Path, opts.ModelLoadOptions)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		embedder.swap(runner)
-		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(runner), "context_length": runner.Config().MaxSeqLen})
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(runner), "context_length": runner.Config().MaxSeqLen, "out_of_core": runner.OutOfCore()})
 	}))
 	mux.HandleFunc("/models/embed", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -871,6 +900,102 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 		fmt.Fprintf(logw, "Auto-tune via web UI: %s\n", res.SettingsLine())
 		writeJSON(w, map[string]any{"cached": cached, "result": res})
 	}))
+	mux.HandleFunc("/agentos/status", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.AgentOS == nil {
+			writeJSON(w, map[string]any{"enabled": false})
+			return
+		}
+		writeJSON(w, map[string]any{
+			"enabled": true,
+			"policy":  string(opts.AgentOS.Policy),
+			"allowed": opts.AgentOS.Allowed,
+		})
+	})
+	mux.HandleFunc("/agentos/propose", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.AgentOS == nil {
+			http.Error(w, "the agentic OS-command feature is not enabled on this server", http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Instruction string `json:"instruction"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		body.Instruction = strings.TrimSpace(body.Instruction)
+		if body.Instruction == "" {
+			http.Error(w, "instruction must not be empty", http.StatusBadRequest)
+			return
+		}
+		state.withRunner(func(r *gopherllm.Runner) {
+			options := opts.Defaults
+			options.SystemPrompt = agentos.SystemPrompt
+			options.Tools = nil
+			options.ToolChoice = "none"
+			options = withRequestContext(options, req)
+			result, err := r.GenerateChat([]gopherllm.ChatMessage{gopherllm.UserMessage(body.Instruction)}, options)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			proposal, err := agentos.ParseProposal(result.Text)
+			if err != nil {
+				http.Error(w, "model did not return a usable proposal: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+			decision := opts.AgentOS.Evaluate(proposal)
+			response := map[string]any{"proposal": proposal, "decision": decision}
+			// AutoRun means the operator's own policy (whitelist/allow), not the
+			// model's self-reported "safe" field, already authorizes this — see
+			// the agentos package comment on why Evaluate never reads Safe.
+			if decision.AutoRun {
+				res, dec, execErr := opts.AgentOS.Execute(req.Context(), proposal, false)
+				response["decision"] = dec
+				if execErr != nil {
+					response["error"] = execErr.Error()
+				} else {
+					response["result"] = res
+				}
+			}
+			writeJSON(w, response)
+		})
+	}))
+	mux.HandleFunc("/agentos/execute", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.AgentOS == nil {
+			http.Error(w, "the agentic OS-command feature is not enabled on this server", http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Proposal agentos.Proposal `json:"proposal"`
+			// Approved is the human's out-of-band decision — a button click in
+			// the browser, never anything read from the model's own output. See
+			// Runner.Execute's doc comment.
+			Approved bool `json:"approved"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		res, dec, err := opts.AgentOS.Execute(req.Context(), body.Proposal, body.Approved)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"decision": dec, "result": res})
+	}))
 	if opts.ChatUI {
 		mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 			if req.URL.Path != "/" {
@@ -879,8 +1004,12 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			}
 			http.Redirect(w, req, "/chat", http.StatusFound)
 		})
-		mux.HandleFunc("/chat", func(w http.ResponseWriter, _ *http.Request) {
-			setChatUIHeaders(w)
+		mux.HandleFunc("/chat", func(w http.ResponseWriter, req *http.Request) {
+			// The diagram renderer is chosen in the browser's Settings, but the
+			// CSP that permits it is a response header, so the choice travels
+			// back as a query parameter and is validated against the map above.
+			mermaid := mermaidChoice(req.URL.Query().Get("mermaid"))
+			setChatUIHeaders(w, mermaid)
 			w.Header().Set("content-type", "text/html; charset=utf-8")
 			model := modelID(state.get())
 			if model == "" {
@@ -895,18 +1024,22 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 				TopK:          opts.Defaults.Sampler.TopK,
 				MinP:          opts.Defaults.Sampler.MinP,
 				RepeatPenalty: opts.Defaults.Sampler.RepeatPenalty,
+				MermaidCDN:    mermaid,
+			}
+			if cdn, ok := mermaidCDNs[mermaid]; ok {
+				data.MermaidScript = cdn.Script
 			}
 			if err := chatTemplate.Execute(w, data); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}
 		})
 		mux.HandleFunc("/style.css", func(w http.ResponseWriter, _ *http.Request) {
-			setChatUIHeaders(w)
+			setChatUIHeaders(w, "")
 			w.Header().Set("content-type", "text/css; charset=utf-8")
 			fmt.Fprint(w, chatCSS)
 		})
 		mux.HandleFunc("/script.js", func(w http.ResponseWriter, _ *http.Request) {
-			setChatUIHeaders(w)
+			setChatUIHeaders(w, "")
 			w.Header().Set("content-type", "text/javascript; charset=utf-8")
 			fmt.Fprint(w, chatJS)
 		})
@@ -942,12 +1075,44 @@ func needsLoadedModel(path string) bool {
 
 // setChatUIHeaders keeps the local browser workspace private to this origin:
 // chat HTML and its assets are never cached and cannot load third-party code.
-func setChatUIHeaders(w http.ResponseWriter) {
+// mermaidCDNs are the only origins the chat page may load a diagram renderer
+// from. Mermaid is ~2.8 MB, so embedding it would inflate every binary for a
+// feature most sessions never use; loading it from a CDN is the alternative,
+// and that means punching a hole in the CSP. The hole is kept as small as
+// possible: one operator-chosen origin, named here rather than assembled from
+// user input, and absent entirely unless a choice was made.
+var mermaidCDNs = map[string]struct {
+	Origin string
+	Script string
+}{
+	"jsdelivr": {"https://cdn.jsdelivr.net", "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"},
+	"unpkg":    {"https://unpkg.com", "https://unpkg.com/mermaid@11/dist/mermaid.min.js"},
+	"cdnjs":    {"https://cdnjs.cloudflare.com", "https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.1/mermaid.min.js"},
+}
+
+// mermaidChoice validates a requested CDN key, returning "" for "no diagrams".
+func mermaidChoice(raw string) string {
+	key := strings.ToLower(strings.TrimSpace(raw))
+	if _, ok := mermaidCDNs[key]; ok {
+		return key
+	}
+	return ""
+}
+
+func setChatUIHeaders(w http.ResponseWriter, mermaidCDN string) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self'; style-src 'self'")
+	script, style := "'self'", "'self'"
+	if cdn, ok := mermaidCDNs[mermaidCDN]; ok {
+		script += " " + cdn.Origin
+		// Mermaid styles the SVG it builds with inline <style>, so drawing a
+		// diagram needs this. It is scoped to the page that opted in: with no
+		// CDN chosen the policy stays strict.
+		style += " 'unsafe-inline'"
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; script-src "+script+"; style-src "+style)
 }
 
 func displayServerURL(addr string, chatUI bool) string {
@@ -1102,7 +1267,14 @@ type OpenAIChatRequest struct {
 	// it preserves normal OpenAI-compatible full-history semantics.
 	GopherLLMContextMode string `json:"gopherllm_context_mode"`
 	Wikimedia            bool   `json:"gopherllm_wikimedia"`
+	// Skills is a pointer so an absent field keeps the historical default
+	// (skills offered whenever --skills-dir is configured) while a client that
+	// wants them off can say so.
+	Skills *bool `json:"gopherllm_skills"`
 }
+
+// SkillsEnabled reports whether this request wants the load_skill tool offered.
+func (o OpenAIChatRequest) SkillsEnabled() bool { return o.Skills == nil || *o.Skills }
 
 // OpenAIStreamOpts is the OpenAI "stream_options" object; IncludeUsage gates
 // whether the final SSE chunk carries a "usage" field (off by default, per
@@ -1524,13 +1696,25 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		}
 		return true
 	}
-	result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, tools, func(text string) bool {
+	// Tool activity is streamed as it happens, in its own chunk field, so the
+	// browser can show a live timeline instead of an unexplained pause. It
+	// rides alongside the content deltas rather than replacing them.
+	observe := func(event gopherllm.AgentEvent) {
+		if streamErr != nil || req.Context().Err() != nil {
+			return
+		}
+		if err := writeOpenAIStreamChunk(w, flusher, id, model, created,
+			map[string]any{}, map[string]any{"gopherllm_agent": event}); err != nil {
+			streamErr = err
+		}
+	}
+	result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skills, tools, func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
 		}
 		return thinkSplitter.Push(text, emit)
-	})
+	}, observe)
 	if streamErr != nil {
 		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, streamErr)
 		return
@@ -1897,6 +2081,19 @@ func openAIChatResponse(model string, result gopherllm.GenerationResult) map[str
 	response := map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "system_fingerprint": systemFingerprint, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
 	if result.PromptCache != nil {
 		response["gopherllm_cache"] = result.PromptCache
+	}
+	return response
+}
+
+// withAgentTimeline attaches the turn's tool activity to a non-streaming
+// response, in the same shape (kind/iteration/tool/result/duration_ms) the
+// streaming path already sends per-chunk as gopherllm_agent — so a client
+// gets the same visibility into what ran and how long it took, regardless of
+// whether it asked for a stream. A nil or empty timeline (the common,
+// tool-free case) leaves the response exactly as it was.
+func withAgentTimeline(response map[string]any, timeline []gopherllm.AgentEvent) map[string]any {
+	if len(timeline) > 0 {
+		response["gopherllm_agent"] = timeline
 	}
 	return response
 }

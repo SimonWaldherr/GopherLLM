@@ -33,6 +33,11 @@ func quantExpertWeightForTest(typ GGMLType, input, output, experts int, seed int
 				// Q6_K stores its f16 block scale at the end.
 				row[off+209] = 0x2c
 				off += 210
+			case GGMLTypeMXFP4:
+				// MXFP4's exponent is the last byte of each 32-value block.
+				// Keep scale at 2^(127-127)=1 so random mantissas stay finite.
+				row[off+16] = 127
+				off += 17
 			default:
 				panic("unsupported quantized expert test type")
 			}
@@ -70,7 +75,7 @@ func TestExpertMatvecQuantPlanesMatchRowDot(t *testing.T) {
 	const (
 		input, output, experts = 512, 128, 3
 	)
-	for _, typ := range []GGMLType{GGMLTypeQ4_K, GGMLTypeQ6_K} {
+	for _, typ := range []GGMLType{GGMLTypeQ4_K, GGMLTypeQ6_K, GGMLTypeMXFP4} {
 		t.Run(typ.String(), func(t *testing.T) {
 			w := quantExpertWeightForTest(typ, input, output, experts, int64(100+typ))
 			x := randomExpertInput(input, int64(200+typ))
@@ -94,6 +99,48 @@ func TestExpertMatvecQuantPlanesMatchRowDot(t *testing.T) {
 						}
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestExpertMatvecPairQuantPlanesMatchRowDot(t *testing.T) {
+	const (
+		input, output, experts = 512, 96, 3
+	)
+	for _, typ := range []GGMLType{GGMLTypeQ4_K, GGMLTypeQ6_K} {
+		t.Run(typ.String(), func(t *testing.T) {
+			gate := quantExpertWeightForTest(typ, input, output, experts, int64(700+typ))
+			up := quantExpertWeightForTest(typ, input, output, experts, int64(800+typ))
+			x := randomExpertInput(input, int64(900+typ))
+			for _, expert := range []int{0, experts - 1} {
+				wantGate := expertMatvecRowDotReference(gate, expert, x)
+				wantUp := expertMatvecRowDotReference(up, expert, x)
+				var gotGate, gotUp, sums []float32
+				withQ8Activations(false, func() {
+					if !expertMatvec2Into(gate, up, expert, x, &sums, &gotGate, &gotUp) {
+						t.Fatalf("expert pair path declined %s", typ)
+					}
+				})
+				for _, pair := range []struct {
+					name string
+					got  []float32
+					want []float32
+				}{
+					{"gate", gotGate, wantGate},
+					{"up", gotUp, wantUp},
+				} {
+					if len(pair.got) != len(pair.want) {
+						t.Fatalf("expert %d %s length = %d, want %d", expert, pair.name, len(pair.got), len(pair.want))
+					}
+					for i := range pair.want {
+						diff := math.Abs(float64(pair.got[i] - pair.want[i]))
+						limit := 1e-2 * math.Max(1, math.Abs(float64(pair.want[i])))
+						if diff > limit {
+							t.Fatalf("expert %d %s row %d = %v, want %v (diff %g, limit %g)", expert, pair.name, i, pair.got[i], pair.want[i], diff, limit)
+						}
+					}
+				}
 			}
 		})
 	}
@@ -124,4 +171,47 @@ func BenchmarkExpertMatvecQ4K_1024x1024(b *testing.B) {
 
 func BenchmarkExpertMatvecQ6K_1024x1024(b *testing.B) {
 	benchmarkExpertMatvec(b, GGMLTypeQ6_K)
+}
+
+func BenchmarkExpertMatvecMXFP4_1024x1024(b *testing.B) {
+	benchmarkExpertMatvec(b, GGMLTypeMXFP4)
+}
+
+func benchmarkSparseMoEWeights(dim, hidden, experts, used int) *SparseMoEWeights {
+	rng := rand.New(rand.NewSource(501))
+	fill := func(n int) []float32 {
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = (rng.Float32()*2 - 1) * 0.05
+		}
+		return v
+	}
+	return &SparseMoEWeights{
+		Router:        Weight{F32: fill(experts * dim)},
+		Gate:          ExpertWeight{Weight: Weight{F32: fill(experts * hidden * dim)}, Input: dim, Output: hidden, Experts: experts},
+		Up:            ExpertWeight{Weight: Weight{F32: fill(experts * hidden * dim)}, Input: dim, Output: hidden, Experts: experts},
+		Down:          ExpertWeight{Weight: Weight{F32: fill(experts * dim * hidden)}, Input: hidden, Output: dim, Experts: experts},
+		NormalizeTopK: true,
+		Scale:         1,
+		ExpertUsed:    used,
+	}
+}
+
+// BenchmarkSparseMoEForward measures the complete decode-time MoE branch:
+// router top-k, expert SwiGLUs, and weighted aggregation. 128/6 matches the
+// common high-expert deployment shape while the 256-wide synthetic matrices
+// keep the benchmark suitable for normal developer machines.
+func BenchmarkSparseMoEForward_E128_K6_256x256(b *testing.B) {
+	const dim, hidden, experts, used = 256, 256, 128, 6
+	w := benchmarkSparseMoEWeights(dim, hidden, experts, used)
+	x := randomExpertInput(dim, 502)
+	buf := NewDecodeBuffer(Config{Dim: dim, HiddenDim: hidden, ExpertCount: experts}, dim, 1, dim)
+	sparseMoEForward(w, x, buf) // warm scratch capacity before allocation metrics
+	b.ReportAllocs()
+	// Three selected expert matrices are streamed for each active expert.
+	b.SetBytes(int64(3 * used * dim * hidden * 4))
+	b.ResetTimer()
+	for b.Loop() {
+		sparseMoEForward(w, x, buf)
+	}
 }

@@ -14,11 +14,11 @@ func TestResolveInternalToolCallsExecutesOnlyServerTools(t *testing.T) {
 		},
 	}
 	calls := []ToolCall{{ID: "id1", Function: ToolCallFunction{Name: "lookup", Arguments: `{"q":"Berlin"}`}}}
-	msgs, ok := resolveInternalToolCalls(context.Background(), calls, nil, []AgenticTool{tool})
+	msgs, ok := resolveInternalToolCalls(context.Background(), calls, nil, []AgenticTool{tool}, 1, nil)
 	if !ok || len(msgs) != 2 || msgs[1].Content != `result for {"q":"Berlin"}` {
 		t.Fatalf("resolved = %#v, ok = %v", msgs, ok)
 	}
-	if _, ok := resolveInternalToolCalls(context.Background(), append(calls, ToolCall{ID: "id2", Function: ToolCallFunction{Name: "caller_tool"}}), nil, []AgenticTool{tool}); ok {
+	if _, ok := resolveInternalToolCalls(context.Background(), append(calls, ToolCall{ID: "id2", Function: ToolCallFunction{Name: "caller_tool"}}), nil, []AgenticTool{tool}, 1, nil); ok {
 		t.Fatal("mixed server/caller calls must stay with the caller")
 	}
 }

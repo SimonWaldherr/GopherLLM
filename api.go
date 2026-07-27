@@ -35,6 +35,8 @@ type loadSettings struct {
 	threads          int
 	prepareQuantized bool
 	useMetal         bool
+	outOfCore        bool
+	prefault         MmapPrefaultMode
 }
 
 // WithLogWriter directs load-progress and warning diagnostics (GGUF summary,
@@ -66,6 +68,22 @@ func WithPrepareQuantized(enabled bool) Option {
 // supports them.
 func WithMetal(enabled bool) Option {
 	return func(s *loadSettings) { s.useMetal = enabled }
+}
+
+// WithOutOfCore loads a single-file GGUF through a CPU-only demand-paged mmap
+// path. Scalar F16/F32/BF16 weights stay in their on-disk form rather than
+// expanding into an owned float32 copy, and sparse MoE expert banks are not
+// prewarmed. It cannot be combined with Metal or prepared quantized weights.
+func WithOutOfCore(enabled bool) Option {
+	return func(s *loadSettings) { s.outOfCore = enabled }
+}
+
+// WithMmapPrefault sets the explicit mmap warm-up policy. The zero value
+// (MmapPrefaultAll) preserves normal eager readiness; MmapPrefaultNone is
+// useful for profiling demand paging. WithOutOfCore changes All to Core so
+// sparse expert banks stay cold by default.
+func WithMmapPrefault(mode MmapPrefaultMode) Option {
+	return func(s *loadSettings) { s.prefault = mode }
 }
 
 // Open memory-maps and loads a GGUF model file. The returned Model borrows
@@ -112,6 +130,8 @@ func (s loadSettings) loadOptions() LoadOptions {
 	return LoadOptions{
 		PrepareQuantized: s.prepareQuantized,
 		UseMetal:         s.useMetal,
+		OutOfCore:        s.outOfCore,
+		Prefault:         s.prefault,
 		LogWriter:        s.logw,
 	}
 }
