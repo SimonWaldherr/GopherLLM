@@ -33,7 +33,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Split/sharded GGUF loading: point at any one shard of a
   `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
   and merged automatically (see [Performance Notes](#performance-notes)).
-- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS,
+- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ2_S, IQ3_S, IQ4_NL, IQ4_XS,
   Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/F64/BF16 load
   directly (BF16 covers QAT-derived and modern full-precision GGUFs).
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
@@ -50,7 +50,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
   `/v1/embeddings`, `/v1/skills`, `/api/generate`, `/api/chat`, and `/api/embeddings`.
 - Optional browser chat UI served from the embedded `web_ui` assets, with
   persistent local conversations and a template-aware smart context window.
-- Model discovery for LM Studio community model directories.
+- Model discovery across the complete local LM Studio model library.
 
 ## Requirements
 
@@ -58,7 +58,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - A GGUF text model. By default the tool scans:
 
 ```sh
-~/.cache/lm-studio/models/lmstudio-community
+~/.cache/lm-studio/models
 ```
 
 That default is resolved in this order: the `--model-dir <path>` flag (highest
@@ -211,13 +211,13 @@ Line Tools `make` directly if that happens:
 List discovered GGUF models:
 
 ```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" --list-models
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" --list-models
 ```
 
 Run a prompt against a selected model:
 
 ```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --model "model-name-or-file-fragment" \
   --prompt "Explain local LLM inference in three sentences." \
   --max-tokens 128
@@ -235,7 +235,7 @@ bin/gopherllm /path/to/model.gguf \
 Start an interactive REPL:
 
 ```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --model "model-name-or-file-fragment" \
   --repl
 ```
@@ -243,7 +243,7 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
 Run with a [skill](#tool-use--agentic) available (one-shot or REPL alike):
 
 ```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --model "model-name-or-file-fragment" \
   --skills-dir ./skills \
   --prompt "How do I fill out a PDF form on the command line?"
@@ -300,7 +300,7 @@ The same features are available in the library as `AnalyzeGGUF`,
 Start the API server with the embedded chat UI:
 
 ```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --model "model-name-or-file-fragment" \
   --serve 127.0.0.1:8080 \
   --chat
@@ -313,7 +313,7 @@ was selected at startup or through the browser/API model picker). Restart it
 without `--model` and it automatically reloads that model:
 
 ```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models/lmstudio-community" \
+bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --serve 127.0.0.1:8080 --chat
 ```
 
@@ -929,6 +929,7 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 
 ```text
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, qwen3, qwen3moe,
+qwen35, qwen35moe,
 deepseek2, kimi_k2,
 phi3, granite (dense), exaone, internlm2, stablelm, gpt-oss, gemma, gemma2, gemma3, gemma4,
 nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
@@ -949,10 +950,17 @@ Qwen2.5-Math, and QwQ checkpoints when they declare that architecture;
 shared expert. `qwen3` covers dense text-only Qwen3 (including Qwen3-based
 DeepSeek-R1 distills) with mandatory per-head QK-norm. `qwen3moe` adds the
 matching normalized sparse routing and QK-norm required by Qwen3-MoE, including
-Qwen3-Coder GGUFs that declare `qwen3moe`. Qwen vision-language and hybrid
-families are deliberately outside this scope: `qwen2vl`, `qwen3vl`,
-`qwen3vlmoe`, `qwen3next`, `qwen35`, and `qwen35moe` need multimodal MRoPE,
-visual-feature injection, DeltaNet, or other non-standard graphs.
+Qwen3-Coder GGUFs that declare `qwen3moe`. `qwen35` and `qwen35moe` have a
+native experimental hybrid Gated-DeltaNet / periodic-attention path;
+`qwen35moe` also uses the sparse-expert implementation and Qwen-style gated
+shared experts (including Ornith-style GGUFs). The loader and tensor geometry
+are covered by structural tests, but output parity for the hybrid DeltaNet
+graph is not yet validated and the runtime emits an explicit warning. Vision
+families that require visual-feature injection or multimodal MRoPE remain
+outside this text-generation scope: `qwen2vl`, `qwen3vl`, `qwen3vlmoe`, and
+`qwen3next`. Qwen3.6 GGUFs with trailing MTP draft layers load for ordinary
+generation; the draft layer is intentionally skipped until speculative
+decoding is implemented.
 
 `deepseek2` and `kimi_k2` provide a dedicated Multi-head Latent Attention
 (MLA) path for Kimi K2 and compatible single-group MLA GGUFs. It uses a

@@ -110,6 +110,8 @@ func TestGGMLTypeDataSize(t *testing.T) {
 		{GGMLTypeF16, 10, 20},
 		{GGMLTypeQ8_0, 32, 34},
 		{GGMLTypeIQ4_NL, 32, 18},
+		{GGMLTypeIQ2_S, 256, 82},
+		{GGMLTypeIQ3_S, 256, 110},
 		{GGMLTypeIQ4_XS, 256, 136},
 		{GGMLTypeQ4_K, 256, 144},
 		{GGMLTypeQ6_K, 256, 210},
@@ -147,6 +149,17 @@ func TestGGMLTypeBlockBytes(t *testing.T) {
 		got, ok := tt.typ.BlockBytes()
 		if !ok || got != tt.want {
 			t.Fatalf("%s BlockBytes = %d, %v; want %d, true", tt.typ, got, ok, tt.want)
+		}
+	}
+}
+
+func TestGGMLTypeFromUint32RecognizesIQS(t *testing.T) {
+	for raw, want := range map[uint32]GGMLType{
+		21: GGMLTypeIQ3_S,
+		22: GGMLTypeIQ2_S,
+	} {
+		if got := ggmlTypeFromUint32(raw); got != want {
+			t.Fatalf("ggmlTypeFromUint32(%d) = %s, want %s", raw, got, want)
 		}
 	}
 }

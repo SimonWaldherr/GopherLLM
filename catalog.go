@@ -11,7 +11,15 @@ import (
 	"strings"
 )
 
-const lmStudioCommunitySubdir = ".cache/lm-studio/models/lmstudio-community"
+const (
+	// lmStudioModelsSubdir is LM Studio's library root. Models downloaded
+	// from the community catalog as well as manually added repositories live
+	// below it, so scanning only lmstudio-community hides valid local GGUFs.
+	lmStudioModelsSubdir = ".cache/lm-studio/models"
+	// lmStudioCommunitySubdir is retained as a fallback for older LM Studio
+	// installs whose parent library directory has not been created yet.
+	lmStudioCommunitySubdir = lmStudioModelsSubdir + "/lmstudio-community"
+)
 
 // ModelEntry describes one GGUF file found under the model directory. ID is
 // the root-relative path without the .gguf suffix (unique within a scan and
@@ -47,7 +55,8 @@ func (m ModelEntry) Status() string {
 // DefaultModelDir returns the directory scanned when --model-dir is not
 // given: $GOPHERLLM_MODEL_DIR if set, else the deprecated $RUSTY_LLM_MODEL_DIR
 // (the project's pre-rename spelling, kept so existing environments keep
-// working), else the LM Studio community models directory under $HOME.
+// working), else the LM Studio library root under $HOME. If that root does
+// not exist yet, the former community-only path remains the fallback.
 // (MODEL_DIR is a Makefile variable, not read here.)
 func DefaultModelDir() string {
 	if path := strings.TrimSpace(os.Getenv("GOPHERLLM_MODEL_DIR")); path != "" {
@@ -58,9 +67,13 @@ func DefaultModelDir() string {
 		return path
 	}
 	if home := os.Getenv("HOME"); home != "" {
+		root := filepath.Join(home, lmStudioModelsSubdir)
+		if st, err := os.Stat(root); err == nil && st.IsDir() {
+			return root
+		}
 		return filepath.Join(home, lmStudioCommunitySubdir)
 	}
-	return lmStudioCommunitySubdir
+	return lmStudioModelsSubdir
 }
 
 // DiscoverModels recursively finds every .gguf under root and parses each

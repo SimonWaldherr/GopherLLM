@@ -75,14 +75,19 @@ type Config struct {
 	// paths. These fields are unused by the standard transformer path. A
 	// zero-valued per-layer entry means that the layer does not expose that
 	// component.
-	LayerHeads            []int
-	LayerKVHeads          []int
-	LayerFFNDim           []int
-	SSMConv               int
-	SSMInner              int
-	SSMState              int
-	SSMHeads              int
-	SSMGroups             int
+	LayerHeads   []int
+	LayerKVHeads []int
+	LayerFFNDim  []int
+	SSMConv      int
+	SSMInner     int
+	SSMState     int
+	SSMHeads     int
+	SSMGroups    int
+	// FullAttentionInterval is Qwen3.5/3.6's hybrid schedule: layer il (0
+	// indexed) keeps ordinary self-attention when (il+1)%FullAttentionInterval
+	// == 0, and uses the Gated DeltaNet linear-recurrent mixer otherwise. Zero
+	// means the architecture does not use this schedule.
+	FullAttentionInterval int
 	ExpertWeightsNorm     bool
 	ExpertWeightsScale    float32
 	ExpertWeightsNormClip float32
@@ -282,6 +287,14 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		cfg.SSMHeads = int(gguf.GetU32(p+".ssm.time_step_rank", 0))
 		cfg.SSMGroups = int(gguf.GetU32(p+".ssm.group_count", 0))
 	}
+	if p == "qwen35" || p == "qwen35moe" {
+		cfg.SSMConv = int(gguf.GetU32(p+".ssm.conv_kernel", 0))
+		cfg.SSMInner = int(gguf.GetU32(p+".ssm.inner_size", 0))
+		cfg.SSMState = int(gguf.GetU32(p+".ssm.state_size", 0))
+		cfg.SSMHeads = int(gguf.GetU32(p+".ssm.time_step_rank", 0))
+		cfg.SSMGroups = int(gguf.GetU32(p+".ssm.group_count", 0))
+		cfg.FullAttentionInterval = int(gguf.GetU32(p+".full_attention_interval", 0))
+	}
 	if v, ok := gguf.Metadata[p+".expert_weights_norm"]; ok {
 		if norm, ok := v.AsBool(); ok {
 			cfg.ExpertWeightsNorm = norm
@@ -381,6 +394,10 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeIQ4_NL:
 		MatvecIQ4NLInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ2_S:
+		MatvecIQ2SInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ3_S:
+		MatvecIQ3SInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeIQ4_XS:
 		MatvecIQ4XSInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_1:
@@ -579,6 +596,12 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeIQ4_NL:
 		rowBytes := (cols / 32) * 18
 		DequantRowIQ4NLInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ2_S:
+		rowBytes := (cols / 256) * 82
+		DequantRowIQ2SInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ3_S:
+		rowBytes := (cols / 256) * 110
+		DequantRowIQ3SInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeIQ4_XS:
 		rowBytes := (cols / 256) * 136
 		DequantRowIQ4XSInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
@@ -784,8 +807,12 @@ type KVCache struct {
 	// Nemotron is the shared recurrent cache for Mamba-2 graphs. Hybrid
 	// Nemotron-H also uses K/V rows; pure Mamba2 leaves those dimensions empty.
 	Nemotron *NemotronHCache
-	K16      [][]uint16
-	V16      [][]uint16
+	// Qwen35 is the Gated DeltaNet recurrent state for the qwen35/qwen35moe
+	// hybrid graph. Its periodic full-attention layers use the K/V rows above,
+	// same dual-cache pattern as Nemotron-H.
+	Qwen35 *Qwen35Cache
+	K16    [][]uint16
+	V16    [][]uint16
 }
 
 // NewKVCache allocates an f32 cache for `layers` layers of maxLen positions
@@ -917,9 +944,24 @@ type DecodeBuffer struct {
 	MambaDT                 []float32
 	MambaY                  []float32
 	MambaKernel             []float32
-	ExpertRow               []float32
-	ExpertHidden            []float32
-	batch                   batchDecodeBuffer
+	// MambaBeta/MambaRecall are Qwen3.5 Gated DeltaNet scratch: MambaBeta is
+	// the per-head delta-rule mixing gate (reuses the Mamba naming scheme
+	// rather than adding a parallel "DeltaNet*" set, since they play the same
+	// per-head-scratch role as MambaDT etc.), MambaRecall is the single head's
+	// worth of scratch for what the state currently predicts for this token's
+	// key, before the delta correction.
+	MambaBeta   []float32
+	MambaRecall []float32
+	// QGate/AttnGate are Qwen3.5's gated-attention scratch: attn_q projects
+	// each head to [query(headDim) | gate(headDim)] rather than plain
+	// headDim, so QGate holds the raw strided projection and AttnGate the
+	// extracted, compactly-packed gate half (the query half is copied into
+	// the ordinary Q buffer so every existing per-head helper still applies).
+	QGate        []float32
+	AttnGate     []float32
+	ExpertRow    []float32
+	ExpertHidden []float32
+	batch        batchDecodeBuffer
 }
 
 type ExpertScore struct {
@@ -1509,7 +1551,7 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 			f[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
 		}
 		return Weight{F32: f}, nil
-	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeIQ4_XS, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
+	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeIQ2_S, GGMLTypeIQ3_S, GGMLTypeIQ4_XS, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
 		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
 		if forceF32 {
 			f, ok := dequantTensor(info.DType, raw, numel)
@@ -1550,6 +1592,10 @@ func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
 		return DequantRowQ4_0(raw, numel), true
 	case GGMLTypeIQ4_NL:
 		return DequantRowIQ4NL(raw, numel), true
+	case GGMLTypeIQ2_S:
+		return DequantRowIQ2S(raw, numel), true
+	case GGMLTypeIQ3_S:
+		return DequantRowIQ3S(raw, numel), true
 	case GGMLTypeIQ4_XS:
 		return DequantRowIQ4XS(raw, numel), true
 	case GGMLTypeQ4_1:
@@ -2166,6 +2212,10 @@ func sameTypeQuantDot(a, b Weight, x []float32) (quantRowDot, int, bool) {
 		dot = DotQ4_0F32
 	case GGMLTypeIQ4_NL:
 		dot = DotIQ4NLF32
+	case GGMLTypeIQ2_S:
+		dot = DotIQ2SF32
+	case GGMLTypeIQ3_S:
+		dot = DotIQ3SF32
 	case GGMLTypeIQ4_XS:
 		dot = DotIQ4XSF32
 	case GGMLTypeQ4_1:

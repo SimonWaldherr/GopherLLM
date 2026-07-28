@@ -22,7 +22,7 @@ METAL_LDFLAGS ?= $(if $(METAL_SDK),-isysroot $(METAL_SDK),)
 METAL_BIN    ?= $(BUILD_DIR)/$(BINARY)-metal
 METAL_TAGS   ?= metal
 
-MODEL_DIR     ?= $(HOME)/.cache/lm-studio/models/lmstudio-community
+MODEL_DIR     ?= $(HOME)/.cache/lm-studio/models
 MODEL         ?=
 PROMPT        ?= Wer war Albert Einstein?
 SYNONYM_PROMPT ?= Nenne ein Synonym für Synonym und antworte nur mit diesem einen Wort.

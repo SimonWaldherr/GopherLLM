@@ -240,6 +240,7 @@ const (
 	loadedNemotronH
 	loadedMamba2
 	loadedBERT
+	loadedQwen35
 )
 
 // prefixCacheState owns no additional KV memory: it points at the retained
@@ -268,6 +269,7 @@ type Runner struct {
 	nemotronH      NemotronHWeights
 	mamba2         Mamba2Weights
 	bert           BERTWeights
+	qwen35         Qwen35Weights
 	genLock        sync.Mutex
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
@@ -286,6 +288,9 @@ type Runner struct {
 //   - Mixtral/Llama-MoE, qwen2moe, qwen3moe, gpt-oss, and DeepSeek/Kimi use
 //     sparse experts when their router tensors are present. deepseek2 uses a
 //     dedicated MLA attention path and its sigmoid/noaux shared-expert router.
+//   - qwen35/qwen35moe use the experimental native Gated-DeltaNet hybrid
+//     loader. qwen35moe shares the validated sparse-expert tensor path; a
+//     trailing Qwen MTP draft layer is skipped for ordinary generation.
 //   - Phi-3, dense Granite, EXAONE, and InternLM2 use the same pre-norm, RoPE, GQA and
 //     SwiGLU graph as the standard loader. Their architecture-specific scales
 //     are read from GGUF metadata by ConfigFromGGUF.
@@ -295,7 +300,7 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
+		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
 		return true
 	default:
 		return false
@@ -378,6 +383,16 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 			return nil, err
 		}
 		r.config, r.mamba2, r.kind = config, weights, loadedMamba2
+	case "qwen35", "qwen35moe":
+		// Reconstructed without a reference implementation — loads and runs
+		// but does not yet produce coherent text; see qwen35.go's package
+		// comment for exactly what has and hasn't been validated.
+		fmt.Fprintln(logw, "Warning: qwen35 support is experimental and unvalidated (loads and runs, but generation is not yet coherent — see qwen35.go)")
+		config, weights, err := LoadQwen35Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
+		if err != nil {
+			return nil, err
+		}
+		r.config, r.qwen35, r.kind = config, weights, loadedQwen35
 	case "gpt-oss":
 		config, weights, err := LoadGptOssModel(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
@@ -508,6 +523,8 @@ func (r *Runner) releaseMetalWeights() {
 		releaseNemotronHMetalWeights(&r.nemotronH)
 	case loadedMamba2:
 		releaseMamba2MetalWeights(&r.mamba2)
+	case loadedQwen35:
+		releaseQwen35MetalWeights(&r.qwen35)
 	default:
 		releaseModelMetalWeights(&r.standard)
 	}
@@ -889,9 +906,10 @@ func (r *Runner) clearPrefixCache() {
 }
 
 func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
-	// Recurrent Mamba state must be replayed from the beginning. Reusing only
-	// the attention K/V rows (or none at all for pure Mamba2) would be wrong.
-	return r.kind != loadedNemotronH && r.kind != loadedMamba2 && cache != nil && cache == r.workspaceCache
+	// Recurrent Mamba/DeltaNet state must be replayed from the beginning.
+	// Reusing only the attention K/V rows (or none at all for pure Mamba2)
+	// would be wrong.
+	return r.kind != loadedNemotronH && r.kind != loadedMamba2 && r.kind != loadedQwen35 && cache != nil && cache == r.workspaceCache
 }
 
 // prefixReuse returns the exact number of resident KV positions that can be
@@ -941,7 +959,7 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.F16)
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
-			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 {
+			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 && r.kind != loadedQwen35 {
 				if copied := copyKVPrefix(cache, old, len(r.prefixCache.tokens)); copied == len(r.prefixCache.tokens) {
 					r.prefixCache.cache = cache
 				} else {
@@ -962,6 +980,12 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		// overwrite it, so a reused workspace must start every request at zero.
 		cache.Nemotron.reset()
 	}
+	if r.kind == loadedQwen35 {
+		if !cache.Qwen35.compatible(r.config) {
+			cache.Qwen35 = newQwen35Cache(r.config)
+		}
+		cache.Qwen35.reset()
+	}
 	if r.workspaceBuf == nil {
 		r.workspaceBuf = NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
 	}
@@ -974,6 +998,8 @@ func (r *Runner) forwardTokenInto(cache *KVCache, buf *DecodeBuffer, token uint3
 		ForwardNemotronHInto(r.config, r.nemotronH, cache, buf, token, pos, logits)
 	case loadedMamba2:
 		ForwardMamba2Into(r.config, r.mamba2, cache, buf, token, pos, logits)
+	case loadedQwen35:
+		ForwardQwen35Into(r.config, r.qwen35, cache, buf, token, pos, logits)
 	case loadedGptOss:
 		ForwardGptOssInto(r.config, r.gptOss, cache, buf, token, pos, logits)
 	case loadedGemma4:
@@ -1004,6 +1030,12 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, logits)
+	case loadedQwen35:
+		ForwardQwen35BodyInto(r.config, r.qwen35, cache, buf, token, pos)
+		if next, ok := argmaxOutputTokenInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, logits); ok {
+			return next, true
+		}
+		ProjectLogitsInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, logits)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenInto(r.config, r.gptOss.Standard, buf, logits); ok {
@@ -1032,6 +1064,8 @@ func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uin
 		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
 	case loadedMamba2:
 		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
+	case loadedQwen35:
+		ForwardQwen35BodyInto(r.config, r.qwen35, cache, buf, token, pos)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
@@ -1152,6 +1186,8 @@ func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token ui
 		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
 	case loadedMamba2:
 		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
+	case loadedQwen35:
+		ForwardQwen35BodyInto(r.config, r.qwen35, cache, buf, token, pos)
 	case loadedGptOss:
 		ForwardPrefill(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:

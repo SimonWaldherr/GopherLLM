@@ -46,7 +46,7 @@ func TestSelectModelReportsAmbiguousTextMatches(t *testing.T) {
 }
 
 func TestArchitectureSupportedCoversImplementedLoaders(t *testing.T) {
-	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "bert", "nomic-bert"} {
+	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "bert", "nomic-bert"} {
 		if !ArchitectureSupported(arch) {
 			t.Fatalf("ArchitectureSupported(%q) = false, want true", arch)
 		}
@@ -124,9 +124,16 @@ func TestDefaultModelDirPrefersEnvironment(t *testing.T) {
 	}
 	t.Setenv("GOPHERLLM_MODEL_DIR", "")
 	t.Setenv("RUSTY_LLM_MODEL_DIR", "")
-	t.Setenv("HOME", "/home/tester")
-	if got := DefaultModelDir(); got != filepath.Join("/home/tester", lmStudioCommunitySubdir) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if got := DefaultModelDir(); got != filepath.Join(home, lmStudioCommunitySubdir) {
 		t.Fatalf("DefaultModelDir() = %q", got)
+	}
+	if err := os.MkdirAll(filepath.Join(home, lmStudioModelsSubdir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := DefaultModelDir(); got != filepath.Join(home, lmStudioModelsSubdir) {
+		t.Fatalf("DefaultModelDir() library root = %q", got)
 	}
 }
 
