@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -289,8 +290,10 @@ type Runner struct {
 //     sparse experts when their router tensors are present. deepseek2 uses a
 //     dedicated MLA attention path and its sigmoid/noaux shared-expert router.
 //   - qwen35/qwen35moe use the experimental native Gated-DeltaNet hybrid
-//     loader. qwen35moe shares the validated sparse-expert tensor path; a
-//     trailing Qwen MTP draft layer is skipped for ordinary generation.
+//     loader. It has focused graph and local-GGUF smoke coverage, while
+//     cross-runtime logit parity, vision, and MTP speculation remain out of
+//     scope. qwen35moe shares the sparse-expert tensor path; a trailing
+//     Qwen MTP draft layer is skipped for ordinary generation.
 //   - Phi-3, dense Granite, EXAONE, and InternLM2 use the same pre-norm, RoPE, GQA and
 //     SwiGLU graph as the standard loader. Their architecture-specific scales
 //     are read from GGUF metadata by ConfigFromGGUF.
@@ -384,10 +387,10 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		}
 		r.config, r.mamba2, r.kind = config, weights, loadedMamba2
 	case "qwen35", "qwen35moe":
-		// Reconstructed without a reference implementation — loads and runs
-		// but does not yet produce coherent text; see qwen35.go's package
-		// comment for exactly what has and hasn't been validated.
-		fmt.Fprintln(logw, "Warning: qwen35 support is experimental and unvalidated (loads and runs, but generation is not yet coherent — see qwen35.go)")
+		// Text-only decode is implemented and covered by focused graph tests and
+		// local GGUF smoke tests. Keep the remaining unsupported capabilities
+		// explicit instead of claiming general Qwen3.6 feature parity.
+		fmt.Fprintln(logw, "Warning: qwen35 support is experimental: text-only decode is implemented; vision, MTP speculative decoding, and cross-runtime logit-parity validation are pending (see qwen35.go)")
 		config, weights, err := LoadQwen35Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
@@ -838,6 +841,18 @@ func (r *Runner) cacheDims() (int, int, int, int, int) {
 	return r.config.NKVHeads * r.config.HeadDim, r.config.KVDim, r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
 }
 
+// kvCacheLayerCount is normally the model's decoder depth. Qwen3.5/3.6 is a
+// hybrid graph, though: only its periodic full-attention layers ever access
+// K/V rows. DeltaNet layers keep their separate recurrent state, so reserving
+// K/V for every decoder layer wastes three quarters of the cache for the
+// standard every-fourth-layer schedule.
+func (r *Runner) kvCacheLayerCount() int {
+	if r.kind == loadedQwen35 {
+		return qwen35AttentionLayerCount(r.qwen35)
+	}
+	return r.config.NLayers
+}
+
 const maxReusableKVCacheBytes int64 = 512 << 20
 
 func kvCacheBytes(layers, kDim, vDim, cacheLen int, f16 bool) int64 {
@@ -938,7 +953,7 @@ func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
 // turning one unusually large context into a permanent memory commitment.
 func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
-	layers := r.config.NLayers
+	layers := r.kvCacheLayerCount()
 	old := r.workspaceCache
 	shapeCompatible := old != nil && old.layerCount() == layers && old.F16 == useF16KVCache &&
 		old.PerPosKDim == kDim && old.PerPosVDim == vDim
@@ -981,8 +996,9 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		cache.Nemotron.reset()
 	}
 	if r.kind == loadedQwen35 {
-		if !cache.Qwen35.compatible(r.config) {
-			cache.Qwen35 = newQwen35Cache(r.config)
+		recurrentLayers := qwen35RecurrentLayerCount(r.qwen35)
+		if !cache.Qwen35.compatible(r.config, recurrentLayers) {
+			cache.Qwen35 = newQwen35Cache(r.config, recurrentLayers)
 		}
 		cache.Qwen35.reset()
 	}
@@ -1253,6 +1269,14 @@ func (r *Runner) isStopToken(token uint32) bool {
 			return true
 		}
 	}
+	if qwen35Family(r.arch) {
+		// Qwen3.5/3.6 opens assistant turns with ChatML and terminates them
+		// with <|im_end|>. Its tokenizer EOS is not consistently configured to
+		// that turn marker across converted GGUFs.
+		if id, ok := r.tok.SpecialID("<|im_end|>"); ok && token == id {
+			return true
+		}
+	}
 	if gemmaFamily(r.arch) {
 		// Gemma instruct models end assistant turns with <end_of_turn>, not
 		// the <eos> the GGUF declares as EOS.
@@ -1273,6 +1297,11 @@ func (r *Runner) isStopToken(token uint32) bool {
 func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) []uint32 {
 	if r.arch == "gpt-oss" {
 		return r.renderGptOssMessages(messages, systemPrompt)
+	}
+	if qwen35Family(r.arch) {
+		if tokens, ok := r.renderQwen35Messages(messages, systemPrompt, tools); ok {
+			return tokens
+		}
 	}
 	if r.chatTemplateKind() == "kimi-chat" {
 		if tokens, ok := r.renderKimiMessages(messages, systemPrompt, tools); ok {
@@ -1852,6 +1881,152 @@ func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt strin
 	tokens = append(tokens, imStart)
 	tokens = append(tokens, r.tok.EncodeWithoutBOS("assistant\n")...)
 	return tokens, true
+}
+
+// renderQwen35Messages mirrors the text-only parts of Qwen3.5/3.6's embedded
+// ChatML template. In addition to its thinking prompt it uses Qwen's native
+// XML-like tool protocol; generic JSON tool blocks noticeably degrade tool
+// calling because the model was trained on <function=...>/<parameter=...>.
+// The optional tools argument keeps the simple two-argument form convenient
+// for renderer tests and callers that do not expose tools.
+func (r *Runner) renderQwen35Messages(messages []ChatMessage, systemPrompt string, toolSets ...[]ToolDefinition) ([]uint32, bool) {
+	imStart, ok1 := r.tok.SpecialID("<|im_start|>")
+	imEnd, ok2 := r.tok.SpecialID("<|im_end|>")
+	if !(ok1 && ok2) {
+		return nil, false
+	}
+	var tools []ToolDefinition
+	if len(toolSets) > 0 {
+		tools = toolSets[0]
+	}
+	tokens := make([]uint32, 0)
+	appendText := func(text string) {
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(text)...)
+	}
+	appendTurn := func(role, content string) {
+		tokens = append(tokens, imStart)
+		appendText(role + "\n" + strings.TrimSpace(content))
+		tokens = append(tokens, imEnd)
+		appendText("\n")
+	}
+
+	hasSystem := false
+	var systemParts []string
+	for _, message := range messages {
+		if message.Role == ChatRoleSystem {
+			hasSystem = true
+			if content := strings.TrimSpace(message.Content); content != "" {
+				systemParts = append(systemParts, content)
+			}
+		}
+	}
+	// The embedded Qwen template permits a system turn only at the beginning.
+	// Normalize multiple API-level system messages into that one turn rather
+	// than silently dropping a later instruction.
+	explicitSystem := strings.Join(systemParts, "\n\n")
+	if len(tools) > 0 {
+		content := qwen35ToolSystemPrompt(tools)
+		if hasSystem {
+			content = appendSection(content, explicitSystem)
+		} else if strings.TrimSpace(systemPrompt) != "" {
+			content = appendSection(content, systemPrompt)
+		}
+		appendTurn("system", content)
+	} else if hasSystem {
+		appendTurn("system", explicitSystem)
+	} else if strings.TrimSpace(systemPrompt) != "" {
+		appendTurn("system", systemPrompt)
+	}
+
+	for i, message := range messages {
+		if message.Role == ChatRoleSystem {
+			// The system turn was rendered above, including the native tool list.
+			continue
+		}
+		switch message.Role {
+		case ChatRoleAssistant:
+			content := strings.TrimSpace(message.Content)
+			if len(message.ToolCalls) > 0 {
+				content = renderQwen35AssistantToolCalls(content, message.ToolCalls)
+			}
+			appendTurn("assistant", content)
+		case ChatRoleTool:
+			// Qwen groups consecutive tool results into one user turn.
+			if i == 0 || messages[i-1].Role != ChatRoleTool {
+				tokens = append(tokens, imStart)
+				appendText("user")
+			}
+			appendText("\n<tool_response>\n")
+			appendText(strings.TrimSpace(message.Content))
+			appendText("\n</tool_response>")
+			if i == len(messages)-1 || messages[i+1].Role != ChatRoleTool {
+				tokens = append(tokens, imEnd)
+				appendText("\n")
+			}
+		default:
+			appendTurn("user", message.Content)
+		}
+	}
+	// add_generation_prompt=True with thinking enabled (the Qwen default).
+	tokens = append(tokens, imStart)
+	appendText("assistant\n<think>\n")
+	return tokens, true
+}
+
+func qwen35ToolSystemPrompt(tools []ToolDefinition) string {
+	var sb strings.Builder
+	sb.WriteString("# Tools\n\nYou have access to the following functions:\n\n<tools>")
+	for _, tool := range tools {
+		if encoded, err := json.Marshal(tool); err == nil {
+			sb.WriteByte('\n')
+			sb.Write(encoded)
+		}
+	}
+	sb.WriteString("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n")
+	// Keep the native text portion byte-for-byte aligned with Qwen3.5/3.6's
+	// embedded chat template. These models are sensitive to the exact native
+	// XML example and its explicit instruction block.
+	sb.WriteString("<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
+	return sb.String()
+}
+
+func renderQwen35AssistantToolCalls(content string, calls []ToolCall) string {
+	var sb strings.Builder
+	if content != "" {
+		sb.WriteString(content)
+	}
+	for i, call := range calls {
+		if i == 0 && sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		} else if i > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString("<tool_call>\n<function=")
+		sb.WriteString(call.Function.Name)
+		sb.WriteString(">\n")
+		var args map[string]any
+		if json.Unmarshal([]byte(call.Function.Arguments), &args) != nil {
+			args = map[string]any{}
+		}
+		keys := make([]string, 0, len(args))
+		for key := range args {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			sb.WriteString("<parameter=")
+			sb.WriteString(key)
+			sb.WriteString(">\n")
+			if value, ok := args[key].(string); ok {
+				sb.WriteString(value)
+			} else if encoded, err := json.Marshal(args[key]); err == nil {
+				sb.Write(encoded)
+			}
+			sb.WriteString("\n</parameter>\n")
+		}
+		sb.WriteString("</function>\n</tool_call>")
+	}
+	return sb.String()
 }
 
 // renderSoofiIsarMessages mirrors the text-only portion of the embedded

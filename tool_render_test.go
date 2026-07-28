@@ -169,3 +169,70 @@ func TestRenderMessagesChatMLCarriesToolsEndToEnd(t *testing.T) {
 		t.Fatalf("chatml render should use the generic convention, not Mistral's: %q", text)
 	}
 }
+
+func TestQwen35NativeToolsRenderAndParseEndToEnd(t *testing.T) {
+	tok := newChatTokenizer("<|im_start|>", "<|im_end|>", "<think>", "=")
+	r := &Runner{tok: tok, arch: "qwen35"}
+	messages := []ChatMessage{
+		UserMessage("weather in Berlin?"),
+		{Role: ChatRoleAssistant, ToolCalls: []ToolCall{{
+			ID: "call12345", Type: "function",
+			Function: ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Berlin","days":2}`},
+		}}},
+		ToolResultMessage("call12345", "get_weather", "18C, sunny"),
+	}
+	tokens := r.renderMessages(messages, "be concise", []ToolDefinition{sampleTool()})
+	text := decodeAll(tok, tokens)
+	for _, want := range []string{
+		"<tools>", "get_weather", "<tool_call>", "<function=get_weather>",
+		"<parameter=city>", "Berlin", "<parameter=days>", "<tool_response>", "18C, sunny",
+		"<parameter=example_parameter_2>", "that can span\nmultiple lines", "<IMPORTANT>",
+		"answer the question like normal", "assistant\n<think>\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("native Qwen tool prompt missing %q: %q", want, text)
+		}
+	}
+	if strings.Contains(text, `{"name":"get_weather","arguments":`) {
+		t.Fatalf("Qwen should replay native XML-like calls rather than generic JSON: %q", text)
+	}
+
+	raw := "I will check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBerlin\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
+	content, calls := extractToolCallsQwen35(raw)
+	if content != "I will check." || len(calls) != 1 || calls[0].Function.Name != "get_weather" {
+		t.Fatalf("parsed content=%q calls=%#v", content, calls)
+	}
+	if calls[0].Function.Arguments != `{"city":"Berlin","days":2}` {
+		t.Fatalf("arguments = %s", calls[0].Function.Arguments)
+	}
+	content, reasoning, calls := r.classifyOutput("thinking</think>"+raw, []ToolDefinition{sampleTool()}, NewRng(1))
+	if reasoning != "thinking" || content != "I will check." || len(calls) != 1 || !validToolCallID(calls[0].ID) {
+		t.Fatalf("classifyOutput = content %q reasoning %q calls %#v", content, reasoning, calls)
+	}
+}
+
+func TestQwen35RendererNormalizesSystemMessagesIntoInitialTurn(t *testing.T) {
+	tok := newChatTokenizer("<|im_start|>", "<|im_end|>", "<think>")
+	r := &Runner{tok: tok, arch: "qwen35"}
+	text := decodeAll(tok, r.renderMessages([]ChatMessage{
+		UserMessage("first"),
+		{Role: ChatRoleSystem, Content: "later instruction"},
+		UserMessage("second"),
+	}, "default", nil))
+	systemAt := strings.Index(text, "system\nlater instruction")
+	firstUserAt := strings.Index(text, "user\nfirst")
+	if systemAt < 0 || firstUserAt < 0 || systemAt > firstUserAt {
+		t.Fatalf("system instruction should be normalized to the initial Qwen turn: %q", text)
+	}
+	if strings.Count(text, "later instruction") != 1 {
+		t.Fatalf("system instruction was duplicated or dropped: %q", text)
+	}
+}
+
+func TestQwen35ToolParserPreservesMalformedCall(t *testing.T) {
+	raw := "before<tool_call><function=get_weather><parameter=city>Berlin</function></tool_call>after"
+	content, calls := extractToolCallsQwen35(raw)
+	if content != raw || calls != nil {
+		t.Fatalf("malformed Qwen tool call should remain text: content=%q calls=%#v", content, calls)
+	}
+}

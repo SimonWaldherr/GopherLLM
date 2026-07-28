@@ -104,6 +104,10 @@ func TestSparseMoEForwardGPTOSSActivationAndBiases(t *testing.T) {
 }
 
 func buildTinySparseMoEGGUF(arch string, shared bool, metadataExperts int) []byte {
+	return buildTinySparseMoEGGUFWithExpertLayout(arch, shared, metadataExperts, true, false)
+}
+
+func buildTinySparseMoEGGUFWithExpertLayout(arch string, shared bool, metadataExperts int, separateGateUp, fusedGateUp bool) []byte {
 	const (
 		dim, heads, kv, hdim = 8, 2, 2, 4
 		hidden, expertHidden = 16, 4
@@ -160,6 +164,9 @@ func buildTinySparseMoEGGUF(arch string, shared bool, metadataExperts int) []byt
 	expert := func(name string, input, output, count, seed int) ggufTensor {
 		return ggufTensor{name: name, dims: []uint64{uint64(input), uint64(output), uint64(count)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(input*output*count, seed))}
 	}
+	fusedExpert := func(name string, input, output, count, seed int) ggufTensor {
+		return ggufTensor{name: name, dims: []uint64{uint64(input), uint64(2 * output), uint64(count)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(input*2*output*count, seed))}
+	}
 	expertBias := func(name string, output, count, seed int) ggufTensor {
 		return ggufTensor{name: name, dims: []uint64{uint64(output), uint64(count)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(output*count, seed))}
 	}
@@ -174,9 +181,16 @@ func buildTinySparseMoEGGUF(arch string, shared bool, metadataExperts int) []byt
 		f32t("blk.0.attn_output.weight", dim, heads*hdim, 8),
 		vec("blk.0.ffn_norm.weight", dim, 9),
 		f32t("blk.0.ffn_gate_inp.weight", experts, dim, 10),
-		expert("blk.0.ffn_gate_exps.weight", dim, expertHidden, experts, 11),
-		expert("blk.0.ffn_up_exps.weight", dim, expertHidden, experts, 12),
 		expert("blk.0.ffn_down_exps.weight", expertHidden, dim, experts, 13),
+	}
+	if separateGateUp {
+		tensors = append(tensors,
+			expert("blk.0.ffn_gate_exps.weight", dim, expertHidden, experts, 11),
+			expert("blk.0.ffn_up_exps.weight", dim, expertHidden, experts, 12),
+		)
+	}
+	if fusedGateUp {
+		tensors = append(tensors, fusedExpert("blk.0.ffn_gate_up_exps.weight", dim, expertHidden, experts, 26))
 	}
 	if arch == "qwen3moe" {
 		tensors = append(tensors, vec("blk.0.attn_q_norm.weight", hdim, 14), vec("blk.0.attn_k_norm.weight", hdim, 15))
@@ -267,6 +281,181 @@ func TestSparseMoEGGUFFamiliesLoadAndRun(t *testing.T) {
 			for i, v := range logits {
 				if !finite32(v) {
 					t.Fatalf("logit %d is non-finite: %v", i, v)
+				}
+			}
+		})
+	}
+}
+
+func TestSparseMoEGGUFFusedGateUpLoadsAndRunsOutOfCore(t *testing.T) {
+	data := buildTinySparseMoEGGUFWithExpertLayout("llama", false, 0, false, true)
+	r, err := RunnerFromGGUFBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moe := r.standard.Layers[0].MoE
+	if moe == nil {
+		t.Fatal("fused sparse MoE weights were not loaded")
+	}
+	if moe.Gate.StorageOutput != 2*moe.Gate.Output || moe.Gate.RowOffset != 0 || moe.Up.RowOffset != moe.Gate.Output {
+		t.Fatalf("fused expert views = gate(%+v) up(%+v), want contiguous gate/up halves", moe.Gate, moe.Up)
+	}
+	if moe.Gate.Weight.F32 == nil || moe.Up.Weight.F32 == nil || &moe.Gate.Weight.F32[0] != &moe.Up.Weight.F32[0] {
+		t.Fatal("fused gate/up weights were copied instead of sharing their backing tensor")
+	}
+
+	// Exercise the out-of-core path as well: scalar F32 expert weights must
+	// remain raw mmap-style bytes while each view addresses its own rows.
+	gguf, err := ParseGGUFQuiet(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := ConfigFromGGUF(gguf)
+	lazy, err := loadSparseMoEWeights(data, gguf.DataOffset, "blk.0.", cfg, indexTensors(gguf), inferTensorSizes(data, gguf), true, false, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lazy.Gate.Weight.F32 != nil || lazy.Up.Weight.F32 != nil || len(lazy.Gate.Weight.Raw) == 0 || &lazy.Gate.Weight.Raw[0] != &lazy.Up.Weight.Raw[0] {
+		t.Fatal("out-of-core fused gate/up weights did not retain one shared raw backing tensor")
+	}
+	buf := &DecodeBuffer{}
+	sparseMoEForward(lazy, onesF32(cfg.Dim), buf)
+	if len(buf.Proj) != cfg.Dim {
+		t.Fatalf("out-of-core fused MoE output len = %d, want %d", len(buf.Proj), cfg.Dim)
+	}
+	for i, v := range buf.Proj {
+		if !finite32(v) {
+			t.Fatalf("out-of-core fused MoE output %d is non-finite: %v", i, v)
+		}
+	}
+}
+
+func TestSparseMoELoaderPrefersSeparateGateUpOverFused(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinySparseMoEGGUFWithExpertLayout("llama", false, 0, true, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moe := r.standard.Layers[0].MoE
+	if moe == nil {
+		t.Fatal("sparse MoE weights were not loaded")
+	}
+	if moe.Gate.StorageOutput != 0 || moe.Up.StorageOutput != 0 || moe.Up.RowOffset != 0 {
+		t.Fatalf("separate gate/up tensors were not preferred: gate=%+v up=%+v", moe.Gate, moe.Up)
+	}
+}
+
+func fusedExpertReference(w ExpertWeight, expert int, x []float32) []float32 {
+	out := make([]float32, w.Output)
+	row := make([]float32, w.Input)
+	for r := range w.Output {
+		w.Weight.RowInto(expert*w.storageRows()+w.RowOffset+r, w.Input, &row)
+		out[r] = DotF32(row, x)
+	}
+	return out
+}
+
+func TestFusedExpertWeightViewsAddressEachExpertPlane(t *testing.T) {
+	const (
+		input, output, experts = 2, 2, 2
+	)
+	// Each expert plane is [gate rows | up rows], and every row has a unique
+	// dot product so a wrong plane stride or row offset is immediately visible.
+	backing := []float32{
+		1, 2, 3, 4, 5, 6, 7, 8, // expert 0
+		9, 10, 11, 12, 13, 14, 15, 16, // expert 1
+	}
+	gate := ExpertWeight{
+		Weight:        Weight{F32: backing},
+		Input:         input,
+		Output:        output,
+		Experts:       experts,
+		StorageOutput: 2 * output,
+	}
+	up := gate
+	up.RowOffset = output
+	x := []float32{2, -1}
+	var gotGate, gotUp, sums []float32
+	if !expertMatvec2Into(gate, up, 1, x, &sums, &gotGate, &gotUp) {
+		t.Fatal("fused F32 expert pair path declined valid views")
+	}
+	for _, tc := range []struct {
+		name string
+		got  []float32
+		want []float32
+	}{
+		{"gate", gotGate, []float32{8, 10}},
+		{"up", gotUp, []float32{12, 14}},
+	} {
+		for i := range tc.want {
+			closeMoEFloat(t, tc.name, tc.got[i], tc.want[i])
+		}
+	}
+
+	// The same geometry must work for a raw scalar view, which is how F32/F16
+	// out-of-core model mappings are represented.
+	rawGate := gate
+	rawGate.Weight = Weight{Raw: f32Bytes(backing), Type: GGMLTypeF32, Rows: 2 * output, Cols: input}
+	rawUp := rawGate
+	rawUp.RowOffset = output
+	gotGate = nil
+	gotUp = nil
+	var row []float32
+	expertMatvecInto(rawGate, 1, x, &gotGate, &row)
+	expertMatvecInto(rawUp, 1, x, &gotUp, &row)
+	for _, tc := range []struct {
+		name string
+		got  []float32
+		want []float32
+	}{
+		{"raw gate", gotGate, []float32{8, 10}},
+		{"raw up", gotUp, []float32{12, 14}},
+	} {
+		for i := range tc.want {
+			closeMoEFloat(t, tc.name, tc.got[i], tc.want[i])
+		}
+	}
+}
+
+func TestFusedExpertWeightQuantizedViewsAddressEachExpertPlane(t *testing.T) {
+	const (
+		input, output, experts = 512, 8, 3
+	)
+	for _, typ := range []GGMLType{GGMLTypeQ4_K, GGMLTypeQ6_K} {
+		t.Run(typ.String(), func(t *testing.T) {
+			// Construct the physical [input, 2*output, expert] tensor directly;
+			// gate and up then become zero-copy row views into each expert plane.
+			fused := quantExpertWeightForTest(typ, input, 2*output, experts, int64(1000+typ))
+			gate := fused
+			gate.Output = output
+			gate.StorageOutput = 2 * output
+			up := gate
+			up.RowOffset = output
+			if len(gate.Weight.Raw) == 0 || &gate.Weight.Raw[0] != &up.Weight.Raw[0] {
+				t.Fatal("fused quantized views do not share raw storage")
+			}
+			x := randomExpertInput(input, int64(2000+typ))
+			wantGate := fusedExpertReference(gate, experts-1, x)
+			wantUp := fusedExpertReference(up, experts-1, x)
+			var gotGate, gotUp, sums []float32
+			withQ8Activations(false, func() {
+				if !expertMatvec2Into(gate, up, experts-1, x, &sums, &gotGate, &gotUp) {
+					t.Fatalf("fused %s expert pair path declined valid views", typ)
+				}
+			})
+			for _, tc := range []struct {
+				name string
+				got  []float32
+				want []float32
+			}{
+				{"gate", gotGate, wantGate},
+				{"up", gotUp, wantUp},
+			} {
+				for i := range tc.want {
+					diff := math.Abs(float64(tc.got[i] - tc.want[i]))
+					limit := 1e-2 * math.Max(1, math.Abs(float64(tc.want[i])))
+					if diff > limit {
+						t.Fatalf("%s fused %s row %d = %v, want %v (diff %g, limit %g)", typ, tc.name, i, tc.got[i], tc.want[i], diff, limit)
+					}
 				}
 			}
 		})

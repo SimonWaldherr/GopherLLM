@@ -1,6 +1,9 @@
 package gopherllm
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // newChatTokenizer builds a SentencePiece-style tokenizer with the base
 // character vocabulary plus the given control tokens, so the chat renderers can
@@ -40,6 +43,21 @@ func TestRenderChatMLMessages(t *testing.T) {
 	}
 	if _, ok := (&Runner{tok: newInstTestTokenizer(), arch: "qwen2"}).renderChatMLMessages(nil, ""); ok {
 		t.Fatal("render without im_start/im_end tokens should fail")
+	}
+}
+
+func TestRenderQwen35MessagesOpensThinkingAndStopsAtChatMLEnd(t *testing.T) {
+	tok := newChatTokenizer("<|im_start|>", "<|im_end|>", "<think>")
+	r := &Runner{tok: tok, arch: "qwen35"}
+	tokens, ok := r.renderQwen35Messages([]ChatMessage{UserMessage("hi")}, "be precise")
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if text := decodeAll(tok, tokens); !strings.HasSuffix(text, "assistant\n<think>\n") {
+		t.Fatalf("prompt should end in an open Qwen thinking turn: %q", text)
+	}
+	if !r.isStopToken(tok.TokenToID["<|im_end|>"]) {
+		t.Fatal("Qwen3.5/3.6 must stop at <|im_end|>")
 	}
 }
 

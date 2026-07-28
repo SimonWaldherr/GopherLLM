@@ -110,6 +110,25 @@ func TestOutOfCorePathKeepsScalarWeightsMapped(t *testing.T) {
 	}
 }
 
+func TestQwen35OutOfCoreKeepsDeltaConvHot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tiny-qwen35.gguf")
+	if err := os.WriteFile(path, buildTinyQwen35MoEGGUF(false), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, _, err := RunnerFromPathWithOptions(path, LoadOptions{OutOfCore: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if !r.OutOfCore() || r.qwen35.TokenEmbd.F32 != nil {
+		t.Fatal("Qwen3.5 model did not retain its main scalar weights as out-of-core views")
+	}
+	conv := r.qwen35.Layers[0].DeltaNet.ConvKernel
+	if conv.F32 == nil || len(conv.F32) == 0 {
+		t.Fatal("Qwen3.5 DeltaNet convolution should remain a small hot F32 tensor")
+	}
+}
+
 func TestOutOfCoreRejectsInMemoryAndCopyingModes(t *testing.T) {
 	data := buildTinyLlamaGGUF()
 	if _, err := RunnerFromGGUFBytesWithOptions(data, LoadOptions{OutOfCore: true}); err == nil {

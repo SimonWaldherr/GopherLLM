@@ -2,22 +2,13 @@ package gopherllm
 
 // Native Qwen3.5 / Qwen3.6 ("qwen35") inference.
 //
-// EXPERIMENTAL AND KNOWN-UNVALIDATED: this is a from-scratch reconstruction
-// written without a reference implementation (no internet access was
-// available while writing it, and none was supplied). It loads real
-// Qwen3.5-9B / Qwen3.6-27B GGUFs, every tensor shape it asserts against
-// matches the file, and generation runs to completion with finite,
-// reasonably-scaled activations at every layer (no NaN/Inf, no runaway
-// magnitudes) — but the generated text is not yet coherent. Several
-// combinations of plausible alternatives (Gated-DeltaNet channel order,
-// disabling the delta-rule correction entirely, swapping which half of the
-// attention layers' doubled attn_q width is the query vs. the gate) were
-// tried empirically against a real Qwen3.5-9B GGUF and none produced
-// materially different (let alone better) output, which narrows the bug
-// somewhat but does not localize it. Treat this file as a documented,
-// falsifiable hypothesis to correct against a real reference (the Qwen3-Next
-// tech report, or an llama.cpp/vLLM implementation of qwen3_next/qwen3.5),
-// not as validated inference.
+// EXPERIMENTAL: this is a native, text-only single-token decode path for the
+// Qwen3.5/3.6 hybrid architecture. Its DeltaNet and gated-attention math
+// follows the Qwen reference graph and the llama.cpp GGUF conversion layout:
+// QKV is [Q|K|V], Q/K use L2 normalization, and full attention uses a sigmoid
+// gate. The implementation has focused unit coverage, but does not yet offer
+// cross-runtime logit-parity validation, chunked DeltaNet prefill, multimodal
+// vision/3D-MRoPE, or MTP speculative decoding.
 //
 // Reconstructed architecture: most layers replace ordinary self-attention
 // with a Gated DeltaNet linear-recurrent mixer, and every
@@ -62,19 +53,20 @@ const (
 	qwen35Attention
 )
 
+func qwen35Family(arch string) bool {
+	return arch == "qwen35" || arch == "qwen35moe"
+}
+
 type Qwen35AttentionWeights struct {
 	Q, K, V, O   Weight
 	QNorm, KNorm []float32
 }
 
 // Qwen35DeltaNetWeights holds one Gated DeltaNet layer's projections. QKVConv
-// projects the normalized hidden state to the concatenated [X | B | C] input
-// of the causal short convolution (X is the per-head "value" stream, B/C are
-// the per-group "key"/"query" streams that write into and read out of the
-// recurrent state — Mamba-2 naming, despite the GGUF's "attn_" tensor
-// prefixes). Gate/AlphaProj/BetaProj read directly from the un-convolved
-// hidden state, matching how nemotron_h's dt/z are separate from its own
-// conv'd stream.
+// projects the normalized hidden state to the concatenated [Q | K | V] input
+// of the causal short convolution. Q/K are per-key-group streams, while V has
+// one stream per value head. Gate/AlphaProj/BetaProj read directly from the
+// un-convolved hidden state.
 type Qwen35DeltaNetWeights struct {
 	QKVConv    Weight
 	ConvKernel Weight
@@ -96,9 +88,14 @@ type Qwen35LayerWeights struct {
 	Norm         []float32
 	PostAttnNorm []float32
 	Kind         qwen35LayerKind
-	Attention    Qwen35AttentionWeights
-	DeltaNet     Qwen35DeltaNetWeights
-	FFN          Qwen35FFNWeights
+	// KVCacheSlot and RecurrentCacheSlot compact the two disjoint cache
+	// classes. They are assigned at load time; only a periodic subset of Qwen
+	// layers uses full attention, while every other layer uses DeltaNet state.
+	KVCacheSlot        int
+	RecurrentCacheSlot int
+	Attention          Qwen35AttentionWeights
+	DeltaNet           Qwen35DeltaNetWeights
+	FFN                Qwen35FFNWeights
 }
 
 type Qwen35Weights struct {
@@ -109,9 +106,9 @@ type Qwen35Weights struct {
 }
 
 // Qwen35Cache holds the Gated DeltaNet recurrent state (one HeadDim x HeadDim
-// matrix per head per layer — the delta rule's associative memory) plus the
-// short causal-conv history. Attention-kind layers use the same *KVCache's
-// ordinary K/V rows, exactly like Nemotron-H's dual-cache pattern.
+// matrix per head per recurrent layer — the delta rule's associative memory)
+// plus the short causal-conv history. Attention-kind layers use the separate
+// compact K/V cache, exactly like Nemotron-H's dual-cache pattern.
 type Qwen35Cache struct {
 	Conv     []float32
 	State    []float32
@@ -122,14 +119,14 @@ type Qwen35Cache struct {
 	HeadDim  int
 }
 
-func newQwen35Cache(c Config) *Qwen35Cache {
+func newQwen35Cache(c Config, recurrentLayers int) *Qwen35Cache {
 	channels := c.SSMInner + 2*c.SSMGroups*c.SSMState
 	headDim := 0
 	if c.SSMHeads > 0 {
 		headDim = c.SSMInner / c.SSMHeads
 	}
 	cache := &Qwen35Cache{
-		Layers: c.NLayers, Channels: channels, ConvLen: max(0, c.SSMConv-1),
+		Layers: recurrentLayers, Channels: channels, ConvLen: max(0, c.SSMConv-1),
 		Heads: c.SSMHeads, HeadDim: headDim,
 	}
 	if cache.ConvLen > 0 && channels > 0 {
@@ -141,7 +138,7 @@ func newQwen35Cache(c Config) *Qwen35Cache {
 	return cache
 }
 
-func (c *Qwen35Cache) compatible(cfg Config) bool {
+func (c *Qwen35Cache) compatible(cfg Config, recurrentLayers int) bool {
 	if c == nil {
 		return false
 	}
@@ -150,7 +147,7 @@ func (c *Qwen35Cache) compatible(cfg Config) bool {
 	if cfg.SSMHeads > 0 {
 		headDim = cfg.SSMInner / cfg.SSMHeads
 	}
-	return c.Layers == cfg.NLayers && c.Channels == channels && c.ConvLen == max(0, cfg.SSMConv-1) &&
+	return c.Layers == recurrentLayers && c.Channels == channels && c.ConvLen == max(0, cfg.SSMConv-1) &&
 		c.Heads == cfg.SSMHeads && c.HeadDim == headDim
 }
 
@@ -180,27 +177,48 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 		return cfg, Qwen35Weights{}, fmt.Errorf("not a Qwen3.5 GGUF: %s", cfg.Arch)
 	}
 	tensors := indexTensors(gguf)
-	// Some Qwen3.6 exports append one or more MTP (multi-token prediction)
-	// draft layers to the ordinary decoder stack. They are marked by nextn.*
-	// tensors and are useful only to a speculative-decoding implementation;
-	// normal autoregressive inference must stop at the preceding base layer.
-	// Treating one as a DeltaNet layer otherwise produces an unhelpful missing
-	// attn_qkv error on an otherwise usable text model.
-	skippedMTP := 0
-	for cfg.NLayers > 1 {
-		last := cfg.NLayers - 1
-		if _, ok := tensors[fmt.Sprintf("blk.%d.nextn.eh_proj.weight", last)]; !ok {
-			break
+	// Some Qwen3.6 exports append MTP (multi-token prediction) draft blocks
+	// to the decoder stack. Prefer the explicit metadata count, then retain a
+	// tensor-marker fallback for older converters. The draft blocks are useful
+	// only to speculative decoding; normal autoregressive inference stops at
+	// the preceding trunk layer.
+	skippedMTP := cfg.NextNPredictLayers
+	if skippedMTP > 0 {
+		if skippedMTP >= cfg.NLayers {
+			return cfg, Qwen35Weights{}, fmt.Errorf("%s: nextn_predict_layers=%d leaves no decoder layers", cfg.Arch, skippedMTP)
 		}
-		cfg.NLayers--
-		skippedMTP++
+		for il := cfg.NLayers - skippedMTP; il < cfg.NLayers; il++ {
+			if _, ok := tensors[fmt.Sprintf("blk.%d.nextn.eh_proj.weight", il)]; !ok {
+				return cfg, Qwen35Weights{}, fmt.Errorf("%s: MTP metadata declares draft layer %d but its nextn.eh_proj.weight is missing", cfg.Arch, il)
+			}
+		}
+		cfg.NLayers -= skippedMTP
+	} else {
+		for cfg.NLayers > 1 {
+			last := cfg.NLayers - 1
+			if _, ok := tensors[fmt.Sprintf("blk.%d.nextn.eh_proj.weight", last)]; !ok {
+				break
+			}
+			cfg.NLayers--
+			skippedMTP++
+		}
 	}
 	if cfg.Dim <= 0 || cfg.NLayers <= 0 || cfg.SSMConv <= 0 || cfg.SSMInner <= 0 || cfg.SSMState <= 0 ||
-		cfg.SSMHeads <= 0 || cfg.SSMGroups <= 0 || cfg.FullAttentionInterval <= 0 {
+		cfg.SSMHeads <= 0 || cfg.SSMGroups <= 0 ||
+		(cfg.FullAttentionInterval <= 0 && len(cfg.QwenRecurrentLayers) == 0) {
 		return cfg, Qwen35Weights{}, fmt.Errorf("%s: incomplete Gated DeltaNet metadata", cfg.Arch)
 	}
 	if cfg.SSMInner%cfg.SSMHeads != 0 || cfg.SSMHeads%cfg.SSMGroups != 0 {
 		return cfg, Qwen35Weights{}, fmt.Errorf("%s: invalid DeltaNet dimensions inner=%d heads=%d groups=%d", cfg.Arch, cfg.SSMInner, cfg.SSMHeads, cfg.SSMGroups)
+	}
+	if headV := cfg.SSMInner / cfg.SSMHeads; headV != cfg.SSMState {
+		return cfg, Qwen35Weights{}, fmt.Errorf("%s: unsupported DeltaNet head geometry value=%d key=%d (Qwen requires equal head widths)", cfg.Arch, headV, cfg.SSMState)
+	}
+	if cfg.HeadDim <= 0 || cfg.ValueDim != cfg.HeadDim {
+		return cfg, Qwen35Weights{}, fmt.Errorf("%s: unsupported full-attention head geometry key=%d value=%d", cfg.Arch, cfg.HeadDim, cfg.ValueDim)
+	}
+	if len(cfg.QwenRecurrentLayers) > 0 && len(cfg.QwenRecurrentLayers) < cfg.NLayers {
+		return cfg, Qwen35Weights{}, fmt.Errorf("%s: recurrent-layer schedule has %d entries, need at least %d", cfg.Arch, len(cfg.QwenRecurrentLayers), cfg.NLayers)
 	}
 	if cfg.Arch == "qwen35moe" {
 		if cfg.ExpertCount <= 0 || cfg.ExpertUsedCount <= 0 || cfg.ExpertUsedCount > cfg.ExpertCount {
@@ -216,6 +234,14 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
 	load := func(name string) (Weight, error) {
 		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+	}
+	// The depthwise DeltaNet convolution is tiny relative to the checkpoint but
+	// runs once per channel for every recurrent layer and generated token. Keep
+	// scalar kernels hot even for an out-of-core model: a Qwen3.6-27B kernel
+	// bank is only a few MiB, while repeatedly decoding it from the mmap would
+	// otherwise add hundreds of thousands of row conversions per token.
+	loadHotScalar := func(name string) (Weight, error) {
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal, false)
 	}
 	loadVec := func(name string) ([]float32, error) {
 		return loadF32Vec(data, gguf.DataOffset, name, tensors, inferred)
@@ -236,6 +262,7 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 		}
 	}
 	weights := Qwen35Weights{TokenEmbd: token, OutputNorm: outNorm, Output: out, Layers: make([]Qwen35LayerWeights, cfg.NLayers)}
+	attentionLayers, recurrentLayers := 0, 0
 	for i := range cfg.NLayers {
 		prefix := fmt.Sprintf("blk.%d.", i)
 		norm, err := loadVec(prefix + "attn_norm.weight")
@@ -246,9 +273,20 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 		if err != nil {
 			return cfg, Qwen35Weights{}, err
 		}
-		layer := Qwen35LayerWeights{Norm: norm, PostAttnNorm: postNorm}
-		if (i+1)%cfg.FullAttentionInterval == 0 {
+		layer := Qwen35LayerWeights{
+			Norm: norm, PostAttnNorm: postNorm,
+			KVCacheSlot: -1, RecurrentCacheSlot: -1,
+		}
+		isRecurrent := true
+		if len(cfg.QwenRecurrentLayers) > 0 {
+			isRecurrent = cfg.QwenRecurrentLayers[i]
+		} else {
+			isRecurrent = (i+1)%cfg.FullAttentionInterval != 0
+		}
+		if !isRecurrent {
 			layer.Kind = qwen35Attention
+			layer.KVCacheSlot = attentionLayers
+			attentionLayers++
 			layer.Attention.Q, err = load(prefix + "attn_q.weight")
 			if err == nil {
 				layer.Attention.K, err = load(prefix + "attn_k.weight")
@@ -273,9 +311,11 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 			}
 		} else {
 			layer.Kind = qwen35DeltaNet
+			layer.RecurrentCacheSlot = recurrentLayers
+			recurrentLayers++
 			layer.DeltaNet.QKVConv, err = load(prefix + "attn_qkv.weight")
 			if err == nil {
-				layer.DeltaNet.ConvKernel, err = load(prefix + "ssm_conv1d.weight")
+				layer.DeltaNet.ConvKernel, err = loadHotScalar(prefix + "ssm_conv1d.weight")
 			}
 			if err == nil {
 				layer.DeltaNet.Gate, err = load(prefix + "attn_gate.weight")
@@ -324,10 +364,33 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 		}
 		weights.Layers[i] = layer
 		if i == 0 || (i+1)%8 == 0 || i+1 == cfg.NLayers {
-			fmt.Fprintf(logw, "  Loaded Qwen3.5 layer %d/%d\n", i+1, cfg.NLayers)
+			fmt.Fprintf(logw, "  Loaded Qwen hybrid layer %d/%d\n", i+1, cfg.NLayers)
 		}
 	}
+	if attentionLayers == 0 || recurrentLayers == 0 {
+		return cfg, Qwen35Weights{}, fmt.Errorf("%s: hybrid schedule must contain both attention and recurrent layers", cfg.Arch)
+	}
 	return cfg, weights, nil
+}
+
+func qwen35AttentionLayerCount(weights Qwen35Weights) int {
+	n := 0
+	for _, layer := range weights.Layers {
+		if layer.Kind == qwen35Attention {
+			n++
+		}
+	}
+	return n
+}
+
+func qwen35RecurrentLayerCount(weights Qwen35Weights) int {
+	n := 0
+	for _, layer := range weights.Layers {
+		if layer.Kind == qwen35DeltaNet {
+			n++
+		}
+	}
+	return n
 }
 
 func ForwardQwen35Into(cfg Config, weights Qwen35Weights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) {
@@ -344,13 +407,13 @@ func ForwardQwen35BodyInto(cfg Config, weights Qwen35Weights, cache *KVCache, bu
 	// to prepare once and reuse across every attention-kind layer below,
 	// exactly as the standard decoder does in ForwardBodyInto.
 	ropeHalf, ropePairs := prepareRopeScratch(pos, cfg.HeadDim, cfg.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
-	for i, layer := range weights.Layers {
+	for _, layer := range weights.Layers {
 		rmsNormInto(buf.X, layer.Norm, cfg.RMSNormEps, &buf.XN)
 		switch layer.Kind {
 		case qwen35Attention:
-			qwen35AttentionForward(cfg, layer.Attention, cache, buf.XN, i, pos, ropeHalf, ropePairs, buf)
+			qwen35AttentionForward(cfg, layer.Attention, cache, buf.XN, layer.KVCacheSlot, pos, ropeHalf, ropePairs, buf)
 		default:
-			qwen35DeltaNetForward(cfg, layer.DeltaNet, cache.Qwen35, buf.XN, i, buf)
+			qwen35DeltaNetForward(cfg, layer.DeltaNet, cache.Qwen35, buf.XN, layer.RecurrentCacheSlot, buf)
 		}
 		addInPlace(buf.X[:cfg.Dim], buf.Proj[:cfg.Dim])
 		rmsNormInto(buf.X, layer.PostAttnNorm, cfg.RMSNormEps, &buf.XN)
@@ -364,15 +427,20 @@ func ForwardQwen35BodyInto(cfg Config, weights Qwen35Weights, cache *KVCache, bu
 	rmsNormInto(buf.X, weights.OutputNorm, cfg.RMSNormEps, &buf.XN)
 }
 
-// qwen35AttentionForward runs one of the periodic full-attention layers. See
-// the file header for why attn_q's doubled width is split into a query half
-// (QK-normed and RoPE'd) and a gate half (a plain per-head sigmoid on that
-// head's attention output before the O projection).
+// qwen35AttentionForward runs one of the periodic full-attention layers. Its
+// doubled Q projection is split into a QK-normed/RoPE'd query and a per-head
+// sigmoid gate applied before the O projection.
 func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache, x []float32, layer, pos, ropeHalf, ropePairs int, buf *DecodeBuffer) {
 	headDim := cfg.HeadDim
 	nHeads := cfg.NHeads
 	kvMul := max(1, cfg.KVMul)
-	w.Q.MatvecInto(x, &buf.QGate)
+	// Q and K share their input and are commonly the same quantization in
+	// Qwen3.6 GGUFs (including the local IQ variants). Fuse their row work
+	// when possible; V remains separate because its format often differs.
+	if !tryMatvec2Into(w.Q, w.K, x, &buf.Q4KXSums, &buf.QGate, &buf.K) {
+		w.Q.MatvecInto(x, &buf.QGate)
+		w.K.MatvecInto(x, &buf.K)
+	}
 	if len(buf.QGate) < nHeads*2*headDim {
 		panic("Qwen3.5 attention: attn_q projection has an invalid shape")
 	}
@@ -383,7 +451,6 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 		copy(buf.Q[h*headDim:(h+1)*headDim], src[:headDim])
 		copy(buf.AttnGate[h*headDim:(h+1)*headDim], src[headDim:2*headDim])
 	}
-	w.K.MatvecInto(x, &buf.K)
 	w.V.MatvecInto(x, &buf.V)
 	perHeadRMSNormInPlace(buf.Q, headDim, nHeads, w.QNorm, cfg.RMSNormEps)
 	perHeadRMSNormInPlace(buf.K, headDim, cfg.NKVHeads, w.KNorm, cfg.RMSNormEps)
@@ -401,18 +468,16 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 		gate := buf.AttnGate[h*headDim : h*headDim+cfg.ValueDim]
 		out := buf.AttnOut[outOff : outOff+cfg.ValueDim]
 		for d, g := range gate {
-			out[d] *= g / (1 + float32(math.Exp(float64(-g))))
+			out[d] *= 1 / (1 + float32(math.Exp(float64(-g))))
 		}
 	}
 	w.O.MatvecInto(buf.AttnOut[:nHeads*cfg.ValueDim], &buf.Proj)
 }
 
-// qwen35DeltaNetForward runs one Gated DeltaNet layer. See the file header for
-// the reconstructed recurrence; in one sentence: decay the existing per-head
-// state, subtract what it already recalls for this token's key from the true
-// value (the "delta"), and write beta times that residual back in — then
-// read the state out via this token's query, gate with SiLU, and RMS-norm
-// per head before the output projection.
+// qwen35DeltaNetForward runs one Gated DeltaNet layer. It performs the
+// reference recurrent Gated Delta Rule: convolve [Q|K|V], L2-normalize Q/K,
+// decay the state, write beta*(V-recall) through K, then read through the
+// scaled Q before gated RMSNorm and the output projection.
 func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache, x []float32, layer int, buf *DecodeBuffer) {
 	dInner, dState, nHeads, nGroups := cfg.SSMInner, cfg.SSMState, cfg.SSMHeads, cfg.SSMGroups
 	headDim := dInner / nHeads
@@ -425,17 +490,26 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 	ensureLenNoClear(&buf.MambaConv, channels)
 	copy(buf.MambaConv, buf.MambaIn[:channels])
 
-	// Causal depthwise convolution, then SiLU — same short-conv preprocessing
-	// Mamba-2 applies to its combined x/B/C stream before the recurrence.
+	// Causal depthwise convolution, then SiLU over the Q|K|V channels.
 	ensureLenNoClear(&buf.MambaKernel, cfg.SSMConv)
+	// F32/F16/BF16 convolution weights are intentionally materialized by the
+	// loader, including in out-of-core mode. Direct row views avoid a copy and
+	// method dispatch for every channel; quantized/future kernels retain the
+	// general RowInto fallback.
+	f32Kernel := w.ConvKernel.F32
 	for ch := range channels {
-		w.ConvKernel.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
+		kernel := buf.MambaKernel[:cfg.SSMConv]
+		if len(f32Kernel) >= (ch+1)*cfg.SSMConv {
+			kernel = f32Kernel[ch*cfg.SSMConv : (ch+1)*cfg.SSMConv]
+		} else {
+			w.ConvKernel.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
+		}
 		off := state.convOffset(layer, ch)
 		v := float32(0)
 		for k := 0; k < state.ConvLen; k++ {
-			v += buf.MambaKernel[k] * state.Conv[off+k]
+			v += kernel[k] * state.Conv[off+k]
 		}
-		v += buf.MambaKernel[state.ConvLen] * buf.MambaConv[ch]
+		v += kernel[state.ConvLen] * buf.MambaConv[ch]
 		if state.ConvLen > 0 {
 			copy(state.Conv[off:off+state.ConvLen-1], state.Conv[off+1:off+state.ConvLen])
 			state.Conv[off+state.ConvLen-1] = buf.MambaConv[ch]
@@ -443,14 +517,23 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 		buf.MambaConv[ch] = v / (1 + float32(math.Exp(float64(-v))))
 	}
 
-	ensureLenNoClear(&buf.MambaX, dInner)
-	ensureLenNoClear(&buf.MambaB, nGroups*dState)
-	ensureLenNoClear(&buf.MambaC, nGroups*dState)
+	ensureLenNoClear(&buf.MambaX, dInner)         // V, one vector per value head.
+	ensureLenNoClear(&buf.MambaB, nGroups*dState) // Q, one vector per key group.
+	ensureLenNoClear(&buf.MambaC, nGroups*dState) // K, one vector per key group.
 	ensureLenNoClear(&buf.MambaY, dInner)
-	bcDim := nGroups * dState
-	copy(buf.MambaX, buf.MambaConv[:dInner])
-	copy(buf.MambaB, buf.MambaConv[dInner:dInner+bcDim])
-	copy(buf.MambaC, buf.MambaConv[dInner+bcDim:channels])
+	keyDim := nGroups * dState
+	copy(buf.MambaB, buf.MambaConv[:keyDim])
+	copy(buf.MambaC, buf.MambaConv[keyDim:2*keyDim])
+	copy(buf.MambaX, buf.MambaConv[2*keyDim:channels])
+
+	// GGUF conversion keeps Q/K in key-head order and tiles the V-head stream
+	// to match its broadcast layout. Normalize each shared Q/K once; Q carries
+	// the 1/sqrt(d_k) DeltaNet attention scale after L2 normalization.
+	qScale := float32(1 / math.Sqrt(float64(dState)))
+	for group := range nGroups {
+		qwen35L2NormalizeInPlace(buf.MambaB[group*dState:(group+1)*dState], cfg.RMSNormEps, qScale)
+		qwen35L2NormalizeInPlace(buf.MambaC[group*dState:(group+1)*dState], cfg.RMSNormEps, 1)
+	}
 
 	ensureLenNoClear(&buf.MambaDT, nHeads)
 	ensureLenNoClear(&buf.MambaBeta, nHeads)
@@ -459,14 +542,13 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 
 	ensureLenNoClear(&buf.MambaRecall, headDim)
 	recall := buf.MambaRecall[:headDim]
-	groupSize := nHeads / nGroups
 	for h := range nHeads {
-		dt := nemotronSoftplus(buf.MambaDT[h] + w.DTBias[h])
-		decay := float32(math.Exp(float64(dt * w.A[h])))
+		alpha := nemotronSoftplus(buf.MambaDT[h] + w.DTBias[h])
+		decay := float32(math.Exp(float64(alpha * w.A[h])))
 		beta := nemotronSigmoid(buf.MambaBeta[h])
-		group := h / groupSize
-		k := buf.MambaB[group*dState : group*dState+dState]
-		q := buf.MambaC[group*dState : group*dState+dState]
+		group := h % nGroups
+		q := buf.MambaB[group*dState : group*dState+dState]
+		k := buf.MambaC[group*dState : group*dState+dState]
 		xv := buf.MambaX[h*headDim : h*headDim+headDim]
 
 		off := state.stateOffset(layer, h)
@@ -483,18 +565,32 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 		}
 	}
 
-	ensureLenNoClear(&buf.MambaZ, dInner)
-	w.Gate.MatvecInto(x, &buf.MambaZ)
-	for i, g := range buf.MambaZ[:dInner] {
-		buf.MambaY[i] *= g / (1 + float32(math.Exp(float64(-g))))
-	}
+	// Qwen's Gated RMSNorm normalizes the recurrent output first, then applies
+	// SiLU(z). Applying the gate before RMSNorm would mostly cancel its scale
+	// and materially changes the reference graph.
 	for h := range nHeads {
 		part := buf.MambaY[h*headDim : h*headDim+headDim]
 		ss := DotF32(part, part)
 		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+cfg.RMSNormEps)))
 		mulScaleF32(part, w.Norm[:headDim], scale, part)
 	}
+	ensureLenNoClear(&buf.MambaZ, dInner)
+	w.Gate.MatvecInto(x, &buf.MambaZ)
+	for i, g := range buf.MambaZ[:dInner] {
+		buf.MambaY[i] *= g / (1 + float32(math.Exp(float64(-g))))
+	}
 	w.Out.MatvecInto(buf.MambaY, &buf.Proj)
+}
+
+// qwen35L2NormalizeInPlace applies the Qwen/FLA L2 normalization used by the
+// DeltaNet kernel. postScale is 1 for K and 1/sqrt(d_k) for Q.
+func qwen35L2NormalizeInPlace(v []float32, eps, postScale float32) {
+	if len(v) == 0 {
+		return
+	}
+	ss := DotF32(v, v)
+	scale := postScale * float32(1/math.Sqrt(float64(ss+eps)))
+	ScaleF32(v, scale)
 }
 
 func qwen35FFNForward(w Qwen35FFNWeights, x []float32, buf *DecodeBuffer) {

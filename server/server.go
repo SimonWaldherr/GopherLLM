@@ -1676,10 +1676,13 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	}
 
 	var streamErr error
-	// Soofi Isar's native template opens <think> in the prompt, so its first
-	// generated characters are reasoning and the first marker received is the
-	// closing tag. Other models emit the opening marker themselves.
-	thinkSplitter := gopherllm.NewThinkStreamSplitter(r.Architecture() == "nemotron_h_moe")
+	// Soofi Isar and Qwen3.5/3.6's native templates open <think> in the
+	// prompt, so their first generated characters are reasoning and the first
+	// marker received is the closing tag. Other models emit the opening marker
+	// themselves.
+	arch := r.Architecture()
+	startsInReasoning := arch == "nemotron_h_moe" || arch == "qwen35" || arch == "qwen35moe"
+	thinkSplitter := gopherllm.NewThinkStreamSplitter(startsInReasoning)
 	streamedReasoning := false
 	emit := func(reasoning bool, text string) bool {
 		if text == "" {

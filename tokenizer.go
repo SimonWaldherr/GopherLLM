@@ -261,6 +261,9 @@ func (t *Tokenizer) decodeGPT2Bytes(raw string) string {
 }
 
 func (t *Tokenizer) pretokenize(text string) []string {
+	if strings.Contains(t.Pre, "qwen35") {
+		return pretokenizeQwen35(text)
+	}
 	if strings.Contains(t.Pre, "kimi") {
 		return pretokenizeKimi(text)
 	}
@@ -268,6 +271,133 @@ func (t *Tokenizer) pretokenize(text string) []string {
 		return pretokenizeTekken(text)
 	}
 	return pretokenizeGPT2(text)
+}
+
+// pretokenizeQwen35 implements Qwen3.5/3.6's tokenizer.json pattern:
+//
+//	(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+//
+// It is deliberately separate from Qwen2: Qwen35 keeps combining marks with
+// their word and emits each numeric rune as a piece. Both details affect BPE
+// merge boundaries and therefore prompt token IDs.
+func pretokenizeQwen35(text string) []string {
+	r := []rune(text)
+	pieces := make([]string, 0, len(r)/3+1)
+	for i := 0; i < len(r); {
+		if end, ok := matchQwen35Contraction(r, i); ok {
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if end, ok := matchQwen35Word(r, i); ok {
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if unicode.IsNumber(r[i]) {
+			pieces = append(pieces, string(r[i:i+1]))
+			i++
+			continue
+		}
+		if end, ok := matchQwen35Punct(r, i); ok {
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		if unicode.IsSpace(r[i]) {
+			end := qwen35WhitespaceEnd(r, i)
+			pieces = append(pieces, string(r[i:end]))
+			i = end
+			continue
+		}
+		pieces = append(pieces, string(r[i:i+1]))
+		i++
+	}
+	return pieces
+}
+
+func qwen35WordRune(c rune) bool {
+	return unicode.IsLetter(c) || unicode.Is(unicode.M, c)
+}
+
+func matchQwen35Contraction(r []rune, i int) (int, bool) {
+	if i >= len(r) || r[i] != '\'' {
+		return i, false
+	}
+	for _, suffix := range []string{"re", "ve", "ll", "s", "t", "m", "d"} {
+		if i+1+len(suffix) > len(r) {
+			continue
+		}
+		match := true
+		for j := range suffix {
+			c := r[i+1+j]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != rune(suffix[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i + 1 + len(suffix), true
+		}
+	}
+	return i, false
+}
+
+func matchQwen35Word(r []rune, i int) (int, bool) {
+	wordEnd := func(start int) int {
+		end := start
+		for end < len(r) && qwen35WordRune(r[end]) {
+			end++
+		}
+		return end
+	}
+	// Prefer a word beginning at i. This preserves a leading combining mark,
+	// which is a member of [\p{L}\p{M}]+ even though it can also satisfy the
+	// optional prefix's broad negated class.
+	if end := wordEnd(i); end > i {
+		return end, true
+	}
+	if i < len(r) && r[i] != '\r' && r[i] != '\n' && !unicode.IsLetter(r[i]) && !unicode.IsNumber(r[i]) {
+		if end := wordEnd(i + 1); end > i+1 {
+			return end, true
+		}
+	}
+	return i, false
+}
+
+func matchQwen35Punct(r []rune, i int) (int, bool) {
+	j := i
+	if j < len(r) && r[j] == ' ' {
+		j++
+	}
+	start := j
+	for j < len(r) && !unicode.IsSpace(r[j]) && !qwen35WordRune(r[j]) && !unicode.IsNumber(r[j]) {
+		j++
+	}
+	if j == start {
+		return i, false
+	}
+	for j < len(r) && (r[j] == '\r' || r[j] == '\n') {
+		j++
+	}
+	return j, true
+}
+
+func qwen35WhitespaceEnd(r []rune, i int) int {
+	end, lastNewline := i, -1
+	for end < len(r) && unicode.IsSpace(r[end]) {
+		if r[end] == '\r' || r[end] == '\n' {
+			lastNewline = end
+		}
+		end++
+	}
+	if lastNewline >= 0 {
+		return lastNewline + 1
+	}
+	return end
 }
 
 // pretokenizeKimi implements the tiktoken pattern bundled with Kimi K2:

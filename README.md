@@ -953,14 +953,14 @@ matching normalized sparse routing and QK-norm required by Qwen3-MoE, including
 Qwen3-Coder GGUFs that declare `qwen3moe`. `qwen35` and `qwen35moe` have a
 native experimental hybrid Gated-DeltaNet / periodic-attention path;
 `qwen35moe` also uses the sparse-expert implementation and Qwen-style gated
-shared experts (including Ornith-style GGUFs). The loader and tensor geometry
-are covered by structural tests, but output parity for the hybrid DeltaNet
-graph is not yet validated and the runtime emits an explicit warning. Vision
-families that require visual-feature injection or multimodal MRoPE remain
-outside this text-generation scope: `qwen2vl`, `qwen3vl`, `qwen3vlmoe`, and
-`qwen3next`. Qwen3.6 GGUFs with trailing MTP draft layers load for ordinary
-generation; the draft layer is intentionally skipped until speculative
-decoding is implemented.
+shared experts (including Ornith-style GGUFs). The hybrid DeltaNet graph has
+focused scalar-reference tests and text-only local-GGUF smoke coverage; full
+cross-runtime logit parity remains pending, so the runtime emits an explicit
+experimental warning. Vision families that require visual-feature injection
+or multimodal MRoPE remain outside this text-generation scope: `qwen2vl`,
+`qwen3vl`, `qwen3vlmoe`, and `qwen3next`. Qwen3.6 GGUFs with trailing MTP
+draft layers load for ordinary generation; the draft layer is intentionally
+skipped until speculative decoding is implemented.
 
 `deepseek2` and `kimi_k2` provide a dedicated Multi-head Latent Attention
 (MLA) path for Kimi K2 and compatible single-group MLA GGUFs. It uses a

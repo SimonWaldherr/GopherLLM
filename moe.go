@@ -14,6 +14,15 @@ type ExpertWeight struct {
 	Input   int
 	Output  int
 	Experts int
+
+	// StorageOutput and RowOffset describe a view into one expert plane. They
+	// are normally zero, which means this logical matrix occupies a complete
+	// [input, Output, expert] tensor. Fused gate/up tensors instead store both
+	// projections in a [input, 2*Output, expert] plane; the two ExpertWeights
+	// share Weight and select their own contiguous row range without copying or
+	// dequantizing the backing tensor.
+	StorageOutput int
+	RowOffset     int
 }
 
 // ExpertBias is the optional [output, expert] bias plane paired with an
@@ -96,9 +105,57 @@ func loadExpertWeight(data []byte, dataOffset int, name string, tensors map[stri
 	return ExpertWeight{Weight: w, Input: int(info.Dims[0]), Output: int(info.Dims[1]), Experts: int(info.Dims[2])}, nil
 }
 
+// loadFusedExpertGateUpWeight loads llama.cpp's optional fused expert tensor
+// [input, 2*hidden, expert] and returns zero-copy views of its gate and up
+// halves. Keeping a shared backing Weight is important for quantized and
+// out-of-core MoE banks, where splitting it would otherwise duplicate many GB.
+func loadFusedExpertGateUpWeight(data []byte, dataOffset int, name string, tensors map[string]TensorInfo, inferred map[string]int, borrow bool, lazyScalars ...bool) (ExpertWeight, ExpertWeight, error) {
+	fused, err := loadExpertWeight(data, dataOffset, name, tensors, inferred, borrow, lazyScalars...)
+	if err != nil {
+		return ExpertWeight{}, ExpertWeight{}, err
+	}
+	if fused.Output <= 0 || fused.Output%2 != 0 {
+		return ExpertWeight{}, ExpertWeight{}, fmt.Errorf("tensor %s has output width %d, want an even fused gate/up width", name, fused.Output)
+	}
+	storageOutput := fused.Output
+	fused.Output /= 2
+	fused.StorageOutput = storageOutput
+	gate := fused
+	up := fused
+	up.RowOffset = fused.Output
+	return gate, up, nil
+}
+
+func (w ExpertWeight) storageRows() int {
+	if w.StorageOutput != 0 {
+		return w.StorageOutput
+	}
+	return w.Output
+}
+
+func (w ExpertWeight) f32Plane(expert int) ([]float32, bool) {
+	if w.Weight.F32 == nil || expert < 0 || expert >= w.Experts || w.Input <= 0 || w.Output <= 0 {
+		return nil, false
+	}
+	storageRows := w.storageRows()
+	if storageRows <= 0 || w.RowOffset < 0 || w.RowOffset+w.Output > storageRows {
+		return nil, false
+	}
+	start := (expert*storageRows + w.RowOffset) * w.Input
+	end := start + w.Output*w.Input
+	if start < 0 || end < start || end > len(w.Weight.F32) {
+		return nil, false
+	}
+	return w.Weight.F32[start:end], true
+}
+
 func validateExpertWeight(name string, w ExpertWeight, input, output, experts int) error {
 	if w.Input != input || w.Output != output || w.Experts != experts {
 		return fmt.Errorf("tensor %s has [%d, %d, %d], want [%d, %d, %d]", name, w.Input, w.Output, w.Experts, input, output, experts)
+	}
+	storageRows := w.storageRows()
+	if storageRows < w.Output || w.RowOffset < 0 || w.RowOffset+w.Output > storageRows {
+		return fmt.Errorf("tensor %s has invalid expert row view: offset=%d output=%d storage_output=%d", name, w.RowOffset, w.Output, storageRows)
 	}
 	return nil
 }
@@ -194,19 +251,45 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 			}
 		}
 	}
-	if w.Gate, err = loadExpertWeight(data, dataOffset, prefix+"ffn_gate_exps.weight", tensors, inferred, borrow, lazyScalarWeights); err != nil {
-		return nil, err
-	}
-	if w.Up, err = loadExpertWeight(data, dataOffset, prefix+"ffn_up_exps.weight", tensors, inferred, borrow, lazyScalarWeights); err != nil {
-		return nil, err
+	gateName := prefix + "ffn_gate_exps.weight"
+	upName := prefix + "ffn_up_exps.weight"
+	fusedGateUpName := prefix + "ffn_gate_up_exps.weight"
+	_, hasGate := tensors[gateName]
+	_, hasUp := tensors[upName]
+	_, hasFusedGateUp := tensors[fusedGateUpName]
+	gateTensorName, upTensorName := gateName, upName
+	switch {
+	case hasGate && hasUp:
+		// Prefer separate expert tensors when both layouts are available. This
+		// is the canonical GGUF layout and also permits independent types.
+		if w.Gate, err = loadExpertWeight(data, dataOffset, gateName, tensors, inferred, borrow, lazyScalarWeights); err != nil {
+			return nil, err
+		}
+		if w.Up, err = loadExpertWeight(data, dataOffset, upName, tensors, inferred, borrow, lazyScalarWeights); err != nil {
+			return nil, err
+		}
+	case !hasGate && !hasUp && hasFusedGateUp:
+		w.Gate, w.Up, err = loadFusedExpertGateUpWeight(data, dataOffset, fusedGateUpName, tensors, inferred, borrow, lazyScalarWeights)
+		if err != nil {
+			return nil, err
+		}
+		gateTensorName, upTensorName = fusedGateUpName, fusedGateUpName
+	case !hasGate && !hasUp:
+		// Retain the established missing-tensor diagnostic for checkpoints
+		// which provide neither representation.
+		if w.Gate, err = loadExpertWeight(data, dataOffset, gateName, tensors, inferred, borrow, lazyScalarWeights); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("%s: partial MoE gate/up layout (need both %s and %s, or %s)", cfg.Arch, gateName, upName, fusedGateUpName)
 	}
 	if w.Down, err = loadExpertWeight(data, dataOffset, prefix+"ffn_down_exps.weight", tensors, inferred, borrow, lazyScalarWeights); err != nil {
 		return nil, err
 	}
-	if err := validateExpertWeight(prefix+"ffn_gate_exps.weight", w.Gate, cfg.Dim, w.Gate.Output, cfg.ExpertCount); err != nil {
+	if err := validateExpertWeight(gateTensorName, w.Gate, cfg.Dim, w.Gate.Output, cfg.ExpertCount); err != nil {
 		return nil, err
 	}
-	if err := validateExpertWeight(prefix+"ffn_up_exps.weight", w.Up, cfg.Dim, w.Gate.Output, cfg.ExpertCount); err != nil {
+	if err := validateExpertWeight(upTensorName, w.Up, cfg.Dim, w.Gate.Output, cfg.ExpertCount); err != nil {
 		return nil, err
 	}
 	if err := validateExpertWeight(prefix+"ffn_down_exps.weight", w.Down, w.Gate.Output, cfg.Dim, cfg.ExpertCount); err != nil {
@@ -503,13 +586,11 @@ func expertMatvec2Into(a, b ExpertWeight, expert int, x []float32, q4Sums *[]flo
 		return false
 	}
 	if a.Weight.F32 != nil && b.Weight.F32 != nil {
-		aBase := expert * a.Output * a.Input
-		bBase := expert * b.Output * b.Input
-		if aBase < 0 || bBase < 0 || aBase+a.Output*a.Input > len(a.Weight.F32) || bBase+b.Output*b.Input > len(b.Weight.F32) {
+		aData, okA := a.f32Plane(expert)
+		bData, okB := b.f32Plane(expert)
+		if !okA || !okB {
 			return false
 		}
-		aData := a.Weight.F32[aBase : aBase+a.Output*a.Input]
-		bData := b.Weight.F32[bBase : bBase+b.Output*b.Input]
 		ensureLenNoClear(aOut, a.Output)
 		ensureLenNoClear(bOut, b.Output)
 		totalRows := a.Output + b.Output
@@ -554,13 +635,18 @@ func expertPlaneWeight(w ExpertWeight, expert int) (Weight, bool) {
 	if expert < 0 || expert >= w.Experts || w.Weight.F32 != nil {
 		return Weight{}, false
 	}
+	storageRows := w.storageRows()
+	if w.Input <= 0 || w.Output <= 0 || storageRows <= 0 || w.RowOffset < 0 || w.RowOffset+w.Output > storageRows {
+		return Weight{}, false
+	}
 	rowBytes, ok := w.Weight.Type.DataSize(w.Input)
 	if !ok || rowBytes <= 0 {
 		return Weight{}, false
 	}
+	storageBytes := storageRows * rowBytes
 	planeBytes := w.Output * rowBytes
-	start := expert * planeBytes
-	if start < 0 || start+planeBytes > len(w.Weight.Raw) {
+	start := expert*storageBytes + w.RowOffset*rowBytes
+	if start < 0 || start+planeBytes < start || start+planeBytes > len(w.Weight.Raw) {
 		return Weight{}, false
 	}
 	// Prepared and Metal descriptors refer to the complete rank-3 tensor's
@@ -579,8 +665,11 @@ func expertMatvecInto(w ExpertWeight, expert int, x []float32, out *[]float32, r
 	}
 	ensureLenNoClear(out, w.Output)
 	if w.Weight.F32 != nil {
-		base := expert * w.Output * w.Input
-		MatvecF32Into(w.Weight.F32[base:base+w.Output*w.Input], x, w.Output, w.Input, out)
+		plane, ok := w.f32Plane(expert)
+		if !ok {
+			panic("invalid F32 expert plane")
+		}
+		MatvecF32Into(plane, x, w.Output, w.Input, out)
 		return
 	}
 	if plane, ok := expertPlaneWeight(w, expert); ok {
@@ -588,8 +677,9 @@ func expertMatvecInto(w ExpertWeight, expert int, x []float32, out *[]float32, r
 		return
 	}
 	ensureLenNoClear(row, w.Input)
+	storageRows := w.storageRows()
 	for r := range w.Output {
-		w.Weight.RowInto(expert*w.Output+r, w.Input, row)
+		w.Weight.RowInto(expert*storageRows+w.RowOffset+r, w.Input, row)
 		(*out)[r] = DotF32(*row, x)
 	}
 }

@@ -20,7 +20,7 @@ func newInstTestTokenizer() *Tokenizer {
 	// JSON/tool-calling punctuation, so tool-call payloads and <tool_call>
 	// convention markers survive encoding intact instead of silently dropping
 	// unknown characters.
-	for _, c := range "{}[]\":,_.- <>/" {
+	for _, c := range "{}[]\":,_.- <>/=" {
 		tokens = append(tokens, string(c))
 	}
 	toID := make(map[string]uint32, len(tokens))

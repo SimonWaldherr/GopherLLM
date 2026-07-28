@@ -83,6 +83,16 @@ type Config struct {
 	SSMState     int
 	SSMHeads     int
 	SSMGroups    int
+	// QwenRecurrentLayers, when supplied by a Qwen3.5/3.6 GGUF, is the
+	// authoritative per-layer hybrid schedule: true denotes a Gated DeltaNet
+	// layer and false denotes ordinary full attention.  Older exports expose
+	// only FullAttentionInterval, for which the loader retains the documented
+	// every-Nth-layer fallback.
+	QwenRecurrentLayers []bool
+	// NextNPredictLayers is the number of MTP/NextN draft blocks appended to
+	// the Qwen3.5/3.6 decoder stack. They are not part of normal autoregressive
+	// inference unless speculative decoding is enabled.
+	NextNPredictLayers int
 	// FullAttentionInterval is Qwen3.5/3.6's hybrid schedule: layer il (0
 	// indexed) keeps ordinary self-attention when (il+1)%FullAttentionInterval
 	// == 0, and uses the Gated DeltaNet linear-recurrent mixer otherwise. Zero
@@ -294,6 +304,10 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		cfg.SSMHeads = int(gguf.GetU32(p+".ssm.time_step_rank", 0))
 		cfg.SSMGroups = int(gguf.GetU32(p+".ssm.group_count", 0))
 		cfg.FullAttentionInterval = int(gguf.GetU32(p+".full_attention_interval", 0))
+		cfg.NextNPredictLayers = int(gguf.GetU32(p+".nextn_predict_layers", 0))
+		if v, ok := gguf.Metadata[p+".attention.recurrent_layers"]; ok {
+			cfg.QwenRecurrentLayers, _ = v.AsBoolArray()
+		}
 	}
 	if v, ok := gguf.Metadata[p+".expert_weights_norm"]; ok {
 		if norm, ok := v.AsBool(); ok {

@@ -24,10 +24,12 @@ func (r *Runner) classifyOutput(raw string, tools []ToolDefinition, rng *Rng) (c
 	} else {
 		content, reasoning = extractThink(raw)
 		if len(tools) > 0 {
-			switch kind {
-			case "mistral-inst":
+			switch {
+			case qwen35Family(r.arch):
+				content, calls = extractToolCallsQwen35(content)
+			case kind == "mistral-inst":
 				content, calls = extractToolCallsMistral(content)
-			case "kimi-chat":
+			case kind == "kimi-chat":
 				content, calls = extractToolCallsKimi(content)
 			default:
 				content, calls = extractToolCallsGeneric(content)
@@ -355,6 +357,106 @@ func extractToolCallsGeneric(text string) (content string, calls []ToolCall) {
 		}
 	}
 	return strings.TrimSpace(contentBuf.String()), calls
+}
+
+// extractToolCallsQwen35 parses Qwen3.5/3.6's native XML-like convention:
+//
+//	<tool_call>
+//	<function=name>
+//	<parameter=key>
+//	value
+//	</parameter>
+//	</function>
+//	</tool_call>
+//
+// A malformed block deliberately remains visible text. That avoids turning an
+// incomplete streamed answer into an invented tool invocation.
+func extractToolCallsQwen35(text string) (content string, calls []ToolCall) {
+	const openTag, closeTag = "<tool_call>", "</tool_call>"
+	var visible strings.Builder
+	rest := text
+	for {
+		start := strings.Index(rest, openTag)
+		if start < 0 {
+			visible.WriteString(rest)
+			break
+		}
+		visible.WriteString(rest[:start])
+		afterStart := rest[start+len(openTag):]
+		end := strings.Index(afterStart, closeTag)
+		if end < 0 {
+			visible.WriteString(rest[start:])
+			break
+		}
+		block := afterStart[:end]
+		if call, ok := parseQwen35ToolCall(block); ok {
+			calls = append(calls, call)
+		} else {
+			visible.WriteString(rest[start : start+len(openTag)+end+len(closeTag)])
+		}
+		rest = afterStart[end+len(closeTag):]
+	}
+	return strings.TrimSpace(visible.String()), calls
+}
+
+func parseQwen35ToolCall(block string) (ToolCall, bool) {
+	rest := strings.TrimSpace(block)
+	if !strings.HasPrefix(rest, "<function=") {
+		return ToolCall{}, false
+	}
+	headerEnd := strings.Index(rest, ">")
+	if headerEnd < len("<function=") {
+		return ToolCall{}, false
+	}
+	name := strings.TrimSpace(rest[len("<function="):headerEnd])
+	if name == "" || strings.ContainsAny(name, " \t\r\n<>") {
+		return ToolCall{}, false
+	}
+	rest = strings.TrimLeft(rest[headerEnd+1:], "\r\n")
+	args := map[string]json.RawMessage{}
+	for {
+		rest = strings.TrimLeft(rest, " \t\r\n")
+		if strings.HasPrefix(rest, "</function>") {
+			if strings.TrimSpace(rest[len("</function>"):]) != "" {
+				return ToolCall{}, false
+			}
+			encoded, err := json.Marshal(args)
+			if err != nil {
+				return ToolCall{}, false
+			}
+			return ToolCall{Type: "function", Function: ToolCallFunction{Name: name, Arguments: string(encoded)}}, true
+		}
+		if !strings.HasPrefix(rest, "<parameter=") {
+			return ToolCall{}, false
+		}
+		parameterEnd := strings.Index(rest, ">")
+		if parameterEnd < len("<parameter=") {
+			return ToolCall{}, false
+		}
+		parameter := strings.TrimSpace(rest[len("<parameter="):parameterEnd])
+		if parameter == "" || strings.ContainsAny(parameter, " \t\r\n<>") {
+			return ToolCall{}, false
+		}
+		rest = strings.TrimLeft(rest[parameterEnd+1:], "\r\n")
+		valueEnd := strings.Index(rest, "</parameter>")
+		if valueEnd < 0 {
+			return ToolCall{}, false
+		}
+		if _, duplicate := args[parameter]; duplicate {
+			return ToolCall{}, false
+		}
+		value := strings.TrimSpace(rest[:valueEnd])
+		if json.Valid([]byte(value)) {
+			args[parameter] = json.RawMessage(value)
+		} else {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return ToolCall{}, false
+			}
+			args[parameter] = encoded
+		}
+		rest = rest[valueEnd+len("</parameter>"):]
+	}
 }
 
 // normalizeToolArguments turns a parsed "arguments" field (a JSON object in

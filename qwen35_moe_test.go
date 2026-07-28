@@ -10,6 +10,10 @@ import (
 // layer. Each layer has the Ornith/Qwen35-MoE sparse expert layout, including
 // the gated shared expert.
 func buildTinyQwen35MoEGGUF(withMTP bool) []byte {
+	return buildTinyQwen35MoEGGUFWithSchedule(withMTP, nil, 2)
+}
+
+func buildTinyQwen35MoEGGUFWithSchedule(withMTP bool, recurrentSchedule []bool, fullAttentionInterval int) []byte {
 	const (
 		arch                                          = "qwen35moe"
 		dim, heads, kvHeads, headDim, vocab           = 8, 2, 1, 4, 16
@@ -53,7 +57,7 @@ func buildTinyQwen35MoEGGUF(withMTP bool) []byte {
 		{arch + ".expert_used_count", ggufU32, uint32(used)},
 		{arch + ".expert_feed_forward_length", ggufU32, uint32(expertHidden)},
 		{arch + ".expert_shared_feed_forward_length", ggufU32, uint32(expertHidden)},
-		{arch + ".full_attention_interval", ggufU32, uint32(2)},
+		{arch + ".full_attention_interval", ggufU32, uint32(fullAttentionInterval)},
 		{arch + ".ssm.conv_kernel", ggufU32, uint32(conv)},
 		{arch + ".ssm.inner_size", ggufU32, uint32(ssmInner)},
 		{arch + ".ssm.state_size", ggufU32, uint32(ssmState)},
@@ -64,6 +68,16 @@ func buildTinyQwen35MoEGGUF(withMTP bool) []byte {
 		{"tokenizer.ggml.scores", ggufArr, ggufArray{ggufF32, scores}},
 		{"tokenizer.ggml.bos_token_id", ggufU32, uint32(1)},
 		{"tokenizer.ggml.eos_token_id", ggufU32, uint32(2)},
+	}
+	if len(recurrentSchedule) > 0 {
+		items := make([]any, len(recurrentSchedule))
+		for i, recurrent := range recurrentSchedule {
+			items[i] = recurrent
+		}
+		kvs = append(kvs, ggufKV{arch + ".attention.recurrent_layers", ggufArr, ggufArray{ggufBool, items}})
+	}
+	if withMTP {
+		kvs = append(kvs, ggufKV{arch + ".nextn_predict_layers", ggufU32, uint32(1)})
 	}
 	f32t := func(name string, rows, cols, seed int) ggufTensor {
 		return ggufTensor{name: name, dims: []uint64{uint64(cols), uint64(rows)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(rows*cols, seed))}
@@ -155,6 +169,12 @@ func TestQwen35MoELoadsAndRunsHybridGraph(t *testing.T) {
 	if cache.Qwen35 == nil {
 		t.Fatal("Qwen35 recurrent cache was not initialized")
 	}
+	if cache.layerCount() != 1 {
+		t.Fatalf("Qwen35 K/V cache layers = %d, want 1 attention layer", cache.layerCount())
+	}
+	if cache.Qwen35.Layers != 1 {
+		t.Fatalf("Qwen35 recurrent cache layers = %d, want 1 DeltaNet layer", cache.Qwen35.Layers)
+	}
 	var logits []float32
 	for pos, token := range []uint32{1, 3, 4} {
 		r.forwardTokenInto(cache, buf, token, pos, &logits)
@@ -176,5 +196,25 @@ func TestQwen35SkipsTrailingMTPDraftLayer(t *testing.T) {
 	}
 	if r.config.NLayers != 2 || len(r.qwen35.Layers) != 2 {
 		t.Fatalf("MTP-adjusted layers = %d/%d, want 2/2", r.config.NLayers, len(r.qwen35.Layers))
+	}
+}
+
+func TestQwen35UsesExplicitRecurrentScheduleWithoutInterval(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUFWithSchedule(false, []bool{true, false}, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.qwen35.Layers[0].Kind != qwen35DeltaNet || r.qwen35.Layers[1].Kind != qwen35Attention {
+		t.Fatalf("explicit layer schedule = %v, %v", r.qwen35.Layers[0].Kind, r.qwen35.Layers[1].Kind)
+	}
+	if got := r.qwen35.Layers[0].RecurrentCacheSlot; got != 0 {
+		t.Fatalf("DeltaNet cache slot = %d, want 0", got)
+	}
+	if got := r.qwen35.Layers[1].KVCacheSlot; got != 0 {
+		t.Fatalf("attention K/V cache slot = %d, want 0", got)
+	}
+	cache, _ := r.generationWorkspace(3)
+	if cache.layerCount() != 1 || cache.Qwen35.Layers != 1 {
+		t.Fatalf("compact cache layers K/V=%d recurrent=%d, want 1/1", cache.layerCount(), cache.Qwen35.Layers)
 	}
 }
