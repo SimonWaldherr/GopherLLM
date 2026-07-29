@@ -12,6 +12,7 @@ type TokenizerMode int
 const (
 	TokenizerSentencePiece TokenizerMode = iota
 	TokenizerGPT2BPE
+	TokenizerWordPiece
 )
 
 type Pair struct {
@@ -19,7 +20,7 @@ type Pair struct {
 	Right string
 }
 
-// Tokenizer implements the two GGUF tokenizer families:
+// Tokenizer implements the GGUF tokenizer families:
 //
 //   - TokenizerSentencePiece (tokenizer.ggml.model = "llama"): text is mapped
 //     to "▁"-prefixed pieces and greedily merged by vocabulary Scores, with
@@ -29,21 +30,34 @@ type Pair struct {
 //     family-specific variant), bytes are mapped through the GPT-2
 //     printable-byte alphabet (ByteEncoder/ByteDecoder), and pieces are
 //     merged by MergeRanks.
+//   - TokenizerWordPiece ("bert"): text is normalized and split at whitespace,
+//     punctuation, and CJK characters, then each word is greedily segmented.
+//     Both llama.cpp's phantom-space GGUF vocabulary and raw "##" WordPiece
+//     vocabularies are accepted.
 //
 // AddBOS mirrors tokenizer.ggml.add_bos_token: Encode prepends BOSID when
-// set, EncodeWithoutBOS never does (chat renderers place BOS themselves).
+// set. BERT tokenizers also append SEP/EOS according to their metadata.
+// EncodeWithoutBOS never adds any boundary tokens (chat renderers place those
+// themselves).
 type Tokenizer struct {
-	Vocab       []string
-	Scores      []float32
-	TokenToID   map[string]uint32
-	MergeRanks  map[Pair]int
-	ByteEncoder map[byte]rune
-	ByteDecoder map[rune]byte
-	Mode        TokenizerMode
-	Pre         string
-	AddBOS      bool
-	BOSID       uint32
-	EOSID       uint32
+	Vocab             []string
+	Scores            []float32
+	TokenToID         map[string]uint32
+	MergeRanks        map[Pair]int
+	ByteEncoder       map[byte]rune
+	ByteDecoder       map[rune]byte
+	Mode              TokenizerMode
+	Pre               string
+	AddBOS            bool
+	AddEOS            bool
+	AddSEP            bool
+	BOSID             uint32
+	EOSID             uint32
+	UNKID             uint32
+	SEPID             uint32
+	Lowercase         bool
+	StripAccents      bool
+	RawWordPieceVocab bool
 }
 
 // TokenizerFromMetadata builds a Tokenizer from a GGUF's tokenizer.* keys:
@@ -97,34 +111,121 @@ func TokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
 	// than silently treating such vocabularies as SentencePiece.
 	if strings.EqualFold(model, "gpt2") || strings.Contains(preLower, "qwen") || strings.Contains(preLower, "gpt") || strings.Contains(preLower, "tekken") || strings.Contains(preLower, "kimi") {
 		mode = TokenizerGPT2BPE
+	} else if strings.EqualFold(model, "bert") {
+		mode = TokenizerWordPiece
 	}
 	enc, dec := buildByteMaps()
-	bosID, eosID := uint32(1), uint32(2)
-	if v, ok := metadata["tokenizer.ggml.bos_token_id"]; ok {
-		if n, ok := v.AsU32(); ok {
-			bosID = n
+	bosID, eosID, unkID, sepID := uint32(1), uint32(2), uint32(0), uint32(2)
+	addBOS, addEOS, addSEP := true, false, false
+	sepFromVocab := false
+	if mode == TokenizerWordPiece {
+		bosID, eosID, unkID, sepID = 101, 102, 100, 102
+		addSEP = true
+		// Small and custom BERT vocabularies do not necessarily use the
+		// conventional 100-103 IDs. Token text is a useful fallback when the
+		// explicit metadata is absent.
+		if id, ok := tokenToID["[CLS]"]; ok {
+			bosID = id
+		}
+		if id, ok := tokenToID["[UNK]"]; ok {
+			unkID = id
+		} else if id, ok := tokenToID["<unk>"]; ok {
+			unkID = id
+		}
+		if id, ok := tokenToID["[SEP]"]; ok {
+			sepID, eosID = id, id
+			sepFromVocab = true
 		}
 	}
-	if v, ok := metadata["tokenizer.ggml.eos_token_id"]; ok {
-		if n, ok := v.AsU32(); ok {
-			eosID = n
+	readID := func(current uint32, keys ...string) uint32 {
+		for _, key := range keys {
+			if v, ok := metadata[key]; ok {
+				if n, ok := v.AsU32(); ok {
+					return n
+				}
+			}
+		}
+		return current
+	}
+	readBool := func(current bool, key string) bool {
+		if v, ok := metadata[key]; ok {
+			if b, ok := v.AsBool(); ok {
+				return b
+			}
+		}
+		return current
+	}
+	bosID = readID(bosID, "tokenizer.ggml.bos_token_id", "tokenizer.ggml.cls_token_id")
+	eosID = readID(eosID, "tokenizer.ggml.eos_token_id")
+	unkID = readID(unkID, "tokenizer.ggml.unknown_token_id")
+	// llama.cpp's GGUF key has historically used the "seperator" spelling.
+	// Accept the corrected spelling too for files produced by other writers.
+	sepKeys := []string{
+		"tokenizer.ggml.seperator_token_id",
+		"tokenizer.ggml.separator_token_id",
+		"tokenizer.ggml.sep_token_id",
+	}
+	hasExplicitSEP := false
+	for _, key := range sepKeys {
+		if v, ok := metadata[key]; ok {
+			if n, ok := v.AsU32(); ok {
+				sepID, hasExplicitSEP = n, true
+				break
+			}
 		}
 	}
-	addBOS := true
-	if v, ok := metadata["tokenizer.ggml.add_bos_token"]; ok {
-		if b, ok := v.AsBool(); ok {
-			addBOS = b
+	if mode == TokenizerWordPiece && !hasExplicitSEP && !sepFromVocab {
+		// Some GGUF writers only expose the BERT separator as EOS.
+		sepID = eosID
+	}
+	addBOS = readBool(addBOS, "tokenizer.ggml.add_bos_token")
+	addEOS = readBool(addEOS, "tokenizer.ggml.add_eos_token")
+	addSEP = readBool(addSEP, "tokenizer.ggml.add_sep_token")
+	// llama.cpp's BertNormalizer defaults to lowercase=true. Keep that default
+	// scoped to WordPiece; the field is unused by the other tokenizer modes.
+	lowercase := readBool(mode == TokenizerWordPiece, "tokenizer.ggml.normalizer.lowercase")
+	// This matches llama.cpp's BERT default: uncased tokenizers strip accents
+	// unless the GGUF carries an explicit override.
+	stripAccents := readBool(lowercase, "tokenizer.ggml.normalizer.strip_accents")
+	rawWordPieceVocab := false
+	if mode == TokenizerWordPiece {
+		hasPhantomSpace := false
+		for _, token := range vocab {
+			if strings.HasPrefix(token, "##") {
+				rawWordPieceVocab = true
+				break
+			}
+			hasPhantomSpace = hasPhantomSpace || strings.HasPrefix(token, "\u2581")
+		}
+		if !rawWordPieceVocab {
+			rawWordPieceVocab = !hasPhantomSpace
 		}
 	}
-	return &Tokenizer{Vocab: vocab, Scores: scores, TokenToID: tokenToID, MergeRanks: mergeRanks, ByteEncoder: enc, ByteDecoder: dec, Mode: mode, Pre: preLower, AddBOS: addBOS, BOSID: bosID, EOSID: eosID}, nil
+	return &Tokenizer{
+		Vocab: vocab, Scores: scores, TokenToID: tokenToID, MergeRanks: mergeRanks,
+		ByteEncoder: enc, ByteDecoder: dec, Mode: mode, Pre: preLower,
+		AddBOS: addBOS, AddEOS: addEOS, AddSEP: addSEP,
+		BOSID: bosID, EOSID: eosID, UNKID: unkID, SEPID: sepID,
+		Lowercase: lowercase, StripAccents: stripAccents,
+		RawWordPieceVocab: rawWordPieceVocab,
+	}, nil
 }
 
 func (t *Tokenizer) Encode(text string) []uint32 {
-	out := make([]uint32, 0, len(text)/3+1)
+	out := make([]uint32, 0, len(text)/3+2)
 	if t.AddBOS {
 		out = append(out, t.BOSID)
 	}
-	return append(out, t.EncodeWithoutBOS(text)...)
+	out = append(out, t.EncodeWithoutBOS(text)...)
+	if t.Mode == TokenizerWordPiece {
+		if t.AddSEP {
+			out = append(out, t.SEPID)
+		}
+		if t.AddEOS && (!t.AddSEP || t.EOSID != t.SEPID) {
+			out = append(out, t.EOSID)
+		}
+	}
+	return out
 }
 
 func (t *Tokenizer) EncodeWithoutBOS(text string) []uint32 {
@@ -133,6 +234,9 @@ func (t *Tokenizer) EncodeWithoutBOS(text string) []uint32 {
 	}
 	if t.Mode == TokenizerGPT2BPE {
 		return t.encodeGPT2BPE(text)
+	}
+	if t.Mode == TokenizerWordPiece {
+		return t.encodeWordPiece(text)
 	}
 	return t.encodeSentencePiece(text)
 }
@@ -152,6 +256,19 @@ func (t *Tokenizer) DecodeToken(id uint32) string {
 	raw := t.decodeRaw(id)
 	if t.Mode == TokenizerGPT2BPE {
 		return t.decodeGPT2Bytes(raw)
+	}
+	if t.Mode == TokenizerWordPiece && t.RawWordPieceVocab {
+		if strings.HasPrefix(raw, "##") {
+			return strings.TrimPrefix(raw, "##")
+		}
+		if (strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]")) ||
+			(strings.HasPrefix(raw, "<") && strings.HasSuffix(raw, ">")) {
+			return raw
+		}
+		// Raw Hugging Face vocabularies use the absence of ## to mark a new
+		// word. Mirror the leading ▁ carried by converted GGUF vocabularies so
+		// token-by-token decoding preserves boundaries.
+		return " " + raw
 	}
 	if strings.HasPrefix(raw, "<0x") && strings.HasSuffix(raw, ">") && len(raw) == 6 {
 		if b, err := strconv.ParseUint(raw[3:5], 16, 8); err == nil {
@@ -194,6 +311,91 @@ func (t *Tokenizer) encodeSentencePiece(text string) []uint32 {
 		current = append(current[:bestIdx+1], current[bestIdx+2:]...)
 	}
 	return current
+}
+
+func (t *Tokenizer) encodeWordPiece(text string) []uint32 {
+	words := t.preprocessWordPiece(text)
+	out := make([]uint32, 0, len(words))
+	for _, word := range words {
+		wordStart := len(out)
+		pieces := []rune(word)
+		if !t.RawWordPieceVocab {
+			pieces = append([]rune{'\u2581'}, pieces...)
+		}
+		for start := 0; start < len(pieces); {
+			matchEnd := -1
+			var matchID uint32
+			for end := len(pieces); end > start; end-- {
+				candidate := string(pieces[start:end])
+				if t.RawWordPieceVocab && start > 0 {
+					candidate = "##" + candidate
+				}
+				if id, ok := t.TokenToID[candidate]; ok {
+					matchEnd, matchID = end, id
+					break
+				}
+			}
+			if matchEnd < 0 {
+				// WordPiece treats a partially covered word as wholly unknown;
+				// retaining its earlier pieces would change every later
+				// position compared with the model's training tokenizer.
+				out = out[:wordStart]
+				out = append(out, t.UNKID)
+				break
+			}
+			out = append(out, matchID)
+			start = matchEnd
+		}
+	}
+	return out
+}
+
+func (t *Tokenizer) preprocessWordPiece(text string) []string {
+	words := make([]string, 0, len(text)/5+1)
+	current := make([]rune, 0, 16)
+	flush := func() {
+		if len(current) > 0 {
+			words = append(words, string(current))
+			current = current[:0]
+		}
+	}
+	for _, r := range text {
+		if unicode.IsSpace(r) || unicode.Is(unicode.Z, r) {
+			flush()
+			continue
+		}
+		if r == 0 || r == unicode.ReplacementChar || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		if t.Lowercase {
+			r = unicode.ToLower(r)
+		}
+		if t.StripAccents {
+			if unicode.Is(unicode.Mn, r) {
+				continue
+			}
+			r = stripWordPieceAccent(r)
+		}
+		if unicode.IsPunct(r) || (r < unicode.MaxASCII && unicode.IsSymbol(r)) || isWordPieceCJK(r) {
+			flush()
+			words = append(words, string(r))
+			continue
+		}
+		current = append(current, r)
+	}
+	flush()
+	return words
+}
+
+func isWordPieceCJK(r rune) bool {
+	return (r >= 0x4E00 && r <= 0x9FFF) ||
+		(r >= 0x3400 && r <= 0x4DBF) ||
+		(r >= 0x20000 && r <= 0x2A6DF) ||
+		(r >= 0x2A700 && r <= 0x2B73F) ||
+		(r >= 0x2B740 && r <= 0x2B81F) ||
+		(r >= 0x2B920 && r <= 0x2CEAF) ||
+		(r >= 0xF900 && r <= 0xFAFF) ||
+		(r >= 0x2F800 && r <= 0x2FA1F)
 }
 
 func (t *Tokenizer) encodeGPT2BPE(text string) []uint32 {

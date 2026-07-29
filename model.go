@@ -181,6 +181,17 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	// public architecture label (it drives loader/template selection) while
 	// reading the namespace that is actually present in the GGUF.
 	p := arch
+	// `llama2`/`llama3` are compatibility labels used by a few third-party
+	// converters. Canonical GGUF metadata still lives under `llama.*`; prefer
+	// an alias-specific namespace when it exists, otherwise read the canonical
+	// keys while preserving the public architecture label.
+	if arch == "llama2" || arch == "llama3" {
+		if _, hasAliasPrefix := gguf.Metadata[p+".embedding_length"]; !hasAliasPrefix {
+			if _, hasLlamaPrefix := gguf.Metadata["llama.embedding_length"]; hasLlamaPrefix {
+				p = "llama"
+			}
+		}
+	}
 	if arch == "kimi_k2" {
 		if _, hasKimiPrefix := gguf.Metadata[p+".embedding_length"]; !hasKimiPrefix {
 			if _, hasDeepSeekPrefix := gguf.Metadata["deepseek2.embedding_length"]; hasDeepSeekPrefix {
@@ -466,6 +477,14 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ6KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeMXFP4:
 		MatvecMXFP4Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeTQ1_0:
+		MatvecTQ1_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeTQ2_0:
+		MatvecTQ2_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ1_0:
+		MatvecQ1_0Into(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeQ2_0:
+		MatvecQ2_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	default:
 		panic(fmt.Sprintf("unsupported quantized matvec: %v", w.Type))
 	}
@@ -670,6 +689,18 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeMXFP4:
 		rowBytes := (cols / 32) * 17
 		DequantRowMXFP4Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeTQ1_0:
+		rowBytes := (cols / 256) * 54
+		DequantRowTQ1_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeTQ2_0:
+		rowBytes := (cols / 256) * 66
+		DequantRowTQ2_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ1_0:
+		rowBytes := (cols / 128) * 18
+		DequantRowQ1_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeQ2_0:
+		rowBytes := (cols / 64) * 18
+		DequantRowQ2_0Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	default:
 		panic(fmt.Sprintf("unsupported quantized row extraction: %v", w.Type))
 	}
@@ -1659,7 +1690,8 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		}
 		return Weight{F32: f}, nil
 	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeIQ2_S, GGMLTypeIQ3_S, GGMLTypeIQ4_XS, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
-		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeMXFP4:
+		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeTQ1_0, GGMLTypeTQ2_0,
+		GGMLTypeMXFP4, GGMLTypeQ1_0, GGMLTypeQ2_0:
 		if forceF32 {
 			f, ok := dequantTensor(info.DType, raw, numel)
 			if !ok {
@@ -1727,6 +1759,14 @@ func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
 		return DequantRowQ6K(raw, numel), true
 	case GGMLTypeMXFP4:
 		return DequantRowMXFP4(raw, numel), true
+	case GGMLTypeTQ1_0:
+		return DequantRowTQ1_0(raw, numel), true
+	case GGMLTypeTQ2_0:
+		return DequantRowTQ2_0(raw, numel), true
+	case GGMLTypeQ1_0:
+		return DequantRowQ1_0(raw, numel), true
+	case GGMLTypeQ2_0:
+		return DequantRowQ2_0(raw, numel), true
 	default:
 		return nil, false
 	}
@@ -1878,26 +1918,12 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		if config.layerUsesSWA(l) {
 			attnStart = max(0, pos-config.SlidingWindow)
 		}
-		attnHeads := func(hStart, hEnd int) {
-			for h := hStart; h < hEnd; h++ {
-				kvH := h / kvMul
-				qOff := h * headDim
-				outOff := h * config.ValueDim
-				sink, hasSink := float32(0), h < len(layer.AttnSinks)
-				if hasSink {
-					sink = layer.AttnSinks[h]
-				}
-				cache.attendHeadWithSink(l, kvH, buf.Q[qOff:qOff+headDim], headDim, config.ValueDim,
-					attnStart, pos, scale, config.AttnLogitSoftcap, sink, hasSink,
-					buf.AttnOut[outOff:outOff+config.ValueDim])
-			}
-		}
 		// Attention cost grows with context length; spread heads across the
 		// worker pool once there is enough work to amortize dispatch overhead.
 		if attnLen := pos - attnStart + 1; attnLen >= 128 && config.NHeads > 1 {
-			parallelChunks(config.NHeads, attnHeads)
+			parallelAttendHeads(config, layer, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else {
-			attnHeads(0, config.NHeads)
+			attendHeadsRange(&config, &layer, cache, buf, l, pos, attnStart, scale, kvMul, 0, config.NHeads)
 		}
 		layer.WO.MatvecInto(buf.AttnOut, &buf.Proj)
 		addInPlace(buf.Proj, layer.BO)
@@ -1969,6 +1995,32 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		}
 	}
 	normalizeDecoderInto(config, buf.X, weights.OutputNorm, weights.OutputNormBias, &buf.XN)
+}
+
+// attendHeadsRange lives outside ForwardBodyInto so the common short-context
+// serial path does not construct an escaping closure for every layer. The
+// parallel wrapper owns the copies captured by its worker closure.
+func attendHeadsRange(config *Config, layer *LayerWeights, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul, hStart, hEnd int) {
+	headDim := config.HeadDim
+	valueDim := config.ValueDim
+	for h := hStart; h < hEnd; h++ {
+		kvH := h / kvMul
+		qOff := h * headDim
+		outOff := h * valueDim
+		sink, hasSink := float32(0), h < len(layer.AttnSinks)
+		if hasSink {
+			sink = layer.AttnSinks[h]
+		}
+		cache.attendHeadWithSink(l, kvH, buf.Q[qOff:qOff+headDim], headDim, valueDim,
+			attnStart, pos, scale, config.AttnLogitSoftcap, sink, hasSink,
+			buf.AttnOut[outOff:outOff+valueDim])
+	}
+}
+
+func parallelAttendHeads(config Config, layer LayerWeights, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul int) {
+	parallelChunks(config.NHeads, func(hStart, hEnd int) {
+		attendHeadsRange(&config, &layer, cache, buf, l, pos, attnStart, scale, kvMul, hStart, hEnd)
+	})
 }
 
 func normalizeDecoderInto(config Config, x, weight, bias []float32, out *[]float32) {
@@ -2373,6 +2425,14 @@ func sameTypeQuantDot(a, b Weight, x []float32) (quantRowDot, int, bool) {
 		dot = DotQ6KF32
 	case GGMLTypeMXFP4:
 		dot = DotMXFP4F32
+	case GGMLTypeTQ1_0:
+		dot = DotTQ1_0F32
+	case GGMLTypeTQ2_0:
+		dot = DotTQ2_0F32
+	case GGMLTypeQ1_0:
+		dot = DotQ1_0F32
+	case GGMLTypeQ2_0:
+		dot = DotQ2_0F32
 	default:
 		return nil, 0, false
 	}
@@ -2386,16 +2446,6 @@ func matvecDotRows(data []byte, rowBytes int, x []float32, start, end int, out [
 	}
 }
 
-// onlineAttention computes softmax(q·K^T * scale)·V for one head over cached
-// positions [startT, endT] using the online-softmax algorithm: a single pass
-// that tracks the running max score and rescales the accumulated output
-// whenever a new maximum appears (out *= exp(oldMax-newMax)), so no
-// per-position score array is materialized regardless of context length.
-// keys/values are the head's slices into the position-major KV cache, striding
-// by keyStride/valueStride per position. softcap > 0 applies Gemma 2-style
-// attention-logit softcapping (cap*tanh(score/cap)) before the softmax. out
-// must be zeroed by the caller and receives the already-normalized weighted
-// value sum.
 // attnScoresPool holds per-head score scratch for the two-pass attention
 // below. Heads run concurrently (parallelChunks), so each in-flight head
 // borrows its own buffer.

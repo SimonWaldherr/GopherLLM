@@ -1,14 +1,13 @@
-//go:build !amd64
+//go:build !amd64 && !(darwin && arm64)
 
 package gopherllm
 
 import "os"
 
-// The f16 KV cache is enabled by default only on amd64 (F16C converts rows
-// in-register). On other platforms it remains opt-in: scalar conversion is
-// slower, but `GOPHERLLM_KV_F16=1` halves KV-cache memory, which is useful for
-// long-context models on unified-memory Macs. The default stays exact f32.
-// The scalar implementations below are correct everywhere.
+// The f16 KV cache remains opt-in on platforms without the amd64 F16C or
+// Apple Silicon NEON implementations. Scalar conversion is slower, but
+// `GOPHERLLM_KV_F16=1` still halves KV-cache memory. The default stays exact
+// f32 and the scalar implementations below keep every target correct.
 var useF16KVCache = os.Getenv("GOPHERLLM_KV_F16") == "1"
 
 func dotF32F16(a []float32, b []uint16) float32 { return dotF32F16Scalar(a, b, 0) }

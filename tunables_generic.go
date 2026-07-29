@@ -5,8 +5,8 @@ package gopherllm
 import "runtime"
 
 // The int8-activation matvecs are amd64-only (VPMADDUBSW). Non-amd64 builds
-// do have a correct scalar f16 KV-cache implementation: it is opt-in by
-// default because it trades decode speed for half the cache footprint.
+// do have a correct f16 KV-cache implementation (NEON on Apple Silicon,
+// scalar elsewhere); it is opt-in by default and available to the autotuner.
 
 func q8ActivationsAvailable() bool { return false }
 

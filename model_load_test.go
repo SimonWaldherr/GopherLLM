@@ -23,6 +23,36 @@ func TestConfigFromTinyGGUF(t *testing.T) {
 	}
 }
 
+func TestLlamaAliasArchitectureUsesCanonicalMetadata(t *testing.T) {
+	data := buildTinyLlamaGGUF()
+	canonical, err := ParseGGUFQuiet(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ConfigFromGGUF(canonical)
+	for _, alias := range []string{"llama2", "llama3"} {
+		t.Run(alias, func(t *testing.T) {
+			g, err := ParseGGUFQuiet(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g.Metadata["general.architecture"] = MetaValue{Kind: "str", Value: alias}
+
+			cfg := ConfigFromGGUF(g)
+			if cfg.Arch != alias || cfg.Dim != want.Dim || cfg.NLayers != want.NLayers {
+				t.Fatalf("alias config = {arch:%q dim:%d layers:%d}", cfg.Arch, cfg.Dim, cfg.NLayers)
+			}
+			r, err := runnerFromParsedGGUF(data, g, false, LoadOptions{})
+			if err != nil {
+				t.Fatalf("load alias GGUF: %v", err)
+			}
+			if r.Architecture() != alias {
+				t.Fatalf("Architecture() = %q, want %q", r.Architecture(), alias)
+			}
+		})
+	}
+}
+
 func TestLoadAndGenerateTinyModel(t *testing.T) {
 	runner, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {

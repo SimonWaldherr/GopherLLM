@@ -28,7 +28,10 @@ func buildTinyBERTGGUFWithArchAndFusedQKV(arch string, fusedQKV bool) []byte {
 		tokens[i] = string(rune('a' + i))
 		scores[i] = float32(0)
 	}
-	tokens[0], tokens[1], tokens[2] = "<unk>", "[CLS]", "[SEP]"
+	// llama.cpp converts a raw WordPiece vocabulary to phantom-space form:
+	// first pieces gain ▁ and continuation pieces lose their ## prefix.
+	tokens[0], tokens[1], tokens[2] = "[UNK]", "[CLS]", "[SEP]"
+	tokens[3], tokens[4], tokens[5], tokens[6] = "▁a", "b", "c", "▁nomic"
 	kvs := []ggufKV{
 		{"general.architecture", ggufStr, arch},
 		{"general.name", ggufStr, "tiny bert embedding"},
@@ -39,12 +42,16 @@ func buildTinyBERTGGUFWithArchAndFusedQKV(arch string, fusedQKV bool) []byte {
 		{arch + ".context_length", ggufU32, uint32(16)},
 		{arch + ".attention.layer_norm_epsilon", ggufF32, float32(1e-5)},
 		{arch + ".pooling_type", ggufU32, uint32(1)},
-		{"tokenizer.ggml.model", ggufStr, "llama"},
+		{"tokenizer.ggml.model", ggufStr, "bert"},
 		{"tokenizer.ggml.tokens", ggufArr, ggufArray{ggufStr, tokens}},
 		{"tokenizer.ggml.scores", ggufArr, ggufArray{ggufF32, scores}},
 		{"tokenizer.ggml.bos_token_id", ggufU32, uint32(1)},
 		{"tokenizer.ggml.eos_token_id", ggufU32, uint32(2)},
+		{"tokenizer.ggml.unknown_token_id", ggufU32, uint32(0)},
+		{"tokenizer.ggml.seperator_token_id", ggufU32, uint32(2)},
 		{"tokenizer.ggml.add_bos_token", ggufBool, true},
+		{"tokenizer.ggml.add_sep_token", ggufBool, true},
+		{"tokenizer.ggml.normalizer.lowercase", ggufBool, true},
 	}
 	f32t := func(name string, rows, cols, seed int) ggufTensor {
 		return ggufTensor{name: name, dims: []uint64{uint64(cols), uint64(rows)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(rows*cols, seed))}
@@ -121,7 +128,7 @@ func TestLoadAndEmbedTinyBERTModel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("embed: %v", err)
 	}
-	if len(emb.Embedding) != r.Config().Dim || emb.TokenCount == 0 {
+	if len(emb.Embedding) != r.Config().Dim || emb.TokenCount != 5 {
 		t.Fatalf("embedding=%d tokens=%d", len(emb.Embedding), emb.TokenCount)
 	}
 	var norm float64
@@ -150,8 +157,12 @@ func TestLoadAndEmbedTinyNomicBERTModel(t *testing.T) {
 	if r.kind != loadedBERT {
 		t.Fatalf("kind = %v, want loadedBERT", r.kind)
 	}
-	if _, err := r.Embed("nomic"); err != nil {
+	emb, err := r.Embed("nomic")
+	if err != nil {
 		t.Fatalf("embed: %v", err)
+	}
+	if emb.TokenCount != 3 {
+		t.Fatalf("token count = %d, want CLS/nomic/SEP", emb.TokenCount)
 	}
 }
 

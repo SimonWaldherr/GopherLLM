@@ -117,7 +117,11 @@ func TestGGMLTypeDataSize(t *testing.T) {
 		{GGMLTypeQ6_K, 256, 210},
 		{GGMLTypeQ8_K, 256, 292},
 		{GGMLTypeF64, 10, 80},
+		{GGMLTypeTQ1_0, 256, 54},
+		{GGMLTypeTQ2_0, 256, 66},
 		{GGMLTypeMXFP4, 32, 17},
+		{GGMLTypeQ1_0, 128, 18},
+		{GGMLTypeQ2_0, 64, 18},
 	}
 	for _, c := range cases {
 		got, ok := c.typ.DataSize(c.n)
@@ -127,6 +131,44 @@ func TestGGMLTypeDataSize(t *testing.T) {
 	}
 	if _, ok := GGMLTypeUnknown.DataSize(10); ok {
 		t.Fatal("unknown type DataSize should not be ok")
+	}
+}
+
+func TestGGMLTypeBlockSize(t *testing.T) {
+	cases := []struct {
+		typ  GGMLType
+		want int
+	}{
+		{GGMLTypeF32, 1},
+		{GGMLTypeBF16, 1},
+		{GGMLTypeQ4_0, 32},
+		{GGMLTypeQ4_K, 256},
+		{GGMLTypeIQ2_S, 256},
+		{GGMLTypeTQ1_0, 256},
+		{GGMLTypeTQ2_0, 256},
+		{GGMLTypeQ1_0, 128},
+		{GGMLTypeQ2_0, 64},
+	}
+	for _, tc := range cases {
+		if got := tc.typ.BlockSize(); got != tc.want {
+			t.Errorf("%s BlockSize() = %d, want %d", tc.typ, got, tc.want)
+		}
+	}
+}
+
+func TestLatestGGMLTypeIDs(t *testing.T) {
+	for _, tc := range []struct {
+		id   uint32
+		want GGMLType
+	}{
+		{34, GGMLTypeTQ1_0},
+		{35, GGMLTypeTQ2_0},
+		{41, GGMLTypeQ1_0},
+		{42, GGMLTypeQ2_0},
+	} {
+		if got := ggmlTypeFromUint32(tc.id); got != tc.want {
+			t.Errorf("ggml type id %d = %s, want %s", tc.id, got, tc.want)
+		}
 	}
 }
 

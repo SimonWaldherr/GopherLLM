@@ -224,18 +224,23 @@
           <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
         </label>
         <p id="contextWindowStatus" class="settings-note" aria-live="polite"></p>
-        <label class="toggle-row">
-          <input id="wikimediaTools" type="checkbox">
-          <span>Wikipedia &amp; Wikidata research <span class="field-note">sends only model-requested search queries to Wikimedia</span></span>
-        </label>
-        <label class="toggle-row" id="skillsToolsRow" hidden>
-          <input id="skillsTools" type="checkbox" checked>
-          <span>Skills <span class="field-note">let the model load SKILL.md files from this server</span></span>
-        </label>
-        <label class="toggle-row">
-          <input id="showAgentActivity" type="checkbox" checked>
-          <span>Show tool activity <span class="field-note">what ran, with which arguments, and how long it took</span></span>
-        </label>
+        <details class="settings-disclosure" open>
+          <summary><span>Tools &amp; agents</span><small>Research, skills, and activity visibility</small></summary>
+          <div class="settings-disclosure-body">
+            <label class="toggle-row">
+              <input id="wikimediaTools" type="checkbox">
+              <span>Wikipedia &amp; Wikidata research <span class="field-note">sends only model-requested search queries to Wikimedia</span></span>
+            </label>
+            <label class="toggle-row" id="skillsToolsRow" hidden>
+              <input id="skillsTools" type="checkbox" checked>
+              <span>Skills <span class="field-note">let the model load SKILL.md files from this server</span></span>
+            </label>
+            <label class="toggle-row">
+              <input id="showAgentActivity" type="checkbox" checked>
+              <span>Show tool activity <span class="field-note">what ran, with which arguments, and how long it took</span></span>
+            </label>
+          </div>
+        </details>
         <details class="settings-disclosure">
           <summary><span>Memory &amp; retrieval</span><small>Search relevant messages from saved chats</small></summary>
           <div class="settings-disclosure-body">

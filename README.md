@@ -33,9 +33,10 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Split/sharded GGUF loading: point at any one shard of a
   `<name>-00001-of-00005.gguf`-style download and every sibling is discovered
   and merged automatically (see [Performance Notes](#performance-notes)).
-- Quantized matrix kernels for Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ2_S, IQ3_S, IQ4_NL, IQ4_XS,
-  Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/F64/BF16 load
-  directly (BF16 covers QAT-derived and modern full-precision GGUFs).
+- Quantized matrix kernels for TQ1_0, TQ2_0, Q1_0, Q2_0, Q2_K, Q3_K, Q4_K,
+  Q5_K, Q6_K, Q8_K, IQ2_S, IQ3_S, IQ4_NL, IQ4_XS, Q4_0, Q4_1, Q5_0,
+  Q5_1, Q8_0, Q8_1, and MXFP4 tensors; F32/F16/F64/BF16 load directly
+  (BF16 covers QAT-derived and modern full-precision GGUFs).
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
 - OpenAI-compatible tool/function calling, with a native prompt format for
   Mistral-family models and a generic convention for everything else.
@@ -356,12 +357,13 @@ in front of it.
 The composer keeps the default path deliberately small: write a message,
 attach files, and send. **Pro tools** reveals quick controls for context mode,
 output length, and slash commands; the complete configuration remains in
-Settings. Any file type can be attached. Text files up to 500 KB are included
-as text in the model request; non-text files (images, audio, video, PDFs,
-archives, and other binaries) stay local to the browser and are shown as
-attachment cards. With the built-in text-only server, their filename, type,
-and size are sent as metadata rather than pretending that binary content was
-analysed.
+Settings. Related settings are grouped into disclosures, and the mobile header
+wraps its actions below the chat title instead of clipping them on narrow
+screens. Any file type can be attached. Text files up to 500 KB are included as
+text in the model request; non-text files (images, audio, video, PDFs, archives,
+and other binaries) stay local to the browser and are shown as attachment
+cards. With the built-in text-only server, their filename, type, and size are
+sent as metadata rather than pretending that binary content was analysed.
 
 ### Smart context for long chats
 
@@ -806,6 +808,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - Use `--threads <N>` to set both GopherLLM worker threads and `GOMAXPROCS`.
   Make targets expose the same setting as `THREADS=<N>`; 8 was fastest in the
   measured M2 Max setup, but should be re-benchmarked on each target Mac.
+- The short-context attention path avoids constructing an escaping per-layer
+  worker closure. On the M2 Max development machine this reduced a tiny-model
+  forward pass from 2,502 to 2,339 ns/op, allocations from 11 to 8, and a real
+  0.11B F32 GGUF generation benchmark from 39.150 to 38.081 ms/op.
 - Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
   scale/min data plus selected Q6_K scale data, then switches supported rows to
   prepared kernels.
@@ -870,6 +876,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
   spread across the worker pool at longer contexts, and single-token matvec work
   is over-chunked so performance cores absorb efficiency-core stragglers.
+  Apple Silicon also uses NEON FP16 conversion, dot, and accumulation kernels
+  for the optional compact KV cache; at 4k context they made the f16 attention
+  benchmark about 3.7x faster than the scalar path. Exact f32 remains the
+  default there because it was still faster on the measured M2 Max.
 - Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
   it.
 - Split GGUFs (llama.cpp's `gguf-split` naming convention,
@@ -888,9 +898,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   accumulation), which measured ~1.15x over the previous online-softmax loop
   at 4k-16k context and uses the true score maximum for stability.
   On non-amd64 systems the exact f32 cache remains the default; set
-  `GOPHERLLM_KV_F16=1` to opt into the scalar f16 cache when memory capacity
+  `GOPHERLLM_KV_F16=1` to opt into the compact cache when memory capacity
   matters more than decode speed (for example, large Kimi contexts on a
-  unified-memory Mac).
+  unified-memory Mac). Apple Silicon converts its rows with dedicated NEON
+  FP16 kernels; other non-amd64 targets use the portable scalar fallback.
 - After mmap'ing a single-file GGUF, every page is touched once up front
   across all worker threads (`prefaultPages`) before the model is reported
   loaded. A memory-mapped file only pages in on first touch, and a forward
@@ -916,7 +927,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
-| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into the scalar f16 cache on non-amd64 to halve KV memory (may reduce speed) |
+| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on Apple Silicon) to halve KV memory |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
@@ -1032,6 +1043,9 @@ selection.
 embedding models for `/v1/embeddings` and history RAG, but intentionally cannot
 be selected for chat generation. This covers BERT-format Granite Embedding
 GGUFs as well as Nomic Embed GGUFs carrying `general.architecture = nomic-bert`.
+GGUF tokenizers declaring `tokenizer.ggml.model = bert` use native WordPiece
+normalization and greedy segmentation, including CLS/SEP boundaries and both
+llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 
 ## Development
 
@@ -1042,7 +1056,7 @@ GGUFs as well as Nomic Embed GGUFs carrying `general.architecture = nomic-bert`.
 | GGUF parsing + file mapping | `gguf.go`, `mmap.go` (Unix) / `mmap_windows.go` (Win32 file mapping) |
 | Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
 | Compute kernels + worker pool | `simd.go`; assembly in `*_amd64.s` / `*_arm64.s` behind `dot_f32_*.go`, `vector_ops_*.go`, `quant_*.go`, `q4k_q8_*.go` dispatch shims |
-| Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE) |
+| Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE + BERT WordPiece) |
 | Sampling | `sampling.go` |
 | Generation orchestration + chat templates | `runtime.go` |
 | Tool calling / reasoning / skills | `tools.go`, `extract.go`, `agent.go`, `skills.go` |

@@ -47,7 +47,11 @@ const (
 	GGMLTypeIQ4_XS  GGMLType = 23
 	GGMLTypeF64     GGMLType = 28
 	GGMLTypeBF16    GGMLType = 30
+	GGMLTypeTQ1_0   GGMLType = 34
+	GGMLTypeTQ2_0   GGMLType = 35
 	GGMLTypeMXFP4   GGMLType = 39
+	GGMLTypeQ1_0    GGMLType = 41
+	GGMLTypeQ2_0    GGMLType = 42
 	GGMLTypeUnknown GGMLType = 255
 )
 
@@ -58,7 +62,8 @@ func ggmlTypeFromUint32(v uint32) GGMLType {
 	switch GGMLType(v) {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
-		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeIQ3_S, GGMLTypeIQ2_S, GGMLTypeIQ4_XS, GGMLTypeF64, GGMLTypeBF16, GGMLTypeMXFP4:
+		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeIQ3_S, GGMLTypeIQ2_S, GGMLTypeIQ4_XS,
+		GGMLTypeF64, GGMLTypeBF16, GGMLTypeTQ1_0, GGMLTypeTQ2_0, GGMLTypeMXFP4, GGMLTypeQ1_0, GGMLTypeQ2_0:
 		return GGMLType(v)
 	default:
 		return GGMLTypeUnknown
@@ -107,8 +112,16 @@ func (t GGMLType) String() string {
 		return "F64"
 	case GGMLTypeBF16:
 		return "BF16"
+	case GGMLTypeTQ1_0:
+		return "TQ1_0"
+	case GGMLTypeTQ2_0:
+		return "TQ2_0"
 	case GGMLTypeMXFP4:
 		return "MXFP4"
+	case GGMLTypeQ1_0:
+		return "Q1_0"
+	case GGMLTypeQ2_0:
+		return "Q2_0"
 	default:
 		return "Unknown"
 	}
@@ -119,13 +132,21 @@ func (t GGMLType) String() string {
 // and IQ4_XS use 256-element superblocks. DataSize remains the authoritative
 // byte-size accessor for every format.
 func (t GGMLType) BlockSize() int {
-	if t == GGMLTypeF32 || t == GGMLTypeF16 || t == GGMLTypeF64 {
+	if t == GGMLTypeF32 || t == GGMLTypeF16 || t == GGMLTypeF64 || t == GGMLTypeBF16 {
 		return 1
 	}
-	if t == GGMLTypeIQ2_S || t == GGMLTypeIQ3_S || t == GGMLTypeIQ4_XS {
+	switch t {
+	case GGMLTypeQ1_0:
+		return 128
+	case GGMLTypeQ2_0:
+		return 64
+	case GGMLTypeTQ1_0, GGMLTypeTQ2_0,
+		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeQ8_K,
+		GGMLTypeIQ2_S, GGMLTypeIQ3_S, GGMLTypeIQ4_XS:
 		return 256
+	default:
+		return 32
 	}
-	return 32
 }
 
 // BlockBytes returns the byte size of one block for the simple (32-element)
@@ -181,8 +202,12 @@ func (t GGMLType) BlockBytes() (int, bool) {
 //	       8 high-index bits + 8 packed scales
 //	IQ3_S: 110 B / 256 elems = f16 d + 64 byte codebook indices + 8 high
 //	       index bits + 32 sign bits + 4 packed scales
+//	TQ1_0:  54 B / 256 elems = 48 base-3 bytes + 4 base-3 high bytes + f16 d
+//	TQ2_0:  66 B / 256 elems = 64 packed 2-bit ternary values + f16 d
 //	MXFP4: 17 B / 32 elems  = 16 nibble-packed FP4 values + 1 shared
 //	       power-of-two exponent byte
+//	Q1_0:  18 B / 128 elems = f16 scale + 128 packed sign bits
+//	Q2_0:  18 B / 64 elems  = f16 scale + 64 packed 2-bit values
 //
 // ok is false for types this runtime cannot size (callers then fall back to
 // offset-difference inference; see inferTensorSizes).
@@ -218,8 +243,16 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 		return (n / 256) * 82, true
 	case GGMLTypeIQ3_S:
 		return (n / 256) * 110, true
+	case GGMLTypeTQ1_0:
+		return (n / 256) * 54, true
+	case GGMLTypeTQ2_0:
+		return (n / 256) * 66, true
 	case GGMLTypeMXFP4:
 		return (n / 32) * 17, true
+	case GGMLTypeQ1_0:
+		return (n / 128) * 18, true
+	case GGMLTypeQ2_0:
+		return (n / 64) * 18, true
 	default:
 		return 0, false
 	}

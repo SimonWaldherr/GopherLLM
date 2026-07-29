@@ -8,8 +8,9 @@ import "math"
 // through attention per generated token, which grow linearly with context.
 // The activation math itself stays f32; only the cached K/V rows are
 // rounded, the same tradeoff llama.cpp makes by default. Portable scalar
-// fallbacks below keep every platform correct; the amd64 F16C kernels make
-// it fast, and useF16KVCache gates the feature to platforms where it wins.
+// fallbacks below keep every platform correct; amd64 F16C and Apple Silicon
+// NEON kernels accelerate the conversions, and useF16KVCache gates the
+// feature to configurations where it is wanted or wins autotuning.
 
 // F32ToF16 converts a float32 to IEEE 754 half-precision bits with
 // round-to-nearest-even, the scalar counterpart of F16ToF32.

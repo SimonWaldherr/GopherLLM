@@ -637,7 +637,11 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .command-name { flex: none; color: var(--accent); font: 700 12px/1.4 var(--mono); }
 .command-desc { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
 .toggle-row { display: flex !important; align-items: center; gap: 8px; color: var(--ink) !important; font-size: 12px !important; }
-.toggle-row input[type="checkbox"] { width: auto !important; min-height: 0 !important; margin: 0; padding: 0; accent-color: var(--accent); }
+.toggle-row input[type="checkbox"] { flex: none; width: auto !important; min-height: 0 !important; margin: 0; padding: 0; accent-color: var(--accent); }
+/* Without this the label span refuses to shrink below its content width (the
+   flex default), so a long label + field-note runs off narrow viewports
+   instead of wrapping. */
+.toggle-row > span { flex: 1; min-width: 0; }
 .rag-setting { gap: 7px !important; }
 .rag-setting > .toggle-row { width: 100%; }
 .goal-rounds { max-width: 150px; margin-top: 10px; }
@@ -702,8 +706,13 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .sidebar-scrim { position: fixed; z-index: 19; inset: 0; display: block; border: 0; background: rgba(0, 0, 0, .28); }
   .sidebar-toggle { display: grid; }
   .header-logo { display: grid; width: 29px; height: 29px; border-radius: 9px; font-size: 15px; }
-  header { flex-wrap: nowrap; padding: 10px 12px; }
-  .top { gap: 8px; }
+  /* Title/rename/delete stay on their own line (they already truncate via
+     ellipsis); Briefing/Share/Settings wrap to a second line instead of
+     being clipped past the viewport edge once they no longer fit beside a
+     long chat title. */
+  header { flex-wrap: wrap; padding: 10px 12px; }
+  .header-left { flex: 1 1 100%; }
+  .top { flex: 0 0 auto; gap: 8px; margin-left: auto; }
   .status { font-size: 11px; }
   .model-name { max-width: 40vw; }
   body.chat main { padding: 14px 10px; }
