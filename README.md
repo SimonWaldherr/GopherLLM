@@ -417,6 +417,11 @@ measured result as `gopherllm_cache` with `mode`, `hit`, `reused_tokens`, and
 browser UI shows the same information as cache warming or reuse, separately
 from Smart Context's message-selection status.
 
+OpenAI-compatible completion responses also report the reused portion as
+`usage.prompt_tokens_details.cached_tokens` (zero on a cold request).
+When `stream_options.include_usage` is enabled, streaming chat completions emit
+the standard final usage chunk with an empty `choices` array.
+
 Minimal OpenAI-compatible chat request:
 
 ```sh

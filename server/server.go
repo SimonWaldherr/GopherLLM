@@ -1757,9 +1757,6 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		finalDelta["tool_calls"] = result.ToolCalls
 	}
 	extra := map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason)}
-	if includeUsage {
-		extra["usage"] = usage(result)
-	}
 	// Headers are already committed once an SSE stream begins. Put the final
 	// loop iteration's context accounting in the terminal choice instead, so a
 	// skill/tool loop cannot leave the UI reporting the initial prompt as if it
@@ -1771,6 +1768,9 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		extra["gopherllm_cache"] = result.PromptCache
 	}
 	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra)
+	if includeUsage {
+		_ = writeOpenAIUsageChunk(w, flusher, id, model, created, usage(result))
+	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
@@ -1793,6 +1793,22 @@ func writeOpenAIStreamChunk(w http.ResponseWriter, flusher http.Flusher, id, mod
 		"model":              model,
 		"system_fingerprint": systemFingerprint,
 		"choices":            []any{choice},
+	})
+}
+
+// OpenAI emits requested streaming usage as a final, top-level usage object
+// with no choices. Keeping it separate from the terminal finish-reason chunk
+// lets compatible SDKs account for cached input tokens without understanding
+// GopherLLM's choice-level extensions.
+func writeOpenAIUsageChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, usage map[string]any) error {
+	return writeSSE(w, flusher, "", map[string]any{
+		"id":                 id,
+		"object":             "chat.completion.chunk",
+		"created":            created,
+		"model":              model,
+		"system_fingerprint": systemFingerprint,
+		"choices":            []any{},
+		"usage":              usage,
 	})
 }
 
@@ -2125,8 +2141,19 @@ func finishReasonOrDefault(reason string) string {
 	return reason
 }
 
-func usage(result gopherllm.GenerationResult) map[string]int {
-	return map[string]int{"prompt_tokens": result.Stats.PromptTokens, "completion_tokens": result.Stats.GeneratedTokens, "total_tokens": result.Stats.PromptTokens + result.Stats.GeneratedTokens}
+func usage(result gopherllm.GenerationResult) map[string]any {
+	cachedTokens := 0
+	if result.PromptCache != nil {
+		cachedTokens = min(max(result.PromptCache.ReusedTokens, 0), result.Stats.PromptTokens)
+	}
+	return map[string]any{
+		"prompt_tokens":     result.Stats.PromptTokens,
+		"completion_tokens": result.Stats.GeneratedTokens,
+		"total_tokens":      result.Stats.PromptTokens + result.Stats.GeneratedTokens,
+		"prompt_tokens_details": map[string]int{
+			"cached_tokens": cachedTokens,
+		},
+	}
 }
 
 func modelID(r *gopherllm.Runner) string {

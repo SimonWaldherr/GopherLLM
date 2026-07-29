@@ -231,6 +231,98 @@ func TestOpenAIStreamOptionsGatesUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIUsageReportsCachedInputTokens(t *testing.T) {
+	srv := newTestServer(t, HandlerOptions{})
+	const request = `{"messages":[{"role":"user","content":"a b c"}]}`
+
+	post := func(payload string) *http.Response {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	decodeUsage := func(resp *http.Response) struct {
+		PromptTokens       int `json:"prompt_tokens"`
+		PromptTokenDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+	} {
+		t.Helper()
+		defer resp.Body.Close()
+		var body struct {
+			Usage struct {
+				PromptTokens       int `json:"prompt_tokens"`
+				PromptTokenDetails struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Usage
+	}
+
+	cold := decodeUsage(post(request))
+	if cold.PromptTokenDetails.CachedTokens != 0 {
+		t.Fatalf("cold cached_tokens = %d, want 0", cold.PromptTokenDetails.CachedTokens)
+	}
+	warm := decodeUsage(post(request))
+	if warm.PromptTokenDetails.CachedTokens <= 0 {
+		t.Fatalf("warm cached_tokens = %d, want > 0", warm.PromptTokenDetails.CachedTokens)
+	}
+	if warm.PromptTokenDetails.CachedTokens > warm.PromptTokens {
+		t.Fatalf("warm cached_tokens = %d, prompt_tokens = %d", warm.PromptTokenDetails.CachedTokens, warm.PromptTokens)
+	}
+
+	stream := readAll(t, post(`{"messages":[{"role":"user","content":"a b c"}],"stream":true,"stream_options":{"include_usage":true}}`))
+	streamUsage, choices := usageFromSSE(t, stream)
+	if streamUsage.PromptTokenDetails.CachedTokens <= 0 {
+		t.Fatalf("stream cached_tokens = %d, want > 0; body=%s", streamUsage.PromptTokenDetails.CachedTokens, stream)
+	}
+	if len(choices) != 0 {
+		t.Fatalf("stream usage chunk choices = %d, want 0; body=%s", len(choices), stream)
+	}
+}
+
+func usageFromSSE(t *testing.T, body string) (struct {
+	PromptTokens       int `json:"prompt_tokens"`
+	PromptTokenDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}, []any) {
+	t.Helper()
+	scanner := bufio.NewScanner(strings.NewReader(body))
+	for scanner.Scan() {
+		data := strings.TrimPrefix(scanner.Text(), "data: ")
+		if data == scanner.Text() || data == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []any `json:"choices"`
+			Usage   *struct {
+				PromptTokens       int `json:"prompt_tokens"`
+				PromptTokenDetails struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			t.Fatalf("decode SSE chunk: %v (%s)", err, data)
+		}
+		if chunk.Usage != nil {
+			return *chunk.Usage, chunk.Choices
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatalf("stream contained no usage chunk: %s", body)
+	panic("unreachable")
+}
+
 func readAll(t *testing.T, resp *http.Response) string {
 	t.Helper()
 	defer resp.Body.Close()
