@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"math"
 	"strings"
 	"testing"
 )
@@ -479,6 +480,37 @@ func TestPhi2OutputBiasIsApplied(t *testing.T) {
 	for i, bias := range r.standard.OutputBias {
 		if d := (withBias[i] - withoutBias[i]) - bias; d < -1e-6 || d > 1e-6 {
 			t.Fatalf("logit %d bias delta = %v, want %v", i, withBias[i]-withoutBias[i], bias)
+		}
+	}
+}
+
+func TestStableLMParallelBranchesShareAttentionNorm(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyParallelStableLMGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.config.ParallelResidual {
+		t.Fatal("StableLM without FFN norm must use parallel residual branches")
+	}
+	layer := r.standard.Layers[0]
+	if len(layer.FFNNorm) != 0 {
+		t.Fatal("synthetic StableLM should exercise the shared-norm tensor layout")
+	}
+	kDim, vDim, mh, mk, mv := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, 1)
+	buf := NewDecodeBuffer(r.config, mh, mk, mv)
+	token := uint32(2)
+	input := r.standard.TokenEmbd.Row(int(token), r.config.Dim)
+	want := []float32{}
+	layerNormInto(input, layer.AttnNorm, layer.AttnNormBias, r.config.RMSNormEps, &want)
+
+	ForwardBodyInto(r.config, r.standard, cache, buf, token, 0)
+	if len(buf.XN2) < len(want) {
+		t.Fatalf("FFN input length = %d, want at least %d", len(buf.XN2), len(want))
+	}
+	for i := range want {
+		if d := math.Abs(float64(buf.XN2[i] - want[i])); d > 1e-6 {
+			t.Fatalf("FFN input %d = %v, want shared attention norm %v", i, buf.XN2[i], want[i])
 		}
 	}
 }

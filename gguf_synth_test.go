@@ -178,6 +178,14 @@ func buildTinyLlamaGGUF() []byte { return buildTinyStandardGGUF("llama") }
 // buildTinyStandardGGUF is the shared pre-norm RoPE/GQA/SwiGLU graph used by
 // Llama and the compatible decoder families exercised in runtime tests.
 func buildTinyStandardGGUF(arch string) []byte {
+	return buildTinyStandardGGUFWithStableParallel(arch, false)
+}
+
+func buildTinyParallelStableLMGGUF() []byte {
+	return buildTinyStandardGGUFWithStableParallel("stablelm", true)
+}
+
+func buildTinyStandardGGUFWithStableParallel(arch string, stableParallel bool) []byte {
 	const (
 		dim    = 8
 		heads  = 2
@@ -228,19 +236,25 @@ func buildTinyStandardGGUF(arch string) []byte {
 	vec := func(name string, n int) ggufTensor {
 		return ggufTensor{name: name, dims: []uint64{uint64(n)}, dtype: GGMLTypeF32, data: f32Bytes(onesF32(n))}
 	}
+	attnNorm := vec("blk.0.attn_norm.weight", dim)
+	if arch == "stablelm" {
+		attnNorm.data = f32Bytes([]float32{1.5, 0.75, 2, 0.5, 1.25, 0.8, 1.75, 0.6})
+	}
 	tensors := []ggufTensor{
 		f32t("token_embd.weight", vocab, dim, 1),
 		vec("output_norm.weight", dim),
 		f32t("output.weight", vocab, dim, 2),
-		vec("blk.0.attn_norm.weight", dim),
+		attnNorm,
 		f32t("blk.0.attn_q.weight", heads*hdim, dim, 3),
 		f32t("blk.0.attn_k.weight", kv*hdim, dim, 4),
 		f32t("blk.0.attn_v.weight", kv*hdim, dim, 5),
 		f32t("blk.0.attn_output.weight", dim, heads*hdim, 6),
-		vec("blk.0.ffn_norm.weight", dim),
 		f32t("blk.0.ffn_gate.weight", hidden, dim, 7),
 		f32t("blk.0.ffn_up.weight", hidden, dim, 8),
 		f32t("blk.0.ffn_down.weight", dim, hidden, 9),
+	}
+	if arch != "stablelm" || !stableParallel {
+		tensors = append(tensors, vec("blk.0.ffn_norm.weight", dim))
 	}
 	return buildGGUF(3, kvs, tensors)
 }

@@ -6,11 +6,11 @@ import (
 	"testing"
 )
 
-// TestLocalGGUFLoadSmoke is an opt-in integration test for a machine's local
-// model collection. It intentionally only loads a model: a one-token decode
-// can take minutes for large CPU-only models and is covered by targeted CLI
-// smoke runs instead. Set GOPHERLLM_MODEL_SMOKE_DIR to a directory containing
-// GGUF files to run it, for example:
+// TestLocalGGUFLoadSmoke is an opt-in integration test for a machine's complete
+// local model collection. It validates every supported non-projector layout
+// in out-of-core mode; a one-token decode can take minutes for large CPU-only
+// dense models and is covered by targeted CLI smoke runs instead. Set
+// GOPHERLLM_MODEL_SMOKE_DIR to a directory containing GGUF files, for example:
 //
 // GOPHERLLM_MODEL_SMOKE_DIR="$HOME/.cache/lm-studio/models" go test -run TestLocalGGUFLoadSmoke -v .
 func TestLocalGGUFLoadSmoke(t *testing.T) {
@@ -34,14 +34,7 @@ func TestLocalGGUFLoadSmoke(t *testing.T) {
 			if !entry.IsSupported {
 				t.Skipf("unsupported architecture: %s", entry.Architecture)
 			}
-			// Gemma 4 currently covers multiple incompatible GGUF graphs. Its
-			// unsupported PLE/MoE layouts fail with a precise loader diagnostic;
-			// keep those in the inventory without turning that known gap into a
-			// test-infrastructure failure.
-			if entry.Architecture == "gemma4" {
-				t.Skipf("architecture requires a layout-specific smoke test: %s", entry.Architecture)
-			}
-			r, _, err := RunnerFromPath(entry.Path)
+			r, _, err := RunnerFromPathWithOptions(entry.Path, LoadOptions{OutOfCore: true})
 			if err != nil {
 				t.Fatal(err)
 			}

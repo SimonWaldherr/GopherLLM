@@ -3,10 +3,9 @@ package gopherllm
 // Native pure Mamba-2 inference.
 //
 // Mamba2 GGUFs use the same convolution/SSM state layout as the Mamba blocks
-// in Nemotron-H, but have no attention KV cache and use y*SiLU(z) rather than
-// Nemotron's z*SiLU(y) gate. Keeping this loader and forward path separate
-// makes that graph distinction explicit instead of accepting an architecture
-// label and silently running the wrong recurrence.
+// in Nemotron-H, but have no attention KV cache. Keeping this loader and
+// forward path separate prevents architectures with attention or an MLP
+// branch from silently running the wrong graph.
 
 import (
 	"fmt"
@@ -160,7 +159,7 @@ func ForwardMamba2BodyInto(cfg Config, weights Mamba2Weights, cache *KVCache, bu
 	weights.TokenEmbd.RowInto(int(token), cfg.Dim, &buf.X)
 	for i, layer := range weights.Layers {
 		rmsNormInto(buf.X, layer.Norm, cfg.RMSNormEps, &buf.XN)
-		mambaSSMForward(cfg, layer.Mamba, cache.Nemotron, buf.XN, i, buf, false)
+		mambaSSMForward(cfg, layer.Mamba, cache.Nemotron, buf.XN, i, buf)
 		addInPlace(buf.X[:cfg.Dim], buf.Proj[:cfg.Dim])
 	}
 	rmsNormInto(buf.X, weights.OutputNorm, cfg.RMSNormEps, &buf.XN)

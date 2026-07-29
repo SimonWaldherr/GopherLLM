@@ -98,12 +98,11 @@ func TestMamba2RejectsMLPVariant(t *testing.T) {
 	}
 }
 
-func TestMamba2GateOrdering(t *testing.T) {
+func TestMamba2AndNemotronShareGateOrdering(t *testing.T) {
 	y, z := float32(2), float32(-1)
-	mamba := mambaGatedValue(y, z, false)
-	nemotron := mambaGatedValue(y, z, true)
+	got := mambaGatedValue(y, z)
 	want := y * (z / (1 + float32(math.Exp(float64(-z)))))
-	if math.Abs(float64(mamba-want)) > 1e-6 || mamba == nemotron {
-		t.Fatalf("Mamba2 gate=%v Nemotron gate=%v want=%v", mamba, nemotron, want)
+	if math.Abs(float64(got-want)) > 1e-6 {
+		t.Fatalf("shared Mamba2/Nemotron gate=%v, want=%v", got, want)
 	}
 }

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
 
 const smallModelLimitBytes int64 = 5 * 1024 * 1024 * 1024
+const modelSweepOutOfCoreThreshold int64 = 4 * 1024 * 1024 * 1024
 
 func TestSmallLocalModelsAnswerEinsteinPrompt(t *testing.T) {
 	if os.Getenv("GOPHERLLM_RUN_MODEL_SWEEP") != "1" {
@@ -35,11 +37,17 @@ func TestSmallLocalModelsAnswerEinsteinPrompt(t *testing.T) {
 	}
 	timeout := modelSweepTimeout(t)
 
-	prompt := "Antworte in einem vollstaendigen deutschen Satz: Wer war Albert Einstein?"
+	prompt := "Wer war Albert Einstein?"
 	for _, entry := range small {
 		entry := entry
 		t.Run(safeTestName(entry.ID), func(t *testing.T) {
-			text, err := runModelPromptWithTimeout(binary, entry.Path, prompt, timeout)
+			maxTokens := 16
+			if entry.Architecture == "nemotron_h" || entry.Architecture == "nemotron_h_moe" {
+				// Hybrid recurrent decode is deliberately per-token; a shorter
+				// answer keeps the complete opt-in sweep practical on CPU.
+				maxTokens = 12
+			}
+			text, err := runModelPromptWithTimeout(binary, entry.Path, prompt, maxTokens, timeout, entry.SizeBytes >= modelSweepOutOfCoreThreshold)
 			t.Logf("%s size=%.2fGB timeout=%s output=%q", entry.ID, float64(entry.SizeBytes)/(1024*1024*1024), timeout, text)
 			if err != nil {
 				t.Fatal(err)
@@ -51,19 +59,21 @@ func TestSmallLocalModelsAnswerEinsteinPrompt(t *testing.T) {
 	}
 }
 
-func runModelPromptWithTimeout(binary, modelPath, prompt string, timeout time.Duration) (string, error) {
+func runModelPromptWithTimeout(binary, modelPath, prompt string, maxTokens int, timeout time.Duration, outOfCore bool) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(
-		ctx,
-		binary,
+	args := []string{
 		modelPath,
 		"--prompt", prompt,
-		"--max-tokens", "24",
+		"--max-tokens", strconv.Itoa(maxTokens),
 		"--temp", "0",
 		"--system-prompt", "",
 		"--timeout", timeout.String(),
-	)
+	}
+	if outOfCore {
+		args = append(args, "--out-of-core")
+	}
+	cmd := exec.CommandContext(ctx, binary, args...)
 	var combined bytes.Buffer
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
@@ -97,11 +107,25 @@ func modelSweepTimeout(t *testing.T) time.Duration {
 func smallUsableModels(entries []ModelEntry) []ModelEntry {
 	out := []ModelEntry{}
 	for _, entry := range entries {
-		if entry.IsSupported && !entry.IsProjector && entry.SizeBytes < smallModelLimitBytes {
+		if entry.IsSupported && !entry.IsProjector && !entry.IsEmbedding && entry.SizeBytes < smallModelLimitBytes {
 			out = append(out, entry)
 		}
 	}
 	return out
+}
+
+func TestSmallUsableModelsExcludeProjectorsAndEmbeddings(t *testing.T) {
+	entries := []ModelEntry{
+		{ID: "chat", IsSupported: true, SizeBytes: 1},
+		{ID: "embedding", IsSupported: true, IsEmbedding: true, SizeBytes: 1},
+		{ID: "projector", IsSupported: true, IsProjector: true, SizeBytes: 1},
+		{ID: "large", IsSupported: true, SizeBytes: smallModelLimitBytes},
+		{ID: "unsupported", SizeBytes: 1},
+	}
+	got := smallUsableModels(entries)
+	if len(got) != 1 || got[0].ID != "chat" {
+		t.Fatalf("small usable models = %+v, want only chat", got)
+	}
 }
 
 func looksLikeEinsteinAnswer(text string) bool {

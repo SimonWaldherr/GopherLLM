@@ -83,8 +83,8 @@ func TestCompatibleDenseDecoderArchitecturesLoadAndGenerate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if arch == "stablelm" && (!r.config.UseLayerNorm || !r.config.ParallelResidual) {
-				t.Fatalf("stablelm config = %+v, want LayerNorm plus parallel residual", r.config)
+			if arch == "stablelm" && (!r.config.UseLayerNorm || r.config.ParallelResidual) {
+				t.Fatalf("stablelm config = %+v, want tensor-selected sequential LayerNorm residual", r.config)
 			}
 			opts := DefaultGenerationOptions()
 			opts.MaxTokens = 1

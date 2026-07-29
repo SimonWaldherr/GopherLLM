@@ -396,9 +396,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			} else {
 				addInPlace(X[t], Proj[t])
 			}
-			if config.Arch == "phi2" {
-				// Phi-2's attention and MLP branches share the same single
-				// LayerNorm output computed at the beginning of the block.
+			if config.sharesParallelBranchNorm() {
+				// Parallel StableLM and Phi-2 blocks feed both residual
+				// branches from the same normalized block input.
 			} else if config.usesPostNormOnly() {
 				copy(XN[t], X[t])
 			} else {

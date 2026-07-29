@@ -395,10 +395,7 @@ func nemotronSoftplus(x float32) float32 {
 	return float32(math.Log1p(math.Exp(float64(x))))
 }
 
-func mambaGatedValue(y, z float32, nemotronGate bool) float32 {
-	if nemotronGate {
-		return z * (y / (1 + float32(math.Exp(float64(-y)))))
-	}
+func mambaGatedValue(y, z float32) float32 {
 	return y * (z / (1 + float32(math.Exp(float64(-z)))))
 }
 
@@ -474,14 +471,12 @@ func nemotronDenseFFNForward(w NemotronDenseFFNWeights, x []float32, buf *Decode
 }
 
 func nemotronMambaForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, x []float32, layer int, buf *DecodeBuffer) {
-	mambaSSMForward(cfg, w, state, x, layer, buf, true)
+	mambaSSMForward(cfg, w, state, x, layer, buf)
 }
 
 // mambaSSMForward executes the common Mamba-2 convolution and SSM recurrence.
-// Nemotron-H and canonical Mamba2 use the same state layout but intentionally
-// differ in their gate ordering: Nemotron applies z*SiLU(y), while Mamba2
-// applies y*SiLU(z), both before the per-group RMSNorm.
-func mambaSSMForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, x []float32, layer int, buf *DecodeBuffer, nemotronGate bool) {
+// Nemotron-H and canonical Mamba2 share the y*SiLU(z) gate and state layout.
+func mambaSSMForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, x []float32, layer int, buf *DecodeBuffer) {
 	dInner, dState, nHeads, nGroups := cfg.SSMInner, cfg.SSMState, cfg.SSMHeads, cfg.SSMGroups
 	headDim := dInner / nHeads
 	channels := dInner + 2*nGroups*dState
@@ -541,7 +536,7 @@ func mambaSSMForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, 
 			if h < len(w.D) {
 				y += xv * w.D[h]
 			}
-			buf.MambaY[h*headDim+d] = mambaGatedValue(y, buf.MambaZ[h*headDim+d], nemotronGate)
+			buf.MambaY[h*headDim+d] = mambaGatedValue(y, buf.MambaZ[h*headDim+d])
 		}
 	}
 	// Mamba-2 applies RMS normalization independently to each B/C group.

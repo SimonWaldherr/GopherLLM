@@ -221,8 +221,8 @@ func TestBatchedPrefillMatchesPerTokenForStableLM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.config.UseLayerNorm || !r.config.ParallelResidual || !r.canBatchPrefill() {
-		t.Fatalf("stablelm should use batched LayerNorm/parallel-residual prefill: %+v", r.config)
+	if !r.config.UseLayerNorm || r.config.ParallelResidual || !r.canBatchPrefill() {
+		t.Fatalf("Stable-Code-style StableLM should use batched sequential LayerNorm prefill: %+v", r.config)
 	}
 	tokens := r.tok.Encode(strings.Repeat("abcdefghij", 10))
 	kDim, vDim, mh, mk, mv := r.cacheDims()

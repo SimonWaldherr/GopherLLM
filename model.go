@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -199,6 +200,14 @@ func (c Config) usesPostNormOnly() bool {
 	return c.Arch == "exaone4" || c.Arch == "olmo2"
 }
 
+// sharesParallelBranchNorm identifies architectures whose attention and FFN
+// branches consume the same normalized block input. Parallel StableLM variants
+// use a learned LayerNorm for both branches; Phi-2 does the same with its
+// ungated-GELU MLP.
+func (c Config) sharesParallelBranchNorm() bool {
+	return c.ParallelResidual && (c.Arch == "phi2" || c.Arch == "stablelm")
+}
+
 // usesFullProjectionQKNorm distinguishes OLMo 2/3's one RMSNorm over the
 // complete Q or K projection from the shared per-head norm used by Qwen3 and
 // EXAONE 4.
@@ -277,6 +286,19 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	parallelResidual := false
 	if v, ok := gguf.Metadata[p+".use_parallel_residual"]; ok {
 		parallelResidual, _ = v.AsBool()
+	}
+	if arch == "stablelm" {
+		// StableLM converters commonly retain use_parallel_residual=true even
+		// for Stable-Code checkpoints that contain a separate FFN LayerNorm.
+		// The tensor layout is authoritative: llama.cpp also selects the
+		// sequential branch whenever ffn_norm is present.
+		parallelResidual = true
+		for _, tensor := range gguf.Tensors {
+			if strings.HasSuffix(tensor.Name, ".ffn_norm.weight") {
+				parallelResidual = false
+				break
+			}
+		}
 	}
 	normEps := gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5)
 	if p == "stablelm" || p == "phi2" {
@@ -1550,7 +1572,7 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		return LayerWeights{}, err
 	}
 	var ffnNorm []float32
-	if config.usesPostNormOnly() || config.Arch == "phi2" {
+	if config.usesPostNormOnly() || config.sharesParallelBranchNorm() {
 		ffnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
 	} else {
 		ffnNorm, err = loadF32Vec(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
@@ -2132,7 +2154,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.X[:dim], buf.Proj)
 		}
 
-		if config.Arch == "phi2" {
+		if config.sharesParallelBranchNorm() {
 			ensureLenNoClear(&buf.XN2, dim)
 			copy(buf.XN2, buf.XN[:dim])
 		} else if config.usesPostNormOnly() {

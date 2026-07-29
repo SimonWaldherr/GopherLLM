@@ -885,13 +885,14 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   With `GOPHERLLM_Q8_ACTIVATIONS=0` the older dequantize-once-per-chunk f32 path
   runs instead. ARM64 reuses per-worker dequantization rows and dispatches one
   coarse batch range per worker to avoid allocation and scheduling overhead.
-  The same path now covers StableLM's LayerNorm plus parallel-residual block,
-  dense Qwen3's per-head QK norm, EXAONE 4's QK plus post-branch norms, and
-  OLMo 2/3's full-projection QK plus post-branch norms, and Phi-2's shared
-  biased LayerNorm plus parallel exact-GELU branch. This moves all four
-  families' prompt ingestion from per-token weight streaming onto the chunked
-  path as well. Q4_0/Q8_0 rows also use the dequantize-once path, which is
-  important for Stable Code and other legacy-Q4 GGUFs on Apple Silicon.
+  The same path now covers StableLM's tensor-selected sequential or
+  parallel-residual LayerNorm block, dense Qwen3's per-head QK norm, EXAONE
+  4's QK plus post-branch norms, OLMo 2/3's full-projection QK plus post-branch
+  norms, and Phi-2's shared biased LayerNorm plus parallel exact-GELU branch.
+  This moves all five families' prompt ingestion from per-token weight
+  streaming onto the chunked path as well. Q4_0/Q8_0 rows also use the
+  dequantize-once path, which is important for Stable Code and other legacy-Q4
+  GGUFs on Apple Silicon.
   Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token path (A/B
   benchmarking / debugging), or `GOPHERLLM_PREFILL_CHUNK=<N>` to tune the chunk
   size on the deployment machine.
@@ -999,6 +1000,7 @@ Important upstream GGUF families that are **not implemented yet**:
 | Falcon, GPT-NeoX/GPT-2, StarCoder2 | Non-Llama block layouts and their tokenizer conventions |
 | Jamba, RWKV, Hyena-family hybrids | Recurrent/state-space cache and mixing kernels |
 | Multimodal Qwen/Gemma/Llama models | Vision projector loading, visual-token injection, and multimodal positional encoding |
+| Standalone MTP/assistant draft files (`deepseek4_mtp*`, `gemma4-assistant`) | A parent-model speculative-decoding runtime; these auxiliary GGUFs are not standalone chat models |
 
 This gap list tracks architecture families, not every fine-tune name: a
 fine-tune is supported when its GGUF declares one of the implemented
@@ -1060,7 +1062,11 @@ RMS-normalized per head, branch projections are RMS-normalized before the
 residual add, and the 32B model follows its three-local/one-global SWA/RoPE
 schedule. Its `[|system|]` / `[|user|]` / `[|assistant|]` /
 `[|endofturn|]` instruct protocol is rendered natively. StableLM adds
-LayerNorm, learned norm biases, and optionally its parallel residual branch.
+LayerNorm and learned norm biases. Its residual layout is selected from the
+actual tensors rather than the sometimes-stale `use_parallel_residual`
+metadata: checkpoints with `ffn_norm` (including Stable Code) use the
+sequential attention-then-FFN graph, while variants without it feed attention
+and FFN from one shared normalized input.
 Sparse Granite MoE checkpoints remain intentionally rejected: their expert
 router and expert tensors require the separate MoE execution graph.
 
@@ -1096,9 +1102,9 @@ the optional shared ReLU² expert.
 
 Pure `mamba2` GGUFs (including the canonical 2.7B/7B family) run through a
 native convolution/SSM recurrence with no fabricated attention cache. The
-canonical `RMSNorm(y · SiLU(z))` gate is distinct from Nemotron-H's gate;
-Mamba2 variants with an additional MLP branch are rejected explicitly rather
-than being evaluated with an incompatible graph.
+canonical `RMSNorm(y · SiLU(z))` gate and state update are shared with
+Nemotron-H's Mamba-2 blocks; Mamba2 variants with an additional MLP branch are
+rejected explicitly rather than being evaluated with an incompatible graph.
 
 Gemma-family support (`gemma`/`gemma2`/`gemma3`/`gemma4`, including Gemma QAT
 GGUFs) implements `sqrt(dim)` embedding scaling, GELU FFN, QK-norm,
@@ -1163,6 +1169,27 @@ Run the full local check:
 
 ```sh
 make check
+```
+
+Validate every supported GGUF layout in a local model library without loading
+all weights into RAM:
+
+```sh
+GOPHERLLM_MODEL_SMOKE_DIR="$HOME/.cache/lm-studio/models" \
+  go test -run TestLocalGGUFLoadSmoke -v .
+```
+
+For a slower end-to-end answer check of every supported text model below 5 GB,
+first build the CLI and then run the opt-in sweep. Embedding GGUFs are
+deliberately excluded from chat generation and remain covered by the loader
+test plus `/v1/embeddings` tests.
+
+```sh
+go build -o /tmp/gopherllm-model-sweep ./cmd/gopherllm
+GOPHERLLM_RUN_MODEL_SWEEP=1 \
+GOPHERLLM_SWEEP_BINARY=/tmp/gopherllm-model-sweep \
+GOPHERLLM_MODEL_DIR="$HOME/.cache/lm-studio/models" \
+  go test -run TestSmallLocalModelsAnswerEinsteinPrompt -v .
 ```
 
 Check test coverage:
