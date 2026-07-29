@@ -80,13 +80,15 @@ The checked-in Go module intentionally has no third-party dependencies: its
 enforces that policy. The embedded chat UI is also self-contained; it does not
 load packages, fonts, or scripts from a CDN.
 
-The module-root Go files form the public `gopherllm` package, so they remain
-there to preserve the stable import path
-`github.com/SimonWaldherr/GopherLLM`. Executable entry points live in `cmd/`,
-HTTP code and UI assets in `server/`, implementation details in `internal/`,
-and test-only fixtures—including preserved profiling captures—in `testdata/`.
-Build output and local model/RAG data are ignored and are not part of the
-repository.
+The module-root Go files form the public `gopherllm` package, so core package
+sources remain there to preserve the stable import path
+`github.com/SimonWaldherr/GopherLLM`. Architecture-specific kernel dispatch and
+assembly are consolidated into `kernels_<arch>.go` / `kernels_<arch>.s`
+instead of being spread across one file per operation. Executable entry points
+live in `cmd/`, HTTP code and UI assets in `server/`, generated tables and
+other implementation details in `internal/`, and test-only fixtures—including
+preserved profiling captures—in `testdata/`. Build output and local model/RAG
+data are ignored and are not part of the repository.
 
 ## Quickstart
 
@@ -1161,13 +1163,14 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 |---|---|
 | GGUF parsing + file mapping | `gguf.go`, `mmap.go` (Unix) / `mmap_windows.go` (Win32 file mapping) |
 | Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
-| Compute kernels + worker pool | `simd.go`; assembly in `*_amd64.s` / `*_arm64.s` behind `dot_f32_*.go`, `vector_ops_*.go`, `quant_*.go`, `q4k_q8_*.go` dispatch shims |
+| Compute kernels + worker pool | `simd.go`; platform dispatch and assembly grouped in `kernels_*.go` / `kernels_*.s` |
+| Generated inference tables | `internal/iqcodebook/` |
 | Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE + BERT WordPiece) |
 | Sampling | `sampling.go` |
 | Generation orchestration + chat templates | `runtime.go` |
 | Tool calling / reasoning / skills | `tools.go`, `extract.go`, `agent.go`, `skills.go` |
 | Model discovery + selection | `catalog.go` |
-| HTTP server | `server.go`, `web_ui/` |
+| HTTP server | `server/server.go`, `server/web_ui/` |
 | CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
 
 A full architecture walkthrough — load path, inference data flow, kernel

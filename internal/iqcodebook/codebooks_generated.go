@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: MIT
 // See THIRD_PARTY_NOTICES.md for the complete license notice.
 
-package gopherllm
+package iqcodebook
 
 import (
 	"crypto/sha256"
@@ -156,8 +156,8 @@ const iq3SGridBase64 = "" +
 	"Aw8JBQMPBwkDDwsJAw8DAQUPCQEFDwEDBQ8NAwUPAwUFDwEHBQ8DCwUPBQEHDwUHBw8LBwcPBwsHDwMBCQ8LAQkPBwMJDwEFCQ8B" +
 	"CwkPBQULDwUJCw8FAQ0PAwcNDwEBDw8="
 
-var iq2SGrid [1024]uint64
-var iq3SGrid [512]uint32
+var IQ2SGrid [1024]uint64
+var IQ3SGrid [512]uint32
 
 var iq2SGridSHA256 = [sha256.Size]byte{
 	0xe1, 0xaa, 0x14, 0x73, 0x41, 0x2b, 0x05, 0x52,
@@ -181,8 +181,8 @@ func init() {
 	if sha256.Sum256(iq2Raw) != iq2SGridSHA256 {
 		panic("embedded IQ2_S codebook checksum mismatch")
 	}
-	for i := range iq2SGrid {
-		iq2SGrid[i] = binary.LittleEndian.Uint64(iq2Raw[i*8:])
+	for i := range IQ2SGrid {
+		IQ2SGrid[i] = binary.LittleEndian.Uint64(iq2Raw[i*8:])
 	}
 
 	iq3Raw, err := base64.StdEncoding.DecodeString(iq3SGridBase64)
@@ -192,7 +192,7 @@ func init() {
 	if sha256.Sum256(iq3Raw) != iq3SGridSHA256 {
 		panic("embedded IQ3_S codebook checksum mismatch")
 	}
-	for i := range iq3SGrid {
-		iq3SGrid[i] = binary.LittleEndian.Uint32(iq3Raw[i*4:])
+	for i := range IQ3SGrid {
+		IQ3SGrid[i] = binary.LittleEndian.Uint32(iq3Raw[i*4:])
 	}
 }

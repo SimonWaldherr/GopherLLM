@@ -3,7 +3,7 @@
 ## llama.cpp IQ codebook tables
 
 The embedded `iq2s_grid` and `iq3s_grid` data in
-`iq_codebooks_generated.go` are derived verbatim from
+`internal/iqcodebook/codebooks_generated.go` are derived verbatim from
 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), file
 `ggml/src/ggml-common.h`, commit
 [`e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0`](https://github.com/ggml-org/llama.cpp/commit/e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0).

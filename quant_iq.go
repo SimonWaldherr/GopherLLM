@@ -1,7 +1,9 @@
 package gopherllm
 
+import "github.com/SimonWaldherr/GopherLLM/internal/iqcodebook"
+
 // Scalar IQ2_S and IQ3_S dequantization kernels. The block codebooks are
-// embedded in iq_codebooks_generated.go from the corresponding MIT-licensed
+// embedded in internal/iqcodebook from the corresponding MIT-licensed
 // llama.cpp reference tables. These formats trade a compact per-block index
 // stream for indirect lookup, so the portable path intentionally favors exact
 // decoding and row parallelism over a premature SIMD approximation.
@@ -14,11 +16,11 @@ func iqSign(signs byte, index int) float32 {
 }
 
 func iq2SGridValue(index, component int) float32 {
-	return float32(byte(iq2SGrid[index] >> (8 * component)))
+	return float32(byte(iqcodebook.IQ2SGrid[index] >> (8 * component)))
 }
 
 func iq3SGridValue(index, component int) float32 {
-	return float32(byte(iq3SGrid[index] >> (8 * component)))
+	return float32(byte(iqcodebook.IQ3SGrid[index] >> (8 * component)))
 }
 
 // DequantRowIQ2SInto decodes GGML's IQ2_S blocks. A 256-value block contains
