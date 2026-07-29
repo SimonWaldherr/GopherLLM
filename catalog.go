@@ -79,7 +79,8 @@ func DefaultModelDir() string {
 // DiscoverModels recursively finds every .gguf under root and parses each
 // file's header (mmap'd, weights untouched) to fill in architecture, name,
 // and support status. Unparseable files are skipped with a stderr note rather
-// than failing the whole scan. Results are sorted by ID.
+// than failing the whole scan. Results put supported models first, then sort
+// case-insensitively by their display name with ID as a deterministic tie.
 func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
 	if logw == nil {
 		logw = io.Discard
@@ -107,8 +108,28 @@ func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
 		}
 		entries = append(entries, entry)
 	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].ID < entries[j].ID })
+	sort.Slice(entries, func(i, j int) bool { return modelSortKey(entries[i]) < modelSortKey(entries[j]) })
 	return entries, nil
+}
+
+// modelSortKey orders supported models before unsupported ones (unsupported
+// entries can never actually be loaded, so they should not sit ahead of
+// usable choices even when a caller opts to show them), then
+// case-insensitively by the same display name the Web UI and --list-models
+// show, e.g. ModelName ("general.name" from the GGUF) falling back to ID.
+// A plain byte-wise sort on ID mixes repositories unpredictably, since
+// upper-case org names (e.g. "DavidAU") sort before all lower-case ones
+// (e.g. "bartowski") in ASCII.
+func modelSortKey(m ModelEntry) string {
+	supported := "1"
+	if m.IsSupported {
+		supported = "0"
+	}
+	name := m.ModelName
+	if name == "" {
+		name = m.ID
+	}
+	return supported + "\x00" + strings.ToLower(name) + "\x00" + strings.ToLower(m.ID) + "\x00" + m.ID
 }
 
 // ResolveModelPath turns the CLI's model selector into a concrete .gguf path.

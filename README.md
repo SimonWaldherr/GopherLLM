@@ -353,6 +353,10 @@ are saved in the browser's IndexedDB. It supports chat search, rename/delete,
 non-destructive edit and retry branches, local text-file insertion, and
 JSON/Markdown export. Editing an earlier prompt or retrying an answer opens a
 new local branch while retaining the original conversation for comparison.
+Every assistant answer also has an under-text **Copy message** action and a
+**Change model** action; changing the model creates a comparison branch and
+automatically asks the same question again while preserving the original. The
+model picker is searchable and hides unsupported GGUFs unless requested.
 Nothing is synced to a third party; exported archives are the portable backup
 format. The UI assets use no-store and same-origin security headers, so start
 the server on a trusted local address unless you add your own network security
@@ -1107,7 +1111,7 @@ with V RMSNorm where declared, per-layer output scales, and the
 its real shared-dense-plus-sparse GEGLU graph: scaled RMS router input, fused
 expert gate/up banks, expert down scales, and the three branch/sum norms. E2B
 executes the exact token-conditioned per-layer embedding residual (its global
-projection/norm, gated exact-GELU residual) and its query-only shared-KV tail:
+pre-norm-scaled projection, gated exact-GELU residual) and its query-only shared-KV tail:
 15 physical slots, with tail SWA blocks reading slot 13 and global blocks slot
 14. Local 12B, 26B and E2B Q4 out-of-core decode smoke tests are green.
 

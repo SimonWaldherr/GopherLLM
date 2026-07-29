@@ -707,8 +707,14 @@ func forwardNativeGemma4BodyInto(config Config, weights Gemma4Weights, cache *KV
 
 // prepareNativeGemma4PerLayerInputs implements E2B's token-conditioned PLE
 // input graph. The regular token embedding is already sqrt(dim)-scaled when
-// this runs. Each layer receives (RMSNorm(model_proj(x))/sqrt(dim) +
+// this runs. Each layer receives
+// (RMSNorm(model_proj(x)/sqrt(dim)) +
 // sqrt(ple_dim)*per_layer_token_embedding[token, layer]) / sqrt(2).
+//
+// The projection scale must be applied before RMSNorm. Besides matching the
+// reference graph, that ordering cancels the regular embedding's sqrt(dim)
+// scale before normalization. Applying it afterwards incorrectly shrinks the
+// entire projected PLE branch by 1/sqrt(dim), which severely derails E2B.
 func prepareNativeGemma4PerLayerInputs(config Config, weights *Gemma4PerLayerWeights, token uint32, buf *DecodeBuffer) {
 	if weights == nil || weights.Dim <= 0 || len(weights.ProjNorm) != weights.Dim {
 		panic("invalid native Gemma 4 per-layer embedding weights")
@@ -723,6 +729,7 @@ func prepareNativeGemma4PerLayerInputs(config Config, weights *Gemma4PerLayerWei
 		panic("native Gemma 4 per-layer embedding projection has an invalid shape")
 	}
 	projScale := float32(1 / math.Sqrt(float64(config.Dim)))
+	ScaleF32(buf.Gemma4PLE[:total], projScale)
 	inputScale := float32(math.Sqrt(float64(weights.Dim)))
 	combineScale := float32(1 / math.Sqrt2)
 	for layer := 0; layer < config.NLayers; layer++ {
@@ -731,7 +738,7 @@ func prepareNativeGemma4PerLayerInputs(config Config, weights *Gemma4PerLayerWei
 		rawInput := buf.Gemma4PLEInput[off : off+weights.Dim]
 		gemma4RMSNormInPlace(projected, weights.ProjNorm, config.RMSNormEps)
 		for i := range projected {
-			projected[i] = (projected[i]*projScale + rawInput[i]*inputScale) * combineScale
+			projected[i] = (projected[i] + rawInput[i]*inputScale) * combineScale
 		}
 	}
 }

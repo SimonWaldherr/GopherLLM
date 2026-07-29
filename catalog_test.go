@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -165,6 +166,26 @@ func TestCatalogHelpers(t *testing.T) {
 	}
 	if got := modelDirFromEntries(nil); got != "the model directory" {
 		t.Fatalf("empty modelDirFromEntries = %q", got)
+	}
+}
+
+func TestModelSortKeyPutsSupportedModelsFirstAndUsesDisplayName(t *testing.T) {
+	entries := []ModelEntry{
+		{ID: "repo/unsupported", ModelName: "Aardvark", IsSupported: false},
+		{ID: "repo/zeta", ModelName: "zeta", IsSupported: true},
+		{ID: "repo/alpha-b", ModelName: "Alpha", IsSupported: true},
+		{ID: "repo/alpha-a", ModelName: "alpha", IsSupported: true},
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return modelSortKey(entries[i]) < modelSortKey(entries[j])
+	})
+	got := make([]string, len(entries))
+	for i := range entries {
+		got[i] = entries[i].ID
+	}
+	want := "repo/alpha-a,repo/alpha-b,repo/zeta,repo/unsupported"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("model catalog order = %v, want %s", got, want)
 	}
 }
 

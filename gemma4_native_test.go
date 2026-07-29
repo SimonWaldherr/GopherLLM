@@ -205,6 +205,41 @@ func TestNativeGemma4PLERequiresPLETensors(t *testing.T) {
 	}
 }
 
+func TestNativeGemma4PLEScalesProjectionBeforeRMSNorm(t *testing.T) {
+	config := Config{Dim: 4, NLayers: 1, RMSNormEps: 0}
+	weights := &Gemma4PerLayerWeights{
+		Dim:       2,
+		TokenEmbd: Weight{F32: []float32{1, 2}, Rows: 1, Cols: 2},
+		ModelProj: Weight{
+			F32: []float32{
+				1, 0, 0, 0,
+				0.5, 0, 0, 0,
+			},
+			Rows: 2,
+			Cols: 4,
+		},
+		ProjNorm: []float32{1, 1},
+	}
+	buf := NewDecodeBuffer(config, 1, 1, 1)
+	// This is the regular token embedding after sqrt(dim) scaling. The model
+	// projection therefore produces [2, 1], then the required pre-norm
+	// 1/sqrt(dim) scale produces [1, 0.5].
+	buf.X = []float32{2, 0, 0, 0}
+
+	prepareNativeGemma4PerLayerInputs(config, weights, 0, buf)
+
+	projectedRMS := float32(math.Sqrt((1.0 + 0.25) / 2))
+	want := []float32{
+		(1/projectedRMS + float32(math.Sqrt2)) / float32(math.Sqrt2),
+		(0.5/projectedRMS + 2*float32(math.Sqrt2)) / float32(math.Sqrt2),
+	}
+	for i := range want {
+		if got := buf.Gemma4PLE[i]; math.Abs(float64(got-want[i])) > 1e-5 {
+			t.Fatalf("prepared PLE[%d]=%g, want %g", i, got, want[i])
+		}
+	}
+}
+
 // buildTinyNativeGemma4E2BGGUF is a structural E2B fixture. It has the real
 // 35/20 split (fifteen physical K/V layers and twenty query-only tail layers),
 // scalar KV-head metadata, PLE tensors, and deliberately serialized tail K/V

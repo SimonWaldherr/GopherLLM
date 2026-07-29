@@ -213,14 +213,21 @@ function messageFooter(el) {
 function attachCopyButton(el) {
   if (el.querySelector(".copy-btn")) return;
   const button = document.createElement("button");
-  button.className = "message-icon-button copy-btn";
   button.type = "button";
-  button.textContent = "⧉";
-  button.dataset.copiedLabel = "✓";
   button.setAttribute("aria-label", "Copy message to clipboard");
-  button.title = "Copy message";
+  if (el.classList.contains("assistant")) {
+    button.className = "message-action copy-btn";
+    button.textContent = "Copy message";
+    button.dataset.copiedLabel = "Copied";
+    messageFooter(el).appendChild(button);
+  } else {
+    button.className = "message-icon-button copy-btn";
+    button.textContent = "⧉";
+    button.dataset.copiedLabel = "✓";
+    button.title = "Copy message";
+    messageControls(el).appendChild(button);
+  }
   bindCopy(button, () => el.dataset.raw || "");
-  messageControls(el).appendChild(button);
 }
 
 function attachDetailsButton(el, meta) {
@@ -934,6 +941,9 @@ function toMarkdown(chat) {
   const contextEstimateEl = $("contextEstimate");
   const promptCacheStatusEl = $("promptCacheStatus");
   const modelSelectEl = $("modelSelect");
+  const modelSearchEl = $("modelSearch");
+  const modelShowUnsupportedEl = $("modelShowUnsupported");
+  const modelHiddenCountEl = $("modelHiddenCount");
   const modelNameEl = $("modelName");
   const chatTitleEl = $("chatTitle");
   const chatListEl = $("chatList");
@@ -969,10 +979,11 @@ function toMarkdown(chat) {
   const MAX_CHATS = 100;
   let chats = [];
   let activeID = "";
-  let preferences = { theme: "system", power: false, composerPro: false, goalRounds: 3, embeddingModel: "", mermaidCDN: "", showAgentActivity: true };
+  let preferences = { theme: "system", power: false, composerPro: false, goalRounds: 3, embeddingModel: "", mermaidCDN: "", showAgentActivity: true, showUnsupportedModels: false };
   let busy = false;
   let tuning = false;
   let loadingModel = false;
+  let pendingModelRetry = null;
   let loadingEmbeddingModel = false;
   let activeEmbeddingModel = "";
   let ragSearching = false;
@@ -1630,7 +1641,14 @@ function toMarkdown(chat) {
       action.setAttribute("aria-label", "Regenerate this answer in a new branch");
       action.title = "Regenerate in a new branch";
       action.addEventListener("click", () => retryMessage(index));
-      wrap.appendChild(action);
+      const changeModel = document.createElement("button");
+      changeModel.className = "message-action message-change-model";
+      changeModel.type = "button";
+      changeModel.textContent = "Change model";
+      changeModel.setAttribute("aria-label", "Regenerate this answer with another model");
+      changeModel.title = "Choose another model and regenerate in a new branch";
+      changeModel.addEventListener("click", () => changeModelForMessage(index, changeModel));
+      wrap.append(action, changeModel);
       return;
     }
     wrap.appendChild(action);
@@ -2353,6 +2371,17 @@ function toMarkdown(chat) {
     generate();
   }
 
+  function changeModelForMessage(index, opener) {
+    if (busy || tuning || loadingModel) return;
+    if (editingIndex !== null) cancelEdit();
+    const chat = activeChat();
+    if (!chat || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
+    if (!chat.messages.slice(0, index).some((message) => message.role === "user")) return;
+    pendingModelRetry = { chatID: chat.id, index };
+    openSettings(modelSelectEl, opener);
+    showToast("Choose another model to regenerate the same question.", "success");
+  }
+
   function updateSettings() {
     const chat = activeChat();
     if (!chat) return;
@@ -2389,6 +2418,21 @@ function toMarkdown(chat) {
     }
   }
 
+  function filterModelOptions() {
+    const query = modelSearchEl.value.trim().toLowerCase();
+    const showUnsupported = modelShowUnsupportedEl.checked;
+    let hidden = 0;
+    Array.from(modelSelectEl.options).forEach((option) => {
+      if (!option.value) return;
+      const unsupported = option.dataset.supported === "false";
+      const matches = !query || (option.dataset.search || option.textContent.toLowerCase()).includes(query);
+      const visible = option.dataset.loaded === "true" || (matches && (showUnsupported || !unsupported));
+      option.hidden = !visible;
+      if (!visible) hidden++;
+    });
+    modelHiddenCountEl.textContent = hidden ? "(" + hidden + " hidden)" : "";
+  }
+
   async function loadModels() {
     try {
       const response = await fetch("/models");
@@ -2410,6 +2454,8 @@ function toMarkdown(chat) {
         option.value = model.id;
         const context = model.context_length ? " · " + (model.context_length >= 1000 ? Math.round(model.context_length / 1000) + "K" : model.context_length) + " ctx" : "";
         option.textContent = (model.name || model.id) + (model.architecture ? " [" + model.architecture + "]" : "") + context + (model.size_gb ? " — " + model.size_gb.toFixed(1) + " GB" : "") + (!model.supported ? " (unsupported)" : "");
+        option.dataset.supported = String(Boolean(model.supported));
+        option.dataset.search = [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB"].filter(Boolean).join(" ").toLowerCase();
         if (model.loaded) {
           option.selected = true;
           option.dataset.loaded = "true";
@@ -2419,6 +2465,7 @@ function toMarkdown(chat) {
         if (!model.supported) option.style.color = "var(--muted)";
         modelSelectEl.appendChild(option);
       });
+      filterModelOptions();
       const embeddingModels = data.models.filter((model) => model.embedding === true);
       ragModelEl.replaceChildren();
       if (!embeddingModels.length) {
@@ -3064,9 +3111,16 @@ function toMarkdown(chat) {
   agentosApproveEl.addEventListener("click", () => executeAgentOSProposal(true));
   agentosDenyEl.addEventListener("click", () => executeAgentOSProposal(false));
 
+  modelSearchEl.addEventListener("input", filterModelOptions);
+  modelShowUnsupportedEl.addEventListener("change", () => {
+    preferences.showUnsupportedModels = modelShowUnsupportedEl.checked;
+    filterModelOptions();
+    save();
+  });
   modelSelectEl.addEventListener("change", async () => {
     const model = modelSelectEl.value;
     if (!model || busy || tuning || loadingModel) return;
+    let regenerateAfterLoad = false;
     lastContextWindow = null;
     loadingModel = true;
     const previous = Array.from(modelSelectEl.options).find((option) => option.dataset.loaded === "true");
@@ -3087,12 +3141,28 @@ function toMarkdown(chat) {
       const loaded = Array.from(modelSelectEl.options).find((option) => option.value === model);
       if (loaded) loaded.dataset.loaded = "true";
       contextLimit = Number(data.context_length) || 0;
-      setModelName(data.model || model);
+      const loadedName = data.model || model;
+      const retry = pendingModelRetry;
+      const source = retry && chats.find((chat) => chat.id === retry.chatID);
+      if (source && source.messages[retry.index] && source.messages[retry.index].role === "assistant") {
+        const branch = createBranch(source, source.messages.slice(0, retry.index), "model");
+        branch.model = loadedName;
+        modelNameEl.textContent = loadedName;
+        modelNameEl.title = loadedName;
+        pendingModelRetry = null;
+        closeSettings();
+        renderWorkspace(true);
+        showToast("Created a model-comparison branch. The original chat is unchanged.", "success");
+        regenerateAfterLoad = true;
+      } else {
+        pendingModelRetry = null;
+        setModelName(loadedName);
+        showToast("Model loaded. Your chats were kept.", "success");
+      }
       updateComposer(false);
       renderChatList();
       save();
       setStatus("Ready");
-      showToast("Model loaded. Your chats were kept.", "success");
       loadAutoTuneStatus();
     } catch (error) {
       if (previous) modelSelectEl.value = previous.value;
@@ -3105,6 +3175,7 @@ function toMarkdown(chat) {
       autoTuneRunEl.disabled = false;
       autoTuneEffortEl.disabled = false;
     }
+    if (regenerateAfterLoad) generate();
   });
 
   autoTuneRunEl.addEventListener("click", async () => {
@@ -3214,12 +3285,13 @@ function toMarkdown(chat) {
   chatSearchEl.addEventListener("input", renderChatList);
   sidebarToggleEl.addEventListener("click", () => setSidebar(!sidebarEl.classList.contains("is-open")));
   sidebarScrimEl.addEventListener("click", () => setSidebar(false));
-  function openSettings() {
+  function openSettings(initialFocus, opener) {
     settingsToggleEl.setAttribute("aria-expanded", "true");
-    openDialog(settingsEl, settingsToggleEl, settingsCloseEl);
+    openDialog(settingsEl, opener || settingsToggleEl, initialFocus || settingsCloseEl);
   }
   function closeSettings() {
     if (settingsEl.hidden) return;
+    pendingModelRetry = null;
     settingsToggleEl.setAttribute("aria-expanded", "false");
     closeDialog(settingsEl);
   }
@@ -3489,7 +3561,8 @@ function toMarkdown(chat) {
         goalRounds: boundedNumber(stored.preferences.goalRounds, 3, 2, 8, true),
         embeddingModel: typeof stored.preferences.embeddingModel === "string" ? stored.preferences.embeddingModel : "",
         mermaidCDN: typeof stored.preferences.mermaidCDN === "string" ? stored.preferences.mermaidCDN : "",
-        showAgentActivity: stored.preferences.showAgentActivity !== false
+        showAgentActivity: stored.preferences.showAgentActivity !== false,
+        showUnsupportedModels: stored.preferences.showUnsupportedModels === true
       };
     }
     if (typeof stored.activeID === "string" && chats.some((chat) => chat.id === stored.activeID)) activeID = stored.activeID;
@@ -3504,6 +3577,7 @@ function toMarkdown(chat) {
   applyPowerPreference(preferences.power);
   applyMermaidChoice(preferences.mermaidCDN, true);
   if (showAgentActivityEl) showAgentActivityEl.checked = preferences.showAgentActivity !== false;
+  modelShowUnsupportedEl.checked = preferences.showUnsupportedModels === true;
   setComposerProOpen(preferences.composerPro);
   goalRoundsEl.value = preferences.goalRounds;
   renderWorkspace(true);

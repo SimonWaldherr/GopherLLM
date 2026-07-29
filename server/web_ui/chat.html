@@ -186,9 +186,14 @@
             <p>Choose the local model for this server.</p>
           </div>
         </div>
+        <input type="search" id="modelSearch" class="model-search" placeholder="Search models by name, architecture, or size…" aria-label="Search models" autocomplete="off">
         <select id="modelSelect" aria-label="Select model">
           <option value="">{{.Model}}</option>
         </select>
+        <label class="toggle-row model-show-unsupported">
+          <input type="checkbox" id="modelShowUnsupported">
+          <span>Show unsupported models <small id="modelHiddenCount"></small></span>
+        </label>
       </section>
 
       <section class="settings-section">
