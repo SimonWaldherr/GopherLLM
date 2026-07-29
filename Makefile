@@ -22,6 +22,18 @@ METAL_LDFLAGS ?= $(if $(METAL_SDK),-isysroot $(METAL_SDK),)
 METAL_BIN    ?= $(BUILD_DIR)/$(BINARY)-metal
 METAL_TAGS   ?= metal
 
+# METAL: whether the plain build/run/serve targets (as opposed to the
+# explicit *-metal targets, which always want it) use Metal GPU offload.
+# Defaults to on when building natively on macOS with a C compiler
+# available, since Metal is a real ~1.5-2x decode / ~10x load speedup on
+# Apple GPUs and cgo cross-compiles are unaffected (cross-build always uses
+# CROSS_CGO_ENABLED, never this variable). Override with `METAL=0` to force
+# the portable CPU-only build, e.g. for a CI runner without Xcode.
+UNAME_S      := $(shell uname -s)
+METAL_CC_OK  := $(shell command -v $(METAL_CC) >/dev/null 2>&1 && echo 1)
+METAL        ?= $(if $(filter Darwin,$(UNAME_S)),$(if $(METAL_CC_OK),1,0),0)
+_METAL_FLAG  = $(if $(filter 1,$(METAL)),--metal,)
+
 MODEL_DIR     ?= $(HOME)/.cache/lm-studio/models
 MODEL         ?=
 PROMPT        ?= Wer war Albert Einstein?
@@ -69,15 +81,19 @@ _AUTO_JSON_FLAG = $(if $(filter 1 true yes on,$(AUTO_JSON)),--auto-json,)
 _AUTO_ARGS     = $(if $(_AUTO_ENABLED),--auto --auto-effort "$(AUTO_EFFORT)" $(_AUTO_REFRESH_FLAG) $(_AUTO_JSON_FLAG),)
 _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p "$(MIN_P)" --repeat-penalty "$(REPEAT_PENALTY)" $(_SEED_FLAG)
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
-_RUN_ARGS      = $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
+_RUN_ARGS      = $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
 .PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
 build:
-	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE)
+	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
+ifeq ($(METAL),1)
+	@TMPDIR="$(TMP_DIR)/" GOTMPDIR="$(TMP_DIR)" CC="$(METAL_CC)" CXX="$(METAL_CXX)" CGO_CFLAGS="$(CGO_CFLAGS) $(METAL_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS) $(METAL_LDFLAGS)" CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags "$(METAL_TAGS)" -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/gopherllm
+else
 	$(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BIN) ./cmd/gopherllm
+endif
 
 release: build
 
@@ -140,10 +156,10 @@ compare-run-metal: release build-metal
 	@$(METAL_BIN) --metal --prepare-quant $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
 repl: release
-	@$(BIN) $(PREPARE_FLAG) $(_AUTO_ARGS) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) $(_SAMPLER_ARGS) --repl
+	@$(BIN) $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) $(_SAMPLER_ARGS) --repl
 
 serve: release
-	@$(BIN) $(PREPARE_FLAG) $(_AUTO_ARGS) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
+	@$(BIN) $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --serve "$(SERVE_ADDR)" $(CHAT_FLAG)
 
 serve-metal: PREPARE_QUANT=1
 serve-metal: build-metal
@@ -293,7 +309,7 @@ clean:
 help:
 	@printf "Targets:\n"
 	@printf "  make all                             Run check and release build\n"
-	@printf "  make build/release                   Build ./$(BIN)\n"
+	@printf "  make build/release                   Build ./$(BIN) (auto-uses Metal on macOS w/ Xcode CLT; METAL=0 to force CPU-only)\n"
 	@printf "  make build-metal                     Build ./$(METAL_BIN) with CGO+Metal tag\n"
 	@printf "  make cross-build                     Build darwin/linux/windows for amd64 and arm64\n"
 	@printf "  make fmt-check                       Fail if Go source files are not gofmt-formatted\n"

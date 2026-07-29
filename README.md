@@ -759,9 +759,18 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 
 ## Make Targets
 
+- `make build`, `make run`, `make repl`, and `make serve` auto-detect Metal:
+  on macOS with Xcode Command Line Tools installed, they build with
+  `CGO_ENABLED=1 -tags metal` and pass `--metal` for you (a real ~1.5-2x
+  decode speedup and ~10x faster load from measurements on an M2 Max).
+  Set `METAL=0` (e.g. `make build METAL=0`) to force the portable CPU-only
+  build instead — useful for CI or a machine without Xcode. Cross-compiled
+  binaries (`make cross-build`) are unaffected either way; they always use
+  `CROSS_CGO_ENABLED` (default `0`) since Metal only exists on macOS.
 - `make run MODEL=... PROMPT='...'` builds and runs one prompt.
 - `make run-prep MODEL=...` runs the prompt with `--prepare-quant`.
-- `make build-metal` builds `bin/gopherllm-metal` with CGO and the `metal` tag.
+- `make build-metal` builds `bin/gopherllm-metal` explicitly, regardless of
+  the `METAL` auto-detection above (useful to keep both binaries around).
 - `make run-metal MODEL=...` runs with experimental `--metal` enabled.
 - `make run-auto MODEL=...` and `make run-auto-metal MODEL=...` tune (or reuse
   a cached tuning) before generating; set `AUTO_EFFORT=quick|balanced|thorough`
@@ -870,8 +879,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - Use `--min-p <F>` (e.g. `0.05`) for min-p nucleus sampling; `0` disables it.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
   comparisons.
-- Metal is available only in `bin/gopherllm-metal` builds made with
-  `CGO_ENABLED=1 -tags metal`, and must be enabled with `--metal`. The selective
+- Metal requires a build with `CGO_ENABLED=1 -tags metal` (the plain `make
+  build`/`run`/`serve` targets do this automatically on macOS when Xcode
+  Command Line Tools are present; `make build-metal` does it explicitly
+  regardless of platform detection) and must be enabled with `--metal` at
+  runtime (also automatic from the `make` targets above; pass it yourself for
+  a manually built binary). The selective
   path fuses mixed Q4_K/Q4_K/Q6_K Q/K/V projections into one command buffer and
   offloads Q4_K attention-output, Q4_K gate/up + SiLU + Q6_K FFN-down in one
   command buffer, and Q6_K vocabulary-output projections. GGUF files opened
