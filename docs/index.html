@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GopherLLM — Local GGUF inference in pure Go</title>
+  <meta name="description" content="Run GGUF language models locally with a dependency-free Go runtime, OpenAI and Ollama compatible APIs, hardware acceleration, and a private browser chat UI.">
+  <meta name="theme-color" content="#101513">
+  <meta name="color-scheme" content="dark light">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="GopherLLM — Local GGUF inference in pure Go">
+  <meta property="og:description" content="A dependency-free Go runtime for local GGUF models, compatible APIs, and private browser chat.">
+  <meta property="og:url" content="https://simonwaldherr.github.io/GopherLLM/">
+  <meta name="twitter:card" content="summary">
+  <link rel="canonical" href="https://simonwaldherr.github.io/GopherLLM/">
+  <link rel="stylesheet" href="./styles.css">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareSourceCode",
+      "name": "GopherLLM",
+      "description": "A dependency-free Go runtime for local GGUF language-model inference.",
+      "codeRepository": "https://github.com/SimonWaldherr/GopherLLM",
+      "programmingLanguage": "Go",
+      "license": "https://opensource.org/license/mit",
+      "runtimePlatform": ["Linux", "macOS", "Windows"]
+    }
+  </script>
+  <script src="./script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="wordmark" href="#top" aria-label="GopherLLM home">GopherLLM</a>
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <a href="#features">Features</a>
+        <a href="#models">Models</a>
+        <a href="#api">API</a>
+        <a href="#performance">Performance</a>
+      </nav>
+      <div class="header-actions">
+        <button id="themeToggle" class="quiet-button" type="button" aria-label="Switch color theme">Light theme</button>
+        <a class="button button-small" href="https://github.com/SimonWaldherr/GopherLLM">View on GitHub</a>
+      </div>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="top" class="hero shell">
+      <div class="hero-copy">
+        <div class="eyebrow" aria-label="Project characteristics">
+          <span>Local inference</span>
+          <span>Pure Go</span>
+          <span>GGUF</span>
+        </div>
+        <h1>Your models.<br>Your machine.<br>Your data.</h1>
+        <p class="hero-lede">GopherLLM is a compact GGUF runtime written in Go. Run modern language models locally, expose familiar APIs, or embed inference directly into your own Go application.</p>
+        <div class="hero-actions">
+          <a class="button" href="https://github.com/SimonWaldherr/GopherLLM#quickstart">Start locally</a>
+          <a class="button button-secondary" href="#api">Explore the API</a>
+        </div>
+        <p class="hero-note">MIT licensed. No Python runtime. Local by default; remote features remain opt-in.</p>
+      </div>
+
+      <div class="terminal-card" aria-label="Quickstart command">
+        <div class="terminal-head">
+          <span>Quickstart</span>
+          <button class="copy-button" type="button" data-copy-target="quickstartCode">Copy</button>
+        </div>
+        <pre id="quickstartCode"><code><span class="code-comment"># Build the CLI</span>
+git clone https://github.com/SimonWaldherr/GopherLLM
+cd GopherLLM
+make build
+
+<span class="code-comment"># Discover local GGUF models</span>
+bin/gopherllm --model-dir /path/to/models --list-models
+
+<span class="code-comment"># Start the API and private chat UI</span>
+bin/gopherllm --model-dir /path/to/models \
+  --serve 127.0.0.1:8080 --chat</code></pre>
+        <div class="terminal-status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>Ready on localhost</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="proof-strip" aria-label="Project highlights">
+      <div class="shell proof-grid">
+        <div><strong>35</strong><span>GGUF architectures</span></div>
+        <div><strong>3</strong><span>API styles</span></div>
+        <div><strong>0</strong><span>third-party Go modules</span></div>
+        <div><strong>1</strong><span>self-contained binary</span></div>
+      </div>
+    </section>
+
+    <section id="features" class="section shell">
+      <div class="section-heading">
+        <p class="section-label">Built for local work</p>
+        <h2>Everything between a GGUF file and a useful application.</h2>
+        <p>One runtime covers model loading, generation, embeddings, model inspection, chat, tools, and production-compatible HTTP endpoints.</p>
+      </div>
+      <div class="feature-grid">
+        <article class="feature-card feature-card-wide">
+          <span class="feature-number">01</span>
+          <h3>Private browser workspace</h3>
+          <p>Use the embedded chat interface for persistent local conversations, smart context windows, model switching, branching, file attachments, and export.</p>
+          <a href="https://github.com/SimonWaldherr/GopherLLM#server">See the server UI</a>
+        </article>
+        <article class="feature-card">
+          <span class="feature-number">02</span>
+          <h3>Fast model loading</h3>
+          <p>Memory-mapped weights, zero-copy quantized tensors, split GGUF discovery, and parallel page warm-up keep startup predictable.</p>
+        </article>
+        <article class="feature-card">
+          <span class="feature-number">03</span>
+          <h3>Drop-in APIs</h3>
+          <p>OpenAI-compatible and Ollama-compatible routes make existing clients easy to connect, while native endpoints expose GopherLLM features directly.</p>
+        </article>
+        <article class="feature-card">
+          <span class="feature-number">04</span>
+          <h3>Hardware-aware runtime</h3>
+          <p>AVX2, FMA, ARM64 NEON, and optional Metal kernels accelerate the same portable Go inference graph.</p>
+        </article>
+        <article class="feature-card feature-card-wide">
+          <span class="feature-number">05</span>
+          <h3>Tools, skills, and retrieval</h3>
+          <p>Build agentic workflows with function calling, local skills, Wikipedia and Wikidata research, embeddings, and browser-side RAG over saved conversations.</p>
+          <a href="https://github.com/SimonWaldherr/GopherLLM#tool-use--agentic">Explore agent features</a>
+        </article>
+      </div>
+    </section>
+
+    <section id="models" class="section section-tinted">
+      <div class="shell">
+        <div class="section-heading section-heading-split">
+          <div>
+            <p class="section-label">Broad model coverage</p>
+            <h2>Use the model that fits the job.</h2>
+          </div>
+          <p>GopherLLM validates each architecture and tensor layout instead of treating unknown files as generic Llama models.</p>
+        </div>
+        <div class="model-groups">
+          <article>
+            <h3>General and instruction</h3>
+            <div class="chip-list">
+              <span>Llama 2 and 3</span><span>Mistral</span><span>Ministral</span><span>Mixtral</span>
+              <span>Gemma 1–4</span><span>Phi 2–4</span><span>Granite</span><span>StableLM</span>
+            </div>
+          </article>
+          <article>
+            <h3>Reasoning and coding</h3>
+            <div class="chip-list">
+              <span>Qwen 2–3.6</span><span>Qwen Coder</span><span>DeepSeek V2 and V3</span>
+              <span>Kimi K2</span><span>GPT-OSS</span><span>EXAONE 4</span><span>InternLM2</span>
+            </div>
+          </article>
+          <article>
+            <h3>MoE, recurrent, and embeddings</h3>
+            <div class="chip-list">
+              <span>Qwen MoE</span><span>Gemma 4 MoE</span><span>Nemotron-H</span>
+              <span>Mamba2</span><span>BERT</span><span>Nomic-BERT</span>
+            </div>
+          </article>
+        </div>
+        <a class="text-link" href="https://github.com/SimonWaldherr/GopherLLM#supported-architectures">Review the full compatibility matrix</a>
+      </div>
+    </section>
+
+    <section id="api" class="section shell">
+      <div class="section-heading">
+        <p class="section-label">Connect your stack</p>
+        <h2>Familiar on the outside. Native Go underneath.</h2>
+        <p>Keep the client you already use or call the library directly.</p>
+      </div>
+      <div class="api-demo">
+        <div class="api-tabs" role="tablist" aria-label="API examples">
+          <button id="tabOpenAI" class="api-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="panelOpenAI" data-api-tab="openai">OpenAI API</button>
+          <button id="tabOllama" class="api-tab" type="button" role="tab" aria-selected="false" aria-controls="panelOllama" data-api-tab="ollama" tabindex="-1">Ollama API</button>
+          <button id="tabGo" class="api-tab" type="button" role="tab" aria-selected="false" aria-controls="panelGo" data-api-tab="go" tabindex="-1">Go library</button>
+        </div>
+        <div class="api-panels">
+          <section id="panelOpenAI" class="api-panel" role="tabpanel" aria-labelledby="tabOpenAI" data-api-panel="openai">
+            <button class="copy-button" type="button" data-copy-target="openaiCode">Copy</button>
+            <pre id="openaiCode"><code>curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local",
+    "messages": [
+      {"role": "user", "content": "Explain mmap in one sentence."}
+    ],
+    "stream": true
+  }'</code></pre>
+          </section>
+          <section id="panelOllama" class="api-panel" role="tabpanel" aria-labelledby="tabOllama" data-api-panel="ollama" hidden>
+            <button class="copy-button" type="button" data-copy-target="ollamaCode">Copy</button>
+            <pre id="ollamaCode"><code>curl http://127.0.0.1:8080/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local",
+    "messages": [
+      {"role": "user", "content": "Explain mmap in one sentence."}
+    ]
+  }'</code></pre>
+          </section>
+          <section id="panelGo" class="api-panel" role="tabpanel" aria-labelledby="tabGo" data-api-panel="go" hidden>
+            <button class="copy-button" type="button" data-copy-target="goCode">Copy</button>
+            <pre id="goCode"><code>model, err := gopherllm.Load("model.gguf")
+if err != nil {
+    log.Fatal(err)
+}
+defer model.Close()
+
+result, err := model.Generate(
+    context.Background(),
+    "Explain mmap in one sentence.",
+    gopherllm.GenerateOptions{MaxTokens: 80},
+)</code></pre>
+          </section>
+        </div>
+      </div>
+    </section>
+
+    <section id="performance" class="section section-performance">
+      <div class="shell performance-layout">
+        <div class="section-heading">
+          <p class="section-label">Performance without guesswork</p>
+          <h2>Measure the machine you actually run.</h2>
+          <p>Auto-tuning benchmarks thread counts, activation paths, KV-cache formats, and prefill chunks for the loaded model. Results are cached and applied on the next run.</p>
+          <a class="button button-secondary" href="https://github.com/SimonWaldherr/GopherLLM#auto-mode-hardware-autotuning">Read about auto mode</a>
+        </div>
+        <div class="performance-list">
+          <article><strong>Memory mapped</strong><p>Weights stay backed by the GGUF file and quantized tensors borrow mapped memory directly.</p></article>
+          <article><strong>Cached input tokens</strong><p>Reusable prompt prefixes skip repeated local prefill work for compatible conversations and models.</p></article>
+          <article><strong>Compact KV cache</strong><p>Optional f16 key-value storage reduces memory pressure while optimized kernels preserve throughput.</p></article>
+          <article><strong>Portable acceleration</strong><p>Architecture-specific assembly and Metal paths sit behind the same Go API and test suite.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="closing shell">
+      <p class="section-label">Run local by default</p>
+      <h2>Start with one GGUF file.</h2>
+      <p>Build the binary, point it at your model directory, and choose the interface that fits your application.</p>
+      <div class="hero-actions">
+        <a class="button" href="https://github.com/SimonWaldherr/GopherLLM#quickstart">Open the quickstart</a>
+        <a class="button button-secondary" href="https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM">Read the Go docs</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell footer-inner">
+      <div><strong>GopherLLM</strong><p>Local GGUF inference in pure Go.</p></div>
+      <nav aria-label="Footer navigation">
+        <a href="https://github.com/SimonWaldherr/GopherLLM">Source</a>
+        <a href="https://github.com/SimonWaldherr/GopherLLM/blob/main/LICENSE">MIT License</a>
+        <a href="https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM">Go package</a>
+      </nav>
+      <span>© <span id="year">2026</span> GopherLLM</span>
+    </div>
+  </footer>
+
+  <div id="copyStatus" class="toast" role="status" aria-live="polite" hidden>Copied to clipboard</div>
+</body>
+</html>
