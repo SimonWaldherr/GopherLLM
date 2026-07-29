@@ -1,4 +1,4 @@
-package gopherllm
+package integration_test
 
 import (
 	"bytes"
@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
 const smallModelLimitBytes int64 = 5 * 1024 * 1024 * 1024
@@ -21,9 +23,9 @@ func TestSmallLocalModelsAnswerEinsteinPrompt(t *testing.T) {
 	}
 	modelDir := os.Getenv("GOPHERLLM_MODEL_DIR")
 	if modelDir == "" {
-		modelDir = DefaultModelDir()
+		modelDir = gopherllm.DefaultModelDir()
 	}
-	entries, err := DiscoverModels(modelDir, os.Stderr)
+	entries, err := gopherllm.DiscoverModels(modelDir, os.Stderr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,8 +106,8 @@ func modelSweepTimeout(t *testing.T) time.Duration {
 	return timeout
 }
 
-func smallUsableModels(entries []ModelEntry) []ModelEntry {
-	out := []ModelEntry{}
+func smallUsableModels(entries []gopherllm.ModelEntry) []gopherllm.ModelEntry {
+	out := []gopherllm.ModelEntry{}
 	for _, entry := range entries {
 		if entry.IsSupported && !entry.IsProjector && !entry.IsEmbedding && entry.SizeBytes < smallModelLimitBytes {
 			out = append(out, entry)
@@ -115,7 +117,7 @@ func smallUsableModels(entries []ModelEntry) []ModelEntry {
 }
 
 func TestSmallUsableModelsExcludeProjectorsAndEmbeddings(t *testing.T) {
-	entries := []ModelEntry{
+	entries := []gopherllm.ModelEntry{
 		{ID: "chat", IsSupported: true, SizeBytes: 1},
 		{ID: "embedding", IsSupported: true, IsEmbedding: true, SizeBytes: 1},
 		{ID: "projector", IsSupported: true, IsProjector: true, SizeBytes: 1},

@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/wordpiece"
 )
 
 type TokenizerMode int
@@ -374,7 +376,7 @@ func (t *Tokenizer) preprocessWordPiece(text string) []string {
 			if unicode.Is(unicode.Mn, r) {
 				continue
 			}
-			r = stripWordPieceAccent(r)
+			r = wordpiece.StripAccent(r)
 		}
 		if unicode.IsPunct(r) || (r < unicode.MaxASCII && unicode.IsSymbol(r)) || isWordPieceCJK(r) {
 			flush()

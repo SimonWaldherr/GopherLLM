@@ -1,4 +1,4 @@
-package gopherllm_test
+package integration_test
 
 import (
 	"os/exec"

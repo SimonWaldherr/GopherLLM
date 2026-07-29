@@ -1,63 +1,44 @@
-//go:build !windows
-
 package gopherllm
 
-import (
-	"os"
-	"syscall"
-)
+import "github.com/SimonWaldherr/GopherLLM/internal/mmapfile"
 
 // MmapFile exposes a model file as one immutable byte slice, memory-mapped
 // where the platform allows so multi-gigabyte weights are paged in on demand
-// rather than copied. Quantized Weights borrow sub-slices of it directly
-// (loadWeight's borrow mode), so it must stay open for the Runner's lifetime;
-// Runner.Close unmaps it.
-type MmapFile struct {
-	data []byte
-	mmap bool
-}
+// rather than copied. It must stay open for the Runner's lifetime.
+type MmapFile = mmapfile.File
 
-// OpenMmap uses the platform mmap syscall without CGO. If mmap is unavailable
-// for a specific file, it falls back to os.ReadFile while preserving the same
-// immutable byte-slice API.
+// OpenMmap opens path through the platform's read-only file-mapping backend.
+// If mapping is unavailable for a specific file, it falls back to a read copy.
 func OpenMmap(path string) (*MmapFile, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if st.Size() == 0 {
-		return &MmapFile{}, nil
-	}
-
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(st.Size()), syscall.PROT_READ, syscall.MAP_PRIVATE)
-	if err == nil {
-		return &MmapFile{data: data, mmap: true}, nil
-	}
-
-	data, err = os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	return &MmapFile{data: data}, nil
+	return mmapfile.Open(path)
 }
 
-func (m *MmapFile) Bytes() []byte { return m.data }
-func (m *MmapFile) Len() int      { return len(m.data) }
-func (m *MmapFile) Close() error {
-	if len(m.data) == 0 {
-		return nil
+type mmapByteRange struct {
+	start int
+	end   int
+}
+
+func prefaultPages(data []byte) {
+	mmapfile.PrefaultPages(data, numThreads())
+}
+
+func prefaultRanges(data []byte, ranges []mmapByteRange) {
+	mmapfile.PrefaultRanges(data, toInternalMmapRanges(ranges), numThreads())
+}
+
+func normalizeMmapRanges(dataLen int, ranges []mmapByteRange) []mmapByteRange {
+	normalized := mmapfile.NormalizeRanges(dataLen, toInternalMmapRanges(ranges))
+	out := make([]mmapByteRange, len(normalized))
+	for i, r := range normalized {
+		out[i] = mmapByteRange{start: r.Start, end: r.End}
 	}
-	data := m.data
-	m.data = nil
-	if m.mmap {
-		m.mmap = false
-		return syscall.Munmap(data)
+	return out
+}
+
+func toInternalMmapRanges(ranges []mmapByteRange) []mmapfile.ByteRange {
+	out := make([]mmapfile.ByteRange, len(ranges))
+	for i, r := range ranges {
+		out[i] = mmapfile.ByteRange{Start: r.start, End: r.end}
 	}
-	return nil
+	return out
 }

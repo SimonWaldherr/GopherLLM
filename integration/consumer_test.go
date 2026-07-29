@@ -1,4 +1,4 @@
-package gopherllm
+package integration_test
 
 import (
 	"os"
@@ -17,7 +17,7 @@ func TestExternalConsumerBuilds(t *testing.T) {
 	if err != nil {
 		t.Skip("go binary not in PATH")
 	}
-	dir, err := filepath.Abs(filepath.Join("testdata", "consumer"))
+	dir, err := filepath.Abs(filepath.Join("..", "testdata", "consumer"))
 	if err != nil {
 		t.Fatal(err)
 	}

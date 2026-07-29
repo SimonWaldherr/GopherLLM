@@ -1,4 +1,4 @@
-package gopherllm
+package mmapfile
 
 import (
 	"os"
@@ -15,7 +15,7 @@ func TestOpenMmapReadsBytesAndCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mapped, err := OpenMmap(path)
+	mapped, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func TestOpenMmapReadsBytesAndCloses(t *testing.T) {
 	}
 	switch runtime.GOOS {
 	case "windows", "linux", "darwin":
-		if !mapped.mmap {
+		if !mapped.IsMapped() {
 			t.Fatal("expected a real OS mapping on this platform, got the read-copy fallback")
 		}
 	}
@@ -48,7 +48,7 @@ func TestOpenMmapEmptyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mapped, err := OpenMmap(path)
+	mapped, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestOpenMmapEmptyFile(t *testing.T) {
 }
 
 func TestOpenMmapMissingFile(t *testing.T) {
-	_, err := OpenMmap(filepath.Join(t.TempDir(), "missing.bin"))
+	_, err := Open(filepath.Join(t.TempDir(), "missing.bin"))
 	if !os.IsNotExist(err) {
 		t.Fatalf("OpenMmap missing file error = %v, want not exist", err)
 	}

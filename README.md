@@ -87,8 +87,9 @@ assembly are consolidated into `kernels_<arch>.go` / `kernels_<arch>.s`
 instead of being spread across one file per operation. Executable entry points
 live in `cmd/`, HTTP code and UI assets in `server/`, generated tables and
 other implementation details in `internal/`, and test-only fixtures—including
-preserved profiling captures—in `testdata/`. Build output and local model/RAG
-data are ignored and are not part of the repository.
+preserved profiling captures—in `testdata/`. Public-boundary and opt-in local
+model tests live in `integration/`. Build output and local model/RAG data are
+ignored and are not part of the repository.
 
 ## Quickstart
 
@@ -1161,10 +1162,11 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 
 | Area | Files |
 |---|---|
-| GGUF parsing + file mapping | `gguf.go`, `mmap.go` (Unix) / `mmap_windows.go` (Win32 file mapping) |
+| GGUF parsing + file mapping | `gguf.go`; public facade in `mmap.go`, platform backends in `internal/mmapfile/` |
 | Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
 | Compute kernels + worker pool | `simd.go`; platform dispatch and assembly grouped in `kernels_*.go` / `kernels_*.s` |
 | Generated inference tables | `internal/iqcodebook/` |
+| Tokenizer normalization tables | `internal/wordpiece/` |
 | Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE + BERT WordPiece) |
 | Sampling | `sampling.go` |
 | Generation orchestration + chat templates | `runtime.go` |
@@ -1195,7 +1197,7 @@ all weights into RAM:
 
 ```sh
 GOPHERLLM_MODEL_SMOKE_DIR="$HOME/.cache/lm-studio/models" \
-  go test -run TestLocalGGUFLoadSmoke -v .
+  go test -run TestLocalGGUFLoadSmoke -v ./integration
 ```
 
 For a slower end-to-end answer check of every supported text model below 5 GB,
@@ -1208,7 +1210,7 @@ go build -o /tmp/gopherllm-model-sweep ./cmd/gopherllm
 GOPHERLLM_RUN_MODEL_SWEEP=1 \
 GOPHERLLM_SWEEP_BINARY=/tmp/gopherllm-model-sweep \
 GOPHERLLM_MODEL_DIR="$HOME/.cache/lm-studio/models" \
-  go test -run TestSmallLocalModelsAnswerEinsteinPrompt -v .
+  go test -run TestSmallLocalModelsAnswerEinsteinPrompt -v ./integration
 ```
 
 Check test coverage:

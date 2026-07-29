@@ -1,9 +1,11 @@
-package gopherllm
+package integration_test
 
 import (
 	"io"
 	"os"
 	"testing"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
 // TestLocalGGUFLoadSmoke is an opt-in integration test for a machine's complete
@@ -12,13 +14,13 @@ import (
 // dense models and is covered by targeted CLI smoke runs instead. Set
 // GOPHERLLM_MODEL_SMOKE_DIR to a directory containing GGUF files, for example:
 //
-// GOPHERLLM_MODEL_SMOKE_DIR="$HOME/.cache/lm-studio/models" go test -run TestLocalGGUFLoadSmoke -v .
+// GOPHERLLM_MODEL_SMOKE_DIR="$HOME/.cache/lm-studio/models" go test -run TestLocalGGUFLoadSmoke -v ./integration
 func TestLocalGGUFLoadSmoke(t *testing.T) {
 	root := os.Getenv("GOPHERLLM_MODEL_SMOKE_DIR")
 	if root == "" {
 		t.Skip("set GOPHERLLM_MODEL_SMOKE_DIR to smoke-test locally installed GGUF models")
 	}
-	entries, err := DiscoverModels(root, io.Discard)
+	entries, err := gopherllm.DiscoverModels(root, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +36,7 @@ func TestLocalGGUFLoadSmoke(t *testing.T) {
 			if !entry.IsSupported {
 				t.Skipf("unsupported architecture: %s", entry.Architecture)
 			}
-			r, _, err := RunnerFromPathWithOptions(entry.Path, LoadOptions{OutOfCore: true})
+			r, _, err := gopherllm.RunnerFromPathWithOptions(entry.Path, gopherllm.LoadOptions{OutOfCore: true})
 			if err != nil {
 				t.Fatal(err)
 			}

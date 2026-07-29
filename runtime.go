@@ -466,7 +466,7 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	if err != nil {
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
-	if options.OutOfCore && !mmap.mmap {
+	if options.OutOfCore && !mmap.IsMapped() {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, fmt.Errorf("out-of-core loading requires an OS memory map; this file fell back to an in-memory read")
 	}
@@ -482,10 +482,10 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 			}
 			return r, LoadInfo{FileSizeBytes: int(mergedBytes), LoadTime: time.Since(t0), OutOfCore: false}, nil
 		}
-		if mmap.mmap {
+		if mmap.IsMapped() {
 			prefaultMappedModel(mmap.Bytes(), header, options)
 		}
-	} else if mmap.mmap {
+	} else if mmap.IsMapped() {
 		// A malformed model will fail in the real parser below. Preserve the
 		// legacy full warm-up behavior when no trustworthy tensor map exists.
 		if effectivePrefaultMode(options) == MmapPrefaultAll {
@@ -499,7 +499,7 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	// C object must never keep a pointer into Go-managed heap memory. Without
 	// Metal, borrowing from the heap buffer is plain Go slice aliasing and
 	// always safe.
-	r, err := runnerFromGGUFBytes(mmap.Bytes(), mmap.mmap || !options.UseMetal, options)
+	r, err := runnerFromGGUFBytes(mmap.Bytes(), mmap.IsMapped() || !options.UseMetal, options)
 	if err != nil {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, err

@@ -1,4 +1,4 @@
-package gopherllm
+package mmapfile
 
 import (
 	"os"
@@ -8,18 +8,18 @@ import (
 )
 
 // prefaultSink forces the compiler to keep every touched byte "used" so the
-// page-in reads in prefaultPages can never be optimized away; the value
+// page-in reads in PrefaultPages can never be optimized away; the value
 // itself is meaningless and never read back.
 var prefaultSink atomic.Uint64
 
 const prefaultPageSize = 4096
 
-type mmapByteRange struct {
-	start int
-	end   int
+type ByteRange struct {
+	Start int
+	End   int
 }
 
-// prefaultPages forces every page of an mmap'd region into the process's
+// PrefaultPages forces every page of an mmap'd region into the process's
 // working set before the model is reported ready, by reading one byte per
 // page across all worker threads concurrently.
 //
@@ -41,19 +41,19 @@ type mmapByteRange struct {
 // would otherwise land unpredictably on whichever request happens to run
 // first. Risk: none beyond the already-necessary page-in cost happening
 // eagerly instead of lazily. Rollback: set GOPHERLLM_NO_PREFAULT=1.
-func prefaultPages(data []byte) {
-	prefaultRanges(data, []mmapByteRange{{start: 0, end: len(data)}})
+func PrefaultPages(data []byte, workers int) {
+	PrefaultRanges(data, []ByteRange{{Start: 0, End: len(data)}}, workers)
 }
 
-// prefaultRanges touches just the given mmap ranges. Ranges are normalized and
+// PrefaultRanges touches just the given mmap ranges. Ranges are normalized and
 // split into moderately sized jobs so one large tensor cannot leave most worker
 // threads idle. This is deliberately a best-effort warm-up: mmap remains the
 // owner of residency and the operating system may evict any page later.
-func prefaultRanges(data []byte, ranges []mmapByteRange) {
+func PrefaultRanges(data []byte, ranges []ByteRange, workers int) {
 	if len(data) == 0 || len(ranges) == 0 || os.Getenv("GOPHERLLM_NO_PREFAULT") != "" {
 		return
 	}
-	ranges = normalizeMmapRanges(len(data), ranges)
+	ranges = NormalizeRanges(len(data), ranges)
 	if len(ranges) == 0 {
 		return
 	}
@@ -61,14 +61,14 @@ func prefaultRanges(data []byte, ranges []mmapByteRange) {
 	// 16 MiB keeps the job list compact even for large GGUFs, yet gives the
 	// worker pool enough pieces to balance differently sized tensors.
 	const chunkBytes = 16 << 20
-	jobs := make([]mmapByteRange, 0, len(ranges))
+	jobs := make([]ByteRange, 0, len(ranges))
 	for _, r := range ranges {
-		for start := r.start; start < r.end; start += chunkBytes {
-			jobs = append(jobs, mmapByteRange{start: start, end: min(start+chunkBytes, r.end)})
+		for start := r.Start; start < r.End; start += chunkBytes {
+			jobs = append(jobs, ByteRange{Start: start, End: min(start+chunkBytes, r.End)})
 		}
 	}
-	threads := min(max(1, numThreads()), len(jobs))
-	work := make(chan mmapByteRange)
+	threads := min(max(1, workers), len(jobs))
+	work := make(chan ByteRange)
 	var wg sync.WaitGroup
 	for t := 0; t < threads; t++ {
 		wg.Add(1)
@@ -76,7 +76,7 @@ func prefaultRanges(data []byte, ranges []mmapByteRange) {
 			defer wg.Done()
 			for r := range work {
 				var sink byte
-				for i := r.start; i < r.end; i += prefaultPageSize {
+				for i := r.Start; i < r.End; i += prefaultPageSize {
 					sink += data[i]
 				}
 				prefaultSink.Add(uint64(sink))
@@ -90,23 +90,23 @@ func prefaultRanges(data []byte, ranges []mmapByteRange) {
 	wg.Wait()
 }
 
-func normalizeMmapRanges(dataLen int, ranges []mmapByteRange) []mmapByteRange {
+func NormalizeRanges(dataLen int, ranges []ByteRange) []ByteRange {
 	if dataLen <= 0 || len(ranges) == 0 {
 		return nil
 	}
 	// Tensor descriptors are in file order for normal GGUFs, but sorting keeps
 	// this safe for producers that do not preserve that convention.
-	ranges = append([]mmapByteRange(nil), ranges...)
-	sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
-	out := make([]mmapByteRange, 0, len(ranges))
+	ranges = append([]ByteRange(nil), ranges...)
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].Start < ranges[j].Start })
+	out := make([]ByteRange, 0, len(ranges))
 	for _, r := range ranges {
-		r.start = max(0, r.start)
-		r.end = min(dataLen, r.end)
-		if r.start >= r.end {
+		r.Start = max(0, r.Start)
+		r.End = min(dataLen, r.End)
+		if r.Start >= r.End {
 			continue
 		}
-		if n := len(out); n > 0 && r.start <= out[n-1].end {
-			out[n-1].end = max(out[n-1].end, r.end)
+		if n := len(out); n > 0 && r.Start <= out[n-1].End {
+			out[n-1].End = max(out[n-1].End, r.End)
 			continue
 		}
 		out = append(out, r)

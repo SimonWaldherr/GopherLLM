@@ -1,6 +1,6 @@
 //go:build windows
 
-package gopherllm
+package mmapfile
 
 import (
 	"os"
@@ -8,21 +8,21 @@ import (
 	"unsafe"
 )
 
-// MmapFile is the Windows variant of the mmap.go type: the same immutable
+// File is the Windows variant of the Unix type: the same immutable
 // byte-slice API, backed by a real Win32 file mapping
 // (CreateFileMapping/MapViewOfFile) so multi-gigabyte weights are paged in
 // on demand instead of being read up front. If mapping fails for a specific
 // file, it falls back to a full os.ReadFile copy, preserving the API.
-type MmapFile struct {
-	data []byte
-	mmap bool
-	addr uintptr
+type File struct {
+	data   []byte
+	mapped bool
+	addr   uintptr
 }
 
-// OpenMmap memory-maps path read-only. The mapping-object handle and the
+// Open memory-maps path read-only. The mapping-object handle and the
 // file handle are both closed before returning — a mapped view keeps the
 // underlying mapping (and file) alive on its own until UnmapViewOfFile.
-func OpenMmap(path string) (*MmapFile, error) {
+func Open(path string) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -35,7 +35,7 @@ func OpenMmap(path string) (*MmapFile, error) {
 	}
 	size := st.Size()
 	if size == 0 {
-		return &MmapFile{}, nil
+		return &File{}, nil
 	}
 
 	mapping, err := syscall.CreateFileMapping(syscall.Handle(f.Fd()), nil, syscall.PAGE_READONLY, uint32(size>>32), uint32(size), nil)
@@ -51,7 +51,7 @@ func OpenMmap(path string) (*MmapFile, error) {
 			var base unsafe.Pointer
 			*(*uintptr)(unsafe.Pointer(&base)) = addr
 			data := unsafe.Slice((*byte)(base), size)
-			return &MmapFile{data: data, mmap: true, addr: addr}, nil
+			return &File{data: data, mapped: true, addr: addr}, nil
 		}
 	}
 
@@ -59,18 +59,19 @@ func OpenMmap(path string) (*MmapFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &MmapFile{data: data}, nil
+	return &File{data: data}, nil
 }
 
-func (m *MmapFile) Bytes() []byte { return m.data }
-func (m *MmapFile) Len() int      { return len(m.data) }
-func (m *MmapFile) Close() error {
+func (m *File) Bytes() []byte  { return m.data }
+func (m *File) Len() int       { return len(m.data) }
+func (m *File) IsMapped() bool { return m.mapped }
+func (m *File) Close() error {
 	if len(m.data) == 0 {
 		return nil
 	}
 	m.data = nil
-	if m.mmap {
-		m.mmap = false
+	if m.mapped {
+		m.mapped = false
 		addr := m.addr
 		m.addr = 0
 		return syscall.UnmapViewOfFile(addr)

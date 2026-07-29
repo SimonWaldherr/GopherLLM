@@ -1,12 +1,14 @@
-package gopherllm
+package integration_test
 
 import (
 	"reflect"
 	"testing"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
-func wordPieceMetadata(tokens []string) map[string]MetaValue {
-	return map[string]MetaValue{
+func wordPieceMetadata(tokens []string) map[string]gopherllm.MetaValue {
+	return map[string]gopherllm.MetaValue{
 		"tokenizer.ggml.model":                    {Kind: "str", Value: "bert"},
 		"tokenizer.ggml.tokens":                   {Kind: "arr", Value: tokens},
 		"tokenizer.ggml.bos_token_id":             {Kind: "u32", Value: uint32(2)},
@@ -22,11 +24,11 @@ func wordPieceMetadata(tokens []string) map[string]MetaValue {
 
 func TestWordPieceRawVocabulary(t *testing.T) {
 	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "world", "##s", "!"}
-	tok, err := TokenizerFromMetadata(wordPieceMetadata(vocab))
+	tok, err := gopherllm.TokenizerFromMetadata(wordPieceMetadata(vocab))
 	if err != nil {
 		t.Fatalf("TokenizerFromMetadata: %v", err)
 	}
-	if tok.Mode != TokenizerWordPiece || !tok.RawWordPieceVocab {
+	if tok.Mode != gopherllm.TokenizerWordPiece || !tok.RawWordPieceVocab {
 		t.Fatalf("mode/raw = %v/%v, want WordPiece/raw", tok.Mode, tok.RawWordPieceVocab)
 	}
 
@@ -54,11 +56,11 @@ func TestWordPiecePhantomSpaceGGUFVocabulary(t *testing.T) {
 	// This is the vocabulary layout emitted by llama.cpp's BERT converter:
 	// ordinary first pieces have ▁, while raw ## continuations lose the ##.
 	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "▁hello", "▁world", "s", "▁!"}
-	tok, err := TokenizerFromMetadata(wordPieceMetadata(vocab))
+	tok, err := gopherllm.TokenizerFromMetadata(wordPieceMetadata(vocab))
 	if err != nil {
 		t.Fatalf("TokenizerFromMetadata: %v", err)
 	}
-	if tok.Mode != TokenizerWordPiece || tok.RawWordPieceVocab {
+	if tok.Mode != gopherllm.TokenizerWordPiece || tok.RawWordPieceVocab {
 		t.Fatalf("mode/raw = %v/%v, want WordPiece/phantom-space", tok.Mode, tok.RawWordPieceVocab)
 	}
 
@@ -71,7 +73,7 @@ func TestWordPiecePhantomSpaceGGUFVocabulary(t *testing.T) {
 
 func TestWordPieceUnknownAndNormalizer(t *testing.T) {
 	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "cafe", "known", "cesky"}
-	tok, err := TokenizerFromMetadata(wordPieceMetadata(vocab))
+	tok, err := gopherllm.TokenizerFromMetadata(wordPieceMetadata(vocab))
 	if err != nil {
 		t.Fatalf("TokenizerFromMetadata: %v", err)
 	}
@@ -90,9 +92,9 @@ func TestWordPieceCorrectedSeparatorMetadataKey(t *testing.T) {
 	vocab := []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "hello", "[ALT_SEP]"}
 	meta := wordPieceMetadata(vocab)
 	delete(meta, "tokenizer.ggml.seperator_token_id")
-	meta["tokenizer.ggml.separator_token_id"] = MetaValue{Kind: "u32", Value: uint32(5)}
+	meta["tokenizer.ggml.separator_token_id"] = gopherllm.MetaValue{Kind: "u32", Value: uint32(5)}
 
-	tok, err := TokenizerFromMetadata(meta)
+	tok, err := gopherllm.TokenizerFromMetadata(meta)
 	if err != nil {
 		t.Fatalf("TokenizerFromMetadata: %v", err)
 	}
@@ -107,7 +109,7 @@ func TestWordPieceNormalizerDefaults(t *testing.T) {
 	delete(meta, "tokenizer.ggml.normalizer.lowercase")
 	delete(meta, "tokenizer.ggml.normalizer.strip_accents")
 
-	tok, err := TokenizerFromMetadata(meta)
+	tok, err := gopherllm.TokenizerFromMetadata(meta)
 	if err != nil {
 		t.Fatalf("TokenizerFromMetadata: %v", err)
 	}

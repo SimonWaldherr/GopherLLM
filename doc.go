@@ -34,7 +34,7 @@
 // A rough map of the internals:
 //
 //   - gguf.go       GGUF container parsing (header, metadata, tensor table)
-//   - mmap*.go      memory-mapped file access (per-OS)
+//   - mmap.go       public file-mapping facade (backends in internal/mmapfile)
 //   - model.go      model config, weight loading, transformer forward pass
 //   - forward_batch.go  batched prefill (prompt tokens processed per chunk)
 //   - simd.go, quant_extra.go  matvec/dot kernels + dequantization + pool
