@@ -1,5 +1,7 @@
 # GopherLLM
 
+[![DOI](https://zenodo.org/badge/1264366305.svg)](https://doi.org/10.5281/zenodo.21197831)
+
 GopherLLM is a local GGUF inference tool written in Go. It can run one-shot prompts,
 interactive REPL sessions, embeddings, model inspection, benchmark runs, and an HTTP
 server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
