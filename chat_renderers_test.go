@@ -46,6 +46,60 @@ func TestRenderChatMLMessages(t *testing.T) {
 	}
 }
 
+// TestRenderChatMLMessagesOpensThinkTagOnlyForCheckpointsThatDefaultToIt
+// guards a real bug: Nemotron-H's own chat_template defaults
+// enable_thinking to true and then emits an unclosed '<think>\n' after
+// '<|im_start|>assistant\n'. The generic ChatML renderer left that out
+// entirely, which fed the checkpoint a prompt suffix it never saw in
+// training and derailed generation into word salad. The fix checks each
+// checkpoint's own chat_template before adding the tag, so plain ChatML
+// models (no thinking convention) are unaffected.
+func TestRenderChatMLMessagesOpensThinkTagOnlyForCheckpointsThatDefaultToIt(t *testing.T) {
+	tok := newChatTokenizer("<|im_start|>", "<|im_end|>", "<think>")
+
+	defaultsToThinking := &Runner{
+		tok:  tok,
+		arch: "nemotron_h",
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "str", Value: "{%- set enable_thinking = enable_thinking if enable_thinking is defined else True %}" +
+				"{%- if enable_thinking %}{{- '<|im_start|>assistant\\n<think>\\n' }}{%- else %}{{- '<|im_start|>assistant\\n<think></think>' }}{%- endif %}"},
+		}},
+	}
+	tokens, ok := defaultsToThinking.renderChatMLMessages([]ChatMessage{UserMessage("hi")}, "")
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	thinkID := tok.TokenToID["<think>"]
+	imStartID := tok.TokenToID["<|im_start|>"]
+	lastImStart, lastThink := -1, -1
+	for i, id := range tokens {
+		if id == imStartID {
+			lastImStart = i
+		}
+		if id == thinkID {
+			lastThink = i
+		}
+	}
+	if lastThink < 0 || lastThink < lastImStart {
+		t.Fatalf("expected an open <think> tag after the final assistant turn: %v", tokens)
+	}
+
+	plainChatML := &Runner{
+		tok:  tok,
+		arch: "stablelm",
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "str", Value: "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"},
+		}},
+	}
+	tokens, ok = plainChatML.renderChatMLMessages([]ChatMessage{UserMessage("hi")}, "")
+	if !ok {
+		t.Fatal("ok=false")
+	}
+	if hasAll(tokens, tok.TokenToID["<think>"]) {
+		t.Fatalf("plain ChatML checkpoints must not get a fabricated think tag: %v", tokens)
+	}
+}
+
 func TestRenderQwen35MessagesOpensThinkingAndStopsAtChatMLEnd(t *testing.T) {
 	tok := newChatTokenizer("<|im_start|>", "<|im_end|>", "<think>")
 	r := &Runner{tok: tok, arch: "qwen35"}

@@ -1771,15 +1771,44 @@ func (r *Runner) renderGemma4Messages(messages []ChatMessage, systemPrompt strin
 		}
 		appendTurn(role, message.Content)
 	}
-	// The official template opens and immediately closes the thought channel
-	// when reasoning is disabled, then lets generation select its final
-	// channel.  This avoids injecting the old Gemma <start_of_turn> protocol.
 	tokens = append(tokens, startTurn)
 	tokens = append(tokens, r.tok.EncodeWithoutBOS("model\n")...)
-	tokens = append(tokens, channelStart)
-	tokens = append(tokens, r.tok.EncodeWithoutBOS("thought\n")...)
-	tokens = append(tokens, channelEnd)
+	// Some Gemma 4 checkpoints (e.g. 12B/26B) open and immediately close the
+	// thought channel here when reasoning is disabled, so generation lands on
+	// a fresh channel rather than the old Gemma <start_of_turn> protocol.
+	// Others (E2B) never emit this in their own add_generation_prompt branch
+	// at all; injecting it there is out-of-distribution and derails
+	// generation into gibberish. Checked per-checkpoint against its own
+	// chat_template rather than assumed for every gemma4-chat model.
+	if r.gemma4ClosesThoughtChannelAtGenerate() {
+		tokens = append(tokens, channelStart)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS("thought\n")...)
+		tokens = append(tokens, channelEnd)
+	}
 	return tokens, true
+}
+
+// gemma4ClosesThoughtChannelAtGenerate reports whether this checkpoint's own
+// chat_template appends '<|channel>thought\n<channel|>' right after
+// '<|turn>model\n' in its add_generation_prompt branch. That literal only
+// appears there for models whose default-thinking behaviour needs an
+// explicit closed channel; the same substring also shows up (via string
+// concatenation, not this literal) when serialising a past assistant turn's
+// reasoning back into history, so a plain substring check on that other
+// occurrence would be a false positive - hence the exact literal match.
+func (r *Runner) gemma4ClosesThoughtChannelAtGenerate() bool {
+	if r.gguf == nil {
+		return false
+	}
+	v, ok := r.gguf.Metadata["tokenizer.chat_template"]
+	if !ok {
+		return false
+	}
+	s, ok := v.AsString()
+	if !ok {
+		return false
+	}
+	return strings.Contains(s, `<|channel>thought\n<channel|>`)
 }
 
 func (r *Runner) renderHeaderChatMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
@@ -2176,7 +2205,38 @@ func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt strin
 	}
 	tokens = append(tokens, imStart)
 	tokens = append(tokens, r.tok.EncodeWithoutBOS("assistant\n")...)
+	// Some ChatML checkpoints (e.g. Nemotron-H) default enable_thinking to
+	// true when a caller does not pass it, and their own add_generation_prompt
+	// branch then opens an explicit, unclosed <think> tag rather than leaving
+	// the assistant turn bare. Skipping that tag is out-of-distribution for
+	// those checkpoints and derails generation; mirror it only for models
+	// whose own chat_template actually does this by default.
+	if think, ok := r.tok.SpecialID("<think>"); ok && r.chatMLOpensThinkTagByDefault() {
+		tokens = append(tokens, think)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+	}
 	return tokens, true
+}
+
+// chatMLOpensThinkTagByDefault reports whether this checkpoint's own
+// chat_template emits '<|im_start|>assistant\n<think>\n' in its
+// add_generation_prompt branch when enable_thinking is left at the
+// template's own default (i.e. the literal appears unconditionally on one
+// side of the enable_thinking check, not only when a caller opts in).
+func (r *Runner) chatMLOpensThinkTagByDefault() bool {
+	if r.gguf == nil {
+		return false
+	}
+	v, ok := r.gguf.Metadata["tokenizer.chat_template"]
+	if !ok {
+		return false
+	}
+	s, ok := v.AsString()
+	if !ok {
+		return false
+	}
+	return strings.Contains(s, `'<|im_start|>assistant\n<think>\n'`) &&
+		strings.Contains(s, `enable_thinking = enable_thinking if enable_thinking is defined else True`)
 }
 
 // renderQwen35Messages mirrors the text-only parts of Qwen3.5/3.6's embedded

@@ -531,3 +531,44 @@ func TestRenderGemma4MessagesAndStopToken(t *testing.T) {
 		t.Fatal("Gemma4 must stop at <turn|>")
 	}
 }
+
+// TestRenderGemma4MessagesOnlyClosesThoughtChannelWhenTheCheckpointWantsIt
+// guards a real bug: E2B's own chat_template never emits
+// '<|channel>thought\n<channel|>' in its add_generation_prompt branch, while
+// other Gemma 4 checkpoints (12B/26B) do so by default. Injecting it
+// unconditionally fed E2B an out-of-distribution prompt suffix and derailed
+// its generation into gibberish; the fix reads each checkpoint's own
+// chat_template to decide.
+func TestRenderGemma4MessagesOnlyClosesThoughtChannelWhenTheCheckpointWantsIt(t *testing.T) {
+	tok := newChatTokenizer("<|turn>", "<turn|>", "<|channel>", "<channel|>")
+
+	wantsIt := &Runner{
+		tok:  tok,
+		arch: "gemma4",
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "str", Value: `{%- if not enable_thinking | default(false) -%}{{- '<|channel>thought\n<channel|>' -}}{%- endif -%}`},
+		}},
+	}
+	tokens, ok := wantsIt.renderGemma4Messages([]ChatMessage{UserMessage("hi")}, "")
+	if !ok {
+		t.Fatal("renderGemma4Messages ok=false")
+	}
+	if !hasAll(tokens, tok.TokenToID["<|channel>"], tok.TokenToID["<channel|>"]) {
+		t.Fatalf("expected the thought channel to be opened and closed: %v", tokens)
+	}
+
+	doesNotWantIt := &Runner{
+		tok:  tok,
+		arch: "gemma4",
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "str", Value: `{%- if add_generation_prompt -%}{{- '<|turn>model\n' -}}{%- endif -%}`},
+		}},
+	}
+	tokens, ok = doesNotWantIt.renderGemma4Messages([]ChatMessage{UserMessage("hi")}, "")
+	if !ok {
+		t.Fatal("renderGemma4Messages ok=false")
+	}
+	if hasAll(tokens, tok.TokenToID["<|channel>"]) {
+		t.Fatalf("E2B-style template must not get a fabricated thought channel: %v", tokens)
+	}
+}
