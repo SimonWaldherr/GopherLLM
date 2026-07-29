@@ -50,6 +50,11 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		`role="status" aria-live="polite" aria-atomic="true"`,
 		`id="modelSearch"`,
 		`id="modelShowUnsupported"`,
+		`id="activeModelSummary"`,
+		`id="modelLibrary"`,
+		`role="tablist" aria-label="Settings sections"`,
+		`data-settings-tab="model"`,
+		`data-settings-page="generation"`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("chat page missing compact-composer/accessibility contract %q", want)
@@ -86,6 +91,9 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		`changeModel.textContent = "Change model"`,
 		"function changeModelForMessage(",
 		"function filterModelOptions(",
+		"function renderModelLibrary(",
+		"function renderActiveModelSummary(",
+		"function setSettingsTab(",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("chat script missing interaction contract %q", want)

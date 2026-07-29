@@ -942,9 +942,17 @@ function toMarkdown(chat) {
   const promptCacheStatusEl = $("promptCacheStatus");
   const modelSelectEl = $("modelSelect");
   const modelSearchEl = $("modelSearch");
+  const modelLibraryEl = $("modelLibrary");
+  const modelResultCountEl = $("modelResultCount");
   const modelShowUnsupportedEl = $("modelShowUnsupported");
   const modelHiddenCountEl = $("modelHiddenCount");
+  const activeModelSummaryEl = $("activeModelSummary");
+  const activeModelNameEl = $("activeModelName");
+  const activeModelMetaEl = $("activeModelMeta");
+  const activeModelStateEl = $("activeModelState");
   const modelNameEl = $("modelName");
+  const settingsTabEls = Array.from(document.querySelectorAll("[data-settings-tab]"));
+  const settingsPageEls = Array.from(document.querySelectorAll("[data-settings-page]"));
   const chatTitleEl = $("chatTitle");
   const chatListEl = $("chatList");
   const chatSearchEl = $("chatSearch");
@@ -983,6 +991,8 @@ function toMarkdown(chat) {
   let busy = false;
   let tuning = false;
   let loadingModel = false;
+  let loadingModelID = "";
+  let modelCatalog = [];
   let pendingModelRetry = null;
   let loadingEmbeddingModel = false;
   let activeEmbeddingModel = "";
@@ -1487,6 +1497,7 @@ function toMarkdown(chat) {
   function setBusy(value) {
     busy = value;
     modelSelectEl.disabled = value;
+    if (modelCatalog.length) renderModelLibrary();
     newChatEl.disabled = value;
     renameChatEl.disabled = value;
     deleteChatEl.disabled = value;
@@ -2378,7 +2389,8 @@ function toMarkdown(chat) {
     if (!chat || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
     if (!chat.messages.slice(0, index).some((message) => message.role === "user")) return;
     pendingModelRetry = { chatID: chat.id, index };
-    openSettings(modelSelectEl, opener);
+    setSettingsTab("model");
+    openSettings(modelSearchEl, opener);
     showToast("Choose another model to regenerate the same question.", "success");
   }
 
@@ -2411,6 +2423,7 @@ function toMarkdown(chat) {
     if (!name) return;
     modelNameEl.textContent = name;
     modelNameEl.title = name;
+    modelNameEl.setAttribute("aria-label", "Change active model: " + name);
     const chat = activeChat();
     if (chat) {
       chat.model = name;
@@ -2418,44 +2431,135 @@ function toMarkdown(chat) {
     }
   }
 
-  function filterModelOptions() {
+  function modelContextLabel(value) {
+    const n = Number(value) || 0;
+    if (!n) return "";
+    if (n >= 1000000) return (n / 1000000).toFixed(n % 1000000 ? 1 : 0) + "M ctx";
+    if (n >= 1000) return Math.round(n / 1000) + "K ctx";
+    return n + " ctx";
+  }
+
+  function modelMeta(model) {
+    return [
+      model.architecture || "unknown arch",
+      model.size_gb ? model.size_gb.toFixed(1) + " GB" : "",
+      modelContextLabel(model.context_length)
+    ].filter(Boolean);
+  }
+
+  function renderActiveModelSummary(model, state) {
+    const loading = state === "loading";
+    activeModelSummaryEl.classList.toggle("is-loading", loading);
+    activeModelSummaryEl.classList.toggle("is-loaded", Boolean(model && !loading));
+    if (!model) {
+      activeModelNameEl.textContent = "No model loaded";
+      activeModelMetaEl.textContent = "Choose a compatible GGUF below.";
+      activeModelStateEl.textContent = "Not loaded";
+      return;
+    }
+    activeModelNameEl.textContent = model.name || model.id;
+    activeModelNameEl.title = model.name || model.id;
+    activeModelMetaEl.textContent = modelMeta(model).join(" · ") || model.id;
+    activeModelStateEl.textContent = loading ? "Loading…" : "Loaded";
+  }
+
+  function renderModelLibrary() {
     const query = modelSearchEl.value.trim().toLowerCase();
     const showUnsupported = modelShowUnsupportedEl.checked;
-    let hidden = 0;
-    Array.from(modelSelectEl.options).forEach((option) => {
-      if (!option.value) return;
-      const unsupported = option.dataset.supported === "false";
-      const matches = !query || (option.dataset.search || option.textContent.toLowerCase()).includes(query);
-      const visible = option.dataset.loaded === "true" || (matches && (showUnsupported || !unsupported));
-      option.hidden = !visible;
-      if (!visible) hidden++;
+    const chatModels = modelCatalog.filter((model) => model.embedding !== true);
+    const unsupportedHidden = chatModels.filter((model) => !model.supported && !showUnsupported).length;
+    const visible = chatModels.filter((model) => {
+      if (!showUnsupported && !model.supported) return false;
+      return !query || model.search.includes(query);
     });
-    modelHiddenCountEl.textContent = hidden ? "(" + hidden + " hidden)" : "";
+
+    modelLibraryEl.replaceChildren();
+    modelLibraryEl.setAttribute("aria-busy", "false");
+    if (!visible.length) {
+      const empty = document.createElement("p");
+      empty.className = "model-library-empty";
+      empty.textContent = query ? "No GGUF matches this search." : "No compatible chat model found.";
+      modelLibraryEl.appendChild(empty);
+    }
+    visible.forEach((model) => {
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "model-card";
+      card.dataset.model = model.id;
+      card.setAttribute("role", "option");
+      card.setAttribute("aria-selected", String(Boolean(model.loaded)));
+      card.disabled = !model.supported || loadingModel || busy || tuning;
+      card.title = !model.supported ? "This GGUF architecture is not supported for chat." : "Load " + (model.name || model.id);
+      card.classList.toggle("is-loaded", Boolean(model.loaded));
+      card.classList.toggle("is-loading", loadingModelID === model.id);
+
+      const name = document.createElement("span");
+      name.className = "model-card-name";
+      name.textContent = model.name || model.id;
+      name.title = model.name || model.id;
+      const state = document.createElement("span");
+      state.className = "model-card-state";
+      state.textContent = loadingModelID === model.id ? "Loading" : model.loaded ? "Active" : !model.supported ? "Unsupported" : "";
+      const meta = document.createElement("span");
+      meta.className = "model-card-meta";
+      modelMeta(model).forEach((label) => {
+        const badge = document.createElement("span");
+        badge.className = "model-badge";
+        badge.textContent = label;
+        meta.appendChild(badge);
+      });
+      const path = document.createElement("span");
+      path.className = "model-card-path";
+      path.textContent = model.id;
+      path.title = model.id;
+      card.append(name, state, meta, path);
+      modelLibraryEl.appendChild(card);
+    });
+    modelHiddenCountEl.textContent = unsupportedHidden ? "(" + unsupportedHidden + " hidden)" : "";
+    const compatibleCount = chatModels.filter((model) => model.supported).length;
+    modelResultCountEl.textContent = visible.length + " shown · " + compatibleCount + " compatible";
+
+    const active = chatModels.find((model) => model.loaded);
+    const loading = chatModels.find((model) => model.id === loadingModelID);
+    renderActiveModelSummary(loading || active || null, loading ? "loading" : "loaded");
+  }
+
+  function filterModelOptions() {
+    renderModelLibrary();
   }
 
   async function loadModels() {
     try {
       const response = await fetch("/models");
-      if (!response.ok) return;
+      if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
-      if (!data.models || !data.models.length) return;
+      if (!data.models || !data.models.length) {
+        modelLibraryEl.setAttribute("aria-busy", "false");
+        modelLibraryEl.querySelector(".model-library-empty").textContent = "No GGUF models found in the configured model directory.";
+        modelResultCountEl.textContent = "0 models";
+        return;
+      }
       modelSelectEl.replaceChildren();
       modelSelectEl.disabled = false;
       const chatModels = data.models.filter((model) => model.embedding !== true);
+      modelCatalog = data.models.map((model) => Object.assign({}, model, {
+        search: [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB"].filter(Boolean).join(" ").toLowerCase()
+      }));
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "Choose a local model";
+      placeholder.selected = true;
+      modelSelectEl.appendChild(placeholder);
       if (!chatModels.length) {
-        const option = document.createElement("option");
-        option.value = "";
-        option.textContent = "No chat model available";
-        modelSelectEl.appendChild(option);
+        placeholder.textContent = "No chat model available";
         modelSelectEl.disabled = true;
       }
       chatModels.forEach((model) => {
         const option = document.createElement("option");
         option.value = model.id;
-        const context = model.context_length ? " · " + (model.context_length >= 1000 ? Math.round(model.context_length / 1000) + "K" : model.context_length) + " ctx" : "";
+        const context = model.context_length ? " · " + modelContextLabel(model.context_length) : "";
         option.textContent = (model.name || model.id) + (model.architecture ? " [" + model.architecture + "]" : "") + context + (model.size_gb ? " — " + model.size_gb.toFixed(1) + " GB" : "") + (!model.supported ? " (unsupported)" : "");
         option.dataset.supported = String(Boolean(model.supported));
-        option.dataset.search = [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB"].filter(Boolean).join(" ").toLowerCase();
         if (model.loaded) {
           option.selected = true;
           option.dataset.loaded = "true";
@@ -2490,6 +2594,13 @@ function toMarkdown(chat) {
       }
       updateComposer(false);
     } catch (_) {
+      modelLibraryEl.setAttribute("aria-busy", "false");
+      modelLibraryEl.replaceChildren();
+      const empty = document.createElement("p");
+      empty.className = "model-library-empty";
+      empty.textContent = "Could not reach the local model catalog.";
+      modelLibraryEl.appendChild(empty);
+      modelResultCountEl.textContent = "Catalog unavailable";
       setStatus("Offline");
     }
   }
@@ -3117,18 +3228,31 @@ function toMarkdown(chat) {
     filterModelOptions();
     save();
   });
+  modelLibraryEl.addEventListener("click", (event) => {
+    const card = event.target.closest(".model-card");
+    if (!card || card.disabled || !card.dataset.model) return;
+    const selected = modelCatalog.find((model) => model.id === card.dataset.model);
+    if (selected && selected.loaded) {
+      showToast("This model is already active.", "success");
+      return;
+    }
+    modelSelectEl.value = card.dataset.model;
+    modelSelectEl.dispatchEvent(new Event("change", { bubbles: true }));
+  });
   modelSelectEl.addEventListener("change", async () => {
     const model = modelSelectEl.value;
     if (!model || busy || tuning || loadingModel) return;
     let regenerateAfterLoad = false;
     lastContextWindow = null;
     loadingModel = true;
+    loadingModelID = model;
     const previous = Array.from(modelSelectEl.options).find((option) => option.dataset.loaded === "true");
     modelSelectEl.disabled = true;
     autoTuneRunEl.disabled = true;
     autoTuneEffortEl.disabled = true;
     statusEl.classList.add("busy");
     setStatus("Loading model…");
+    renderModelLibrary();
     try {
       const response = await fetch("/models/load", {
         method: "POST",
@@ -3140,6 +3264,7 @@ function toMarkdown(chat) {
       Array.from(modelSelectEl.options).forEach((option) => { delete option.dataset.loaded; });
       const loaded = Array.from(modelSelectEl.options).find((option) => option.value === model);
       if (loaded) loaded.dataset.loaded = "true";
+      modelCatalog.forEach((entry) => { entry.loaded = entry.id === model; });
       contextLimit = Number(data.context_length) || 0;
       const loadedName = data.model || model;
       const retry = pendingModelRetry;
@@ -3170,10 +3295,12 @@ function toMarkdown(chat) {
       addMessage("error", "Failed to load model: " + (error.message || error));
     } finally {
       loadingModel = false;
+      loadingModelID = "";
       statusEl.classList.remove("busy");
       modelSelectEl.disabled = false;
       autoTuneRunEl.disabled = false;
       autoTuneEffortEl.disabled = false;
+      renderModelLibrary();
     }
     if (regenerateAfterLoad) generate();
   });
@@ -3185,6 +3312,7 @@ function toMarkdown(chat) {
     autoTuneEffortEl.disabled = true;
     const modelSelectWasDisabled = modelSelectEl.disabled;
     modelSelectEl.disabled = true;
+    renderModelLibrary();
     updateComposer(false);
     statusEl.classList.add("busy");
     const effort = autoTuneEffortEl.value;
@@ -3209,6 +3337,7 @@ function toMarkdown(chat) {
       autoTuneRunEl.disabled = false;
       autoTuneEffortEl.disabled = false;
       modelSelectEl.disabled = modelSelectWasDisabled;
+      renderModelLibrary();
       statusEl.classList.remove("busy");
       setStatus("Ready");
       updateComposer(false);
@@ -3285,6 +3414,18 @@ function toMarkdown(chat) {
   chatSearchEl.addEventListener("input", renderChatList);
   sidebarToggleEl.addEventListener("click", () => setSidebar(!sidebarEl.classList.contains("is-open")));
   sidebarScrimEl.addEventListener("click", () => setSidebar(false));
+  function setSettingsTab(name, focusTab) {
+    const selected = settingsTabEls.find((tab) => tab.dataset.settingsTab === name) || settingsTabEls[0];
+    settingsTabEls.forEach((tab) => {
+      const active = tab === selected;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
+    });
+    settingsPageEls.forEach((page) => { page.hidden = page.dataset.settingsPage !== selected.dataset.settingsTab; });
+    if (focusTab) selected.focus();
+  }
+
   function openSettings(initialFocus, opener) {
     settingsToggleEl.setAttribute("aria-expanded", "true");
     openDialog(settingsEl, opener || settingsToggleEl, initialFocus || settingsCloseEl);
@@ -3298,6 +3439,20 @@ function toMarkdown(chat) {
   settingsToggleEl.addEventListener("click", () => {
     if (settingsEl.hidden) openSettings();
     else closeSettings();
+  });
+  modelNameEl.addEventListener("click", () => {
+    setSettingsTab("model");
+    openSettings(modelSearchEl, modelNameEl);
+  });
+  settingsTabEls.forEach((tab, index) => {
+    tab.addEventListener("click", () => setSettingsTab(tab.dataset.settingsTab));
+    tab.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      event.preventDefault();
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const next = (index + direction + settingsTabEls.length) % settingsTabEls.length;
+      setSettingsTab(settingsTabEls[next].dataset.settingsTab, true);
+    });
   });
   settingsCloseEl.addEventListener("click", closeSettings);
   settingsDoneEl.addEventListener("click", closeSettings);
@@ -3367,7 +3522,7 @@ function toMarkdown(chat) {
     setComposerProOpen(composerProPanelEl.hidden);
     save();
   });
-  composerSettingsEl.addEventListener("click", openSettings);
+  composerSettingsEl.addEventListener("click", () => openSettings());
 
   exportChatsEl.addEventListener("click", () => {
     download("gopherllm-chats-" + new Date().toISOString().slice(0, 10) + ".json", "application/json", JSON.stringify(Object.assign(workspace(), { exportedAt: new Date().toISOString() }), null, 2));
@@ -3470,10 +3625,9 @@ function toMarkdown(chat) {
   document.addEventListener("click", (event) => {
     const button = event.target.closest && event.target.closest(".mermaid-enable");
     if (!button) return;
+    setSettingsTab("workspace");
     openSettings();
     if (mermaidCDNEl) {
-      const section = mermaidCDNEl.closest("details");
-      if (section) section.open = true;
       mermaidCDNEl.focus();
     }
   });

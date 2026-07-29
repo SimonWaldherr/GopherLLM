@@ -356,7 +356,11 @@ new local branch while retaining the original conversation for comparison.
 Every assistant answer also has an under-text **Copy message** action and a
 **Change model** action; changing the model creates a comparison branch and
 automatically asks the same question again while preserving the original. The
-model picker is searchable and hides unsupported GGUFs unless requested.
+**Model & chat** settings page presents discovered GGUFs as a searchable
+two-column library with architecture, file size, context length, compatibility,
+load progress, and the currently active model visible at a glance. Unsupported
+or auxiliary GGUFs stay hidden unless requested, and the model name in the chat
+header opens this picker directly.
 Nothing is synced to a third party; exported archives are the portable backup
 format. The UI assets use no-store and same-origin security headers, so start
 the server on a trusted local address unless you add your own network security
@@ -365,13 +369,17 @@ in front of it.
 The composer keeps the default path deliberately small: write a message,
 attach files, and send. **Pro tools** reveals quick controls for context mode,
 output length, and slash commands; the complete configuration remains in
-Settings. Related settings are grouped into disclosures, and the mobile header
-wraps its actions below the chat title instead of clipping them on narrow
-screens. Any file type can be attached. Text files up to 500 KB are included as
-text in the model request; non-text files (images, audio, video, PDFs, archives,
-and other binaries) stay local to the browser and are shown as attachment
-cards. With the built-in text-only server, their filename, type, and size are
-sent as metadata rather than pretending that binary content was analysed.
+Settings. The Settings dialog separates **Model & chat**, **Capabilities**,
+**Generation**, and **Workspace** into keyboard-accessible tabs so common model
+switching stays close while advanced sampling and storage controls do not
+compete for attention. The model library and tab bar collapse cleanly on narrow
+screens, and the mobile header wraps its actions below the chat title instead
+of clipping them. Any file type can be attached. Text files up to 500 KB are
+included as text in the model request; non-text files (images, audio, video,
+PDFs, archives, and other binaries) stay local to the browser and are shown as
+attachment cards. With the built-in text-only server, their filename, type, and
+size are sent as metadata rather than pretending that binary content was
+analysed.
 
 ### Smart context for long chats
 
