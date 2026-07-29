@@ -320,8 +320,8 @@ func TestGenerateChatPrefixCacheKeepsSamplingDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cached.PromptCache == nil || !cached.PromptCache.Hit || cached.PromptCache.ReusedTokens != cached.Stats.PromptTokens-1 {
-		t.Fatalf("same-prompt cache = %+v for %d tokens, want all but final token reused", cached.PromptCache, cached.Stats.PromptTokens)
+	if cached.PromptCache == nil || !cached.PromptCache.Hit || cached.PromptCache.ReusedTokens != cached.Stats.PromptTokens {
+		t.Fatalf("same-prompt cache = %+v for %d tokens, want full prompt reuse", cached.PromptCache, cached.Stats.PromptTokens)
 	}
 	cold, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {
@@ -382,7 +382,7 @@ func TestRecentTokenWindowKeepsOnlyTrailingTokens(t *testing.T) {
 	for i := range tokens {
 		tokens[i] = uint32(i)
 	}
-	recent := recentTokenWindow(tokens)
+	recent := recentTokenWindowInto(nil, tokens)
 	if len(recent) != repeatPenaltyWindow {
 		t.Fatalf("window length = %d, want %d", len(recent), repeatPenaltyWindow)
 	}

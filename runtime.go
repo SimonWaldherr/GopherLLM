@@ -244,12 +244,16 @@ const (
 	loadedQwen35
 )
 
-// prefixCacheState owns no additional KV memory: it points at the retained
-// generation workspace, and tokens are exactly the positions resident in it.
+// prefixCacheState points at the retained generation workspace. tokens are
+// exactly the positions resident in it. promptLogits is a bounded,
+// vocab-sized snapshot taken before sampling mutates the live logits; it lets
+// an identical request skip even the final prompt-token forward pass.
 // Runner.genLock protects the whole structure.
 type prefixCacheState struct {
-	cache  *KVCache
-	tokens []uint32
+	cache        *KVCache
+	tokens       []uint32
+	promptTokens int
+	promptLogits []float32
 }
 
 // Runner is a fully loaded model ready to generate: parsed GGUF header,
@@ -614,6 +618,9 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
 	reusedTokens := 0
 	cacheEligible := r.prefixCacheSupported(cache)
+	cachedResidentTokens := r.prefixCache.tokens
+	cachedPromptTokens := r.prefixCache.promptTokens
+	cachedPromptLogits := r.prefixCache.promptLogits
 	if cacheEligible {
 		cacheInfo.Mode = "prefix"
 		reusedTokens = r.prefixReuse(cache, tokens)
@@ -635,15 +642,22 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		r.clearPrefixCache()
 	}
 	prefillOffset := reusedTokens
+	logits := buf.Logits
 	if prefillOffset == len(tokens) {
-		prefillOffset = max(0, len(tokens)-1)
-		cacheInfo.Hit = prefillOffset > 0
-		cacheInfo.ReusedTokens = prefillOffset
+		if cachedPromptTokens == len(tokens) && len(cachedPromptLogits) > 0 {
+			ensureLenNoClear(&logits, len(cachedPromptLogits))
+			copy(logits, cachedPromptLogits)
+		} else {
+			prefillOffset = max(0, len(tokens)-1)
+			cacheInfo.Hit = prefillOffset > 0
+			cacheInfo.ReusedTokens = prefillOffset
+		}
 	}
 	prefillBegan := time.Now()
-	logits := []float32{}
-	residentTokens := []uint32(nil)
+	residentTokens := cachedResidentTokens[:0]
+	promptLogits := cachedPromptLogits[:0]
 	defer func() {
+		buf.Logits = logits
 		if !cacheEligible {
 			return
 		}
@@ -651,7 +665,12 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			r.clearPrefixCache()
 			return
 		}
-		state := prefixCacheState{cache: cache, tokens: append([]uint32(nil), residentTokens...)}
+		state := prefixCacheState{
+			cache:        cache,
+			tokens:       residentTokens,
+			promptTokens: len(tokens),
+			promptLogits: promptLogits,
+		}
 		r.prefixCache = state
 	}()
 	if prefillOffset < len(tokens) {
@@ -672,6 +691,10 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			}
 		}
 	}
+	if cacheEligible {
+		ensureLenNoClear(&promptLogits, len(logits))
+		copy(promptLogits, logits)
+	}
 	residentTokens = append(residentTokens, tokens...)
 	prefillTime := time.Since(prefillBegan)
 	decodeStart := time.Now()
@@ -681,7 +704,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	for _, stop := range options.StopSequences {
 		maxStopLen = max(maxStopLen, len(stop))
 	}
-	streamBuf := []byte{}
+	streamBuf := buf.StreamBytes[:0]
 	flushStream := func(final bool) bool {
 		if len(streamBuf) == 0 {
 			return true
@@ -711,8 +734,13 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		}
 		return true
 	}
-	generated := []uint32{}
-	recent := recentTokenWindow(tokens)
+	generated := buf.GeneratedTokens[:0]
+	recent := recentTokenWindowInto(buf.RecentTokens[:0], tokens)
+	defer func() {
+		buf.GeneratedTokens = generated[:0]
+		buf.RecentTokens = recent[:0]
+		buf.StreamBytes = streamBuf[:0]
+	}()
 	pos := len(tokens)
 	finishReason := "length"
 	greedyFastPath := r.canGreedyOutputFastPath(options)
@@ -769,7 +797,8 @@ decode:
 		generated = append(generated, token)
 		recent = append(recent, token)
 		if len(recent) > repeatPenaltyWindow {
-			recent = recent[len(recent)-repeatPenaltyWindow:]
+			copy(recent, recent[len(recent)-repeatPenaltyWindow:])
+			recent = recent[:repeatPenaltyWindow]
 		}
 		if len(generated) >= options.MaxTokens || pos >= cacheLen {
 			break
@@ -807,9 +836,9 @@ func generationCacheLen(maxSeqLen, promptTokens, maxTokens int) int {
 	return promptTokens + maxTokens + 1
 }
 
-func recentTokenWindow(tokens []uint32) []uint32 {
+func recentTokenWindowInto(dst, tokens []uint32) []uint32 {
 	start := max(0, len(tokens)-repeatPenaltyWindow)
-	return append([]uint32(nil), tokens[start:]...)
+	return append(dst[:0], tokens[start:]...)
 }
 
 func validUTF8PrefixLen(b []byte) int {
@@ -947,10 +976,9 @@ func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
 	return r.kind != loadedNemotronH && r.kind != loadedMamba2 && r.kind != loadedQwen35 && cache != nil && cache == r.workspaceCache
 }
 
-// prefixReuse returns the exact number of resident KV positions that can be
-// skipped. An identical prompt re-runs only its final token because sampling
-// mutates logits in place; retaining raw logits would otherwise make a retry
-// subtly diverge from a cold run.
+// prefixReuse returns the exact number of resident KV positions that match.
+// GenerateChatStreamUntil may skip an identical prompt completely when the
+// corresponding immutable pre-sampling logits snapshot is also resident.
 func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
 	state := r.prefixCache
 	if state.cache != cache || len(state.tokens) == 0 || cache == nil {
@@ -959,9 +987,6 @@ func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
 	matched := min(sharedTokenPrefix(tokens, state.tokens), cache.MaxLen)
 	if matched == 0 {
 		return 0
-	}
-	if matched == len(tokens) {
-		return max(0, matched-1)
 	}
 	return matched
 }

@@ -1009,11 +1009,12 @@ func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, va
 // DecodeBuffer is reusable request scratch for single-token decode and batched
 // prefill: activation vectors (X residual stream, XN/XN2 normed views,
 // Q/K/V/AttnOut/Proj attention buffers, Gate/Up/Hidden FFN buffers), the
-// sampler's candidate scratch, and precomputed RoPE tables (per-pair inverse
-// frequencies plus per-position sin/cos filled in prepareRopeScratch). One
-// DecodeBuffer serves successive requests, so decode allocates nothing per
-// token and prefill reuses its activation slabs. Not safe for concurrent use;
-// Runner.genLock serializes requests.
+// output logits and generation/token scratch, the sampler's candidate scratch,
+// and precomputed RoPE tables (per-pair inverse frequencies plus per-position
+// sin/cos filled in prepareRopeScratch). One DecodeBuffer serves successive
+// requests, so decode allocates nothing per token and prefill reuses its
+// activation slabs. Not safe for concurrent use; Runner.genLock serializes
+// requests.
 type DecodeBuffer struct {
 	X        []float32
 	XN       []float32
@@ -1050,6 +1051,10 @@ type DecodeBuffer struct {
 	TopExperts              []ExpertScore
 	ExpertProbs             []float32
 	SamplerCandidates       []TokenProb
+	Logits                  []float32
+	RecentTokens            []uint32
+	GeneratedTokens         []uint32
+	StreamBytes             []byte
 	Q4KXSums                []float32
 	RopeInvFreq             []float32
 	RopeSin                 []float32
@@ -1128,6 +1133,10 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		TopExperts:              make([]ExpertScore, 0, config.ExpertUsedCount),
 		ExpertProbs:             make([]float32, 0, config.ExpertUsedCount),
 		SamplerCandidates:       make([]TokenProb, 0, 64),
+		Logits:                  make([]float32, config.VocabSize),
+		RecentTokens:            make([]uint32, 0, repeatPenaltyWindow),
+		GeneratedTokens:         make([]uint32, 0, 64),
+		StreamBytes:             make([]byte, 0, 256),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
 		RopeInvFreq:             inv,
 		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),

@@ -236,6 +236,29 @@ func BenchmarkTinyModelBatchedPrefillReuse(b *testing.B) {
 	}
 }
 
+func BenchmarkTinyModelCachedPrompt(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 1
+	opts.Seed = 7
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+	if _, err := r.Generate("a b c a b c", opts); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := r.Generate("a b c a b c", opts); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkTinyStableLMBatchedPrefillReuse(b *testing.B) {
 	r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF("stablelm"))
 	if err != nil {

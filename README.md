@@ -309,20 +309,24 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
 
 Open `http://127.0.0.1:8080/chat` for the browser UI.
 
-The server remembers the last successfully loaded **local** GGUF (whether it
-was selected at startup or through the browser/API model picker). Restart it
-without `--model` and it automatically reloads that model:
+The CLI remembers every successfully loaded **local** GGUF, whether it was
+used for a one-shot prompt, REPL, benchmark, server startup, or selected
+through the browser/API model picker. Later commands can omit the model
+selector entirely; an explicit selector always wins. For example, restart a
+server with:
 
 ```sh
 bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --serve 127.0.0.1:8080 --chat
 ```
 
-An explicit `--model` overrides the remembered selection. If there is no saved
-model, or its file is no longer available, the server starts without weights so
-you can choose a discovered GGUF later in the browser's model picker (or with
-`POST /models/load`). Until then, catalog and UI routes remain available while
-inference routes return `503 Service Unavailable` with a clear explanation.
+The remembered absolute path is stored as `last-model.json` below the
+platform's per-user configuration directory (override with
+`GOPHERLLM_MODEL_STATE_PATH`). Only the first run, a removed model, or an
+unreadable state file can therefore start a server without weights. In that
+case, choose a discovered GGUF in the browser's model picker or with
+`POST /models/load`; the successful load immediately repairs the remembered
+selection.
 
 ### OpenAI-compatible remote APIs
 
@@ -416,6 +420,13 @@ measured result as `gopherllm_cache` with `mode`, `hit`, `reused_tokens`, and
 `prompt_tokens`; streaming responses carry it in the terminal SSE choice. The
 browser UI shows the same information as cache warming or reuse, separately
 from Smart Context's message-selection status.
+
+The runner also retains an immutable, vocabulary-sized snapshot of the prompt
+logits before sampling. An exactly repeated prompt can therefore reuse every
+input token without re-running the final prompt token through the transformer.
+Logit, generated-token, repeat-window, and streaming buffers are retained in
+the bounded runner workspace to reduce allocation and garbage-collection work
+across requests.
 
 OpenAI-compatible completion responses also report the reused portion as
 `usage.prompt_tokens_details.cached_tokens` (zero on a cold request).

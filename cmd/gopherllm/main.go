@@ -24,6 +24,8 @@ import (
 func printUsage(name string) {
 	fmt.Fprintf(os.Stderr, "gopherllm %s\n\n", gopherllm.Version)
 	fmt.Fprintf(os.Stderr, "Usage: %s [model.gguf|model-name|model-dir] [options]\n\n", name)
+	fmt.Fprintln(os.Stderr, "If the model is omitted, the last successfully loaded local model is reused.")
+	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Options:")
 	fmt.Fprintln(os.Stderr, "  --model <name>           Select a GGUF from --model-dir by repo, file, or metadata name")
 	fmt.Fprintln(os.Stderr, "  --model-dir <path>       Directory to recursively scan for GGUF files")
@@ -33,7 +35,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
 	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
-	fmt.Fprintln(os.Stderr, "                           With --serve, resumes the last local model unless --model is given")
+	fmt.Fprintln(os.Stderr, "                           Explicit model selectors always override the remembered model")
 	fmt.Fprintln(os.Stderr, "  --max-connections <N>     Max concurrent server connections")
 	fmt.Fprintln(os.Stderr, "  --max-tokens <N>          Max tokens to generate (default: 256)")
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
@@ -132,10 +134,6 @@ func main() {
 
 func run() error {
 	args := os.Args
-	if len(args) < 2 {
-		printUsage(args[0])
-		return fmt.Errorf("missing model selector; use --list-models to inspect the configured model directory")
-	}
 	for _, arg := range args[1:] {
 		if arg == "--help" || arg == "-h" {
 			printUsage(args[0])
@@ -183,18 +181,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// A model selected by a previous server session is a better default than an
-	// interactive picker: a restart should resume serving without intervention.
-	// An explicit --model always wins, and an unusable saved path leaves the
-	// server in its existing no-model state so the browser/API picker remains
-	// available.
-	if cfg.modelSelector == nil && cfg.serveAddr != "" {
-		if path, err := loadLastServerModel(); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not resume the last server model: %v\n", err)
-		} else if path != "" {
-			cfg.modelSelector = &path
-			fmt.Fprintf(os.Stderr, "Resuming last server model: %s\n", path)
-		}
+	// A successfully used local model is the default for every later command,
+	// including a bare invocation and server restarts. An explicit selector
+	// always wins. An unusable saved path leaves a server in its model-picker
+	// state rather than preventing it from starting.
+	resumeLastModel(&cfg, os.Stderr)
+	if cfg.modelSelector == nil && len(args) < 2 {
+		printUsage(args[0])
+		return fmt.Errorf("no model has been used yet; provide a model once or use --list-models")
 	}
 	// A server with a model catalog is useful before any weights are loaded:
 	// the browser can show its model picker immediately and POST /models/load
@@ -295,6 +289,7 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "Model: %s\n", name)
 	}
 	fmt.Fprintf(os.Stderr, "Architecture: %s\n", runner.Architecture())
+	recordLastModel(modelPath)
 	// Auto-tuning runs before every generation path (one-shot, REPL, server,
 	// bench) so all of them share the measured configuration.
 	var appliedAutoTune *gopherllm.AutoTuneResult
@@ -312,8 +307,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		recordLastServerModel(modelPath)
-		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastServerModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -366,6 +360,26 @@ func run() error {
 	printReasoningAndToolCalls(result)
 	printStats(result.Stats)
 	return nil
+}
+
+func resumeLastModel(cfg *cliConfig, logw io.Writer) bool {
+	if cfg == nil || cfg.modelSelector != nil {
+		return false
+	}
+	if logw == nil {
+		logw = io.Discard
+	}
+	path, err := loadLastModel()
+	if err != nil {
+		fmt.Fprintf(logw, "Warning: could not resume the last model: %v\n", err)
+		return false
+	}
+	if path == "" {
+		return false
+	}
+	cfg.modelSelector = &path
+	fmt.Fprintf(logw, "Resuming last model: %s\n", path)
+	return true
 }
 
 // runAutoTune calibrates the runtime settings for this model on this machine.
