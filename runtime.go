@@ -301,6 +301,9 @@ type Runner struct {
 //   - Phi-3, dense Granite, EXAONE, and InternLM2 use the same pre-norm, RoPE, GQA and
 //     SwiGLU graph as the standard loader. Their architecture-specific scales
 //     are read from GGUF metadata by ConfigFromGGUF.
+//   - SmolLM3 uses the standard dense graph with its every-fourth-layer RoPE
+//     omission. EXAONE 4 uses per-head QK norm, post-attention/post-FFN norm,
+//     and its local/global attention schedule.
 //   - Devstral and Mistral-Small GGUFs usually declare llama or mistral3;
 //     their [INST]/Tekken behavior is picked up from tokenizer metadata, not
 //     the arch string.
@@ -308,6 +311,8 @@ func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
 		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
+		return true
+	case "smollm3", "exaone4":
 		return true
 	default:
 		return false
@@ -1159,11 +1164,12 @@ func (r *Runner) canBatchPrefill() bool {
 	if os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
 		return false
 	}
-	// The batched graph implements both RMSNorm and LayerNorm, including
-	// StableLM's parallel attention/FFN residual. Gemma-family mechanisms
-	// such as QK/post norms still fall back to the per-token path.
+	// The batched graph implements RMSNorm, LayerNorm, QK norm, post norm, and
+	// StableLM's parallel attention/FFN residual. Sparse experts retain the
+	// per-token path because their token-dependent routing needs a separate
+	// batched execution strategy.
 	for _, l := range r.standard.Layers {
-		if l.MoE != nil || l.AttnQNorm != nil || l.AttnKNorm != nil || l.PostAttnNorm != nil || l.PostFFNNorm != nil {
+		if l.MoE != nil {
 			return false
 		}
 	}
@@ -1339,6 +1345,11 @@ func (r *Runner) isStopToken(token uint32) bool {
 			return true
 		}
 	}
+	if r.arch == "exaone4" {
+		if id, ok := r.tok.SpecialID("[|endofturn|]"); ok && token == id {
+			return true
+		}
+	}
 	if gemmaFamily(r.arch) {
 		if r.arch == "gemma4" {
 			// Gemma 4's native turn delimiter replaces the older
@@ -1395,6 +1406,10 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, too
 	}
 	generic, genericSystem := injectGenericTools(messages, systemPrompt, tools)
 	switch r.chatTemplateKind() {
+	case "exaone4-chat":
+		if tokens, ok := r.renderExaone4Messages(generic, genericSystem); ok {
+			return tokens
+		}
 	case "gemma4-chat":
 		if tokens, ok := r.renderGemma4Messages(generic, genericSystem); ok {
 			return tokens
@@ -2602,6 +2617,47 @@ func (r *Runner) renderGraniteMessages(messages []ChatMessage, systemPrompt stri
 	return tokens, true
 }
 
+// renderExaone4Messages mirrors the text-only EXAONE 4 instruct protocol.
+// Unlike most turn formats, user content ends with a newline but no
+// [|endofturn|]; system, assistant, and tool-derived turns are closed.
+func (r *Runner) renderExaone4Messages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	system, ok1 := r.tok.SpecialID("[|system|]")
+	user, ok2 := r.tok.SpecialID("[|user|]")
+	assistant, ok3 := r.tok.SpecialID("[|assistant|]")
+	end, ok4 := r.tok.SpecialID("[|endofturn|]")
+	if !(ok1 && ok2 && ok3 && ok4) {
+		return nil, false
+	}
+	tokens := []uint32{}
+	appendClosed := func(marker uint32, content string) {
+		tokens = append(tokens, marker)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(strings.TrimSpace(content))...)
+		tokens = append(tokens, end)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+	}
+	hasSystem := false
+	for _, m := range messages {
+		hasSystem = hasSystem || m.Role == ChatRoleSystem
+	}
+	if strings.TrimSpace(systemPrompt) != "" && !hasSystem {
+		appendClosed(system, systemPrompt)
+	}
+	for _, m := range messages {
+		switch m.Role {
+		case ChatRoleSystem:
+			appendClosed(system, m.Content)
+		case ChatRoleAssistant:
+			appendClosed(assistant, m.Content)
+		default:
+			tokens = append(tokens, user)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(strings.TrimSpace(m.Content))...)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+		}
+	}
+	tokens = append(tokens, assistant)
+	return tokens, true
+}
+
 func (r *Runner) chatTemplateKind() string {
 	if r == nil || r.tok == nil {
 		return ""
@@ -2610,6 +2666,8 @@ func (r *Runner) chatTemplateKind() string {
 		if v, ok := r.gguf.Metadata["tokenizer.chat_template"]; ok {
 			if s, ok := v.AsString(); ok {
 				switch {
+				case r.arch == "exaone4" && strings.Contains(s, "[|system|]") && strings.Contains(s, "[|assistant|]") && strings.Contains(s, "[|endofturn|]"):
+					return "exaone4-chat"
 				case strings.Contains(s, "<|turn>") && strings.Contains(s, "<turn|>"):
 					return "gemma4-chat"
 				case strings.Contains(s, "[INST]") && strings.Contains(s, "[/INST]"):
@@ -2644,6 +2702,15 @@ func (r *Runner) chatTemplateKind() string {
 			if _, ok := r.tok.SpecialID("<|im_middle|>"); ok {
 				if _, ok := r.tok.SpecialID("<|im_end|>"); ok {
 					return "kimi-chat"
+				}
+			}
+		}
+	}
+	if r.arch == "exaone4" {
+		if _, ok := r.tok.SpecialID("[|system|]"); ok {
+			if _, ok := r.tok.SpecialID("[|assistant|]"); ok {
+				if _, ok := r.tok.SpecialID("[|endofturn|]"); ok {
+					return "exaone4-chat"
 				}
 			}
 		}

@@ -276,3 +276,39 @@ func BenchmarkTinyStableLMBatchedPrefillReuse(b *testing.B) {
 		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
 	}
 }
+
+func BenchmarkTinyQwen3BatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen3GGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := r.tok.Encode("a b c a b c a b")
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyExaone4BatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyExaone4GGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := r.tok.Encode("a b c a b c a b")
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}

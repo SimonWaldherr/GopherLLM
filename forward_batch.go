@@ -294,7 +294,11 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	for l := 0; l < config.NLayers; l++ {
 		layer := weights.Layers[l]
 		for t := 0; t < p; t++ {
-			normalizeDecoderInto(config, X[t], layer.AttnNorm, layer.AttnNormBias, &XN[t])
+			if config.usesPostNormOnly() {
+				copy(XN[t], X[t])
+			} else {
+				normalizeDecoderInto(config, X[t], layer.AttnNorm, layer.AttnNormBias, &XN[t])
+			}
 		}
 		if layer.HasQKV {
 			qkvLen := qLen + kLen + vLen
@@ -318,8 +322,14 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			addInPlace(Q[t], layer.BQ)
 			addInPlace(K[t], layer.BK)
 			addInPlace(V[t], layer.BV)
+			if layer.AttnQNorm != nil {
+				perHeadRMSNormInPlace(Q[t], headDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
+			}
+			if layer.AttnKNorm != nil {
+				perHeadRMSNormInPlace(K[t], headDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
+			}
 			pos := startPos + t
-			if ropePairs > 0 {
+			if ropePairs > 0 && config.layerUsesRoPE(l) {
 				applyPreparedRope(Q[t], headDim, config.NHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
 				applyPreparedRope(K[t], headDim, config.NKVHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
 			}
@@ -356,6 +366,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		matvecBatch(layer.WO, AttnOut, Proj)
 		for t := 0; t < p; t++ {
 			addInPlace(Proj[t], layer.BO)
+			if layer.PostAttnNorm != nil {
+				rmsNormInto(Proj[t], layer.PostAttnNorm, config.RMSNormEps, &Proj[t])
+			}
 			if config.ResidualScale != 1 {
 				ScaleF32(Proj[t], config.ResidualScale)
 			}
@@ -364,7 +377,11 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			} else {
 				addInPlace(X[t], Proj[t])
 			}
-			normalizeDecoderInto(config, X[t], layer.FFNNorm, layer.FFNNormBias, &XN[t])
+			if config.usesPostNormOnly() {
+				copy(XN[t], X[t])
+			} else {
+				normalizeDecoderInto(config, X[t], layer.FFNNorm, layer.FFNNormBias, &XN[t])
+			}
 		}
 		if layer.HasGateUp {
 			gateUpLen := hDim * 2
@@ -398,6 +415,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 		matvecBatch(layer.W2, Hidden, Proj)
 		for t := 0; t < p; t++ {
+			if layer.PostFFNNorm != nil {
+				rmsNormInto(Proj[t], layer.PostFFNNorm, config.RMSNormEps, &Proj[t])
+			}
 			if config.ResidualScale != 1 {
 				ScaleF32(Proj[t], config.ResidualScale)
 			}

@@ -171,6 +171,28 @@ func (c Config) layerUsesSWA(il int) bool {
 	return c.SWAPattern[il]
 }
 
+// layerUsesRoPE reports whether layer il rotates Q/K. Most decoder families
+// apply RoPE in every block. SmolLM3 deliberately leaves every fourth block
+// unrotated; EXAONE 4's 32B graph rotates only its local-attention blocks
+// (the dense 1.2B model has no sliding window and rotates every block).
+func (c Config) layerUsesRoPE(il int) bool {
+	switch c.Arch {
+	case "smollm3":
+		return (il+1)%4 != 0
+	case "exaone4":
+		return c.SlidingWindow <= 0 || c.layerUsesSWA(il)
+	default:
+		return true
+	}
+}
+
+// usesPostNormOnly identifies decoder blocks whose residual branches consume
+// the unnormalized hidden state and normalize each projected branch before it
+// is added back. EXAONE 4 is the first supported family with this layout.
+func (c Config) usesPostNormOnly() bool {
+	return c.Arch == "exaone4"
+}
+
 func ConfigFromGGUF(gguf *GGUFFile) Config {
 	arch, ok := gguf.GetString("general.architecture")
 	if !ok || arch == "" {
@@ -338,6 +360,12 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 			cfg.QwenRecurrentLayers, _ = v.AsBoolArray()
 		}
 	}
+	if p == "exaone4" {
+		// EXAONE 4 rotates only its SWA blocks, so the optional SWA-specific
+		// base is the one the active RoPE table must use.
+		cfg.RopeTheta = gguf.GetF32(p+".rope.freq_base_swa", cfg.RopeTheta)
+		cfg.NextNPredictLayers = int(gguf.GetU32(p+".nextn_predict_layers", 0))
+	}
 	if v, ok := gguf.Metadata[p+".expert_weights_norm"]; ok {
 		if norm, ok := v.AsBool(); ok {
 			cfg.ExpertWeightsNorm = norm
@@ -360,27 +388,36 @@ func u32ArrayAsInts(gguf *GGUFFile, key string) []int {
 
 // swaPattern determines which layers use the sliding window. Priority:
 // explicit bool-array metadata ({arch}.attention.sliding_window_pattern, one
-// entry per layer — the Gemma 4 convention), then the known per-architecture
-// interleave defaults expressed as "every Nth layer is global" (Gemma 2
-// alternates 1:1, Gemma 3/4 run 5 local then 1 global). nil means every layer
-// uses the window (the pre-Gemma behavior, correct for e.g. old Mistral).
+// entry per layer — the Gemma 4 convention), an explicit scalar period (the
+// EXAONE 4 convention), then known per-architecture defaults expressed as
+// "every Nth layer is global". nil means every layer uses the window (the
+// pre-Gemma behavior, correct for e.g. old Mistral).
 func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
+	period := 0
 	if v, ok := gguf.Metadata[p+".attention.sliding_window_pattern"]; ok {
 		if arr, ok := v.AsBoolArray(); ok && len(arr) > 0 {
 			return arr
 		}
+		if n, ok := v.AsU32(); ok {
+			period = int(n)
+		}
 	}
-	period := 0
-	switch p {
-	case "gemma2":
-		period = 2
-	case "gemma3", "gemma4":
-		period = 6
-	case "gpt-oss":
-		// GPT-OSS alternates local attention on even layers with full
-		// attention on odd layers. The generic pattern below marks the first
-		// period-1 layer as local, which is exactly that 1:1 schedule.
-		period = 2
+	if period == 0 {
+		switch p {
+		case "gemma2":
+			period = 2
+		case "gemma3", "gemma4":
+			period = 6
+		case "gpt-oss":
+			// GPT-OSS alternates local attention on even layers with full
+			// attention on odd layers. The generic pattern below marks the first
+			// period-1 layer as local, which is exactly that 1:1 schedule.
+			period = 2
+		case "exaone4":
+			// EXAONE 4 32B uses three local layers followed by one global layer.
+			// The 1.2B model has no sliding window, so this pattern remains inert.
+			period = 4
+		}
 	}
 	if period == 0 || nLayers <= 0 {
 		return nil
@@ -1281,6 +1318,15 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		return LoadDeepSeek2Model(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
 	}
 	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
+	if config.Arch == "exaone4" && config.NextNPredictLayers > 0 {
+		if config.NextNPredictLayers >= config.NLayers {
+			return config, ModelWeights{}, fmt.Errorf("exaone4: nextn_predict_layers=%d leaves no decoder layers", config.NextNPredictLayers)
+		}
+		config.NLayers -= config.NextNPredictLayers
+		if len(config.SWAPattern) > config.NLayers {
+			config.SWAPattern = config.SWAPattern[:config.NLayers]
+		}
+	}
 	fmt.Fprintf(logw, "Config: dim=%d, layers=%d, heads=%d/%d, hidden=%d, vocab=%d, ctx=%d\n",
 		config.Dim, config.NLayers, config.NHeads, config.NKVHeads, config.HiddenDim, config.VocabSize, config.MaxSeqLen)
 	tensorIdx := indexTensors(gguf)
@@ -1405,9 +1451,15 @@ func validateGemma4DenseLayout(config Config, tensors map[string]TensorInfo) err
 
 func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal, lazyScalarWeights bool, qRows, kRows, vRows int) (LayerWeights, error) {
 	prefix := fmt.Sprintf("blk.%d.", l)
-	attnNorm, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
-	if err != nil {
-		return LayerWeights{}, err
+	var attnNorm []float32
+	var err error
+	if config.usesPostNormOnly() {
+		attnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
+	} else {
+		attnNorm, err = loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
+		if err != nil {
+			return LayerWeights{}, err
+		}
 	}
 	var wq, wk, wv, wqkv Weight
 	hasQKV := false
@@ -1435,9 +1487,14 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	if err != nil {
 		return LayerWeights{}, err
 	}
-	ffnNorm, err := loadF32Vec(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
-	if err != nil {
-		return LayerWeights{}, err
+	var ffnNorm []float32
+	if config.usesPostNormOnly() {
+		ffnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
+	} else {
+		ffnNorm, err = loadF32Vec(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
+		if err != nil {
+			return LayerWeights{}, err
+		}
 	}
 	var w1, w2, w3, wGateUp Weight
 	hasGateUp := false
@@ -1486,6 +1543,14 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	}
 	if (config.Arch == "qwen3" || config.Arch == "qwen3moe") && (len(attnQNorm) != config.HeadDim || len(attnKNorm) != config.HeadDim) {
 		return LayerWeights{}, fmt.Errorf("%s requires %d-element attn_q_norm and attn_k_norm tensors", config.Arch, config.HeadDim)
+	}
+	if config.Arch == "exaone4" {
+		if len(attnQNorm) != config.HeadDim || len(attnKNorm) != config.HeadDim {
+			return LayerWeights{}, fmt.Errorf("exaone4 requires %d-element attn_q_norm and attn_k_norm tensors", config.HeadDim)
+		}
+		if len(postAttnNorm) != config.Dim || len(postFFNNorm) != config.Dim {
+			return LayerWeights{}, fmt.Errorf("exaone4 requires %d-element post_attention_norm and post_ffw_norm tensors", config.Dim)
+		}
 	}
 	if config.Arch == "gpt-oss" {
 		if len(attnSinks) != config.NHeads {
@@ -1884,7 +1949,12 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	}
 	for l := range config.NLayers {
 		layer := weights.Layers[l]
-		normalizeDecoderInto(config, buf.X, layer.AttnNorm, layer.AttnNormBias, &buf.XN)
+		if config.usesPostNormOnly() {
+			ensureLenNoClear(&buf.XN, dim)
+			copy(buf.XN, buf.X[:dim])
+		} else {
+			normalizeDecoderInto(config, buf.X, layer.AttnNorm, layer.AttnNormBias, &buf.XN)
+		}
 		if layer.HasQKV {
 			layer.WQKV.MatvecInto(buf.XN, &buf.QKV)
 			qLen := config.NHeads * headDim
@@ -1910,8 +1980,10 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		if layer.AttnKNorm != nil {
 			perHeadRMSNormInPlace(buf.K, headDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
 		}
-		applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
-		applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
+		if config.layerUsesRoPE(l) {
+			applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
+			applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
+		}
 		if temperature := attentionTemperatureAt(config, pos); temperature != 1 {
 			ScaleF32(buf.Q, temperature)
 		}
@@ -1948,7 +2020,12 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.X[:dim], buf.Proj)
 		}
 
-		normalizeDecoderInto(config, buf.X, layer.FFNNorm, layer.FFNNormBias, &buf.XN2)
+		if config.usesPostNormOnly() {
+			ensureLenNoClear(&buf.XN2, dim)
+			copy(buf.XN2, buf.X[:dim])
+		} else {
+			normalizeDecoderInto(config, buf.X, layer.FFNNorm, layer.FFNNormBias, &buf.XN2)
+		}
 		if layer.MoE != nil {
 			sparseMoEForward(layer.MoE, buf.XN2, buf)
 		} else {
@@ -2219,7 +2296,7 @@ func applyPreparedRope(vec []float32, headDim, nHeads, half, nCache int, sin, co
 
 func ropeInterleaved(arch string) bool {
 	switch arch {
-	case "llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral":
+	case "llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "smollm3":
 		return true
 	default:
 		return false

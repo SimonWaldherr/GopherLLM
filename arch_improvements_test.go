@@ -1,6 +1,8 @@
 package gopherllm
 
 import (
+	"context"
+	"math"
 	"strings"
 	"testing"
 )
@@ -103,9 +105,8 @@ func TestQwen3LoadsWithQKNormAndChatML(t *testing.T) {
 	if kind := r.chatTemplateKind(); kind != "chatml" {
 		t.Fatalf("template kind = %q, want chatml", kind)
 	}
-	// QK-norm forces the fully-featured per-token prefill path.
-	if r.canBatchPrefill() {
-		t.Fatal("QK-norm models must not take the batched prefill path")
+	if !r.canBatchPrefill() {
+		t.Fatal("dense QK-norm models should use batched prefill")
 	}
 	opts := DefaultGenerationOptions()
 	opts.MaxTokens = 4
@@ -123,6 +124,53 @@ func TestQwen3LoadsWithQKNormAndChatML(t *testing.T) {
 	if a.Text != b.Text {
 		t.Fatalf("qwen3 greedy not deterministic: %q vs %q", a.Text, b.Text)
 	}
+}
+
+func assertStandardBatchParity(t *testing.T, r *Runner, tokens []uint32) {
+	t.Helper()
+	kDim, vDim, mh, mk, mv := r.cacheDims()
+	newRun := func() (*KVCache, *DecodeBuffer) {
+		return NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1), NewDecodeBuffer(r.config, mh, mk, mv)
+	}
+	perCache, perBuf := newRun()
+	perToken := []float32{}
+	for pos, tok := range tokens {
+		if pos == len(tokens)-1 {
+			r.forwardTokenInto(perCache, perBuf, tok, pos, &perToken)
+		} else {
+			r.forwardPrefillToken(perCache, perBuf, tok, pos)
+		}
+	}
+	batchCache, batchBuf := newRun()
+	batched := []float32{}
+	if err := r.prefillBatched(context.Background(), batchCache, batchBuf, tokens, &batched); err != nil {
+		t.Fatal(err)
+	}
+	if len(batched) != len(perToken) {
+		t.Fatalf("logit len %d vs %d", len(batched), len(perToken))
+	}
+	for i := range perToken {
+		if d := math.Abs(float64(batched[i] - perToken[i])); d > 1e-3*math.Max(1, math.Abs(float64(perToken[i]))) {
+			t.Fatalf("logit %d: batched=%v per-token=%v", i, batched[i], perToken[i])
+		}
+	}
+	for l := range perCache.K {
+		for i := range perCache.K[l] {
+			if d := math.Abs(float64(batchCache.K[l][i] - perCache.K[l][i])); d > 1e-3 {
+				t.Fatalf("layer %d K[%d]: batched=%v per-token=%v", l, i, batchCache.K[l][i], perCache.K[l][i])
+			}
+		}
+	}
+}
+
+func TestQwen3QKNormBatchedPrefillMatchesPerToken(t *testing.T) {
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "7")
+	r, err := RunnerFromGGUFBytes(buildTinyQwen3GGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := r.tok.Encode(strings.Repeat("abcdefghij", 4))
+	assertStandardBatchParity(t, r, tokens)
 }
 
 func TestQwen3LoaderRejectsMissingQKNorm(t *testing.T) {

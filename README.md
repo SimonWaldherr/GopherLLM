@@ -881,9 +881,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   With `GOPHERLLM_Q8_ACTIVATIONS=0` the older dequantize-once-per-chunk f32 path
   runs instead. ARM64 reuses per-worker dequantization rows and dispatches one
   coarse batch range per worker to avoid allocation and scheduling overhead.
-  The same path now covers StableLM's LayerNorm plus parallel-residual block;
-  Q4_0/Q8_0 rows also use the dequantize-once path, which is important for
-  Stable Code and other legacy-Q4 GGUFs on Apple Silicon.
+  The same path now covers StableLM's LayerNorm plus parallel-residual block,
+  dense Qwen3's per-head QK norm, and EXAONE 4's QK plus post-branch norms.
+  This moves Qwen3 and EXAONE 4 prompt ingestion from per-token weight
+  streaming onto the chunked path as well. Q4_0/Q8_0 rows also use the
+  dequantize-once path, which is important for Stable Code and other legacy-Q4
+  GGUFs on Apple Silicon.
   Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token path (A/B
   benchmarking / debugging), or `GOPHERLLM_PREFILL_CHUNK=<N>` to tune the chunk
   size on the deployment machine.
@@ -959,9 +962,46 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, qwen3, qwen3moe,
 qwen35, qwen35moe,
 deepseek2, kimi_k2,
-phi3, granite (dense), exaone, internlm2, stablelm, gpt-oss, gemma, gemma2, gemma3, gemma4,
+phi3, granite (dense), exaone, exaone4, smollm3, internlm2, stablelm,
+gpt-oss, gemma, gemma2, gemma3, gemma4,
 nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
 ```
+
+The architecture value is only accepted when its execution graph and expected
+tensor layout are implemented; an unknown GGUF is not treated as Llama merely
+because some tensor names happen to match. The main coverage is:
+
+| Family | Covered GGUF models / notes |
+|---|---|
+| Llama-style | Llama 2/3 text models, compatible `llama` exports, SmolLM3 3B (including its every-fourth-layer no-RoPE schedule) |
+| Mistral | Mistral, Mistral Small/Devstral exports, Mistral 3, Ministral, and Mixtral |
+| Qwen | Qwen2/2.5, QwQ, dense/sparse Qwen3 and Qwen3 Coder, plus experimental text-only Qwen3.5/3.6 hybrid exports |
+| DeepSeek / Kimi | Modern DeepSeek-V2/V3 and Kimi K2 MLA layouts |
+| Gemma | Gemma 1–3 and native dense/MoE/E2B Gemma 4 text graphs |
+| Other decoders | Phi-3/3.5, dense Granite, EXAONE 3, EXAONE 4 1.2B/32B, InternLM2, StableLM, GPT-OSS |
+| Recurrent / hybrid | Mamba2 and Nemotron-H / Nemotron-H-MoE |
+| Embeddings | BERT and Nomic-BERT (`/v1/embeddings`, not chat generation) |
+
+Important upstream GGUF families that are **not implemented yet**:
+
+| Missing family | Required work |
+|---|---|
+| Llama 4 | Its architecture-specific attention/normalization graph and model validation |
+| Phi-2 / Phi-MoE | Biased LayerNorm, parallel attention/FFN, GELU MLP, and MoE variants |
+| OLMo2/OLMo3/OLMoE | Full-vector QK normalization, post-norm blocks, and architecture-specific SWA/RoPE rules |
+| Command-R / Cohere2 | Their attention, normalization, and tokenizer/chat conventions |
+| GLM4 / GLM4-MoE, MiniMax M2, LFM2 | Dedicated dense, sparse, or hybrid execution graphs |
+| Falcon, GPT-NeoX/GPT-2, StarCoder2 | Non-Llama block layouts and their tokenizer conventions |
+| Jamba, RWKV, Hyena-family hybrids | Recurrent/state-space cache and mixing kernels |
+| Multimodal Qwen/Gemma/Llama models | Vision projector loading, visual-token injection, and multimodal positional encoding |
+
+This gap list tracks architecture families, not every fine-tune name: a
+fine-tune is supported when its GGUF declares one of the implemented
+architectures and retains that architecture's tensor layout. The reference
+catalog is llama.cpp's
+[current GGUF architecture enum](https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py);
+adding a family generally requires both the
+[hyperparameter/tensor loader and a matching computation graph](https://github.com/ggml-org/llama.cpp/blob/master/docs/development/HOWTO-add-model.md).
 
 Sparse MoE is native for Mixtral-style GGUFs (including checkpoints that
 declare `llama`), `qwen2moe`, and `qwen3moe`. The loader validates the router
@@ -1007,11 +1047,17 @@ assistant-message prefill: a conversation ending in an assistant message
 leaves the turn open so generation continues it.
 
 Phi-3 (including the Phi-3.5 GGUFs that declare `phi3`), dense Granite,
-EXAONE, and InternLM2 use GopherLLM's standard pre-norm RoPE/GQA/SwiGLU
-decoder path. StableLM adds LayerNorm, learned norm biases, and optionally its
-parallel residual branch. Sparse
-Granite MoE checkpoints remain intentionally rejected: their expert router and
-expert tensors require the separate MoE execution graph.
+EXAONE 3, and InternLM2 use GopherLLM's standard pre-norm RoPE/GQA/SwiGLU
+decoder path. SmolLM3 shares the dense SwiGLU graph but uses interleaved RoPE
+and deliberately omits RoPE in every fourth layer. EXAONE 4 has its own
+post-norm block behavior: raw residual input feeds attention/FFN, Q and K are
+RMS-normalized per head, branch projections are RMS-normalized before the
+residual add, and the 32B model follows its three-local/one-global SWA/RoPE
+schedule. Its `[|system|]` / `[|user|]` / `[|assistant|]` /
+`[|endofturn|]` instruct protocol is rendered natively. StableLM adds
+LayerNorm, learned norm biases, and optionally its parallel residual branch.
+Sparse Granite MoE checkpoints remain intentionally rejected: their expert
+router and expert tensors require the separate MoE execution graph.
 
 Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context
