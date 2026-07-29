@@ -403,18 +403,24 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		}
 		r.config, r.gptOss, r.kind = config, weights, loadedGptOss
 	case "gemma", "gemma2", "gemma3", "gemma4":
-		// The dense Gemma graph is implemented (sqrt(dim) embedding scaling,
-		// GELU FFN, QK-norm, post-attention/post-FFN norms, attention/final
-		// logit softcapping, per-layer sliding-window map, <start_of_turn>
-		// template) but has not yet been validated against real Gemma
-		// weights, and the Gemma 4-specific mechanisms (p-RoPE frequency
-		// factors, per-layer RoPE bases, cross-layer KV sharing, per-layer
-		// embeddings, the 26B MoE) are still missing. See
-		// docs/INFERENCE_NOTES.md.
-		fmt.Fprintf(logw, "Warning: %s support is experimental (dense graph implemented, unvalidated against real weights; Gemma 4 p-RoPE/PLE/MoE missing — see docs/INFERENCE_NOTES.md)\n", arch)
 		config, weights, err := LoadGemma4Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
+		}
+		if arch == "gemma4" && weights.Native {
+			features := []string{"proportional RoPE", "K-as-V", "per-layer output scales", "native turn template"}
+			if len(weights.MoE) > 0 {
+				features = append(features, "shared-dense/MoE FFN")
+			}
+			if weights.PerLayer != nil {
+				features = append(features, "per-layer embeddings")
+			}
+			if nativeGemma4KVCacheLayerCount(weights) < len(weights.Layers) {
+				features = append(features, "shared KV cache")
+			}
+			fmt.Fprintf(logw, "Gemma 4: native SWA/global decoder enabled (%s)\n", strings.Join(features, ", "))
+		} else {
+			fmt.Fprintf(logw, "Warning: %s support is experimental; dense decoder support has not had cross-runtime logit-parity validation\n", arch)
 		}
 		r.config, r.gemma4, r.kind = config, weights, loadedGemma4
 	default:
@@ -521,7 +527,7 @@ func (r *Runner) releaseMetalWeights() {
 	case loadedGptOss:
 		releaseModelMetalWeights(&r.gptOss.Standard)
 	case loadedGemma4:
-		releaseModelMetalWeights(&r.gemma4.Standard)
+		releaseGemma4MetalWeights(&r.gemma4)
 	case loadedNemotronH:
 		releaseNemotronHMetalWeights(&r.nemotronH)
 	case loadedMamba2:
@@ -830,6 +836,17 @@ func (r *Runner) cacheDims() (int, int, int, int, int) {
 		return r.config.NKVHeads * r.config.HeadDim, r.config.KVDim, r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
 	}
 	if r.kind == loadedGemma4 {
+		if r.gemma4.Native {
+			maxKDim, maxVDim, maxHD, maxKV, maxVal := 0, 0, 0, 0, 0
+			for _, l := range r.gemma4.Layers {
+				maxKDim = max(maxKDim, l.NKVHeads*l.HeadDim)
+				maxVDim = max(maxVDim, l.NKVHeads*l.ValueDim)
+				maxHD = max(maxHD, l.HeadDim)
+				maxKV = max(maxKV, l.NKVHeads)
+				maxVal = max(maxVal, l.ValueDim)
+			}
+			return maxKDim, maxVDim, maxHD, maxKV, maxVal
+		}
 		maxHD, maxKV, maxVal := r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
 		for _, l := range r.gemma4.Layers {
 			maxHD = max(maxHD, l.HeadDim)
@@ -849,6 +866,9 @@ func (r *Runner) cacheDims() (int, int, int, int, int) {
 func (r *Runner) kvCacheLayerCount() int {
 	if r.kind == loadedQwen35 {
 		return qwen35AttentionLayerCount(r.qwen35)
+	}
+	if r.kind == loadedGemma4 && r.gemma4.Native {
+		return nativeGemma4KVCacheLayerCount(r.gemma4)
 	}
 	return r.config.NLayers
 }
@@ -1059,6 +1079,15 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 		}
 		ProjectLogitsInto(r.config, r.gptOss.Standard, buf, logits)
 	case loadedGemma4:
+		if r.gemma4.Native {
+			forwardNativeGemma4BodyInto(r.config, r.gemma4, cache, buf, token, pos)
+			nativeOutput := ModelWeights{Output: r.gemma4.Output}
+			if next, ok := argmaxOutputTokenInto(r.config, nativeOutput, buf, logits); ok {
+				return next, true
+			}
+			projectNativeGemma4Logits(r.config, r.gemma4, buf, logits)
+			break
+		}
 		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenInto(r.config, r.gemma4.Standard, buf, logits); ok {
 			return next, true
@@ -1085,7 +1114,11 @@ func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uin
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
-		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
+		if r.gemma4.Native {
+			forwardNativeGemma4BodyInto(r.config, r.gemma4, cache, buf, token, pos)
+		} else {
+			ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
+		}
 	default:
 		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
 	}
@@ -1207,7 +1240,11 @@ func (r *Runner) forwardPrefillToken(cache *KVCache, buf *DecodeBuffer, token ui
 	case loadedGptOss:
 		ForwardPrefill(r.config, r.gptOss.Standard, cache, buf, token, pos)
 	case loadedGemma4:
-		ForwardPrefill(r.config, r.gemma4.Standard, cache, buf, token, pos)
+		if r.gemma4.Native {
+			forwardNativeGemma4BodyInto(r.config, r.gemma4, cache, buf, token, pos)
+		} else {
+			ForwardPrefill(r.config, r.gemma4.Standard, cache, buf, token, pos)
+		}
 	default:
 		ForwardPrefill(r.config, r.standard, cache, buf, token, pos)
 	}
@@ -1278,6 +1315,13 @@ func (r *Runner) isStopToken(token uint32) bool {
 		}
 	}
 	if gemmaFamily(r.arch) {
+		if r.arch == "gemma4" {
+			// Gemma 4's native turn delimiter replaces the older
+			// <end_of_turn> marker used by Gemma 1--3.
+			if id, ok := r.tok.SpecialID("<turn|>"); ok && token == id {
+				return true
+			}
+		}
 		// Gemma instruct models end assistant turns with <end_of_turn>, not
 		// the <eos> the GGUF declares as EOS.
 		if id, ok := r.tok.SpecialID("<end_of_turn>"); ok && token == id {
@@ -1288,12 +1332,12 @@ func (r *Runner) isStopToken(token uint32) bool {
 }
 
 // renderMessages renders the conversation (and, if any, the tool listing) into
-// tokens using the active chat template. Mistral and Kimi get their native
-// tool conventions; every other template (and gpt-oss, for which tool calling
-// is not yet implemented) uses the generic <tool_call> JSON convention,
-// applied uniformly by flattening tool listings and tool-call history into
-// ordinary system/user/assistant text before delegating to the per-family
-// renderer below.
+// tokens using the active chat template. Mistral, Llama 3.1, and Kimi get
+// their native tool conventions; every other template (and gpt-oss, for
+// which tool calling is not yet implemented) uses the generic <tool_call>
+// JSON convention, applied uniformly by flattening tool listings and
+// tool-call history into ordinary system/user/assistant text before
+// delegating to the per-family renderer below.
 func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) []uint32 {
 	if r.arch == "gpt-oss" {
 		return r.renderGptOssMessages(messages, systemPrompt)
@@ -1319,8 +1363,17 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, too
 			return tokens
 		}
 	}
+	if r.chatTemplateKind() == "llama31-chat" {
+		if tokens, ok := r.renderLlama31Messages(messages, systemPrompt, tools); ok {
+			return tokens
+		}
+	}
 	generic, genericSystem := injectGenericTools(messages, systemPrompt, tools)
 	switch r.chatTemplateKind() {
+	case "gemma4-chat":
+		if tokens, ok := r.renderGemma4Messages(generic, genericSystem); ok {
+			return tokens
+		}
 	case "gemma-chat":
 		if tokens, ok := r.renderGemmaMessages(generic, genericSystem); ok {
 			return tokens
@@ -1329,8 +1382,19 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, too
 		if tokens, ok := r.renderHeaderChatMessages(generic, genericSystem); ok {
 			return tokens
 		}
+	case "llama31-chat":
+		// A historical turn which the native Llama 3.1 template cannot replay
+		// (for example, multiple calls in one assistant message) still needs a
+		// lossless fallback rather than silently dropping tool state.
+		if tokens, ok := r.renderHeaderChatMessages(generic, genericSystem); ok {
+			return tokens
+		}
 	case "chatml":
 		if tokens, ok := r.renderChatMLMessages(generic, genericSystem); ok {
+			return tokens
+		}
+	case "phi4-chat":
+		if tokens, ok := r.renderPhi4Messages(generic, genericSystem); ok {
 			return tokens
 		}
 	case "phi-chat":
@@ -1663,6 +1727,61 @@ func (r *Runner) renderGemmaMessages(messages []ChatMessage, systemPrompt string
 	return tokens, true
 }
 
+// renderGemma4Messages implements the text-only part of Gemma 4's native
+// template.  Tool-call serialisation is intentionally delegated to the
+// generic formatter above; the important part for ordinary chat is preserving
+// Gemma 4's turn and disabled-thinking channel markers:
+//
+//	<|turn>user\n...<turn|>\n<|turn>model\n<|channel>thought\n<channel|>
+func (r *Runner) renderGemma4Messages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	startTurn, ok1 := r.tok.SpecialID("<|turn>")
+	endTurn, ok2 := r.tok.SpecialID("<turn|>")
+	channelStart, ok3 := r.tok.SpecialID("<|channel>")
+	channelEnd, ok4 := r.tok.SpecialID("<channel|>")
+	if !(ok1 && ok2 && ok3 && ok4) {
+		return nil, false
+	}
+	tokens := make([]uint32, 0, 64)
+	if r.tok.AddBOS {
+		tokens = append(tokens, r.tok.BOSID)
+	}
+	appendTurn := func(role, content string) {
+		tokens = append(tokens, startTurn)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(role+"\n")...)
+		if content = strings.TrimSpace(content); content != "" {
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
+		}
+		tokens = append(tokens, endTurn)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+	}
+	hasSystem := false
+	for _, message := range messages {
+		hasSystem = hasSystem || message.Role == ChatRoleSystem
+	}
+	if system := strings.TrimSpace(systemPrompt); system != "" && !hasSystem {
+		appendTurn("system", system)
+	}
+	for _, message := range messages {
+		role := "user"
+		switch message.Role {
+		case ChatRoleSystem:
+			role = "system"
+		case ChatRoleAssistant:
+			role = "model"
+		}
+		appendTurn(role, message.Content)
+	}
+	// The official template opens and immediately closes the thought channel
+	// when reasoning is disabled, then lets generation select its final
+	// channel.  This avoids injecting the old Gemma <start_of_turn> protocol.
+	tokens = append(tokens, startTurn)
+	tokens = append(tokens, r.tok.EncodeWithoutBOS("model\n")...)
+	tokens = append(tokens, channelStart)
+	tokens = append(tokens, r.tok.EncodeWithoutBOS("thought\n")...)
+	tokens = append(tokens, channelEnd)
+	return tokens, true
+}
+
 func (r *Runner) renderHeaderChatMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
 	bot, ok1 := r.tok.SpecialID("<|begin_of_text|>")
 	startHeader, ok2 := r.tok.SpecialID("<|start_header_id|>")
@@ -1700,6 +1819,183 @@ func (r *Runner) renderHeaderChatMessages(messages []ChatMessage, systemPrompt s
 	}
 	pushHeader("assistant")
 	return tokens, true
+}
+
+const (
+	llama31KnowledgeCutoff = "December 2023"
+	llama31DefaultDate     = "26 Jul 2024"
+)
+
+// renderLlama31Messages mirrors Meta's Llama-3.1-Instruct chat template for
+// custom function tools. In particular, the template always starts with its
+// dated system envelope, puts custom tool definitions into the first user
+// turn, serializes an assistant call as {"name", "parameters"}, and feeds a
+// tool result back using the ipython header. Built-in tools use Llama's
+// separate <|python_tag|> protocol and intentionally remain outside the
+// OpenAI-compatible ToolDefinition API.
+func (r *Runner) renderLlama31Messages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, bool) {
+	bot, ok1 := r.tok.SpecialID("<|begin_of_text|>")
+	startHeader, ok2 := r.tok.SpecialID("<|start_header_id|>")
+	endHeader, ok3 := r.tok.SpecialID("<|end_header_id|>")
+	eot, ok4 := r.tok.SpecialID("<|eot_id|>")
+	if !(ok1 && ok2 && ok3 && ok4) {
+		return nil, false
+	}
+
+	loopMessages := messages
+	system := strings.TrimSpace(systemPrompt)
+	// The native template consumes a leading system message into the mandatory
+	// initial system envelope. This matches the ordinary Chat API convention
+	// while leaving any later system message as a normal, replayable turn.
+	if len(loopMessages) > 0 && loopMessages[0].Role == ChatRoleSystem {
+		system = strings.TrimSpace(loopMessages[0].Content)
+		loopMessages = loopMessages[1:]
+	}
+
+	// Meta's template with tools_in_user_message=true requires the first
+	// remaining message to be a user message. Returning false here gives the
+	// caller's generic fallback a chance to preserve an unusual history.
+	toolUser := -1
+	if len(tools) > 0 {
+		if len(loopMessages) == 0 || loopMessages[0].Role != ChatRoleUser {
+			return nil, false
+		}
+		toolUser = 0
+	}
+
+	tokens := make([]uint32, 0, 64)
+	appendText := func(text string) {
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(text)...)
+	}
+	pushHeader := func(role string) {
+		tokens = append(tokens, startHeader)
+		appendText(role)
+		tokens = append(tokens, endHeader)
+		appendText("\n\n")
+	}
+	appendTurn := func(role, content string) {
+		pushHeader(role)
+		appendText(strings.TrimSpace(content))
+		tokens = append(tokens, eot)
+	}
+
+	tokens = append(tokens, bot)
+	pushHeader("system")
+	if len(tools) > 0 {
+		// This is emitted for custom tools too; it tells the model that the
+		// result payload will be provided as an ipython turn.
+		appendText("Environment: ipython\n")
+	}
+	appendText("Cutting Knowledge Date: " + llama31KnowledgeCutoff + "\n")
+	appendText("Today Date: " + r.llama31TemplateDate() + "\n\n")
+	appendText(system)
+	tokens = append(tokens, eot)
+
+	for i, message := range loopMessages {
+		if i == toolUser {
+			pushHeader("user")
+			// Keep the otherwise slightly surprising lack of a newline between
+			// the format sentence and "Do not use variables." This is how the
+			// local Meta-Llama-3.1 GGUF's Jinja whitespace controls render it.
+			appendText("Given the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\n")
+			appendText("Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n")
+			for _, tool := range tools {
+				payload, err := json.MarshalIndent(tool, "", "    ")
+				if err != nil {
+					return nil, false
+				}
+				appendText(string(payload))
+				appendText("\n\n")
+			}
+			appendText(strings.TrimSpace(message.Content))
+			tokens = append(tokens, eot)
+			continue
+		}
+
+		switch message.Role {
+		case ChatRoleTool:
+			// Tool output is intentionally not trimmed. The native template
+			// treats it as an ipython value rather than prose, so whitespace can
+			// carry semantic meaning for a caller.
+			pushHeader("ipython")
+			appendText(message.Content)
+			tokens = append(tokens, eot)
+		case ChatRoleAssistant:
+			if len(message.ToolCalls) == 0 {
+				appendTurn("assistant", message.Content)
+				continue
+			}
+			// Llama 3.1's custom-function branch explicitly supports one tool
+			// call per assistant turn. Do not invent a multi-call encoding: use
+			// the generic lossless fallback instead for such historical turns.
+			if len(message.ToolCalls) != 1 {
+				return nil, false
+			}
+			call := message.ToolCalls[0]
+			args := strings.TrimSpace(call.Function.Arguments)
+			if call.Function.Name == "" || len(args) == 0 || args[0] != '{' || !json.Valid([]byte(args)) {
+				return nil, false
+			}
+			// Keep the literal separators from Meta's template rather than
+			// using a generic compact wrapper: {"name": "…", "parameters": …}.
+			// The arguments themselves are already JSON as required by the
+			// OpenAI-compatible ToolCall surface.
+			name, err := json.Marshal(call.Function.Name)
+			if err != nil {
+				return nil, false
+			}
+			pushHeader("assistant")
+			appendText(`{"name": ` + string(name) + `, "parameters": ` + args + `}`)
+			tokens = append(tokens, eot)
+		case ChatRoleSystem:
+			appendTurn("system", message.Content)
+		default:
+			appendTurn("user", message.Content)
+		}
+	}
+	pushHeader("assistant")
+	return tokens, true
+}
+
+// llama31TemplateDate reads the Jinja date_string assignment when present so
+// closely related Llama 3.1 GGUF exports keep their own declared date. The
+// inspected Meta-Llama-3.1-8B-Instruct template falls back to 26 Jul 2024.
+func (r *Runner) llama31TemplateDate() string {
+	if r == nil || r.gguf == nil {
+		return llama31DefaultDate
+	}
+	v, ok := r.gguf.Metadata["tokenizer.chat_template"]
+	if !ok {
+		return llama31DefaultDate
+	}
+	template, ok := v.AsString()
+	if !ok {
+		return llama31DefaultDate
+	}
+	const assignment = "date_string"
+	for start := 0; start < len(template); {
+		i := strings.Index(template[start:], assignment)
+		if i < 0 {
+			break
+		}
+		i += start
+		rest := strings.TrimSpace(template[i+len(assignment):])
+		start = i + len(assignment)
+		if !strings.HasPrefix(rest, "=") {
+			continue
+		}
+		rest = strings.TrimSpace(rest[1:])
+		if len(rest) < 2 || (rest[0] != '"' && rest[0] != 39) {
+			continue
+		}
+		quote := rest[0]
+		if end := strings.IndexByte(rest[1:], quote); end >= 0 {
+			if date := rest[1 : end+1]; date != "" {
+				return date
+			}
+		}
+	}
+	return llama31DefaultDate
 }
 
 const kimiDefaultSystemPrompt = "You are Kimi, an AI assistant created by Moonshot AI."
@@ -2069,6 +2365,51 @@ func (r *Runner) renderSoofiIsarMessages(messages []ChatMessage, systemPrompt st
 	return tokens, true
 }
 
+// renderPhi4Messages mirrors Phi-4's embedded template:
+//
+//	<|im_start|>role<|im_sep|>content<|im_end|>
+//
+// It is deliberately not ChatML: ChatML places a newline after the role,
+// whereas Phi-4 uses its dedicated <|im_sep|> control token. The final
+// assistant turn remains open after that separator for generation.
+func (r *Runner) renderPhi4Messages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	imStart, ok1 := r.tok.SpecialID("<|im_start|>")
+	imSep, ok2 := r.tok.SpecialID("<|im_sep|>")
+	imEnd, ok3 := r.tok.SpecialID("<|im_end|>")
+	if !(ok1 && ok2 && ok3) {
+		return nil, false
+	}
+	tokens := []uint32{}
+	appendTurn := func(role, content string) {
+		tokens = append(tokens, imStart)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(role)...)
+		tokens = append(tokens, imSep)
+		tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
+		tokens = append(tokens, imEnd)
+	}
+	hasSystem := false
+	for _, message := range messages {
+		hasSystem = hasSystem || message.Role == ChatRoleSystem
+	}
+	if strings.TrimSpace(systemPrompt) != "" && !hasSystem {
+		appendTurn("system", systemPrompt)
+	}
+	for _, message := range messages {
+		role := "user"
+		switch message.Role {
+		case ChatRoleSystem:
+			role = "system"
+		case ChatRoleAssistant:
+			role = "assistant"
+		}
+		appendTurn(role, message.Content)
+	}
+	tokens = append(tokens, imStart)
+	tokens = append(tokens, r.tok.EncodeWithoutBOS("assistant")...)
+	tokens = append(tokens, imSep)
+	return tokens, true
+}
+
 func (r *Runner) renderPhiMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
 	systemTok, ok1 := r.tok.SpecialID("<|system|>")
 	userTok, ok2 := r.tok.SpecialID("<|user|>")
@@ -2184,12 +2525,21 @@ func (r *Runner) chatTemplateKind() string {
 		if v, ok := r.gguf.Metadata["tokenizer.chat_template"]; ok {
 			if s, ok := v.AsString(); ok {
 				switch {
+				case strings.Contains(s, "<|turn>") && strings.Contains(s, "<turn|>"):
+					return "gemma4-chat"
 				case strings.Contains(s, "[INST]") && strings.Contains(s, "[/INST]"):
 					return "mistral-inst"
+				case r.arch == "llama" && strings.Contains(s, "<|python_tag|>") && strings.Contains(s, "<|eom_id|>") && strings.Contains(s, "tools_in_user_message"):
+					// This is Meta's Llama-3.1-Instruct template, which has a
+					// native custom-function / ipython exchange on top of the
+					// otherwise shared Llama header protocol.
+					return "llama31-chat"
 				case strings.Contains(s, "<|start_header_id|>") && strings.Contains(s, "<|eot_id|>"):
 					return "header-chat"
 				case strings.Contains(s, "<|im_user|>") && strings.Contains(s, "<|im_assistant|>") && strings.Contains(s, "<|im_middle|>") && strings.Contains(s, "<|im_end|>"):
 					return "kimi-chat"
+				case r.arch == "phi3" && strings.Contains(s, "<|im_start|>") && strings.Contains(s, "<|im_sep|>") && strings.Contains(s, "<|im_end|>"):
+					return "phi4-chat"
 				case strings.Contains(s, "<|im_start|>") && strings.Contains(s, "<|im_end|>"):
 					return "chatml"
 				case strings.Contains(s, "<|user|>") && strings.Contains(s, "<|assistant|>") && strings.Contains(s, "<|end|>"):
@@ -2216,6 +2566,20 @@ func (r *Runner) chatTemplateKind() string {
 	if _, ok := r.tok.SpecialID("[INST]"); ok {
 		if _, ok := r.tok.SpecialID("[/INST]"); ok {
 			return "mistral-inst"
+		}
+	}
+	if _, ok := r.tok.SpecialID("<|turn>"); ok {
+		if _, ok := r.tok.SpecialID("<turn|>"); ok {
+			return "gemma4-chat"
+		}
+	}
+	if r.arch == "phi3" {
+		if _, ok := r.tok.SpecialID("<|im_start|>"); ok {
+			if _, ok := r.tok.SpecialID("<|im_sep|>"); ok {
+				if _, ok := r.tok.SpecialID("<|im_end|>"); ok {
+					return "phi4-chat"
+				}
+			}
 		}
 	}
 	if _, ok := r.tok.SpecialID("<|im_start|>"); ok {

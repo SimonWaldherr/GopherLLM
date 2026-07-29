@@ -71,6 +71,14 @@ type SparseMoEWeights struct {
 	OAIActivation  bool
 	ExpertUsed     int
 	RoutingSigmoid bool
+	// GroupCount/GroupUsed implement DeepSeek-V3's group-limited noaux
+	// routing.  Before selecting ExpertUsed experts, the router keeps only
+	// GroupUsed of GroupCount equally sized expert groups. Groups are ranked
+	// by their best corrected sigmoid score, or by the sum of their best two
+	// scores when a correction bias is present. A value of 1/1 is the Kimi-K2
+	// / ungrouped DeepSeek behaviour.
+	GroupCount int
+	GroupUsed  int
 
 	// Qwen2-MoE shared expert: sigmoid(SharedGateIn(x)) times a normal
 	// SwiGLU FFN. For that layout all four pointers are present together;
@@ -227,6 +235,8 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 		OAIActivation:  cfg.Arch == "gpt-oss",
 		ExpertUsed:     cfg.ExpertUsedCount,
 		RoutingSigmoid: deepSeek2Family(cfg.Arch) && cfg.ExpertGatingFunc == deepSeekExpertGatingSigmoid,
+		GroupCount:     1,
+		GroupUsed:      1,
 	}
 	if w.Scale == 0 {
 		w.Scale = 1
@@ -249,6 +259,15 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 			if err != nil {
 				return nil, err
 			}
+		}
+		w.GroupCount = max(1, cfg.ExpertGroupCount)
+		w.GroupUsed = max(1, cfg.ExpertGroupUsedCount)
+		if w.GroupCount > cfg.ExpertCount || cfg.ExpertCount%w.GroupCount != 0 || w.GroupUsed > w.GroupCount ||
+			cfg.ExpertUsedCount > (cfg.ExpertCount/w.GroupCount)*w.GroupUsed {
+			return nil, fmt.Errorf("%s: invalid grouped MoE metadata experts=%d groups=%d groups_used=%d", cfg.Arch, cfg.ExpertCount, w.GroupCount, w.GroupUsed)
+		}
+		if w.GroupCount > 1 && !w.RoutingSigmoid {
+			return nil, fmt.Errorf("%s: grouped MoE routing requires sigmoid/noaux expert_gating_func=%d", cfg.Arch, deepSeekExpertGatingSigmoid)
 		}
 	}
 	gateName := prefix + "ffn_gate_exps.weight"
@@ -498,10 +517,86 @@ func sparseMoESigmoidRoutingWeights(scores []float32, selected []ExpertScore, no
 	return weights
 }
 
+// selectDeepSeekGroupedExperts implements the group-limited greedy router
+// used by DeepSeek-V3. The caller supplies corrected sigmoid scores: the
+// correction bias participates in choosing experts and groups, while the
+// uncorrected sigmoid values remain the mixture weights (see
+// sparseMoESigmoidRoutingWeights).
+//
+// A correction bias changes group scoring from the largest score to the sum
+// of the two largest scores. This seemingly small distinction is part of
+// DeepSeek-V3's noaux algorithm and matches the reference implementation.
+func selectDeepSeekGroupedExperts(scores []float32, groupCount, groupUsed, expertUsed int, useTopTwo bool, groupScratch *[]float32, groupTopScratch *[]ExpertScore, expertScratch *[]ExpertScore) []ExpertScore {
+	if groupCount <= 0 || groupUsed <= 0 || groupUsed > groupCount || expertUsed <= 0 || expertUsed > len(scores) ||
+		groupCount > len(scores) || len(scores)%groupCount != 0 ||
+		expertUsed > (len(scores)/groupCount)*groupUsed {
+		panic("invalid grouped DeepSeek MoE routing")
+	}
+	if groupCount == 1 {
+		return selectTopExperts(scores, expertUsed, expertScratch)
+	}
+	groupWidth := len(scores) / groupCount
+	ensureLenNoClear(groupScratch, groupCount)
+	groups := *groupScratch
+	for group := range groupCount {
+		start := group * groupWidth
+		best, second := float32(math.Inf(-1)), float32(math.Inf(-1))
+		for _, score := range scores[start : start+groupWidth] {
+			if score > best {
+				second, best = best, score
+			} else if score > second {
+				second = score
+			}
+		}
+		if useTopTwo && groupWidth > 1 {
+			groups[group] = best + second
+		} else {
+			groups[group] = best
+		}
+	}
+	selectedGroups := selectTopExperts(groups, groupUsed, groupTopScratch)
+
+	// Disallow experts outside of the selected groups without allocating a
+	// mask. A negative infinity sentinel retains group-limited semantics even
+	// for a checkpoint whose correction bias makes a valid score negative.
+	for group := range groupCount {
+		keep := false
+		for _, selected := range selectedGroups {
+			if selected.Index == group {
+				keep = true
+				break
+			}
+		}
+		if !keep {
+			start := group * groupWidth
+			for i := start; i < start+groupWidth; i++ {
+				scores[i] = float32(math.Inf(-1))
+			}
+		}
+	}
+	return selectTopExperts(scores, expertUsed, expertScratch)
+}
+
 func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
+	groupCount, groupUsed := 1, 1
+	if w != nil {
+		// Keep manually assembled SparseMoEWeights (including small unit-test
+		// fixtures and API consumers) backward compatible with the pre-grouped
+		// layout, where omitted group fields meant one unpartitioned group.
+		if w.GroupCount != 0 {
+			groupCount = w.GroupCount
+		}
+		if w.GroupUsed != 0 {
+			groupUsed = w.GroupUsed
+		}
+	}
 	if w == nil || len(x) != w.Gate.Input || w.Gate.Experts <= 0 || w.ExpertUsed <= 0 || w.ExpertUsed > w.Gate.Experts ||
 		w.Gate.Experts != w.Up.Experts || w.Gate.Experts != w.Down.Experts ||
-		(len(w.RouterCorrectionBias) != 0 && len(w.RouterCorrectionBias) != w.Gate.Experts) {
+		(len(w.RouterCorrectionBias) != 0 && len(w.RouterCorrectionBias) != w.Gate.Experts) ||
+		groupCount <= 0 || groupUsed <= 0 || groupUsed > groupCount ||
+		groupCount > w.Gate.Experts || w.Gate.Experts%groupCount != 0 ||
+		w.ExpertUsed > (w.Gate.Experts/groupCount)*groupUsed ||
+		(groupCount > 1 && !w.RoutingSigmoid) {
 		panic("invalid sparse MoE weights")
 	}
 	w.Router.MatvecInto(x, &buf.RouterLogits)
@@ -524,7 +619,11 @@ func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 			}
 			buf.RouterSelection[i] = selection
 		}
-		selected = selectTopExperts(buf.RouterSelection, w.ExpertUsed, &buf.TopExperts)
+		if groupCount > 1 {
+			selected = selectDeepSeekGroupedExperts(buf.RouterSelection, groupCount, groupUsed, w.ExpertUsed, len(w.RouterCorrectionBias) != 0, &buf.RouterGroups, &buf.TopGroups, &buf.TopExperts)
+		} else {
+			selected = selectTopExperts(buf.RouterSelection, w.ExpertUsed, &buf.TopExperts)
+		}
 		routing = sparseMoESigmoidRoutingWeights(buf.RouterLogits, selected, w.NormalizeTopK, &buf.ExpertProbs)
 	} else {
 		selected = selectTopExperts(buf.RouterLogits, w.ExpertUsed, &buf.TopExperts)

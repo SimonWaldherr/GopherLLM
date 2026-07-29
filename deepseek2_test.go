@@ -19,7 +19,7 @@ func buildTinyDeepSeek2GGUF(expertGroups uint32) []byte {
 		rope, keyMLA      = 2, 4 // 2 no-position + 2 RoPE dimensions
 		valueMLA          = 2
 		hidden, expertFF  = 8, 4
-		experts, used     = 3, 2
+		experts, used     = 4, 2
 	)
 	if expertGroups == 0 {
 		expertGroups = 1
@@ -304,9 +304,102 @@ func TestDeepSeek2SigmoidCorrectionBiasAndAlwaysOnSharedExpert(t *testing.T) {
 	closeMoEFloat(t, "DeepSeek/Kimi sigmoid mixture + shared", buf.Proj[0], want)
 }
 
-func TestDeepSeek2RejectsGroupedRoutingAndMetal(t *testing.T) {
-	if _, err := RunnerFromGGUFBytes(buildTinyDeepSeek2GGUF(2)); err == nil || !strings.Contains(err.Error(), "grouped MoE") {
-		t.Fatalf("grouped DeepSeek2 routing error = %v, want clear unsupported-group diagnostic", err)
+func TestDeepSeekGroupedRouterUsesDeepSeekV3GroupRules(t *testing.T) {
+	// With a correction bias, groups are ranked by the sum of their two best
+	// corrected scores. Group 1 wins (0.55+0.54) although group 0 has the
+	// individually best expert (0.95). Without a bias, the reference instead
+	// ranks groups by their maximum and group 0 wins.
+	base := []float32{0.95, 0.01, 0.55, 0.54}
+	withBias := append([]float32(nil), base...)
+	var groups []float32
+	var topGroups, topExperts []ExpertScore
+	got := selectDeepSeekGroupedExperts(withBias, 2, 1, 2, true, &groups, &topGroups, &topExperts)
+	if len(got) != 2 || (got[0].Index != 2 && got[1].Index != 2) || (got[0].Index != 3 && got[1].Index != 3) {
+		t.Fatalf("top-two group selection = %#v, want experts 2 and 3", got)
+	}
+	withoutBias := append([]float32(nil), base...)
+	got = selectDeepSeekGroupedExperts(withoutBias, 2, 1, 2, false, &groups, &topGroups, &topExperts)
+	if len(got) != 2 || (got[0].Index != 0 && got[1].Index != 0) || (got[0].Index != 1 && got[1].Index != 1) {
+		t.Fatalf("max group selection = %#v, want experts 0 and 1", got)
+	}
+}
+
+func TestDeepSeekV3EightGroupRoutingKeepsOnlySelectedGroups(t *testing.T) {
+	// Match the production V3 geometry: 256 routed experts, eight contiguous
+	// groups, four retained groups, and eight final experts. A monotonic group
+	// score makes the expected surviving groups unambiguous.
+	scores := make([]float32, 256)
+	for group := range 8 {
+		for expert := range 32 {
+			scores[group*32+expert] = float32(group) + float32(expert)/100
+		}
+	}
+	var groupScratch []float32
+	var topGroups, topExperts []ExpertScore
+	selected := selectDeepSeekGroupedExperts(scores, 8, 4, 8, true, &groupScratch, &topGroups, &topExperts)
+	if len(selected) != 8 {
+		t.Fatalf("selected=%d experts, want 8", len(selected))
+	}
+	for _, expert := range selected {
+		if group := expert.Index / 32; group < 4 || group > 7 {
+			t.Fatalf("expert %d came from unselected V3 group %d", expert.Index, group)
+		}
+	}
+}
+
+func TestDeepSeekGroupedSigmoidWeightsIgnoreCorrectionBias(t *testing.T) {
+	// The correction bias sends selection to the weaker second group. Its
+	// mixture still must use the original sigmoid values, never the corrected
+	// scores used for group/expert ranking.
+	logit := func(p float32) float32 { return float32(math.Log(float64(p / (1 - p)))) }
+	p0, p1, p2, p3 := float32(0.90), float32(0.80), float32(0.30), float32(0.20)
+	w := &SparseMoEWeights{
+		Router:               Weight{F32: []float32{logit(p0), logit(p1), logit(p2), logit(p3)}},
+		RouterCorrectionBias: []float32{0, 0, 2, 2},
+		RoutingSigmoid:       true,
+		NormalizeTopK:        true,
+		Scale:                2,
+		ExpertUsed:           2,
+		GroupCount:           2,
+		GroupUsed:            1,
+		Gate:                 ExpertWeight{Weight: Weight{F32: []float32{1, 1, 1, 1}}, Input: 1, Output: 1, Experts: 4},
+		Up:                   ExpertWeight{Weight: Weight{F32: []float32{1, 1, 1, 1}}, Input: 1, Output: 1, Experts: 4},
+		Down:                 ExpertWeight{Weight: Weight{F32: []float32{1, 3, 5, 7}}, Input: 1, Output: 1, Experts: 4},
+	}
+	buf := &DecodeBuffer{}
+	sparseMoEForward(w, []float32{1}, buf)
+	if len(buf.TopExperts) != 2 || (buf.TopExperts[0].Index != 2 && buf.TopExperts[1].Index != 2) || (buf.TopExperts[0].Index != 3 && buf.TopExperts[1].Index != 3) {
+		t.Fatalf("grouped correction bias did not select experts 2 and 3: %#v", buf.TopExperts)
+	}
+	weight2, weight3 := p2/(p2+p3), p3/(p2+p3)
+	want := 2 * (weight2*5 + weight3*7) * nemotronSigmoid(1)
+	closeMoEFloat(t, "grouped DeepSeek unbiased mixture", buf.Proj[0], want)
+}
+
+func TestDeepSeek2GroupedRoutingLoadsAndMetalRemainsRejected(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyDeepSeek2GGUF(2))
+	if err != nil {
+		t.Fatalf("grouped DeepSeek2 load: %v", err)
+	}
+	if r.config.ExpertGroupCount != 2 || r.config.ExpertGroupUsedCount != 1 || r.standard.Layers[1].MoE.GroupCount != 2 || r.standard.Layers[1].MoE.GroupUsed != 1 {
+		t.Fatalf("grouped DeepSeek2 metadata was not retained: config=%+v moe=%+v", r.config, r.standard.Layers[1].MoE)
+	}
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	logits := Forward(r.config, r.standard, NewKVCache(r.config.NLayers, kDim, vDim, 1), NewDecodeBuffer(r.config, maxHead, maxKV, maxVal), 3, 0)
+	if len(logits) != r.config.VocabSize || math.IsNaN(float64(logits[0])) || math.IsInf(float64(logits[0]), 0) {
+		t.Fatalf("grouped DeepSeek2 forward produced invalid logits: %v", logits)
+	}
+	if _, err := RunnerFromGGUFBytes(buildTinyDeepSeek2GGUF(3)); err == nil || !strings.Contains(err.Error(), "invalid grouped MoE") {
+		t.Fatalf("invalid grouped DeepSeek2 error = %v, want grouped-MoE diagnostic", err)
+	}
+	tooManyData := buildTinyDeepSeek2GGUF(2)
+	tooMany, err := ParseGGUFQuiet(tooManyData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tooMany.Metadata["deepseek2.expert_used_count"] = MetaValue{Kind: "u32", Value: uint32(3)}
+	if _, err := runnerFromParsedGGUF(tooManyData, tooMany, false, LoadOptions{}); err == nil || !strings.Contains(err.Error(), "invalid grouped MoE") {
+		t.Fatalf("too many grouped DeepSeek2 experts error = %v, want grouped-MoE diagnostic", err)
 	}
 	if _, err := RunnerFromGGUFBytesWithOptions(buildTinyDeepSeek2GGUF(1), LoadOptions{UseMetal: true}); err == nil || !strings.Contains(err.Error(), "does not support Metal") {
 		t.Fatalf("DeepSeek2 Metal error = %v, want explicit MLA CPU diagnostic", err)

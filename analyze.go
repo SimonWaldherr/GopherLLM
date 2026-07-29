@@ -140,9 +140,17 @@ func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 		a.BitsPerWeight = float64(a.FileBytes) * 8 / float64(a.Params)
 	}
 
-	// KV cache: per position, every layer stores NKVHeads*HeadDim keys plus
-	// NKVHeads*ValueDim values as f32.
-	perPos := int64(cfg.NLayers) * int64(cfg.NKVHeads) * int64(cfg.HeadDim+cfg.ValueDim) * 4
+	// KV cache: per position, every physical KV layer stores
+	// NKVHeads*HeadDim keys plus NKVHeads*ValueDim values as f32. Gemma 4 E2B
+	// has a query-only shared-KV tail, so its physical cache depth is smaller
+	// than the decoder depth (35-20=15 in the local E2B GGUF).
+	kvLayers := cfg.NLayers
+	if cfg.Arch == "gemma4" {
+		if shared := int(g.GetU32("gemma4.attention.shared_kv_layers", 0)); shared > 0 && shared < kvLayers {
+			kvLayers -= shared
+		}
+	}
+	perPos := int64(kvLayers) * int64(cfg.NKVHeads) * int64(cfg.HeadDim+cfg.ValueDim) * 4
 	a.KVCacheBytesAtFullContext = perPos * int64(cfg.MaxSeqLen)
 	a.KVCacheBytesAt4K = perPos * int64(min(4096, cfg.MaxSeqLen))
 

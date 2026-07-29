@@ -307,6 +307,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				applyPreparedRope(Q[t], headDim, config.NHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
 				applyPreparedRope(K[t], headDim, config.NKVHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
 			}
+			if temperature := attentionTemperatureAt(config, pos); temperature != 1 {
+				ScaleF32(Q[t], temperature)
+			}
 			cache.storeKV(l, pos, K[t], V[t])
 		}
 

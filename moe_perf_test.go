@@ -215,3 +215,29 @@ func BenchmarkSparseMoEForward_E128_K6_256x256(b *testing.B) {
 		sparseMoEForward(w, x, buf)
 	}
 }
+
+// BenchmarkSparseMoEForward_DeepSeekV3 exercises the group-limited noaux
+// route at V3's production router geometry (256 experts, 8 groups, 4 kept,
+// 8 active). The matrices stay compact so it measures routing overhead and
+// reusable group-router scratch on ordinary developer machines.
+func BenchmarkSparseMoEForward_DeepSeekV3_E256_G8_K8_256x256(b *testing.B) {
+	const dim, hidden, experts, used, groups, groupsUsed = 256, 256, 256, 8, 8, 4
+	w := benchmarkSparseMoEWeights(dim, hidden, experts, used)
+	w.RoutingSigmoid = true
+	w.RouterCorrectionBias = make([]float32, experts)
+	w.GroupCount = groups
+	w.GroupUsed = groupsUsed
+	w.Scale = 2.5
+	x := randomExpertInput(dim, 503)
+	buf := NewDecodeBuffer(Config{
+		Dim: dim, HiddenDim: hidden, ExpertCount: experts, ExpertUsedCount: used,
+		ExpertGroupCount: groups, ExpertGroupUsedCount: groupsUsed,
+	}, dim, 1, dim)
+	sparseMoEForward(w, x, buf) // warm scratch capacity before allocation metrics
+	b.ReportAllocs()
+	b.SetBytes(int64(3 * used * dim * hidden * 4))
+	b.ResetTimer()
+	for b.Loop() {
+		sparseMoEForward(w, x, buf)
+	}
+}

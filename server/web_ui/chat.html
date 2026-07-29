@@ -87,29 +87,31 @@
             placeholder="Message GopherLLM…"
             autofocus
             autocomplete="off"
-            aria-describedby="promptHint contextEstimate"
+            aria-describedby="promptHint"
             aria-required="true"
           ></textarea>
           <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
           <div class="prompt-footer">
             <div class="prompt-footer-start">
-              <button id="attachFile" class="composer-button" type="button">Attach</button>
+              <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><span aria-hidden="true">＋</span></button>
               <input id="fileInput" type="file" multiple hidden>
-              <span id="promptHint"><kbd>↵</kbd> send</span>
+              <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
             </div>
             <div class="prompt-footer-end">
-              <span id="contextEstimate">~0 tokens</span>
-              <button id="composerProToggle" class="composer-button" type="button" aria-expanded="false" aria-controls="composerProPanel">Options</button>
-              <button id="clear" class="text-button" type="button" aria-label="Start a new conversation">New chat</button>
+              <button id="composerProToggle" class="composer-button composer-options-toggle" type="button" aria-expanded="false" aria-controls="composerProPanel">Controls <span aria-hidden="true">⌄</span></button>
             </div>
           </div>
           <span id="promptCacheStatus" class="sr-only" aria-live="polite" hidden></span>
         </div>
         <div class="actions">
-          <button id="send" type="submit" aria-label="Send message" disabled><span aria-hidden="true">↑</span><span class="send-label">Send</span></button>
+          <button id="send" type="submit" aria-label="Send message" title="Send message" disabled><span aria-hidden="true">↑</span><span class="send-label">Send</span></button>
         </div>
       </div>
       <div id="composerProPanel" class="composer-pro" hidden>
+        <div class="composer-pro-head">
+          <span>Reply controls</span>
+          <span id="contextEstimate" class="context-estimate" aria-live="polite">~0 tokens</span>
+        </div>
         <label>Context
           <select id="composerContextWindow" aria-label="Context window mode">
             <option value="recent">Smart recent turns</option>
@@ -447,6 +449,7 @@
   </div>
 </div>
 
+<div id="a11yStatus" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
 <noscript>

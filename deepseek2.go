@@ -117,11 +117,10 @@ func validateDeepSeek2Config(config *Config) error {
 	if config.ExpertGroupUsedCount == 0 {
 		config.ExpertGroupUsedCount = 1
 	}
-	// Kimi K2 has one group. Selecting a subset of expert groups changes the
-	// router top-k semantics, so reject it rather than silently routing across
-	// every expert as the generic sparse path does.
-	if config.ExpertGroupCount != 1 || config.ExpertGroupUsedCount != 1 {
-		return fmt.Errorf("%s uses unsupported grouped MoE routing (expert_group_count=%d, expert_group_used_count=%d); only Kimi-style single-group routing is supported", config.Arch, config.ExpertGroupCount, config.ExpertGroupUsedCount)
+	if config.ExpertCount <= 0 || config.ExpertGroupCount > config.ExpertCount ||
+		config.ExpertCount%config.ExpertGroupCount != 0 || config.ExpertGroupUsedCount > config.ExpertGroupCount ||
+		config.ExpertUsedCount > (config.ExpertCount/config.ExpertGroupCount)*config.ExpertGroupUsedCount {
+		return fmt.Errorf("%s has invalid grouped MoE metadata: experts=%d, expert_group_count=%d, expert_group_used_count=%d", config.Arch, config.ExpertCount, config.ExpertGroupCount, config.ExpertGroupUsedCount)
 	}
 	return nil
 }

@@ -91,6 +91,48 @@ func TestRenderPhiMessages(t *testing.T) {
 	}
 }
 
+func TestRenderPhi4MessagesUsesIMSeparator(t *testing.T) {
+	tok := newChatTokenizer("<|im_start|>", "<|im_sep|>", "<|im_end|>")
+	imStart := tok.TokenToID["<|im_start|>"]
+	imSep := tok.TokenToID["<|im_sep|>"]
+	imEnd := tok.TokenToID["<|im_end|>"]
+	// Phi-4 declares <|im_end|> as EOS, so this also guards natural stopping.
+	tok.EOSID = imEnd
+	r := &Runner{
+		tok:  tok,
+		arch: "phi3",
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "str", Value: "<|im_start|>role<|im_sep|>content<|im_end|>"},
+		}},
+	}
+	if kind := r.chatTemplateKind(); kind != "phi4-chat" {
+		t.Fatalf("template kind = %q, want phi4-chat", kind)
+	}
+	tokens := r.renderMessages([]ChatMessage{UserMessage("hi")}, "sys", nil)
+	if got := countToken(tokens, imStart); got != 3 {
+		t.Fatalf("im_start count = %d, want system/user/open-assistant", got)
+	}
+	if got := countToken(tokens, imSep); got != 3 {
+		t.Fatalf("im_sep count = %d, want one per turn", got)
+	}
+	if got := countToken(tokens, imEnd); got != 2 {
+		t.Fatalf("im_end count = %d, want closed system and user turns", got)
+	}
+	wantTail := append([]uint32{imStart}, tok.EncodeWithoutBOS("assistant")...)
+	wantTail = append(wantTail, imSep)
+	if len(tokens) < len(wantTail) {
+		t.Fatalf("tokens too short: %v", tokens)
+	}
+	for i, want := range wantTail {
+		if got := tokens[len(tokens)-len(wantTail)+i]; got != want {
+			t.Fatalf("assistant generation suffix[%d] = %d, want %d; tokens=%v", i, got, want, tokens)
+		}
+	}
+	if !r.isStopToken(imEnd) {
+		t.Fatal("Phi-4 must stop at <|im_end|>")
+	}
+}
+
 func TestRenderDeepSeekMessages(t *testing.T) {
 	tok := newChatTokenizer("<｜User｜>", "<｜Assistant｜>", "<｜end▁of▁sentence｜>")
 	r := &Runner{tok: tok, arch: "qwen2"}

@@ -57,3 +57,29 @@ func TestBuildRopeInvFreqNonYarnHasUnitMscale(t *testing.T) {
 		t.Fatalf("inv[0] = %v, want 1", inv[0])
 	}
 }
+
+func TestMistral3AttentionTemperatureSchedule(t *testing.T) {
+	gguf := &GGUFFile{Metadata: map[string]MetaValue{
+		"general.architecture":                          {Kind: "str", Value: "mistral3"},
+		"mistral3.attention.temperature_scale":          {Kind: "f32", Value: float32(0.1)},
+		"mistral3.rope.scaling.original_context_length": {Kind: "u32", Value: uint32(16)},
+	}}
+	cfg := ConfigFromGGUF(gguf)
+	if cfg.AttentionTemperatureScale != 0.1 || cfg.AttentionTemperatureFloor != 16 {
+		t.Fatalf("temperature config = scale=%v floor=%d", cfg.AttentionTemperatureScale, cfg.AttentionTemperatureFloor)
+	}
+	for _, pos := range []int{0, 15} {
+		if got := attentionTemperatureAt(cfg, pos); got != 1 {
+			t.Fatalf("scale at pos %d = %v, want 1 before the floor", pos, got)
+		}
+	}
+	if got, want := attentionTemperatureAt(cfg, 16), float32(1+0.1*math.Log(2)); math.Abs(float64(got-want)) > 1e-6 {
+		t.Fatalf("scale at first long-context block = %v, want %v", got, want)
+	}
+	if got, want := attentionTemperatureAt(cfg, 32), float32(1+0.1*math.Log(3)); math.Abs(float64(got-want)) > 1e-6 {
+		t.Fatalf("scale at second long-context block = %v, want %v", got, want)
+	}
+	if got := attentionTemperatureAt(Config{}, 1<<20); got != 1 {
+		t.Fatalf("zero-value config must be inert, got %v", got)
+	}
+}

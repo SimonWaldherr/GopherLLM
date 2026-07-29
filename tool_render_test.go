@@ -25,6 +25,96 @@ func newMistralToolTokenizer() *Tokenizer {
 	return newChatTokenizer("[AVAILABLE_TOOLS]", "[/AVAILABLE_TOOLS]", "[TOOL_CALLS]", "[ARGS]", "[TOOL_RESULTS]", "[/TOOL_RESULTS]")
 }
 
+func newLlama31ToolTokenizer() *Tokenizer {
+	return newChatTokenizer(
+		"<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>",
+		"<|eot_id|>", "<|eom_id|>", "<|python_tag|>",
+	)
+}
+
+func newLlama31ToolRunner(tok *Tokenizer) *Runner {
+	return &Runner{tok: tok, arch: "llama", gguf: &GGUFFile{Metadata: map[string]MetaValue{
+		// Deliberately contains the Llama-3.1-specific markers rather than
+		// merely the shared header protocol, so this verifies native-template
+		// selection instead of the older Llama 3 header renderer.
+		"tokenizer.chat_template": {Kind: "str", Value: `{% set date_string = "26 Jul 2024" %}{% set tools_in_user_message = true %}<|python_tag|><|eom_id|><|start_header_id|>{{ role }}<|end_header_id|><|eot_id|>`},
+	}}}
+}
+
+func TestLlama31NativeToolTemplateSystemDateAndIPythonRound(t *testing.T) {
+	tok := newLlama31ToolTokenizer()
+	r := newLlama31ToolRunner(tok)
+	if kind := r.chatTemplateKind(); kind != "llama31-chat" {
+		t.Fatalf("template kind = %q, want llama31-chat", kind)
+	}
+	messages := []ChatMessage{
+		{Role: ChatRoleSystem, Content: "Answer concisely."},
+		UserMessage("weather in Berlin?"),
+		{Role: ChatRoleAssistant, ToolCalls: []ToolCall{{
+			ID: "abc123XYZ", Type: "function",
+			Function: ToolCallFunction{Name: "get_weather", Arguments: `{"city":"Berlin"}`},
+		}}},
+		ToolResultMessage("abc123XYZ", "get_weather", `{"temperature":18}`),
+	}
+	text := decodeAll(tok, r.renderMessages(messages, "ignored default system", []ToolDefinition{sampleTool()}))
+	for _, want := range []string{
+		"<|begin_of_text|>", "Cutting Knowledge Date: December 2023", "Today Date: 26 Jul 2024",
+		"Answer concisely.", "Environment: ipython", "Given the following functions",
+		`"get_weather"`, `{"name": "get_weather", "parameters": {"city":"Berlin"}}`,
+		"ipython", `{"temperature":18}`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("native Llama 3.1 prompt missing %q: %q", want, text)
+		}
+	}
+	if strings.Contains(text, "ignored default system") {
+		t.Fatalf("leading system message must replace the default system prompt: %q", text)
+	}
+	if !strings.Contains(text, "value}.Do not use variables.") {
+		t.Fatalf("tool instruction must keep native Jinja whitespace behavior: %q", text)
+	}
+	if strings.Contains(text, "<tool_call>") || strings.Contains(text, "<tool_response") {
+		t.Fatalf("Llama 3.1 should not fall back to generic tool markup: %q", text)
+	}
+	if got := strings.Count(text, "<|eot_id|>"); got != 4 {
+		t.Fatalf("eot count = %d, want system/user/tool-call/ipython turns; prompt=%q", got, text)
+	}
+	lastHeader := strings.LastIndex(text, "<|start_header_id|>")
+	if lastHeader < 0 || !strings.Contains(text[lastHeader:], "assistant<|end_header_id|>") || strings.Contains(text[lastHeader:], "<|eot_id|>") {
+		t.Fatalf("prompt must end with an open assistant header: %q", text)
+	}
+}
+
+func TestLlama31ToolParserAndClassifier(t *testing.T) {
+	r := newLlama31ToolRunner(newLlama31ToolTokenizer())
+	raw := `{"name":"get_weather","parameters":{"city":"Berlin","days":2}}`
+	content, calls := extractToolCallsLlama31(raw)
+	if content != "" || len(calls) != 1 || calls[0].Function.Name != "get_weather" {
+		t.Fatalf("parsed content/calls = %q / %#v", content, calls)
+	}
+	if calls[0].Function.Arguments != `{"city":"Berlin","days":2}` {
+		t.Fatalf("arguments = %q", calls[0].Function.Arguments)
+	}
+	content, reasoning, calls := r.classifyOutput(raw, []ToolDefinition{sampleTool()}, NewRng(1))
+	if content != "" || reasoning != "" || len(calls) != 1 || !validToolCallID(calls[0].ID) {
+		t.Fatalf("classifyOutput = content %q reasoning %q calls %#v", content, reasoning, calls)
+	}
+
+	malformed := `{"name":"get_weather","parameters":"Berlin"}`
+	content, calls = extractToolCallsLlama31(malformed)
+	if content != malformed || calls != nil {
+		t.Fatalf("malformed native call must stay visible: content=%q calls=%#v", content, calls)
+	}
+}
+
+func TestLlama31TemplateDateUsesJinjaAssignmentAfterDefinedCheck(t *testing.T) {
+	r := newLlama31ToolRunner(newLlama31ToolTokenizer())
+	r.gguf.Metadata["tokenizer.chat_template"] = MetaValue{Kind: "str", Value: `{% if not date_string is defined %}{% set date_string = "01 Jan 2030" %}{% endif %}<|python_tag|><|eom_id|>{% set tools_in_user_message = true %}`}
+	if got := r.llama31TemplateDate(); got != "01 Jan 2030" {
+		t.Fatalf("template date = %q, want the Jinja assignment", got)
+	}
+}
+
 func TestMistralRenderInjectsAvailableTools(t *testing.T) {
 	tok := newMistralToolTokenizer()
 	r := &Runner{tok: tok, arch: "ministral"}

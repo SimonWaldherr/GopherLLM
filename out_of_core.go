@@ -68,6 +68,7 @@ func isSparseExpertTensor(name string, info TensorInfo) bool {
 	}
 	return strings.HasSuffix(name, ".ffn_gate_exps.weight") ||
 		strings.HasSuffix(name, ".ffn_up_exps.weight") ||
+		strings.HasSuffix(name, ".ffn_gate_up_exps.weight") ||
 		strings.HasSuffix(name, ".ffn_down_exps.weight")
 }
 

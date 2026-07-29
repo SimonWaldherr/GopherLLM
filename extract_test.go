@@ -44,6 +44,32 @@ func TestExtractThinkUnterminated(t *testing.T) {
 	}
 }
 
+func TestExtractMistralThinkNativeMarkers(t *testing.T) {
+	content, reasoning := extractMistralThink("[THINK]check the units[/THINK]The result is 42.")
+	if content != "The result is 42." {
+		t.Fatalf("content = %q", content)
+	}
+	if reasoning != "check the units" {
+		t.Fatalf("reasoning = %q", reasoning)
+	}
+	// Older Mistral exports can still use the common marker; keep that
+	// compatible fallback rather than exposing its thoughts in content.
+	content, reasoning = extractMistralThink("<think>legacy reasoning</think>answer")
+	if content != "answer" || reasoning != "legacy reasoning" {
+		t.Fatalf("fallback content/reasoning = %q / %q", content, reasoning)
+	}
+}
+
+func TestClassifyOutputUsesMistralNativeThinkingMarkers(t *testing.T) {
+	r := &Runner{tok: newInstTestTokenizer(), arch: "mistral3", gguf: &GGUFFile{Metadata: map[string]MetaValue{
+		"tokenizer.chat_template": {Kind: "str", Value: "[INST]{{ content }}[/INST]"},
+	}}}
+	content, reasoning, calls := r.classifyOutput("[THINK]work[/THINK]answer", nil, NewRng(1))
+	if content != "answer" || reasoning != "work" || len(calls) != 0 {
+		t.Fatalf("content/reasoning/calls = %q / %q / %#v", content, reasoning, calls)
+	}
+}
+
 func TestThinkStreamSplitterSeparatesTagsAcrossChunks(t *testing.T) {
 	s := NewThinkStreamSplitter(false)
 	var content, reasoning strings.Builder
@@ -108,6 +134,33 @@ func TestThinkStreamSplitterCanStartInsidePromptThinkBlock(t *testing.T) {
 	}
 	if got := content.String(); got != "answer" {
 		t.Fatalf("content = %q", got)
+	}
+}
+
+func TestMistralThinkStreamSplitterSeparatesNativeTagsAcrossChunks(t *testing.T) {
+	s := NewMistralThinkStreamSplitter()
+	var content, reasoning strings.Builder
+	emit := func(isReasoning bool, text string) bool {
+		if isReasoning {
+			reasoning.WriteString(text)
+		} else {
+			content.WriteString(text)
+		}
+		return true
+	}
+	for _, chunk := range []string{"Before [TH", "INK]work it ", "out[/TH", "INK] after"} {
+		if !s.Push(chunk, emit) {
+			t.Fatal("splitter stopped unexpectedly")
+		}
+	}
+	if !s.Flush(emit) {
+		t.Fatal("splitter flush stopped unexpectedly")
+	}
+	if got := content.String(); got != "Before  after" {
+		t.Fatalf("content = %q", got)
+	}
+	if got := reasoning.String(); got != "work it out" {
+		t.Fatalf("reasoning = %q", got)
 	}
 }
 

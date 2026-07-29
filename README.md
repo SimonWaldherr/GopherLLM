@@ -813,7 +813,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   model, does not fit comfortably in RAM or Apple unified memory. It keeps the
   model CPU-only, disables Metal and prepared-quant copies, leaves F16/F32/BF16
   matrices as mmap-backed scalar bytes, and does not prewarm the rank-3 expert
-  banks. The operating system pages selected experts in on demand; this is not
+  banks (including fused `ffn_gate_up_exps` layouts). The operating system
+  pages selected experts in on demand; this is not
   a hard RSS limit, so a cold expert can add SSD/page-fault latency and dense
   models that are far larger than RAM can still thrash. It intentionally rejects
   `--metal`, `--prepare-quant`, `--auto`, byte-backed loads, and split GGUFs
@@ -963,12 +964,14 @@ draft layers load for ordinary generation; the draft layer is intentionally
 skipped until speculative decoding is implemented.
 
 `deepseek2` and `kimi_k2` provide a dedicated Multi-head Latent Attention
-(MLA) path for Kimi K2 and compatible single-group MLA GGUFs. It uses a
+(MLA) path for Kimi K2 and compatible modern DeepSeek-V2/V3 GGUFs. It uses a
 compressed KV cache, the split `attn_k_b`/`attn_v_b` MLA tensors, and the
-sigmoid/noaux sparse router with its always-on shared expert. This path is
-currently CPU-only (`--metal` is rejected) and explicitly rejects grouped
-DeepSeek-MoE routing; it does not claim support for every DeepSeek-V2/V3 or
-legacy `attn_kv_b` GGUF.
+sigmoid/noaux sparse router with its always-on shared expert. Group-limited
+DeepSeek-V3 routing is native: it ranks the configured expert groups from
+corrected sigmoid scores, chooses the final experts within those groups, then
+mixes them using the original sigmoid probabilities. This path is currently
+CPU-only (`--metal` is rejected); legacy fused `attn_kv_b` layouts and MLA
+files without the compact modern metadata remain unsupported.
 
 DeepSeek-R1 reasoning output is separated into `reasoning_content` in both
 template conventions (self-opened `<think>` blocks and the newer forced-open
@@ -1002,19 +1005,25 @@ canonical `RMSNorm(y · SiLU(z))` gate is distinct from Nemotron-H's gate;
 Mamba2 variants with an additional MLP branch are rejected explicitly rather
 than being evaluated with an incompatible graph.
 
-Gemma-family support (`gemma`/`gemma2`/`gemma3`/`gemma4`, including the Gemma QAT
-GGUFs) is **experimental**: the dense Gemma graph is implemented — hardcoded
-`sqrt(dim)` embedding scaling, GELU FFN, QK-norm, post-attention/post-FFN
-norms, attention/final logit softcapping, the per-layer sliding-window map
-(explicit `sliding_window_pattern` bool-array metadata or the known Gemma 2/4
-interleave defaults), the `<start_of_turn>` chat template, and `<end_of_turn>`
-as a stop token — but it has not been validated against real Gemma weights
-yet, and the Gemma 4-specific mechanisms (p-RoPE frequency factors, per-layer
-RoPE bases, cross-layer KV sharing, per-layer embeddings, the 26B MoE) are
-still missing. The loader prints a warning. See
-[docs/INFERENCE_NOTES.md](docs/INFERENCE_NOTES.md) for the architecture notes,
-QAT specifics, and per-family recommended sampling settings (e.g. Gemma:
-`--temp 1.0 --top-p 0.95 --top-k 64`).
+Gemma-family support (`gemma`/`gemma2`/`gemma3`/`gemma4`, including Gemma QAT
+GGUFs) implements `sqrt(dim)` embedding scaling, GELU FFN, QK-norm,
+post-attention/post-FFN norms, attention/final-logit softcapping and the
+per-layer sliding-window map. Native **Gemma 4 12B dense**, **26B A4B MoE**
+and **E2B** GGUFs use their real mixed local/global attention geometry: the
+local/global RoPE bases and global proportional `rope_freqs.weight`, K-as-V
+with V RMSNorm where declared, per-layer output scales, and the
+`<|turn>…<turn|>` chat protocol are all executed. 26B additionally executes
+its real shared-dense-plus-sparse GEGLU graph: scaled RMS router input, fused
+expert gate/up banks, expert down scales, and the three branch/sum norms. E2B
+executes the exact token-conditioned per-layer embedding residual (its global
+projection/norm, gated exact-GELU residual) and its query-only shared-KV tail:
+15 physical slots, with tail SWA blocks reading slot 13 and global blocks slot
+14. Local 12B, 26B and E2B Q4 out-of-core decode smoke tests are green.
+
+Multimodal `mmproj` files remain separate work. Gemma 1--3 and Gemma 4 retain
+an experimental warning until cross-runtime logit-parity coverage is
+available. A sensible Gemma sampling starting point is `--temp 1.0 --top-p
+0.95 --top-k 64`.
 
 Projector files such as `mmproj-*` are detected and excluded from text-model
 selection.

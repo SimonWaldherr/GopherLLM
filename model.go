@@ -24,17 +24,22 @@ import (
 // meaning "use 1/sqrt(HeadDim)" for AttentionScale) and are only non-trivial
 // for architectures whose GGUFs carry them.
 type Config struct {
-	Arch                      string
-	Dim                       int
-	HiddenDim                 int
-	NLayers                   int
-	NHeads                    int
-	NKVHeads                  int
-	VocabSize                 int
-	MaxSeqLen                 int
-	RopeTheta                 float32
-	RMSNormEps                float32
-	AttentionScale            float32
+	Arch           string
+	Dim            int
+	HiddenDim      int
+	NLayers        int
+	NHeads         int
+	NKVHeads       int
+	VocabSize      int
+	MaxSeqLen      int
+	RopeTheta      float32
+	RMSNormEps     float32
+	AttentionScale float32
+	// AttentionTemperatureScale is Mistral 3's long-context Q scaling
+	// coefficient. It remains separate from AttentionScale, which is the
+	// ordinary static QK score multiplier.
+	AttentionTemperatureScale float32
+	AttentionTemperatureFloor int
 	EmbeddingScale            float32
 	ResidualScale             float32
 	LogitScale                float32
@@ -231,10 +236,19 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	if p == "stablelm" {
 		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
 	}
+	hiddenDim := int(gguf.GetU32(p+".feed_forward_length", 0))
+	// Gemma 4 E2B serializes feed_forward_length as one entry per layer. The
+	// native loader still validates tensor shapes, but retaining its maximum in
+	// Config makes header-only analysis and early workspace sizing truthful.
+	if perLayerFFN, ok := gguf.GetU32Array(p + ".feed_forward_length"); ok {
+		for _, width := range perLayerFFN {
+			hiddenDim = max(hiddenDim, int(width))
+		}
+	}
 	cfg := Config{
 		Arch:                      arch,
 		Dim:                       dim,
-		HiddenDim:                 int(gguf.GetU32(p+".feed_forward_length", 0)),
+		HiddenDim:                 hiddenDim,
 		NLayers:                   int(gguf.GetU32(p+".block_count", 0)),
 		NHeads:                    nHeads,
 		NKVHeads:                  nKVHeads,
@@ -243,6 +257,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeTheta:                 gguf.GetF32(p+".rope.freq_base", 10000),
 		RMSNormEps:                normEps,
 		AttentionScale:            gguf.GetF32(p+".attention.scale", 0),
+		AttentionTemperatureScale: gguf.GetF32(p+".attention.temperature_scale", 0),
 		EmbeddingScale:            embeddingScale,
 		ResidualScale:             residualScale,
 		LogitScale:                logitScale,
@@ -281,6 +296,9 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
+	// Mistral 3's temperature schedule uses the original YaRN context length
+	// as its floor (llama.cpp's n_attn_temp_floor_scale).
+	cfg.AttentionTemperatureFloor = cfg.RopeOriginalContextLength
 	if deepSeek2Family(arch) {
 		// The compact K/V cache is only valid when all MLA dimensions are
 		// present.  The tensor loader performs the stricter per-layer shape
@@ -775,6 +793,13 @@ type ModelWeights struct {
 }
 
 type Gemma4LayerWeights struct {
+	// Native is true for the actual Gemma 4 graph.  Unlike Gemma 1--3, Gemma
+	// 4 changes attention geometry between SWA and global blocks, may omit V
+	// (then K is used as V), and applies a layer output scale after the whole
+	// block.  The older fields below are retained for the generic Gemma path
+	// and for API compatibility with the original wrapper.
+	Native bool
+
 	AttnNorm   []float32
 	AttnQ      Weight
 	AttnK      Weight
@@ -788,6 +813,43 @@ type Gemma4LayerWeights struct {
 	NKVHeads   int
 	ValueDim   int
 	HasAttnV   bool
+
+	// Native Gemma 4-only tensors and per-layer geometry.  The names mirror
+	// the GGUF tensors and llama.cpp graph: Q/K have learned per-head RMS
+	// norms; V is RMS-normalized without a learned weight; post norms sit
+	// before each residual add; OutputScale is applied last in the block.
+	AttnQNorm    []float32
+	AttnKNorm    []float32
+	PostAttnNorm []float32
+	PostFFNNorm  []float32
+	OutputScale  float32
+	IsSWA        bool
+	HasKV        bool
+	UsesKAsV     bool
+	// KVCacheSlot compacts native Gemma 4 shared-KV layouts. Dense 12B/26B
+	// layers use their own slot; E2B tail layers read the matching preceding
+	// local/global slot and never write K/V of their own.
+	KVCacheSlot   int
+	RopeDimension int
+	RopeInvFreq   []float32
+	FFNHiddenDim  int
+	// Per-layer embedding (PLE) tensors are present on E2B-style checkpoints.
+	// They inject a token-specific gated low-rank residual after the ordinary
+	// attention/FFN block and before OutputScale.
+	PerLayerInputGate Weight
+	PerLayerProj      Weight
+	PerLayerPostNorm  []float32
+}
+
+// Gemma4PerLayerWeights holds the global part of Gemma 4 E2B's PLE graph.
+// TokenEmbd stores one Dim-wide slice per decoder layer in every token row.
+// ModelProj and ProjNorm mix the scaled regular input into those slices before
+// each layer's own gate/projection consumes its selected slice.
+type Gemma4PerLayerWeights struct {
+	TokenEmbd Weight
+	ModelProj Weight
+	ProjNorm  []float32
+	Dim       int
 }
 
 type Gemma4Weights struct {
@@ -795,7 +857,17 @@ type Gemma4Weights struct {
 	OutputNorm []float32
 	Output     Weight
 	Layers     []Gemma4LayerWeights
-	Standard   ModelWeights
+	// MoE holds Gemma 4's special shared-dense-plus-expert FFN state by
+	// decoder layer. It intentionally is not SparseMoEWeights: Gemma 4 routes
+	// from attn_out through a scaled RMS input and combines separately
+	// normalized dense/expert branches.
+	MoE []*Gemma4MoEWeights
+	// PerLayer is non-nil for E2B-style per-layer embeddings.
+	PerLayer *Gemma4PerLayerWeights
+	// Native selects the isolated Gemma 4 execution graph.  Standard remains
+	// populated for Gemma/Gemma2/Gemma3 and legacy synthetic Gemma4 fixtures.
+	Native   bool
+	Standard ModelWeights
 }
 
 type GptOssWeights struct {
@@ -933,12 +1005,17 @@ type DecodeBuffer struct {
 	// MLA scratch holds the Q LoRA intermediate, the compact KV projection,
 	// and a temporary RoPE/value expansion plane.  It is reused across all
 	// layers so Kimi/DeepSeek decode remains allocation-free.
-	MLAQ                    []float32
-	MLAKV                   []float32
-	MLATmp                  []float32
-	MLAValues               []float32
-	RouterLogits            []float32
-	RouterSelection         []float32
+	MLAQ            []float32
+	MLAKV           []float32
+	MLATmp          []float32
+	MLAValues       []float32
+	RouterLogits    []float32
+	RouterSelection []float32
+	// RouterGroups/TopGroups are DeepSeek-V3's allocation-free scratch for
+	// group-limited noaux routing. They remain small (eight groups in V3)
+	// while TopExperts retains the final selected expert indices.
+	RouterGroups            []float32
+	TopGroups               []ExpertScore
 	TopExperts              []ExpertScore
 	ExpertProbs             []float32
 	SamplerCandidates       []TokenProb
@@ -975,7 +1052,13 @@ type DecodeBuffer struct {
 	AttnGate     []float32
 	ExpertRow    []float32
 	ExpertHidden []float32
-	batch        batchDecodeBuffer
+	// Gemma4PLE and Gemma4PLEInput retain a token's prepared E2B per-layer
+	// embedding slices and their raw embedding-row source. They are grown only
+	// when a native PLE model is used, so ordinary decoder workspaces stay the
+	// same size.
+	Gemma4PLE      []float32
+	Gemma4PLEInput []float32
+	batch          batchDecodeBuffer
 }
 
 type ExpertScore struct {
@@ -1009,6 +1092,10 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		MLAValues:               make([]float32, max(1, config.NHeads*config.MLAValueDim)),
 		RouterLogits:            make([]float32, config.ExpertCount),
 		RouterSelection:         make([]float32, config.ExpertCount),
+		RouterGroups:            make([]float32, max(1, config.ExpertGroupCount)),
+		TopGroups:               make([]ExpertScore, 0, max(1, config.ExpertGroupUsedCount)),
+		TopExperts:              make([]ExpertScore, 0, config.ExpertUsedCount),
+		ExpertProbs:             make([]float32, 0, config.ExpertUsedCount),
 		SamplerCandidates:       make([]TokenProb, 0, 64),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
 		RopeInvFreq:             inv,
@@ -1212,6 +1299,12 @@ func LoadGptOssModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuanti
 
 func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, useMetal bool, logw io.Writer, outOfCore ...bool) (Config, Gemma4Weights, error) {
 	config := ConfigFromGGUF(gguf)
+	// Real Gemma 4 exports are structurally different from the older Gemma
+	// decoder graph: their per-layer output scales make a reliable marker that
+	// lets us keep the tested Gemma/Gemma2/Gemma3 fallback untouched.
+	if config.Arch == "gemma4" && isNativeGemma4Layout(indexTensors(gguf)) {
+		return loadNativeGemma4Model(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
+	}
 	if config.Arch == "gemma4" {
 		if err := validateGemma4DenseLayout(config, indexTensors(gguf)); err != nil {
 			return config, Gemma4Weights{}, err
@@ -1770,6 +1863,9 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		}
 		applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
 		applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
+		if temperature := attentionTemperatureAt(config, pos); temperature != 1 {
+			ScaleF32(buf.Q, temperature)
+		}
 
 		cache.storeKV(l, pos, buf.K, buf.V)
 
@@ -1903,10 +1999,21 @@ func ForwardHiddenGptOss(config Config, weights GptOssWeights, cache *KVCache, b
 }
 
 func ForwardGemma4Into(config Config, weights Gemma4Weights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) {
+	if weights.Native {
+		forwardNativeGemma4BodyInto(config, weights, cache, buf, token, pos)
+		projectNativeGemma4Logits(config, weights, buf, logits)
+		return
+	}
 	ForwardInto(config, weights.Standard, cache, buf, token, pos, logits)
 }
 
 func ForwardHiddenGemma4(config Config, weights Gemma4Weights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {
+	if weights.Native {
+		forwardNativeGemma4BodyInto(config, weights, cache, buf, token, pos)
+		out := make([]float32, len(buf.XN))
+		copy(out, buf.XN)
+		return out
+	}
 	ForwardBodyInto(config, weights.Standard, cache, buf, token, pos)
 	out := make([]float32, len(buf.XN))
 	copy(out, buf.XN)
@@ -2056,6 +2163,18 @@ func ropeInterleaved(arch string) bool {
 	default:
 		return false
 	}
+}
+
+// attentionTemperatureAt implements Mistral 3's position-dependent
+// long-context temperature schedule. llama.cpp multiplies Q (after RoPE) by
+// this value, using the original YaRN context length as the floor interval.
+// A missing/zero metadata pair is deliberately inert for every other family.
+func attentionTemperatureAt(config Config, pos int) float32 {
+	if config.AttentionTemperatureScale == 0 || config.AttentionTemperatureFloor <= 0 || pos < 0 {
+		return 1
+	}
+	step := math.Floor(float64(pos) / float64(config.AttentionTemperatureFloor))
+	return 1 + config.AttentionTemperatureScale*float32(math.Log(step+1))
 }
 
 // tryMatvec3Into / tryMatvec2Into route same-typed Q4_K or Q6_K weight groups

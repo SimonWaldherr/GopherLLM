@@ -97,6 +97,71 @@ func TestBatchedPrefillMatchesPerToken(t *testing.T) {
 	}
 }
 
+func TestMistral3TemperatureScalingMatchesBatchedPrefill(t *testing.T) {
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "32")
+	r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF("mistral3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the synthetic model short while crossing multiple temperature
+	// floors; a real Ministral-3-14B uses 16,384 here.
+	r.config.AttentionTemperatureScale = 0.1
+	r.config.AttentionTemperatureFloor = 2
+	tokens := r.tok.Encode(strings.Repeat("abcdefghij", 3))
+	kDim, vDim, mh, mk, mv := r.cacheDims()
+	newRun := func() (*KVCache, *DecodeBuffer) {
+		return NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1), NewDecodeBuffer(r.config, mh, mk, mv)
+	}
+
+	perCache, perBuf := newRun()
+	perToken := []float32{}
+	for pos, tok := range tokens {
+		if pos == len(tokens)-1 {
+			r.forwardTokenInto(perCache, perBuf, tok, pos, &perToken)
+		} else {
+			r.forwardPrefillToken(perCache, perBuf, tok, pos)
+		}
+	}
+	batchCache, batchBuf := newRun()
+	batched := []float32{}
+	if err := r.prefillBatched(context.Background(), batchCache, batchBuf, tokens, &batched); err != nil {
+		t.Fatal(err)
+	}
+	if len(batched) != len(perToken) {
+		t.Fatalf("logit len %d vs %d", len(batched), len(perToken))
+	}
+	for i := range perToken {
+		if d := math.Abs(float64(batched[i] - perToken[i])); d > 1e-3*math.Max(1, math.Abs(float64(perToken[i]))) {
+			t.Fatalf("logit %d: batched=%v per-token=%v", i, batched[i], perToken[i])
+		}
+	}
+
+	// The schedule must have a real effect past its floor, so this test cannot
+	// pass merely because both prefill implementations skipped it.
+	saved := r.config.AttentionTemperatureScale
+	r.config.AttentionTemperatureScale = 0
+	plainCache, plainBuf := newRun()
+	plain := []float32{}
+	for pos, tok := range tokens {
+		if pos == len(tokens)-1 {
+			r.forwardTokenInto(plainCache, plainBuf, tok, pos, &plain)
+		} else {
+			r.forwardPrefillToken(plainCache, plainBuf, tok, pos)
+		}
+	}
+	r.config.AttentionTemperatureScale = saved
+	different := false
+	for i := range plain {
+		if math.Abs(float64(plain[i]-perToken[i])) > 1e-6 {
+			different = true
+			break
+		}
+	}
+	if !different {
+		t.Fatal("temperature schedule did not affect long-context logits")
+	}
+}
+
 func TestBatchedPrefillSupportsFusedQKVAndGateUp(t *testing.T) {
 	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "32")
 	r, err := RunnerFromGGUFBytes(buildTinyFusedLlamaGGUF())

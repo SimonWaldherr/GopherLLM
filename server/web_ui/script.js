@@ -199,6 +199,17 @@ function messageControls(el) {
   return controls;
 }
 
+function messageFooter(el) {
+  let footer = el.querySelector(":scope > .message-actions");
+  if (!footer) {
+    footer = document.createElement("div");
+    footer.className = "message-actions";
+    footer.setAttribute("aria-label", "Message actions");
+    el.appendChild(footer);
+  }
+  return footer;
+}
+
 function attachCopyButton(el) {
   if (el.querySelector(".copy-btn")) return;
   const button = document.createElement("button");
@@ -213,10 +224,11 @@ function attachCopyButton(el) {
 }
 
 function attachDetailsButton(el, meta) {
+  if (el.querySelector(".message-details-toggle")) return;
   const button = document.createElement("button");
-  button.className = "message-icon-button message-details-toggle";
+  button.className = "message-action message-details-toggle";
   button.type = "button";
-  button.textContent = "ⓘ";
+  button.textContent = "Details";
   button.title = "Answer details";
   button.setAttribute("aria-label", "Show answer details");
   button.setAttribute("aria-expanded", "false");
@@ -224,10 +236,11 @@ function attachDetailsButton(el, meta) {
     const open = meta.hidden;
     meta.hidden = !open;
     button.setAttribute("aria-expanded", String(open));
+    button.textContent = open ? "Hide details" : "Details";
     button.setAttribute("aria-label", open ? "Hide answer details" : "Show answer details");
     button.title = open ? "Hide details" : "Answer details";
   });
-  messageControls(el).appendChild(button);
+  messageFooter(el).appendChild(button);
 }
 
 /* Renders any Mermaid sources in container, or — when no renderer was loaded —
@@ -387,6 +400,33 @@ function renderAgentTimeline(el, timeline) {
     }
     el.appendChild(item);
   }
+}
+
+function activityLabel(timeline, live) {
+  const tools = (timeline || []).filter((row) => row.kind === "tool");
+  const running = live || tools.some((row) => row.running);
+  const count = tools.length;
+  if (running) return "Working with " + count + " tool call" + (count === 1 ? "" : "s") + "…";
+  return "Activity · " + count + " tool call" + (count === 1 ? "" : "s");
+}
+
+function renderActivityDisclosure(el, timeline, live, before) {
+  let details = el.querySelector(":scope > .activity-details");
+  if (!details) {
+    details = document.createElement("details");
+    details.className = "activity-details";
+    const summary = document.createElement("summary");
+    const timelineEl = document.createElement("div");
+    timelineEl.className = "agent-timeline";
+    details.append(summary, timelineEl);
+    if (before) el.insertBefore(details, before);
+    else el.appendChild(details);
+  }
+  details.classList.toggle("activity-live", !!live);
+  details.open = false;
+  details.querySelector("summary").textContent = activityLabel(timeline, live);
+  renderAgentTimeline(details.querySelector(".agent-timeline"), timeline);
+  return details;
 }
 
 function prettyJSON(value) {
@@ -902,7 +942,6 @@ function toMarkdown(chat) {
   const sidebarToggleEl = $("sidebarToggle");
   const sidebarScrimEl = $("sidebarScrim");
   const newChatEl = $("newChat");
-  const clearEl = $("clear");
   const renameChatEl = $("renameChat");
   const deleteChatEl = $("deleteChat");
   const attachFileEl = $("attachFile");
@@ -915,6 +954,8 @@ function toMarkdown(chat) {
   const themeSelectEl = $("themeSelect");
   const editStateEl = $("editState");
   const cancelEditEl = $("cancelEdit");
+  const appEl = document.querySelector(".app");
+  const a11yStatusEl = $("a11yStatus");
   const toastEl = $("toast");
 
   const defaults = {
@@ -956,6 +997,7 @@ function toMarkdown(chat) {
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
+  let activeDialog = null;
   const embeddingCache = new Map();
 
   function activeChat() {
@@ -991,6 +1033,84 @@ function toMarkdown(chat) {
     toastTimer = setTimeout(() => { toastEl.hidden = true; }, 2600);
   }
   document.addEventListener("gopherllm:notice", (event) => showToast(event.detail.text, event.detail.kind));
+
+  function announce(text) {
+    if (!a11yStatusEl) return;
+    a11yStatusEl.textContent = "";
+    requestAnimationFrame(() => { a11yStatusEl.textContent = text; });
+  }
+
+  function setAppInert(inert) {
+    if (!appEl) return;
+    appEl.inert = inert;
+    if (inert) appEl.setAttribute("aria-hidden", "true");
+    else appEl.removeAttribute("aria-hidden");
+  }
+
+  function dialogFocusables(root) {
+    const panel = root.querySelector('[role="dialog"]');
+    if (!panel) return [];
+    return Array.from(panel.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+      .filter((element) => !element.closest("[hidden]") && element.getClientRects().length > 0);
+  }
+
+  function openDialog(root, opener, initialFocus) {
+    if (activeDialog && activeDialog.root !== root) return;
+    root.hidden = false;
+    activeDialog = { root, opener };
+    setAppInert(true);
+    const panel = root.querySelector('[role="dialog"]');
+    if (panel) panel.tabIndex = -1;
+    const target = initialFocus && !initialFocus.disabled ? initialFocus : (dialogFocusables(root)[0] || panel);
+    if (target) target.focus();
+  }
+
+  function closeDialog(root) {
+    if (root.hidden) return;
+    root.hidden = true;
+    if (!activeDialog || activeDialog.root !== root) return;
+    const opener = activeDialog.opener;
+    activeDialog = null;
+    setAppInert(false);
+    if (opener && document.contains(opener)) opener.focus();
+  }
+
+  function trapDialogFocus(event) {
+    if (event.key !== "Tab" || !activeDialog) return false;
+    const panel = activeDialog.root.querySelector('[role="dialog"]');
+    const focusables = dialogFocusables(activeDialog.root);
+    if (!focusables.length) {
+      event.preventDefault();
+      if (panel) panel.focus();
+      return true;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (panel && !panel.contains(document.activeElement)) {
+      event.preventDefault();
+      first.focus();
+      return true;
+    }
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+      return true;
+    }
+    if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+      return true;
+    }
+    return false;
+  }
+
+  function closeActiveDialog() {
+    if (!activeDialog) return;
+    if (activeDialog.root === briefingEl) closeBriefing();
+    else if (activeDialog.root === settingsEl) closeSettings();
+    else if (activeDialog.root === batchEl) closeBatch();
+    else if (activeDialog.root === agentosEl) closeAgentOS();
+  }
 
   function setStatus(text) {
     statusTextEl.textContent = text;
@@ -1310,7 +1430,11 @@ function toMarkdown(chat) {
     updatePromptCacheStatus();
     if (!busy) {
       sendEl.disabled = tuning || ragSearching || batchRunning || (!promptEl.value.trim() && pendingAttachments.length === 0);
-      sendLabelEl.textContent = editingIndex === null ? "Send" : "Save & retry";
+      const editing = editingIndex !== null;
+      sendLabelEl.textContent = editing ? "Save & retry" : "Send";
+      sendEl.classList.toggle("editing", editing);
+      sendEl.setAttribute("aria-label", editing ? "Save edited message and retry" : "Send message");
+      sendEl.title = editing ? "Save and retry" : "Send message";
     }
   }
 
@@ -1424,14 +1548,8 @@ function toMarkdown(chat) {
     // A stored timeline is re-rendered on reload, so an answer keeps its
     // explanation of how it was produced. It is dropped, not just hidden, when
     // the viewing preference is off.
-    const existingTimeline = el.querySelector(":scope > .agent-timeline");
-    if (existingTimeline) existingTimeline.remove();
-    if (preferences.showAgentActivity !== false && result.agent && result.agent.length) {
-      const timelineEl = document.createElement("div");
-      timelineEl.className = "agent-timeline";
-      renderAgentTimeline(timelineEl, result.agent);
-      el.insertBefore(timelineEl, content);
-    }
+    const existingActivity = el.querySelector(":scope > .activity-details");
+    if (existingActivity) existingActivity.remove();
     const calls = result.toolCalls || [];
     if (result.answer) {
       content.innerHTML = renderMarkdown(result.answer);
@@ -1444,6 +1562,11 @@ function toMarkdown(chat) {
       content.classList.add("muted");
     }
     if (calls.length) {
+      const disclosure = document.createElement("details");
+      disclosure.className = "tool-call-disclosure";
+      disclosure.open = !result.answer;
+      const summary = document.createElement("summary");
+      summary.textContent = "Tool call" + (calls.length === 1 ? "" : "s") + " · " + calls.length;
       const wrap = document.createElement("div");
       wrap.className = "tool-calls";
       for (const call of calls) {
@@ -1465,7 +1588,11 @@ function toMarkdown(chat) {
         card.append(head, args);
         wrap.appendChild(card);
       }
-      el.appendChild(wrap);
+      disclosure.append(summary, wrap);
+      el.appendChild(disclosure);
+    }
+    if (preferences.showAgentActivity !== false && result.agent && result.agent.length) {
+      renderActivityDisclosure(el, result.agent, false);
     }
     const parts = [];
     if (result.usage && typeof result.usage.completion_tokens === "number") {
@@ -1489,8 +1616,7 @@ function toMarkdown(chat) {
 
   function addActions(el, message, index) {
     if (message.role !== "user" && message.role !== "assistant") return;
-    const wrap = document.createElement("div");
-    wrap.className = "message-actions";
+    const wrap = messageFooter(el);
     const action = document.createElement("button");
     action.className = "message-action";
     action.type = "button";
@@ -1499,12 +1625,12 @@ function toMarkdown(chat) {
       action.setAttribute("aria-label", "Edit this message in a new branch");
       action.addEventListener("click", () => editMessage(index));
     } else {
-      action.className = "message-icon-button message-retry";
-      action.textContent = "↻";
+      action.className = "message-action message-retry";
+      action.textContent = "Regenerate";
       action.setAttribute("aria-label", "Regenerate this answer in a new branch");
-      action.title = "Retry in new branch";
+      action.title = "Regenerate in a new branch";
       action.addEventListener("click", () => retryMessage(index));
-      messageControls(el).appendChild(action);
+      wrap.appendChild(action);
       return;
     }
     wrap.appendChild(action);
@@ -1512,8 +1638,7 @@ function toMarkdown(chat) {
   }
 
   function addRetryAction(el) {
-    const wrap = document.createElement("div");
-    wrap.className = "message-actions";
+    const wrap = messageFooter(el);
     const action = document.createElement("button");
     action.className = "message-action";
     action.type = "button";
@@ -1994,18 +2119,16 @@ function toMarkdown(chat) {
     }
     briefOutputEl.value = "";
     briefStatusEl.textContent = "Uses the active local chat model once. Nothing is sent outside this server.";
-    briefingEl.hidden = false;
     briefChatEl.setAttribute("aria-expanded", "true");
     updateBriefControls();
-    briefGenerateEl.focus();
+    openDialog(briefingEl, briefChatEl, briefGenerateEl);
   }
 
   function closeBriefing() {
     if (briefController) briefController.abort();
-    briefingEl.hidden = true;
     briefChatEl.setAttribute("aria-expanded", "false");
     updateBriefControls();
-    briefChatEl.focus();
+    closeDialog(briefingEl);
   }
 
   async function generateBriefing() {
@@ -2059,17 +2182,15 @@ function toMarkdown(chat) {
     setBusy(true);
     updatePromptCacheStatus();
     controller = new AbortController();
-    // Live tool timeline: created lazily so a turn without tool activity adds
-    // no chrome at all.
+    // Live tool activity stays compact until the user asks for its details.
     let agentEl = null;
     const onAgentTimeline = (timeline) => {
       if (!preferences.showAgentActivity) return;
       if (!agentEl) {
-        agentEl = document.createElement("div");
-        agentEl.className = "agent-timeline";
-        assistantEl.insertBefore(agentEl, assistantEl.querySelector(".content"));
+        agentEl = renderActivityDisclosure(assistantEl, timeline, true, assistantEl.querySelector(".content"));
+      } else {
+        renderActivityDisclosure(assistantEl, timeline, true);
       }
-      renderAgentTimeline(agentEl, timeline);
       scrollToBottom(false);
     };
     const startedAt = performance.now();
@@ -2132,6 +2253,7 @@ function toMarkdown(chat) {
       streamFinished = true;
       result.decodeMS = firstTokenAt ? performance.now() - firstTokenAt : performance.now() - startedAt;
       finalizeAssistant(assistantEl, result);
+      announce("Answer ready.");
       const stored = {
         role: "assistant", content: result.answer || "", reasoning: result.reasoning || "",
         tool_calls: result.toolCalls || null, usage: result.usage || null, finishReason: result.finishReason || "",
@@ -2154,6 +2276,7 @@ function toMarkdown(chat) {
         if (partial || reasoning) {
           const stored = { role: "assistant", content: partial, reasoning, tool_calls: null, usage: null, finishReason: "stopped" };
           finalizeAssistant(assistantEl, { answer: partial, reasoning, toolCalls: null, usage: null, finishReason: "stopped", decodeMS: 0 });
+          announce("Generation stopped. Partial answer ready.");
           chat.messages.push(stored);
           addActions(assistantEl, stored, chat.messages.length - 1);
           touch(chat);
@@ -2635,9 +2758,8 @@ function toMarkdown(chat) {
 
   /* ── /batch: one prompt, many items ── */
   function openBatch() {
-    batchEl.hidden = false;
     refreshBatchDataset();
-    batchTemplateEl.focus();
+    openDialog(batchEl, promptEl, batchTemplateEl);
   }
 
   function closeBatch() {
@@ -2645,8 +2767,7 @@ function toMarkdown(chat) {
       showToast("Stop the batch run first.", "error");
       return;
     }
-    batchEl.hidden = true;
-    promptEl.focus();
+    closeDialog(batchEl);
   }
 
   function refreshBatchDataset() {
@@ -2805,17 +2926,15 @@ function toMarkdown(chat) {
   }
 
   function openAgentOS(prefill) {
-    agentosEl.hidden = false;
     resetAgentOSPanels();
     agentosPolicyNoteEl.textContent = agentOSPolicyNote();
     if (prefill) agentosInstructionEl.value = prefill;
-    agentosInstructionEl.focus();
+    openDialog(agentosEl, promptEl, agentosInstructionEl);
   }
 
   function closeAgentOS() {
     if (agentOSBusy) return;
-    agentosEl.hidden = true;
-    promptEl.focus();
+    closeDialog(agentosEl);
   }
 
   function agentOSField(label, value) {
@@ -3080,7 +3199,6 @@ function toMarkdown(chat) {
   });
 
   newChatEl.addEventListener("click", createChat);
-  clearEl.addEventListener("click", createChat);
   renameChatEl.addEventListener("click", () => renameChat(activeID));
   deleteChatEl.addEventListener("click", () => deleteChat(activeID));
   shareChatEl.addEventListener("click", shareActiveChat);
@@ -3097,15 +3215,13 @@ function toMarkdown(chat) {
   sidebarToggleEl.addEventListener("click", () => setSidebar(!sidebarEl.classList.contains("is-open")));
   sidebarScrimEl.addEventListener("click", () => setSidebar(false));
   function openSettings() {
-    settingsEl.hidden = false;
     settingsToggleEl.setAttribute("aria-expanded", "true");
-    settingsCloseEl.focus();
+    openDialog(settingsEl, settingsToggleEl, settingsCloseEl);
   }
   function closeSettings() {
     if (settingsEl.hidden) return;
-    settingsEl.hidden = true;
     settingsToggleEl.setAttribute("aria-expanded", "false");
-    settingsToggleEl.focus();
+    closeDialog(settingsEl);
   }
   settingsToggleEl.addEventListener("click", () => {
     if (settingsEl.hidden) openSettings();
@@ -3229,7 +3345,9 @@ function toMarkdown(chat) {
     powerCommandsEl.checked = preferences.power;
     composerPowerCommandsEl.checked = preferences.power;
     powerOptionsEl.hidden = !preferences.power;
-    promptHintEl.textContent = preferences.power ? "/ commands" : "↵ send";
+    promptHintEl.textContent = preferences.power
+      ? "Type slash for commands. Press Enter to send and Shift+Enter for a new line."
+      : "Press Enter to send and Shift+Enter for a new line.";
     if (!preferences.power) closeCommandMenu();
   }
 
@@ -3237,7 +3355,9 @@ function toMarkdown(chat) {
     preferences.composerPro = !!open;
     composerProPanelEl.hidden = !preferences.composerPro;
     composerProToggleEl.setAttribute("aria-expanded", String(preferences.composerPro));
-    composerProToggleEl.textContent = preferences.composerPro ? "Hide options" : "Options";
+    composerProToggleEl.innerHTML = preferences.composerPro
+      ? 'Hide controls <span aria-hidden="true">⌃</span>'
+      : 'Controls <span aria-hidden="true">⌄</span>';
   }
   powerCommandsEl.addEventListener("change", () => {
     applyPowerPreference(powerCommandsEl.checked);
@@ -3336,15 +3456,20 @@ function toMarkdown(chat) {
   });
 
   document.addEventListener("keydown", (event) => {
+    if (activeDialog) {
+      if (trapDialogFocus(event)) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeActiveDialog();
+      }
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
       event.preventDefault();
       setSidebar(true);
       chatSearchEl.focus();
     }
     if (event.key === "Escape" && sidebarEl.classList.contains("is-open")) setSidebar(false);
-    if (event.key === "Escape" && !settingsEl.hidden) closeSettings();
-    if (event.key === "Escape" && !batchEl.hidden) closeBatch();
-    if (event.key === "Escape" && !agentosEl.hidden) closeAgentOS();
   });
   window.addEventListener("beforeunload", save);
 

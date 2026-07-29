@@ -22,7 +22,13 @@ func (r *Runner) classifyOutput(raw string, tools []ToolDefinition, rng *Rng) (c
 	if r.arch == "gpt-oss" {
 		content, reasoning, calls = extractGptOssChannels(raw)
 	} else {
-		content, reasoning = extractThink(raw)
+		if kind == "mistral-inst" {
+			// Ministral-3-Reasoning's native template uses bracketed markers,
+			// rather than the <think> tags used by DeepSeek and Qwen.
+			content, reasoning = extractMistralThink(raw)
+		} else {
+			content, reasoning = extractThink(raw)
+		}
 		if len(tools) > 0 {
 			switch {
 			case qwen35Family(r.arch):
@@ -31,6 +37,8 @@ func (r *Runner) classifyOutput(raw string, tools []ToolDefinition, rng *Rng) (c
 				content, calls = extractToolCallsMistral(content)
 			case kind == "kimi-chat":
 				content, calls = extractToolCallsKimi(content)
+			case kind == "llama31-chat":
+				content, calls = extractToolCallsLlama31(content)
 			default:
 				content, calls = extractToolCallsGeneric(content)
 			}
@@ -62,6 +70,44 @@ func (r *Runner) classifyOutput(raw string, tools []ToolDefinition, rng *Rng) (c
 // reasoning.
 func extractThink(text string) (content, reasoning string) {
 	const openTag, closeTag = "<think>", "</think>"
+	var contentBuf strings.Builder
+	var reasoningParts []string
+	rest := text
+	if closeIdx := strings.Index(rest, closeTag); closeIdx >= 0 {
+		openIdx := strings.Index(rest, openTag)
+		if openIdx < 0 || closeIdx < openIdx {
+			reasoningParts = append(reasoningParts, rest[:closeIdx])
+			rest = rest[closeIdx+len(closeTag):]
+		}
+	}
+	for {
+		i := strings.Index(rest, openTag)
+		if i < 0 {
+			contentBuf.WriteString(rest)
+			break
+		}
+		contentBuf.WriteString(rest[:i])
+		rest = rest[i+len(openTag):]
+		j := strings.Index(rest, closeTag)
+		if j < 0 {
+			reasoningParts = append(reasoningParts, rest)
+			break
+		}
+		reasoningParts = append(reasoningParts, rest[:j])
+		rest = rest[j+len(closeTag):]
+	}
+	return strings.TrimSpace(contentBuf.String()), strings.TrimSpace(strings.Join(reasoningParts, "\n\n"))
+}
+
+// extractMistralThink separates Ministral-3-Reasoning's native
+// [THINK]...[/THINK] blocks. Older Mistral models may still emit <think>
+// markers, so retain the normal extractor when no native bracket marker is
+// present.
+func extractMistralThink(text string) (content, reasoning string) {
+	const openTag, closeTag = "[THINK]", "[/THINK]"
+	if !strings.Contains(text, openTag) && !strings.Contains(text, closeTag) {
+		return extractThink(text)
+	}
 	var contentBuf strings.Builder
 	var reasoningParts []string
 	rest := text
@@ -141,6 +187,54 @@ func (s *ThinkStreamSplitter) Push(text string, emit func(reasoning bool, text s
 // incomplete tag text is ordinary content unless it follows an actual
 // opening <think> marker.
 func (s *ThinkStreamSplitter) Flush(emit func(reasoning bool, text string) bool) bool {
+	if s.pending == "" {
+		return true
+	}
+	text := s.pending
+	s.pending = ""
+	return emit(s.inReasoning, text)
+}
+
+// MistralThinkStreamSplitter is the streaming counterpart of
+// extractMistralThink. It is kept separate from ThinkStreamSplitter because
+// [THINK]...[/THINK] is a model-specific protocol verified against the
+// Ministral-3-Reasoning GGUF template, not a generic alternate syntax.
+type MistralThinkStreamSplitter struct {
+	inReasoning bool
+	pending     string
+}
+
+func NewMistralThinkStreamSplitter() MistralThinkStreamSplitter {
+	return MistralThinkStreamSplitter{}
+}
+
+func (s *MistralThinkStreamSplitter) Push(text string, emit func(reasoning bool, text string) bool) bool {
+	s.pending += text
+	for {
+		marker := "[THINK]"
+		if s.inReasoning {
+			marker = "[/THINK]"
+		}
+		if i := strings.Index(s.pending, marker); i >= 0 {
+			if i > 0 && !emit(s.inReasoning, s.pending[:i]) {
+				return false
+			}
+			s.pending = s.pending[i+len(marker):]
+			s.inReasoning = !s.inReasoning
+			continue
+		}
+		keep := markerPrefixSuffixLen(s.pending, marker)
+		if n := len(s.pending) - keep; n > 0 {
+			if !emit(s.inReasoning, s.pending[:n]) {
+				return false
+			}
+			s.pending = s.pending[n:]
+		}
+		return true
+	}
+}
+
+func (s *MistralThinkStreamSplitter) Flush(emit func(reasoning bool, text string) bool) bool {
 	if s.pending == "" {
 		return true
 	}
@@ -357,6 +451,33 @@ func extractToolCallsGeneric(text string) (content string, calls []ToolCall) {
 		}
 	}
 	return strings.TrimSpace(contentBuf.String()), calls
+}
+
+// extractToolCallsLlama31 parses the native custom-function form emitted by
+// Meta's Llama-3.1-Instruct template:
+//
+//	{"name":"get_weather","parameters":{"city":"Berlin"}}
+//
+// The format carries one call and no wrapper marker. It is intentionally
+// strict: ordinary JSON-looking assistant prose remains visible unless it is
+// exactly a named call with an object-valued parameters field.
+func extractToolCallsLlama31(text string) (content string, calls []ToolCall) {
+	trimmed := strings.TrimSpace(text)
+	var call struct {
+		Name       string          `json:"name"`
+		Parameters json.RawMessage `json:"parameters"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &call); err != nil || call.Name == "" {
+		return trimmed, nil
+	}
+	arguments := strings.TrimSpace(string(call.Parameters))
+	if len(arguments) == 0 || arguments[0] != '{' || !json.Valid([]byte(arguments)) {
+		return trimmed, nil
+	}
+	return "", []ToolCall{{
+		Type:     "function",
+		Function: ToolCallFunction{Name: call.Name, Arguments: arguments},
+	}}
 }
 
 // extractToolCallsQwen35 parses Qwen3.5/3.6's native XML-like convention:

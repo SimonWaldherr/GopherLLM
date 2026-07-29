@@ -174,6 +174,29 @@ func TestCorePrefaultRangesSkipOnlySparseExperts(t *testing.T) {
 	}
 }
 
+func TestCorePrefaultRangesSkipFusedSparseGateUpExperts(t *testing.T) {
+	data := buildTinySparseMoEGGUFWithExpertLayout("mixtral", false, 0, false, true)
+	gguf, err := ParseGGUFQuiet(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ranges, skipped := corePrefaultRanges(data, gguf)
+	if skipped != 2 || len(ranges) == 0 {
+		t.Fatalf("skipped=%d ranges=%v, want fused gate/up and down expert banks", skipped, ranges)
+	}
+	for _, tensor := range gguf.Tensors {
+		if !isSparseExpertTensor(tensor.Name, tensor) {
+			continue
+		}
+		start := gguf.DataOffset + int(tensor.Offset)
+		for _, r := range ranges {
+			if start >= r.start && start < r.end {
+				t.Fatalf("fused expert tensor %s starts in prefault range %+v", tensor.Name, r)
+			}
+		}
+	}
+}
+
 func TestNormalizeMmapRanges(t *testing.T) {
 	got := normalizeMmapRanges(100, []mmapByteRange{{80, 120}, {5, 10}, {-3, 6}, {12, 12}, {20, 40}, {35, 60}})
 	want := []mmapByteRange{{0, 10}, {20, 60}, {80, 100}}

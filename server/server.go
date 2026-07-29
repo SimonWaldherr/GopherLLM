@@ -1648,6 +1648,11 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 	}
 }
 
+type reasoningStreamSplitter interface {
+	Push(string, func(reasoning bool, text string) bool) bool
+	Flush(func(reasoning bool, text string) bool) bool
+}
+
 // streamOpenAIChat streams a chat completion via SSE. Content deltas flow
 // incrementally exactly as before whenever no tool call could possibly be in
 // play; once skills or caller tools are active, gopherllm.RunAgenticChat buffers the
@@ -1681,8 +1686,17 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	// marker received is the closing tag. Other models emit the opening marker
 	// themselves.
 	arch := r.Architecture()
-	startsInReasoning := arch == "nemotron_h_moe" || arch == "qwen35" || arch == "qwen35moe"
-	thinkSplitter := gopherllm.NewThinkStreamSplitter(startsInReasoning)
+	var thinkSplitter reasoningStreamSplitter
+	if arch == "mistral3" {
+		// Ministral-3-Reasoning uses the native [THINK] protocol recorded in
+		// its GGUF template, rather than the <think> protocol below.
+		splitter := gopherllm.NewMistralThinkStreamSplitter()
+		thinkSplitter = &splitter
+	} else {
+		startsInReasoning := arch == "nemotron_h_moe" || arch == "qwen35" || arch == "qwen35moe"
+		splitter := gopherllm.NewThinkStreamSplitter(startsInReasoning)
+		thinkSplitter = &splitter
+	}
 	streamedReasoning := false
 	emit := func(reasoning bool, text string) bool {
 		if text == "" {

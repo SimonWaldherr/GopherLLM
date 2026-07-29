@@ -23,8 +23,13 @@ type BERTWeights struct {
 }
 
 type BERTLayerWeights struct {
-	Q, K, V, Output              Weight
-	QB, KB, VB, OutputB          []float32
+	Q, K, V, Output Weight
+	// QKV holds a single [Q; K; V] projection when the GGUF stores the
+	// attention projections fused.  Nomic Embed v1.5 uses this layout: its
+	// attn_qkv.weight has 3*Dim output rows instead of separate q/k/v tensors.
+	QKV                          Weight
+	HasQKV                       bool
+	QB, KB, VB, QKVB, OutputB    []float32
 	AttentionNorm, AttentionBias []float32
 	FFNUp, FFNDown, FFNGate      Weight
 	FFNUpB, FFNDownB             []float32
@@ -36,18 +41,24 @@ type BERTLayerWeights struct {
 // avoid re-allocating several MiB for every repeated API embedding request.
 // The exported EmbedBERT function supplies a short-lived instance instead.
 type bertEmbeddingScratch struct {
-	XFlat, QFlat, KFlat, VFlat, HiddenFlat, GateFlat []float32
-	X, Q, K, V, Hidden, Gate                         [][]float32
-	Position, RopeSin, RopeCos, Scores               []float32
+	XFlat, QFlat, KFlat, VFlat, QKVFlat, HiddenFlat, GateFlat []float32
+	X, Q, K, V, QKV, Hidden, Gate                             [][]float32
+	Position, RopeSin, RopeCos, Scores                        []float32
 }
 
 const maxReusableBERTScratchBytes int64 = 128 << 20
 
-func reusableBERTScratch(n, dim, hidden int, useGate bool) bool {
+func reusableBERTScratch(n, dim, hidden int, useGate, useFusedQKV bool) bool {
 	if n <= 0 || dim <= 0 || hidden < 0 {
 		return false
 	}
 	values := int64(n) * (int64(dim)*4 + int64(hidden))
+	if useFusedQKV {
+		// The combined projection is transient (it is split into Q/K/V before
+		// attention), but retaining it in Runner scratch avoids a large
+		// per-request allocation for Nomic's fused QKV tensor.
+		values += int64(n) * int64(dim) * 3
+	}
 	if useGate {
 		values += int64(n) * int64(hidden)
 	}
@@ -98,17 +109,30 @@ func LoadBERTModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantize
 	layers := make([]BERTLayerWeights, 0, config.NLayers)
 	for l := range config.NLayers {
 		prefix := fmt.Sprintf("blk.%d.", l)
-		q, err := load(prefix + "attn_q.weight")
-		if err != nil {
-			return config, BERTWeights{}, err
-		}
-		k, err := load(prefix + "attn_k.weight")
-		if err != nil {
-			return config, BERTWeights{}, err
-		}
-		v, err := load(prefix + "attn_v.weight")
-		if err != nil {
-			return config, BERTWeights{}, err
+		var q, k, v, qkv Weight
+		hasQKV := false
+		if info, ok := tensors[prefix+"attn_qkv.weight"]; ok {
+			if len(info.Dims) != 2 || int(info.Dims[0]) != config.Dim || int(info.Dims[1]) != 3*config.Dim {
+				return config, BERTWeights{}, fmt.Errorf("invalid fused BERT QKV shape for layer %d: got %v, want [%d %d]", l, info.Dims, config.Dim, 3*config.Dim)
+			}
+			qkv, err = load(prefix + "attn_qkv.weight")
+			if err != nil {
+				return config, BERTWeights{}, err
+			}
+			hasQKV = true
+		} else {
+			q, err = load(prefix + "attn_q.weight")
+			if err != nil {
+				return config, BERTWeights{}, err
+			}
+			k, err = load(prefix + "attn_k.weight")
+			if err != nil {
+				return config, BERTWeights{}, err
+			}
+			v, err = load(prefix + "attn_v.weight")
+			if err != nil {
+				return config, BERTWeights{}, err
+			}
 		}
 		output, err := load(prefix + "attn_output.weight")
 		if err != nil {
@@ -138,10 +162,11 @@ func LoadBERTModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantize
 			return config, BERTWeights{}, err
 		}
 		layers = append(layers, BERTLayerWeights{
-			Q: q, K: k, V: v, Output: output,
+			Q: q, K: k, V: v, QKV: qkv, HasQKV: hasQKV, Output: output,
 			QB:            loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_q.bias", tensors, inferred, config.Dim),
 			KB:            loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_k.bias", tensors, inferred, config.Dim),
 			VB:            loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_v.bias", tensors, inferred, config.Dim),
+			QKVB:          loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_qkv.bias", tensors, inferred, 3*config.Dim),
 			OutputB:       loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_output.bias", tensors, inferred, config.Dim),
 			AttentionNorm: attentionNorm,
 			AttentionBias: loadOptionalF32Vec(data, gguf.DataOffset, prefix+"attn_output_norm.bias", tensors, inferred, config.Dim),
@@ -175,7 +200,7 @@ func (r *Runner) embedBERT(text string) (EmbeddingResult, error) {
 		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	var scratch *bertEmbeddingScratch
-	if reusableBERTScratch(len(tokens), r.config.Dim, r.config.HiddenDim, r.bert.UseRoPE) {
+	if reusableBERTScratch(len(tokens), r.config.Dim, r.config.HiddenDim, r.bert.UseRoPE, bertHasFusedQKV(r.bert)) {
 		scratch = &r.bertScratch
 	}
 	matvec := bertBatchMatvec(matvecBERTBatch)
@@ -186,6 +211,15 @@ func (r *Runner) embedBERT(text string) (EmbeddingResult, error) {
 		matvec = matvecBERTSequential
 	}
 	return embedBERTWithScratch(r.config, r.bert, tokens, matvec, scratch)
+}
+
+func bertHasFusedQKV(weights BERTWeights) bool {
+	for i := range weights.Layers {
+		if weights.Layers[i].HasQKV {
+			return true
+		}
+	}
+	return false
 }
 
 // bertBatchMatvec lets the BERT graph use one batched matrix traversal per
@@ -268,19 +302,40 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 	q := reuseBatchViews(&scratch.QFlat, &scratch.Q, n, dim)
 	k := reuseBatchViews(&scratch.KFlat, &scratch.K, n, dim)
 	v := reuseBatchViews(&scratch.VFlat, &scratch.V, n, dim)
+	var qkv [][]float32
+	if bertHasFusedQKV(weights) {
+		qkv = reuseBatchViews(&scratch.QKVFlat, &scratch.QKV, n, 3*dim)
+	}
 	hidden := reuseBatchViews(&scratch.HiddenFlat, &scratch.Hidden, n, config.HiddenDim)
 	var gate [][]float32
 	if weights.UseRoPE {
 		gate = reuseBatchViews(&scratch.GateFlat, &scratch.Gate, n, config.HiddenDim)
 	}
 	for _, layer := range weights.Layers {
-		matvec(layer.Q, x, q)
-		matvec(layer.K, x, k)
-		matvec(layer.V, x, v)
+		if layer.HasQKV {
+			matvec(layer.QKV, x, qkv)
+			for i := range n {
+				copy(q[i], qkv[i][:dim])
+				copy(k[i], qkv[i][dim:2*dim])
+				copy(v[i], qkv[i][2*dim:])
+			}
+		} else {
+			matvec(layer.Q, x, q)
+			matvec(layer.K, x, k)
+			matvec(layer.V, x, v)
+		}
 		for i := range n {
-			addInPlace(q[i], layer.QB)
-			addInPlace(k[i], layer.KB)
-			addInPlace(v[i], layer.VB)
+			if layer.HasQKV {
+				if len(layer.QKVB) >= 3*dim {
+					addInPlace(q[i], layer.QKVB[:dim])
+					addInPlace(k[i], layer.QKVB[dim:2*dim])
+					addInPlace(v[i], layer.QKVB[2*dim:])
+				}
+			} else {
+				addInPlace(q[i], layer.QB)
+				addInPlace(k[i], layer.KB)
+				addInPlace(v[i], layer.VB)
+			}
 			if weights.UseRoPE {
 				half, cached := prepareRopeScratch(i, headDim, config.RopeDimensionCount, ropeInv, ropeMscale, &scratch.RopeSin, &scratch.RopeCos)
 				applyPreparedRope(q[i], headDim, config.NHeads, half, cached, scratch.RopeSin, scratch.RopeCos, false)
@@ -425,6 +480,7 @@ func releaseBERTMetalWeights(weights *BERTWeights) {
 		release(&layer.Q)
 		release(&layer.K)
 		release(&layer.V)
+		release(&layer.QKV)
 		release(&layer.Output)
 		release(&layer.FFNUp)
 		release(&layer.FFNDown)

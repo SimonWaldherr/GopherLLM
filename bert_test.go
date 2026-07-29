@@ -8,6 +8,14 @@ import (
 func buildTinyBERTGGUF() []byte { return buildTinyBERTGGUFWithArch("bert") }
 
 func buildTinyBERTGGUFWithArch(arch string) []byte {
+	return buildTinyBERTGGUFWithArchAndFusedQKV(arch, false)
+}
+
+func buildTinyBERTGGUFWithFusedQKV(arch string) []byte {
+	return buildTinyBERTGGUFWithArchAndFusedQKV(arch, true)
+}
+
+func buildTinyBERTGGUFWithArchAndFusedQKV(arch string, fusedQKV bool) []byte {
 	const (
 		dim    = 4
 		heads  = 2
@@ -48,15 +56,30 @@ func buildTinyBERTGGUFWithArch(arch string) []byte {
 		return ggufTensor{name: name, dims: []uint64{uint64(n)}, dtype: GGMLTypeF32, data: f32Bytes(values)}
 	}
 	zeros := make([]float32, dim)
+	qData := smallWeights(dim*dim, 3)
+	kData := smallWeights(dim*dim, 4)
+	vData := smallWeights(dim*dim, 5)
+	matrix := func(name string, rows, cols int, values []float32) ggufTensor {
+		return ggufTensor{name: name, dims: []uint64{uint64(cols), uint64(rows)}, dtype: GGMLTypeF32, data: f32Bytes(values)}
+	}
+	attention := []ggufTensor{
+		matrix("blk.0.attn_q.weight", dim, dim, qData),
+		matrix("blk.0.attn_k.weight", dim, dim, kData),
+		matrix("blk.0.attn_v.weight", dim, dim, vData),
+	}
+	if fusedQKV {
+		fused := make([]float32, 0, 3*dim*dim)
+		fused = append(fused, qData...)
+		fused = append(fused, kData...)
+		fused = append(fused, vData...)
+		attention = []ggufTensor{matrix("blk.0.attn_qkv.weight", 3*dim, dim, fused)}
+	}
 	tensors := []ggufTensor{
 		f32t("token_embd.weight", vocab, dim, 1),
 		f32t("position_embd.weight", 16, dim, 2),
 		vec("token_embd_norm.weight", dim, nil),
 		vec("token_embd_norm.bias", dim, zeros),
 		vec("token_types.weight", dim, zeros),
-		f32t("blk.0.attn_q.weight", dim, dim, 3),
-		f32t("blk.0.attn_k.weight", dim, dim, 4),
-		f32t("blk.0.attn_v.weight", dim, dim, 5),
 		f32t("blk.0.attn_output.weight", dim, dim, 6),
 		vec("blk.0.attn_q.bias", dim, zeros),
 		vec("blk.0.attn_k.bias", dim, zeros),
@@ -71,6 +94,10 @@ func buildTinyBERTGGUFWithArch(arch string) []byte {
 		vec("blk.0.layer_output_norm.weight", dim, nil),
 		vec("blk.0.layer_output_norm.bias", dim, zeros),
 	}
+	// Keep the Q/K/V group next to the rest of attention tensors. The exact
+	// ordering is immaterial to GGUF, but putting it here makes the fused test
+	// fixture resemble the real Nomic v1.5 files.
+	tensors = append(tensors[:5], append(attention, tensors[5:]...)...)
 	if arch == "nomic-bert" {
 		// Nomic-BERT uses RoPE rather than absolute position embeddings.
 		tensors = append(tensors[:1], tensors[2:]...)
@@ -125,6 +152,74 @@ func TestLoadAndEmbedTinyNomicBERTModel(t *testing.T) {
 	}
 	if _, err := r.Embed("nomic"); err != nil {
 		t.Fatalf("embed: %v", err)
+	}
+}
+
+func TestLoadAndEmbedTinyFusedQKVNomicBERTModel(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithFusedQKV("nomic-bert"))
+	if err != nil {
+		t.Fatalf("load fused nomic-bert: %v", err)
+	}
+	if !r.bert.Layers[0].HasQKV {
+		t.Fatal("fused Nomic QKV tensor was not retained as a fused projection")
+	}
+	if r.bert.Layers[0].Q.F32 != nil || r.bert.Layers[0].K.F32 != nil || r.bert.Layers[0].V.F32 != nil {
+		t.Fatal("fused Nomic QKV unexpectedly loaded split Q/K/V weights")
+	}
+	emb, err := r.Embed("nomic")
+	if err != nil {
+		t.Fatalf("embed fused nomic-bert: %v", err)
+	}
+	if len(emb.Embedding) != r.config.Dim || emb.TokenCount == 0 {
+		t.Fatalf("embedding=%d tokens=%d", len(emb.Embedding), emb.TokenCount)
+	}
+}
+
+func TestEmbedFusedBERTQKVMatchesSplit(t *testing.T) {
+	split, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithArch("nomic-bert"))
+	if err != nil {
+		t.Fatalf("load split nomic-bert: %v", err)
+	}
+	fused, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithFusedQKV("nomic-bert"))
+	if err != nil {
+		t.Fatalf("load fused nomic-bert: %v", err)
+	}
+	tokens := []uint32{3, 4, 5, 6}
+	want, err := embedBERTWithMatvec(split.config, split.bert, tokens, matvecBERTSequential)
+	if err != nil {
+		t.Fatalf("embed split nomic-bert: %v", err)
+	}
+	got, err := EmbedBERT(fused.config, fused.bert, tokens)
+	if err != nil {
+		t.Fatalf("embed fused nomic-bert: %v", err)
+	}
+	if got.TokenCount != want.TokenCount || len(got.Embedding) != len(want.Embedding) {
+		t.Fatalf("shape got=%d/%d want=%d/%d", got.TokenCount, len(got.Embedding), want.TokenCount, len(want.Embedding))
+	}
+	for i := range want.Embedding {
+		if d := math.Abs(float64(got.Embedding[i] - want.Embedding[i])); d > 1e-5 {
+			t.Fatalf("embedding[%d]: fused=%v split=%v", i, got.Embedding[i], want.Embedding[i])
+		}
+	}
+}
+
+func TestRunnerFusedBERTQKVScratchIsReused(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithFusedQKV("nomic-bert"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Embed("nomic"); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.bertScratch.QKVFlat) == 0 {
+		t.Fatal("fused BERT QKV scratch was not retained by Runner")
+	}
+	first := &r.bertScratch.QKVFlat[0]
+	if _, err := r.Embed("nomic"); err != nil {
+		t.Fatal(err)
+	}
+	if &r.bertScratch.QKVFlat[0] != first {
+		t.Fatal("same-shape fused BERT embedding reallocated QKV scratch")
 	}
 }
 
