@@ -302,6 +302,10 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	if scale == 0 {
 		scale = float32(1 / math.Sqrt(float64(headDim)))
 	}
+	qScale := float32(1)
+	if config.Arch == "phi2" {
+		qScale, scale = scale, 1
+	}
 	for l := 0; l < config.NLayers; l++ {
 		layer := weights.Layers[l]
 		for t := 0; t < p; t++ {
@@ -348,6 +352,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			if temperature := attentionTemperatureAt(config, pos); temperature != 1 {
 				ScaleF32(Q[t], temperature)
 			}
+			if qScale != 1 {
+				ScaleF32(Q[t], qScale)
+			}
 			cache.storeKV(l, pos, K[t], V[t])
 		}
 
@@ -389,13 +396,21 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			} else {
 				addInPlace(X[t], Proj[t])
 			}
-			if config.usesPostNormOnly() {
+			if config.Arch == "phi2" {
+				// Phi-2's attention and MLP branches share the same single
+				// LayerNorm output computed at the beginning of the block.
+			} else if config.usesPostNormOnly() {
 				copy(XN[t], X[t])
 			} else {
 				normalizeDecoderInto(config, X[t], layer.FFNNorm, layer.FFNNormBias, &XN[t])
 			}
 		}
-		if layer.HasGateUp {
+		if config.Arch == "phi2" {
+			matvecBatch(layer.W3, XN, Up)
+			for t := 0; t < p; t++ {
+				addInPlace(Up[t], layer.FFNUpBias)
+			}
+		} else if layer.HasGateUp {
 			gateUpLen := hDim * 2
 			GateUp = reuseBatchViews(&b.GateUpFlat, &b.GateUp, p, gateUpLen)
 			matvecBatch(layer.WGateUp, XN, GateUp)
@@ -409,7 +424,11 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 		activateFFN := func(ts, te int) {
 			for t := ts; t < te; t++ {
-				if config.UseGELU {
+				if config.Arch == "phi2" {
+					for i := 0; i < hDim; i++ {
+						Hidden[t][i] = geluExact(Up[t][i])
+					}
+				} else if config.UseGELU {
 					for i := 0; i < hDim; i++ {
 						Hidden[t][i] = geluTanh(Gate[t][i]) * Up[t][i]
 					}
@@ -427,6 +446,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 		matvecBatch(layer.W2, Hidden, Proj)
 		for t := 0; t < p; t++ {
+			addInPlace(Proj[t], layer.FFNDownBias)
 			if layer.PostFFNNorm != nil {
 				rmsNormInto(Proj[t], layer.PostFFNNorm, config.RMSNormEps, &Proj[t])
 			}
@@ -450,6 +470,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		last := p - 1
 		normalizeDecoderInto(config, X[last], weights.OutputNorm, weights.OutputNormBias, &buf.XN)
 		weights.Output.MatvecInto(buf.XN, logits)
+		addInPlace(*logits, weights.OutputBias)
 		if config.LogitScale != 1 {
 			ScaleF32(*logits, 1/config.LogitScale)
 		}

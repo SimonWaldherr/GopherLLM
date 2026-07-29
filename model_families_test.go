@@ -161,6 +161,86 @@ func buildTinyOlmo2GGUFWithOutput(withOutput bool) []byte {
 	return buildGGUF(3, kvs, tensors)
 }
 
+func buildTinyPhi2GGUF() []byte {
+	return buildTinyPhi2GGUFWithOutputBias(true)
+}
+
+func buildTinyPhi2GGUFWithOutputBias(withOutputBias bool) []byte {
+	const (
+		dim    = 8
+		heads  = 2
+		kv     = 2
+		hdim   = dim / heads
+		hidden = 16
+		vocab  = 18
+	)
+	toks := make([]any, vocab)
+	scores := make([]any, vocab)
+	for i := 0; i < vocab; i++ {
+		if i == 0 {
+			toks[i] = "<unk>"
+		} else if i == 1 {
+			toks[i] = "<|endoftext|>"
+		} else {
+			toks[i] = string(rune('a' + i - 2))
+		}
+		scores[i] = float32(0)
+	}
+	kvs := []ggufKV{
+		{"general.architecture", ggufStr, "phi2"},
+		{"general.name", ggufStr, "tiny-phi2"},
+		{"phi2.embedding_length", ggufU32, uint32(dim)},
+		{"phi2.block_count", ggufU32, uint32(1)},
+		{"phi2.attention.head_count", ggufU32, uint32(heads)},
+		{"phi2.attention.head_count_kv", ggufU32, uint32(kv)},
+		{"phi2.attention.key_length", ggufU32, uint32(hdim)},
+		{"phi2.attention.value_length", ggufU32, uint32(hdim)},
+		{"phi2.feed_forward_length", ggufU32, uint32(hidden)},
+		{"phi2.context_length", ggufU32, uint32(1024)},
+		{"phi2.attention.layer_norm_epsilon", ggufF32, float32(1e-5)},
+		{"phi2.rope.freq_base", ggufF32, float32(10000)},
+		{"phi2.rope.dimension_count", ggufU32, uint32(hdim)},
+		{"tokenizer.ggml.model", ggufStr, "gpt2"},
+		{"tokenizer.ggml.pre", ggufStr, "gpt2"},
+		{"tokenizer.ggml.tokens", ggufArr, ggufArray{ggufStr, toks}},
+		{"tokenizer.ggml.scores", ggufArr, ggufArray{ggufF32, scores}},
+		{"tokenizer.ggml.eos_token_id", ggufU32, uint32(1)},
+		{"tokenizer.ggml.add_bos_token", ggufBool, false},
+	}
+	f32t := func(name string, rows, cols, seed int) ggufTensor {
+		return ggufTensor{name: name, dims: []uint64{uint64(cols), uint64(rows)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(rows*cols, seed))}
+	}
+	vec := func(name string, values []float32) ggufTensor {
+		return ggufTensor{name: name, dims: []uint64{uint64(len(values))}, dtype: GGMLTypeF32, data: f32Bytes(values)}
+	}
+	zeros := func(n int) []float32 { return make([]float32, n) }
+	outputBias := make([]float32, vocab)
+	for i := range outputBias {
+		outputBias[i] = float32(i-4) * 0.01
+	}
+	tensors := []ggufTensor{
+		f32t("token_embd.weight", vocab, dim, 31),
+		vec("output_norm.weight", onesF32(dim)),
+		vec("output_norm.bias", zeros(dim)),
+		f32t("output.weight", vocab, dim, 32),
+		vec("blk.0.attn_norm.weight", onesF32(dim)),
+		vec("blk.0.attn_norm.bias", zeros(dim)),
+		f32t("blk.0.attn_q.weight", heads*hdim, dim, 33),
+		f32t("blk.0.attn_k.weight", kv*hdim, dim, 34),
+		f32t("blk.0.attn_v.weight", kv*hdim, dim, 35),
+		f32t("blk.0.attn_output.weight", dim, heads*hdim, 36),
+		vec("blk.0.attn_output.bias", zeros(dim)),
+		f32t("blk.0.ffn_up.weight", hidden, dim, 37),
+		vec("blk.0.ffn_up.bias", zeros(hidden)),
+		f32t("blk.0.ffn_down.weight", dim, hidden, 38),
+		vec("blk.0.ffn_down.bias", zeros(dim)),
+	}
+	if withOutputBias {
+		tensors = append(tensors, vec("output.bias", outputBias))
+	}
+	return buildGGUF(3, kvs, tensors)
+}
+
 func TestSmolLM3LoadsAndUsesItsRopeSchedule(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF("smollm3"))
 	if err != nil {
@@ -353,5 +433,72 @@ func TestOlmo2RequiresUntiedOutput(t *testing.T) {
 	_, err := RunnerFromGGUFBytes(buildTinyOlmo2GGUFWithOutput(false))
 	if err == nil || !strings.Contains(err.Error(), "olmo2 requires output.weight") {
 		t.Fatalf("error = %v, want required output diagnostic", err)
+	}
+}
+
+func TestPhi2LoadsNativeParallelBiasedGraph(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyPhi2GGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.config.UseLayerNorm || !r.config.ParallelResidual || !r.config.UseGELU {
+		t.Fatalf("unexpected Phi-2 graph flags: %+v", r.config)
+	}
+	layer := r.standard.Layers[0]
+	if layer.FFNNorm != nil || layer.W1.F32 != nil || layer.W1.Raw != nil || layer.W3.F32 == nil {
+		t.Fatal("Phi-2 must load one shared norm and an ungated up projection")
+	}
+	if len(layer.AttnNormBias) != r.config.Dim ||
+		len(layer.FFNUpBias) != r.config.HiddenDim ||
+		len(layer.FFNDownBias) != r.config.Dim ||
+		len(r.standard.OutputBias) != r.config.VocabSize {
+		t.Fatal("Phi-2 mandatory biases were not loaded")
+	}
+	if !r.canBatchPrefill() {
+		t.Fatal("Phi-2 should support batched prefill")
+	}
+	tokens := r.tok.Encode("abcdefghijklm")
+	assertStandardBatchParity(t, r, tokens)
+}
+
+func TestPhi2OutputBiasIsApplied(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyPhi2GGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	kDim, vDim, mh, mk, mv := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, 2)
+	buf := NewDecodeBuffer(r.config, mh, mk, mv)
+	ForwardBodyInto(r.config, r.standard, cache, buf, 2, 0)
+	withBias := []float32{}
+	ProjectLogitsInto(r.config, r.standard, buf, &withBias)
+	withoutWeights := r.standard
+	withoutWeights.OutputBias = nil
+	withoutBias := []float32{}
+	ProjectLogitsInto(r.config, withoutWeights, buf, &withoutBias)
+	for i, bias := range r.standard.OutputBias {
+		if d := (withBias[i] - withoutBias[i]) - bias; d < -1e-6 || d > 1e-6 {
+			t.Fatalf("logit %d bias delta = %v, want %v", i, withBias[i]-withoutBias[i], bias)
+		}
+	}
+}
+
+func TestPhi2RejectsMissingOutputBias(t *testing.T) {
+	_, err := RunnerFromGGUFBytes(buildTinyPhi2GGUFWithOutputBias(false))
+	if err == nil || !strings.Contains(err.Error(), "phi2 requires 18-element output.bias") {
+		t.Fatalf("error = %v, want output bias diagnostic", err)
+	}
+}
+
+func TestGreedyArgmaxIncludesOutputBias(t *testing.T) {
+	config := Config{Dim: 2, VocabSize: 2, LogitScale: 1}
+	weights := ModelWeights{
+		Output:     Weight{F32: make([]float32, 4), Rows: 2, Cols: 2},
+		OutputBias: []float32{-1, 2},
+	}
+	buf := &DecodeBuffer{XN: []float32{3, 4}, Logits: make([]float32, 2)}
+	got, ok := argmaxOutputTokenInto(config, weights, buf, nil)
+	if !ok || got != 1 {
+		t.Fatalf("argmax = %d, ok=%v; want biased token 1", got, ok)
 	}
 }

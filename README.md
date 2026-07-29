@@ -883,7 +883,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   coarse batch range per worker to avoid allocation and scheduling overhead.
   The same path now covers StableLM's LayerNorm plus parallel-residual block,
   dense Qwen3's per-head QK norm, EXAONE 4's QK plus post-branch norms, and
-  OLMo 2/3's full-projection QK plus post-branch norms. This moves all three
+  OLMo 2/3's full-projection QK plus post-branch norms, and Phi-2's shared
+  biased LayerNorm plus parallel exact-GELU branch. This moves all four
   families' prompt ingestion from per-token weight streaming onto the chunked
   path as well. Q4_0/Q8_0 rows also use the dequantize-once path, which is
   important for Stable Code and other legacy-Q4 GGUFs on Apple Silicon.
@@ -962,7 +963,7 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, qwen3, qwen3moe,
 qwen35, qwen35moe,
 deepseek2, kimi_k2,
-phi3, granite (dense), exaone, exaone4, smollm3, internlm2, stablelm,
+phi2, phi3, granite (dense), exaone, exaone4, smollm3, internlm2, stablelm,
 olmo2, gpt-oss, gemma, gemma2, gemma3, gemma4,
 nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
 ```
@@ -978,7 +979,7 @@ because some tensor names happen to match. The main coverage is:
 | Qwen | Qwen2/2.5, QwQ, dense/sparse Qwen3 and Qwen3 Coder, plus experimental text-only Qwen3.5/3.6 hybrid exports |
 | DeepSeek / Kimi | Modern DeepSeek-V2/V3 and Kimi K2 MLA layouts |
 | Gemma | Gemma 1–3 and native dense/MoE/E2B Gemma 4 text graphs |
-| Other decoders | Phi-3/3.5, dense Granite, EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
+| Other decoders | Phi-2, Phi-3/3.5, dense Granite, EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
 | Recurrent / hybrid | Mamba2 and Nemotron-H / Nemotron-H-MoE |
 | Embeddings | BERT and Nomic-BERT (`/v1/embeddings`, not chat generation) |
 
@@ -987,7 +988,7 @@ Important upstream GGUF families that are **not implemented yet**:
 | Missing family | Required work |
 |---|---|
 | Llama 4 | Its architecture-specific attention/normalization graph and model validation |
-| Phi-2 / Phi-MoE | Biased LayerNorm, parallel attention/FFN, GELU MLP, and MoE variants |
+| Phi-MoE | Sparse expert routing and the architecture-specific expert graph |
 | OLMoE | Its sparse expert router and expert execution graph |
 | Command-R / Cohere2 | Their attention, normalization, and tokenizer/chat conventions |
 | GLM4 / GLM4-MoE, MiniMax M2, LFM2 | Dedicated dense, sparse, or hybrid execution graphs |
@@ -1058,6 +1059,14 @@ schedule. Its `[|system|]` / `[|user|]` / `[|assistant|]` /
 LayerNorm, learned norm biases, and optionally its parallel residual branch.
 Sparse Granite MoE checkpoints remain intentionally rejected: their expert
 router and expert tensors require the separate MoE execution graph.
+
+`phi2` uses its native parallel block rather than the Phi-3 graph: one biased
+mean/variance LayerNorm feeds both attention and the sequential, ungated
+exact-GELU MLP; both branch outputs are added to the original residual.
+Attention-output, FFN-up/down, output-norm, and vocabulary-output biases are
+loaded and validated. The vocabulary bias is applied in both ordinary logits
+and the allocation-saving greedy argmax path. Dense Phi-2 prompt ingestion
+uses batched prefill; Phi-MoE remains a separate unsupported architecture.
 
 `olmo2` covers both dense OLMo 2 and OLMo 3 GGUFs. The latter retains the
 `olmo2` architecture label and adds a three-local/one-global sliding-attention

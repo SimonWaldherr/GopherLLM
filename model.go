@@ -70,7 +70,9 @@ type Config struct {
 	ParallelResidual bool
 	// Gemma-family mechanics (all inert at their zero values; see
 	// docs/INFERENCE_NOTES.md for the researched semantics):
-	// UseGELU switches the FFN activation from SiLU to tanh-approximated GELU.
+	// UseGELU switches the FFN activation from SiLU to GELU. Gemma uses the
+	// tanh approximation in its gated MLP; Phi-2 uses exact GELU in a
+	// sequential, ungated MLP selected by its architecture.
 	// AttnLogitSoftcap/FinalLogitSoftcap apply cap*tanh(v/cap) to attention
 	// scores / final logits (Gemma 2: 50.0 / 30.0). SWAPattern, when non-nil,
 	// restricts the sliding window to layers whose entry is true (Gemma 4
@@ -277,7 +279,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		parallelResidual, _ = v.AsBool()
 	}
 	normEps := gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5)
-	if p == "stablelm" {
+	if p == "stablelm" || p == "phi2" {
 		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
 	}
 	hiddenDim := int(gguf.GetU32(p+".feed_forward_length", 0))
@@ -333,9 +335,9 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
 		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
 		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
-		UseLayerNorm:              arch == "stablelm",
-		ParallelResidual:          parallelResidual,
-		UseGELU:                   gemmaFamily(arch),
+		UseLayerNorm:              arch == "stablelm" || arch == "phi2",
+		ParallelResidual:          parallelResidual || arch == "phi2",
+		UseGELU:                   gemmaFamily(arch) || arch == "phi2",
 		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
@@ -846,6 +848,8 @@ type LayerWeights struct {
 	W1           Weight
 	W2           Weight
 	W3           Weight
+	FFNUpBias    []float32
+	FFNDownBias  []float32
 	WGateUp      Weight
 	HasGateUp    bool
 	// MLA is set for DeepSeek-V2/V3 and Kimi-K2 attention blocks.  Those
@@ -875,6 +879,7 @@ type ModelWeights struct {
 	OutputNorm     []float32
 	OutputNormBias []float32
 	Output         Weight
+	OutputBias     []float32
 	Layers         []LayerWeights
 }
 
@@ -1395,10 +1400,21 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 			return config, ModelWeights{}, err
 		}
 	} else {
-		if config.Arch == "olmo2" {
-			return config, ModelWeights{}, fmt.Errorf("olmo2 requires output.weight")
+		if config.Arch == "olmo2" || config.Arch == "phi2" {
+			return config, ModelWeights{}, fmt.Errorf("%s requires output.weight", config.Arch)
 		}
 		fmt.Fprintln(logw, "Note: output tied to embeddings")
+	}
+	outputBias := loadOptionalF32VecNil(data, gguf.DataOffset, "output.bias", tensorIdx, inferred)
+	outputNormBias := loadOptionalF32Vec(data, gguf.DataOffset, "output_norm.bias", tensorIdx, inferred, config.Dim)
+	if config.Arch == "phi2" {
+		if len(outputBias) != config.VocabSize {
+			return config, ModelWeights{}, fmt.Errorf("phi2 requires %d-element output.bias", config.VocabSize)
+		}
+		outputNormBias = loadOptionalF32VecNil(data, gguf.DataOffset, "output_norm.bias", tensorIdx, inferred)
+		if len(outputNormBias) != config.Dim {
+			return config, ModelWeights{}, fmt.Errorf("phi2 requires %d-element output_norm.bias", config.Dim)
+		}
 	}
 
 	layers := make([]LayerWeights, 0, config.NLayers)
@@ -1417,8 +1433,10 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	}
 	return config, ModelWeights{
 		TokenEmbd: tokenEmbd, OutputNorm: outputNorm,
-		OutputNormBias: loadOptionalF32Vec(data, gguf.DataOffset, "output_norm.bias", tensorIdx, inferred, config.Dim),
-		Output:         output, Layers: layers,
+		OutputNormBias: outputNormBias,
+		Output:         output,
+		OutputBias:     outputBias,
+		Layers:         layers,
 	}, nil
 }
 
@@ -1532,7 +1550,7 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		return LayerWeights{}, err
 	}
 	var ffnNorm []float32
-	if config.usesPostNormOnly() {
+	if config.usesPostNormOnly() || config.Arch == "phi2" {
 		ffnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
 	} else {
 		ffnNorm, err = loadF32Vec(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
@@ -1553,7 +1571,12 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
+		if config.Arch == "phi2" {
+			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+			if err != nil {
+				return LayerWeights{}, err
+			}
+		} else if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
 			w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 			if err != nil {
 				return LayerWeights{}, err
@@ -1604,6 +1627,21 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 			return LayerWeights{}, fmt.Errorf("olmo2 requires %d-element post_attention_norm and post_ffw_norm tensors", config.Dim)
 		}
 	}
+	var ffnUpBias, ffnDownBias []float32
+	if config.Arch == "phi2" {
+		attnNormBias := loadOptionalF32VecNil(data, dataOffset, prefix+"attn_norm.bias", tensors, inferred)
+		ffnUpBias = loadOptionalF32VecNil(data, dataOffset, prefix+"ffn_up.bias", tensors, inferred)
+		ffnDownBias = loadOptionalF32VecNil(data, dataOffset, prefix+"ffn_down.bias", tensors, inferred)
+		if len(attnNormBias) != config.Dim {
+			return LayerWeights{}, fmt.Errorf("phi2 requires %d-element %sattn_norm.bias", config.Dim, prefix)
+		}
+		if _, ok := tensors[prefix+"attn_output.bias"]; !ok || len(bo) != config.Dim {
+			return LayerWeights{}, fmt.Errorf("phi2 requires %d-element %sattn_output.bias", config.Dim, prefix)
+		}
+		if len(ffnUpBias) != config.HiddenDim || len(ffnDownBias) != config.Dim {
+			return LayerWeights{}, fmt.Errorf("phi2 requires %d-element ffn_up.bias and %d-element ffn_down.bias", config.HiddenDim, config.Dim)
+		}
+	}
 	if config.Arch == "gpt-oss" {
 		if len(attnSinks) != config.NHeads {
 			return LayerWeights{}, fmt.Errorf("gpt-oss requires %d-element attn_sinks.weight", config.NHeads)
@@ -1630,6 +1668,8 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		W1:           w1,
 		W2:           w2,
 		W3:           w3,
+		FFNUpBias:    ffnUpBias,
+		FFNDownBias:  ffnDownBias,
 		WGateUp:      wGateUp,
 		HasGateUp:    hasGateUp,
 		MoE:          moe,
@@ -1936,6 +1976,7 @@ func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *Decod
 
 func ProjectLogitsInto(config Config, weights ModelWeights, buf *DecodeBuffer, logits *[]float32) {
 	weights.Output.MatvecInto(buf.XN, logits)
+	addInPlace(*logits, weights.OutputBias)
 	if config.LogitScale != 1 {
 		ScaleF32(*logits, 1/config.LogitScale)
 	}
@@ -1951,6 +1992,14 @@ func ArgmaxOutputToken(config Config, weights ModelWeights, buf *DecodeBuffer) (
 func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffer, logits *[]float32) (uint32, bool) {
 	if !finite32(config.LogitScale) || config.LogitScale <= 0 || config.FinalLogitSoftcap < 0 {
 		return 0, false
+	}
+	if len(weights.OutputBias) > 0 {
+		ProjectLogitsInto(config, weights, buf, &buf.Logits)
+		if logits != nil {
+			ensureLenNoClear(logits, len(buf.Logits))
+			copy(*logits, buf.Logits)
+		}
+		return argmaxFiniteToken(buf.Logits), true
 	}
 	// Greedy decode only needs the winning token. Positive logit scaling and the
 	// optional positive softcap preserve argmax ordering, so Metal can reduce its
@@ -2052,6 +2101,12 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		if scale == 0 {
 			scale = float32(1 / math.Sqrt(float64(headDim)))
 		}
+		if config.Arch == "phi2" {
+			// Phi-2 scales Q before the dot product and uses a unit attention
+			// scale to keep intermediate scores in the trained precision range.
+			ScaleF32(buf.Q, scale)
+			scale = 1
+		}
 		attnStart := 0
 		if config.layerUsesSWA(l) {
 			attnStart = max(0, pos-config.SlidingWindow)
@@ -2077,7 +2132,10 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.X[:dim], buf.Proj)
 		}
 
-		if config.usesPostNormOnly() {
+		if config.Arch == "phi2" {
+			ensureLenNoClear(&buf.XN2, dim)
+			copy(buf.XN2, buf.XN[:dim])
+		} else if config.usesPostNormOnly() {
 			ensureLenNoClear(&buf.XN2, dim)
 			copy(buf.XN2, buf.X[:dim])
 		} else {
@@ -2091,39 +2149,51 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			// Keep all three stages in one command buffer when the measured
 			// Q4_K/Q4_K/Q6_K shape matches. Any unsupported shape or GPU failure falls
 			// through to the unchanged CPU/GPU path; removing this branch is rollback.
-			fusedMetalFFN := !layer.HasGateUp && !config.UseGELU &&
+			fusedMetalFFN := config.Arch != "phi2" && !layer.HasGateUp && !config.UseGELU &&
 				matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
 			if !fusedMetalFFN {
-				if layer.HasGateUp {
-					layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
-					ensureLenNoClear(&buf.Gate, config.HiddenDim)
-					ensureLenNoClear(&buf.Up, config.HiddenDim)
-					copy(buf.Gate, buf.GateUp[:config.HiddenDim])
-					copy(buf.Up, buf.GateUp[config.HiddenDim:2*config.HiddenDim])
+				if config.Arch == "phi2" {
+					layer.W3.MatvecInto(buf.XN2, &buf.Up)
+					addInPlace(buf.Up, layer.FFNUpBias)
+					ensureLenNoClear(&buf.Hidden, config.HiddenDim)
+					for i := range config.HiddenDim {
+						buf.Hidden[i] = geluExact(buf.Up[i])
+					}
+					layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
+					addInPlace(buf.Proj, layer.FFNDownBias)
 				} else {
-					if !tryMatvec2Into(layer.W1, layer.W3, buf.XN2, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
-						layer.W1.MatvecInto(buf.XN2, &buf.Gate)
-						layer.W3.MatvecInto(buf.XN2, &buf.Up)
-					}
-				}
-				hDim := config.HiddenDim
-				ensureLenNoClear(&buf.Hidden, hDim)
-				if hDim > 0 {
-					gate := buf.Gate
-					up := buf.Up
-					hidden := buf.Hidden
-					_ = gate[hDim-1]
-					_ = up[hDim-1]
-					_ = hidden[hDim-1]
-					if config.UseGELU {
-						for i := 0; i < hDim; i++ {
-							hidden[i] = geluTanh(gate[i]) * up[i]
-						}
+					if layer.HasGateUp {
+						layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
+						ensureLenNoClear(&buf.Gate, config.HiddenDim)
+						ensureLenNoClear(&buf.Up, config.HiddenDim)
+						copy(buf.Gate, buf.GateUp[:config.HiddenDim])
+						copy(buf.Up, buf.GateUp[config.HiddenDim:2*config.HiddenDim])
 					} else {
-						siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
+						if !tryMatvec2Into(layer.W1, layer.W3, buf.XN2, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+							layer.W1.MatvecInto(buf.XN2, &buf.Gate)
+							layer.W3.MatvecInto(buf.XN2, &buf.Up)
+						}
 					}
+					hDim := config.HiddenDim
+					ensureLenNoClear(&buf.Hidden, hDim)
+					if hDim > 0 {
+						gate := buf.Gate
+						up := buf.Up
+						hidden := buf.Hidden
+						_ = gate[hDim-1]
+						_ = up[hDim-1]
+						_ = hidden[hDim-1]
+						if config.UseGELU {
+							for i := 0; i < hDim; i++ {
+								hidden[i] = geluTanh(gate[i]) * up[i]
+							}
+						} else {
+							siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
+						}
+					}
+					layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
+					addInPlace(buf.Proj, layer.FFNDownBias)
 				}
-				layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
 			}
 		}
 		if layer.PostFFNNorm != nil {

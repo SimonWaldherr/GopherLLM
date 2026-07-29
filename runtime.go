@@ -306,6 +306,8 @@ type Runner struct {
 //     and its local/global attention schedule.
 //   - OLMo 2 and OLMo 3 both declare olmo2. They use full-projection QK norm,
 //     post-norm residual branches, and (for OLMo 3) separate local/global RoPE.
+//   - Phi-2 uses its native biased LayerNorm, parallel attention/exact-GELU
+//     MLP branches, mandatory projection biases, and biased vocabulary head.
 //   - Devstral and Mistral-Small GGUFs usually declare llama or mistral3;
 //     their [INST]/Tekken behavior is picked up from tokenizer metadata, not
 //     the arch string.
@@ -317,6 +319,8 @@ func ArchitectureSupported(arch string) bool {
 	case "smollm3", "exaone4":
 		return true
 	case "olmo2":
+		return true
+	case "phi2":
 		return true
 	default:
 		return false
