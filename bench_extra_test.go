@@ -312,3 +312,21 @@ func BenchmarkTinyExaone4BatchedPrefillReuse(b *testing.B) {
 		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
 	}
 }
+
+func BenchmarkTinyOlmo2BatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyOlmo2GGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := r.tok.Encode("abcdefghijklm")
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}

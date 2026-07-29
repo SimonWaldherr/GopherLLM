@@ -24,9 +24,11 @@ type batchDecodeBuffer struct {
 	GateFlat, UpFlat, HiddenFlat            []float32
 	QKVFlat, GateUpFlat                     []float32
 	RopeSinFlat, RopeCosFlat                []float32
+	RopeSWASinFlat, RopeSWACosFlat          []float32
 	X, XN, Q, K, V, AttnOut, Proj, AttnProj [][]float32
 	Gate, Up, Hidden, QKV, GateUp           [][]float32
 	RopeSin, RopeCos                        [][]float32
+	RopeSWASin, RopeSWACos                  [][]float32
 }
 
 func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]float32 {
@@ -286,6 +288,15 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			prepareRopeScratch(startPos+t, headDim, config.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &ropeSin[t], &ropeCos[t])
 		}
 	}
+	swaRopePairs := min(ropeHalf, len(buf.RopeSWAInvFreq))
+	var swaRopeSin, swaRopeCos [][]float32
+	if swaRopePairs > 0 {
+		swaRopeSin = reuseBatchViews(&b.RopeSWASinFlat, &b.RopeSWASin, p, swaRopePairs)
+		swaRopeCos = reuseBatchViews(&b.RopeSWACosFlat, &b.RopeSWACos, p, swaRopePairs)
+		for t := 0; t < p; t++ {
+			prepareRopeScratch(startPos+t, headDim, config.RopeDimensionCount, buf.RopeSWAInvFreq, buf.RopeSWAMscale, &swaRopeSin[t], &swaRopeCos[t])
+		}
+	}
 
 	scale := config.AttentionScale
 	if scale == 0 {
@@ -322,16 +333,17 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			addInPlace(Q[t], layer.BQ)
 			addInPlace(K[t], layer.BK)
 			addInPlace(V[t], layer.BV)
-			if layer.AttnQNorm != nil {
-				perHeadRMSNormInPlace(Q[t], headDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
-			}
-			if layer.AttnKNorm != nil {
-				perHeadRMSNormInPlace(K[t], headDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
-			}
+			normalizeProjectedQKInPlace(config, layer, Q[t], K[t])
 			pos := startPos + t
 			if ropePairs > 0 && config.layerUsesRoPE(l) {
-				applyPreparedRope(Q[t], headDim, config.NHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
-				applyPreparedRope(K[t], headDim, config.NKVHeads, ropeHalf, ropePairs, ropeSin[t], ropeCos[t], interleaved)
+				activePairs := ropePairs
+				activeSin, activeCos := ropeSin[t], ropeCos[t]
+				if config.layerUsesSWA(l) && swaRopePairs > 0 {
+					activePairs = swaRopePairs
+					activeSin, activeCos = swaRopeSin[t], swaRopeCos[t]
+				}
+				applyPreparedRope(Q[t], headDim, config.NHeads, ropeHalf, activePairs, activeSin, activeCos, interleaved)
+				applyPreparedRope(K[t], headDim, config.NKVHeads, ropeHalf, activePairs, activeSin, activeCos, interleaved)
 			}
 			if temperature := attentionTemperatureAt(config, pos); temperature != 1 {
 				ScaleF32(Q[t], temperature)

@@ -85,6 +85,82 @@ func buildTinyExaone4GGUFWithNextN(withNextN bool) []byte {
 	return buildGGUF(3, kvs, tensors)
 }
 
+func buildTinyOlmo2GGUF() []byte {
+	return buildTinyOlmo2GGUFWithOutput(true)
+}
+
+func buildTinyOlmo2GGUFWithOutput(withOutput bool) []byte {
+	const (
+		dim    = 8
+		heads  = 2
+		kv     = 2
+		hdim   = dim / heads
+		hidden = 16
+		vocab  = 18
+	)
+	toks := make([]any, vocab)
+	scores := make([]any, vocab)
+	for i := 0; i < vocab; i++ {
+		if i == 0 {
+			toks[i] = "<unk>"
+		} else if i == 1 {
+			toks[i] = "<|endoftext|>"
+		} else {
+			toks[i] = string(rune('a' + i - 2))
+		}
+		scores[i] = float32(0)
+	}
+	kvs := []ggufKV{
+		{"general.architecture", ggufStr, "olmo2"},
+		{"general.name", ggufStr, "tiny-olmo3-layout"},
+		{"olmo2.embedding_length", ggufU32, uint32(dim)},
+		{"olmo2.block_count", ggufU32, uint32(1)},
+		{"olmo2.attention.head_count", ggufU32, uint32(heads)},
+		{"olmo2.attention.head_count_kv", ggufU32, uint32(kv)},
+		{"olmo2.attention.key_length", ggufU32, uint32(hdim)},
+		{"olmo2.attention.value_length", ggufU32, uint32(hdim)},
+		{"olmo2.feed_forward_length", ggufU32, uint32(hidden)},
+		{"olmo2.context_length", ggufU32, uint32(1024)},
+		{"olmo2.attention.layer_norm_rms_epsilon", ggufF32, float32(1e-6)},
+		{"olmo2.attention.sliding_window", ggufU32, uint32(128)},
+		{"olmo2.attention.sliding_window_pattern", ggufU32, uint32(4)},
+		{"olmo2.rope.freq_base", ggufF32, float32(10000)},
+		{"olmo2.rope.freq_base_swa", ggufF32, float32(500000)},
+		{"olmo2.rope.dimension_count", ggufU32, uint32(hdim)},
+		{"tokenizer.ggml.model", ggufStr, "gpt2"},
+		{"tokenizer.ggml.pre", ggufStr, "olmo"},
+		{"tokenizer.ggml.tokens", ggufArr, ggufArray{ggufStr, toks}},
+		{"tokenizer.ggml.scores", ggufArr, ggufArray{ggufF32, scores}},
+		{"tokenizer.ggml.eos_token_id", ggufU32, uint32(1)},
+		{"tokenizer.ggml.add_bos_token", ggufBool, false},
+	}
+	f32t := func(name string, rows, cols, seed int) ggufTensor {
+		return ggufTensor{name: name, dims: []uint64{uint64(cols), uint64(rows)}, dtype: GGMLTypeF32, data: f32Bytes(smallWeights(rows*cols, seed))}
+	}
+	vec := func(name string, n int) ggufTensor {
+		return ggufTensor{name: name, dims: []uint64{uint64(n)}, dtype: GGMLTypeF32, data: f32Bytes(onesF32(n))}
+	}
+	tensors := []ggufTensor{
+		f32t("token_embd.weight", vocab, dim, 21),
+		vec("output_norm.weight", dim),
+		f32t("blk.0.attn_q.weight", heads*hdim, dim, 22),
+		f32t("blk.0.attn_k.weight", kv*hdim, dim, 23),
+		f32t("blk.0.attn_v.weight", kv*hdim, dim, 24),
+		vec("blk.0.attn_q_norm.weight", heads*hdim),
+		vec("blk.0.attn_k_norm.weight", kv*hdim),
+		f32t("blk.0.attn_output.weight", dim, heads*hdim, 25),
+		vec("blk.0.post_attention_norm.weight", dim),
+		f32t("blk.0.ffn_gate.weight", hidden, dim, 26),
+		f32t("blk.0.ffn_up.weight", hidden, dim, 27),
+		f32t("blk.0.ffn_down.weight", dim, hidden, 28),
+		vec("blk.0.post_ffw_norm.weight", dim),
+	}
+	if withOutput {
+		tensors = append(tensors, f32t("output.weight", vocab, dim, 29))
+	}
+	return buildGGUF(3, kvs, tensors)
+}
+
 func TestSmolLM3LoadsAndUsesItsRopeSchedule(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF("smollm3"))
 	if err != nil {
@@ -189,5 +265,93 @@ func TestRenderExaone4Messages(t *testing.T) {
 	}
 	if kind := r.chatTemplateKind(); kind != "exaone4-chat" {
 		t.Fatalf("template kind = %q", kind)
+	}
+}
+
+func TestOlmo2AndOlmo3PostNormGraph(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyOlmo2GGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Architecture() != "olmo2" || !r.config.usesFullProjectionQKNorm() {
+		t.Fatalf("unexpected OLMo config: %+v", r.config)
+	}
+	if r.config.RopeThetaSWA != 500000 {
+		t.Fatalf("SWA RoPE base = %v, want 500000", r.config.RopeThetaSWA)
+	}
+	layer := r.standard.Layers[0]
+	if layer.AttnNorm != nil || layer.FFNNorm != nil {
+		t.Fatal("OLMo 2/3 must not fabricate pre-normalization tensors")
+	}
+	if len(layer.AttnQNorm) != r.config.NHeads*r.config.HeadDim ||
+		len(layer.AttnKNorm) != r.config.NKVHeads*r.config.HeadDim {
+		t.Fatal("OLMo full-projection QK norms were not loaded")
+	}
+	if !r.canBatchPrefill() {
+		t.Fatal("dense OLMo 2/3 should support batched prefill")
+	}
+	tokens := r.tok.Encode("abcdefghijklm")
+	if len(tokens) < 2 {
+		t.Fatalf("synthetic OLMo prompt too short: %v", tokens)
+	}
+	assertStandardBatchParity(t, r, tokens)
+}
+
+func TestOlmoFullProjectionQKNormIsNotPerHead(t *testing.T) {
+	config := Config{Arch: "olmo2", HeadDim: 2, NHeads: 2, NKVHeads: 2, RMSNormEps: 1e-6}
+	layer := LayerWeights{
+		AttnQNorm: onesF32(4),
+		AttnKNorm: onesF32(4),
+	}
+	q := []float32{1, 1, 10, 10}
+	k := append([]float32(nil), q...)
+	normalizeProjectedQKInPlace(config, layer, q, k)
+	if q[0] >= 0.2 || q[2] <= 1 {
+		t.Fatalf("OLMo Q norm looks per-head instead of full-projection: %v", q)
+	}
+	for i := range q {
+		if q[i] != k[i] {
+			t.Fatalf("Q/K norm mismatch at %d: %v vs %v", i, q[i], k[i])
+		}
+	}
+}
+
+func TestOlmo3UsesSeparateUnscaledSWARope(t *testing.T) {
+	config := Config{
+		Arch:                      "olmo2",
+		Dim:                       8,
+		HiddenDim:                 16,
+		NHeads:                    2,
+		NKVHeads:                  2,
+		HeadDim:                   4,
+		ValueDim:                  4,
+		RopeDimensionCount:        4,
+		RopeTheta:                 10000,
+		RopeThetaSWA:              500000,
+		RopeScalingType:           "yarn",
+		RopeScalingFactor:         4,
+		RopeOriginalContextLength: 128,
+		MaxSeqLen:                 512,
+	}
+	buf := NewDecodeBuffer(config, 4, 2, 4)
+	if len(buf.RopeInvFreq) != 2 || len(buf.RopeSWAInvFreq) != 2 {
+		t.Fatalf("rope table sizes global=%d swa=%d", len(buf.RopeInvFreq), len(buf.RopeSWAInvFreq))
+	}
+	if buf.RopeSWAMscale != 1 {
+		t.Fatalf("SWA OLMo 3 RoPE magnitude = %v, want 1", buf.RopeSWAMscale)
+	}
+	wantSWA := float32(1 / 707.1067811865476) // 1 / 500000^(2/4)
+	if d := buf.RopeSWAInvFreq[1] - wantSWA; d < -1e-6 || d > 1e-6 {
+		t.Fatalf("SWA inverse frequency = %v, want %v", buf.RopeSWAInvFreq[1], wantSWA)
+	}
+	if d := buf.RopeInvFreq[1] - buf.RopeSWAInvFreq[1]; d > -1e-7 && d < 1e-7 {
+		t.Fatalf("global and local OLMo 3 RoPE tables unexpectedly match: %v", buf.RopeInvFreq)
+	}
+}
+
+func TestOlmo2RequiresUntiedOutput(t *testing.T) {
+	_, err := RunnerFromGGUFBytes(buildTinyOlmo2GGUFWithOutput(false))
+	if err == nil || !strings.Contains(err.Error(), "olmo2 requires output.weight") {
+		t.Fatalf("error = %v, want required output diagnostic", err)
 	}
 }

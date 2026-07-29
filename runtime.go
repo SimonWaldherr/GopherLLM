@@ -304,6 +304,8 @@ type Runner struct {
 //   - SmolLM3 uses the standard dense graph with its every-fourth-layer RoPE
 //     omission. EXAONE 4 uses per-head QK norm, post-attention/post-FFN norm,
 //     and its local/global attention schedule.
+//   - OLMo 2 and OLMo 3 both declare olmo2. They use full-projection QK norm,
+//     post-norm residual branches, and (for OLMo 3) separate local/global RoPE.
 //   - Devstral and Mistral-Small GGUFs usually declare llama or mistral3;
 //     their [INST]/Tekken behavior is picked up from tokenizer metadata, not
 //     the arch string.
@@ -313,6 +315,8 @@ func ArchitectureSupported(arch string) bool {
 		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
 		return true
 	case "smollm3", "exaone4":
+		return true
+	case "olmo2":
 		return true
 	default:
 		return false

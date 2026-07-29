@@ -882,11 +882,11 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   runs instead. ARM64 reuses per-worker dequantization rows and dispatches one
   coarse batch range per worker to avoid allocation and scheduling overhead.
   The same path now covers StableLM's LayerNorm plus parallel-residual block,
-  dense Qwen3's per-head QK norm, and EXAONE 4's QK plus post-branch norms.
-  This moves Qwen3 and EXAONE 4 prompt ingestion from per-token weight
-  streaming onto the chunked path as well. Q4_0/Q8_0 rows also use the
-  dequantize-once path, which is important for Stable Code and other legacy-Q4
-  GGUFs on Apple Silicon.
+  dense Qwen3's per-head QK norm, EXAONE 4's QK plus post-branch norms, and
+  OLMo 2/3's full-projection QK plus post-branch norms. This moves all three
+  families' prompt ingestion from per-token weight streaming onto the chunked
+  path as well. Q4_0/Q8_0 rows also use the dequantize-once path, which is
+  important for Stable Code and other legacy-Q4 GGUFs on Apple Silicon.
   Set `GOPHERLLM_NO_BATCH_PREFILL=1` to fall back to the per-token path (A/B
   benchmarking / debugging), or `GOPHERLLM_PREFILL_CHUNK=<N>` to tune the chunk
   size on the deployment machine.
@@ -963,7 +963,7 @@ llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, q
 qwen35, qwen35moe,
 deepseek2, kimi_k2,
 phi3, granite (dense), exaone, exaone4, smollm3, internlm2, stablelm,
-gpt-oss, gemma, gemma2, gemma3, gemma4,
+olmo2, gpt-oss, gemma, gemma2, gemma3, gemma4,
 nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
 ```
 
@@ -978,7 +978,7 @@ because some tensor names happen to match. The main coverage is:
 | Qwen | Qwen2/2.5, QwQ, dense/sparse Qwen3 and Qwen3 Coder, plus experimental text-only Qwen3.5/3.6 hybrid exports |
 | DeepSeek / Kimi | Modern DeepSeek-V2/V3 and Kimi K2 MLA layouts |
 | Gemma | Gemma 1–3 and native dense/MoE/E2B Gemma 4 text graphs |
-| Other decoders | Phi-3/3.5, dense Granite, EXAONE 3, EXAONE 4 1.2B/32B, InternLM2, StableLM, GPT-OSS |
+| Other decoders | Phi-3/3.5, dense Granite, EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
 | Recurrent / hybrid | Mamba2 and Nemotron-H / Nemotron-H-MoE |
 | Embeddings | BERT and Nomic-BERT (`/v1/embeddings`, not chat generation) |
 
@@ -988,7 +988,7 @@ Important upstream GGUF families that are **not implemented yet**:
 |---|---|
 | Llama 4 | Its architecture-specific attention/normalization graph and model validation |
 | Phi-2 / Phi-MoE | Biased LayerNorm, parallel attention/FFN, GELU MLP, and MoE variants |
-| OLMo2/OLMo3/OLMoE | Full-vector QK normalization, post-norm blocks, and architecture-specific SWA/RoPE rules |
+| OLMoE | Its sparse expert router and expert execution graph |
 | Command-R / Cohere2 | Their attention, normalization, and tokenizer/chat conventions |
 | GLM4 / GLM4-MoE, MiniMax M2, LFM2 | Dedicated dense, sparse, or hybrid execution graphs |
 | Falcon, GPT-NeoX/GPT-2, StarCoder2 | Non-Llama block layouts and their tokenizer conventions |
@@ -1058,6 +1058,15 @@ schedule. Its `[|system|]` / `[|user|]` / `[|assistant|]` /
 LayerNorm, learned norm biases, and optionally its parallel residual branch.
 Sparse Granite MoE checkpoints remain intentionally rejected: their expert
 router and expert tensors require the separate MoE execution graph.
+
+`olmo2` covers both dense OLMo 2 and OLMo 3 GGUFs. The latter retains the
+`olmo2` architecture label and adds a three-local/one-global sliding-attention
+schedule. Q and K use one RMSNorm over their complete projections rather than
+one norm per head; attention and FFN branches are normalized before their
+residual adds. OLMo 3 local layers use a separate SWA frequency base with
+ordinary unscaled RoPE, while global layers retain the checkpoint's normal
+long-context scaling. Both decode and batched prefill select the matching
+precomputed RoPE table per layer. Sparse `olmoe` remains unsupported.
 
 Mistral-family instruct models (including Ministral) use the `[INST]…[/INST]`
 chat format, the Tekken byte-level BPE pre-tokenizer, and YaRN RoPE context

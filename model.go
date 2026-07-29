@@ -24,15 +24,19 @@ import (
 // meaning "use 1/sqrt(HeadDim)" for AttentionScale) and are only non-trivial
 // for architectures whose GGUFs carry them.
 type Config struct {
-	Arch           string
-	Dim            int
-	HiddenDim      int
-	NLayers        int
-	NHeads         int
-	NKVHeads       int
-	VocabSize      int
-	MaxSeqLen      int
-	RopeTheta      float32
+	Arch      string
+	Dim       int
+	HiddenDim int
+	NLayers   int
+	NHeads    int
+	NKVHeads  int
+	VocabSize int
+	MaxSeqLen int
+	RopeTheta float32
+	// RopeThetaSWA is an optional second frequency base for local-attention
+	// layers. OLMo 3 uses it with unscaled RoPE while its global layers retain
+	// the model's ordinary (potentially YaRN-scaled) RoPE table.
+	RopeThetaSWA   float32
 	RMSNormEps     float32
 	AttentionScale float32
 	// AttentionTemperatureScale is Mistral 3's long-context Q scaling
@@ -190,7 +194,14 @@ func (c Config) layerUsesRoPE(il int) bool {
 // the unnormalized hidden state and normalize each projected branch before it
 // is added back. EXAONE 4 is the first supported family with this layout.
 func (c Config) usesPostNormOnly() bool {
-	return c.Arch == "exaone4"
+	return c.Arch == "exaone4" || c.Arch == "olmo2"
+}
+
+// usesFullProjectionQKNorm distinguishes OLMo 2/3's one RMSNorm over the
+// complete Q or K projection from the shared per-head norm used by Qwen3 and
+// EXAONE 4.
+func (c Config) usesFullProjectionQKNorm() bool {
+	return c.Arch == "olmo2"
 }
 
 func ConfigFromGGUF(gguf *GGUFFile) Config {
@@ -366,6 +377,9 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		cfg.RopeTheta = gguf.GetF32(p+".rope.freq_base_swa", cfg.RopeTheta)
 		cfg.NextNPredictLayers = int(gguf.GetU32(p+".nextn_predict_layers", 0))
 	}
+	if p == "olmo2" && cfg.SlidingWindow > 0 {
+		cfg.RopeThetaSWA = gguf.GetF32(p+".rope.freq_base_swa", cfg.RopeTheta)
+	}
 	if v, ok := gguf.Metadata[p+".expert_weights_norm"]; ok {
 		if norm, ok := v.AsBool(); ok {
 			cfg.ExpertWeightsNorm = norm
@@ -416,6 +430,10 @@ func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
 		case "exaone4":
 			// EXAONE 4 32B uses three local layers followed by one global layer.
 			// The 1.2B model has no sliding window, so this pattern remains inert.
+			period = 4
+		case "olmo2":
+			// OLMo 3 GGUFs retain the olmo2 architecture label and use the
+			// same three-local/one-global pattern.
 			period = 4
 		}
 	}
@@ -1097,6 +1115,10 @@ type DecodeBuffer struct {
 	RopeSin                 []float32
 	RopeCos                 []float32
 	RopeMscale              float32
+	RopeSWAInvFreq          []float32
+	RopeSWASin              []float32
+	RopeSWACos              []float32
+	RopeSWAMscale           float32
 	RopeGptOssInvFreq       []float32
 	RopeGptOssConcentration float32
 	MambaIn                 []float32
@@ -1141,6 +1163,21 @@ type ExpertScore struct {
 
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
 	inv, mscale := buildRopeInvFreq(config, maxHeadDim)
+	var swaInv []float32
+	var swaSin, swaCos []float32
+	swaMscale := float32(1)
+	if config.RopeThetaSWA > 0 {
+		swaConfig := config
+		swaConfig.RopeTheta = config.RopeThetaSWA
+		swaConfig.RopeScalingType = ""
+		swaConfig.RopeScalingFactor = 1
+		swaConfig.RopeOriginalContextLength = 0
+		swaConfig.RopeFactorsLong = nil
+		swaConfig.RopeFactorsShort = nil
+		swaInv, swaMscale = buildRopeInvFreq(swaConfig, maxHeadDim)
+		swaSin = make([]float32, max(1, maxHeadDim/2))
+		swaCos = make([]float32, max(1, maxHeadDim/2))
+	}
 	gptInv, concentration := buildRopeInvFreqGptOss(config)
 	return &DecodeBuffer{
 		X:                       make([]float32, config.Dim),
@@ -1179,6 +1216,10 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeCos:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeMscale:              mscale,
+		RopeSWAInvFreq:          swaInv,
+		RopeSWASin:              swaSin,
+		RopeSWACos:              swaCos,
+		RopeSWAMscale:           swaMscale,
 		RopeGptOssInvFreq:       gptInv,
 		RopeGptOssConcentration: concentration,
 	}
@@ -1354,6 +1395,9 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 			return config, ModelWeights{}, err
 		}
 	} else {
+		if config.Arch == "olmo2" {
+			return config, ModelWeights{}, fmt.Errorf("olmo2 requires output.weight")
+		}
 		fmt.Fprintln(logw, "Note: output tied to embeddings")
 	}
 
@@ -1550,6 +1594,14 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		}
 		if len(postAttnNorm) != config.Dim || len(postFFNNorm) != config.Dim {
 			return LayerWeights{}, fmt.Errorf("exaone4 requires %d-element post_attention_norm and post_ffw_norm tensors", config.Dim)
+		}
+	}
+	if config.Arch == "olmo2" {
+		if len(attnQNorm) != qRows || len(attnKNorm) != kRows {
+			return LayerWeights{}, fmt.Errorf("olmo2 requires %d-element attn_q_norm and %d-element attn_k_norm tensors", qRows, kRows)
+		}
+		if len(postAttnNorm) != config.Dim || len(postFFNNorm) != config.Dim {
+			return LayerWeights{}, fmt.Errorf("olmo2 requires %d-element post_attention_norm and post_ffw_norm tensors", config.Dim)
 		}
 	}
 	if config.Arch == "gpt-oss" {
@@ -1942,6 +1994,10 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		ropeInvFreq, ropeMscale = buf.RopeGptOssInvFreq, buf.RopeGptOssConcentration
 	}
 	ropeHalf, ropePairs := prepareRopeScratch(pos, headDim, config.RopeDimensionCount, ropeInvFreq, ropeMscale, &buf.RopeSin, &buf.RopeCos)
+	swaRopeHalf, swaRopePairs := 0, 0
+	if len(buf.RopeSWAInvFreq) > 0 {
+		swaRopeHalf, swaRopePairs = prepareRopeScratch(pos, headDim, config.RopeDimensionCount, buf.RopeSWAInvFreq, buf.RopeSWAMscale, &buf.RopeSWASin, &buf.RopeSWACos)
+	}
 	ropeIsInterleaved := ropeInterleaved(config.Arch)
 	weights.TokenEmbd.RowInto(int(token), dim, &buf.X)
 	if config.EmbeddingScale != 1 {
@@ -1972,17 +2028,18 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			addInPlace(buf.K, layer.BK)
 			addInPlace(buf.V, layer.BV)
 		}
-		// Gemma 3/4-style QK-norm (per-head RMS on the projected Q/K, before
-		// RoPE); inert for models without the norm tensors.
-		if layer.AttnQNorm != nil {
-			perHeadRMSNormInPlace(buf.Q, headDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
-		}
-		if layer.AttnKNorm != nil {
-			perHeadRMSNormInPlace(buf.K, headDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
-		}
+		// Normalize projected Q/K before RoPE. Qwen3/EXAONE 4 use one RMSNorm
+		// per head; OLMo 2/3 normalize each complete projection.
+		normalizeProjectedQKInPlace(config, layer, buf.Q, buf.K)
 		if config.layerUsesRoPE(l) {
-			applyPreparedRope(buf.Q, headDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
-			applyPreparedRope(buf.K, headDim, config.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, ropeIsInterleaved)
+			activeHalf, activePairs := ropeHalf, ropePairs
+			activeSin, activeCos := buf.RopeSin, buf.RopeCos
+			if config.layerUsesSWA(l) && swaRopePairs > 0 {
+				activeHalf, activePairs = swaRopeHalf, swaRopePairs
+				activeSin, activeCos = buf.RopeSWASin, buf.RopeSWACos
+			}
+			applyPreparedRope(buf.Q, headDim, config.NHeads, activeHalf, activePairs, activeSin, activeCos, ropeIsInterleaved)
+			applyPreparedRope(buf.K, headDim, config.NKVHeads, activeHalf, activePairs, activeSin, activeCos, ropeIsInterleaved)
 		}
 		if temperature := attentionTemperatureAt(config, pos); temperature != 1 {
 			ScaleF32(buf.Q, temperature)
@@ -2190,6 +2247,24 @@ func perHeadRMSNormInPlace(vec []float32, headDim, nHeads int, weight []float32,
 		ss := DotF32(sub, sub)
 		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+eps)))
 		mulScaleF32(sub, weight[:headDim], scale, sub)
+	}
+}
+
+func normalizeProjectedQKInPlace(config Config, layer LayerWeights, q, k []float32) {
+	if config.usesFullProjectionQKNorm() {
+		if layer.AttnQNorm != nil {
+			rmsNormInto(q, layer.AttnQNorm, config.RMSNormEps, &q)
+		}
+		if layer.AttnKNorm != nil {
+			rmsNormInto(k, layer.AttnKNorm, config.RMSNormEps, &k)
+		}
+		return
+	}
+	if layer.AttnQNorm != nil {
+		perHeadRMSNormInPlace(q, config.HeadDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
+	}
+	if layer.AttnKNorm != nil {
+		perHeadRMSNormInPlace(k, config.HeadDim, config.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
 	}
 }
 
