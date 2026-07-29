@@ -177,12 +177,11 @@ func TestAutoTuneEndpointsReportStatusAndInvalidateOnSwap(t *testing.T) {
 	}
 	defer runner.Close()
 
-	srv := httptest.NewServer(NewHandler(runner, HandlerOptions{
+	srv := newManagedTestServer(t, NewHandler(runner, HandlerOptions{
 		ModelDir:              modelDir,
 		ModelPath:             modelPath,
 		BaselineRuntimeTuning: &baseline,
 	}))
-	defer srv.Close()
 
 	type status struct {
 		Active bool `json:"active"`

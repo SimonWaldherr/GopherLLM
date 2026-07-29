@@ -2,6 +2,8 @@ package agentos
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -160,8 +162,11 @@ func TestNonAllowPolicyDoesNotUseAShell(t *testing.T) {
 }
 
 func TestExecuteTimesOutAndCapsOutput(t *testing.T) {
-	r := Runner{Policy: PolicyAllow, Timeout: 250 * time.Millisecond}
-	res, _, err := r.Execute(context.Background(), Proposal{Cmd: "sleep 5"}, true)
+	t.Setenv("GO_WANT_AGENTOS_HELPER_PROCESS", "1")
+	helper := `"` + os.Args[0] + `" -test.run=^TestExecuteHelperProcess$ -- `
+
+	r := Runner{Policy: PolicyDeny, Timeout: 250 * time.Millisecond}
+	res, _, err := r.Execute(context.Background(), Proposal{Cmd: helper + "sleep"}, true)
 	if err != nil && !res.TimedOut {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -169,13 +174,39 @@ func TestExecuteTimesOutAndCapsOutput(t *testing.T) {
 		t.Fatal("long command did not report a timeout")
 	}
 
-	capped := Runner{Policy: PolicyAllow, MaxOutput: 64}
-	out, _, err := capped.Execute(context.Background(), Proposal{Cmd: "printf 'x%.0s' $(seq 1 500)"}, true)
+	capped := Runner{Policy: PolicyDeny, MaxOutput: 64}
+	out, _, err := capped.Execute(context.Background(), Proposal{Cmd: helper + "output"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !out.Truncated || len(out.Output) > 64 {
 		t.Fatalf("output cap not applied: truncated=%v len=%d", out.Truncated, len(out.Output))
+	}
+}
+
+func TestExecuteHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_AGENTOS_HELPER_PROCESS") != "1" {
+		return
+	}
+	switch os.Args[len(os.Args)-1] {
+	case "sleep":
+		time.Sleep(5 * time.Second)
+	case "output":
+		fmt.Print(strings.Repeat("x", 500))
+	default:
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestAllowPolicyUsesNativeShell(t *testing.T) {
+	r := Runner{Policy: PolicyAllow}
+	res, _, err := r.Execute(context.Background(), Proposal{Cmd: "echo shell-ok"}, false)
+	if err != nil {
+		t.Fatalf("native shell command failed: %v", err)
+	}
+	if !strings.Contains(res.Output, "shell-ok") {
+		t.Fatalf("native shell output = %q", res.Output)
 	}
 }
 

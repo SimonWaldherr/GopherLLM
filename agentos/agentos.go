@@ -276,7 +276,7 @@ func (r Runner) Execute(ctx context.Context, p Proposal, approved bool) (Result,
 	var cmd *exec.Cmd
 	if r.Policy == PolicyAllow {
 		// Only the mode that already permits everything gets a shell.
-		cmd = exec.CommandContext(ctx, "/bin/sh", "-c", p.Cmd)
+		cmd = shellCommandContext(ctx, p.Cmd)
 	} else {
 		args, err := SplitArgs(p.Cmd)
 		if err != nil {

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -88,6 +89,17 @@ func (s *embeddingState) swap(r *gopherllm.Runner) {
 	}
 }
 
+func (s *embeddingState) close() error {
+	s.mu.Lock()
+	old := s.r
+	s.r = nil
+	s.mu.Unlock()
+	if old == nil {
+		return nil
+	}
+	return old.Close()
+}
+
 func (s *runnerState) get() *gopherllm.Runner {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -116,6 +128,19 @@ func (s *runnerState) swap(r *gopherllm.Runner, path string) {
 	if old != nil {
 		_ = old.Close()
 	}
+}
+
+func (s *runnerState) close() error {
+	s.mu.Lock()
+	old := s.r
+	s.r = nil
+	s.path = ""
+	s.autoTune = nil
+	s.mu.Unlock()
+	if old == nil {
+		return nil
+	}
+	return old.Close()
 }
 
 func (s *runnerState) getPath() string {
@@ -219,6 +244,32 @@ type HandlerOptions struct {
 	AgentOS *agentos.Runner
 }
 
+// Handler is the mountable HTTP API returned by NewHandler. Close releases
+// the currently active chat and embedding runners, including memory-mapped
+// GGUF files installed through a hot-swap. Hosts should stop their HTTP server
+// before calling Close so no new requests can enter.
+type Handler struct {
+	next      http.Handler
+	state     *runnerState
+	embedder  *embeddingState
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	h.next.ServeHTTP(w, req)
+}
+
+func (h *Handler) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.closeOnce.Do(func() {
+		h.closeErr = errors.Join(h.embedder.close(), h.state.close())
+	})
+	return h.closeErr
+}
+
 // modelLoadRequest accepts the model catalog ID used by the browser UI and
 // API clients. Path remains for compatibility with older clients, but is
 // treated only as a selector for a model already discovered in ModelDir.
@@ -290,6 +341,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		LogWriter:             logw,
 		AgentOS:               opts.AgentOS,
 	})
+	defer handler.Close()
 	server := &http.Server{Addr: opts.Addr, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
 	fmt.Fprintf(logw, "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
 	return server.ListenAndServe()
@@ -299,16 +351,18 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 // replacement for the former gopherllm.Model.HTTPHandler method, which had to
 // go when HTTP serving moved out of the inference package: the handler shares
 // the Model's underlying Runner, so requests serialize with direct Model calls.
-func HandlerForModel(m *gopherllm.Model, opts HandlerOptions) http.Handler {
+func HandlerForModel(m *gopherllm.Model, opts HandlerOptions) *Handler {
 	return NewHandler(m.Runner(), opts)
 }
 
 // NewHandler returns the complete GopherLLM HTTP API (OpenAI-compatible,
 // Ollama-compatible, and native endpoints — see the README's endpoint table)
-// as a mountable http.Handler. It owns no listener and writes nothing except
-// to opts.LogWriter, so it composes with any router, middleware stack, or
-// server the host application already has.
-func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handler {
+// as a mountable http.Handler. It owns no listener, manages runners installed
+// by model hot-swaps, and writes nothing except to opts.LogWriter, so it
+// composes with any router, middleware stack, or server the host application
+// already has. After stopping that server, call Handler.Close to release the
+// active runners and their memory-mapped GGUF files.
+func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	logw := opts.LogWriter
 	if logw == nil {
 		logw = io.Discard
@@ -1029,8 +1083,13 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			if cdn, ok := mermaidCDNs[mermaid]; ok {
 				data.MermaidScript = cdn.Script
 			}
-			if err := chatTemplate.Execute(w, data); err != nil {
+			var page bytes.Buffer
+			if err := chatTemplate.Execute(&page, data); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if _, err := w.Write(page.Bytes()); err != nil {
+				fmt.Fprintf(logw, "Warning: write chat page: %v\n", err)
 			}
 		})
 		mux.HandleFunc("/style.css", func(w http.ResponseWriter, _ *http.Request) {
@@ -1044,7 +1103,11 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) http.Handl
 			fmt.Fprint(w, chatJS)
 		})
 	}
-	return remoteOrLoadedModel(state, remote, mux)
+	return &Handler{
+		next:     remoteOrLoadedModel(state, remote, mux),
+		state:    state,
+		embedder: embedder,
+	}
 }
 
 // requireLoadedModel keeps catalog, UI and model-loading routes available when

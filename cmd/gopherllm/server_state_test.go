@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -32,7 +33,9 @@ func TestLastModelRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows protects this file through the user's directory ACL. Its
+	// os.FileMode permission bits are synthetic and always report 0666.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("state file permissions = %o, want 600", info.Mode().Perm())
 	}
 }

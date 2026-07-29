@@ -170,6 +170,11 @@ mux.Handle("/llm/", http.StripPrefix("/llm",
     server.HandlerForModel(model, server.HandlerOptions{Defaults: gopherllm.DefaultGenerationOptions()})))
 ```
 
+`server.NewHandler` returns a closeable `*server.Handler`. Hosts that enable
+model hot-swapping should stop their HTTP server and then call
+`handler.Close()` so the current chat and embedding GGUF mappings are released;
+`server.Serve` does this automatically when it returns.
+
 > **Moved in this release.** `gopherllm.Serve`, `gopherllm.NewHandler`,
 > `gopherllm.HandlerOptions`/`ServeOptions` and the request/response types are
 > now `server.*`, and `model.HTTPHandler(opts)` is now
