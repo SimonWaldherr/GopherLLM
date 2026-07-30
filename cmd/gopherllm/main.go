@@ -3,6 +3,7 @@ package main
 import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"github.com/SimonWaldherr/GopherLLM/agentos"
+	"github.com/SimonWaldherr/GopherLLM/internal/huggingface"
 	"github.com/SimonWaldherr/GopherLLM/server"
 
 	"bufio"
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
@@ -23,14 +25,17 @@ import (
 
 func printUsage(name string) {
 	fmt.Fprintf(os.Stderr, "gopherllm %s\n\n", gopherllm.Version)
-	fmt.Fprintf(os.Stderr, "Usage: %s [model.gguf|model-name|model-dir] [options]\n\n", name)
+	fmt.Fprintf(os.Stderr, "Usage: %s [model.gguf|model-name|model-dir|hf:owner/repo:quant@revision] [options]\n\n", name)
 	fmt.Fprintln(os.Stderr, "If the model is omitted, the last successfully loaded local model is reused.")
+	fmt.Fprintln(os.Stderr, "Hugging Face: hf:owner/repo:Q4_K_M[@revision] downloads and reuses GGUFs from the HF cache.")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Options:")
 	fmt.Fprintln(os.Stderr, "  --model <name>           Select a GGUF from --model-dir by repo, file, or metadata name")
 	fmt.Fprintln(os.Stderr, "  --model-dir <path>       Directory to recursively scan for GGUF files")
 	fmt.Fprintln(os.Stderr, "                           Passing a directory as model selector opens an interactive model picker")
 	fmt.Fprintln(os.Stderr, "  --list-models            List GGUF files in --model-dir and exit")
+	fmt.Fprintln(os.Stderr, "  --hf-list <repo>         List GGUF variants in a Hugging Face repo, e.g. bartowski/Qwen3-4B-GGUF")
+	fmt.Fprintln(os.Stderr, "  --privacy                Print the local-first privacy and network-use report, then exit")
 	fmt.Fprintln(os.Stderr, "  --prompt <text>           Input prompt (interactive if omitted)")
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
 	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
@@ -85,6 +90,8 @@ type cliConfig struct {
 	prompt           string
 	options          gopherllm.GenerationOptions
 	listModels       bool
+	hfList           string
+	privacyReport    bool
 	listTensors      bool
 	repl             bool
 	serveAddr        string
@@ -147,6 +154,14 @@ func run() error {
 	cfg, err := parseCLI(args[1:])
 	if err != nil {
 		return err
+	}
+	commandCtx, stopCommand := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopCommand()
+	if cfg.hfList != "" {
+		return huggingface.ListGGUFContext(commandCtx, cfg.hfList, os.Stdout)
+	}
+	if cfg.privacyReport {
+		return gopherllm.WritePrivacyReport(os.Stdout)
 	}
 	if cfg.listModels {
 		entries, err := gopherllm.DiscoverModels(cfg.modelDir, os.Stderr)
@@ -240,7 +255,12 @@ func run() error {
 	if cfg.prepareQuant {
 		fmt.Fprintln(os.Stderr, "Quant prep: enabled for supported quantized weights")
 	}
-	modelPath, err := gopherllm.ResolveModelPath(cfg.modelSelector, cfg.modelDir)
+	var modelPath string
+	if cfg.modelSelector != nil && strings.HasPrefix(strings.ToLower(*cfg.modelSelector), "hf:") {
+		modelPath, err = huggingface.ResolveHuggingFaceModelContext(commandCtx, *cfg.modelSelector, os.Stderr)
+	} else {
+		modelPath, err = gopherllm.ResolveModelPath(cfg.modelSelector, cfg.modelDir)
+	}
 	if err != nil {
 		return err
 	}
@@ -500,6 +520,14 @@ func parseCLI(args []string) (cliConfig, error) {
 			cfg.modelDir = v
 		case "--list-models":
 			cfg.listModels = true
+		case "--hf-list":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.hfList = v
+		case "--privacy":
+			cfg.privacyReport = true
 		case "--prompt", "-p":
 			v, err := next(arg)
 			if err != nil {

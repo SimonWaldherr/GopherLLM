@@ -242,6 +242,10 @@ type HandlerOptions struct {
 	// unless an operator deliberately configured a policy for it. See the
 	// agentos package for the safety model.
 	AgentOS *agentos.Runner
+	// OSMSearchURL optionally replaces the public Nominatim endpoint with an
+	// operator-managed compatible endpoint. The source remains disabled until
+	// a request explicitly sets gopherllm_openstreetmap to true.
+	OSMSearchURL string
 }
 
 // Handler is the mountable HTTP API returned by NewHandler. Close releases
@@ -314,6 +318,8 @@ type ServeOptions struct {
 	LogWriter io.Writer
 	// AgentOS enables the agentic OS-command feature; see HandlerOptions.AgentOS.
 	AgentOS *agentos.Runner
+	// OSMSearchURL is forwarded to HandlerOptions.OSMSearchURL.
+	OSMSearchURL string
 }
 
 // Serve builds the API handler and runs a blocking http.Server on opts.Addr.
@@ -340,6 +346,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		BaselineRuntimeTuning: opts.BaselineRuntimeTuning,
 		LogWriter:             logw,
 		AgentOS:               opts.AgentOS,
+		OSMSearchURL:          opts.OSMSearchURL,
 	})
 	defer handler.Close()
 	server := &http.Server{Addr: opts.Addr, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
@@ -381,18 +388,23 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		}
 		fmt.Fprintf(logw, "Skills: loaded %d (%s)\n", len(skills), strings.Join(names, ", "))
 	}
-	wikimediaTools := newWikimediaClient(nil).tools()
+	wikimediaTools := NewResearchTools(ResearchOptions{Wikimedia: true})
+	osmTools := NewResearchTools(ResearchOptions{OpenStreetMap: true, OSMSearchURL: opts.OSMSearchURL})
 	skillsFor := func(enabled bool) []gopherllm.Skill {
 		if !enabled {
 			return nil
 		}
 		return skills
 	}
-	agenticToolsFor := func(enabled bool) []gopherllm.AgenticTool {
-		if !enabled {
-			return nil
+	agenticToolsFor := func(wikimedia, openStreetMap bool) []gopherllm.AgenticTool {
+		var tools []gopherllm.AgenticTool
+		if wikimedia {
+			tools = append(tools, wikimediaTools...)
 		}
-		return wikimediaTools
+		if openStreetMap {
+			tools = append(tools, osmTools...)
+		}
+		return tools
 	}
 	baseline := gopherllm.CaptureRuntimeTuning()
 	if opts.BaselineRuntimeTuning != nil {
@@ -410,6 +422,20 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get()), "remote": remote.enabled()})
+	})
+	mux.HandleFunc("/privacy", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"report": gopherllm.DefaultPrivacyReport(),
+			"research_tools": map[string]any{
+				"default":              "disabled",
+				"request_flags":        []string{"gopherllm_wikimedia", "gopherllm_openstreetmap"},
+				"openstreetmap_notice": OSMUsageNotice,
+			},
+		})
 	})
 	mux.HandleFunc("/remote", func(w http.ResponseWriter, req *http.Request) {
 		switch req.Method {
@@ -456,7 +482,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		options = withRequestContext(options, req)
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue)
 			logInferenceResult(logw, requestID, "/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -484,7 +510,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if contextMode != gopherllm.ContextWindowFull {
-				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, skills, agenticToolsFor(body.Wikimedia))
+				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
 				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
 				if err != nil {
 					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, gopherllm.GenerationResult{}, err)
@@ -494,12 +520,12 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			}
 			if body.Stream {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
-				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia), includeUsage)
+				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia, body.OpenStreetMap), includeUsage)
 				return
 			}
 			var timeline []gopherllm.AgentEvent
 			observe := func(e gopherllm.AgentEvent) { timeline = append(timeline, e) }
-			result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia), alwaysContinue, observe)
+			result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue, observe)
 			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -587,10 +613,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
-				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills, agenticToolsFor(body.Wikimedia))
+				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
 				return
 			}
-			result, err := gopherllm.RunAgenticChatWithTools(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -615,10 +641,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
-				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia))
+				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
 				return
 			}
-			result, err := gopherllm.RunAgenticChatWithTools(r, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia), alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/chat", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1216,6 +1242,7 @@ type GenerateRequest struct {
 	Tools         []gopherllm.ToolDefinition `json:"tools"`
 	ToolChoice    any                        `json:"tool_choice"`
 	Wikimedia     bool                       `json:"gopherllm_wikimedia"`
+	OpenStreetMap bool                       `json:"gopherllm_openstreetmap"`
 }
 
 func (g GenerateRequest) ToMessagesAndOptions(def gopherllm.GenerationOptions) ([]gopherllm.ChatMessage, gopherllm.GenerationOptions) {
@@ -1330,6 +1357,7 @@ type OpenAIChatRequest struct {
 	// it preserves normal OpenAI-compatible full-history semantics.
 	GopherLLMContextMode string `json:"gopherllm_context_mode"`
 	Wikimedia            bool   `json:"gopherllm_wikimedia"`
+	OpenStreetMap        bool   `json:"gopherllm_openstreetmap"`
 	// Skills is a pointer so an absent field keeps the historical default
 	// (skills offered whenever --skills-dir is configured) while a client that
 	// wants them off can say so.
@@ -1433,13 +1461,14 @@ func (e EmbeddingsRequest) Inputs() []string {
 }
 
 type OllamaGenerateRequest struct {
-	Model     string        `json:"model"`
-	Prompt    string        `json:"prompt"`
-	System    string        `json:"system"`
-	Stream    *bool         `json:"stream"`
-	Options   OllamaOptions `json:"options"`
-	Stop      any           `json:"stop"`
-	Wikimedia bool          `json:"gopherllm_wikimedia"`
+	Model         string        `json:"model"`
+	Prompt        string        `json:"prompt"`
+	System        string        `json:"system"`
+	Stream        *bool         `json:"stream"`
+	Options       OllamaOptions `json:"options"`
+	Stop          any           `json:"stop"`
+	Wikimedia     bool          `json:"gopherllm_wikimedia"`
+	OpenStreetMap bool          `json:"gopherllm_openstreetmap"`
 }
 
 func (o OllamaGenerateRequest) GenerationOptions(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
@@ -1451,12 +1480,13 @@ func (o OllamaGenerateRequest) GenerationOptions(def gopherllm.GenerationOptions
 }
 
 type OllamaChatRequest struct {
-	Model     string                     `json:"model"`
-	Messages  []OllamaMessage            `json:"messages"`
-	Stream    *bool                      `json:"stream"`
-	Options   OllamaOptions              `json:"options"`
-	Tools     []gopherllm.ToolDefinition `json:"tools"`
-	Wikimedia bool                       `json:"gopherllm_wikimedia"`
+	Model         string                     `json:"model"`
+	Messages      []OllamaMessage            `json:"messages"`
+	Stream        *bool                      `json:"stream"`
+	Options       OllamaOptions              `json:"options"`
+	Tools         []gopherllm.ToolDefinition `json:"tools"`
+	Wikimedia     bool                       `json:"gopherllm_wikimedia"`
+	OpenStreetMap bool                       `json:"gopherllm_openstreetmap"`
 }
 
 // streamEnabled implements Ollama's default-true streaming semantics: the

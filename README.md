@@ -57,6 +57,8 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Optional browser chat UI served from the embedded `web_ui` assets, with
   persistent local conversations and a template-aware smart context window.
 - Model discovery across the complete local LM Studio model library.
+- Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
+  private/gated-model tokens, and revision selection.
 
 ## Requirements
 
@@ -117,6 +119,35 @@ make build
 make list-models MODEL_DIR=/path/to/models
 make run MODEL_DIR=/path/to/models MODEL="some-model" PROMPT="Explain local LLM inference in three sentences."
 ```
+
+### Hugging Face imports
+
+Use an `hf:` selector to download a GGUF directly. Add the quantization after
+the repository name when it contains more than one GGUF, and optionally add a
+branch, tag, or commit after `@`:
+
+```sh
+bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M --repl
+bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main --serve 127.0.0.1:8080 --chat
+```
+
+Explore a repository first when you do not know its available quantizations:
+
+```sh
+bin/gopherllm --hf-list bartowski/Qwen3-4B-GGUF
+```
+
+The output includes each selectable quantization, its total download size,
+the number of GGUF shards, and a ready-to-run `hf:` selector. Downloads show
+progress and resume from a saved partial blob after an interrupted transfer.
+Split-model downloads use a bounded three-worker pool; pressing Ctrl-C cancels
+repository requests and active transfers through Go contexts while retaining
+the partial blobs for a later resume.
+
+Downloads, including every shard of split GGUFs, use the shared Hugging Face
+`blobs`/`refs`/`snapshots` cache under `$HF_HOME/hub` (or the platform cache
+when `HF_HOME` is unset). Existing cached snapshots remain usable offline.
+Set `HF_TOKEN` for gated or private repositories.
 
 ## Use as a Go Library
 
@@ -191,6 +222,27 @@ into diagnostics. Tool calling, reasoning extraction, and skills are available
 via `WithTools`, `Result.ReasoningText`, and `RunAgenticChat` — see the godoc
 and the runnable examples in `example_test.go`; `testdata/consumer` is a
 complete external application using the API.
+
+### Native Go research tools
+
+Go hosts can choose the same bounded factual source tools without running a
+separate process or exposing an HTTP endpoint. No source is enabled by default:
+
+```go
+tools := server.NewResearchTools(server.ResearchOptions{
+    Wikimedia:     true,
+    OpenStreetMap: true,
+})
+result, err := gopherllm.RunAgenticChatWithTools(
+    model.Runner(), []gopherllm.ChatMessage{gopherllm.UserMessage("Where is the Brandenburg Gate?")},
+    gopherllm.DefaultGenerationOptions(), nil, tools, nil,
+)
+```
+
+`ResearchOptions` can enable Wikipedia/Wikidata and a bounded OpenStreetMap
+place lookup independently. Every result carries a source URL and attribution.
+For a self-hosted Nominatim-compatible service, set `OSMSearchURL` instead of
+using the public endpoint.
 
 ## Build
 
@@ -600,6 +652,36 @@ API clients enable the same integration per request with
 `/api/chat`, or `/api/generate`. Set `tool_choice` to `none` to suppress it.
 Results include their Wikimedia source URL or query endpoint; answers should
 attribute factual claims to those results.
+
+### OpenStreetMap place research
+
+The browser chat can separately enable **OpenStreetMap place research** in
+**Options → Tools & agents**. API clients use
+`"gopherllm_openstreetmap": true` on the same chat and generation endpoints.
+It is off by default. Only the bounded place query selected by the model is
+sent to the configured Nominatim endpoint; the chat transcript is not sent.
+Results include OpenStreetMap attribution and an object URL.
+
+The default public Nominatim service is intentionally restricted to direct,
+low-volume place lookups: GopherLLM enforces at most one request per second and
+does not offer autocomplete or bulk geocoding. Do not send personal or
+confidential data. Operators with a larger workload should configure their own
+compatible endpoint with `server.HandlerOptions{OSMSearchURL: "..."}`. See the
+[Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/).
+
+### Privacy report
+
+Local model inference does not make network requests and GopherLLM has no
+telemetry. Inspect the complete contract with:
+
+```sh
+gopherllm --privacy
+curl http://127.0.0.1:8080/privacy
+```
+
+The report names every feature that can send data externally, its destination,
+and the limited data it may send. Hugging Face imports, remote model proxies,
+and factual research sources remain opt-in.
 
 ## Auto Mode (hardware autotuning)
 

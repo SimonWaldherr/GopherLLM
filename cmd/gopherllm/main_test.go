@@ -60,6 +60,26 @@ func TestParseCLIOutOfCore(t *testing.T) {
 	}
 }
 
+func TestParseCLIHuggingFaceList(t *testing.T) {
+	cfg, err := parseCLI([]string{"--hf-list", "bartowski/Qwen3-4B-GGUF@main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.hfList != "bartowski/Qwen3-4B-GGUF@main" {
+		t.Fatalf("hf list = %q", cfg.hfList)
+	}
+}
+
+func TestParseCLIPrivacyReport(t *testing.T) {
+	cfg, err := parseCLI([]string{"--privacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.privacyReport {
+		t.Fatal("--privacy was not recorded")
+	}
+}
+
 func TestParseCLIAutoFlags(t *testing.T) {
 	// Each of the auto sub-flags implies --auto, so none of them can be passed
 	// without actually turning tuning on.

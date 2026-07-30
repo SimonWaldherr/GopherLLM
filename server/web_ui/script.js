@@ -584,6 +584,7 @@ function cleanSettings(value, defaults) {
     contextWindowMode: value.contextWindowMode === "full" || value.contextWindowMode === "autoCompress" ? value.contextWindowMode : "recent",
     ragMode: value.ragMode === true,
     wikimediaTools: value.wikimediaTools === true,
+    openStreetMapTools: value.openStreetMapTools === true,
     skillsTools: value.skillsTools !== false
   };
 }
@@ -868,6 +869,7 @@ function toMarkdown(chat) {
   const contextWindowModeEl = $("contextWindowMode");
   const ragModeEl = $("ragMode");
   const wikimediaToolsEl = $("wikimediaTools");
+  const openStreetMapToolsEl = $("openStreetMapTools");
   const skillsToolsEl = $("skillsTools");
   const skillsToolsRowEl = $("skillsToolsRow");
   const showAgentActivityEl = $("showAgentActivity");
@@ -1489,6 +1491,7 @@ function toMarkdown(chat) {
     composerPowerCommandsEl.checked = preferences.power;
     ragModeEl.checked = chat.settings.ragMode;
     wikimediaToolsEl.checked = chat.settings.wikimediaTools;
+    openStreetMapToolsEl.checked = chat.settings.openStreetMapTools === true;
     if (skillsToolsEl) skillsToolsEl.checked = chat.settings.skillsTools !== false;
     composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
     personaEl.value = Object.prototype.hasOwnProperty.call(PERSONAS, chat.persona) ? chat.persona : "custom";
@@ -2035,6 +2038,7 @@ function toMarkdown(chat) {
       stream_options: { include_usage: true },
       gopherllm_context_mode: chat.settings.contextWindowMode,
       gopherllm_wikimedia: chat.settings.wikimediaTools === true,
+      gopherllm_openstreetmap: chat.settings.openStreetMapTools === true,
       gopherllm_skills: chat.settings.skillsTools !== false,
       system_prompt: [chat.systemPrompt.trim(), ragContext].filter(Boolean).join("\n\n") || undefined
     });
@@ -2053,7 +2057,8 @@ function toMarkdown(chat) {
         stream: true,
         stream_options: { include_usage: true },
         system_prompt: (systemPrompt || "").trim() || undefined,
-        gopherllm_wikimedia: settings.wikimediaTools === true
+        gopherllm_wikimedia: settings.wikimediaTools === true,
+        gopherllm_openstreetmap: settings.openStreetMapTools === true
       }))
     });
     if (!response.ok) {
@@ -2404,6 +2409,7 @@ function toMarkdown(chat) {
       topK: topKEl.value, minP: minPEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim(),
       stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, ragMode: ragModeEl.checked,
       wikimediaTools: wikimediaToolsEl.checked,
+      openStreetMapTools: openStreetMapToolsEl.checked,
       skillsTools: skillsToolsEl ? skillsToolsEl.checked : true
     }, defaults);
     // A changed system prompt, output reserve, or model-side sampler setting
@@ -3469,7 +3475,7 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
-  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, skillsToolsEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, skillsToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });
