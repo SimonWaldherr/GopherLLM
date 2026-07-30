@@ -1,4 +1,4 @@
-package gopherllm
+package tooling
 
 import "encoding/json"
 
@@ -6,46 +6,46 @@ import "encoding/json"
 // Arguments is a JSON-encoded object (a string, matching the OpenAI wire
 // format), not a nested object, so it round-trips through JSON unchanged
 // regardless of what the caller's argument schema looks like.
-type ToolCallFunction struct {
+type CallFunction struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 }
 
 // ToolCall is one function call requested by the assistant, OpenAI-compatible.
-type ToolCall struct {
-	ID       string           `json:"id"`
-	Type     string           `json:"type"` // always "function"
-	Function ToolCallFunction `json:"function"`
+type Call struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"` // always "function"
+	Function CallFunction `json:"function"`
 }
 
 // ToolFunctionDef describes a callable function, OpenAI-compatible.
-type ToolFunctionDef struct {
+type FunctionDefinition struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
 // ToolDefinition is one entry of an OpenAI-compatible "tools" array.
-type ToolDefinition struct {
-	Type     string          `json:"type"` // always "function"
-	Function ToolFunctionDef `json:"function"`
+type Definition struct {
+	Type     string             `json:"type"` // always "function"
+	Function FunctionDefinition `json:"function"`
 }
 
-const toolCallIDAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+const callIDAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 // newToolCallID generates a tool-call id using the runtime's existing sampler
 // RNG (so ids are reproducible under a fixed --seed, like everything else
 // about a run). Mistral's template requires exactly 9 alphanumeric
 // characters; other conventions accept any short opaque string, so a single
 // generator satisfies every template family.
-func newToolCallID(rng *Rng) string {
+func NewCallID(next func() float32) string {
 	b := make([]byte, 9)
 	for i := range b {
-		idx := int(rng.NextF32() * float32(len(toolCallIDAlphabet)))
-		if idx < 0 || idx >= len(toolCallIDAlphabet) {
+		idx := int(next() * float32(len(callIDAlphabet)))
+		if idx < 0 || idx >= len(callIDAlphabet) {
 			idx = 0
 		}
-		b[i] = toolCallIDAlphabet[idx]
+		b[i] = callIDAlphabet[idx]
 	}
 	return string(b)
 }
@@ -53,7 +53,7 @@ func newToolCallID(rng *Rng) string {
 // validToolCallID reports whether id already satisfies Mistral's exactly-9
 // alphanumeric-character requirement. Applied universally (not just for
 // Mistral) since a conforming id is harmless for every other convention too.
-func validToolCallID(id string) bool {
+func ValidCallID(id string) bool {
 	if len(id) != 9 {
 		return false
 	}
@@ -67,17 +67,17 @@ func validToolCallID(id string) bool {
 }
 
 // findTool returns the definition named name, if present.
-func findTool(tools []ToolDefinition, name string) (ToolFunctionDef, bool) {
+func Find(tools []Definition, name string) (FunctionDefinition, bool) {
 	for _, t := range tools {
 		if t.Function.Name == name {
 			return t.Function, true
 		}
 	}
-	return ToolFunctionDef{}, false
+	return FunctionDefinition{}, false
 }
 
 // toolNames returns the function names of tools, in order.
-func toolNames(tools []ToolDefinition) []string {
+func Names(tools []Definition) []string {
 	out := make([]string, len(tools))
 	for i, t := range tools {
 		out[i] = t.Function.Name

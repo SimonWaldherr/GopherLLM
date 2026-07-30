@@ -1183,7 +1183,7 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 | Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE + BERT WordPiece) |
 | Sampling | `sampling.go` |
 | Generation orchestration + chat templates | `runtime.go` |
-| Tool calling / reasoning / skills | `tools.go`, `extract.go`, `agent.go`, `skills.go` |
+| Tool calling / reasoning / skills | `agent.go`, `extract.go`, `skills.go`; wire types and helpers in `internal/tooling/` |
 | Model discovery + selection | `catalog.go` |
 | HTTP server | `server/server.go`, `server/web_ui/` |
 | CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
@@ -1191,6 +1191,12 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 A full architecture walkthrough — load path, inference data flow, kernel
 dispatch tiers, and how to add a quant kernel / architecture / endpoint — is
 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+For a concise directory map and guidance on where new code belongs, see
+[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
+
+For a concise directory map and guidance on where new code belongs, see
+[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
 
 The same map, with more detail, is in the package comment in `doc.go`. Every
 SIMD kernel has a portable Go scalar reference implementation, and

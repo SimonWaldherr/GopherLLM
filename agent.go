@@ -6,7 +6,31 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/tooling"
 )
+
+// ToolCallFunction is the OpenAI-compatible function payload of a tool call.
+type ToolCallFunction = tooling.CallFunction
+
+// ToolCall is one function call requested by the assistant, OpenAI-compatible.
+type ToolCall = tooling.Call
+
+// ToolFunctionDef describes a callable function, OpenAI-compatible.
+type ToolFunctionDef = tooling.FunctionDefinition
+
+// ToolDefinition is one entry of an OpenAI-compatible "tools" array.
+type ToolDefinition = tooling.Definition
+
+func newToolCallID(rng *Rng) string { return tooling.NewCallID(rng.NextF32) }
+
+func validToolCallID(id string) bool { return tooling.ValidCallID(id) }
+
+func findTool(tools []ToolDefinition, name string) (ToolFunctionDef, bool) {
+	return tooling.Find(tools, name)
+}
+
+func toolNames(tools []ToolDefinition) []string { return tooling.Names(tools) }
 
 // maxAgenticIterations bounds the server-side skill-resolution loop so a
 // model that keeps calling load_skill can't spin forever.

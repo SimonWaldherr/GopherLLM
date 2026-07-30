@@ -42,8 +42,11 @@
 //   - tokenizer.go  SentencePiece and GPT-2/Tekken BPE tokenizers
 //   - sampling.go   temperature/top-k/top-p/min-p sampling
 //   - runtime.go    Runner: generation loop, chat templates per model family
-//   - tools.go, extract.go, agent.go, skills.go  tool calling, reasoning
-//     extraction, the server-side skill loop
+//   - agent.go, extract.go, skills.go  tool calling, reasoning extraction,
+//     the server-side skill loop (wire types live in internal/tooling)
 //   - catalog.go    model discovery/selection in a models directory
 //   - cmd/gopherllm CLI built on all of the above
 package gopherllm
+
+// Version is reported by the CLI's --version and usage header.
+const Version = "0.3.0-go"
