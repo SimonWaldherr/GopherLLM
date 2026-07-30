@@ -47,9 +47,31 @@ func TestSPARQLGuardAcceptsOrdinaryReadOnlyQueries(t *testing.T) {
 		// A variable that merely contains a banned keyword is fine, because
 		// matching is whole-word.
 		"SELECT ?address ?adder WHERE { ?address ?p ?adder }",
+		// SERVICE wikibase:label is the standard, near-essential pattern for
+		// human-readable labels instead of bare Q-IDs -- it must not be
+		// banned along with genuinely federated (SSRF-risk) SERVICE calls.
+		"SELECT ?countryLabel WHERE { wd:Q183 wdt:P463 ?country. SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". } }",
+		"SELECT ?s WHERE { SERVICE SILENT wikibase:label { ?s ?p ?o } }",
 	} {
 		if err := checkReadOnlySPARQL(query); err != nil {
 			t.Errorf("rejected legitimate query %q: %v", query, err)
+		}
+	}
+}
+
+// TestSPARQLGuardStillRejectsExternalServiceFederation guards the boundary
+// of the SERVICE allowance above: only Wikidata's own wikibase: services are
+// permitted. A SERVICE clause naming an arbitrary external URI can make
+// Wikidata's own query engine issue a request to a server the caller
+// controls (SSRF), so that must stay blocked even though wikibase:label now
+// is not.
+func TestSPARQLGuardStillRejectsExternalServiceFederation(t *testing.T) {
+	for _, query := range []string{
+		"SELECT ?s WHERE { SERVICE <http://evil.example/sparql> { ?s ?p ?o } }",
+		"SELECT ?s WHERE { SERVICE ?endpoint { ?s ?p ?o } }",
+	} {
+		if err := checkReadOnlySPARQL(query); err == nil {
+			t.Errorf("accepted external SERVICE federation %q", query)
 		}
 	}
 }

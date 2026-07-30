@@ -109,7 +109,7 @@ func TestCosineSimilarityRejectsInvalidInputs(t *testing.T) {
 }
 
 func TestRopeInterleavedArchitectureSelection(t *testing.T) {
-	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral"} {
+	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "internlm2"} {
 		if !ropeInterleaved(arch) {
 			t.Fatalf("ropeInterleaved(%q) = false, want true", arch)
 		}
@@ -118,6 +118,21 @@ func TestRopeInterleavedArchitectureSelection(t *testing.T) {
 		if ropeInterleaved(arch) {
 			t.Fatalf("ropeInterleaved(%q) = true, want false", arch)
 		}
+	}
+}
+
+// TestInternLM2NeedsInterleavedRope guards a real bug: internlm2's GGUF
+// conversion keeps the original interleaved (adjacent-pair) rotary layout
+// rather than permuting weights for the split-half convention most
+// HF-native architectures use. Defaulting to split-half left positional
+// encoding subtly wrong -- early tokens looked fine, but generation drifted
+// into wrong word choices and glued-together words as position grew
+// (verified live: "42" for 6*7 and clean prose for the other two answers
+// once interleaved rope was enabled, versus math gibberish and words like
+// "theEiffy" beforehand).
+func TestInternLM2NeedsInterleavedRope(t *testing.T) {
+	if !ropeInterleaved("internlm2") {
+		t.Fatal("internlm2 must use interleaved RoPE")
 	}
 }
 

@@ -78,7 +78,8 @@
 
     <form id="form" aria-label="Chat input" novalidate>
       <div class="composer">
-        <div class="prompt-wrap">
+        <div id="promptWrap" class="prompt-wrap">
+          <div id="dropOverlay" class="drop-overlay" aria-hidden="true" hidden>Drop files to attach</div>
           <div id="commandMenu" class="command-menu" role="listbox" aria-label="Power commands" hidden></div>
           <textarea
             id="prompt"

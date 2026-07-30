@@ -965,6 +965,8 @@ function toMarkdown(chat) {
   const attachFileEl = $("attachFile");
   const fileInputEl = $("fileInput");
   const attachmentTrayEl = $("attachmentTray");
+  const promptWrapEl = $("promptWrap");
+  const dropOverlayEl = $("dropOverlay");
   const exportChatsEl = $("exportChats");
   const exportMarkdownEl = $("exportMarkdown");
   const importChatsEl = $("importChats");
@@ -3500,6 +3502,37 @@ function toMarkdown(chat) {
     if (!files.length || busy) return;
     await queueFiles(files);
     promptEl.focus();
+  });
+
+  // Drag-and-drop attachments. dragCounter tracks nested enter/leave pairs
+  // (every child element fires its own dragenter/dragleave as the pointer
+  // crosses it) so the overlay only hides once the pointer truly leaves
+  // promptWrapEl, not just a child inside it.
+  let dragCounter = 0;
+  const isFileDrag = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+  promptWrapEl.addEventListener("dragenter", (event) => {
+    if (!isFileDrag(event) || busy) return;
+    event.preventDefault();
+    dragCounter++;
+    dropOverlayEl.hidden = false;
+  });
+  promptWrapEl.addEventListener("dragover", (event) => {
+    if (!isFileDrag(event) || busy) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  promptWrapEl.addEventListener("dragleave", () => {
+    dragCounter = Math.max(0, dragCounter - 1);
+    if (dragCounter === 0) dropOverlayEl.hidden = true;
+  });
+  promptWrapEl.addEventListener("drop", async (event) => {
+    if (!isFileDrag(event)) return;
+    event.preventDefault();
+    dragCounter = 0;
+    dropOverlayEl.hidden = true;
+    if (busy) return;
+    const files = Array.from(event.dataTransfer.files || []);
+    if (files.length) await queueFiles(files);
   });
 
   composerContextWindowEl.addEventListener("change", () => {

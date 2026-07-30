@@ -2463,7 +2463,7 @@ func applyPreparedRope(vec []float32, headDim, nHeads, half, nCache int, sin, co
 
 func ropeInterleaved(arch string) bool {
 	switch arch {
-	case "llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "smollm3":
+	case "llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "smollm3", "internlm2":
 		return true
 	default:
 		return false

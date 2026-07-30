@@ -46,6 +46,20 @@ func TestRenderChatMLMessages(t *testing.T) {
 	}
 }
 
+// TestStableLMStopsAtIMEndEvenWhenItDiffersFromDeclaredEOS guards a real bug:
+// stable-code-instruct-3b's own ChatML template ends a turn with <|im_end|>,
+// but its GGUF conversion does not declare that as the tokenizer EOS.
+// Falling back to EOSID alone let the raw <|im_end|> tag leak into the
+// visible response text instead of stopping generation there.
+func TestStableLMStopsAtIMEndEvenWhenItDiffersFromDeclaredEOS(t *testing.T) {
+	tok := newChatTokenizer("<|im_start|>", "<|im_end|>", "<|endoftext|>")
+	tok.EOSID = tok.TokenToID["<|endoftext|>"]
+	r := &Runner{tok: tok, arch: "stablelm"}
+	if !r.isStopToken(tok.TokenToID["<|im_end|>"]) {
+		t.Fatal("stablelm must stop at <|im_end|> even when it differs from the declared EOS")
+	}
+}
+
 // TestRenderChatMLMessagesOpensThinkTagOnlyForCheckpointsThatDefaultToIt
 // guards a real bug: Nemotron-H's own chat_template defaults
 // enable_thinking to true and then emits an unclosed '<think>\n' after
@@ -131,7 +145,7 @@ func TestRenderHeaderChatMessages(t *testing.T) {
 }
 
 func TestRenderPhiMessages(t *testing.T) {
-	tok := newChatTokenizer("<|system|>", "<|user|>", "<|assistant|>", "<|end|>")
+	tok := newChatTokenizer("<|system|>", "<|user|>", "<|assistant|>", "<|end|>", "<|endoftext|>")
 	r := &Runner{tok: tok, arch: "phi3"}
 	tokens, ok := r.renderPhiMessages([]ChatMessage{UserMessage("hi")}, "sys")
 	if !ok {
@@ -142,6 +156,17 @@ func TestRenderPhiMessages(t *testing.T) {
 	}
 	if tokens[len(tokens)-1] != tok.TokenToID["<|assistant|>"] && indexOfToken(tokens, tok.TokenToID["<|assistant|>"]) < 0 {
 		t.Fatal("expected assistant token")
+	}
+	// Real Phi-3(.1)-mini GGUFs declare EOS as <|endoftext|>, a different
+	// token from the <|end|> the model's own template actually emits to
+	// close a turn. Relying only on the declared EOS let generation run past
+	// the model's real stop point into hallucinated extra turns; guard both.
+	tok.EOSID = tok.TokenToID["<|endoftext|>"]
+	if !r.isStopToken(tok.TokenToID["<|end|>"]) {
+		t.Fatal("phi3 (Phi-3.1-mini style) must stop at <|end|> even when it differs from the declared EOS")
+	}
+	if !r.isStopToken(tok.TokenToID["<|endoftext|>"]) {
+		t.Fatal("phi3 must still stop at its declared EOS")
 	}
 }
 

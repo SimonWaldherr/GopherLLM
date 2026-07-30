@@ -76,7 +76,8 @@ func (c *wikimediaClient) tools() []gopherllm.AgenticTool {
 		{Definition: wikiToolDefinition("wikipedia_search", "Search Wikipedia for relevant articles. Use this first when you need factual background or a suitable article title.", `{"type":"object","properties":{"query":{"type":"string","description":"Search terms"},"language":{"type":"string","description":"Wikipedia language code, e.g. de or en"}},"required":["query"]}`), Execute: c.search},
 		{Definition: wikiToolDefinition("wikipedia_summary", "Retrieve a Wikipedia article's short LEAD PARAGRAPH ONLY (like a search-engine snippet) — not the article body, and not any list, table, or enumeration the article contains. For a \"List of ...\" article this typically returns just a sentence stating how many items exist, none of their names. Use wikidata_sparql instead when the question needs the actual members of a list, category, or set.", `{"type":"object","properties":{"title":{"type":"string","description":"Exact article title"},"language":{"type":"string","description":"Wikipedia language code, e.g. de or en"}},"required":["title"]}`), Execute: c.summary},
 		{Definition: wikiToolDefinition("wikidata_entity", "Retrieve structured labels and claims for one Wikidata entity Q-ID.", `{"type":"object","properties":{"id":{"type":"string","description":"Wikidata Q-ID, e.g. Q64"},"language":{"type":"string","description":"Preferred language code, e.g. de or en"}},"required":["id"]}`), Execute: c.entity},
-		{Definition: wikiToolDefinition("wikidata_sparql", "Run a bounded read-only SELECT or ASK query against the Wikidata Query Service. Use it for structured comparisons, lists, dates, identifiers, or relations that article summaries cannot answer.", `{"type":"object","properties":{"query":{"type":"string","description":"Read-only SPARQL SELECT or ASK query; include LIMIT when useful"}},"required":["query"]}`), Execute: c.sparql},
+		{Definition: wikiToolDefinition("wikidata_search_entities", "Look up the exact Wikidata Q-ID (item) or P-ID (property/relation) for a name. Use this BEFORE writing a wikidata_sparql query whenever you are not already certain of an ID: guessing a property number from memory (e.g. for \"official language\", \"capital\", \"population\") is unreliable and a wrong ID silently returns zero rows instead of an error.", `{"type":"object","properties":{"query":{"type":"string","description":"Name to look up, e.g. \"official language\" or \"Switzerland\""},"type":{"type":"string","enum":["item","property"],"description":"\"item\" for a Q-ID (a thing, e.g. a country), \"property\" for a P-ID (a relation, e.g. official language). Defaults to item."},"language":{"type":"string","description":"Preferred language code, e.g. de or en"}},"required":["query"]}`), Execute: c.searchEntities},
+		{Definition: wikiToolDefinition("wikidata_sparql", "Run a bounded read-only SELECT or ASK query against the Wikidata Query Service. Use it for structured comparisons, lists, dates, identifiers, or relations that article summaries cannot answer. If you are not certain of a property's P-ID, call wikidata_search_entities first rather than guessing one. Wikidata's own PREFIX declarations (wd:, wdt:, rdfs:, ...) are already active; do not redeclare them unless you need one not on that list. Entities and properties (wd:Q64, wdt:P31, wdt:P17, ...) resolve to Q-/P-IDs, not readable text, so end every query that should show names with 'SERVICE wikibase:label { bd:serviceParam wikibase:language \"[AUTO_LANGUAGE],en\". }' and select the generated ?xLabel variables — otherwise the result is a list of bare IDs. Example: SELECT ?countryLabel WHERE { wd:Q183 wdt:P463 ?country. SERVICE wikibase:label { bd:serviceParam wikibase:language \"en\". } }", `{"type":"object","properties":{"query":{"type":"string","description":"Read-only SPARQL SELECT or ASK query; include LIMIT when useful"}},"required":["query"]}`), Execute: c.sparql},
 	}
 }
 
@@ -179,6 +180,53 @@ func (c *wikimediaClient) entity(ctx context.Context, call gopherllm.ToolCall) (
 	return toolJSON(map[string]any{"source": "Wikidata entity", "id": id, "url": "https://www.wikidata.org/wiki/" + id, "label": localizedValue(entity.Labels, lang), "description": localizedValue(entity.Descriptions, lang), "claims": claims})
 }
 
+type wikidataSearchResponse struct {
+	Search []struct {
+		ID          string `json:"id"`
+		Label       string `json:"label"`
+		Description string `json:"description"`
+	} `json:"search"`
+}
+
+// searchEntities looks up the Q-/P-ID for an item or property by name. Small
+// models writing SPARQL from memory routinely guess a plausible-sounding but
+// wrong property ID (e.g. a random P-number instead of P37 for "official
+// language"), and the query then just returns zero rows with no indication
+// of what went wrong. This mirrors Wikidata's own wbsearchentities action so
+// a model can look an ID up first instead of guessing.
+func (c *wikimediaClient) searchEntities(ctx context.Context, call gopherllm.ToolCall) (string, error) {
+	var args struct{ Query, Type, Language string }
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		return "", fmt.Errorf("invalid arguments: %w", err)
+	}
+	query := boundedText(args.Query, 200)
+	if query == "" {
+		return "", fmt.Errorf("query is required")
+	}
+	kind := strings.ToLower(strings.TrimSpace(args.Type))
+	if kind == "" {
+		kind = "item"
+	}
+	if kind != "item" && kind != "property" {
+		return "", fmt.Errorf("type must be \"item\" or \"property\", got %q", kind)
+	}
+	lang, err := wikiLanguage(args.Language)
+	if err != nil {
+		return "", err
+	}
+	u := c.wikidataAPIBase + "?action=wbsearchentities&format=json&limit=8&language=" + url.QueryEscape(lang) +
+		"&type=" + kind + "&search=" + url.QueryEscape(query)
+	var data wikidataSearchResponse
+	if err := c.getJSON(ctx, u, &data, "application/json"); err != nil {
+		return "", err
+	}
+	matches := make([]map[string]string, 0, len(data.Search))
+	for _, m := range data.Search {
+		matches = append(matches, map[string]string{"id": m.ID, "label": m.Label, "description": m.Description})
+	}
+	return toolJSON(map[string]any{"source": "Wikidata search", "type": kind, "matches": matches})
+}
+
 func (c *wikimediaClient) sparql(ctx context.Context, call gopherllm.ToolCall) (string, error) {
 	var args struct{ Query string }
 	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
@@ -260,10 +308,20 @@ func wikiLanguage(value string) (string, error) {
 
 // sparqlUpdateKeywords covers every SPARQL 1.1 Update form, not just the few
 // that are easy to think of. A prefix check alone is not enough: a query may
-// start with SELECT and still carry an update after a semicolon.
+// start with SELECT and still carry an update after a semicolon. SERVICE is
+// handled separately below rather than banned outright: SERVICE wikibase:label
+// is the standard, near-universal way to get human-readable labels instead of
+// bare Q-IDs, and rejecting it wholesale broke almost every realistic
+// Wikidata query, which was the biggest single drag on small-model success
+// with this tool. Federating to an arbitrary external SERVICE <URI> is still
+// a real SSRF risk and stays blocked.
 var sparqlUpdateKeywords = []string{
-	"insert", "delete", "drop", "clear", "load", "create", "copy", "move", "add", "service", "with", "using",
+	"insert", "delete", "drop", "clear", "load", "create", "copy", "move", "add", "with", "using",
 }
+
+// sparqlServiceRef captures what a SERVICE clause names (its optional SILENT
+// modifier skipped) so it can be checked against the wikibase: allow-list.
+var sparqlServiceRef = regexp.MustCompile(`(?i)\bservice\b\s*(?:silent\b\s*)?(\S+)`)
 
 // checkReadOnlySPARQL rejects anything that is not a plain SELECT or ASK.
 // Comments are stripped first, because "# note\nDROP GRAPH <g>" would
@@ -288,6 +346,11 @@ func checkReadOnlySPARQL(query string) error {
 			if word == banned {
 				return fmt.Errorf("query contains the disallowed SPARQL operation %q", word)
 			}
+		}
+	}
+	for _, match := range sparqlServiceRef.FindAllStringSubmatch(lower, -1) {
+		if !strings.HasPrefix(match[1], "wikibase:") {
+			return fmt.Errorf("SERVICE clauses may only call Wikidata's own wikibase: services (e.g. wikibase:label), not %q", match[1])
 		}
 	}
 	if !strings.Contains(lower, "select") && !strings.Contains(lower, "ask") {

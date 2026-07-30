@@ -1358,6 +1358,31 @@ func (r *Runner) isStopToken(token uint32) bool {
 			return true
 		}
 	}
+	if r.arch == "phi3" {
+		// Phi-3(.1)-mini's own template ends a turn with <|end|>, and Phi-4's
+		// with <|im_end|>; neither is guaranteed to be the tokenizer's
+		// declared EOS (observed drifting to <|endoftext|> instead on some
+		// GGUF conversions). Checking only the fallback EOSID below let
+		// generation run past the model's real stop point into hallucinated
+		// extra turns / unrelated text.
+		if id, ok := r.tok.SpecialID("<|end|>"); ok && token == id {
+			return true
+		}
+		if id, ok := r.tok.SpecialID("<|im_end|>"); ok && token == id {
+			return true
+		}
+		if id, ok := r.tok.SpecialID("<|endoftext|>"); ok && token == id {
+			return true
+		}
+	}
+	if r.arch == "stablelm" {
+		// StableLM's ChatML-style template ends a turn with <|im_end|>, which
+		// some conversions do not set as the declared EOS, letting the raw
+		// tag leak into the visible response text.
+		if id, ok := r.tok.SpecialID("<|im_end|>"); ok && token == id {
+			return true
+		}
+	}
 	if gemmaFamily(r.arch) {
 		if r.arch == "gemma4" {
 			// Gemma 4's native turn delimiter replaces the older
