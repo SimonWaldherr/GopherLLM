@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,19 @@ type hfReference struct {
 	Repository string
 	Quant      string
 	Revision   string
+}
+
+// Options controls Hub operations without relying on a global HTTP transport.
+// Offline mirrors Hugging Face's HF_HUB_OFFLINE convention: no Hub request is
+// made and only complete snapshots already in the shared cache are considered.
+type Options struct {
+	Offline bool
+}
+
+// DefaultOptions reads the Hugging Face-compatible offline setting. Explicit
+// Options supplied by a host or the CLI can enable offline mode as well.
+func DefaultOptions() Options {
+	return Options{Offline: hfBoolEnv("HF_HUB_OFFLINE")}
 }
 
 // ParseHuggingFaceReference parses hf:owner/repository[:quant][@revision].
@@ -118,6 +132,16 @@ func ListGGUF(ref string, out io.Writer) error {
 // ListGGUFContext is ListGGUF with cancellation support for callers that
 // attach the operation to a request, CLI signal, or shutdown context.
 func ListGGUFContext(ctx context.Context, ref string, out io.Writer) error {
+	return ListGGUFContextWithOptions(ctx, ref, out, DefaultOptions())
+}
+
+// ListGGUFContextWithOptions is ListGGUFContext with explicit network policy.
+// In offline mode it lists only complete variants from the cached revision.
+func ListGGUFContextWithOptions(ctx context.Context, ref string, out io.Writer, opts Options) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	offline := opts.Offline || hfBoolEnv("HF_HUB_OFFLINE")
 	ref = strings.TrimSpace(ref)
 	if !strings.HasPrefix(strings.ToLower(ref), hfPrefix) {
 		ref = hfPrefix + ref
@@ -129,12 +153,31 @@ func ListGGUFContext(ctx context.Context, ref string, out io.Writer) error {
 	if out == nil {
 		out = io.Discard
 	}
-	entries, _, err := hfListFiles(ctx, r)
-	if err != nil {
-		return err
+	cache := newHFCache(r)
+	var entries []hfTreeEntry
+	if offline {
+		snapshot := cache.snapshotForRef(r.Revision)
+		if snapshot == "" {
+			return offlineCacheError(r)
+		}
+		entries, err = cachedHFGGUFEntries(ctx, snapshot)
+		if err != nil {
+			return fmt.Errorf("read cached Hugging Face repository %s: %w", r.Repository, err)
+		}
+	} else {
+		entries, _, err = hfListFiles(ctx, r)
+		if err != nil {
+			return err
+		}
 	}
-	options := ggufOptions(entries, r.Quant)
-	if len(options) == 0 {
+	variants := ggufOptions(entries, r.Quant)
+	if offline {
+		variants = completeCachedGGUFOptions(entries, variants)
+	}
+	if len(variants) == 0 {
+		if offline {
+			return offlineCacheError(r)
+		}
 		return fmt.Errorf("no GGUF files found in Hugging Face repository %s", r.Repository)
 	}
 	fmt.Fprintf(out, "GGUF variants in %s", r.Repository)
@@ -155,7 +198,7 @@ func ListGGUFContext(ctx context.Context, ref string, out io.Writer) error {
 		return selector
 	}
 	fmt.Fprintf(out, "%-14s %-10s %-7s %s\n", "quant", "size", "shards", "run")
-	for _, option := range options {
+	for _, option := range variants {
 		quant := option.Quant
 		if quant == "" {
 			quant = "unknown"
@@ -177,6 +220,13 @@ func ResolveHuggingFaceModel(ref string, logw io.Writer) (string, error) {
 // ctx. Cancellation stops repository listing, metadata requests, and any
 // in-flight file transfer while preserving the partial blob for a later resume.
 func ResolveHuggingFaceModelContext(ctx context.Context, ref string, logw io.Writer) (string, error) {
+	return ResolveHuggingFaceModelContextWithOptions(ctx, ref, logw, DefaultOptions())
+}
+
+// ResolveHuggingFaceModelContextWithOptions resolves a GGUF with an explicit
+// network policy. Offline mode never contacts the Hub and requires a complete
+// snapshot for the selected revision to be present in the local cache.
+func ResolveHuggingFaceModelContextWithOptions(ctx context.Context, ref string, logw io.Writer, options Options) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -190,6 +240,15 @@ func ResolveHuggingFaceModelContext(ctx context.Context, ref string, logw io.Wri
 		logw = &synchronizedWriter{w: logw}
 	}
 	cache := newHFCache(r)
+	if options.Offline || hfBoolEnv("HF_HUB_OFFLINE") {
+		if snapshot := cache.snapshotForRef(r.Revision); snapshot != "" {
+			if files, err := cachedGGUFFiles(ctx, snapshot, r.Quant); err == nil && len(files) > 0 {
+				fmt.Fprintf(logw, "Hugging Face: offline; using cached %s\n", filepath.Base(files[0]))
+				return files[0], nil
+			}
+		}
+		return "", offlineCacheError(r)
+	}
 	entries, commit, err := hfListFiles(ctx, r)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -197,7 +256,7 @@ func ResolveHuggingFaceModelContext(ctx context.Context, ref string, logw io.Wri
 		}
 		// A previously resolved revision remains usable without a connection.
 		if snapshot := cache.snapshotForRef(r.Revision); snapshot != "" {
-			if files, cacheErr := cachedGGUFFiles(snapshot, r.Quant); cacheErr == nil && len(files) > 0 {
+			if files, cacheErr := cachedGGUFFiles(ctx, snapshot, r.Quant); cacheErr == nil && len(files) > 0 {
 				fmt.Fprintf(logw, "Hugging Face: offline; using cached %s\n", filepath.Base(files[0]))
 				return files[0], nil
 			}
@@ -218,7 +277,7 @@ func ResolveHuggingFaceModelContext(ctx context.Context, ref string, logw io.Wri
 		commit = safeHFPathPart(r.Revision)
 	}
 	snapshot := cache.snapshot(commit)
-	if cached, err := cachedGGUFFiles(snapshot, r.Quant); err == nil && len(cached) > 0 {
+	if cached, err := cachedGGUFFiles(ctx, snapshot, r.Quant); err == nil && len(cached) > 0 {
 		if err := cache.writeRef(r.Revision, commit); err != nil {
 			return "", err
 		}
@@ -312,10 +371,26 @@ func hfFileSize(entries []hfTreeEntry, name string) int64 {
 
 func hfListReference(r hfReference) string {
 	ref := r.Repository
+	if r.Quant != "" {
+		ref += ":" + r.Quant
+	}
 	if r.Revision != "main" {
 		ref += "@" + r.Revision
 	}
 	return ref
+}
+
+func offlineCacheError(r hfReference) error {
+	return fmt.Errorf("Hugging Face offline mode is enabled; no complete cached GGUF matches %s. Connect once without --hf-offline or unset HF_HUB_OFFLINE=1", hfPrefix+hfListReference(r))
+}
+
+func hfBoolEnv(name string) bool {
+	switch strings.ToUpper(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "ON", "YES", "TRUE":
+		return true
+	default:
+		return false
+	}
 }
 
 func hfEndpoint() string {
@@ -474,7 +549,48 @@ func selectHFGGUF(entries []hfTreeEntry, quant string) ([]string, error) {
 		files[i] = entry.Path
 	}
 	sort.Strings(files)
+	if err := validateHFSplitFiles(files); err != nil {
+		return nil, err
+	}
 	return files, nil
+}
+
+// validateHFSplitFiles rejects a partial or malformed split group before it
+// can be loaded. A valid list must contain every shard exactly once, from 1
+// through the advertised "of" count.
+func validateHFSplitFiles(files []string) error {
+	if len(files) == 0 {
+		return fmt.Errorf("GGUF file set is empty")
+	}
+	first := hfSplitName.FindStringSubmatch(files[0])
+	if first == nil {
+		return nil
+	}
+	expected, err := strconv.Atoi(first[3])
+	if err != nil || expected <= 0 || len(files) != expected {
+		return fmt.Errorf("GGUF split is incomplete: found %d of %s shards", len(files), first[3])
+	}
+	seen := make(map[int]struct{}, len(files))
+	for _, file := range files {
+		match := hfSplitName.FindStringSubmatch(file)
+		if match == nil || match[1] != first[1] || match[3] != first[3] {
+			return fmt.Errorf("GGUF split has inconsistent shard names")
+		}
+		index, err := strconv.Atoi(match[2])
+		if err != nil || index < 1 || index > expected {
+			return fmt.Errorf("GGUF split has invalid shard name %q", file)
+		}
+		if _, duplicate := seen[index]; duplicate {
+			return fmt.Errorf("GGUF split has duplicate shard %d", index)
+		}
+		seen[index] = struct{}{}
+	}
+	for index := 1; index <= expected; index++ {
+		if _, ok := seen[index]; !ok {
+			return fmt.Errorf("GGUF split is incomplete: shard %05d is missing", index)
+		}
+	}
+	return nil
 }
 
 func ggufGroups(entries []hfTreeEntry) map[string][]hfTreeEntry {
@@ -788,18 +904,8 @@ func hfStatusError(resp *http.Response, target string) error {
 	return fmt.Errorf("Hugging Face request for %s failed: %s", target, resp.Status)
 }
 
-func cachedGGUFFiles(cache, quant string) ([]string, error) {
-	entries := []hfTreeEntry{}
-	err := filepath.WalkDir(cache, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && strings.HasSuffix(strings.ToLower(path), ".gguf") {
-			rel, _ := filepath.Rel(cache, path)
-			entries = append(entries, hfTreeEntry{Path: filepath.ToSlash(rel), Type: "file"})
-		}
-		return nil
-	})
+func cachedGGUFFiles(ctx context.Context, cache, quant string) ([]string, error) {
+	entries, err := cachedHFGGUFEntries(ctx, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -807,16 +913,54 @@ func cachedGGUFFiles(cache, quant string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Do not treat a partly downloaded shard set as a reusable model. The
-	// first shard is enough to identify the group, but Open needs every shard.
-	if m := hfSplitName.FindStringSubmatch(files[0]); m != nil {
-		var expected int
-		if _, err := fmt.Sscanf(m[3], "%d", &expected); err != nil || expected != len(files) {
-			return nil, fmt.Errorf("cached split GGUF is incomplete")
-		}
-	}
 	for i := range files {
 		files[i] = filepath.Join(cache, filepath.FromSlash(files[i]))
 	}
 	return files, nil
+}
+
+// cachedHFGGUFEntries reads snapshot links using os.Stat, which follows
+// symlinks into blobs and deliberately ignores stale links from a manually
+// damaged cache. The resulting sizes make offline --hf-list as informative as
+// an online repository listing.
+func cachedHFGGUFEntries(ctx context.Context, cache string) ([]hfTreeEntry, error) {
+	entries := []hfTreeEntry{}
+	err := filepath.WalkDir(cache, func(path string, d os.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.HasSuffix(strings.ToLower(path), ".gguf") {
+			info, statErr := os.Stat(path)
+			if statErr != nil || !info.Mode().IsRegular() {
+				return nil
+			}
+			rel, _ := filepath.Rel(cache, path)
+			entries = append(entries, hfTreeEntry{Path: filepath.ToSlash(rel), Type: "file", Size: info.Size()})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func completeCachedGGUFOptions(entries []hfTreeEntry, options []GGUFOption) []GGUFOption {
+	groups := ggufGroups(entries)
+	complete := make([]GGUFOption, 0, len(options))
+	for _, option := range options {
+		files := groups[option.File]
+		paths := make([]string, len(files))
+		for i, entry := range files {
+			paths[i] = entry.Path
+		}
+		sort.Strings(paths)
+		if validateHFSplitFiles(paths) == nil {
+			complete = append(complete, option)
+		}
+	}
+	return complete
 }

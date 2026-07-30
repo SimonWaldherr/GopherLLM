@@ -120,6 +120,58 @@ make list-models MODEL_DIR=/path/to/models
 make run MODEL_DIR=/path/to/models MODEL="some-model" PROMPT="Explain local LLM inference in three sentences."
 ```
 
+### Reproducible configuration
+
+For repeatable local runs or deployments, pass one explicit JSON file with
+`--config`. Precedence is **built-in defaults and environment defaults → config
+file → CLI flags**. The file is strict: unknown fields and unsupported schema
+versions fail early instead of being silently ignored. It is never discovered
+automatically, and it contains no access tokens.
+
+```json
+{
+  "version": 1,
+  "preset": "precise",
+  "model": "hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main",
+  "model_dir": "/path/to/models",
+  "generation": {
+    "max_tokens": 384,
+    "temperature": 0.25,
+    "top_p": 0.9,
+    "stop": ["<|end_of_text|>"],
+    "context_window_mode": "recent"
+  },
+  "runtime": {
+    "threads": 8,
+    "prepare_quant": true,
+    "timeout": "2m"
+  },
+  "server": {
+    "address": "127.0.0.1:8080",
+    "chat": true,
+    "max_connections": 16
+  },
+  "huggingface": {"offline": true}
+}
+```
+
+```sh
+bin/gopherllm --config ./gopherllm.json
+bin/gopherllm --config ./gopherllm.json --temp 0.4 --prompt "Summarize this."
+bin/gopherllm --config ./gopherllm.json --print-config
+```
+
+`balanced` is the default sampler preset; `precise`, `creative`, and
+`deterministic` offer deliberate starting points. A preset is applied before
+explicit generation values, so a config or CLI `--temp`/`--top-p` setting can
+always fine-tune it. `--print-config` emits a reusable effective config and
+never prints `HF_TOKEN` or a transient user prompt.
+
+`context_window_mode` (or `--context-window`) is `full` by default, which
+returns a context-limit error instead of dropping history. Choose `recent` to
+retain complete recent turns, or `autoCompress` to compact ordinary prose
+before applying the same turn-preserving selection.
+
 ### Hugging Face imports
 
 Use an `hf:` selector to download a GGUF directly. Add the quantization after
@@ -148,6 +200,17 @@ Downloads, including every shard of split GGUFs, use the shared Hugging Face
 `blobs`/`refs`/`snapshots` cache under `$HF_HOME/hub` (or the platform cache
 when `HF_HOME` is unset). Existing cached snapshots remain usable offline.
 Set `HF_TOKEN` for gated or private repositories.
+
+For an auditable air-gapped run, add `--hf-offline` (including to `--hf-list`).
+It makes no HTTP request and accepts only a complete cached snapshot for the
+selected revision. GopherLLM also honors Hugging Face's shared
+`HF_HUB_OFFLINE=1` setting, so Python tooling and GopherLLM follow the same
+network policy:
+
+```sh
+bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main --hf-offline --repl
+HF_HUB_OFFLINE=1 bin/gopherllm --hf-list bartowski/Qwen3-4B-GGUF@main
+```
 
 ## Use as a Go Library
 

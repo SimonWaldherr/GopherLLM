@@ -79,9 +79,19 @@ func TestResolveHuggingFaceModelDownloadsSplitAndReusesCache(t *testing.T) {
 		t.Fatalf("cached download count = %d, want 2", downloads.Load())
 	}
 	t.Setenv("HF_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("HF_HUB_OFFLINE", "1")
 	offlinePath, err := ResolveHuggingFaceModel("hf:org/model:Q4_K_M@revision", io.Discard)
 	if err != nil || offlinePath != path {
 		t.Fatalf("offline cache path = %q, %v", offlinePath, err)
+	}
+	var listing bytes.Buffer
+	if err := ListGGUF("org/model@revision", &listing); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Q4_K_M", "2", "hf:org/model:Q4_K_M@revision"} {
+		if !strings.Contains(listing.String(), want) {
+			t.Fatalf("offline listing missing %q:\n%s", want, listing.String())
+		}
 	}
 	if _, err := os.Stat(filepath.Join(cacheHome, "hub", "models--org--model", "blobs", "blob-1")); err != nil {
 		t.Fatalf("first content blob missing: %v", err)
@@ -195,6 +205,24 @@ func TestResolveHuggingFaceModelContextStopsBeforeNetworkWork(t *testing.T) {
 	}
 }
 
+func TestResolveHuggingFaceModelOfflineNeverContactsHub(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "network access is forbidden", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	t.Setenv("HF_ENDPOINT", server.URL)
+	t.Setenv("HF_HOME", t.TempDir())
+	_, err := ResolveHuggingFaceModelContextWithOptions(context.Background(), "hf:org/model:Q4_K_M@revision", io.Discard, Options{Offline: true})
+	if err == nil || !strings.Contains(err.Error(), "offline mode is enabled") {
+		t.Fatalf("offline error = %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("offline mode made %d Hub requests", requests.Load())
+	}
+}
+
 func TestDownloadHFFilesUsesABoundedWorkerPool(t *testing.T) {
 	var active, peak atomic.Int32
 	started := make(chan struct{}, 3)
@@ -249,5 +277,16 @@ func TestSelectHFGGUFRequiresQuantForMultipleModels(t *testing.T) {
 	files, err := selectHFGGUF(entries, "Q8_0")
 	if err != nil || len(files) != 1 || files[0] != "a-Q8_0.gguf" {
 		t.Fatalf("select = %v, %v", files, err)
+	}
+}
+
+func TestSelectHFGGUFRejectsIncompleteSplit(t *testing.T) {
+	entries := []hfTreeEntry{
+		{Path: "a-Q4_K_M-00001-of-00003.gguf", Type: "file"},
+		{Path: "a-Q4_K_M-00003-of-00003.gguf", Type: "file"},
+	}
+	_, err := selectHFGGUF(entries, "Q4_K_M")
+	if err == nil || !strings.Contains(err.Error(), "split is incomplete") {
+		t.Fatalf("incomplete split error = %v", err)
 	}
 }

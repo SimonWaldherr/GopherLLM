@@ -33,8 +33,12 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --model <name>           Select a GGUF from --model-dir by repo, file, or metadata name")
 	fmt.Fprintln(os.Stderr, "  --model-dir <path>       Directory to recursively scan for GGUF files")
 	fmt.Fprintln(os.Stderr, "                           Passing a directory as model selector opens an interactive model picker")
+	fmt.Fprintln(os.Stderr, "  --config <file>          Load a strict JSON configuration (defaults < config < CLI flags)")
+	fmt.Fprintln(os.Stderr, "  --print-config           Print the effective JSON configuration without access tokens and exit")
+	fmt.Fprintln(os.Stderr, "  --preset <name>          Generation preset: balanced | precise | creative | deterministic")
 	fmt.Fprintln(os.Stderr, "  --list-models            List GGUF files in --model-dir and exit")
 	fmt.Fprintln(os.Stderr, "  --hf-list <repo>         List GGUF variants in a Hugging Face repo, e.g. bartowski/Qwen3-4B-GGUF")
+	fmt.Fprintln(os.Stderr, "  --hf-offline             Use complete Hugging Face cache entries only; never make a network request")
 	fmt.Fprintln(os.Stderr, "  --privacy                Print the local-first privacy and network-use report, then exit")
 	fmt.Fprintln(os.Stderr, "  --prompt <text>           Input prompt (interactive if omitted)")
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
@@ -49,6 +53,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --min-p <F>               Min-P sampling threshold (default: 0, disabled)")
 	fmt.Fprintln(os.Stderr, "  --repeat-penalty <F>      Repetition penalty (default: 1.1)")
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
+	fmt.Fprintln(os.Stderr, "  --context-window <mode>  Chat overflow: full | recent | autoCompress (default: full)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
 	fmt.Fprintln(os.Stderr, "  --metal                   Use selective Metal Q4_K/Q6_K matvec offload when available")
 	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute supported quantized scale data during load for faster matvecs")
@@ -85,44 +90,50 @@ func printUsage(name string) {
 }
 
 type cliConfig struct {
-	modelSelector    *string
-	modelDir         string
-	prompt           string
-	options          gopherllm.GenerationOptions
-	listModels       bool
-	hfList           string
-	privacyReport    bool
-	listTensors      bool
-	repl             bool
-	serveAddr        string
-	chatUI           bool
-	maxConn          int
-	embed            bool
-	bench            bool
-	benchJSON        bool
-	benchOutput      bool
-	benchRuns        int
-	kernelBench      bool
-	kernelBenchJSON  bool
-	kernelBenchRuns  int
-	kernelBenchLayer int
-	timeout          time.Duration
-	cpuProfile       string
-	autoTune         bool
-	autoTuneJSON     bool
-	autoTuneRefresh  bool
-	autoTuneEffort   string
-	useMetal         bool
-	metalExplicit    bool
-	prepareQuant     bool
-	outOfCore        bool
-	inspect          bool
-	listMetadata     bool
-	skillsDir        string
-	analyze          bool
-	findToken        string
-	tokenNeighbors   string
-	neighborCount    int
+	modelSelector           *string
+	modelSelectorFromConfig bool
+	modelDir                string
+	preset                  string
+	prompt                  string
+	options                 gopherllm.GenerationOptions
+	threads                 int
+	threadsSet              bool
+	printConfig             bool
+	listModels              bool
+	hfList                  string
+	hfOffline               bool
+	privacyReport           bool
+	listTensors             bool
+	repl                    bool
+	serveAddr               string
+	chatUI                  bool
+	maxConn                 int
+	embed                   bool
+	bench                   bool
+	benchJSON               bool
+	benchOutput             bool
+	benchRuns               int
+	kernelBench             bool
+	kernelBenchJSON         bool
+	kernelBenchRuns         int
+	kernelBenchLayer        int
+	timeout                 time.Duration
+	cpuProfile              string
+	autoTune                bool
+	autoTuneJSON            bool
+	autoTuneRefresh         bool
+	autoTuneEffort          string
+	useMetal                bool
+	metalExplicit           bool
+	prepareQuant            bool
+	outOfCore               bool
+	inspect                 bool
+	listMetadata            bool
+	skillsDir               string
+	analyze                 bool
+	findToken               string
+	tokenNeighbors          string
+	neighborCount           int
 	// osCommandsPolicy is the raw --os-commands value: "" disables the
 	// agentic OS-command feature entirely (no endpoints registered); any
 	// other value must parse via agentos.ParsePolicy.
@@ -155,10 +166,16 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if cfg.printConfig {
+		if err := cfg.options.Validate(); err != nil {
+			return err
+		}
+		return writeEffectiveConfig(os.Stdout, cfg)
+	}
 	commandCtx, stopCommand := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stopCommand()
 	if cfg.hfList != "" {
-		return huggingface.ListGGUFContext(commandCtx, cfg.hfList, os.Stdout)
+		return huggingface.ListGGUFContextWithOptions(commandCtx, cfg.hfList, os.Stdout, huggingface.Options{Offline: cfg.hfOffline})
 	}
 	if cfg.privacyReport {
 		return gopherllm.WritePrivacyReport(os.Stdout)
@@ -170,9 +187,6 @@ func run() error {
 		}
 		gopherllm.PrintModelList(entries)
 		return nil
-	}
-	if cfg.options.MaxTokens <= 0 {
-		return fmt.Errorf("--max-tokens must be greater than 0")
 	}
 	if err := cfg.options.Validate(); err != nil {
 		return err
@@ -191,6 +205,10 @@ func run() error {
 	}
 	if cfg.outOfCore && cfg.autoTune {
 		return fmt.Errorf("--out-of-core cannot be combined with --auto: calibration intentionally streams the full model")
+	}
+	if cfg.threadsSet {
+		gopherllm.SetNumThreads(cfg.threads)
+		runtime.GOMAXPROCS(cfg.threads)
 	}
 	agentOSRunner, err := buildAgentOSRunner(cfg)
 	if err != nil {
@@ -257,7 +275,7 @@ func run() error {
 	}
 	var modelPath string
 	if cfg.modelSelector != nil && strings.HasPrefix(strings.ToLower(*cfg.modelSelector), "hf:") {
-		modelPath, err = huggingface.ResolveHuggingFaceModelContext(commandCtx, *cfg.modelSelector, os.Stderr)
+		modelPath, err = huggingface.ResolveHuggingFaceModelContextWithOptions(commandCtx, *cfg.modelSelector, os.Stderr, huggingface.Options{Offline: cfg.hfOffline})
 	} else {
 		modelPath, err = gopherllm.ResolveModelPath(cfg.modelSelector, cfg.modelDir)
 	}
@@ -479,12 +497,35 @@ func buildAgentOSRunner(cfg cliConfig) (*agentos.Runner, error) {
 }
 
 func parseCLI(args []string) (cliConfig, error) {
-	cfg := cliConfig{modelDir: gopherllm.DefaultModelDir(), options: gopherllm.DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8}
+	cfg := cliConfig{modelDir: gopherllm.DefaultModelDir(), preset: "balanced", options: gopherllm.DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8}
+	configPath, err := configPathFromArgs(args)
+	if err != nil {
+		return cfg, err
+	}
+	if configPath != "" {
+		raw, err := loadFileConfig(configPath)
+		if err != nil {
+			return cfg, err
+		}
+		if err := applyFileConfig(&cfg, raw); err != nil {
+			return cfg, err
+		}
+	}
+	cliPreset, err := presetFromArgs(args)
+	if err != nil {
+		return cfg, err
+	}
+	if cliPreset != "" {
+		if err := applyPreset(&cfg, cliPreset); err != nil {
+			return cfg, err
+		}
+	}
 	setSelector := func(value string) error {
-		if cfg.modelSelector != nil {
+		if cfg.modelSelector != nil && !cfg.modelSelectorFromConfig {
 			return fmt.Errorf("multiple model selectors were provided")
 		}
 		cfg.modelSelector = &value
+		cfg.modelSelectorFromConfig = false
 		return nil
 	}
 	for i := 0; i < len(args); i++ {
@@ -497,12 +538,24 @@ func parseCLI(args []string) (cliConfig, error) {
 			return args[i], nil
 		}
 		switch arg {
+		case "--config":
+			if _, err := next(arg); err != nil {
+				return cfg, err
+			}
+		case "--print-config":
+			cfg.printConfig = true
+		case "--preset":
+			if _, err := next(arg); err != nil {
+				return cfg, err
+			}
 		case "--model":
 			v, err := next(arg)
 			if err != nil {
 				return cfg, err
 			}
-			if cfg.modelSelector != nil {
+			if cfg.modelSelectorFromConfig {
+				cfg.modelSelector, cfg.modelSelectorFromConfig = &v, false
+			} else if cfg.modelSelector != nil {
 				if st, err := os.Stat(*cfg.modelSelector); err == nil && st.IsDir() {
 					cfg.modelDir = *cfg.modelSelector
 					cfg.modelSelector = &v
@@ -526,6 +579,8 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.hfList = v
+		case "--hf-offline":
+			cfg.hfOffline = true
 		case "--privacy":
 			cfg.privacyReport = true
 		case "--prompt", "-p":
@@ -596,13 +651,22 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.options.Seed = n
+		case "--context-window":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			mode, err := parseContextWindowMode(v)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.options.ContextWindowMode = mode
 		case "--threads":
 			v, err := parseNextInt(next, arg)
 			if err != nil {
 				return cfg, err
 			}
-			gopherllm.SetNumThreads(v)
-			runtime.GOMAXPROCS(v)
+			cfg.threads, cfg.threadsSet = v, true
 		case "--metal":
 			cfg.useMetal = true
 			cfg.metalExplicit = true
@@ -692,9 +756,7 @@ func parseCLI(args []string) (cliConfig, error) {
 			if err != nil {
 				return cfg, err
 			}
-			switch v {
-			case "quick", "balanced", "thorough":
-			default:
+			if !validAutoEffort(v) {
 				return cfg, fmt.Errorf("--auto-effort must be quick, balanced, or thorough")
 			}
 			cfg.autoTune = true
@@ -737,6 +799,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, fmt.Errorf("unknown option: %s", arg)
 			}
 			if cfg.modelSelector != nil {
+				if cfg.modelSelectorFromConfig {
+					if err := setSelector(arg); err != nil {
+						return cfg, err
+					}
+					continue
+				}
 				if st, err := os.Stat(arg); err == nil && st.IsDir() {
 					cfg.modelDir = arg
 				} else {
@@ -752,6 +820,9 @@ func parseCLI(args []string) (cliConfig, error) {
 	}
 	if cfg.maxConn <= 0 {
 		return cfg, fmt.Errorf("--max-connections must be greater than 0")
+	}
+	if cfg.threadsSet && cfg.threads <= 0 {
+		return cfg, fmt.Errorf("--threads must be greater than 0")
 	}
 	return cfg, nil
 }

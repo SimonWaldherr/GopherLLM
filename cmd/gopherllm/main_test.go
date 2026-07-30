@@ -61,12 +61,12 @@ func TestParseCLIOutOfCore(t *testing.T) {
 }
 
 func TestParseCLIHuggingFaceList(t *testing.T) {
-	cfg, err := parseCLI([]string{"--hf-list", "bartowski/Qwen3-4B-GGUF@main"})
+	cfg, err := parseCLI([]string{"--hf-list", "bartowski/Qwen3-4B-GGUF@main", "--hf-offline"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.hfList != "bartowski/Qwen3-4B-GGUF@main" {
-		t.Fatalf("hf list = %q", cfg.hfList)
+	if cfg.hfList != "bartowski/Qwen3-4B-GGUF@main" || !cfg.hfOffline {
+		t.Fatalf("hf list/offline = %q/%v", cfg.hfList, cfg.hfOffline)
 	}
 }
 
