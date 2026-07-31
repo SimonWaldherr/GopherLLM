@@ -1742,9 +1742,62 @@ function toMarkdown(chat) {
     details.querySelector(".reasoning-body").textContent = text;
   }
 
+  /* A ticking read-out under the answer that is still arriving. It reports the
+     phase the server is actually in — reading the prompt, thinking, writing —
+     plus elapsed time and, once tokens flow, the decode rate. Rate is measured
+     from the first token, not from the request, so prefill time does not drag
+     the number down.
+
+     It is aria-hidden on purpose: the header status region already announces
+     each phase change once, and a caption that rewrites itself four times a
+     second would talk over the answer in a screen reader. */
+  function startStreamMeter(el, probe) {
+    const meter = document.createElement("div");
+    meter.className = "stream-meter";
+    meter.setAttribute("aria-hidden", "true");
+    const phase = document.createElement("span");
+    phase.className = "stream-phase";
+    const stats = document.createElement("span");
+    stats.className = "stream-stats";
+    meter.append(phase, stats);
+    el.appendChild(meter);
+
+    const seconds = (ms) => (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + "s";
+    const tick = () => {
+      const now = performance.now();
+      const first = probe.firstToken();
+      const tokens = probe.tokens();
+      if (!first) {
+        // No token yet: the prompt is still being read. Naming that is the
+        // whole point — three bouncing dots for 20s reads as a broken request.
+        phase.textContent = "Reading your prompt";
+        stats.textContent = seconds(now - probe.startedAt);
+        return;
+      }
+      phase.textContent = probe.thinking() ? "Thinking" : "Writing";
+      const decodeMS = now - first;
+      const parts = [tokens + (tokens === 1 ? " token" : " tokens")];
+      // Under ~400ms the rate is mostly measurement noise, so it is withheld
+      // rather than shown as a number that swings by 10x between ticks.
+      if (decodeMS > 400) parts.push((tokens / (decodeMS / 1000)).toFixed(1) + " tok/s");
+      parts.push(seconds(now - probe.startedAt));
+      stats.textContent = parts.join(" · ");
+    };
+    tick();
+    const timer = setInterval(tick, 250);
+    return {
+      stop: () => {
+        clearInterval(timer);
+        meter.remove();
+      }
+    };
+  }
+
   function finalizeAssistant(el, result) {
     const content = el.querySelector(".content");
     content.classList.remove("streaming");
+    const meter = el.querySelector(":scope > .stream-meter");
+    if (meter) meter.remove();
     const parsed = splitThinkText(result.answer || "");
     result.answer = parsed.hasThink ? parsed.answer : (result.answer || "");
     result.reasoning = result.reasoning || parsed.reasoning;
@@ -2417,6 +2470,9 @@ function toMarkdown(chat) {
     const assistantEl = addMessage("assistant", "");
     followStream = true;
     setBusy(true);
+    // setBusy says "Thinking…", but nothing is being thought yet: the server is
+    // reading the prompt. Name the phase the user is actually waiting on.
+    setStatus("Reading prompt…");
     updatePromptCacheStatus();
     controller = new AbortController();
     // Live tool activity stays compact until the user asks for its details.
@@ -2436,16 +2492,30 @@ function toMarkdown(chat) {
     let reasoning = "";
     let streamFinished = false;
     let pending = false;
+    // Live progress. Before the first token the server is reading the prompt,
+    // which on a large context is the longest part of the wait and used to look
+    // identical to a hung request; after it, the meter is the only place the
+    // rate is visible while the answer is still arriving.
+    let tokenCount = 0;
+    let thinkingNow = false;
+    const meter = startStreamMeter(assistantEl, {
+      startedAt: startedAt,
+      firstToken: () => firstTokenAt,
+      tokens: () => tokenCount,
+      thinking: () => thinkingNow
+    });
     const onToken = (answer, nextReasoning, thinking) => {
       const parsed = splitThinkText(answer);
       latest = parsed.answer;
       reasoning = nextReasoning || parsed.reasoning;
       assistantEl.dataset.raw = latest;
+      tokenCount++;
+      thinkingNow = Boolean(thinking || parsed.isThinking);
       if (!firstTokenAt) {
         firstTokenAt = performance.now();
         assistantEl.querySelector(".content").classList.add("streaming");
       }
-      setStatus(thinking || parsed.isThinking ? "Thinking…" : "Generating…");
+      setStatus(thinkingNow ? "Thinking…" : "Generating…");
       if (pending) return;
       pending = true;
       requestAnimationFrame(() => {
@@ -2529,6 +2599,7 @@ function toMarkdown(chat) {
         showToast("The answer could not be generated. Retry the last message.", "error");
       }
     } finally {
+      meter.stop();
       controller = null;
       setBusy(false);
       renderChatList();
