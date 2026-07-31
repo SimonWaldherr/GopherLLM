@@ -59,6 +59,7 @@ type fileRuntimeConfig struct {
 type fileServerConfig struct {
 	Address         *string `json:"address,omitempty"`
 	Chat            *bool   `json:"chat,omitempty"`
+	ChatHistoryPath *string `json:"chat_history_path,omitempty"`
 	MaxConnections  *int    `json:"max_connections,omitempty"`
 	SkillsDir       *string `json:"skills_dir,omitempty"`
 	OSCommands      *string `json:"os_commands,omitempty"`
@@ -81,6 +82,7 @@ var cliValueOptions = map[string]bool{
 	"--prompt":             true,
 	"-p":                   true,
 	"--serve":              true,
+	"--chat-history":       true,
 	"--max-connections":    true,
 	"--max-tokens":         true,
 	"-n":                   true,
@@ -263,6 +265,9 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		if s.Chat != nil {
 			cfg.chatUI = *s.Chat
 		}
+		if s.ChatHistoryPath != nil {
+			cfg.chatHistoryPath = *s.ChatHistoryPath
+		}
 		if s.MaxConnections != nil {
 			cfg.maxConn = *s.MaxConnections
 		}
@@ -360,6 +365,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	type effectiveServerConfig struct {
 		Address         string `json:"address,omitempty"`
 		Chat            bool   `json:"chat,omitempty"`
+		ChatHistoryPath string `json:"chat_history_path,omitempty"`
 		MaxConnections  int    `json:"max_connections,omitempty"`
 		SkillsDir       string `json:"skills_dir,omitempty"`
 		OSCommands      string `json:"os_commands,omitempty"`
@@ -411,10 +417,11 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	if cfg.modelSelector != nil {
 		result.Model = *cfg.modelSelector
 	}
-	if cfg.serveAddr != "" || cfg.chatUI || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
+	if cfg.serveAddr != "" || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
 		result.Server = &effectiveServerConfig{
 			Address:         cfg.serveAddr,
 			Chat:            cfg.chatUI,
+			ChatHistoryPath: cfg.chatHistoryPath,
 			MaxConnections:  cfg.maxConn,
 			SkillsDir:       cfg.skillsDir,
 			OSCommands:      cfg.osCommandsPolicy,

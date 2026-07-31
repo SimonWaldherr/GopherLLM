@@ -38,6 +38,7 @@ func TestConfigFileThenCLIOverrides(t *testing.T) {
   "server": {
     "address": "127.0.0.1:8080",
     "chat": true,
+    "chat_history_path": "/var/lib/gopherllm/chats.json.gz",
     "max_connections": 12
   },
   "huggingface": {"offline": true}
@@ -68,7 +69,7 @@ func TestConfigFileThenCLIOverrides(t *testing.T) {
 	if !cfg.threadsSet || cfg.threads != 5 || !cfg.metalExplicit || cfg.useMetal || cfg.timeout.String() != "2m0s" {
 		t.Fatalf("runtime config = threads:%d/%v metal:%v/%v timeout:%s", cfg.threads, cfg.threadsSet, cfg.useMetal, cfg.metalExplicit, cfg.timeout)
 	}
-	if !cfg.autoTune || cfg.autoTuneEffort != "quick" || cfg.serveAddr != "127.0.0.1:9090" || !cfg.chatUI || cfg.maxConn != 12 || !cfg.hfOffline {
+	if !cfg.autoTune || cfg.autoTuneEffort != "quick" || cfg.serveAddr != "127.0.0.1:9090" || !cfg.chatUI || cfg.chatHistoryPath != "/var/lib/gopherllm/chats.json.gz" || cfg.maxConn != 12 || !cfg.hfOffline {
 		t.Fatalf("config sections were not applied: %+v", cfg)
 	}
 }
@@ -85,12 +86,15 @@ func TestConfigRejectsUnknownFieldsAndDuplicateConfigFlags(t *testing.T) {
 }
 
 func TestConfigAndPresetScanIgnoreFlagLookingValues(t *testing.T) {
-	cfg, err := parseCLI([]string{"--system-prompt", "--preset", "--stop", "--config", "local.gguf"})
+	cfg, err := parseCLI([]string{"--system-prompt", "--preset", "--stop", "--config", "local.gguf", "--chat-history", "/tmp/chats.gz"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.preset != "balanced" || cfg.options.SystemPrompt != "--preset" || len(cfg.options.StopSequences) != 1 || cfg.options.StopSequences[0] != "--config" {
 		t.Fatalf("option scan treated a value as a flag: %+v", cfg)
+	}
+	if cfg.chatHistoryPath != "/tmp/chats.gz" {
+		t.Fatalf("chat history path = %q", cfg.chatHistoryPath)
 	}
 }
 

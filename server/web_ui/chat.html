@@ -161,7 +161,10 @@
       </div>
     </div>
     <div class="settings-panel-foot briefing-foot">
-      <button id="briefCopy" class="text-button" type="button" disabled>Copy briefing</button>
+      <div class="settings-actions">
+        <button id="briefCopy" class="text-button" type="button" disabled>Copy briefing</button>
+        <button id="briefShare" class="text-button" type="button" disabled>Share briefing</button>
+      </div>
       <div>
         <button id="briefCloseDone" class="text-button" type="button">Close</button>
         <button id="briefGenerate" class="autotune-run" type="button">Create briefing</button>
@@ -408,9 +411,18 @@
           <div class="settings-section-head">
             <div>
               <h3>Chat data</h3>
-              <p>Export or restore conversations stored in this browser.</p>
+              <p>Choose where this workspace is stored, then export or restore it when needed.</p>
             </div>
           </div>
+          <div class="settings-primary-grid workspace-fields">
+            <label>History storage
+              <select id="storageMode">
+                <option value="browser">This browser (private)</option>
+                <option value="server">GopherLLM server (shared device)</option>
+              </select>
+            </label>
+          </div>
+          <p id="storageStatus" class="settings-note" aria-live="polite">Browser storage uses IndexedDB with a localStorage fallback.</p>
           <div class="settings-actions settings-export-actions">
             <button id="exportMarkdown" class="text-button" type="button">Export this chat</button>
             <button id="exportChats" class="text-button" type="button">Export all chats (JSON)</button>
@@ -457,7 +469,7 @@
         <h3>1 · Data</h3>
         <div class="batch-source">
           <button id="batchPick" class="text-button" type="button">Choose file…</button>
-          <input id="batchFile" type="file" accept=".json,.csv,.tsv,.md,.markdown,.txt,.log,application/json,text/csv,text/markdown,text/plain" hidden>
+          <input id="batchFile" type="file" accept=".json,.jsonl,.ndjson,.csv,.tsv,.xlsx,.xls,.ods,.md,.markdown,.txt,.log,application/json,text/csv,text/markdown,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.oasis.opendocument.spreadsheet,text/plain" hidden>
           <label class="batch-format">Format
             <select id="batchFormat">
               <option value="auto">Auto-detect</option>
@@ -468,7 +480,7 @@
             </select>
           </label>
         </div>
-        <textarea id="batchInput" rows="5" placeholder="Paste JSON, CSV, or Markdown here — or choose a file above."></textarea>
+        <textarea id="batchInput" rows="5" placeholder="Paste JSON, CSV, or Markdown here — or choose a file above. XLSX/ODS files are parsed locally by the server."></textarea>
         <p id="batchSummary" class="batch-summary">No data yet.</p>
       </section>
 

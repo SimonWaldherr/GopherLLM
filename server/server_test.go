@@ -75,6 +75,7 @@ func TestChatUIAssetsArePrivateAndSelfContained(t *testing.T) {
 		{path: "/chat", contentType: "text/html", marker: `id="shareChat"`},
 		{path: "/style.css", contentType: "text/css", marker: ".sidebar"},
 		{path: "/script.js", contentType: "text/javascript", marker: "IndexedDB"},
+		{path: "/script.js", contentType: "text/javascript", marker: "chat-pin"},
 	} {
 		resp, err := http.Get(srv.URL + want.path)
 		if err != nil {

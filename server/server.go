@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -206,6 +207,10 @@ type HandlerOptions struct {
 	MaxConcurrentRequests int
 	// ChatUI serves the embedded browser chat at /chat (plus its assets).
 	ChatUI bool
+	// ChatHistoryPath enables the opt-in server-side browser workspace. The
+	// history is compressed and atomically replaced at this path; an empty path
+	// keeps browser-local IndexedDB/localStorage as the default.
+	ChatHistoryPath string
 	// ModelDir enables GET /models discovery and POST /models/load hot-swap.
 	// A load request is resolved against this directory's discovered,
 	// supported GGUF files; arbitrary filesystem paths are never loaded.
@@ -293,8 +298,8 @@ func (r modelLoadRequest) selector() string {
 }
 
 // ServeOptions is HandlerOptions plus the listen address, for the Serve
-// convenience wrapper (used by the CLI). ChatHistoryPath/ChatHistoryLock are
-// retained for compatibility but unused.
+// convenience wrapper (used by the CLI). ChatHistoryLock remains for source
+// compatibility with older hosts; the handler serializes its own file access.
 type ServeOptions struct {
 	Addr                     string
 	Defaults                 gopherllm.GenerationOptions
@@ -337,6 +342,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		Defaults:              opts.Defaults,
 		MaxConcurrentRequests: opts.MaxConcurrentConnections,
 		ChatUI:                opts.ChatUI,
+		ChatHistoryPath:       opts.ChatHistoryPath,
 		ModelDir:              opts.ModelDir,
 		ModelPath:             opts.ModelPath,
 		ModelLoadOptions:      opts.ModelLoadOptions,
@@ -412,6 +418,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	}
 	state := &runnerState{r: initialRunner, path: opts.ModelPath, baseline: baseline, autoTune: opts.AppliedAutoTune}
 	embedder := &embeddingState{}
+	history := newChatHistoryStore(opts.ChatHistoryPath)
 	remote := newRemoteState()
 	sem := make(chan struct{}, opts.MaxConcurrentRequests)
 	var autoTuneMu sync.Mutex
@@ -423,6 +430,102 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get()), "remote": remote.enabled()})
 	})
+	mux.HandleFunc("/chat/storage", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		configured := history.enabled()
+		mode := "browser"
+		if configured {
+			mode = "server"
+		}
+		writeJSON(w, map[string]any{
+			"configured": configured,
+			"mode":       mode,
+			"compressed": configured,
+			"max_bytes":  maxChatHistoryBytes,
+		})
+	})
+	mux.HandleFunc("/chat/workspace", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		if !history.enabled() {
+			http.Error(w, "server chat storage is not configured; use browser storage or set ChatHistoryPath", http.StatusNotFound)
+			return
+		}
+		switch req.Method {
+		case http.MethodGet:
+			data, etag, err := history.read(req.Context())
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, "server chat history is empty", http.StatusNotFound)
+				return
+			}
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("ETag", `"`+etag+`"`)
+			_, _ = w.Write(data)
+		case http.MethodPut:
+			data, err := io.ReadAll(io.LimitReader(req.Body, maxChatHistoryBytes+1))
+			if err != nil {
+				http.Error(w, "read chat history: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if len(data) > maxChatHistoryBytes {
+				http.Error(w, fmt.Sprintf("chat history exceeds %d bytes", maxChatHistoryBytes), http.StatusRequestEntityTooLarge)
+				return
+			}
+			etag, err := history.write(req.Context(), data, req.Header.Get("If-Match"))
+			if errors.Is(err, errChatHistoryConflict) {
+				if etag != "" {
+					w.Header().Set("ETag", `"`+etag+`"`)
+				}
+				http.Error(w, err.Error(), http.StatusPreconditionFailed)
+				return
+			}
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					status = http.StatusRequestTimeout
+				}
+				http.Error(w, err.Error(), status)
+				return
+			}
+			w.Header().Set("ETag", `"`+etag+`"`)
+			writeJSON(w, map[string]any{"ok": true, "etag": etag, "bytes": len(data)})
+		case http.MethodDelete:
+			if err := history.clear(req.Context()); err != nil && !errors.Is(err, os.ErrNotExist) {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/batch/parse", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		data, err := io.ReadAll(io.LimitReader(req.Body, maxSpreadsheetBytes+1))
+		if err != nil {
+			http.Error(w, "read spreadsheet: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(data) > maxSpreadsheetBytes {
+			http.Error(w, fmt.Sprintf("spreadsheet exceeds %d bytes", maxSpreadsheetBytes), http.StatusRequestEntityTooLarge)
+			return
+		}
+		result, err := parseSpreadsheet(data, req.URL.Query().Get("filename"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, result)
+	})
 	mux.HandleFunc("/privacy", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -430,6 +533,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		}
 		writeJSON(w, map[string]any{
 			"report": gopherllm.DefaultPrivacyReport(),
+			"chat_history": map[string]any{
+				"configured": history.enabled(),
+				"mode":       map[bool]string{true: "server-file-opt-in", false: "browser-default"}[history.enabled()],
+			},
 			"research_tools": map[string]any{
 				"default":              "disabled",
 				"request_flags":        []string{"gopherllm_wikimedia", "gopherllm_openstreetmap"},

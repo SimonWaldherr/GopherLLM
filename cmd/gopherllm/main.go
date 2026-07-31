@@ -44,6 +44,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
 	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
+	fmt.Fprintln(os.Stderr, "  --chat-history <path>     Enable compressed server-side chat history at <path>")
 	fmt.Fprintln(os.Stderr, "                           Explicit model selectors always override the remembered model")
 	fmt.Fprintln(os.Stderr, "  --max-connections <N>     Max concurrent server connections")
 	fmt.Fprintln(os.Stderr, "  --max-tokens <N>          Max tokens to generate (default: 256)")
@@ -107,6 +108,7 @@ type cliConfig struct {
 	repl                    bool
 	serveAddr               string
 	chatUI                  bool
+	chatHistoryPath         string
 	maxConn                 int
 	embed                   bool
 	bench                   bool
@@ -237,6 +239,7 @@ func run() error {
 			Defaults:                 cfg.options,
 			MaxConcurrentConnections: cfg.maxConn,
 			ChatUI:                   cfg.chatUI,
+			ChatHistoryPath:          cfg.chatHistoryPath,
 			ChatHistoryLock:          &sync.Mutex{},
 			ModelDir:                 cfg.modelDir,
 			SkillsDir:                cfg.skillsDir,
@@ -345,7 +348,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -599,6 +602,12 @@ func parseCLI(args []string) (cliConfig, error) {
 			cfg.serveAddr = v
 		case "--chat":
 			cfg.chatUI = true
+		case "--chat-history":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.chatHistoryPath = v
 		case "--max-connections":
 			v, err := parseNextInt(next, arg)
 			if err != nil {

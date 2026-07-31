@@ -146,7 +146,7 @@ body[data-theme="classic"] .workspace {
   border-bottom: 2px solid #404040;
   background: var(--bg);
 }
-body[data-theme="classic"] :is(.new-chat, .icon-button, .header-brief, .header-share, .suggestion, .message-action, .copy-btn, .code-copy, .chat-menu, .chat-delete, .rename-chat, .delete-chat, .autotune-run, .text-button, .edit-state button, #batchPick) {
+body[data-theme="classic"] :is(.new-chat, .icon-button, .header-brief, .header-share, .suggestion, .message-action, .copy-btn, .code-copy, .chat-pin, .chat-menu, .chat-delete, .rename-chat, .delete-chat, .autotune-run, .text-button, .edit-state button, #batchPick) {
   border: 1px solid #fff;
   border-right-color: #404040;
   border-bottom-color: #404040;
@@ -156,7 +156,7 @@ body[data-theme="classic"] :is(.new-chat, .icon-button, .header-brief, .header-s
   color: #000;
   text-shadow: none;
 }
-body[data-theme="classic"] :is(.new-chat, .icon-button, .header-brief, .header-share, .suggestion, .message-action, .copy-btn, .code-copy, .chat-menu, .chat-delete, .rename-chat, .delete-chat, .autotune-run, .text-button, .edit-state button, #batchPick):active {
+body[data-theme="classic"] :is(.new-chat, .icon-button, .header-brief, .header-share, .suggestion, .message-action, .copy-btn, .code-copy, .chat-pin, .chat-menu, .chat-delete, .rename-chat, .delete-chat, .autotune-run, .text-button, .edit-state button, #batchPick):active {
   border-color: #404040 #fff #fff #404040;
   box-shadow: inset 1px 1px #808080;
   transform: translate(1px, 1px);
@@ -319,7 +319,7 @@ body.chat .app { grid-template-columns: var(--sidebar) minmax(0, 1fr); height: 1
 .chat-select {
   min-width: 0;
   flex: 1;
-  padding: 8px 54px 8px 9px;
+  padding: 8px 80px 8px 9px;
   border: 0;
   border-radius: 9px;
   background: transparent;
@@ -330,7 +330,7 @@ body.chat .app { grid-template-columns: var(--sidebar) minmax(0, 1fr); height: 1
 .chat-row.active .chat-select { color: var(--accent); font-weight: 680; }
 .chat-row-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; line-height: 1.25; }
 .chat-row-meta { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10.5px; line-height: 1.3; }
-.chat-menu, .chat-delete {
+.chat-pin, .chat-menu, .chat-delete {
   position: absolute;
   top: 50%; right: 29px;
   width: 25px; height: 25px; min-width: 0; min-height: 0;
@@ -339,8 +339,11 @@ body.chat .app { grid-template-columns: var(--sidebar) minmax(0, 1fr); height: 1
   font-size: 16px; line-height: 1;
   opacity: 0;
 }
+.chat-pin { right: 54px; font-size: 16px; }
 .chat-delete { right: 4px; font-size: 14px; }
-.chat-row:hover .chat-menu, .chat-menu:focus-visible, .chat-row:hover .chat-delete, .chat-delete:focus-visible { opacity: 1; }
+.chat-row:hover .chat-pin, .chat-pin:focus-visible, .chat-row:hover .chat-menu, .chat-menu:focus-visible, .chat-row:hover .chat-delete, .chat-delete:focus-visible { opacity: 1; }
+.chat-row.pinned .chat-pin { opacity: .9; color: var(--accent); }
+.chat-row.pinned .chat-pin:hover { background: color-mix(in srgb, var(--accent) 12%, var(--panel)); color: var(--accent); }
 .chat-menu:hover { background: var(--panel-2); color: var(--ink); }
 .chat-delete:hover { background: color-mix(in srgb, var(--stop) 12%, var(--panel)); color: var(--stop); }
 .sidebar-footer { display: grid; gap: 9px; padding: 9px 5px 0; border-top: 1px solid var(--line); }
@@ -784,7 +787,7 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 /* ════════════════════════════════
    Responsive layout
    ════════════════════════════════ */
-@media (hover: none) { .message-controls, .code-copy, .chat-menu { opacity: .78; } }
+@media (hover: none) { .message-controls, .code-copy, .chat-pin, .chat-menu { opacity: .78; } }
 @media (max-width: 900px) {
   body.chat .app { grid-template-columns: 232px minmax(0, 1fr); }
   :root { --sidebar: 232px; }

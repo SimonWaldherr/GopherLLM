@@ -52,6 +52,10 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		`id="modelShowUnsupported"`,
 		`id="activeModelSummary"`,
 		`id="modelLibrary"`,
+		`id="storageMode"`,
+		`id="briefShare"`,
+		`.xlsx`,
+		`.jsonl`,
 		`role="tablist" aria-label="Settings sections"`,
 		`data-settings-tab="model"`,
 		`data-settings-page="generation"`,
@@ -94,6 +98,10 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		"function renderModelLibrary(",
 		"function renderActiveModelSummary(",
 		"function setSettingsTab(",
+		`name: "/review"`,
+		`name: "/plan"`,
+		"function parseGoalSpec(",
+		`"/batch/parse?filename="`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("chat script missing interaction contract %q", want)

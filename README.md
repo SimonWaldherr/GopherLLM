@@ -494,6 +494,21 @@ format. The UI assets use no-store and same-origin security headers, so start
 the server on a trusted local address unless you add your own network security
 in front of it.
 
+Important conversations can be pinned with the star button in the local
+sidebar. Pinned chats stay above normal history and are preferred when the
+bounded history cleanup removes old chats; they remain part of the same
+browser-local export/import workspace.
+
+Browser storage is the default and remains private to that browser profile.
+For a shared device workspace, start the server with
+`--chat-history ./gopherllm-chats.json.gz` (or set
+`server.chat_history_path` in the JSON config), then select **GopherLLM server**
+under Settings → Workspace → Chat data. The server stores a compact gzip file,
+writes it atomically with mode `0600`, limits the uncompressed workspace to
+64 MiB, and uses ETags to reject stale writes from another tab. The server
+store is intentionally opt-in and has no authentication; bind it to a trusted
+local address or put authentication/TLS in front of it before sharing it.
+
 The composer keeps the default path deliberately small: write a message,
 attach files, and send. **Pro tools** reveals quick controls for context mode,
 output length, and slash commands; the complete configuration remains in
@@ -503,11 +518,24 @@ switching stays close while advanced sampling and storage controls do not
 compete for attention. The model library and tab bar collapse cleanly on narrow
 screens, and the mobile header wraps its actions below the chat title instead
 of clipping them. Any file type can be attached. Text files up to 500 KB are
-included as text in the model request; non-text files (images, audio, video,
-PDFs, archives, and other binaries) stay local to the browser and are shown as
-attachment cards. With the built-in text-only server, their filename, type, and
-size are sent as metadata rather than pretending that binary content was
-analysed.
+included as text in the model request; `.xlsx` and `.ods` attachments are
+parsed by the local server and included as bounded tabular text. Other
+non-text files (images, audio, video, PDFs, archives, and other binaries) stay
+local to the browser and are shown as attachment cards. With the built-in
+text-only server, their filename, type, and size are sent as metadata rather
+than pretending that binary content was analysed.
+
+With **Power commands** enabled, `/goal` supports `--rounds 2..8` and an
+optional `--focus "…"` rubric. `/review` audits the current conversation for
+gaps, security/privacy risks, and prioritized fixes; `/plan` turns it into an
+ordered, testable implementation plan. Their intermediate prompts are stored
+as normal local/server history, while the model receives an explicit
+untrusted-reference boundary.
+
+Batch mode accepts JSON arrays/JSONL, CSV/TSV, Markdown chapters, plain text,
+and spreadsheet files. `.xlsx` and `.ods` are parsed by the local Go server
+with bounded XML/ZIP expansion; legacy binary `.xls` files should be converted
+to `.xlsx` first. No spreadsheet content is sent to a third party.
 
 ### Smart context for long chats
 
@@ -609,6 +637,9 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | GET | `/autotune` | Report Auto Mode status: whether a tuning is active this session, whether one is cached on disk for this model+machine, and the result either way |
 | POST | `/autotune/run` | Run (or apply a cached) tuning for the loaded model, same effort levels as `--auto-effort` (`{"effort": "quick\|balanced\|thorough", "refresh": false}`) |
 | GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |
+| GET | `/chat/storage` | Report whether opt-in server history is configured |
+| GET / PUT / DELETE | `/chat/workspace` | Read, atomically replace, or clear the configured server workspace |
+| POST | `/batch/parse` | Parse a local `.xlsx` or `.ods` upload into bounded batch rows (no model required) |
 
 ## Tool Use / Agentic
 
