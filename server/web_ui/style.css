@@ -45,14 +45,26 @@
   --r-xl: 14px;
   --r-pill: 999px;
 
+  /* Prose measure. Code, tables and diagrams keep the full column, but a run of
+     text is capped so a line stays inside the 45-90 character band that WCAG
+     1.4.8 and every type manual agree on. 68ch of the body font lands at ~75. */
+  --measure: 68ch;
+
   --sidebar: 272px;
   --bg: #f6f7f8;
   --panel: #ffffff;
   --panel-2: #eff2f3;
   --ink: #15211f;
-  --muted: #66716f;
+  --muted: #626c6b;
   --line: #dbe2e0;
-  --accent: #087f6b;
+  /* --line is the hairline that separates things; --line-strong is the boundary
+     that *identifies* a thing, so every form control and secondary button
+     borrows it. SC 1.4.11 asks 3:1 of a control's boundary, and --line only
+     clears 1.17:1 against the field fill it encloses — the field would be
+     invisible to a low-vision user. Each theme's value is measured against
+     --bg, --panel and --panel-2, the three surfaces a control can sit on. */
+  --line-strong: #7c8683;
+  --accent: #0a6e5e;
   --accent-ink: #ffffff;
   --user-bg: #dff3ed;
   --user-line: #b7e2d5;
@@ -64,25 +76,44 @@
      has to clear 4.5:1 on --panel and not just read as a green dot. */
   --ok: #147a4c;
   --stop: #b3423a;
-  --shadow: 0 2px 8px rgba(21, 33, 31, .055);
+  /* Three elevation steps rather than one, because the surfaces that need depth
+     need different amounts of it: --shadow lifts a resting control, --shadow-pop
+     a transient floater (toast, jump pill, slash palette), --shadow-modal a
+     dialog. Themes that reject soft depth zero all three, which is why nothing
+     may hardcode its own rgba() — that is how the contrast and classic themes
+     used to keep a 60px blur they explicitly rule out. */
+  --shadow: 0 1px 2px rgba(21, 33, 31, .07), 0 2px 8px rgba(21, 33, 31, .05);
+  --shadow-pop: 0 8px 24px -8px rgba(21, 33, 31, .22);
+  --shadow-modal: 0 24px 60px -14px rgba(21, 33, 31, .32);
 }
+/* The dark palette is written twice on purpose, and the two copies must stay
+   identical. A media query cannot be folded into a selector, and the only
+   selector that would cover both — body:not([data-theme]) — would lose to a
+   plain body[data-theme="light"] on a dark desktop, which is exactly the case
+   the comment above is protecting. Editing one copy means editing the other. */
 @media (prefers-color-scheme: dark) {
   body:not([data-theme]) {
     color-scheme: dark;
     --bg: #121417; --panel: #1c1f23; --panel-2: #23272c; --ink: #e8eaed;
-    --muted: #99a1aa; --line: #333940; --accent: #58d0ad; --accent-ink: #08281f;
+    --muted: #99a1aa; --line: #333940; --line-strong: #787f88;
+    --accent: #58d0ad; --accent-ink: #08281f;
     --user-bg: #133c31; --user-line: #27614f; --code-bg: #0c0e11; --code-ink: #dfe3e8;
     --error-bg: #3a1d1f; --error-line: #7a3b3f; --ok: #58c07e; --stop: #e58279;
-    --shadow: 0 1px 3px rgba(0, 0, 0, .45);
+    --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 2px 8px rgba(0, 0, 0, .34);
+    --shadow-pop: 0 8px 24px -8px rgba(0, 0, 0, .66);
+    --shadow-modal: 0 24px 60px -14px rgba(0, 0, 0, .74);
   }
 }
 body[data-theme="dark"] {
   color-scheme: dark;
   --bg: #121417; --panel: #1c1f23; --panel-2: #23272c; --ink: #e8eaed;
-  --muted: #99a1aa; --line: #333940; --accent: #58d0ad; --accent-ink: #08281f;
+  --muted: #99a1aa; --line: #333940; --line-strong: #787f88;
+  --accent: #58d0ad; --accent-ink: #08281f;
   --user-bg: #133c31; --user-line: #27614f; --code-bg: #0c0e11; --code-ink: #dfe3e8;
   --error-bg: #3a1d1f; --error-line: #7a3b3f; --ok: #58c07e; --stop: #e58279;
-  --shadow: 0 1px 3px rgba(0, 0, 0, .45);
+  --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 2px 8px rgba(0, 0, 0, .34);
+  --shadow-pop: 0 8px 24px -8px rgba(0, 0, 0, .66);
+  --shadow-modal: 0 24px 60px -14px rgba(0, 0, 0, .74);
 }
 /* Warm paper tones for long reading sessions. */
 body[data-theme="sepia"] {
