@@ -8,19 +8,8 @@ import (
 	"testing"
 )
 
-func randomQ5KRow(rng *rand.Rand, cols int) []byte {
-	row := make([]byte, (cols/256)*176)
-	for b := 0; b < cols/256; b++ {
-		block := row[b*176 : (b+1)*176]
-		// Small positive f16 scales (0x2c00 ~ 0.0625, 0x1c00 ~ 0.0039).
-		block[0], block[1] = byte(rng.Intn(256)), 0x2c
-		block[2], block[3] = byte(rng.Intn(256)), 0x1c
-		for i := 4; i < 176; i++ {
-			block[i] = byte(rng.Intn(256))
-		}
-	}
-	return row
-}
+// randomQ5KRow now lives in quant_neon_test.go, which has no build tag, so the
+// arm64 SDOT kernel tests can use it too.
 
 // dotQ5KQ8KRowRef is the scalar reference for q5kDotQ8KRow: Q4_K's structure
 // with the fifth bit from the qh plane OR'd onto each nibble (sub-block 2s

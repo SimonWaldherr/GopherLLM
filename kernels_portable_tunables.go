@@ -80,7 +80,7 @@ func dotQ4KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 func dotQ5KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q5kDotQ8KRowPortable(data[r*rowBytes:], q8, xscale, xsums, blocks)
+		out[r] = q5kDotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
 	}
 }
 
@@ -133,7 +133,7 @@ func q8kLayoutFor(t GGMLType, blocks int) (q8kRowLayout, bool) {
 	case GGMLTypeQ4_K:
 		return q8kRowLayout{blocks * 144, blocks * 8, q4kDotQ8KRow}, true
 	case GGMLTypeQ5_K:
-		return q8kRowLayout{blocks * 176, blocks * 8, q5kDotQ8KRowPortable}, true
+		return q8kRowLayout{blocks * 176, blocks * 8, q5kDotQ8KRow}, true
 	case GGMLTypeQ6_K:
 		return q8kRowLayout{blocks * 210, blocks * 16, q6kDotQ8KRow}, true
 	case GGMLTypeQ8_0:

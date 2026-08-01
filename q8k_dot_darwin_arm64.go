@@ -66,8 +66,46 @@ func q8kQuantize(x []float32, q8 []int8, scales []float32, blocks int) {
 // thoroughly; this is the belt to that suite's braces.
 var (
 	q4kDotAsmOK = validateQ4KQ8Dots8Asm()
+	q5kDotAsmOK = validateQ5KQ8Dots8Asm()
 	q6kDotAsmOK = validateQ6KQ8Dots16Asm()
 )
+
+func validateQ5KQ8Dots8Asm() bool {
+	var q [128]byte
+	var qh [32]byte
+	for i := range q {
+		q[i] = byte(i*7 + i/16)
+	}
+	for i := range qh {
+		// Every bit position must be exercised, or a wrong shift immediate in
+		// one of the four unrolled groups would go unnoticed.
+		qh[i] = byte(i*37 + 11)
+	}
+	q8 := q8kSelfCheckActivations()
+
+	var want [8]int32
+	for s := range 4 {
+		var lo, hi int32
+		for l := range 32 {
+			qv := q[s*32+l]
+			h1 := int32((qh[l] >> (2 * s)) & 1)
+			h2 := int32((qh[l] >> (2*s + 1)) & 1)
+			lo += (int32(qv&0x0f) + h1*16) * int32(q8[s*64+l])
+			hi += (int32(qv>>4) + h2*16) * int32(q8[s*64+32+l])
+		}
+		want[2*s], want[2*s+1] = lo, hi
+	}
+
+	var got [8]int32
+	q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
+	if got != want {
+		fmt.Fprintf(os.Stderr,
+			"gopherllm: NEON SDOT Q5_K self-check failed (got %v want %v); falling back to the portable Q5_K int8 kernel. Please report this with your CPU model.\n",
+			got, want)
+		return false
+	}
+	return true
+}
 
 // q8kSelfCheckActivations builds a deterministic activation block that
 // exercises both signs and the int8 extremes, so a lane-order or signedness
@@ -178,6 +216,46 @@ func q4kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 		scales := block[4:16]
 
 		q4kQ8Dots8Asm(&block[16], &q8[b*256], &qdots[0])
+
+		var blockInt int32
+		var minTerm float32
+		for j := range 8 {
+			sc, m := getScaleMinK4(j, scales)
+			blockInt += int32(sc) * qdots[j]
+			minTerm += float32(m) * xsums[b*8+j]
+		}
+		sum += d * xscales[b] * float32(blockInt)
+		sum -= dmin * minTerm
+	}
+	return sum
+}
+
+// q5kQ8Dots8Asm computes the 8 per-sub-block int32 dot products of one Q5_K
+// block. q must point at the 128 packed nibble bytes, qh at the 32-byte
+// fifth-bit plane, q8 at 256 int8 activations, out at 8 int32s.
+//
+//go:noescape
+func q5kQ8Dots8Asm(q *byte, qh *byte, q8 *int8, out *int32)
+
+// q5kDotQ8KRow computes one Q5_K row dot against Q8K-quantized activations.
+//
+// Q5_K_M matters beyond being a common mix in its own right: it is the
+// recommended quantization for the hybrid Mamba-2/MoE models this engine
+// supports through the nemotron_h path, where leaving it on a scalar kernel
+// while Q4_K and Q6_K had NEON would have made the int8 path a net loss.
+func q5kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	if !q5kDotAsmOK {
+		return q5kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		block := row[b*176 : (b+1)*176]
+		d := F16ToF32(binaryLE16(block[0:]))
+		dmin := F16ToF32(binaryLE16(block[2:]))
+		scales := block[4:16]
+
+		q5kQ8Dots8Asm(&block[48], &block[16], &q8[b*256], &qdots[0])
 
 		var blockInt int32
 		var minTerm float32

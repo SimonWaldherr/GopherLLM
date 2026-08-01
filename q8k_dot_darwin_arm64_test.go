@@ -114,6 +114,97 @@ func TestQ4KQ8Dots8AsmMatchesPortable(t *testing.T) {
 	}
 }
 
+// TestQ5KQ8Dots8AsmMatchesPortable checks the fifth-bit plane merge. The four
+// groups are unrolled with a different shift immediate each, so a single wrong
+// immediate corrupts exactly one quarter of the block — which is why the qh
+// pattern here has to exercise all eight bit positions.
+func TestQ5KQ8Dots8AsmMatchesPortable(t *testing.T) {
+	rng := rand.New(rand.NewSource(4248))
+	for iter := range 64 {
+		q := make([]byte, 128)
+		qh := make([]byte, 32)
+		for i := range q {
+			q[i] = byte(rng.Intn(256))
+		}
+		for i := range qh {
+			qh[i] = byte(rng.Intn(256))
+		}
+		q8 := make([]int8, 256)
+		for i := range q8 {
+			q8[i] = int8(rng.Intn(256) - 128)
+		}
+
+		var got [8]int32
+		q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
+
+		var want [8]int32
+		for s := range 4 {
+			var lo, hi int32
+			for l := range 32 {
+				qv := q[s*32+l]
+				h1 := int32((qh[l] >> (2 * s)) & 1)
+				h2 := int32((qh[l] >> (2*s + 1)) & 1)
+				lo += (int32(qv&0x0f) + h1*16) * int32(q8[s*64+l])
+				hi += (int32(qv>>4) + h2*16) * int32(q8[s*64+32+l])
+			}
+			want[2*s], want[2*s+1] = lo, hi
+		}
+		if got != want {
+			t.Fatalf("iter %d: q5kQ8Dots8Asm = %v, want %v", iter, got, want)
+		}
+	}
+}
+
+// An all-ones qh must set the fifth bit of every quant, and an all-zero qh must
+// set none — the cheapest way to catch a mask or shift direction mistake.
+func TestQ5KQ8Dots8AsmBitplaneExtremes(t *testing.T) {
+	q8 := make([]int8, 256)
+	for i := range q8 {
+		q8[i] = 1
+	}
+	q := make([]byte, 128) // all quants zero, so the result is purely the fifth bit
+	for _, tc := range []struct {
+		name string
+		fill byte
+		want int32
+	}{
+		{"qh all zero", 0x00, 0},
+		{"qh all ones", 0xff, 32 * 16}, // every one of 32 elements contributes 16
+	} {
+		qh := make([]byte, 32)
+		for i := range qh {
+			qh[i] = tc.fill
+		}
+		var got [8]int32
+		q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
+		for j, v := range got {
+			if v != tc.want {
+				t.Fatalf("%s: qdots[%d] = %d, want %d (all eight sub-blocks should agree)", tc.name, j, v, tc.want)
+			}
+		}
+	}
+}
+
+func TestQ5KDotQ8KRowAsmMatchesPortable(t *testing.T) {
+	rng := rand.New(rand.NewSource(4249))
+	for _, cols := range []int{256, 1024, 3072, 4096} {
+		blocks := cols / 256
+		row := randomQ5KRow(rng, cols)
+		x := randomVec(rng, cols)
+		q8 := make([]int8, cols)
+		xsc := make([]float32, blocks)
+		q8kQuantizePortable(x, q8, xsc, blocks)
+		var scratch []float32
+		xsums := fillQ4KXSums(x, cols, &scratch)
+
+		got := q5kDotQ8KRow(row, q8, xsc, xsums, blocks)
+		want := q5kDotQ8KRowPortable(row, q8, xsc, xsums, blocks)
+		if diff := math.Abs(float64(got - want)); diff > 1e-3*(1+math.Abs(float64(want))) {
+			t.Fatalf("cols=%d: asm %v != portable %v (diff %v)", cols, got, want, diff)
+		}
+	}
+}
+
 // TestQ6KQ8Dots16AsmMatchesPortable checks Q6_K's two-plane unpack — low nibble
 // from ql plus a 2-bit field from qh — and the half*8 + group*2 + l/16 output
 // indexing that lets the Go side walk sc[0..15] straight against out[0..15].
@@ -186,6 +277,9 @@ func TestQ6KDotQ8KRowAsmMatchesPortable(t *testing.T) {
 func TestQ8KSelfChecksPassed(t *testing.T) {
 	if !q4kDotAsmOK {
 		t.Error("Q4_K SDOT self-check failed at init — the assembly kernel is not in use")
+	}
+	if !q5kDotAsmOK {
+		t.Error("Q5_K SDOT self-check failed at init — the assembly kernel is not in use")
 	}
 	if !q6kDotAsmOK {
 		t.Error("Q6_K SDOT self-check failed at init — the assembly kernel is not in use")

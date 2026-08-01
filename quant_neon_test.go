@@ -20,6 +20,22 @@ func randomQ4KRow(rng *rand.Rand, cols int) []byte {
 	return row
 }
 
+// Lives here rather than beside the amd64 Q5_K kernel tests because nothing
+// about it is architecture-specific and the arm64 SDOT kernel tests need it too.
+func randomQ5KRow(rng *rand.Rand, cols int) []byte {
+	row := make([]byte, (cols/256)*176)
+	for b := 0; b < cols/256; b++ {
+		block := row[b*176 : (b+1)*176]
+		// Small positive f16 scales (0x2c00 ~ 0.0625, 0x1c00 ~ 0.0039).
+		block[0], block[1] = byte(rng.Intn(256)), 0x2c
+		block[2], block[3] = byte(rng.Intn(256)), 0x1c
+		for i := 4; i < 176; i++ {
+			block[i] = byte(rng.Intn(256))
+		}
+	}
+	return row
+}
+
 func randomQ6KRow(rng *rand.Rand, cols int) []byte {
 	row := make([]byte, (cols/256)*210)
 	for b := 0; b < cols/256; b++ {

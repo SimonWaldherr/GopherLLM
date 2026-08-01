@@ -99,6 +99,129 @@ loop:
 	CBNZ R3, loop
 	RET
 
+// Q5MERGE_* fold Q5_K's fifth bit into a 4-bit quant. The bit sits at position
+// k of the qh byte and has to land at position 4 (value 16), so it is moved
+// straight there and masked with 0x10 — two instructions instead of the
+// shift-right, mask-bit-0, shift-left-4 sequence. V21 holds 0x10.
+//
+// Vtmp is clobbered.
+#define Q5MERGE_SHL(Vdst, Vsrc, N, Vtmp) \
+	VSHL $N, Vsrc.B16, Vtmp.B16     \
+	VAND V21.B16, Vtmp.B16, Vtmp.B16 \
+	VORR Vtmp.B16, Vdst.B16, Vdst.B16
+
+#define Q5MERGE_SHR(Vdst, Vsrc, N, Vtmp) \
+	VUSHR $N, Vsrc.B16, Vtmp.B16    \
+	VAND V21.B16, Vtmp.B16, Vtmp.B16 \
+	VORR Vtmp.B16, Vdst.B16, Vdst.B16
+
+#define Q5MERGE_NONE(Vdst, Vsrc, Vtmp) \
+	VAND V21.B16, Vsrc.B16, Vtmp.B16 \
+	VORR Vtmp.B16, Vdst.B16, Vdst.B16
+
+// Q5DOTS reduces the two accumulators for one group and stores the pair.
+#define Q5DOTS(OFF) \
+	VEOR V26.B16, V26.B16, V26.B16 \
+	VEOR V27.B16, V27.B16, V27.B16 \
+	SDOT(26, 2, 6)                 \
+	SDOT(26, 3, 7)                 \
+	SDOT(27, 4, 8)                 \
+	SDOT(27, 5, 9)                 \
+	VADDV V26.S4, V28              \
+	VADDV V27.S4, V29              \
+	FMOVS F28, R4                  \
+	FMOVS F29, R5                  \
+	MOVW R4, OFF(R3)               \
+	MOVW R5, (OFF+4)(R3)
+
+// func q5kQ8Dots8Asm(q *byte, qh *byte, q8 *int8, out *int32)
+//
+// Computes the 8 per-sub-block int32 dot products of ONE Q5_K block: the
+// unsigned 5-bit weight quants times the int8 activations, before any scale is
+// applied. q points at the block's 128 packed nibble bytes, qh at its 32-byte
+// fifth-bit plane, q8 at 256 int8 activations, out at 8 int32s.
+//
+// Q5_K is Q4_K plus one bitplane. The nibble layout is identical: 32 bytes at
+// q[s*32:] hold sub-block 2s in the low nibbles and 2s+1 in the high nibbles.
+// The fifth bit of each quant lives in qh, which is indexed by the element
+// index l ALONE and reused across all four groups — sub-block 2s takes bit 2s of
+// qh[l] and sub-block 2s+1 takes bit 2s+1. That is why qh is loaded once,
+// outside the group sequence.
+//
+// The groups are unrolled rather than looped because the qh bit position is a
+// different immediate each time, and a vector shift by a register would cost
+// more than the unroll saves. The bit is 0..15 in the nibble, so OR-ing 16 into
+// it cannot carry, and the resulting 0..31 quant is still positive as an int8,
+// which is what lets SDOT's signed interpretation be correct here.
+TEXT ·q5kQ8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-32
+	MOVD q+0(FP), R0
+	MOVD qh+8(FP), R1
+	MOVD q8+16(FP), R2
+	MOVD out+24(FP), R3
+
+	VMOVI $15, V20.B16 // low-nibble mask
+	VMOVI $16, V21.B16 // fifth-bit destination mask (0x10)
+
+	// The whole fifth-bit plane, reused by all four groups.
+	VLD1 (R1), [V24.B16, V25.B16]
+
+	// ---- group 0: qh bits 0 (low) and 1 (high) ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_SHL(V2, V24, 4, V16)
+	Q5MERGE_SHL(V3, V25, 4, V17)
+	Q5MERGE_SHL(V4, V24, 3, V18)
+	Q5MERGE_SHL(V5, V25, 3, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(0)
+
+	// ---- group 1: qh bits 2 and 3 ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_SHL(V2, V24, 2, V16)
+	Q5MERGE_SHL(V3, V25, 2, V17)
+	Q5MERGE_SHL(V4, V24, 1, V18)
+	Q5MERGE_SHL(V5, V25, 1, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(8)
+
+	// ---- group 2: qh bits 4 (already in place) and 5 ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_NONE(V2, V24, V16)
+	Q5MERGE_NONE(V3, V25, V17)
+	Q5MERGE_SHR(V4, V24, 1, V18)
+	Q5MERGE_SHR(V5, V25, 1, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(16)
+
+	// ---- group 3: qh bits 6 and 7 ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_SHR(V2, V24, 2, V16)
+	Q5MERGE_SHR(V3, V25, 2, V17)
+	Q5MERGE_SHR(V4, V24, 3, V18)
+	Q5MERGE_SHR(V5, V25, 3, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(24)
+	RET
+
 // func q6kQ8Dots16Asm(ql *byte, qh *byte, q8 *int8, out *int32)
 //
 // Computes the 16 per-scale-group int32 dot products of ONE Q6_K block: the
