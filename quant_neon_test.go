@@ -6,40 +6,6 @@ import (
 	"testing"
 )
 
-func randomQ4KRow(rng *rand.Rand, cols int) []byte {
-	row := make([]byte, (cols/256)*144)
-	for b := 0; b < cols/256; b++ {
-		block := row[b*144 : (b+1)*144]
-		// Small positive f16 scales (0x2c00 ~ 0.0625, 0x1c00 ~ 0.0039).
-		block[0], block[1] = byte(rng.Intn(256)), 0x2c
-		block[2], block[3] = byte(rng.Intn(256)), 0x1c
-		for i := 4; i < 144; i++ {
-			block[i] = byte(rng.Intn(256))
-		}
-	}
-	return row
-}
-
-func randomQ6KRow(rng *rand.Rand, cols int) []byte {
-	row := make([]byte, (cols/256)*210)
-	for b := 0; b < cols/256; b++ {
-		block := row[b*210 : (b+1)*210]
-		for i := 0; i < 208; i++ {
-			block[i] = byte(rng.Intn(256))
-		}
-		block[208], block[209] = byte(rng.Intn(256)), 0x2c
-	}
-	return row
-}
-
-func randomVec(rng *rand.Rand, n int) []float32 {
-	out := make([]float32, n)
-	for i := range out {
-		out[i] = rng.Float32()*2 - 1
-	}
-	return out
-}
-
 func TestDotQ4KWithXSumsMatchesScalar(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	for _, cols := range []int{256, 512, 1024} {

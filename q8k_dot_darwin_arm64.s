@@ -99,6 +99,129 @@ loop:
 	CBNZ R3, loop
 	RET
 
+// Q5MERGE_* fold Q5_K's fifth bit into a 4-bit quant. The bit sits at position
+// k of the qh byte and has to land at position 4 (value 16), so it is moved
+// straight there and masked with 0x10 — two instructions instead of the
+// shift-right, mask-bit-0, shift-left-4 sequence. V21 holds 0x10.
+//
+// Vtmp is clobbered.
+#define Q5MERGE_SHL(Vdst, Vsrc, N, Vtmp) \
+	VSHL $N, Vsrc.B16, Vtmp.B16     \
+	VAND V21.B16, Vtmp.B16, Vtmp.B16 \
+	VORR Vtmp.B16, Vdst.B16, Vdst.B16
+
+#define Q5MERGE_SHR(Vdst, Vsrc, N, Vtmp) \
+	VUSHR $N, Vsrc.B16, Vtmp.B16    \
+	VAND V21.B16, Vtmp.B16, Vtmp.B16 \
+	VORR Vtmp.B16, Vdst.B16, Vdst.B16
+
+#define Q5MERGE_NONE(Vdst, Vsrc, Vtmp) \
+	VAND V21.B16, Vsrc.B16, Vtmp.B16 \
+	VORR Vtmp.B16, Vdst.B16, Vdst.B16
+
+// Q5DOTS reduces the two accumulators for one group and stores the pair.
+#define Q5DOTS(OFF) \
+	VEOR V26.B16, V26.B16, V26.B16 \
+	VEOR V27.B16, V27.B16, V27.B16 \
+	SDOT(26, 2, 6)                 \
+	SDOT(26, 3, 7)                 \
+	SDOT(27, 4, 8)                 \
+	SDOT(27, 5, 9)                 \
+	VADDV V26.S4, V28              \
+	VADDV V27.S4, V29              \
+	FMOVS F28, R4                  \
+	FMOVS F29, R5                  \
+	MOVW R4, OFF(R3)               \
+	MOVW R5, (OFF+4)(R3)
+
+// func q5kQ8Dots8Asm(q *byte, qh *byte, q8 *int8, out *int32)
+//
+// Computes the 8 per-sub-block int32 dot products of ONE Q5_K block: the
+// unsigned 5-bit weight quants times the int8 activations, before any scale is
+// applied. q points at the block's 128 packed nibble bytes, qh at its 32-byte
+// fifth-bit plane, q8 at 256 int8 activations, out at 8 int32s.
+//
+// Q5_K is Q4_K plus one bitplane. The nibble layout is identical: 32 bytes at
+// q[s*32:] hold sub-block 2s in the low nibbles and 2s+1 in the high nibbles.
+// The fifth bit of each quant lives in qh, which is indexed by the element
+// index l ALONE and reused across all four groups — sub-block 2s takes bit 2s of
+// qh[l] and sub-block 2s+1 takes bit 2s+1. That is why qh is loaded once,
+// outside the group sequence.
+//
+// The groups are unrolled rather than looped because the qh bit position is a
+// different immediate each time, and a vector shift by a register would cost
+// more than the unroll saves. The bit is 0..15 in the nibble, so OR-ing 16 into
+// it cannot carry, and the resulting 0..31 quant is still positive as an int8,
+// which is what lets SDOT's signed interpretation be correct here.
+TEXT ·q5kQ8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-32
+	MOVD q+0(FP), R0
+	MOVD qh+8(FP), R1
+	MOVD q8+16(FP), R2
+	MOVD out+24(FP), R3
+
+	VMOVI $15, V20.B16 // low-nibble mask
+	VMOVI $16, V21.B16 // fifth-bit destination mask (0x10)
+
+	// The whole fifth-bit plane, reused by all four groups.
+	VLD1 (R1), [V24.B16, V25.B16]
+
+	// ---- group 0: qh bits 0 (low) and 1 (high) ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_SHL(V2, V24, 4, V16)
+	Q5MERGE_SHL(V3, V25, 4, V17)
+	Q5MERGE_SHL(V4, V24, 3, V18)
+	Q5MERGE_SHL(V5, V25, 3, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(0)
+
+	// ---- group 1: qh bits 2 and 3 ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_SHL(V2, V24, 2, V16)
+	Q5MERGE_SHL(V3, V25, 2, V17)
+	Q5MERGE_SHL(V4, V24, 1, V18)
+	Q5MERGE_SHL(V5, V25, 1, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(8)
+
+	// ---- group 2: qh bits 4 (already in place) and 5 ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_NONE(V2, V24, V16)
+	Q5MERGE_NONE(V3, V25, V17)
+	Q5MERGE_SHR(V4, V24, 1, V18)
+	Q5MERGE_SHR(V5, V25, 1, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(16)
+
+	// ---- group 3: qh bits 6 and 7 ----
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VAND  V20.B16, V0.B16, V2.B16
+	VAND  V20.B16, V1.B16, V3.B16
+	VUSHR $4, V0.B16, V4.B16
+	VUSHR $4, V1.B16, V5.B16
+	Q5MERGE_SHR(V2, V24, 2, V16)
+	Q5MERGE_SHR(V3, V25, 2, V17)
+	Q5MERGE_SHR(V4, V24, 3, V18)
+	Q5MERGE_SHR(V5, V25, 3, V19)
+	VLD1.P 32(R2), [V6.B16, V7.B16]
+	VLD1.P 32(R2), [V8.B16, V9.B16]
+	Q5DOTS(24)
+	RET
+
 // func q6kQ8Dots16Asm(ql *byte, qh *byte, q8 *int8, out *int32)
 //
 // Computes the 16 per-scale-group int32 dot products of ONE Q6_K block: the
@@ -211,6 +334,172 @@ half_loop:
 	ADD  $32, R3 // 8 int32s written
 	SUB  $1, R4
 	CBNZ R4, half_loop
+	RET
+
+// LEGDOTS reduces the two nibble-half accumulators into one int32 and stores it.
+// The legacy 32-element formats produce a single dot per block, unlike the
+// K-quants' two, because they carry one scale rather than packed sub-scales.
+#define LEGDOTS \
+	VEOR V16.B16, V16.B16, V16.B16 \
+	SDOT(16, 2, 6)                 \
+	SDOT(16, 3, 7)                 \
+	VADDV V16.S4, V18              \
+	FMOVS F18, R4                  \
+	MOVW R4, (R2)                  \
+	ADD $4, R2
+
+// func q4_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+//
+// Computes the 8 per-block int32 dot products of ONE 256-element Q4_0
+// superchunk. row points at 8 consecutive 18-byte blocks, each an f16 scale
+// followed by 16 packed nibble bytes; q8 at 256 int8 activations; out at 8
+// int32s.
+//
+// Q4_0 splits its 32 quants the same way Q4_K splits a sub-block pair: the low
+// nibbles of the 16 bytes are quants 0..15 and the high nibbles are quants
+// 16..31, against the first and second half of the block's 32 activations. The
+// quants are unsigned 0..15 here; Q4_0's -8 bias is not applied per element but
+// carried exactly in the float xsums term, which is why this kernel returns raw
+// unsigned dots.
+TEXT ·q4_0Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	VMOVI $15, V20.B16
+	MOVD  $8, R3
+
+q4_0_loop:
+	// Step over the f16 scale; the post-indexed load takes the 16 nibble bytes
+	// and leaves R0 exactly 18 further on.
+	ADD    $2, R0
+	VLD1.P 16(R0), [V0.B16]
+	VAND   V20.B16, V0.B16, V2.B16
+	VUSHR  $4, V0.B16, V3.B16
+	VLD1.P 32(R1), [V6.B16, V7.B16]
+	LEGDOTS
+
+	SUB  $1, R3
+	CBNZ R3, q4_0_loop
+	RET
+
+// func q4_1Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+//
+// The Q4_1 analogue: identical nibble layout, but each block carries both a
+// scale and a minimum, so the header is 4 bytes and the stride is 20.
+TEXT ·q4_1Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	VMOVI $15, V20.B16
+	MOVD  $8, R3
+
+q4_1_loop:
+	ADD    $4, R0 // f16 scale plus f16 minimum
+	VLD1.P 16(R0), [V0.B16]
+	VAND   V20.B16, V0.B16, V2.B16
+	VUSHR  $4, V0.B16, V3.B16
+	VLD1.P 32(R1), [V6.B16, V7.B16]
+	LEGDOTS
+
+	SUB  $1, R3
+	CBNZ R3, q4_1_loop
+	RET
+
+// func mxfp4Q8Dots8Asm(row *byte, q8 *int8, lut *int8, out *int32)
+//
+// Computes the 8 per-block int32 dot products of ONE 256-element MXFP4
+// (gpt-oss) superchunk. row points at 8 consecutive 17-byte blocks, each 16
+// packed nibble bytes followed by one raw exponent byte; q8 at 256 int8
+// activations; lut at the 16-entry table of DOUBLED signed values; out at 8
+// int32s.
+//
+// Two things make MXFP4 different from the other nibble formats:
+//
+// First, the nibble is not a magnitude but an index into a table of signed
+// values {0,1,2,3,4,6,8,12} and their negations. VTBL does that lookup directly
+// — a 16-byte table indexed by 16 nibbles in one instruction — which is why the
+// table is passed in rather than the values being reconstructed arithmetically.
+// The table holds twice each value so the lookup stays integral; the factor 0.5
+// is applied once per block in Go.
+//
+// Second, the pairing is interleaved, not split in halves: the low nibble of
+// byte i multiplies activation 2i and the high nibble multiplies 2i+1. So the
+// activations are de-interleaved with UZP1/UZP2 (evens and odds) to line them up
+// against the low- and high-nibble vectors, rather than loaded as two halves.
+TEXT ·mxfp4Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-32
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD lut+16(FP), R5
+	MOVD out+24(FP), R2
+
+	VMOVI $15, V20.B16
+	VLD1  (R5), [V21.B16] // doubled-value table, reused by every block
+	MOVD  $8, R3
+
+mxfp4_loop:
+	// 16 packed bytes; the trailing exponent byte is skipped after the load.
+	VLD1.P 16(R0), [V0.B16]
+	ADD    $1, R0
+
+	VAND  V20.B16, V0.B16, V4.B16 // low nibbles  -> indices
+	VUSHR $4, V0.B16, V5.B16      // high nibbles -> indices
+
+	// Table lookup turns each index into its doubled signed value.
+	VTBL V4.B16, [V21.B16], V2.B16
+	VTBL V5.B16, [V21.B16], V3.B16
+
+	// 32 activations, then split into evens (for the low nibbles) and odds.
+	VLD1.P 32(R1), [V8.B16, V9.B16]
+	VUZP1  V9.B16, V8.B16, V6.B16
+	VUZP2  V9.B16, V8.B16, V7.B16
+
+	LEGDOTS
+
+	SUB  $1, R3
+	CBNZ R3, mxfp4_loop
+	RET
+
+// func q8_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+//
+// Computes the 8 per-block int32 dot products of ONE 256-element Q8_0
+// superchunk. row points at the first of 8 consecutive 34-byte blocks, each an
+// f16 scale followed by 32 int8 weights; q8 points at the 256 int8 activations;
+// out at 8 int32s.
+//
+// Q8_0 is the cheapest of these kernels because the weights are already int8:
+// there is no nibble unpack and no bitplane, just the stride-34 walk that steps
+// over each block's scale. The scales stay in Go, which combines them with the
+// per-superchunk activation scale.
+//
+// The float path this replaces has no NEON kernel on arm64 at all, so unlike
+// Q4_K and Q6_K this is a straight win rather than a defence of one.
+TEXT ·q8_0Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	MOVD $8, R3
+
+q8_0_loop:
+	// Step over this block's f16 scale; the post-indexed load then advances R0
+	// by the 32 weight bytes, so each iteration consumes exactly 34.
+	ADD    $2, R0
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VLD1.P 32(R1), [V2.B16, V3.B16]
+
+	VEOR V16.B16, V16.B16, V16.B16
+	SDOT(16, 0, 2) // sdot v16.4s, v0.16b, v2.16b
+	SDOT(16, 1, 3) // sdot v16.4s, v1.16b, v3.16b
+
+	VADDV V16.S4, V18
+	FMOVS F18, R4
+	MOVW  R4, (R2)
+	ADD   $4, R2
+
+	SUB  $1, R3
+	CBNZ R3, q8_0_loop
 	RET
 
 // func dotInt8Asm(a, b *int8, n int) int32

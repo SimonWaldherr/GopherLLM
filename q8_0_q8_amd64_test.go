@@ -13,19 +13,8 @@ import (
 // [-127,127] — real Q8_0 quantizers never emit -128, and the asm kernel's
 // VPABSB-based abs computation relies on that (matching llama.cpp's own
 // AVX2 Q8_0 kernel, which makes the same assumption).
-func randomQ8_0Row(rng *rand.Rand, cols int) []byte {
-	blocks := cols / 32
-	row := make([]byte, blocks*34)
-	for b := 0; b < blocks; b++ {
-		block := row[b*34 : (b+1)*34]
-		block[0], block[1] = byte(rng.Intn(256)), 0x2c // small positive f16 scale
-		for i := 2; i < 34; i++ {
-			v := int8(rng.Intn(255) - 127) // [-127, 127]
-			block[i] = byte(v)
-		}
-	}
-	return row
-}
+// randomQ8_0Row now lives in quant_neon_test.go, which has no build tag, so the
+// arm64 SDOT kernel tests can use it too.
 
 // dotQ8_0Q8KRowRef is the scalar reference for q8_0DotQ8KRow: an exact
 // integer dot per 32-element Q8_0 block, scaled by that block's own d and

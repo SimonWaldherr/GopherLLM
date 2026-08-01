@@ -80,7 +80,7 @@ func dotQ4KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 func dotQ5KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q5kDotQ8KRowPortable(data[r*rowBytes:], q8, xscale, xsums, blocks)
+		out[r] = q5kDotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
 	}
 }
 
@@ -94,28 +94,28 @@ func dotQ6KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 func dotQ8_0RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q8_0DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, blocks)
+		out[r] = q8_0DotQ8KRow(data[r*rowBytes:], q8, xscale, blocks)
 	}
 }
 
 func dotQ4_0RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q4_0DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, xsums, blocks)
+		out[r] = q4_0DotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
 	}
 }
 
 func dotQ4_1RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q4_1DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, xsums, blocks)
+		out[r] = q4_1DotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
 	}
 }
 
 func dotMXFP4RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = mxfp4DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, blocks)
+		out[r] = mxfp4DotQ8KRow(data[r*rowBytes:], q8, xscale, blocks)
 	}
 }
 
@@ -133,22 +133,22 @@ func q8kLayoutFor(t GGMLType, blocks int) (q8kRowLayout, bool) {
 	case GGMLTypeQ4_K:
 		return q8kRowLayout{blocks * 144, blocks * 8, q4kDotQ8KRow}, true
 	case GGMLTypeQ5_K:
-		return q8kRowLayout{blocks * 176, blocks * 8, q5kDotQ8KRowPortable}, true
+		return q8kRowLayout{blocks * 176, blocks * 8, q5kDotQ8KRow}, true
 	case GGMLTypeQ6_K:
 		return q8kRowLayout{blocks * 210, blocks * 16, q6kDotQ8KRow}, true
 	case GGMLTypeQ8_0:
 		// Symmetric: no offset term, so one dummy sums slot keeps the shared
 		// per-token indexing valid.
 		return q8kRowLayout{blocks * 272, 1, func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
-			return q8_0DotQ8KRowPortable(row, q8, xsc, blocks)
+			return q8_0DotQ8KRow(row, q8, xsc, blocks)
 		}}, true
 	case GGMLTypeQ4_0:
-		return q8kRowLayout{blocks * 144, blocks * 8, q4_0DotQ8KRowPortable}, true
+		return q8kRowLayout{blocks * 144, blocks * 8, q4_0DotQ8KRow}, true
 	case GGMLTypeQ4_1:
-		return q8kRowLayout{blocks * 160, blocks * 8, q4_1DotQ8KRowPortable}, true
+		return q8kRowLayout{blocks * 160, blocks * 8, q4_1DotQ8KRow}, true
 	case GGMLTypeMXFP4:
 		return q8kRowLayout{blocks * 136, 1, func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
-			return mxfp4DotQ8KRowPortable(row, q8, xsc, blocks)
+			return mxfp4DotQ8KRow(row, q8, xsc, blocks)
 		}}, true
 	}
 	return q8kRowLayout{}, false

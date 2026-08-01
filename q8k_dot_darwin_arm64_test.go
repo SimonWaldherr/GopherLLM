@@ -114,6 +114,178 @@ func TestQ4KQ8Dots8AsmMatchesPortable(t *testing.T) {
 	}
 }
 
+// Q8_0's weights are already int8, so the only thing that can go wrong is the
+// stride: each block is 34 bytes, a 2-byte f16 scale then 32 weights, and the
+// kernel has to step over every scale. An off-by-two would read weights shifted
+// by one byte and still produce plausible magnitudes.
+func TestQ8_0Q8Dots8AsmMatchesPortable(t *testing.T) {
+	rng := rand.New(rand.NewSource(4250))
+	for iter := range 64 {
+		row := make([]byte, 272)
+		for i := range row {
+			row[i] = byte(rng.Intn(256))
+		}
+		q8 := make([]int8, 256)
+		for i := range q8 {
+			q8[i] = int8(rng.Intn(256) - 128)
+		}
+
+		var got [8]int32
+		q8_0Q8Dots8Asm(&row[0], &q8[0], &got[0])
+
+		var want [8]int32
+		for j := range 8 {
+			off := j*34 + 2
+			var dot int32
+			for l := range 32 {
+				dot += int32(int8(row[off+l])) * int32(q8[j*32+l])
+			}
+			want[j] = dot
+		}
+		if got != want {
+			t.Fatalf("iter %d: q8_0Q8Dots8Asm = %v, want %v", iter, got, want)
+		}
+	}
+}
+
+// Poisoning only the scale bytes must not change any dot product — the sharpest
+// test that the stride skips exactly the scale and nothing else.
+func TestQ8_0Q8Dots8AsmIgnoresScaleBytes(t *testing.T) {
+	row := make([]byte, 272)
+	for i := range row {
+		row[i] = 3
+	}
+	q8 := make([]int8, 256)
+	for i := range q8 {
+		q8[i] = 1
+	}
+	var before [8]int32
+	q8_0Q8Dots8Asm(&row[0], &q8[0], &before[0])
+	for j := range 8 {
+		row[j*34], row[j*34+1] = 0xff, 0x7f
+	}
+	var after [8]int32
+	q8_0Q8Dots8Asm(&row[0], &q8[0], &after[0])
+	if before != after {
+		t.Fatalf("scale bytes leaked into the dots: %v became %v", before, after)
+	}
+	// 32 weights of value 3 against activations of 1.
+	for j, v := range before {
+		if v != 96 {
+			t.Fatalf("qdots[%d] = %d, want 96", j, v)
+		}
+	}
+}
+
+func TestQ8_0DotQ8KRowAsmMatchesPortable(t *testing.T) {
+	rng := rand.New(rand.NewSource(4251))
+	for _, cols := range []int{256, 1024, 3072, 4096} {
+		blocks := cols / 256
+		row := randomQ8_0Row(rng, cols)
+		x := randomVec(rng, cols)
+		q8 := make([]int8, cols)
+		xsc := make([]float32, blocks)
+		q8kQuantizePortable(x, q8, xsc, blocks)
+
+		got := q8_0DotQ8KRow(row, q8, xsc, blocks)
+		want := q8_0DotQ8KRowPortable(row, q8, xsc, blocks)
+		if diff := math.Abs(float64(got - want)); diff > 1e-3*(1+math.Abs(float64(want))) {
+			t.Fatalf("cols=%d: asm %v != portable %v (diff %v)", cols, got, want, diff)
+		}
+	}
+}
+
+// TestQ5KQ8Dots8AsmMatchesPortable checks the fifth-bit plane merge. The four
+// groups are unrolled with a different shift immediate each, so a single wrong
+// immediate corrupts exactly one quarter of the block — which is why the qh
+// pattern here has to exercise all eight bit positions.
+func TestQ5KQ8Dots8AsmMatchesPortable(t *testing.T) {
+	rng := rand.New(rand.NewSource(4248))
+	for iter := range 64 {
+		q := make([]byte, 128)
+		qh := make([]byte, 32)
+		for i := range q {
+			q[i] = byte(rng.Intn(256))
+		}
+		for i := range qh {
+			qh[i] = byte(rng.Intn(256))
+		}
+		q8 := make([]int8, 256)
+		for i := range q8 {
+			q8[i] = int8(rng.Intn(256) - 128)
+		}
+
+		var got [8]int32
+		q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
+
+		var want [8]int32
+		for s := range 4 {
+			var lo, hi int32
+			for l := range 32 {
+				qv := q[s*32+l]
+				h1 := int32((qh[l] >> (2 * s)) & 1)
+				h2 := int32((qh[l] >> (2*s + 1)) & 1)
+				lo += (int32(qv&0x0f) + h1*16) * int32(q8[s*64+l])
+				hi += (int32(qv>>4) + h2*16) * int32(q8[s*64+32+l])
+			}
+			want[2*s], want[2*s+1] = lo, hi
+		}
+		if got != want {
+			t.Fatalf("iter %d: q5kQ8Dots8Asm = %v, want %v", iter, got, want)
+		}
+	}
+}
+
+// An all-ones qh must set the fifth bit of every quant, and an all-zero qh must
+// set none — the cheapest way to catch a mask or shift direction mistake.
+func TestQ5KQ8Dots8AsmBitplaneExtremes(t *testing.T) {
+	q8 := make([]int8, 256)
+	for i := range q8 {
+		q8[i] = 1
+	}
+	q := make([]byte, 128) // all quants zero, so the result is purely the fifth bit
+	for _, tc := range []struct {
+		name string
+		fill byte
+		want int32
+	}{
+		{"qh all zero", 0x00, 0},
+		{"qh all ones", 0xff, 32 * 16}, // every one of 32 elements contributes 16
+	} {
+		qh := make([]byte, 32)
+		for i := range qh {
+			qh[i] = tc.fill
+		}
+		var got [8]int32
+		q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
+		for j, v := range got {
+			if v != tc.want {
+				t.Fatalf("%s: qdots[%d] = %d, want %d (all eight sub-blocks should agree)", tc.name, j, v, tc.want)
+			}
+		}
+	}
+}
+
+func TestQ5KDotQ8KRowAsmMatchesPortable(t *testing.T) {
+	rng := rand.New(rand.NewSource(4249))
+	for _, cols := range []int{256, 1024, 3072, 4096} {
+		blocks := cols / 256
+		row := randomQ5KRow(rng, cols)
+		x := randomVec(rng, cols)
+		q8 := make([]int8, cols)
+		xsc := make([]float32, blocks)
+		q8kQuantizePortable(x, q8, xsc, blocks)
+		var scratch []float32
+		xsums := fillQ4KXSums(x, cols, &scratch)
+
+		got := q5kDotQ8KRow(row, q8, xsc, xsums, blocks)
+		want := q5kDotQ8KRowPortable(row, q8, xsc, xsums, blocks)
+		if diff := math.Abs(float64(got - want)); diff > 1e-3*(1+math.Abs(float64(want))) {
+			t.Fatalf("cols=%d: asm %v != portable %v (diff %v)", cols, got, want, diff)
+		}
+	}
+}
+
 // TestQ6KQ8Dots16AsmMatchesPortable checks Q6_K's two-plane unpack — low nibble
 // from ql plus a 2-bit field from qh — and the half*8 + group*2 + l/16 output
 // indexing that lets the Go side walk sc[0..15] straight against out[0..15].
@@ -181,14 +353,114 @@ func TestQ6KDotQ8KRowAsmMatchesPortable(t *testing.T) {
 	}
 }
 
-// Both self-checks must have passed, or the kernels silently degraded to the
-// portable path and the tests above proved nothing about the assembly.
+// Every self-check must have passed, or the kernel silently degraded to the
+// portable path and the differential tests here proved nothing about the
+// assembly — they would be comparing the portable kernel against itself.
 func TestQ8KSelfChecksPassed(t *testing.T) {
-	if !q4kDotAsmOK {
-		t.Error("Q4_K SDOT self-check failed at init — the assembly kernel is not in use")
+	for name, ok := range map[string]bool{
+		"Q4_K":  q4kDotAsmOK,
+		"Q5_K":  q5kDotAsmOK,
+		"Q6_K":  q6kDotAsmOK,
+		"Q8_0":  q8_0DotAsmOK,
+		"Q4_0":  q4_0DotAsmOK,
+		"Q4_1":  q4_1DotAsmOK,
+		"MXFP4": mxfp4DotAsmOK,
+	} {
+		if !ok {
+			t.Errorf("%s SDOT self-check failed at init — the assembly kernel is not in use", name)
+		}
 	}
-	if !q6kDotAsmOK {
-		t.Error("Q6_K SDOT self-check failed at init — the assembly kernel is not in use")
+}
+
+// The three 32-element-block formats share one test shape: build a row, quantize
+// activations, and compare the assembly-backed row kernel against the portable
+// one. Table-driven so a fourth legacy format is a table entry, not a fourth
+// copy of the body.
+func TestLegacyFormatRowKernelsMatchPortable(t *testing.T) {
+	cases := []struct {
+		name string
+		row  func(rng *rand.Rand, cols int) []byte
+		asm  func(row []byte, q8 []int8, xsc, xsums []float32, blocks int) float32
+		ref  func(row []byte, q8 []int8, xsc, xsums []float32, blocks int) float32
+	}{
+		{"Q4_0", randomQ4_0Row, q4_0DotQ8KRow, q4_0DotQ8KRowPortable},
+		{"Q4_1", randomQ4_1Row, q4_1DotQ8KRow, q4_1DotQ8KRowPortable},
+		{
+			"MXFP4", randomMXFP4Row,
+			func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
+				return mxfp4DotQ8KRow(row, q8, xsc, blocks)
+			},
+			func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
+				return mxfp4DotQ8KRowPortable(row, q8, xsc, blocks)
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rng := rand.New(rand.NewSource(4260))
+			for _, cols := range []int{256, 1024, 3072, 4096} {
+				blocks := cols / 256
+				row := tc.row(rng, cols)
+				x := randomVec(rng, cols)
+				q8 := make([]int8, cols)
+				xsc := make([]float32, blocks)
+				q8kQuantizePortable(x, q8, xsc, blocks)
+				var scratch []float32
+				xsums := fillQ4KXSums(x, cols, &scratch)
+
+				got := tc.asm(row, q8, xsc, xsums, blocks)
+				want := tc.ref(row, q8, xsc, xsums, blocks)
+				if diff := math.Abs(float64(got - want)); diff > 1e-3*(1+math.Abs(float64(want))) {
+					t.Fatalf("cols=%d: asm %v != portable %v (diff %v)", cols, got, want, diff)
+				}
+			}
+		})
+	}
+}
+
+// MXFP4 is the one format whose nibbles pair with INTERLEAVED activations (low
+// nibble of byte i against activation 2i), which the kernel handles by
+// de-interleaving with UZP1/UZP2. Getting that backwards would swap every pair
+// and still produce plausible magnitudes, so it gets a direct check: a table
+// where index 1 maps to +1 and everything else to 0 makes each output equal the
+// activation the low or high nibble should have selected.
+func TestMXFP4Q8Dots8AsmDeinterleaves(t *testing.T) {
+	row := make([]byte, 136)
+	q8 := make([]int8, 256)
+	for i := range q8 {
+		q8[i] = int8(i % 127)
+	}
+	// Block 0: every byte 0x01 — low nibble 1, high nibble 0. With the real
+	// doubled table, index 1 is 2 and index 0 is 0, so each block dot must be
+	// 2 * sum of the EVEN-indexed activations of that block.
+	for i := range 16 {
+		row[i] = 0x01
+	}
+	var got [8]int32
+	mxfp4Q8Dots8Asm(&row[0], &q8[0], &mxfp4DoubledLUT8[0], &got[0])
+
+	var wantEven int32
+	for i := range 16 {
+		wantEven += 2 * int32(q8[i*2])
+	}
+	if got[0] != wantEven {
+		t.Fatalf("low-nibble block dot = %d, want %d (UZP1/UZP2 may be swapped)", got[0], wantEven)
+	}
+
+	// Now 0x10: high nibble 1, low nibble 0 — the ODD activations.
+	for i := range 16 {
+		row[i] = 0x10
+	}
+	mxfp4Q8Dots8Asm(&row[0], &q8[0], &mxfp4DoubledLUT8[0], &got[0])
+	var wantOdd int32
+	for i := range 16 {
+		wantOdd += 2 * int32(q8[i*2+1])
+	}
+	if got[0] != wantOdd {
+		t.Fatalf("high-nibble block dot = %d, want %d (UZP1/UZP2 may be swapped)", got[0], wantOdd)
+	}
+	if wantEven == wantOdd {
+		t.Fatal("test is vacuous: even and odd activation sums coincide")
 	}
 }
 

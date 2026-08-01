@@ -4,7 +4,9 @@ package gopherllm
 
 import (
 	"fmt"
+	"math"
 	"os"
+	"slices"
 )
 
 // Apple Silicon int8-activation kernels.
@@ -15,12 +17,11 @@ import (
 // unpacked nibble to float first, so the int8 path removes both the conversion
 // and roughly three quarters of the multiply instructions.
 //
-// The split of work is deliberate: assembly does the nibble unpack and the
-// integer dots (see q8k_dot_darwin_arm64.s), Go does the 6-bit packed
-// scale/min decode and the float combination. That decode is intricate, it is
-// already written and tested once in quant_q8k_portable.go, and moving it into
-// hand-encoded assembly would buy little — it runs 8 times per 256 elements,
-// against 64 SDOTs — while making the kernel much harder to verify.
+// The split of work is deliberate and uniform across all seven formats:
+// assembly does the unpack and the integer dots (see q8k_dot_darwin_arm64.s),
+// Go decodes the scales and does the float combination. Scale decode runs 8 or
+// 16 times per 256 elements against 32-64 SDOTs, so keeping it in Go costs
+// almost nothing and keeps each kernel small enough to review by eye.
 //
 // hasQ8KDotAsm is true here, which also makes the int8-activation path the
 // default on Apple Silicon (see defaultQ8Activations in
@@ -28,50 +29,107 @@ import (
 // float kernels back on for A/B testing or if a numerical problem is suspected.
 const hasQ8KDotAsm = true
 
-// q4kQ8Dots8Asm computes the 8 per-sub-block int32 dot products of one Q4_K
-// block: unsigned 4-bit quants times int8 activations, no scales applied. q
-// must point at the block's 128 packed nibble bytes, q8 at its 256 int8
-// activations, out at 8 int32s.
+/* ── Assembly entry points ───────────────────────────────────────────────── */
+
+// Each of these computes the raw integer dot products of ONE 256-element
+// superchunk, before any scale is applied. q8 always points at that
+// superchunk's 256 int8 activations, out at the dots.
+
+// q4kQ8Dots8Asm: 8 sub-block dots. q is the 128 packed nibble bytes.
 //
 //go:noescape
 func q4kQ8Dots8Asm(q *byte, q8 *int8, out *int32)
 
+// q5kQ8Dots8Asm: 8 sub-block dots. q is 128 packed nibble bytes, qh the
+// 32-byte fifth-bit plane.
+//
+//go:noescape
+func q5kQ8Dots8Asm(q *byte, qh *byte, q8 *int8, out *int32)
+
+// q6kQ8Dots16Asm: 16 per-scale-group dots. ql is 128 bytes, qh 64.
+//
+//go:noescape
+func q6kQ8Dots16Asm(ql *byte, qh *byte, q8 *int8, out *int32)
+
+// q8_0Q8Dots8Asm: 8 block dots over 8 consecutive 34-byte blocks.
+//
+//go:noescape
+func q8_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+
+// q4_0Q8Dots8Asm: 8 block dots over 8 consecutive 18-byte blocks.
+//
+//go:noescape
+func q4_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+
+// q4_1Q8Dots8Asm: 8 block dots over 8 consecutive 20-byte blocks.
+//
+//go:noescape
+func q4_1Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+
+// mxfp4Q8Dots8Asm: 8 block dots over 8 consecutive 17-byte blocks. lut is the
+// 16-entry table of doubled signed values that VTBL indexes with each nibble.
+//
+//go:noescape
+func mxfp4Q8Dots8Asm(row *byte, q8 *int8, lut *int8, out *int32)
+
 // dotInt8Asm is a plain int8 dot product over n elements, n a multiple of 16.
+// No row kernel uses it; it exists so the tests can pin SDOT's behaviour on its
+// own, with no block format in the way.
 //
 //go:noescape
 func dotInt8Asm(a, b *int8, n int) int32
 
-func q8kQuantize(x []float32, q8 []int8, scales []float32, blocks int) {
-	// The quantizer is a float absmax pass plus a round-to-int8 pass; it is
-	// bandwidth-bound on the activation vector, which is tiny next to a weight
-	// matrix, and it runs once per matvec rather than once per row. Not worth
-	// its own assembly.
-	q8kQuantizePortable(x, q8, scales, blocks)
-}
+// mxfp4DoubledLUT8 narrows the portable kernel's table to the int8 form VTBL
+// needs. Every entry is within [-12, 12], so nothing is lost.
+var mxfp4DoubledLUT8 = func() [16]int8 {
+	var t [16]int8
+	for i, v := range mxfp4DoubledLUT {
+		t[i] = int8(v)
+	}
+	return t
+}()
 
-// q4kDotAsmOK is a startup self-check on the hand-encoded SDOT kernel.
-//
+/* ── Startup self-checks ─────────────────────────────────────────────────── */
+
 // SDOT is emitted as a raw WORD because Go has no mnemonic for it, so nothing
 // in the toolchain validates that encoding — not the assembler, and not the
-// disassembler, whose instruction table predates FEAT_DotProd. The kernel is
-// also written and cross-compiled on machines that cannot execute it. Its
+// disassembler, whose instruction table predates FEAT_DotProd. The kernels were
+// also written and cross-compiled on machines that cannot execute them. The
 // failure mode is therefore the bad one: not a crash, but subtly wrong logits
 // that still look like plausible text.
 //
-// So the kernel proves itself once, at package init, against the same scalar
-// unpack the portable kernel uses. If it disagrees the process keeps running on
-// the portable path instead, which is correct everywhere. This costs one
-// 256-element block of work at startup and removes the need to trust untested
-// assembly. q8k_dot_darwin_arm64_test.go covers the same ground far more
-// thoroughly; this is the belt to that suite's braces.
+// So every kernel proves itself once, at package init, against the same scalar
+// unpack its portable counterpart uses. On mismatch the process keeps running on
+// the portable path, which is correct everywhere, and says so on stderr. This
+// costs one 256-element block per format at startup and removes the need to
+// trust untested assembly. q8k_dot_darwin_arm64_test.go covers the same ground
+// far more thoroughly; these are the belt to that suite's braces.
 var (
-	q4kDotAsmOK = validateQ4KQ8Dots8Asm()
-	q6kDotAsmOK = validateQ6KQ8Dots16Asm()
+	q4kDotAsmOK   = validateQ4KQ8Dots8Asm()
+	q5kDotAsmOK   = validateQ5KQ8Dots8Asm()
+	q6kDotAsmOK   = validateQ6KQ8Dots16Asm()
+	q8_0DotAsmOK  = validateQ8_0Q8Dots8Asm()
+	q4_0DotAsmOK  = validateQ4_0Q8Dots8Asm()
+	q4_1DotAsmOK  = validateQ4_1Q8Dots8Asm()
+	mxfp4DotAsmOK = validateMXFP4Q8Dots8Asm()
 )
 
-// q8kSelfCheckActivations builds a deterministic activation block that
-// exercises both signs and the int8 extremes, so a lane-order or signedness
-// mistake cannot cancel out.
+// q8kSelfCheck reports a kernel mismatch once and returns whether the kernel is
+// usable. One place for the message so seven kernels cannot drift in how they
+// describe the same failure.
+func q8kSelfCheck(format string, got, want []int32) bool {
+	if slices.Equal(got, want) {
+		return true
+	}
+	fmt.Fprintf(os.Stderr,
+		"gopherllm: NEON SDOT %s self-check failed (got %v want %v); falling back to the portable %s int8 kernel. Please report this with your CPU model.\n",
+		format, got, want, format)
+	return false
+}
+
+// q8kSelfCheckActivations builds a deterministic activation block that exercises
+// both signs and the int8 extremes, so a lane-order or signedness mistake cannot
+// cancel out.
 func q8kSelfCheckActivations() [256]int8 {
 	var q8 [256]int8
 	for i := range q8 {
@@ -89,18 +147,61 @@ func q8kSelfCheckActivations() [256]int8 {
 	return q8
 }
 
-func validateQ6KQ8Dots16Asm() bool {
-	var ql [128]byte
-	var qh [64]byte
-	for i := range ql {
-		ql[i] = byte(i*13 + i/8)
+// q8kSelfCheckBytes fills n bytes deterministically. Callers pass different
+// multipliers so no two formats share a pattern that could hide a layout bug in
+// one of them, and so every bit position gets exercised.
+func q8kSelfCheckBytes(n, mul, add int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i*mul + add)
 	}
-	for i := range qh {
-		qh[i] = byte(i*29 + 7)
-	}
-	q8 := q8kSelfCheckActivations()
+	return b
+}
 
-	var want [16]int32
+func validateQ4KQ8Dots8Asm() bool {
+	q := q8kSelfCheckBytes(128, 7, 0)
+	q8 := q8kSelfCheckActivations()
+	want := make([]int32, 8)
+	for s := range 4 {
+		var lo, hi int32
+		for l := range 32 {
+			qv := q[s*32+l]
+			lo += int32(qv&0x0f) * int32(q8[s*64+l])
+			hi += int32(qv>>4) * int32(q8[s*64+32+l])
+		}
+		want[2*s], want[2*s+1] = lo, hi
+	}
+	got := make([]int32, 8)
+	q4kQ8Dots8Asm(&q[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q4_K", got, want)
+}
+
+func validateQ5KQ8Dots8Asm() bool {
+	q := q8kSelfCheckBytes(128, 7, 0)
+	qh := q8kSelfCheckBytes(32, 37, 11)
+	q8 := q8kSelfCheckActivations()
+	want := make([]int32, 8)
+	for s := range 4 {
+		var lo, hi int32
+		for l := range 32 {
+			qv := q[s*32+l]
+			h1 := int32((qh[l] >> (2 * s)) & 1)
+			h2 := int32((qh[l] >> (2*s + 1)) & 1)
+			lo += (int32(qv&0x0f) + h1*16) * int32(q8[s*64+l])
+			hi += (int32(qv>>4) + h2*16) * int32(q8[s*64+32+l])
+		}
+		want[2*s], want[2*s+1] = lo, hi
+	}
+	got := make([]int32, 8)
+	q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q5_K", got, want)
+}
+
+func validateQ6KQ8Dots16Asm() bool {
+	ql := q8kSelfCheckBytes(128, 13, 0)
+	qh := q8kSelfCheckBytes(64, 29, 7)
+	q8 := q8kSelfCheckActivations()
+	want := make([]int32, 16)
 	for half := range 2 {
 		qlh := ql[half*64 : half*64+64]
 		qhh := qh[half*32 : half*32+32]
@@ -117,54 +218,113 @@ func validateQ6KQ8Dots16Asm() bool {
 			want[half*8+3*2+is] += q4 * int32(q8h[96+l])
 		}
 	}
-
-	var got [16]int32
+	got := make([]int32, 16)
 	q6kQ8Dots16Asm(&ql[0], &qh[0], &q8[0], &got[0])
-	if got != want {
-		fmt.Fprintf(os.Stderr,
-			"gopherllm: NEON SDOT Q6_K self-check failed (got %v want %v); falling back to the portable Q6_K int8 kernel. Please report this with your CPU model.\n",
-			got, want)
-		return false
-	}
-	return true
+	return q8kSelfCheck("Q6_K", got, want)
 }
 
-func validateQ4KQ8Dots8Asm() bool {
-	// Deterministic inputs that exercise both nibble halves, both signs of the
-	// activations, and the int8 extremes.
-	var q [128]byte
-	for i := range q {
-		q[i] = byte(i*7 + i/16) // spreads distinct values across both nibbles
-	}
+func validateQ8_0Q8Dots8Asm() bool {
+	row := q8kSelfCheckBytes(272, 23, 5)
 	q8 := q8kSelfCheckActivations()
-
-	var want [8]int32
-	for s := range 4 {
-		var lo, hi int32
+	want := make([]int32, 8)
+	for j := range 8 {
+		off := j*34 + 2
 		for l := range 32 {
-			qv := q[s*32+l]
-			lo += int32(qv&0x0f) * int32(q8[s*64+l])
-			hi += int32(qv>>4) * int32(q8[s*64+32+l])
+			want[j] += int32(int8(row[off+l])) * int32(q8[j*32+l])
 		}
-		want[2*s], want[2*s+1] = lo, hi
 	}
-
-	var got [8]int32
-	q4kQ8Dots8Asm(&q[0], &q8[0], &got[0])
-	if got != want {
-		// Loud, once, on the way past: a silent downgrade would hide a real bug.
-		fmt.Fprintf(os.Stderr,
-			"gopherllm: NEON SDOT self-check failed (got %v want %v); falling back to the portable Q4_K int8 kernel. Please report this with your CPU model.\n",
-			got, want)
-		return false
-	}
-	return true
+	got := make([]int32, 8)
+	q8_0Q8Dots8Asm(&row[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q8_0", got, want)
 }
 
-// q4kDotQ8KRow computes one Q4_K row dot against Q8K-quantized activations,
-// with the integer sub-block dots in NEON. xsums holds the per-32-element
-// sums of the ORIGINAL activations, so the dmin term stays exact float —
-// matching q4kDotQ8KRowPortable, which is this function's test oracle.
+// legacyNibbleDots is the shared scalar reference for the 32-element nibble
+// formats: low nibbles against the first half of each block's activations, high
+// nibbles against the second. header is the byte offset of the packed nibbles
+// within a block and stride the block size, which is all that separates Q4_0
+// from Q4_1.
+func legacyNibbleDots(row []byte, q8 *[256]int8, header, stride int) []int32 {
+	out := make([]int32, 8)
+	for j := range 8 {
+		off := j*stride + header
+		for i := range 16 {
+			p := row[off+i]
+			out[j] += int32(p&0x0f) * int32(q8[j*32+i])
+			out[j] += int32(p>>4) * int32(q8[j*32+16+i])
+		}
+	}
+	return out
+}
+
+func validateQ4_0Q8Dots8Asm() bool {
+	row := q8kSelfCheckBytes(144, 19, 3)
+	q8 := q8kSelfCheckActivations()
+	want := legacyNibbleDots(row, &q8, 2, 18)
+	got := make([]int32, 8)
+	q4_0Q8Dots8Asm(&row[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q4_0", got, want)
+}
+
+func validateQ4_1Q8Dots8Asm() bool {
+	row := q8kSelfCheckBytes(160, 31, 9)
+	q8 := q8kSelfCheckActivations()
+	want := legacyNibbleDots(row, &q8, 4, 20)
+	got := make([]int32, 8)
+	q4_1Q8Dots8Asm(&row[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q4_1", got, want)
+}
+
+func validateMXFP4Q8Dots8Asm() bool {
+	row := q8kSelfCheckBytes(136, 41, 13)
+	q8 := q8kSelfCheckActivations()
+	want := make([]int32, 8)
+	for j := range 8 {
+		off := j * 17
+		for i := range 16 {
+			v := row[off+i]
+			// Interleaved, unlike Q4_0: the low nibble takes activation 2i.
+			want[j] += mxfp4DoubledLUT[v&0x0f] * int32(q8[j*32+i*2])
+			want[j] += mxfp4DoubledLUT[v>>4] * int32(q8[j*32+i*2+1])
+		}
+	}
+	got := make([]int32, 8)
+	mxfp4Q8Dots8Asm(&row[0], &q8[0], &mxfp4DoubledLUT8[0], &got[0])
+	return q8kSelfCheck("MXFP4", got, want)
+}
+
+/* ── Row kernels ─────────────────────────────────────────────────────────── */
+
+// The per-row loops stay separate per format rather than sharing one function
+// with a callback. The repo already measured that a func-value call per row
+// costs ~50ns against a ~127ns kernel (see argmaxQ6KRowsQ8 on amd64), so a
+// closure here would give back a third of the win these kernels exist for. What
+// IS shared is the scale arithmetic, one static call per block.
+
+// combineQ4KStyle folds Q4_K/Q5_K's packed 6-bit scale/min pairs into 8 raw
+// unsigned sub-block dots. The two formats differ only in block stride and
+// unpack kernel; this arithmetic is identical, so it lives once. xsums must
+// start at this block's 8 per-32-element activation sums.
+//
+// It does NOT inline: `go build -gcflags=-m` reports cost 102 against the budget
+// of 80, because the eight getScaleMinK4 calls inside it do inline and their
+// bodies are what blow the budget. That leaves exactly one extra static call per
+// 256-element block compared to open-coding this loop in both row kernels —
+// against the 64 SDOTs that block also runs, which is why sharing it is the
+// right trade and why this is a static call rather than a closure.
+func combineQ4KStyle(scales []byte, qdots *[8]int32, xsums []float32, d, dmin, xscale float32) float32 {
+	var blockInt int32
+	var minTerm float32
+	for j := range 8 {
+		sc, m := getScaleMinK4(j, scales)
+		blockInt += int32(sc) * qdots[j]
+		minTerm += float32(m) * xsums[j]
+	}
+	return d*xscale*float32(blockInt) - dmin*minTerm
+}
+
+// q4kDotQ8KRow computes one Q4_K row dot against Q8K-quantized activations.
+// xsums holds the per-32-element sums of the ORIGINAL activations, so the dmin
+// term stays exact float — matching q4kDotQ8KRowPortable, the test oracle.
 func q4kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
 	if !q4kDotAsmOK {
 		return q4kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
@@ -173,43 +333,39 @@ func q4kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 	var sum float32
 	for b := range blocks {
 		block := row[b*144 : (b+1)*144]
-		d := F16ToF32(binaryLE16(block[0:]))
-		dmin := F16ToF32(binaryLE16(block[2:]))
-		scales := block[4:16]
-
 		q4kQ8Dots8Asm(&block[16], &q8[b*256], &qdots[0])
-
-		var blockInt int32
-		var minTerm float32
-		for j := range 8 {
-			sc, m := getScaleMinK4(j, scales)
-			blockInt += int32(sc) * qdots[j]
-			minTerm += float32(m) * xsums[b*8+j]
-		}
-		sum += d * xscales[b] * float32(blockInt)
-		sum -= dmin * minTerm
+		sum += combineQ4KStyle(block[4:16], &qdots, xsums[b*8:],
+			F16ToF32(binaryLE16(block[0:])), F16ToF32(binaryLE16(block[2:])), xscales[b])
 	}
 	return sum
 }
 
-// q6kQ8Dots16Asm computes the 16 per-scale-group int32 dot products of one
-// Q6_K block. ql must point at 128 bytes, qh at 64, q8 at 256 int8
-// activations, out at 16 int32s.
+// q5kDotQ8KRow is the Q5_K analogue: same scale structure, one extra bitplane.
 //
-//go:noescape
-func q6kQ8Dots16Asm(ql *byte, qh *byte, q8 *int8, out *int32)
+// Q5_K_M matters beyond being a common mix in its own right: it is the
+// recommended quantization for the hybrid Mamba-2/MoE models this engine
+// supports through the nemotron_h path.
+func q5kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	if !q5kDotAsmOK {
+		return q5kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		block := row[b*176 : (b+1)*176]
+		q5kQ8Dots8Asm(&block[48], &block[16], &q8[b*256], &qdots[0])
+		sum += combineQ4KStyle(block[4:16], &qdots, xsums[b*8:],
+			F16ToF32(binaryLE16(block[0:])), F16ToF32(binaryLE16(block[2:])), xscales[b])
+	}
+	return sum
+}
 
-// q6kDotQ8KRow computes one Q6_K row dot against Q8K-quantized activations.
+// q6kDotQ8KRow computes one Q6_K row dot.
 //
 // Q6_K matters more than its share of a model's bytes suggests: a Q4_K_M mix
-// stores output.weight as Q6_K, so this kernel runs over the whole vocabulary
-// on every single token. Leaving it on the scalar portable kernel while Q4_K
-// got NEON would have made the int8 path a net regression on Apple Silicon,
-// because the float path it replaces is already vectorised there
-// (q6kQDots16 in kernels_arm64.s).
-//
-// xsums are the per-16-element sums of the original activations pre-scaled by
-// 32, carrying Q6_K's -32 quant offset as an exact float term.
+// stores output.weight as Q6_K, so this runs over the whole vocabulary on every
+// token. xsums are the per-16-element sums pre-scaled by 32, carrying Q6_K's -32
+// quant offset as an exact float term.
 func q6kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
 	if !q6kDotAsmOK {
 		return q6kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
@@ -220,9 +376,7 @@ func q6kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 		block := row[b*210 : (b+1)*210]
 		sc := block[192:208]
 		d := F16ToF32(binaryLE16(block[208:]))
-
 		q6kQ8Dots16Asm(&block[0], &block[128], &q8[b*256], &qdots[0])
-
 		// The assembly indexes its output by half*8 + group*2 + l/16, which is
 		// exactly the scale index, so this is a straight walk.
 		var blockInt int32
@@ -232,8 +386,102 @@ func q6kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 			blockInt += s * qdots[i]
 			offTerm += float32(s) * xsums[b*16+i]
 		}
-		sum += d * xscales[b] * float32(blockInt)
-		sum -= d * offTerm
+		sum += d * (xscales[b]*float32(blockInt) - offTerm)
 	}
 	return sum
+}
+
+// q8_0DotQ8KRow computes one Q8_0 row dot. Q8_0 is symmetric, so unlike the
+// K-quants there is no offset term and no xsums argument.
+func q8_0DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	if !q8_0DotAsmOK {
+		return q8_0DotQ8KRowPortable(row, q8, xscales, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		base := b * 272
+		q8_0Q8Dots8Asm(&row[base], &q8[b*256], &qdots[0])
+		var blockSum float32
+		for j := range 8 {
+			blockSum += F16ToF32(binaryLE16(row[base+j*34:])) * float32(qdots[j])
+		}
+		sum += xscales[b] * blockSum
+	}
+	return sum
+}
+
+// q4_0DotQ8KRow computes one Q4_0 row dot. Q4_0's quants are unsigned nibbles
+// biased by -8, and that bias is folded out through xsums rather than applied
+// per element, which is why the kernel returns raw unsigned dots.
+func q4_0DotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	if !q4_0DotAsmOK {
+		return q4_0DotQ8KRowPortable(row, q8, xscales, xsums, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		base := b * 144
+		q4_0Q8Dots8Asm(&row[base], &q8[b*256], &qdots[0])
+		xscale := xscales[b]
+		for j := range 8 {
+			d := F16ToF32(binaryLE16(row[base+j*18:]))
+			sum += d * (xscale*float32(qdots[j]) - 8*xsums[b*8+j])
+		}
+	}
+	return sum
+}
+
+// q4_1DotQ8KRow computes one Q4_1 row dot: per block, d*xscale*dot + m*xsum,
+// where m is the stored per-block minimum.
+func q4_1DotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	if !q4_1DotAsmOK {
+		return q4_1DotQ8KRowPortable(row, q8, xscales, xsums, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		base := b * 160
+		q4_1Q8Dots8Asm(&row[base], &q8[b*256], &qdots[0])
+		xscale := xscales[b]
+		for j := range 8 {
+			off := base + j*20
+			d := F16ToF32(binaryLE16(row[off:]))
+			m := F16ToF32(binaryLE16(row[off+2:]))
+			sum += d*xscale*float32(qdots[j]) + m*xsums[b*8+j]
+		}
+	}
+	return sum
+}
+
+// mxfp4DotQ8KRow computes one MXFP4 (gpt-oss) row dot. The block scale is a raw
+// power-of-two exponent byte, where 0 means the block is zero; the 0.5
+// compensates for the doubled lookup table.
+func mxfp4DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	if !mxfp4DotAsmOK {
+		return mxfp4DotQ8KRowPortable(row, q8, xscales, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		base := b * 136
+		mxfp4Q8Dots8Asm(&row[base], &q8[b*256], &mxfp4DoubledLUT8[0], &qdots[0])
+		xscale := xscales[b]
+		for j := range 8 {
+			e := uint32(row[base+j*17+16])
+			if e == 0 {
+				continue
+			}
+			sum += math.Float32frombits(e<<23) * 0.5 * xscale * float32(qdots[j])
+		}
+	}
+	return sum
+}
+
+func q8kQuantize(x []float32, q8 []int8, scales []float32, blocks int) {
+	// The quantizer is a float absmax pass plus a round-to-int8 pass; it is
+	// bandwidth-bound on the activation vector, which is tiny next to a weight
+	// matrix, and it runs once per matvec rather than once per row. Not worth
+	// its own assembly.
+	q8kQuantizePortable(x, q8, scales, blocks)
 }

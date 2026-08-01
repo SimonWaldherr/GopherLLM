@@ -39,8 +39,9 @@ func q8kQuantizePortable(x []float32, q8 []int8, scales []float32, blocks int) {
 		var amax float32
 		for _, v := range xb {
 			// NaN fails this comparison and is therefore skipped, so a block
-			// containing one still scales off its finite elements.
-			if a := float32(math.Abs(float64(v))); a > amax {
+			// containing one still scales off its finite elements. absF32 keeps
+			// that property: clearing the sign bit leaves a NaN a NaN.
+			if a := absF32(v); a > amax {
 				amax = a
 			}
 		}
@@ -55,9 +56,41 @@ func q8kQuantizePortable(x []float32, q8 []int8, scales []float32, blocks int) {
 		inv := 127 / amax
 		qb := q8[b*256 : b*256+256]
 		for i, v := range xb {
-			qb[i] = int8(math.RoundToEven(float64(v * inv)))
+			qb[i] = int8(roundToEvenF32(v * inv))
 		}
 	}
+}
+
+// absF32 and roundToEvenF32 exist because this loop runs over the whole
+// activation vector on every matvec, and the obvious spellings
+// (math.Abs(float64(v)) and math.RoundToEven(float64(v))) widen to float64 and
+// back once per element for a result that is exactly representable in float32.
+// Both of these are bit-identical to the float64 forms over the range the
+// quantizer produces, which quant_q8k_portable_amd64_test.go asserts directly
+// rather than assuming.
+
+// absF32 clears the sign bit. Branchless, and unlike a comparison it leaves
+// negative zero as positive zero, matching math.Abs.
+func absF32(v float32) float32 {
+	return math.Float32frombits(math.Float32bits(v) &^ (1 << 31))
+}
+
+// roundToEvenF32 rounds to the nearest integer, ties to even.
+//
+// Adding 2^23 pushes the value into the range where a float32's ulp is exactly
+// 1, so the hardware's default round-to-nearest-even mode does the rounding as
+// part of the addition; subtracting 2^23 then recovers it. Valid for
+// |v| < 2^22, and this only ever sees |v| <= 127 or so.
+//
+// It rounds the magnitude and reapplies the sign bit rather than branching on
+// the sign. That is exact because round-half-to-even is antisymmetric, it is
+// branchless, and it keeps math.RoundToEven's handling of negative zero:
+// rounding -0.5 the other way returns +0, which int8() cannot tell apart but a
+// future caller of this helper could.
+func roundToEvenF32(v float32) float32 {
+	const magic = 8388608.0 // 2^23
+	r := (absF32(v) + magic) - magic
+	return math.Float32frombits(math.Float32bits(r) | (math.Float32bits(v) & (1 << 31)))
 }
 
 // q4kDotQ8KRowPortable computes one Q4_K row dot product against Q8K-quantized

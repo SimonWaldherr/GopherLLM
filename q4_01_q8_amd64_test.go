@@ -8,31 +8,6 @@ import (
 	"testing"
 )
 
-func randomQ4_0Row(rng *rand.Rand, cols int) []byte {
-	row := make([]byte, (cols/32)*18)
-	for b := 0; b < cols/32; b++ {
-		block := row[b*18 : (b+1)*18]
-		block[0], block[1] = byte(rng.Intn(256)), 0x2c // small positive f16 d
-		for i := 2; i < 18; i++ {
-			block[i] = byte(rng.Intn(256))
-		}
-	}
-	return row
-}
-
-func randomQ4_1Row(rng *rand.Rand, cols int) []byte {
-	row := make([]byte, (cols/32)*20)
-	for b := 0; b < cols/32; b++ {
-		block := row[b*20 : (b+1)*20]
-		block[0], block[1] = byte(rng.Intn(256)), 0x2c // f16 d
-		block[2], block[3] = byte(rng.Intn(256)), 0x1c // f16 m
-		for i := 4; i < 20; i++ {
-			block[i] = byte(rng.Intn(256))
-		}
-	}
-	return row
-}
-
 // dotQ4_0Q8KRowRef: per legacy block, d*(xscale*intdot(q, q8) - 8*xsum),
 // low nibbles = elements 0..15, high nibbles = 16..31 (DotQ4_0F32's layout).
 func dotQ4_0Q8KRowRef(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
