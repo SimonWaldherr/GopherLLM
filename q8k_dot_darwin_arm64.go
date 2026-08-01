@@ -298,12 +298,19 @@ func validateMXFP4Q8Dots8Asm() bool {
 // with a callback. The repo already measured that a func-value call per row
 // costs ~50ns against a ~127ns kernel (see argmaxQ6KRowsQ8 on amd64), so a
 // closure here would give back a third of the win these kernels exist for. What
-// IS shared is the scale arithmetic, which is leaf-only and inlines.
+// IS shared is the scale arithmetic, one static call per block.
 
 // combineQ4KStyle folds Q4_K/Q5_K's packed 6-bit scale/min pairs into 8 raw
 // unsigned sub-block dots. The two formats differ only in block stride and
 // unpack kernel; this arithmetic is identical, so it lives once. xsums must
 // start at this block's 8 per-32-element activation sums.
+//
+// It does NOT inline: `go build -gcflags=-m` reports cost 102 against the budget
+// of 80, because the eight getScaleMinK4 calls inside it do inline and their
+// bodies are what blow the budget. That leaves exactly one extra static call per
+// 256-element block compared to open-coding this loop in both row kernels —
+// against the 64 SDOTs that block also runs, which is why sharing it is the
+// right trade and why this is a static call rather than a closure.
 func combineQ4KStyle(scales []byte, qdots *[8]int32, xsums []float32, d, dmin, xscale float32) float32 {
 	var blockInt int32
 	var minTerm float32
