@@ -429,9 +429,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 						Hidden[t][i] = geluExact(Up[t][i])
 					}
 				} else if config.UseGELU {
-					for i := 0; i < hDim; i++ {
-						Hidden[t][i] = geluTanh(Gate[t][i]) * Up[t][i]
-					}
+					geluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])
 				} else {
 					siluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])
 				}

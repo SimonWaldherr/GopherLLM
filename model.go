@@ -2206,9 +2206,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 						_ = up[hDim-1]
 						_ = hidden[hDim-1]
 						if config.UseGELU {
-							for i := 0; i < hDim; i++ {
-								hidden[i] = geluTanh(gate[i]) * up[i]
-							}
+							geluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
 						} else {
 							siluMulF32(gate[:hDim], up[:hDim], hidden[:hDim])
 						}
@@ -2309,17 +2307,17 @@ func ForwardHiddenGemma4(config Config, weights Gemma4Weights, cache *KVCache, b
 
 // geluTanh is the tanh-approximated GELU (gelu_pytorch_tanh) used by the
 // Gemma family's FFN in place of SiLU.
-func geluTanh(x float32) float32 {
-	const sqrt2OverPi = 0.7978845608028654
-	return 0.5 * x * (1 + float32(math.Tanh(sqrt2OverPi*float64(x+0.044715*x*x*x))))
-}
+func geluTanh(x float32) float32 { return geluTanhScalar(x) }
 
 // softcapF32 applies v = cap*tanh(v/cap) elementwise — Gemma's logit
 // softcapping, which bounds values to (-cap, cap) while staying smooth.
+// Gemma applies this to the whole logits vector, so on a 256k-entry vocabulary
+// it is a quarter-million tanh calls per token — by far the heaviest consumer of
+// tanh in the engine, and the reason it uses the float32 one.
 func softcapF32(v []float32, cap float32) {
 	inv := 1 / cap
 	for i, x := range v {
-		v[i] = cap * float32(math.Tanh(float64(x*inv)))
+		v[i] = cap * fastTanhF32(x*inv)
 	}
 }
 

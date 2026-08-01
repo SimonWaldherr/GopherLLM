@@ -306,6 +306,25 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 						return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE router bias: %w", i, err)
 					}
 				}
+				// Nemotron-H's expert FFN is ungated: up -> activation -> down,
+				// with no gate projection, so this loader reads no
+				// ffn_gate_exps / ffn_gate_shexp and the forward pass has
+				// nowhere to apply one. A checkpoint that DOES carry gate
+				// tensors is a different FFN (a SwiGLU-style gated expert), and
+				// silently ignoring them would produce plausible-looking but
+				// wrong logits rather than an error. Refuse instead: a clear
+				// failure is recoverable, a quietly wrong model is not.
+				//
+				// If support for gated experts is added, this check is the place
+				// to relax — and the forward pass in the MoE path has to learn
+				// the gate and its activation at the same time.
+				for _, gate := range []string{"ffn_gate_exps.weight", "ffn_gate_shexp.weight"} {
+					if _, ok := tensors[prefix+gate]; ok {
+						return cfg, NemotronHWeights{}, fmt.Errorf(
+							"layer %d: %s carries %s, so its experts are gated, but the %s path implements only the ungated up/down expert FFN; running it would silently produce wrong output",
+							i, cfg.Arch, gate, cfg.Arch)
+					}
+				}
 				if layer.MoE.SharedUp, err = optionalWeight(prefix + "ffn_up_shexp.weight"); err != nil {
 					return cfg, NemotronHWeights{}, err
 				}
@@ -314,6 +333,18 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 				}
 				if (layer.MoE.SharedUp == nil) != (layer.MoE.SharedDown == nil) {
 					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE shared expert projections must be paired", i)
+				}
+				// The shared expert is taken purely from tensor presence above,
+				// so a checkpoint that declares one in metadata but names its
+				// tensors differently would load with the shared branch silently
+				// switched off. On these hybrids the shared expert is a quarter
+				// of the MoE work, so that is a large, invisible quality loss
+				// rather than a subtle one. moe.go makes the same check for the
+				// generic MoE loader; this is the nemotron path's copy.
+				if cfg.ExpertSharedCount > 0 && layer.MoE.SharedUp == nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf(
+						"layer %d: %s declares expert_shared_count=%d but has no %sffn_up_shexp.weight/%sffn_down_shexp.weight; the shared expert would be dropped",
+						i, cfg.Arch, cfg.ExpertSharedCount, prefix, prefix)
 				}
 				expertInput := cfg.Dim
 				if layer.MoE.LatentIn != nil {

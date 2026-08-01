@@ -12,7 +12,21 @@ import (
 // itself is meaningless and never read back.
 var prefaultSink atomic.Uint64
 
-const prefaultPageSize = 4096
+// prefaultPageSize is the stride of the touch loop: one byte per page is all it
+// takes to fault a page in, so this must be the OS page size and not a guess.
+//
+// It used to be a hard-coded 4096, which is right on x86 but wrong on Apple
+// Silicon, where pages are 16 KB — so the loop did four touches per page and
+// three quarters of its iterations and reads were pure waste. Overestimating
+// would be worse than wasteful: a stride larger than the real page size skips
+// pages and leaves them to fault later, defeating the point, which is why this
+// asks the OS rather than picking a value per GOARCH.
+var prefaultPageSize = func() int {
+	if n := os.Getpagesize(); n > 0 {
+		return n
+	}
+	return 4096
+}()
 
 type ByteRange struct {
 	Start int

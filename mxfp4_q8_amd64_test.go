@@ -8,19 +8,6 @@ import (
 	"testing"
 )
 
-func randomMXFP4Row(rng *rand.Rand, cols int) []byte {
-	row := make([]byte, (cols/32)*17)
-	for b := 0; b < cols/32; b++ {
-		block := row[b*17 : (b+1)*17]
-		for i := 0; i < 16; i++ {
-			block[i] = byte(rng.Intn(256))
-		}
-		// E8M0 exponents around 1.0 (127 +/- 8) keep sums well-conditioned.
-		block[16] = byte(119 + rng.Intn(17))
-	}
-	return row
-}
-
 // dotMXFP4Q8KRowRef mirrors mxfp4DotQ8KRow exactly: integer dot of doubled
 // e2m1 magnitudes (signed) against q8, scaled by 2^(e-127)*0.5*xscale per
 // block, with element 2i = low nibble and 2i+1 = high nibble of byte i.
