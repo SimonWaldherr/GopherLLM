@@ -131,6 +131,12 @@ func (s *chatHistoryStore) write(ctx context.Context, data []byte, expectedETag 
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return "", fmt.Errorf("replace chat history: %w", err)
 	}
+	// Keep the final path private as well as the temporary file. Some
+	// filesystems apply their default mode while materializing a renamed file,
+	// so relying on the temporary file's mode can expose conversation data.
+	if err := os.Chmod(s.path, 0o600); err != nil {
+		return "", fmt.Errorf("protect chat history: %w", err)
+	}
 	removeTemp = false
 	return chatHistoryETag(normalized), nil
 }
