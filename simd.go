@@ -156,9 +156,12 @@ func mulScaleF32Scalar(x []float32, weight []float32, scale float32, out []float
 }
 
 func siluMulF32Scalar(gate, up, out []float32, start, end int) {
+	// fastSigmoidF32 rather than math.Exp(float64(-g)): this is the SwiGLU path
+	// on every target without an AVX2 kernel, so on arm64 it runs for every FFN
+	// element of every token. See fastmath.go for the accuracy measurements.
 	for i := start; i < end; i++ {
 		g := gate[i]
-		out[i] = (g / (1 + float32(math.Exp(float64(-g))))) * up[i]
+		out[i] = g * fastSigmoidF32(g) * up[i]
 	}
 }
 

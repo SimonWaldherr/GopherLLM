@@ -684,9 +684,7 @@ func forwardNativeGemma4BodyInto(config Config, weights Gemma4Weights, cache *KV
 			layer.FFNUp.MatvecInto(buf.XN2[:dim], &buf.Up)
 			hiddenDim := layer.FFNHiddenDim
 			ensureLenNoClear(&buf.Hidden, hiddenDim)
-			for i := range hiddenDim {
-				buf.Hidden[i] = geluTanh(buf.Gate[i]) * buf.Up[i]
-			}
+			geluMulF32(buf.Gate[:hiddenDim], buf.Up[:hiddenDim], buf.Hidden[:hiddenDim])
 			layer.FFNDown.MatvecInto(buf.Hidden[:hiddenDim], &buf.Proj)
 			rmsNormInto(buf.Proj[:dim], layer.PostFFNNorm, config.RMSNormEps, &buf.Proj)
 			addInPlace(buf.X[:dim], buf.Proj[:dim])
@@ -793,9 +791,7 @@ func forwardNativeGemma4MoE(config Config, layer Gemma4LayerWeights, moe *Gemma4
 	layer.FFNUp.MatvecInto(buf.XN2[:dim], &buf.Up)
 	hiddenDim := layer.FFNHiddenDim
 	ensureLenNoClear(&buf.Hidden, hiddenDim)
-	for i := range hiddenDim {
-		buf.Hidden[i] = geluTanh(buf.Gate[i]) * buf.Up[i]
-	}
+	geluMulF32(buf.Gate[:hiddenDim], buf.Up[:hiddenDim], buf.Hidden[:hiddenDim])
 	layer.FFNDown.MatvecInto(buf.Hidden[:hiddenDim], &buf.AttnProj)
 	rmsNormInto(buf.AttnProj[:dim], moe.PostNorm1, config.RMSNormEps, &buf.AttnProj)
 
@@ -819,9 +815,7 @@ func forwardNativeGemma4MoE(config Config, layer Gemma4LayerWeights, moe *Gemma4
 			expertMatvecInto(moe.Up, choice.Index, buf.XN2[:dim], &buf.Up, &buf.ExpertRow)
 		}
 		ensureLenNoClear(&buf.Hidden, moe.Gate.Output)
-		for j := range moe.Gate.Output {
-			buf.Hidden[j] = geluTanh(buf.Gate[j]) * buf.Up[j]
-		}
+		geluMulF32(buf.Gate[:moe.Gate.Output], buf.Up[:moe.Gate.Output], buf.Hidden[:moe.Gate.Output])
 		expertMatvecInto(moe.Down, choice.Index, buf.Hidden[:moe.Gate.Output], &buf.MOE, &buf.ExpertRow)
 		ScaleF32(buf.MOE[:dim], moe.DownScale[choice.Index])
 		AxpyF32(buf.Proj[:dim], routing[i], buf.MOE[:dim])
