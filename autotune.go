@@ -737,13 +737,23 @@ func (t *autoTuner) tuneThreads() {
 // threadCandidates covers the range where memory-bandwidth saturation
 // plausibly sits: all logical CPUs, the physical-core count (hyperthread
 // siblings often add contention, not bandwidth), and half of that.
+//
+// It also offers the performance-core count on asymmetric machines, which the
+// fractions above can miss entirely. An M2 Max reports 12 logical CPUs with 8
+// performance cores, and {12, 9, 6, 3} never proposes 8 — so the one candidate
+// most likely to win on that machine was the one the search could not reach.
+// performanceCores returns 0 on symmetric systems, leaving the set unchanged.
 func threadCandidates(nproc int) []int {
 	if nproc <= 1 {
 		return []int{1}
 	}
+	cands := []int{nproc, nproc / 2, nproc * 3 / 4, max(1, nproc/4)}
+	if p := performanceCores(); p > 1 && p < nproc {
+		cands = append(cands, p)
+	}
 	seen := map[int]bool{}
 	var out []int
-	for _, n := range []int{nproc, nproc / 2, nproc * 3 / 4, max(1, nproc/4)} {
+	for _, n := range cands {
 		if n >= 1 && !seen[n] {
 			seen[n] = true
 			out = append(out, n)
