@@ -101,21 +101,21 @@ func dotQ8_0RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, sta
 func dotQ4_0RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q4_0DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, xsums, blocks)
+		out[r] = q4_0DotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
 	}
 }
 
 func dotQ4_1RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q4_1DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, xsums, blocks)
+		out[r] = q4_1DotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
 	}
 }
 
 func dotMXFP4RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = mxfp4DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, blocks)
+		out[r] = mxfp4DotQ8KRow(data[r*rowBytes:], q8, xscale, blocks)
 	}
 }
 
@@ -143,12 +143,12 @@ func q8kLayoutFor(t GGMLType, blocks int) (q8kRowLayout, bool) {
 			return q8_0DotQ8KRow(row, q8, xsc, blocks)
 		}}, true
 	case GGMLTypeQ4_0:
-		return q8kRowLayout{blocks * 144, blocks * 8, q4_0DotQ8KRowPortable}, true
+		return q8kRowLayout{blocks * 144, blocks * 8, q4_0DotQ8KRow}, true
 	case GGMLTypeQ4_1:
-		return q8kRowLayout{blocks * 160, blocks * 8, q4_1DotQ8KRowPortable}, true
+		return q8kRowLayout{blocks * 160, blocks * 8, q4_1DotQ8KRow}, true
 	case GGMLTypeMXFP4:
 		return q8kRowLayout{blocks * 136, 1, func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
-			return mxfp4DotQ8KRowPortable(row, q8, xsc, blocks)
+			return mxfp4DotQ8KRow(row, q8, xsc, blocks)
 		}}, true
 	}
 	return q8kRowLayout{}, false

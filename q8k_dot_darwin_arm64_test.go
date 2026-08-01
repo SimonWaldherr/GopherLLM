@@ -353,20 +353,114 @@ func TestQ6KDotQ8KRowAsmMatchesPortable(t *testing.T) {
 	}
 }
 
-// Both self-checks must have passed, or the kernels silently degraded to the
-// portable path and the tests above proved nothing about the assembly.
+// Every self-check must have passed, or the kernel silently degraded to the
+// portable path and the differential tests here proved nothing about the
+// assembly — they would be comparing the portable kernel against itself.
 func TestQ8KSelfChecksPassed(t *testing.T) {
-	if !q4kDotAsmOK {
-		t.Error("Q4_K SDOT self-check failed at init — the assembly kernel is not in use")
+	for name, ok := range map[string]bool{
+		"Q4_K":  q4kDotAsmOK,
+		"Q5_K":  q5kDotAsmOK,
+		"Q6_K":  q6kDotAsmOK,
+		"Q8_0":  q8_0DotAsmOK,
+		"Q4_0":  q4_0DotAsmOK,
+		"Q4_1":  q4_1DotAsmOK,
+		"MXFP4": mxfp4DotAsmOK,
+	} {
+		if !ok {
+			t.Errorf("%s SDOT self-check failed at init — the assembly kernel is not in use", name)
+		}
 	}
-	if !q5kDotAsmOK {
-		t.Error("Q5_K SDOT self-check failed at init — the assembly kernel is not in use")
+}
+
+// The three 32-element-block formats share one test shape: build a row, quantize
+// activations, and compare the assembly-backed row kernel against the portable
+// one. Table-driven so a fourth legacy format is a table entry, not a fourth
+// copy of the body.
+func TestLegacyFormatRowKernelsMatchPortable(t *testing.T) {
+	cases := []struct {
+		name string
+		row  func(rng *rand.Rand, cols int) []byte
+		asm  func(row []byte, q8 []int8, xsc, xsums []float32, blocks int) float32
+		ref  func(row []byte, q8 []int8, xsc, xsums []float32, blocks int) float32
+	}{
+		{"Q4_0", randomQ4_0Row, q4_0DotQ8KRow, q4_0DotQ8KRowPortable},
+		{"Q4_1", randomQ4_1Row, q4_1DotQ8KRow, q4_1DotQ8KRowPortable},
+		{
+			"MXFP4", randomMXFP4Row,
+			func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
+				return mxfp4DotQ8KRow(row, q8, xsc, blocks)
+			},
+			func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
+				return mxfp4DotQ8KRowPortable(row, q8, xsc, blocks)
+			},
+		},
 	}
-	if !q6kDotAsmOK {
-		t.Error("Q6_K SDOT self-check failed at init — the assembly kernel is not in use")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rng := rand.New(rand.NewSource(4260))
+			for _, cols := range []int{256, 1024, 3072, 4096} {
+				blocks := cols / 256
+				row := tc.row(rng, cols)
+				x := randomVec(rng, cols)
+				q8 := make([]int8, cols)
+				xsc := make([]float32, blocks)
+				q8kQuantizePortable(x, q8, xsc, blocks)
+				var scratch []float32
+				xsums := fillQ4KXSums(x, cols, &scratch)
+
+				got := tc.asm(row, q8, xsc, xsums, blocks)
+				want := tc.ref(row, q8, xsc, xsums, blocks)
+				if diff := math.Abs(float64(got - want)); diff > 1e-3*(1+math.Abs(float64(want))) {
+					t.Fatalf("cols=%d: asm %v != portable %v (diff %v)", cols, got, want, diff)
+				}
+			}
+		})
 	}
-	if !q8_0DotAsmOK {
-		t.Error("Q8_0 SDOT self-check failed at init — the assembly kernel is not in use")
+}
+
+// MXFP4 is the one format whose nibbles pair with INTERLEAVED activations (low
+// nibble of byte i against activation 2i), which the kernel handles by
+// de-interleaving with UZP1/UZP2. Getting that backwards would swap every pair
+// and still produce plausible magnitudes, so it gets a direct check: a table
+// where index 1 maps to +1 and everything else to 0 makes each output equal the
+// activation the low or high nibble should have selected.
+func TestMXFP4Q8Dots8AsmDeinterleaves(t *testing.T) {
+	row := make([]byte, 136)
+	q8 := make([]int8, 256)
+	for i := range q8 {
+		q8[i] = int8(i % 127)
+	}
+	// Block 0: every byte 0x01 — low nibble 1, high nibble 0. With the real
+	// doubled table, index 1 is 2 and index 0 is 0, so each block dot must be
+	// 2 * sum of the EVEN-indexed activations of that block.
+	for i := range 16 {
+		row[i] = 0x01
+	}
+	var got [8]int32
+	mxfp4Q8Dots8Asm(&row[0], &q8[0], &mxfp4DoubledLUT8[0], &got[0])
+
+	var wantEven int32
+	for i := range 16 {
+		wantEven += 2 * int32(q8[i*2])
+	}
+	if got[0] != wantEven {
+		t.Fatalf("low-nibble block dot = %d, want %d (UZP1/UZP2 may be swapped)", got[0], wantEven)
+	}
+
+	// Now 0x10: high nibble 1, low nibble 0 — the ODD activations.
+	for i := range 16 {
+		row[i] = 0x10
+	}
+	mxfp4Q8Dots8Asm(&row[0], &q8[0], &mxfp4DoubledLUT8[0], &got[0])
+	var wantOdd int32
+	for i := range 16 {
+		wantOdd += 2 * int32(q8[i*2+1])
+	}
+	if got[0] != wantOdd {
+		t.Fatalf("high-nibble block dot = %d, want %d (UZP1/UZP2 may be swapped)", got[0], wantOdd)
+	}
+	if wantEven == wantOdd {
+		t.Fatal("test is vacuous: even and odd activation sums coincide")
 	}
 }
 

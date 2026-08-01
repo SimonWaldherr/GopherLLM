@@ -336,6 +336,131 @@ half_loop:
 	CBNZ R4, half_loop
 	RET
 
+// LEGDOTS reduces the two nibble-half accumulators into one int32 and stores it.
+// The legacy 32-element formats produce a single dot per block, unlike the
+// K-quants' two, because they carry one scale rather than packed sub-scales.
+#define LEGDOTS \
+	VEOR V16.B16, V16.B16, V16.B16 \
+	SDOT(16, 2, 6)                 \
+	SDOT(16, 3, 7)                 \
+	VADDV V16.S4, V18              \
+	FMOVS F18, R4                  \
+	MOVW R4, (R2)                  \
+	ADD $4, R2
+
+// func q4_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+//
+// Computes the 8 per-block int32 dot products of ONE 256-element Q4_0
+// superchunk. row points at 8 consecutive 18-byte blocks, each an f16 scale
+// followed by 16 packed nibble bytes; q8 at 256 int8 activations; out at 8
+// int32s.
+//
+// Q4_0 splits its 32 quants the same way Q4_K splits a sub-block pair: the low
+// nibbles of the 16 bytes are quants 0..15 and the high nibbles are quants
+// 16..31, against the first and second half of the block's 32 activations. The
+// quants are unsigned 0..15 here; Q4_0's -8 bias is not applied per element but
+// carried exactly in the float xsums term, which is why this kernel returns raw
+// unsigned dots.
+TEXT ·q4_0Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	VMOVI $15, V20.B16
+	MOVD  $8, R3
+
+q4_0_loop:
+	// Step over the f16 scale; the post-indexed load takes the 16 nibble bytes
+	// and leaves R0 exactly 18 further on.
+	ADD    $2, R0
+	VLD1.P 16(R0), [V0.B16]
+	VAND   V20.B16, V0.B16, V2.B16
+	VUSHR  $4, V0.B16, V3.B16
+	VLD1.P 32(R1), [V6.B16, V7.B16]
+	LEGDOTS
+
+	SUB  $1, R3
+	CBNZ R3, q4_0_loop
+	RET
+
+// func q4_1Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+//
+// The Q4_1 analogue: identical nibble layout, but each block carries both a
+// scale and a minimum, so the header is 4 bytes and the stride is 20.
+TEXT ·q4_1Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	VMOVI $15, V20.B16
+	MOVD  $8, R3
+
+q4_1_loop:
+	ADD    $4, R0 // f16 scale plus f16 minimum
+	VLD1.P 16(R0), [V0.B16]
+	VAND   V20.B16, V0.B16, V2.B16
+	VUSHR  $4, V0.B16, V3.B16
+	VLD1.P 32(R1), [V6.B16, V7.B16]
+	LEGDOTS
+
+	SUB  $1, R3
+	CBNZ R3, q4_1_loop
+	RET
+
+// func mxfp4Q8Dots8Asm(row *byte, q8 *int8, lut *int8, out *int32)
+//
+// Computes the 8 per-block int32 dot products of ONE 256-element MXFP4
+// (gpt-oss) superchunk. row points at 8 consecutive 17-byte blocks, each 16
+// packed nibble bytes followed by one raw exponent byte; q8 at 256 int8
+// activations; lut at the 16-entry table of DOUBLED signed values; out at 8
+// int32s.
+//
+// Two things make MXFP4 different from the other nibble formats:
+//
+// First, the nibble is not a magnitude but an index into a table of signed
+// values {0,1,2,3,4,6,8,12} and their negations. VTBL does that lookup directly
+// — a 16-byte table indexed by 16 nibbles in one instruction — which is why the
+// table is passed in rather than the values being reconstructed arithmetically.
+// The table holds twice each value so the lookup stays integral; the factor 0.5
+// is applied once per block in Go.
+//
+// Second, the pairing is interleaved, not split in halves: the low nibble of
+// byte i multiplies activation 2i and the high nibble multiplies 2i+1. So the
+// activations are de-interleaved with UZP1/UZP2 (evens and odds) to line them up
+// against the low- and high-nibble vectors, rather than loaded as two halves.
+TEXT ·mxfp4Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-32
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD lut+16(FP), R5
+	MOVD out+24(FP), R2
+
+	VMOVI $15, V20.B16
+	VLD1  (R5), [V21.B16] // doubled-value table, reused by every block
+	MOVD  $8, R3
+
+mxfp4_loop:
+	// 16 packed bytes; the trailing exponent byte is skipped after the load.
+	VLD1.P 16(R0), [V0.B16]
+	ADD    $1, R0
+
+	VAND  V20.B16, V0.B16, V4.B16 // low nibbles  -> indices
+	VUSHR $4, V0.B16, V5.B16      // high nibbles -> indices
+
+	// Table lookup turns each index into its doubled signed value.
+	VTBL V4.B16, [V21.B16], V2.B16
+	VTBL V5.B16, [V21.B16], V3.B16
+
+	// 32 activations, then split into evens (for the low nibbles) and odds.
+	VLD1.P 32(R1), [V8.B16, V9.B16]
+	VUZP1  V9.B16, V8.B16, V6.B16
+	VUZP2  V9.B16, V8.B16, V7.B16
+
+	LEGDOTS
+
+	SUB  $1, R3
+	CBNZ R3, mxfp4_loop
+	RET
+
 // func q8_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
 //
 // Computes the 8 per-block int32 dot products of ONE 256-element Q8_0
