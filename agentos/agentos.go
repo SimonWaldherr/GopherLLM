@@ -35,6 +35,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -226,6 +227,12 @@ func (r Runner) Evaluate(p Proposal) Decision {
 			return Decision{Blocked: true, Reason: err.Error()}
 		}
 		program := filepath.Base(args[0])
+		// Allowed contains program names, not executable paths. Matching the
+		// basename of an arbitrary path would authorize /tmp/git for a "git"
+		// entry, while Execute would still run that untrusted path.
+		if args[0] != program || strings.Contains(args[0], `\`) {
+			return Decision{Program: program, Reason: "program paths need approval"}
+		}
 		for _, allowed := range r.Allowed {
 			if program == strings.TrimSpace(allowed) {
 				return Decision{AutoRun: true, Program: program, Reason: "program is allow-listed"}
@@ -247,6 +254,34 @@ type Result struct {
 	Truncated bool   `json:"truncated"`
 	TimedOut  bool   `json:"timed_out"`
 	Duration  string `json:"duration"`
+}
+
+// boundedOutput drains a child process's stdout and stderr without retaining
+// more than limit bytes. Write always reports success for the whole input so a
+// noisy child does not receive a broken-pipe error merely because its captured
+// output has reached the display limit.
+type boundedOutput struct {
+	mu        sync.Mutex
+	data      []byte
+	limit     int
+	truncated bool
+}
+
+func (w *boundedOutput) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	remaining := w.limit - len(w.data)
+	if remaining > 0 {
+		if remaining < len(p) {
+			w.data = append(w.data, p[:remaining]...)
+		} else {
+			w.data = append(w.data, p...)
+		}
+	}
+	if len(p) > remaining {
+		w.truncated = true
+	}
+	return len(p), nil
 }
 
 // Execute runs a proposal. approved is the human's decision, supplied out of
@@ -286,14 +321,15 @@ func (r Runner) Execute(ctx context.Context, p Proposal, approved bool) (Result,
 	}
 	cmd.Dir = r.WorkDir
 
+	var output boundedOutput
+	output.limit = maxOutput
+	cmd.Stdout = &output
+	cmd.Stderr = &output
 	started := time.Now()
-	out, err := cmd.CombinedOutput()
+	err := cmd.Run()
 	result := Result{Cmd: p.Cmd, Duration: time.Since(started).Round(time.Millisecond).String()}
-	if len(out) > maxOutput {
-		out = out[:maxOutput]
-		result.Truncated = true
-	}
-	result.Output = string(out)
+	result.Output = string(output.data)
+	result.Truncated = output.truncated
 	if ctx.Err() == context.DeadlineExceeded {
 		result.TimedOut = true
 	}
