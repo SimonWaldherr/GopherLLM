@@ -25,6 +25,10 @@ func q5kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 	return q5kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
 }
 
+func q8_0DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	return q8_0DotQ8KRowPortable(row, q8, xscales, blocks)
+}
+
 func q6kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
 	return q6kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
 }

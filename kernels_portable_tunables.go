@@ -94,7 +94,7 @@ func dotQ6KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 func dotQ8_0RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {
-		out[r] = q8_0DotQ8KRowPortable(data[r*rowBytes:], q8, xscale, blocks)
+		out[r] = q8_0DotQ8KRow(data[r*rowBytes:], q8, xscale, blocks)
 	}
 }
 
@@ -140,7 +140,7 @@ func q8kLayoutFor(t GGMLType, blocks int) (q8kRowLayout, bool) {
 		// Symmetric: no offset term, so one dummy sums slot keeps the shared
 		// per-token indexing valid.
 		return q8kRowLayout{blocks * 272, 1, func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
-			return q8_0DotQ8KRowPortable(row, q8, xsc, blocks)
+			return q8_0DotQ8KRow(row, q8, xsc, blocks)
 		}}, true
 	case GGMLTypeQ4_0:
 		return q8kRowLayout{blocks * 144, blocks * 8, q4_0DotQ8KRowPortable}, true

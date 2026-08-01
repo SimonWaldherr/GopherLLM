@@ -41,6 +41,63 @@ func q4kQ8Dots8Asm(q *byte, q8 *int8, out *int32)
 //go:noescape
 func dotInt8Asm(a, b *int8, n int) int32
 
+// q8_0Q8Dots8Asm computes the 8 per-block int32 dot products of one 256-element
+// Q8_0 superchunk. row must point at 8 consecutive 34-byte blocks, q8 at 256
+// int8 activations, out at 8 int32s.
+//
+//go:noescape
+func q8_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+
+func validateQ8_0Q8Dots8Asm() bool {
+	var row [272]byte
+	for i := range row {
+		row[i] = byte(i*23 + 5)
+	}
+	q8 := q8kSelfCheckActivations()
+
+	var want [8]int32
+	for j := range 8 {
+		off := j*34 + 2
+		var dot int32
+		for l := range 32 {
+			dot += int32(int8(row[off+l])) * int32(q8[j*32+l])
+		}
+		want[j] = dot
+	}
+
+	var got [8]int32
+	q8_0Q8Dots8Asm(&row[0], &q8[0], &got[0])
+	if got != want {
+		fmt.Fprintf(os.Stderr,
+			"gopherllm: NEON SDOT Q8_0 self-check failed (got %v want %v); falling back to the portable Q8_0 int8 kernel. Please report this with your CPU model.\n",
+			got, want)
+		return false
+	}
+	return true
+}
+
+// q8_0DotQ8KRow computes one Q8_0 row dot against Q8K-quantized activations.
+// Q8_0 is symmetric, so unlike the K-quants there is no offset term and no
+// xsums argument.
+func q8_0DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	if !q8_0DotAsmOK {
+		return q8_0DotQ8KRowPortable(row, q8, xscales, blocks)
+	}
+	var qdots [8]int32
+	var sum float32
+	for b := range blocks {
+		base := b * 272
+		q8_0Q8Dots8Asm(&row[base], &q8[b*256], &qdots[0])
+		var blockSum float32
+		for j := range 8 {
+			d := F16ToF32(binaryLE16(row[base+j*34:]))
+			blockSum += d * float32(qdots[j])
+		}
+		sum += xscales[b] * blockSum
+	}
+	return sum
+}
+
 func q8kQuantize(x []float32, q8 []int8, scales []float32, blocks int) {
 	// The quantizer is a float absmax pass plus a round-to-int8 pass; it is
 	// bandwidth-bound on the activation vector, which is tiny next to a weight
@@ -65,9 +122,10 @@ func q8kQuantize(x []float32, q8 []int8, scales []float32, blocks int) {
 // assembly. q8k_dot_darwin_arm64_test.go covers the same ground far more
 // thoroughly; this is the belt to that suite's braces.
 var (
-	q4kDotAsmOK = validateQ4KQ8Dots8Asm()
-	q5kDotAsmOK = validateQ5KQ8Dots8Asm()
-	q6kDotAsmOK = validateQ6KQ8Dots16Asm()
+	q4kDotAsmOK  = validateQ4KQ8Dots8Asm()
+	q5kDotAsmOK  = validateQ5KQ8Dots8Asm()
+	q6kDotAsmOK  = validateQ6KQ8Dots16Asm()
+	q8_0DotAsmOK = validateQ8_0Q8Dots8Asm()
 )
 
 func validateQ5KQ8Dots8Asm() bool {

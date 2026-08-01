@@ -54,6 +54,80 @@ func q8kTestInputs(rng *rand.Rand, cols int) (q8 []int8, xsc, xsums32, xsums16 [
 
 var q8kTestCols = []int{256, 1024, 3072, 4096}
 
+// absF32 and roundToEvenF32 replace float64 libm calls in the quantizer's inner
+// loop, so they have to be bit-identical to what they replace — not merely
+// close. A discrepancy would shift a quantized activation by one step, which is
+// invisible in aggregate and impossible to debug later.
+func TestFloat32HelpersMatchFloat64Forms(t *testing.T) {
+	check := func(v float32) {
+		t.Helper()
+		if got, want := absF32(v), float32(math.Abs(float64(v))); math.Float32bits(got) != math.Float32bits(want) {
+			t.Fatalf("absF32(%v) = %v, want %v", v, got, want)
+		}
+		// Only defined for the magnitudes the quantizer actually produces.
+		if a := math.Abs(float64(v)); a < 4194304 {
+			if got, want := roundToEvenF32(v), float32(math.RoundToEven(float64(v))); math.Float32bits(got) != math.Float32bits(want) {
+				t.Fatalf("roundToEvenF32(%v) = %v, want %v", v, got, want)
+			}
+		}
+	}
+	// Exact ties in both directions are the whole point of round-to-EVEN.
+	for _, v := range []float32{
+		0, -0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 3.5, -3.5,
+		126.5, -126.5, 127, -127, 127.4999, -127.4999,
+		1, -1, 0.4999999, -0.4999999,
+	} {
+		check(v)
+	}
+	// Then a dense sweep across the quantizer's output range.
+	rng := rand.New(rand.NewSource(4711))
+	for range 200000 {
+		check(rng.Float32()*254 - 127)
+	}
+	// And every representable eighth, to hit tie cases systematically.
+	for i := -127 * 8; i <= 127*8; i++ {
+		check(float32(i) / 8)
+	}
+}
+
+func BenchmarkQ8KQuantizePortable(b *testing.B) {
+	const cols = 4096
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(i%977)/311 - 1.5
+	}
+	q8 := make([]int8, cols)
+	sc := make([]float32, cols/256)
+	b.Run("float32_helpers", func(b *testing.B) {
+		for range b.N {
+			q8kQuantizePortable(x, q8, sc, cols/256)
+		}
+	})
+	b.Run("float64_libm", func(b *testing.B) {
+		blocks := cols / 256
+		for range b.N {
+			for bl := range blocks {
+				xb := x[bl*256 : bl*256+256]
+				var amax float32
+				for _, v := range xb {
+					if a := float32(math.Abs(float64(v))); a > amax {
+						amax = a
+					}
+				}
+				if amax == 0 || amax != amax {
+					continue
+				}
+				sc[bl] = amax / 127
+				inv := 127 / amax
+				qb := q8[bl*256 : bl*256+256]
+				for i, v := range xb {
+					qb[i] = int8(math.RoundToEven(float64(v * inv)))
+				}
+			}
+		}
+	})
+}
+
 func TestQ8KQuantizePortableMatchesReference(t *testing.T) {
 	rng := rand.New(rand.NewSource(9001))
 	for _, cols := range q8kTestCols {

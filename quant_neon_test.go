@@ -36,6 +36,20 @@ func randomQ5KRow(rng *rand.Rand, cols int) []byte {
 	return row
 }
 
+func randomQ8_0Row(rng *rand.Rand, cols int) []byte {
+	blocks := cols / 32
+	row := make([]byte, blocks*34)
+	for b := 0; b < blocks; b++ {
+		block := row[b*34 : (b+1)*34]
+		block[0], block[1] = byte(rng.Intn(256)), 0x2c // small positive f16 scale
+		for i := 2; i < 34; i++ {
+			v := int8(rng.Intn(255) - 127) // [-127, 127]
+			block[i] = byte(v)
+		}
+	}
+	return row
+}
+
 func randomQ6KRow(rng *rand.Rand, cols int) []byte {
 	row := make([]byte, (cols/256)*210)
 	for b := 0; b < cols/256; b++ {

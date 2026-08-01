@@ -336,6 +336,47 @@ half_loop:
 	CBNZ R4, half_loop
 	RET
 
+// func q8_0Q8Dots8Asm(row *byte, q8 *int8, out *int32)
+//
+// Computes the 8 per-block int32 dot products of ONE 256-element Q8_0
+// superchunk. row points at the first of 8 consecutive 34-byte blocks, each an
+// f16 scale followed by 32 int8 weights; q8 points at the 256 int8 activations;
+// out at 8 int32s.
+//
+// Q8_0 is the cheapest of these kernels because the weights are already int8:
+// there is no nibble unpack and no bitplane, just the stride-34 walk that steps
+// over each block's scale. The scales stay in Go, which combines them with the
+// per-superchunk activation scale.
+//
+// The float path this replaces has no NEON kernel on arm64 at all, so unlike
+// Q4_K and Q6_K this is a straight win rather than a defence of one.
+TEXT ·q8_0Q8Dots8Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD row+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	MOVD $8, R3
+
+q8_0_loop:
+	// Step over this block's f16 scale; the post-indexed load then advances R0
+	// by the 32 weight bytes, so each iteration consumes exactly 34.
+	ADD    $2, R0
+	VLD1.P 32(R0), [V0.B16, V1.B16]
+	VLD1.P 32(R1), [V2.B16, V3.B16]
+
+	VEOR V16.B16, V16.B16, V16.B16
+	SDOT(16, 0, 2) // sdot v16.4s, v0.16b, v2.16b
+	SDOT(16, 1, 3) // sdot v16.4s, v1.16b, v3.16b
+
+	VADDV V16.S4, V18
+	FMOVS F18, R4
+	MOVW  R4, (R2)
+	ADD   $4, R2
+
+	SUB  $1, R3
+	CBNZ R3, q8_0_loop
+	RET
+
 // func dotInt8Asm(a, b *int8, n int) int32
 //
 // Straight int8 dot product of two n-element vectors, n a multiple of 16. This

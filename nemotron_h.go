@@ -334,6 +334,18 @@ func LoadNemotronHModel(data []byte, gguf *GGUFFile, borrow, prepareQuantized, u
 				if (layer.MoE.SharedUp == nil) != (layer.MoE.SharedDown == nil) {
 					return cfg, NemotronHWeights{}, fmt.Errorf("layer %d MoE shared expert projections must be paired", i)
 				}
+				// The shared expert is taken purely from tensor presence above,
+				// so a checkpoint that declares one in metadata but names its
+				// tensors differently would load with the shared branch silently
+				// switched off. On these hybrids the shared expert is a quarter
+				// of the MoE work, so that is a large, invisible quality loss
+				// rather than a subtle one. moe.go makes the same check for the
+				// generic MoE loader; this is the nemotron path's copy.
+				if cfg.ExpertSharedCount > 0 && layer.MoE.SharedUp == nil {
+					return cfg, NemotronHWeights{}, fmt.Errorf(
+						"layer %d: %s declares expert_shared_count=%d but has no %sffn_up_shexp.weight/%sffn_down_shexp.weight; the shared expert would be dropped",
+						i, cfg.Arch, cfg.ExpertSharedCount, prefix, prefix)
+				}
 				expertInput := cfg.Dim
 				if layer.MoE.LatentIn != nil {
 					info := tensors[latentInName]
