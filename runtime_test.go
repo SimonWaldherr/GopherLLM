@@ -162,6 +162,21 @@ func TestGenerationOptionsRejectsInvalidFloatsAndTopK(t *testing.T) {
 	}
 }
 
+func TestGreedyOutputFastPathAllowsRepeatPenalty(t *testing.T) {
+	r := &Runner{}
+	opts := DefaultGenerationOptions()
+	opts.Sampler.Temperature = 0
+	opts.Sampler.RepeatPenalty = 1.1
+	if !r.canGreedyOutputFastPath(opts) {
+		t.Fatal("deterministic decoding with repeat penalty should use the penalized argmax path")
+	}
+	opts.Sampler.Temperature = 0.7
+	opts.Sampler.TopK = 40
+	if r.canGreedyOutputFastPath(opts) {
+		t.Fatal("sampling configuration should not use the argmax path")
+	}
+}
+
 func TestPrefillChunkSizeEnvOverride(t *testing.T) {
 	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "")
 	if got := prefillChunkSize(Config{Dim: 4096, HiddenDim: 14336}); got != 32 {

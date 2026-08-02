@@ -77,6 +77,69 @@ func BenchmarkOnlineAttentionF16_ctx4096(b *testing.B) {
 	}
 }
 
+func benchmarkGQAAttention(b *testing.B, ctx int, grouped bool) {
+	const queryHeads, headDim = 4, 128
+	queries := benchFloatSlice(queryHeads * headDim)
+	keys := benchFloatSlice(ctx * headDim)
+	values := benchFloatSlice(ctx * headDim)
+	out := make([]float32, len(queries))
+	scale := float32(0.08838)
+	b.ReportAllocs()
+	// Report unique K/V bytes. The separate implementation logically reads the
+	// same cache four times; the grouped implementation is designed to keep each
+	// row hot while evaluating all query heads that share it.
+	b.SetBytes(int64(2 * ctx * headDim * 4))
+	for b.Loop() {
+		clear(out)
+		if grouped {
+			onlineAttentionGroup(queries, keys, values, queryHeads,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
+			continue
+		}
+		for h := 0; h < queryHeads; h++ {
+			off := h * headDim
+			onlineAttention(queries[off:off+headDim], keys, values,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0,
+				out[off:off+headDim])
+		}
+	}
+}
+
+func BenchmarkGQAAttention_ctx4096(b *testing.B) {
+	b.Run("separate", func(b *testing.B) { benchmarkGQAAttention(b, 4096, false) })
+	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttention(b, 4096, true) })
+}
+
+func BenchmarkGQAAttention_ctx32768(b *testing.B) {
+	b.Run("separate", func(b *testing.B) { benchmarkGQAAttention(b, 32768, false) })
+	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttention(b, 32768, true) })
+}
+
+func BenchmarkParallelMinistralAttention_ctx1667(b *testing.B) {
+	const nHeads, nKVHeads, headDim, ctx = 32, 8, 128, 1667
+	config := Config{NHeads: nHeads, NKVHeads: nKVHeads, HeadDim: headDim, ValueDim: headDim}
+	cache := NewKVCache(1, nKVHeads*headDim, nKVHeads*headDim, ctx)
+	cache.K[0] = benchFloatSlice(len(cache.K[0]))
+	cache.V[0] = benchFloatSlice(len(cache.V[0]))
+	buf := &DecodeBuffer{Q: benchFloatSlice(nHeads * headDim), AttnOut: make([]float32, nHeads*headDim)}
+	scale := float32(0.0883883476)
+	layer := LayerWeights{}
+	b.Run("separate", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			clear(buf.AttnOut)
+			parallelAttendHeads(config, layer, cache, buf, 0, ctx-1, 0, scale, nHeads/nKVHeads)
+		}
+	})
+	b.Run("grouped", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			clear(buf.AttnOut)
+			parallelAttendHeadGroups(config, cache, buf, 0, ctx-1, 0, scale, nHeads/nKVHeads)
+		}
+	})
+}
+
 // The ctx32768 pair is larger than Apple Silicon's shared performance-core
 // L2, so it measures the compact cache with a DRAM-sized working set instead
 // of measuring only conversion throughput on cache-resident data.

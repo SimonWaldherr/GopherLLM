@@ -50,10 +50,16 @@ var (
 	xscaleScratchPool = sync.Pool{New: func() any { s := make([]float32, 0, 64); return &s }}
 )
 
+type q8ScratchLease struct {
+	q8     *[]int8
+	xscale *[]float32
+}
+
 // acquireQ8 quantizes x once for the whole matvec and hands back the int8
-// activations, the per-256-block scales, and a release func. cols must be a
-// multiple of 256, which every caller checks before taking this path.
-func acquireQ8(x []float32, cols int) (q8 []int8, xscale []float32, release func()) {
+// activations, per-256-block scales, and their pool lease. Keeping release as
+// an ordinary function rather than a returned closure avoids one allocation
+// on every quantized projection. cols must be a multiple of 256.
+func acquireQ8(x []float32, cols int) (q8 []int8, xscale []float32, lease q8ScratchLease) {
 	blocks := cols / 256
 	q8s := q8ScratchPool.Get().(*[]int8)
 	scs := xscaleScratchPool.Get().(*[]float32)
@@ -62,12 +68,14 @@ func acquireQ8(x []float32, cols int) (q8 []int8, xscale []float32, release func
 	q8 = *q8s
 	xscale = *scs
 	q8kQuantize(x, q8, xscale, blocks)
-	return q8, xscale, func() {
-		*q8s = q8
-		q8ScratchPool.Put(q8s)
-		*scs = xscale
-		xscaleScratchPool.Put(scs)
-	}
+	return q8, xscale, q8ScratchLease{q8: q8s, xscale: scs}
+}
+
+func releaseQ8(q8 []int8, xscale []float32, lease q8ScratchLease) {
+	*lease.q8 = q8
+	q8ScratchPool.Put(lease.q8)
+	*lease.xscale = xscale
+	xscaleScratchPool.Put(lease.xscale)
 }
 
 func dotQ4KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
@@ -249,8 +257,8 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 		return 0, false
 	}
 	blocks := cols / 256
-	q8, xsc, release := acquireQ8(x, cols)
-	defer release()
+	q8, xsc, lease := acquireQ8(x, cols)
+	defer releaseQ8(q8, xsc, lease)
 	var mu sync.Mutex
 	bestToken := 0
 	bestValue := negInf32

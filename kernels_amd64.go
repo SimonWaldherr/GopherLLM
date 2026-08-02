@@ -177,11 +177,16 @@ var (
 )
 
 // acquireQ8 quantizes x once (shared across all rows/matrices of a matvec)
-// and returns the int8 activations, per-256-element-block scales, and a
-// release func that returns the scratch buffers to their pools. cols must be
+// and returns the int8 activations, per-256-element-block scales, and a pool
+// lease. An ordinary release function avoids allocating a closure. cols must be
 // a multiple of 256, which every Q4_K/Q6_K matvec entry point guarantees
 // before taking this path.
-func acquireQ8(x []float32, cols int) (q8 []int8, xscale []float32, release func()) {
+type q8ScratchLease struct {
+	q8     *[]int8
+	xscale *[]float32
+}
+
+func acquireQ8(x []float32, cols int) (q8 []int8, xscale []float32, lease q8ScratchLease) {
 	blocks := cols / 256
 	q8s := q8ScratchPool.Get().(*[]int8)
 	scs := xscaleScratchPool.Get().(*[]float32)
@@ -190,12 +195,14 @@ func acquireQ8(x []float32, cols int) (q8 []int8, xscale []float32, release func
 	q8 = *q8s
 	xscale = *scs
 	q8kQuantize(&x[0], &q8[0], &xscale[0], blocks)
-	return q8, xscale, func() {
-		*q8s = q8
-		q8ScratchPool.Put(q8s)
-		*scs = xscale
-		xscaleScratchPool.Put(scs)
-	}
+	return q8, xscale, q8ScratchLease{q8: q8s, xscale: scs}
+}
+
+func releaseQ8(q8 []int8, xscale []float32, lease q8ScratchLease) {
+	*lease.q8 = q8
+	q8ScratchPool.Put(lease.q8)
+	*lease.xscale = xscale
+	xscaleScratchPool.Put(lease.xscale)
 }
 
 // dotQ4KRowsQ8 fills out[start:end] with Q4_K row dots against Q8K-quantized
@@ -232,7 +239,7 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 		return 0, false
 	}
 	blocks := cols / 256
-	q8, xsc, release := acquireQ8(x, cols)
+	q8, xsc, lease := acquireQ8(x, cols)
 	// The dot runs in the inner loop directly rather than through an
 	// argmaxMatvecRows closure: a func-value call per row costs ~50 ns against
 	// the kernel's ~127 ns, which measured as 25 ms vs 17 ms over 131k rows.
@@ -262,7 +269,7 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 		}
 		mu.Unlock()
 	})
-	release()
+	releaseQ8(q8, xsc, lease)
 	return uint32(bestToken), true
 }
 

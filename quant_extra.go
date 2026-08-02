@@ -563,11 +563,11 @@ func MatvecQ4_1Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 		ensureLenNoClear(out, rows)
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)
-		q8, xsc, release := acquireQ8(x, cols)
+		q8, xsc, lease := acquireQ8(x, cols)
 		parallelRows(rows, func(start, end int) {
 			dotQ4_1RowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
 		})
-		release()
+		releaseQ8(q8, xsc, lease)
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return

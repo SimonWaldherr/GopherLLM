@@ -166,6 +166,19 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 			}
 		},
 	))
+	if r.standard.Output.Metal != nil {
+		recent := []uint32{0, 1, 1, uint32(max(0, r.standard.Output.Rows-1))}
+		rows = append(rows, measureFunction(
+			"output_argmax_penalized_path",
+			fmt.Sprintf("%s/argmax/repeat-penalty", r.standard.Output.Type),
+			r.standard.Output.Rows,
+			r.standard.Output.Cols,
+			runs,
+			func() {
+				_, _ = argmaxMetalQ6KPenalized(r.standard.Output.Metal, dimInput, recent, 1.1)
+			},
+		))
+	}
 	return rows
 }
 

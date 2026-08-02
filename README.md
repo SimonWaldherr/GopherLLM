@@ -1065,7 +1065,11 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   a manually built binary). The selective
   path fuses mixed Q4_K/Q4_K/Q6_K Q/K/V projections into one command buffer and
   offloads Q4_K attention-output, Q4_K gate/up + SiLU + Q6_K FFN-down in one
-  command buffer, and Q6_K vocabulary-output projections. GGUF files opened
+  command buffer, and Q6_K vocabulary-output projections. Deterministic decode
+  (`--temp 0` or `--top-k 1`) also applies the bounded recent-token repeat
+  penalty on-device before reducing the vocabulary output to its argmax. This
+  keeps the default repeat penalty from forcing a 131k-logit readback and CPU
+  scan on Ministral 3B. GGUF files opened
   through mmap are exposed to Metal as shared no-copy weight buffers;
   byte-backed models retain the copying path for cgo safety. Prepared ARM64
   kernels remain as the fallback for small projections and Metal failures. The
@@ -1110,7 +1114,20 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   expf polynomial (~1e-7 relative error) instead of per-element `math.Exp`.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
   spread across the worker pool at longer contexts, and single-token matvec work
-  is over-chunked so performance cores absorb efficiency-core stragglers.
+  is over-chunked so performance cores absorb efficiency-core stragglers. The
+  dispatch coordinator computes one shard itself instead of parking, and Q8
+  activation scratch is returned without a per-projection closure allocation.
+  The worker pool remains sized to the configured runtime even when a kernel
+  exposes fewer independent shards, avoiding repeated 8/12-worker teardown and
+  recreation between GQA and projection kernels. Four-query-head GQA (the
+  32-Q/8-KV layout in Ministral 3B) has dedicated shared-row NEON dot and AXPY
+  kernels: every K/V row is loaded once for all four queries. The isolated
+  attention path measured about 2.1x faster at 4k and 1.9x at 32k context on an
+  M2 Max. Decode dispatch retains the more parallel per-head path below 4k,
+  where it won end-to-end, and switches to grouped GQA at 4k; the complete
+  3B forward improved about 3-4% there. Batched prefill already has token-level
+  parallelism and uses grouped GQA directly. Set `GOPHERLLM_NO_GROUPED_GQA=1`
+  for an A/B rollback.
   Apple Silicon also uses NEON FP16 conversion, dot, and accumulation kernels
   for the optional compact KV cache; at 4k context they made the f16 attention
   benchmark about 3.7x faster than the scalar path. Exact f32 remains the
@@ -1160,6 +1177,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
+| `GOPHERLLM_NO_GROUPED_GQA` | Disable the ARM64 four-query-head grouped-GQA path (A/B benchmarking and debugging) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on Apple Silicon) to halve KV memory |

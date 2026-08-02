@@ -367,12 +367,26 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 					attnStart = max(0, pos-config.SlidingWindow)
 				}
 				clear(AttnOut[t])
-				for h := 0; h < config.NHeads; h++ {
-					kvH := h / kvMul
-					cache.attendHead(l, kvH, Q[t][h*headDim:h*headDim+headDim],
-						headDim, valueDim, attnStart, pos, scale,
-						config.AttnLogitSoftcap,
-						AttnOut[t][h*valueDim:h*valueDim+valueDim])
+				if useGroupedGQAAttention && hasFastGQA4 && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 {
+					for kvH := 0; kvH < config.NKVHeads; kvH++ {
+						hStart := kvH * kvMul
+						hEnd := min(hStart+kvMul, config.NHeads)
+						if hStart >= hEnd {
+							break
+						}
+						cache.attendHeadGroup(l, kvH,
+							Q[t][hStart*headDim:hEnd*headDim], hEnd-hStart,
+							headDim, valueDim, attnStart, pos, scale, config.AttnLogitSoftcap,
+							AttnOut[t][hStart*valueDim:hEnd*valueDim])
+					}
+				} else {
+					for h := 0; h < config.NHeads; h++ {
+						kvH := h / kvMul
+						cache.attendHead(l, kvH, Q[t][h*headDim:h*headDim+headDim],
+							headDim, valueDim, attnStart, pos, scale,
+							config.AttnLogitSoftcap,
+							AttnOut[t][h*valueDim:h*valueDim+valueDim])
+					}
 				}
 			}
 		}
