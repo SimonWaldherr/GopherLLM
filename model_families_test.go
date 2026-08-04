@@ -534,3 +534,13 @@ func TestGreedyArgmaxIncludesOutputBias(t *testing.T) {
 		t.Fatalf("argmax = %d, ok=%v; want biased token 1", got, ok)
 	}
 }
+
+func TestPenalizedGreedyArgmaxAppliesSoftcapBeforePenalty(t *testing.T) {
+	config := Config{Dim: 1, VocabSize: 2, LogitScale: 1, FinalLogitSoftcap: 1}
+	weights := ModelWeights{Output: Weight{F32: []float32{10, 2}, Rows: 2, Cols: 1}}
+	buf := &DecodeBuffer{XN: []float32{1}}
+	got, ok := argmaxOutputTokenPenalizedInto(config, weights, buf, []uint32{0}, 2, nil)
+	if !ok || got != 1 {
+		t.Fatalf("penalized softcap argmax = %d, ok=%v; want token 1", got, ok)
+	}
+}

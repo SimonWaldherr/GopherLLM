@@ -818,7 +818,7 @@ decode:
 		}
 		if greedyFastPath {
 			var ok bool
-			nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, &logits)
+			nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, recent, options.Sampler.RepeatPenalty, &logits)
 			haveNextToken = ok
 			if cacheEligible {
 				residentTokens = append(residentTokens, token)
@@ -1086,33 +1086,32 @@ func (r *Runner) forwardTokenInto(cache *KVCache, buf *DecodeBuffer, token uint3
 func (r *Runner) canGreedyOutputFastPath(options GenerationOptions) bool {
 	s := options.Sampler
 	return os.Getenv("GOPHERLLM_NO_GREEDY_ARGMAX") != "1" &&
-		s.RepeatPenalty == 1 &&
 		(s.Temperature < 1e-6 || s.TopK == 1)
 }
 
-func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) (uint32, bool) {
+func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {
 	switch r.kind {
 	case loadedNemotronH:
 		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
-		if next, ok := argmaxOutputTokenInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, logits); ok {
+		if next, ok := argmaxOutputTokenPenalizedInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, logits)
 	case loadedMamba2:
 		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
-		if next, ok := argmaxOutputTokenInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, logits); ok {
+		if next, ok := argmaxOutputTokenPenalizedInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, logits)
 	case loadedQwen35:
 		ForwardQwen35BodyInto(r.config, r.qwen35, cache, buf, token, pos)
-		if next, ok := argmaxOutputTokenInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, logits); ok {
+		if next, ok := argmaxOutputTokenPenalizedInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, logits)
 	case loadedGptOss:
 		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
-		if next, ok := argmaxOutputTokenInto(r.config, r.gptOss.Standard, buf, logits); ok {
+		if next, ok := argmaxOutputTokenPenalizedInto(r.config, r.gptOss.Standard, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.gptOss.Standard, buf, logits)
@@ -1120,20 +1119,20 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 		if r.gemma4.Native {
 			forwardNativeGemma4BodyInto(r.config, r.gemma4, cache, buf, token, pos)
 			nativeOutput := ModelWeights{Output: r.gemma4.Output}
-			if next, ok := argmaxOutputTokenInto(r.config, nativeOutput, buf, logits); ok {
+			if next, ok := argmaxOutputTokenPenalizedInto(r.config, nativeOutput, buf, recent, repeatPenalty, logits); ok {
 				return next, true
 			}
 			projectNativeGemma4Logits(r.config, r.gemma4, buf, logits)
 			break
 		}
 		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
-		if next, ok := argmaxOutputTokenInto(r.config, r.gemma4.Standard, buf, logits); ok {
+		if next, ok := argmaxOutputTokenPenalizedInto(r.config, r.gemma4.Standard, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.gemma4.Standard, buf, logits)
 	default:
 		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
-		if next, ok := argmaxOutputTokenInto(r.config, r.standard, buf, logits); ok {
+		if next, ok := argmaxOutputTokenPenalizedInto(r.config, r.standard, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.standard, buf, logits)

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -36,7 +37,9 @@ func TestChatHistoryStoreCompressesAndDetectsConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows protects files through the current user's directory ACL. Its
+	// os.FileMode permission bits are synthetic and always report 0666.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("history permissions = %o, want 600", info.Mode().Perm())
 	}
 	got, gotETag, err := store.read(t.Context())

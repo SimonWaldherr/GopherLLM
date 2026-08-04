@@ -16,6 +16,7 @@ func TestMetalQ4KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
+	forceExactMetalReference(t)
 	const rows, cols = metalQ4KDirectMinRows, 256
 	rng := rand.New(rand.NewSource(91))
 	data := make([]byte, 0, rows*144)
@@ -42,6 +43,7 @@ func TestMetalBorrowedQ4KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
+	forceExactMetalReference(t)
 	const rows, cols = metalQ4KDirectMinRows, 256
 	rng := rand.New(rand.NewSource(92))
 	data := make([]byte, 0, rows*144)
@@ -80,6 +82,7 @@ func TestMetalQ4KMatvec2MatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
+	forceExactMetalReference(t)
 	const rows, cols = metalQ4KDirectMinRows, 256
 	rng := rand.New(rand.NewSource(93))
 	aData := make([]byte, 0, rows*144)
@@ -114,6 +117,7 @@ func TestMetalQ4K2Q6KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
+	forceExactMetalReference(t)
 	const qRows, kRows, vRows, cols = 4096, 1024, 1024, 256
 	rng := rand.New(rand.NewSource(95))
 	qData := make([]byte, 0, qRows*144)
@@ -159,6 +163,7 @@ func TestMetalQ4K2SwiGLUQ6KMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
+	forceExactMetalReference(t)
 	const inputCols, hiddenRows, outputRows = 256, 1024, 256
 	rng := rand.New(rand.NewSource(96))
 	gateData := make([]byte, 0, hiddenRows*144)
@@ -202,6 +207,7 @@ func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
+	forceExactMetalReference(t)
 	const rows, cols = metalQ6KDirectMinRows, 256
 	rng := rand.New(rand.NewSource(97))
 	data := make([]byte, 0, rows*210)
@@ -225,6 +231,13 @@ func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 	if token, ok := argmaxMetalQ6K(w, x); !ok || token != argmaxFiniteToken(want) {
 		t.Fatalf("Metal argmax token = %d, ok=%v, want %d", token, ok, argmaxFiniteToken(want))
 	}
+	penalized := append([]float32(nil), got...)
+	winner := argmaxFiniteToken(penalized)
+	recent := []uint32{winner, winner, uint32(len(penalized) + 7)}
+	applyRepeatPenalty(penalized, recent, 4)
+	if token, ok := argmaxMetalQ6KPenalized(w, x, recent, 4); !ok || token != argmaxFiniteToken(penalized) {
+		t.Fatalf("Metal penalized argmax token = %d, ok=%v, want %d", token, ok, argmaxFiniteToken(penalized))
+	}
 
 	weights := ModelWeights{Output: Weight{Raw: data, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols, Metal: w}}
 	logits := []float32{}
@@ -232,6 +245,13 @@ func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 	if !ok || token != argmaxFiniteToken(got) {
 		t.Fatalf("Metal greedy token = %d, ok=%v, want %d", token, ok, argmaxFiniteToken(got))
 	}
+}
+
+func forceExactMetalReference(t *testing.T) {
+	t.Helper()
+	saved := useQ8Activations
+	useQ8Activations = false
+	t.Cleanup(func() { useQ8Activations = saved })
 }
 
 func metalTestVector(n int) []float32 {

@@ -3,8 +3,11 @@
 package gopherllm
 
 // withQ8Activations runs fn with the int8-activation path forced on or off.
-// On non-amd64 targets the path does not exist (useQ8Activations is a
-// compile-time false), so fn just runs as-is.
+// Non-amd64 targets also expose this switch: Apple Silicon has an SDOT-backed
+// implementation, while other targets use the portable kernel when enabled.
 func withQ8Activations(enabled bool, fn func()) {
+	saved := useQ8Activations
+	useQ8Activations = enabled
+	defer func() { useQ8Activations = saved }()
 	fn()
 }

@@ -1088,6 +1088,21 @@ func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, va
 		c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
 }
 
+// attendHeadGroup evaluates all query heads that share one GQA/MQA KV head.
+// Keeping their score and value passes adjacent lets the CPU reuse each K/V
+// cacheline instead of streaming the same cache once per query head.
+func (c *KVCache) attendHeadGroup(l, kvH int, queries []float32, queryHeads, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	if c.F16 {
+		onlineAttentionGroupF16(queries, c.K16[l][kvH*keyHeadDim:], c.V16[l][kvH*valueHeadDim:],
+			queryHeads, c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim,
+			startT, endT, scale, softcap, out)
+		return
+	}
+	onlineAttentionGroup(queries, c.K[l][kvH*keyHeadDim:], c.V[l][kvH*valueHeadDim:],
+		queryHeads, c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim,
+		startT, endT, scale, softcap, out)
+}
+
 // DecodeBuffer is reusable request scratch for single-token decode and batched
 // prefill: activation vectors (X residual stream, XN/XN2 normed views,
 // Q/K/V/AttnOut/Proj attention buffers, Gate/Up/Hidden FFN buffers), the
@@ -2012,11 +2027,20 @@ func ArgmaxOutputToken(config Config, weights ModelWeights, buf *DecodeBuffer) (
 }
 
 func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffer, logits *[]float32) (uint32, bool) {
-	if !finite32(config.LogitScale) || config.LogitScale <= 0 || config.FinalLogitSoftcap < 0 {
+	return argmaxOutputTokenPenalizedInto(config, weights, buf, nil, 1, logits)
+}
+
+func argmaxOutputTokenPenalizedInto(config Config, weights ModelWeights, buf *DecodeBuffer, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {
+	if !finite32(config.LogitScale) || config.LogitScale <= 0 || config.FinalLogitSoftcap < 0 ||
+		!finite32(repeatPenalty) || repeatPenalty <= 0 {
 		return 0, false
 	}
-	if len(weights.OutputBias) > 0 {
+	// Positive linear logit scaling commutes with repeat penalty, but adding a
+	// bias or applying the nonlinear softcap does not. Materialize those rare
+	// combinations so penalty ordering stays exactly the sampler's ordering.
+	if len(weights.OutputBias) > 0 || (repeatPenalty != 1 && config.FinalLogitSoftcap > 0) {
 		ProjectLogitsInto(config, weights, buf, &buf.Logits)
+		applyRepeatPenalty(buf.Logits, recent, repeatPenalty)
 		if logits != nil {
 			ensureLenNoClear(logits, len(buf.Logits))
 			copy(*logits, buf.Logits)
@@ -2027,7 +2051,7 @@ func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffe
 	// optional positive softcap preserve argmax ordering, so Metal can reduce its
 	// Q6_K output buffer on-device and avoid a 131k-logit readback plus CPU scan.
 	// Sampling and unsupported output types retain the materialized fallback.
-	if token, ok := argmaxMetalQ6K(weights.Output.Metal, buf.XN); ok {
+	if token, ok := argmaxMetalQ6KPenalized(weights.Output.Metal, buf.XN, recent, repeatPenalty); ok {
 		return token, true
 	}
 	if weights.Output.Metal != nil && logits != nil {
@@ -2035,7 +2059,11 @@ func argmaxOutputTokenInto(config Config, weights ModelWeights, buf *DecodeBuffe
 		if len(*logits) == 0 {
 			return 0, false
 		}
+		applyRepeatPenalty(*logits, recent, repeatPenalty)
 		return argmaxFiniteToken(*logits), true
+	}
+	if repeatPenalty != 1 {
+		return 0, false
 	}
 	return weights.Output.ArgmaxMatvec(buf.XN)
 }
@@ -2133,9 +2161,15 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		if config.layerUsesSWA(l) {
 			attnStart = max(0, pos-config.SlidingWindow)
 		}
-		// Attention cost grows with context length; spread heads across the
-		// worker pool once there is enough work to amortize dispatch overhead.
-		if attnLen := pos - attnStart + 1; attnLen >= 128 && config.NHeads > 1 {
+		// GQA/MQA query heads share K/V rows. Process each complete group together
+		// so the shared cacheline is fetched once, then parallelize across KV
+		// groups at contexts long enough to amortize dispatch.
+		groupedGQA := useGroupedGQAAttention && hasFastGQA4 && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0
+		if attnLen := pos - attnStart + 1; groupedGQA && attnLen >= groupedGQADecodeMinContext && config.NKVHeads > 1 {
+			parallelAttendHeadGroups(config, cache, buf, l, pos, attnStart, scale, kvMul)
+		} else if groupedGQA && attnLen < 128 {
+			attendHeadGroupsRange(&config, cache, buf, l, pos, attnStart, scale, kvMul, 0, config.NKVHeads)
+		} else if attnLen >= 128 && config.NHeads > 1 {
 			parallelAttendHeads(config, layer, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else {
 			attendHeadsRange(&config, &layer, cache, buf, l, pos, attnStart, scale, kvMul, 0, config.NHeads)
@@ -2253,6 +2287,36 @@ func attendHeadsRange(config *Config, layer *LayerWeights, cache *KVCache, buf *
 func parallelAttendHeads(config Config, layer LayerWeights, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul int) {
 	parallelChunks(config.NHeads, func(hStart, hEnd int) {
 		attendHeadsRange(&config, &layer, cache, buf, l, pos, attnStart, scale, kvMul, hStart, hEnd)
+	})
+}
+
+func attendHeadGroupsRange(config *Config, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul, kvStart, kvEnd int) {
+	headDim := config.HeadDim
+	valueDim := config.ValueDim
+	for kvH := kvStart; kvH < kvEnd; kvH++ {
+		hStart := kvH * kvMul
+		hEnd := min(hStart+kvMul, config.NHeads)
+		if hStart >= hEnd {
+			break
+		}
+		cache.attendHeadGroup(l, kvH,
+			buf.Q[hStart*headDim:hEnd*headDim], hEnd-hStart, headDim, valueDim,
+			attnStart, pos, scale, config.AttnLogitSoftcap,
+			buf.AttnOut[hStart*valueDim:hEnd*valueDim])
+	}
+}
+
+func parallelAttendHeadGroups(config Config, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul int) {
+	// Keep the configured worker set awake for the projection matvec that
+	// immediately follows attention. GQA often exposes only eight groups on a
+	// 12-core Apple SoC; dispatching exactly eight jobs made four workers sleep
+	// and added a repeated wake-up penalty at every layer boundary.
+	workItems := max(config.NKVHeads, min(numThreads(), config.NHeads))
+	parallelChunks(workItems, func(kvStart, kvEnd int) {
+		if kvStart >= config.NKVHeads {
+			return
+		}
+		attendHeadGroupsRange(&config, cache, buf, l, pos, attnStart, scale, kvMul, kvStart, min(kvEnd, config.NKVHeads))
 	})
 }
 
@@ -2702,6 +2766,16 @@ func matvecDotRows(data []byte, rowBytes int, x []float32, start, end int, out [
 // borrows its own buffer.
 var attnScoresPool = sync.Pool{New: func() any { s := make([]float32, 0, 4096); return &s }}
 
+// Kept as a package variable so correctness and end-to-end performance tests
+// can A/B the legacy path in one process without changing model state.
+var useGroupedGQAAttention = os.Getenv("GOPHERLLM_NO_GROUPED_GQA") == ""
+
+// Below this point, 32-way head scheduling beats the lower data movement of
+// eight grouped jobs on the M2 Max. At long context the KV bandwidth saved by
+// the NEON x4 kernels dominates. Prefill has independent token-level
+// parallelism and therefore uses grouping without this decode-only threshold.
+const groupedGQADecodeMinContext = 4096
+
 // onlineAttention computes softmax(q·K/scale)·V for one head over positions
 // startT..endT, accumulating into out (which the caller has zeroed).
 //
@@ -2738,6 +2812,162 @@ func onlineAttentionWithSink(query, keys, values []float32, keyStride, valueStri
 	}
 	weightedVSumWithSink(scores[:n], values, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
 	attnScoresPool.Put(scratch)
+}
+
+// onlineAttentionGroup is the IO-aware GQA/MQA path. Query heads sharing one
+// KV head are kept together through both attention passes. The arithmetic for
+// each head is unchanged, but K/V rows remain hot across the group instead of
+// being streamed independently for every query head.
+func onlineAttentionGroup(queries, keys, values []float32, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	if queryHeads == 4 {
+		onlineAttentionGroup4(queries, keys, values, keyStride, valueStride,
+			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+		return
+	}
+	onlineAttentionGroupEither(queries, keys, nil, values, nil, queryHeads,
+		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+}
+
+// onlineAttentionGroup4 is the Ministral-style GQA specialization. Its NEON
+// primitives load each shared K/V row once for four query heads.
+func onlineAttentionGroup4(queries, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	const queryHeads = 4
+	span := endT - startT + 1
+	if span <= 0 || keyHeadDim <= 0 || valueHeadDim <= 0 || len(queries) < queryHeads*keyHeadDim || len(out) < queryHeads*valueHeadDim {
+		return
+	}
+	scratch := attnScoresPool.Get().(*[]float32)
+	scoreLen := queryHeads * span
+	ensureLenNoClear(scratch, scoreLen+queryHeads)
+	scores := (*scratch)[:scoreLen]
+	denoms := (*scratch)[scoreLen : scoreLen+queryHeads]
+
+	n := 0
+	for t := startT; t <= endT; t++ {
+		kOff := t * keyStride
+		if kOff+keyHeadDim > len(keys) {
+			break
+		}
+		s0, s1, s2, s3 := dotF32x4(
+			&queries[0], &queries[keyHeadDim], &queries[2*keyHeadDim], &queries[3*keyHeadDim],
+			&keys[kOff], keyHeadDim)
+		scores[n] = s0 * scale
+		scores[span+n] = s1 * scale
+		scores[2*span+n] = s2 * scale
+		scores[3*span+n] = s3 * scale
+		n++
+	}
+	if n == 0 {
+		attnScoresPool.Put(scratch)
+		return
+	}
+	for h := 0; h < queryHeads; h++ {
+		denoms[h] = attentionWeightsInPlace(scores[h*span:h*span+n], softcap)
+	}
+
+	out0 := out[:valueHeadDim]
+	out1 := out[valueHeadDim : 2*valueHeadDim]
+	out2 := out[2*valueHeadDim : 3*valueHeadDim]
+	out3 := out[3*valueHeadDim : 4*valueHeadDim]
+	for i := 0; i < n; i++ {
+		vOff := (startT + i) * valueStride
+		if vOff+valueHeadDim > len(values) {
+			break
+		}
+		axpyF32x4(&out0[0], &out1[0], &out2[0], &out3[0],
+			scores[i], scores[span+i], scores[2*span+i], scores[3*span+i],
+			&values[vOff], valueHeadDim)
+	}
+	ScaleF32(out0, 1/denoms[0])
+	ScaleF32(out1, 1/denoms[1])
+	ScaleF32(out2, 1/denoms[2])
+	ScaleF32(out3, 1/denoms[3])
+	attnScoresPool.Put(scratch)
+}
+
+func onlineAttentionGroupF16(queries []float32, keys, values []uint16, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	onlineAttentionGroupEither(queries, nil, keys, nil, values, queryHeads,
+		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+}
+
+func onlineAttentionGroupEither(queries []float32, keys []float32, keys16 []uint16, values []float32, values16 []uint16, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	span := endT - startT + 1
+	if span <= 0 || queryHeads <= 0 || len(queries) < queryHeads*keyHeadDim || len(out) < queryHeads*valueHeadDim {
+		return
+	}
+	scratch := attnScoresPool.Get().(*[]float32)
+	scoreLen := queryHeads * span
+	ensureLenNoClear(scratch, scoreLen+queryHeads)
+	scores := (*scratch)[:scoreLen]
+	denoms := (*scratch)[scoreLen : scoreLen+queryHeads]
+
+	n := 0
+	for t := startT; t <= endT; t++ {
+		kOff := t * keyStride
+		if (keys != nil && kOff+keyHeadDim > len(keys)) || (keys == nil && kOff+keyHeadDim > len(keys16)) {
+			break
+		}
+		for h := 0; h < queryHeads; h++ {
+			query := queries[h*keyHeadDim : (h+1)*keyHeadDim]
+			if keys != nil {
+				scores[h*span+n] = DotF32(query, keys[kOff:kOff+keyHeadDim]) * scale
+			} else {
+				scores[h*span+n] = dotF32F16(query, keys16[kOff:kOff+keyHeadDim]) * scale
+			}
+		}
+		n++
+	}
+	if n == 0 {
+		attnScoresPool.Put(scratch)
+		return
+	}
+
+	for h := 0; h < queryHeads; h++ {
+		denoms[h] = attentionWeightsInPlace(scores[h*span:h*span+n], softcap)
+	}
+
+	for i := 0; i < n; i++ {
+		vOff := (startT + i) * valueStride
+		if (values != nil && vOff+valueHeadDim > len(values)) || (values == nil && vOff+valueHeadDim > len(values16)) {
+			break
+		}
+		for h := 0; h < queryHeads; h++ {
+			weight := scores[h*span+i]
+			hout := out[h*valueHeadDim : (h+1)*valueHeadDim]
+			if values != nil {
+				AxpyF32(hout, weight, values[vOff:vOff+valueHeadDim])
+			} else {
+				axpyF16(hout, weight, values16[vOff:vOff+valueHeadDim])
+			}
+		}
+	}
+	for h := 0; h < queryHeads; h++ {
+		if denoms[h] > 0 {
+			ScaleF32(out[h*valueHeadDim:(h+1)*valueHeadDim], 1/denoms[h])
+		}
+	}
+	attnScoresPool.Put(scratch)
+}
+
+func attentionWeightsInPlace(scores []float32, softcap float32) float32 {
+	if softcap > 0 {
+		for i, s := range scores {
+			scores[i] = softcap * float32(math.Tanh(float64(s/softcap)))
+		}
+	}
+	maxScore := scores[0]
+	for _, s := range scores[1:] {
+		if s > maxScore {
+			maxScore = s
+		}
+	}
+	var denom float32
+	for i, s := range scores {
+		w := float32(math.Exp(float64(s - maxScore)))
+		scores[i] = w
+		denom += w
+	}
+	return denom
 }
 
 // weightedVSum finishes attention pass 2 shared by the f32 and f16 K-row

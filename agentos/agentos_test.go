@@ -72,18 +72,19 @@ func TestWhitelistRefusesChaining(t *testing.T) {
 
 func TestWhitelistAllowsPlainAllowlistedProgram(t *testing.T) {
 	r := Runner{Policy: PolicyWhitelist, Allowed: []string{"ls", "git"}}
-	for _, cmd := range []string{"ls -al /tmp", "/bin/ls -al", "git status"} {
+	for _, cmd := range []string{"ls -al /tmp", "git status"} {
 		if d := r.Evaluate(Proposal{Cmd: cmd}); !d.AutoRun {
 			t.Errorf("whitelist blocked allow-listed %q: %+v", cmd, d)
 		}
 	}
 }
 
-// A path is matched by its base name, so /usr/bin/ls counts as "ls" — but a
-// program that merely *contains* an allow-listed name must not.
-func TestWhitelistMatchesProgramNameNotSubstring(t *testing.T) {
+// Explicit executable paths must not inherit the authorization of a matching
+// basename: /tmp/ls might be a malicious executable, not the PATH-resolved ls
+// the operator placed in the allow-list.
+func TestWhitelistRequiresApprovalForExecutablePaths(t *testing.T) {
 	r := Runner{Policy: PolicyWhitelist, Allowed: []string{"ls"}}
-	for _, cmd := range []string{"lsof", "false-ls", "lsblk"} {
+	for _, cmd := range []string{"/bin/ls", "/tmp/ls", "./ls", `C:\temp\ls`, "lsof", "false-ls", "lsblk"} {
 		if d := r.Evaluate(Proposal{Cmd: cmd}); d.AutoRun {
 			t.Errorf("whitelist auto-ran %q on an 'ls' entry: %+v", cmd, d)
 		}
@@ -181,6 +182,34 @@ func TestExecuteTimesOutAndCapsOutput(t *testing.T) {
 	}
 	if !out.Truncated || len(out.Output) > 64 {
 		t.Fatalf("output cap not applied: truncated=%v len=%d", out.Truncated, len(out.Output))
+	}
+}
+
+func TestBoundedOutputRetainsOnlyItsLimit(t *testing.T) {
+	var output boundedOutput
+	output.limit = 64
+	input := strings.Repeat("x", 1024*1024)
+	if n, err := output.Write([]byte(input)); err != nil || n != len(input) {
+		t.Fatalf("Write = %d, %v; want %d, nil", n, err, len(input))
+	}
+	if !output.truncated || len(output.data) != output.limit {
+		t.Fatalf("truncated=%v len=%d, want true/%d", output.truncated, len(output.data), output.limit)
+	}
+}
+
+func TestBoundedOutputDoesNotTruncateAtItsExactLimit(t *testing.T) {
+	output := boundedOutput{limit: 3}
+	if _, err := output.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if output.truncated || string(output.data) != "abc" {
+		t.Fatalf("truncated=%v data=%q, want false/abc", output.truncated, output.data)
+	}
+	if _, err := output.Write([]byte("d")); err != nil {
+		t.Fatal(err)
+	}
+	if !output.truncated || string(output.data) != "abc" {
+		t.Fatalf("truncated=%v data=%q, want true/abc", output.truncated, output.data)
 	}
 }
 

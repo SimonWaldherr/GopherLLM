@@ -91,10 +91,14 @@ func matvecMetalQ6KInto(w *MetalWeight, x []float32, rows, cols int, out *[]floa
 }
 
 func argmaxMetalQ6K(w *MetalWeight, x []float32) (uint32, bool) {
+	return argmaxMetalQ6KPenalized(w, x, nil, 1)
+}
+
+func argmaxMetalQ6KPenalized(w *MetalWeight, x []float32, recent []uint32, repeatPenalty float32) (uint32, bool) {
 	if !metalWeightUsesDirect(w) || w.q6 == nil || w.typ != GGMLTypeQ6_K || len(x) < w.cols {
 		return 0, false
 	}
-	return metalbackend.ArgmaxQ6K(w.q6, x)
+	return metalbackend.ArgmaxQ6KPenalized(w.q6, x, recent, repeatPenalty)
 }
 
 func matvecMetalQ4K2Into(a, b *MetalWeight, x []float32, aRows, bRows, cols int, aOut, bOut *[]float32) bool {

@@ -20,6 +20,7 @@ typedef struct {
 	id<MTLBuffer> x;
 	id<MTLBuffer> out;
 	id<MTLBuffer> argmax;
+	id<MTLBuffer> recent;
 	int rows;
 	int cols;
 	int row_bytes;
@@ -38,6 +39,8 @@ typedef struct {
 	float value;
 	uint32_t index;
 } GLLMArgmaxResult;
+
+enum { GLLM_REPEAT_WINDOW = 64 };
 
 static id<MTLDevice> gllm_device = nil;
 static id<MTLCommandQueue> gllm_queue = nil;
@@ -202,12 +205,25 @@ static const char* gllm_q6k_source =
 "}\n"
 "struct ArgmaxResult { float value; uint index; };\n"
 "kernel void gllm_argmax_f32(\n"
-"    const device float* values [[buffer(0)]],\n"
+"    device float* values [[buffer(0)]],\n"
 "    device ArgmaxResult* result [[buffer(1)]],\n"
 "    constant uint& n [[buffer(2)]],\n"
+"    const device uint* recent [[buffer(3)]],\n"
+"    constant uint& recent_count [[buffer(4)]],\n"
+"    constant float& repeat_penalty [[buffer(5)]],\n"
 "    uint tid [[thread_index_in_threadgroup]]) {\n"
 "  threadgroup float shared_values[256];\n"
 "  threadgroup uint shared_indices[256];\n"
+"  if (tid == 0 && repeat_penalty != 1.0f) {\n"
+"    for (uint j = 0; j < recent_count; ++j) {\n"
+"      uint i = recent[j];\n"
+"      if (i < n) {\n"
+"        float v = values[i];\n"
+"        values[i] = isfinite(v) ? (v > 0.0f ? v / repeat_penalty : v * repeat_penalty) : -INFINITY;\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n"
 "  float best = -INFINITY;\n"
 "  uint best_index = 0;\n"
 "  for (uint i = tid; i < n; i += 256) {\n"
@@ -443,12 +459,14 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 		w->x = [gllm_device newBufferWithLength:(NSUInteger)cols * sizeof(float) options:MTLResourceStorageModeShared];
 		w->out = [gllm_device newBufferWithLength:(NSUInteger)rows * sizeof(float) options:MTLResourceStorageModeShared];
 		w->argmax = [gllm_device newBufferWithLength:sizeof(GLLMArgmaxResult) options:MTLResourceStorageModeShared];
-		if (w->weights == nil || w->x == nil || w->out == nil || w->argmax == nil) {
+		w->recent = [gllm_device newBufferWithLength:GLLM_REPEAT_WINDOW * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+		if (w->weights == nil || w->x == nil || w->out == nil || w->argmax == nil || w->recent == nil) {
 			strncpy(gllm_error, "failed to allocate Metal weight buffer", sizeof(gllm_error) - 1);
 			if (w->weights != nil) [w->weights release];
 			if (w->x != nil) [w->x release];
 			if (w->out != nil) [w->out release];
 			if (w->argmax != nil) [w->argmax release];
+			if (w->recent != nil) [w->recent release];
 			free(w);
 			return NULL;
 		}
@@ -494,12 +512,15 @@ static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 }
 
-static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w) {
+static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, uint32_t recent_count, float repeat_penalty) {
 	[enc setComputePipelineState:gllm_argmax_pipeline];
 	[enc setBuffer:w->out offset:0 atIndex:0];
 	[enc setBuffer:w->argmax offset:0 atIndex:1];
 	uint32_t rows = (uint32_t)w->rows;
 	[enc setBytes:&rows length:sizeof(rows) atIndex:2];
+	[enc setBuffer:w->recent offset:0 atIndex:3];
+	[enc setBytes:&recent_count length:sizeof(recent_count) atIndex:4];
+	[enc setBytes:&repeat_penalty length:sizeof(repeat_penalty) atIndex:5];
 	[enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 }
 
@@ -710,24 +731,28 @@ static int gllm_metal_q6k_matvec(void* handle, const float* x, float* out) {
 	}
 }
 
-static int gllm_metal_q6k_argmax(void* handle, const float* x, uint32_t* token) {
+static int gllm_metal_q6k_argmax(void* handle, const float* x, const uint32_t* recent, uint32_t recent_count, float repeat_penalty, uint32_t* token) {
 	@autoreleasepool {
 		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
-		if (w == NULL || w->weights == nil || x == NULL || token == NULL || !gllm_metal_init_q6k()) {
+		if (w == NULL || w->weights == nil || x == NULL || token == NULL || recent_count > GLLM_REPEAT_WINDOW ||
+			(recent_count > 0 && recent == NULL) || !isfinite(repeat_penalty) || repeat_penalty <= 0.0f || !gllm_metal_init_q6k()) {
 			return 0;
 		}
-		if (w->x == nil || w->out == nil || w->argmax == nil || w->rows <= 0) {
+		if (w->x == nil || w->out == nil || w->argmax == nil || w->recent == nil || w->rows <= 0) {
 			strncpy(gllm_error, "missing Metal argmax buffers", sizeof(gllm_error) - 1);
 			return 0;
 		}
 		memcpy([w->x contents], x, (NSUInteger)w->cols * sizeof(float));
+		if (recent_count > 0) {
+			memcpy([w->recent contents], recent, (NSUInteger)recent_count * sizeof(uint32_t));
+		}
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 		gllm_metal_encode_q6k(enc, w, w->x);
 		[enc endEncoding];
 		enc = [cb computeCommandEncoder];
-		gllm_metal_encode_argmax(enc, w);
+		gllm_metal_encode_argmax(enc, w, recent_count, repeat_penalty);
 		[enc endEncoding];
 		[cb commit];
 		[cb waitUntilCompleted];
@@ -768,6 +793,10 @@ static void gllm_metal_release_weight(void* handle) {
 			[w->argmax release];
 			w->argmax = nil;
 		}
+		if (w->recent != nil) {
+			[w->recent release];
+			w->recent = nil;
+		}
 		free(w);
 	}
 }
@@ -775,6 +804,7 @@ static void gllm_metal_release_weight(void* handle) {
 import "C"
 
 import (
+	"math"
 	"runtime"
 	"unsafe"
 )
@@ -886,11 +916,24 @@ func MatvecQ6K(w *Weight, x, out []float32) bool {
 }
 
 func ArgmaxQ6K(w *Weight, x []float32) (uint32, bool) {
+	return ArgmaxQ6KPenalized(w, x, nil, 1)
+}
+
+// ArgmaxQ6KPenalized applies the sampler's sparse repeat penalty on-device
+// between Q6_K projection and argmax, avoiding a full vocabulary readback.
+func ArgmaxQ6KPenalized(w *Weight, x []float32, recent []uint32, repeatPenalty float32) (uint32, bool) {
 	if w == nil || w.ptr == nil || len(x) < w.cols || w.rows == 0 {
 		return 0, false
 	}
+	if len(recent) > C.GLLM_REPEAT_WINDOW || math.IsNaN(float64(repeatPenalty)) || math.IsInf(float64(repeatPenalty), 0) || repeatPenalty <= 0 {
+		return 0, false
+	}
+	var recentPtr *C.uint32_t
+	if len(recent) > 0 {
+		recentPtr = (*C.uint32_t)(unsafe.Pointer(&recent[0]))
+	}
 	var token C.uint32_t
-	if C.gllm_metal_q6k_argmax(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), &token) == 0 {
+	if C.gllm_metal_q6k_argmax(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), recentPtr, C.uint32_t(len(recent)), C.float(repeatPenalty), &token) == 0 {
 		return 0, false
 	}
 	return uint32(token), true
