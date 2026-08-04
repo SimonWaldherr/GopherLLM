@@ -62,6 +62,8 @@ SERVE_ADDR    ?= $(ADDR)
 CHAT          ?= 1
 ARGS          ?=
 COVER_PROFILE ?= $(CACHE_DIR)/cover.out
+COMPRESS_FORMAT ?= Q4_K
+COMPRESS_OUT    ?= $(BUILD_DIR)/compressed.gguf
 
 export CGO_ENABLED
 export GOCACHE
@@ -83,7 +85,7 @@ _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p 
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
-.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
+.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -192,6 +194,11 @@ inspect: release
 
 list-tensors: release
 	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) --list-tensors
+
+compress: release
+	@mkdir -p "$(dir $(COMPRESS_OUT))"
+	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
+		--compress --compress-format "$(COMPRESS_FORMAT)" --compress-out "$(COMPRESS_OUT)"
 
 bench:
 	@mkdir -p $(GOCACHE)
@@ -338,6 +345,8 @@ help:
 	@printf "  make list-models                     List GGUFs in MODEL_DIR\n"
 	@printf "  make inspect MODEL=...               Inspect GGUF metadata and compatibility\n"
 	@printf "  make list-tensors MODEL=...          Print tensor inventory\n"
+	@printf "  make compress MODEL=... COMPRESS_FORMAT=Q4_K COMPRESS_OUT=...\n"
+	@printf "                                        Requantize a GGUF via round-to-nearest (Q8_0/Q4_0/Q4_K/Q6_K)\n"
 	@printf "  make bench                           Run Go microbenchmarks\n"
 	@printf "  make bench-model MODEL=...           Run CLI generation benchmark JSON with per-run output\n"
 	@printf "  make bench-model-prep MODEL=...      Run generation benchmark with --prepare-quant\n"
@@ -371,6 +380,7 @@ help:
 	@printf "  BENCH_RUNS=%s MODEL_TIMEOUT=%s SERVE_ADDR=%s CHAT=%s\n" "$(BENCH_RUNS)" "$(MODEL_TIMEOUT)" "$(SERVE_ADDR)" "$(CHAT)"
 	@printf "  KERNEL_BENCH_RUNS=%s KERNEL_BENCH_LAYER=%s\n" "$(KERNEL_BENCH_RUNS)" "$(KERNEL_BENCH_LAYER)"
 	@printf "  PREPARE_QUANT=%s\n" "$(PREPARE_QUANT)"
+	@printf "  COMPRESS_FORMAT=%s COMPRESS_OUT=%s\n" "$(COMPRESS_FORMAT)" "$(COMPRESS_OUT)"
 	@printf "  GOCACHE=%s GOMODCACHE=%s TMP_DIR=%s\n" "$(GOCACHE)" "$(GOMODCACHE)" "$(TMP_DIR)"
 	@printf "  METAL_CC=%s METAL_CXX=%s\n" "$(METAL_CC)" "$(METAL_CXX)"
 	@printf "  METAL_SDK=%s\n" "$(METAL_SDK)"

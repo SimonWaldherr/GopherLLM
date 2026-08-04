@@ -19,6 +19,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - [Build](#build)
 - [CLI Usage](#cli-usage)
 - [GGUF Analyzer](#gguf-analyzer)
+- [Model Compression](#model-compression)
 - [Server](#server)
 - [Tool Use / Agentic](#tool-use--agentic)
 - [Auto Mode (hardware autotuning)](#auto-mode-hardware-autotuning)
@@ -59,6 +60,9 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Model discovery across the complete local LM Studio model library.
 - Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
   private/gated-model tokens, and revision selection.
+- `--compress`: requantize any GGUF to Q8_0/Q4_0/Q4_K/Q6_K in place, writing
+  a smaller, independently loadable file (see
+  [Model Compression](#model-compression)).
 
 ## Requirements
 
@@ -423,6 +427,44 @@ bin/gopherllm /path/to/model.gguf --token-neighbors king --neighbors 8
 
 The same features are available in the library as `AnalyzeGGUF`,
 `SearchTokens`, and `Model.NearestTokens`.
+
+## Model Compression
+
+Requantize a GGUF to a smaller format and write it to a new file:
+
+```sh
+bin/gopherllm /path/to/model.gguf --compress --compress-format Q4_K --compress-out smaller.gguf
+```
+
+Supported target formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K` — the formats with
+dedicated AVX2/NEON matvec kernels (see
+[Performance Notes](#performance-notes)). Every eligible weight matrix (2-D
+or higher, row length divisible by the target format's block size — 32 for
+Q8_0/Q4_0, 256 for Q4_K/Q6_K) is dequantized, if not already plain
+float, and requantized with round-to-nearest; norm/bias vectors and any
+tensor that doesn't fit the target block size are copied through unchanged.
+The result is an ordinary, independently loadable GGUF — no relationship to
+the source file is retained.
+
+```sh
+$ bin/gopherllm model-f16.gguf --compress --compress-format Q4_K --compress-out model-q4_k.gguf
+Compressing model-f16.gguf -> model-q4_k.gguf (Q4_K)
+requantize blk.0.attn_q.weight              F16 -> Q4_K (393216 bytes -> 110592 bytes)
+...
+total: 6871947264 bytes -> 2147024896 bytes (31.2%)
+Wrote model-q4_k.gguf
+```
+
+This is plain round-to-nearest quantization today — no calibration data, no
+weighted error minimization (unlike llama.cpp's `imatrix`-guided quantize).
+It's the foundation a planned calibration-aware toolkit (GPTQ, AWQ,
+SmoothQuant, and SparseGPT-style pruning) builds on, to get closer to
+`llm-compressor`-style quality at low bit-widths; that work targets the
+mainline dense-transformer attention/FFN tensors specifically and hasn't
+landed yet.
+
+The same feature is available in the library as `gopherllm.CompressModel`
+and `gopherllm.ParseCompressFormat`.
 
 ## Server
 

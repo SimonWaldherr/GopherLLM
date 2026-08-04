@@ -11,6 +11,27 @@
 </head>
 <body class="chat" data-mermaid-cdn="{{.MermaidCDN}}">
 
+<!-- Icon sprite: plain geometric outlines, hand-drawn for this page, so every
+     chrome icon renders from one same-origin vector source at a consistent
+     optical weight instead of each falling back to whichever font on the
+     visitor's system happens to cover that Unicode symbol (Segoe UI Symbol,
+     Apple Symbols, a CJK font for a fullwidth "+", sometimes a colour emoji
+     font) at its own unrelated stroke weight, baseline and advance width. -->
+<svg aria-hidden="true" focusable="false" class="icon-sprite">
+  <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="14" cy="6" r="1.8" fill="currentColor" stroke="none"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="8" cy="12" r="1.8" fill="currentColor" stroke="none"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="16" cy="18" r="1.8" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3L8 19l-4 1z"/><path d="M14 6l4 4"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/><path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5,12 12,5 19,12"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><polyline points="6,9 12,15 18,9"/></symbol>
+  <symbol id="i-star" viewBox="0 0 24 24"><path d="M12,3 L14.12,9.09 L20.56,9.22 L15.42,13.11 L17.29,19.28 L12,15.6 L6.71,19.28 L8.58,13.11 L3.44,9.22 L9.88,9.09 Z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><polyline points="4,12 9,17 20,6"/></symbol>
+</svg>
+
 <div class="app">
   <aside id="sidebar" class="sidebar" aria-label="Saved conversations">
     <div class="sidebar-brand">
@@ -18,10 +39,10 @@
       <span>GopherLLM</span>
       <span class="local-badge">Local</span>
     </div>
-    <button id="newChat" class="new-chat" type="button"><span aria-hidden="true">＋</span> New chat</button>
+    <button id="newChat" class="new-chat" type="button"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg> New chat</button>
     <label class="chat-search">
       <span class="sr-only">Search chats</span>
-      <span aria-hidden="true">⌕</span>
+      <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
       <input id="chatSearch" type="search" placeholder="Search chats" autocomplete="off">
       <kbd>⌘K</kbd>
     </label>
@@ -35,14 +56,14 @@
   <div class="workspace">
     <header role="banner">
       <div class="header-left">
-        <button id="sidebarToggle" class="icon-button sidebar-toggle" type="button" aria-label="Open chat history" aria-expanded="false" aria-controls="sidebar"><span aria-hidden="true">☰</span></button>
+        <button id="sidebarToggle" class="icon-button sidebar-toggle" type="button" aria-label="Open chat history" aria-expanded="false" aria-controls="sidebar"><svg class="icon" aria-hidden="true"><use href="#i-menu"/></svg></button>
         <div class="brand">
           <span class="logo header-logo" aria-hidden="true">G</span>
           <div class="titles">
             <div class="chat-heading">
               <h1 id="chatTitle">New chat</h1>
-              <button id="renameChat" class="rename-chat" type="button" aria-label="Rename this chat" title="Rename chat">✎</button>
-              <button id="deleteChat" class="delete-chat" type="button" aria-label="Delete this chat" title="Delete chat">⌫</button>
+              <button id="renameChat" class="rename-chat" type="button" aria-label="Rename this chat" title="Rename chat"><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg></button>
+              <button id="deleteChat" class="delete-chat" type="button" aria-label="Delete this chat" title="Delete chat"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg></button>
             </div>
             <button id="modelName" class="model-name" type="button" title="{{.Model}}" aria-label="Change active model">{{.Model}}</button>
           </div>
@@ -55,7 +76,7 @@
         </div>
         <button id="briefChat" class="header-brief" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="briefing">Briefing</button>
         <button id="shareChat" class="header-share" type="button">Share</button>
-        <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><span aria-hidden="true">⚙</span></button>
+        <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg></button>
       </div>
     </header>
 
@@ -73,7 +94,7 @@
           <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
         </div>
       </div>
-      <button id="jumpLatest" class="jump-latest" type="button" hidden>Jump to latest <span aria-hidden="true">↓</span></button>
+      <button id="jumpLatest" class="jump-latest" type="button" hidden>Jump to latest <svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></button>
     </main>
 
     <form id="form" aria-label="Chat input" novalidate>
@@ -94,18 +115,18 @@
           <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
           <div class="prompt-footer">
             <div class="prompt-footer-start">
-              <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><span aria-hidden="true">＋</span></button>
+              <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
               <input id="fileInput" type="file" multiple hidden>
               <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
             </div>
             <div class="prompt-footer-end">
-              <button id="composerProToggle" class="composer-button composer-options-toggle" type="button" aria-expanded="false" aria-controls="composerProPanel">Controls <span aria-hidden="true">⌄</span></button>
+              <button id="composerProToggle" class="composer-button composer-options-toggle" type="button" aria-expanded="false" aria-controls="composerProPanel">Controls <span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></span></button>
             </div>
           </div>
           <span id="promptCacheStatus" class="sr-only" aria-live="polite" hidden></span>
         </div>
         <div class="actions">
-          <button id="send" type="submit" aria-label="Send message" title="Send message" disabled><span aria-hidden="true">↑</span><span class="send-label">Send</span></button>
+          <button id="send" type="submit" aria-label="Send message" title="Send message" disabled><span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg></span><span class="send-label">Send</span></button>
         </div>
       </div>
       <div id="composerProPanel" class="composer-pro" hidden>
@@ -143,7 +164,7 @@
         <h2 id="briefingTitle">Chat briefing</h2>
         <p>A compact, paste-ready handoff for another AI or teammate.</p>
       </div>
-      <button id="briefClose" class="icon-button" type="button" aria-label="Close chat briefing"><span aria-hidden="true">✕</span></button>
+      <button id="briefClose" class="icon-button" type="button" aria-label="Close chat briefing"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
     <div class="settings-panel-body">
       <section class="briefing-intro">
@@ -180,7 +201,7 @@
         <h2 id="settingsTitle">Settings</h2>
         <p>Changes are saved to this chat automatically.</p>
       </div>
-      <button id="settingsClose" class="icon-button" type="button" aria-label="Close settings"><span aria-hidden="true">✕</span></button>
+      <button id="settingsClose" class="icon-button" type="button" aria-label="Close settings"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
     <div class="settings-panel-body">
       <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
@@ -462,7 +483,7 @@
   <div class="settings-panel batch-panel" role="dialog" aria-modal="true" aria-labelledby="batchTitle">
     <div class="settings-panel-head">
       <h2 id="batchTitle">Batch — run one prompt over many items</h2>
-      <button id="batchClose" class="icon-button" type="button" aria-label="Close batch"><span aria-hidden="true">✕</span></button>
+      <button id="batchClose" class="icon-button" type="button" aria-label="Close batch"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
     <div class="settings-panel-body">
       <section class="settings-section">
@@ -516,7 +537,7 @@
   <div class="settings-panel agentos-panel" role="dialog" aria-modal="true" aria-labelledby="agentosTitle">
     <div class="settings-panel-head">
       <h2 id="agentosTitle">Run a local command</h2>
-      <button id="agentosClose" class="icon-button" type="button" aria-label="Close">✕</button>
+      <button id="agentosClose" class="icon-button" type="button" aria-label="Close"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
     <div class="settings-panel-body">
       <section class="settings-section">

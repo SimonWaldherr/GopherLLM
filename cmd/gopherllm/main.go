@@ -88,6 +88,9 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --find-token <text>       Search the vocabulary for tokens containing <text>")
 	fmt.Fprintln(os.Stderr, "  --token-neighbors <t>     Show embedding-space nearest neighbors of a token (id or text)")
 	fmt.Fprintln(os.Stderr, "  --neighbors <N>           Neighbor count for --token-neighbors (default: 12)")
+	fmt.Fprintln(os.Stderr, "  --compress                Requantize the GGUF to --compress-format via round-to-nearest and exit")
+	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target format: Q8_0 | Q4_0 | Q4_K | Q6_K")
+	fmt.Fprintln(os.Stderr, "  --compress-out <path>     Output path for --compress (required)")
 }
 
 type cliConfig struct {
@@ -136,6 +139,11 @@ type cliConfig struct {
 	findToken               string
 	tokenNeighbors          string
 	neighborCount           int
+	// compress requantizes modelSelector's GGUF to compressFormat via plain
+	// round-to-nearest and writes it to compressOut. See compress.go.
+	compress       bool
+	compressFormat string
+	compressOut    string
 	// osCommandsPolicy is the raw --os-commands value: "" disables the
 	// agentic OS-command feature entirely (no endpoints registered); any
 	// other value must parse via agentos.ParsePolicy.
@@ -230,7 +238,7 @@ func run() error {
 	// performs the first load. Non-server commands retain the existing model
 	// picker behavior below.
 	if cfg.modelSelector == nil && cfg.serveAddr != "" {
-		if cfg.inspect || cfg.listTensors || cfg.listMetadata || cfg.analyze || cfg.findToken != "" || cfg.tokenNeighbors != "" || cfg.embed || cfg.bench || cfg.kernelBench || cfg.repl || cfg.prompt != "" || cfg.autoTune {
+		if cfg.inspect || cfg.listTensors || cfg.listMetadata || cfg.analyze || cfg.findToken != "" || cfg.tokenNeighbors != "" || cfg.embed || cfg.bench || cfg.kernelBench || cfg.repl || cfg.prompt != "" || cfg.autoTune || cfg.compress {
 			return fmt.Errorf("this command needs a model selector; start only --serve (optionally --chat) to choose a model later")
 		}
 		fmt.Fprintln(os.Stderr, "No model loaded. Choose one in the Web UI or POST /models/load.")
@@ -292,6 +300,9 @@ func run() error {
 		// Header-only analysis: no weights are loaded, so this is instant
 		// even for multi-gigabyte files.
 		return analyzeGGUF(modelPath, cfg)
+	}
+	if cfg.compress {
+		return runCompress(modelPath, cfg)
 	}
 	// Metal is fixed when the weights load, so auto-tuning (which runs against
 	// an already-loaded Runner) cannot reach it. Decide it here instead, by
@@ -803,6 +814,20 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.neighborCount = v
+		case "--compress":
+			cfg.compress = true
+		case "--compress-format":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.compressFormat = v
+		case "--compress-out":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.compressOut = v
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return cfg, fmt.Errorf("unknown option: %s", arg)
@@ -905,6 +930,29 @@ func analyzeGGUF(path string, cfg cliConfig) error {
 			fmt.Printf("  %6d  %q\n", m.ID, m.Text)
 		}
 	}
+	return nil
+}
+
+// runCompress requantizes modelPath's GGUF to cfg.compressFormat via plain
+// round-to-nearest (gopherllm.CompressModel) and writes it to
+// cfg.compressOut. No weights are loaded through the normal Runner path —
+// CompressModel reads tensor bytes directly from the source file's mmap.
+func runCompress(modelPath string, cfg cliConfig) error {
+	if cfg.compressOut == "" {
+		return fmt.Errorf("--compress requires --compress-out <path>")
+	}
+	format, ok := gopherllm.ParseCompressFormat(cfg.compressFormat)
+	if !ok {
+		return fmt.Errorf("--compress-format %q is not supported (want one of: Q8_0, Q4_0, Q4_K, Q6_K)", cfg.compressFormat)
+	}
+	fmt.Fprintf(os.Stderr, "Compressing %s -> %s (%s)\n", modelPath, cfg.compressOut, format)
+	if err := gopherllm.CompressModel(modelPath, cfg.compressOut, gopherllm.CompressOptions{
+		TargetFormat: format,
+		LogWriter:    os.Stderr,
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "Wrote %s\n", cfg.compressOut)
 	return nil
 }
 

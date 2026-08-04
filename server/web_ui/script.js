@@ -174,16 +174,21 @@ function notify(text, kind) {
 }
 
 function bindCopy(button, getText) {
-  const label = button.textContent;
+  // innerHTML, not textContent: an icon-only copy button's "copied" state is
+  // a check-mark <svg>, not a string, and capturing/restoring innerHTML
+  // still round-trips a plain-text button (the labelled "Copy message" /
+  // "Copy" buttons) exactly as before.
+  const label = button.innerHTML;
+  const copied = button.dataset.copiedHTML || escapeHTML(button.dataset.copiedLabel || "Copied");
   button.addEventListener("click", () => {
     if (!navigator.clipboard || !navigator.clipboard.writeText) {
       notify("Clipboard access is unavailable in this browser.", "error");
       return;
     }
     navigator.clipboard.writeText(getText()).then(() => {
-      button.textContent = button.dataset.copiedLabel || "Copied";
+      button.innerHTML = copied;
       notify("Copied to clipboard", "success");
-      setTimeout(() => { button.textContent = label; }, 1400);
+      setTimeout(() => { button.innerHTML = label; }, 1400);
     }).catch(() => notify("Could not copy to the clipboard.", "error"));
   });
 }
@@ -193,7 +198,10 @@ function messageControls(el) {
   if (!controls) {
     controls = document.createElement("div");
     controls.className = "message-controls";
-    controls.setAttribute("aria-label", "Message actions");
+    // aria-label on a plain <div> (role="generic") is not exposed to
+    // assistive tech at all — it needs a naming-capable role first.
+    controls.setAttribute("role", "group");
+    controls.setAttribute("aria-label", "Actions for your message");
     el.appendChild(controls);
   }
   return controls;
@@ -204,7 +212,8 @@ function messageFooter(el) {
   if (!footer) {
     footer = document.createElement("div");
     footer.className = "message-actions";
-    footer.setAttribute("aria-label", "Message actions");
+    footer.setAttribute("role", "group");
+    footer.setAttribute("aria-label", "Actions for this answer");
     el.appendChild(footer);
   }
   return footer;
@@ -222,8 +231,8 @@ function attachCopyButton(el) {
     messageFooter(el).appendChild(button);
   } else {
     button.className = "message-icon-button copy-btn";
-    button.textContent = "⧉";
-    button.dataset.copiedLabel = "✓";
+    button.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg>';
+    button.dataset.copiedHTML = '<svg class="icon" aria-hidden="true"><use href="#i-check"/></svg>';
     button.title = "Copy message";
     messageControls(el).appendChild(button);
   }
@@ -253,26 +262,39 @@ function attachDetailsButton(el, meta) {
 /* Renders any Mermaid sources in container, or — when no renderer was loaded —
    reveals the one-click route to the Settings control that would load one. */
 let mermaidSeq = 0;
+// "neutral" is a light diagram theme; picking it unconditionally left dark
+// and nord users with dark strokes/labels on the dark .mermaid-block
+// background (near-illegible), and the render was never repeated after a
+// theme switch, so it stayed wrong even after moving back to a light theme.
+function mermaidScheme() {
+  const theme = document.body.dataset.theme;
+  const wantDark = theme === "dark" || theme === "nord" ||
+    (!theme && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  return wantDark ? "dark" : "neutral";
+}
+
 function renderMermaid(container) {
   const blocks = container.querySelectorAll(".mermaid-block");
   if (!blocks.length) return;
   const ready = typeof window.mermaid !== "undefined";
-  if (ready && !renderMermaid.initialised) {
+  const scheme = mermaidScheme();
+  if (ready && renderMermaid.scheme !== scheme) {
     // securityLevel "strict" makes Mermaid sanitize the diagram text, which
     // matters because the diagram was written by a model.
-    window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
-    renderMermaid.initialised = true;
+    window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: scheme });
+    renderMermaid.scheme = scheme;
   }
   blocks.forEach((block) => {
-    if (block.dataset.rendered === "true") return;
     const source = block.querySelector(".mermaid-src");
     const hint = block.querySelector(".mermaid-hint");
+    if (source && !block.dataset.src) block.dataset.src = source.textContent;
+    if (block.dataset.rendered === "true") return;
     if (!ready || !source) {
       if (hint) hint.hidden = false;
       return;
     }
     const id = "mermaid-" + (++mermaidSeq);
-    window.mermaid.render(id, source.textContent).then(({ svg }) => {
+    window.mermaid.render(id, block.dataset.src || source.textContent).then(({ svg }) => {
       source.innerHTML = svg;
       block.dataset.rendered = "true";
       if (hint) hint.hidden = true;
@@ -285,6 +307,18 @@ function renderMermaid(container) {
       }
     });
   });
+}
+
+// Called after a theme switch: an already-rendered diagram keeps its old SVG
+// forever otherwise, since renderMermaid only touches unrendered blocks.
+function redrawMermaidForTheme() {
+  if (typeof window.mermaid === "undefined") return;
+  document.querySelectorAll('.mermaid-block[data-rendered="true"]').forEach((block) => {
+    const source = block.querySelector(".mermaid-src");
+    if (source && block.dataset.src) source.textContent = block.dataset.src;
+    block.dataset.rendered = "";
+  });
+  renderMermaid(document);
 }
 
 function addCodeCopyButtons(container) {
@@ -1243,6 +1277,7 @@ function toMarkdown(chat) {
     if (value === "system") delete document.body.dataset.theme;
     else document.body.dataset.theme = value;
     themeSelectEl.value = value;
+    redrawMermaidForTheme();
   }
 
   function renderStorageStatus(info) {
@@ -1355,7 +1390,10 @@ function toMarkdown(chat) {
       const pin = document.createElement("button");
       pin.type = "button";
       pin.className = "chat-pin";
-      pin.textContent = chat.pinned ? "★" : "☆";
+      // Filled vs outline star, not two different glyphs: one <symbol>,
+      // toggled with .icon-fill so a pinned row's star matches the same
+      // vector weight as every other icon on the page.
+      pin.innerHTML = '<svg class="icon' + (chat.pinned ? " icon-fill" : "") + '" aria-hidden="true"><use href="#i-star"/></svg>';
       pin.title = chat.pinned ? "Unpin chat" : "Pin chat";
       pin.setAttribute("aria-label", (chat.pinned ? "Unpin " : "Pin ") + chat.title);
       pin.setAttribute("aria-pressed", chat.pinned ? "true" : "false");
@@ -1363,14 +1401,14 @@ function toMarkdown(chat) {
       const menu = document.createElement("button");
       menu.type = "button";
       menu.className = "chat-menu";
-      menu.textContent = "✎";
+      menu.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg>';
       menu.title = "Rename chat";
       menu.setAttribute("aria-label", "Rename " + chat.title);
       menu.addEventListener("click", () => manageChat(chat.id));
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "chat-delete";
-      remove.textContent = "⌫";
+      remove.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>';
       remove.title = "Delete chat";
       remove.setAttribute("aria-label", "Delete " + chat.title);
       remove.addEventListener("click", () => deleteChat(chat.id));
@@ -1707,6 +1745,11 @@ function toMarkdown(chat) {
     const el = document.createElement("article");
     el.className = "msg " + role;
     if (role === "error") el.setAttribute("role", "alert");
+    // Who spoke is otherwise conveyed only by alignment and fill colour —
+    // both presentational, neither reaching the accessibility tree. A screen
+    // reader user in a long, reopened chat could not otherwise tell their
+    // own restated question from the model's answer.
+    else el.setAttribute("aria-label", role === "user" ? "You said" : "GopherLLM said");
     el.dataset.raw = text || "";
     const content = document.createElement("div");
     content.className = "content";
@@ -2037,7 +2080,15 @@ function toMarkdown(chat) {
     chat.title = title.trim().slice(0, 160);
     chat.titleManual = true;
     touch(chat);
-    renderWorkspace(false);
+    // renameChat only ever fires on the active chat (see the renameChatEl
+    // listener below), so a direct header update is enough — no need for
+    // renderWorkspace(false)'s full renderConversation(true), which would
+    // tear down and re-parse every message (markdown, Mermaid, the lot)
+    // just to change a title, snapping open disclosures shut and jumping
+    // the scroll position for a rename that touched none of that.
+    chatTitleEl.textContent = chat.title;
+    chatTitleEl.title = chat.title;
+    renderChatList();
     save();
   }
 
@@ -2045,7 +2096,9 @@ function toMarkdown(chat) {
     const chat = chats.find((item) => item.id === id);
     if (!chat || busy) return;
     chat.pinned = !chat.pinned;
-    renderWorkspace(false);
+    // Pinning only reorders/badges a sidebar row; the transcript is
+    // untouched, so renderChatList() alone is enough (see renameChat above).
+    renderChatList();
     save();
     showToast(chat.pinned ? "Chat pinned" : "Chat unpinned", "success");
   }
@@ -2081,7 +2134,14 @@ function toMarkdown(chat) {
     chat.title = choice.trim().slice(0, 160);
     chat.titleManual = true;
     touch(chat);
-    renderWorkspace(false);
+    // Same reasoning as renameChat: this only ever needs to update a sidebar
+    // row's title, plus the header when the renamed chat happens to be the
+    // one open right now — never a full transcript re-render.
+    if (id === activeID) {
+      chatTitleEl.textContent = chat.title;
+      chatTitleEl.title = chat.title;
+    }
+    renderChatList();
     save();
   }
 
@@ -3364,6 +3424,50 @@ function toMarkdown(chat) {
     batchResultsEl.scrollTop = batchResultsEl.scrollHeight;
   }
 
+  // A batch item can stream hundreds of tokens; naively calling
+  // renderBatchResults() per token rebuilds every row accumulated so far, so a
+  // 100-item run costs O(items^2) element creation and forces a synchronous
+  // layout on every token. appendBatchRow adds exactly one row per item, and
+  // paintBatchTail coalesces in-progress token updates to the last row onto a
+  // single animation frame instead of painting every token immediately.
+  let batchPaintHandle = 0;
+  function batchAtBottom() {
+    return batchResultsEl.scrollHeight - batchResultsEl.scrollTop - batchResultsEl.clientHeight < 40;
+  }
+  function appendBatchRow(entry) {
+    const stick = batchAtBottom();
+    batchResultsEl.hidden = false;
+    const row = document.createElement("div");
+    row.className = "batch-row" + (entry.failed ? " failed" : "");
+    const label = document.createElement("span");
+    label.className = "batch-row-label";
+    label.textContent = entry.index + " · " + entry.label;
+    const output = document.createElement("div");
+    output.className = "batch-row-output";
+    output.textContent = entry.output || "…";
+    row.append(label, output);
+    batchResultsEl.appendChild(row);
+    if (stick) batchResultsEl.scrollTop = batchResultsEl.scrollHeight;
+  }
+  function paintBatchTail() {
+    if (batchPaintHandle) return;
+    batchPaintHandle = requestAnimationFrame(() => {
+      batchPaintHandle = 0;
+      const row = batchResultsEl.lastElementChild;
+      const entry = batchResults[batchResults.length - 1];
+      if (!row || !entry) return;
+      // Captured before the text grows the row, so a user who was pinned to
+      // the bottom stays pinned instead of reading as "just left" the moment
+      // this token's text pushes the bottom edge below the viewport.
+      const stick = batchAtBottom();
+      const output = row.querySelector(".batch-row-output");
+      if (output) output.textContent = entry.output || "…";
+      row.classList.toggle("failed", !!entry.failed);
+      batchExportsEl.hidden = !batchResults.some((r) => r.output && !r.failed);
+      if (stick) batchResultsEl.scrollTop = batchResultsEl.scrollHeight;
+    });
+  }
+
   function setBatchRunning(value) {
     batchRunning = value;
     batchStartEl.hidden = value;
@@ -3404,7 +3508,7 @@ function toMarkdown(chat) {
         const item = items[i];
         const entry = { index: i + 1, label: item.label, input: item.text, output: "", failed: false };
         batchResults.push(entry);
-        renderBatchResults();
+        appendBatchRow(entry);
         const elapsed = (performance.now() - startedAt) / 1000;
         const eta = done ? " · ~" + Math.round((elapsed / done) * (items.length - done)) + "s left" : "";
         batchProgressEl.textContent = "Item " + (i + 1) + " of " + items.length + eta;
@@ -3413,7 +3517,7 @@ function toMarkdown(chat) {
           entry.output = await completeOnce(
             [{ role: "user", content: renderTemplate(template, item, i) }],
             chat.settings, chat.systemPrompt, batchController.signal,
-            (partial) => { entry.output = partial; renderBatchResults(); }
+            (partial) => { entry.output = partial; paintBatchTail(); }
           );
           done++;
         } catch (error) {
@@ -3422,7 +3526,10 @@ function toMarkdown(chat) {
           entry.output = "Failed: " + (error && error.message ? error.message : "request failed");
           failed++;
         }
-        renderBatchResults();
+        // Final state for this item (output text and the failed class the
+        // catch block above may just have set) — one more coalesced paint
+        // rather than a full rebuild.
+        paintBatchTail();
       }
       batchProgressEl.textContent = "Done — " + done + " of " + items.length + (failed ? ", " + failed + " failed" : "");
       showToast("Batch finished: " + done + "/" + items.length + " items", failed ? "error" : "success");
@@ -3435,6 +3542,10 @@ function toMarkdown(chat) {
         showToast("Batch failed", "error");
       }
     } finally {
+      if (batchPaintHandle) {
+        cancelAnimationFrame(batchPaintHandle);
+        batchPaintHandle = 0;
+      }
       batchController = null;
       setBatchRunning(false);
       statusEl.classList.remove("busy");
@@ -4012,9 +4123,12 @@ function toMarkdown(chat) {
     preferences.composerPro = !!open;
     composerProPanelEl.hidden = !preferences.composerPro;
     composerProToggleEl.setAttribute("aria-expanded", String(preferences.composerPro));
-    composerProToggleEl.innerHTML = preferences.composerPro
-      ? 'Hide controls <span aria-hidden="true">⌃</span>'
-      : 'Controls <span aria-hidden="true">⌄</span>';
+    // One chevron symbol, not a second "point up" glyph: the CSS already
+    // rotates this span 180deg when aria-expanded is true (see
+    // .composer-options-toggle[aria-expanded="true"] > span[aria-hidden]),
+    // so the same icon serves both states.
+    composerProToggleEl.innerHTML = (preferences.composerPro ? "Hide controls " : "Controls ") +
+      '<span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></span>';
   }
   powerCommandsEl.addEventListener("change", () => {
     applyPowerPreference(powerCommandsEl.checked);
