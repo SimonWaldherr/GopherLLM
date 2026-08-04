@@ -596,9 +596,22 @@ func DotQ8KF32(row []byte, x []float32, cols int) float32 {
 		}
 		d := math.Float32frombits(binary.LittleEndian.Uint32(row[base:]))
 		q := row[base+4 : base+4+256]
-		for i, v := range q {
-			sum += d * float32(int8(v)) * x[b*256+i]
+		xBlock := x[b*256 : b*256+256]
+		// Keep four independent accumulators so the CPU can overlap the
+		// multiply/add chains. This mirrors DotQ8_0F32's hot loop and avoids
+		// making every Q8_K product wait on the previous one.
+		var s0, s1, s2, s3 float32
+		for i := 0; i < 256; i += 8 {
+			s0 += float32(int8(q[i])) * xBlock[i]
+			s1 += float32(int8(q[i+1])) * xBlock[i+1]
+			s2 += float32(int8(q[i+2])) * xBlock[i+2]
+			s3 += float32(int8(q[i+3])) * xBlock[i+3]
+			s0 += float32(int8(q[i+4])) * xBlock[i+4]
+			s1 += float32(int8(q[i+5])) * xBlock[i+5]
+			s2 += float32(int8(q[i+6])) * xBlock[i+6]
+			s3 += float32(int8(q[i+7])) * xBlock[i+7]
 		}
+		sum += d * ((s0 + s1) + (s2 + s3))
 	}
 	return sum
 }
