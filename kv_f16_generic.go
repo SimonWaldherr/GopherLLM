@@ -8,7 +8,7 @@ import "os"
 // Apple Silicon NEON implementations. Scalar conversion is slower, but
 // `GOPHERLLM_KV_F16=1` still halves KV-cache memory. The default stays exact
 // f32 and the scalar implementations below keep every target correct.
-var useF16KVCache = os.Getenv("GOPHERLLM_KV_F16") == "1"
+var useF16KVCache = newAtomicBool(os.Getenv("GOPHERLLM_KV_F16") == "1")
 
 func dotF32F16(a []float32, b []uint16) float32 { return dotF32F16Scalar(a, b, 0) }
 

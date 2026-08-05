@@ -533,6 +533,91 @@ func TestQ6KArgmaxWithXSumsKeepsLowestTiedToken(t *testing.T) {
 	}
 }
 
+// buildQuantizedRows quantizes rows independent, deterministic pseudo-random
+// float rows with encode into rowBytes-sized blocks each, for exercising
+// ArgmaxMatvec against real (not synthetic-garbage) quantized data.
+func buildQuantizedRows(rows, cols int, encode func(row []float32) []byte) []byte {
+	var out []byte
+	for r := range rows {
+		row := make([]float32, cols)
+		for i := range row {
+			row[i] = float32((i*7+r*13)%23-11) / 6
+		}
+		out = append(out, encode(row)...)
+	}
+	return out
+}
+
+func testArgmaxMatvecMatchesFullMatvec(t *testing.T, typ GGMLType, data []byte, rows, cols int) {
+	t.Helper()
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32((i%17)-8) / 5
+	}
+	w := Weight{Raw: data, Type: typ, Rows: rows, Cols: cols}
+	logits := []float32{}
+	w.MatvecInto(x, &logits)
+	want := argmaxFiniteToken(logits)
+	got, ok := w.ArgmaxMatvec(x)
+	if !ok {
+		t.Fatal("ArgmaxMatvec returned false")
+	}
+	if got != want {
+		t.Fatalf("argmax token = %d, want %d", got, want)
+	}
+}
+
+func TestQ4KArgmaxMatvecMatchesFullMatvec(t *testing.T) {
+	const rows, cols = 11, 512
+	data := buildQuantizedRows(rows, cols, func(row []float32) []byte { return QuantizeRowQ4K(row, cols) })
+	for _, q8 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "float", true: "q8"}[q8], func(t *testing.T) {
+			withQ8Activations(q8, func() {
+				testArgmaxMatvecMatchesFullMatvec(t, GGMLTypeQ4_K, data, rows, cols)
+			})
+		})
+	}
+}
+
+func TestQ5KArgmaxMatvecMatchesFullMatvec(t *testing.T) {
+	const rows, cols = 11, 512
+	data := buildQuantizedRows(rows, cols, func(row []float32) []byte { return QuantizeRowQ5K(row, cols) })
+	for _, q8 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "float", true: "q8"}[q8], func(t *testing.T) {
+			withQ8Activations(q8, func() {
+				testArgmaxMatvecMatchesFullMatvec(t, GGMLTypeQ5_K, data, rows, cols)
+			})
+		})
+	}
+}
+
+func TestQ8_0ArgmaxMatvecMatchesFullMatvec(t *testing.T) {
+	const rows, cols = 11, 512
+	data := buildQuantizedRows(rows, cols, func(row []float32) []byte { return QuantizeRowQ8_0(row, cols) })
+	for _, q8 := range []bool{false, true} {
+		t.Run(map[bool]string{false: "float", true: "q8"}[q8], func(t *testing.T) {
+			withQ8Activations(q8, func() {
+				testArgmaxMatvecMatchesFullMatvec(t, GGMLTypeQ8_0, data, rows, cols)
+			})
+		})
+	}
+}
+
+func TestQ4KArgmaxWithXSumsKeepsLowestTiedToken(t *testing.T) {
+	const cols = 256
+	rows := max(3, numThreads()*2+1)
+	data := make([]byte, rows*144) // Zero scale/min bytes make every logit 0.
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(i%11) - 5
+	}
+	scratch := []float32{}
+	xs := fillQ4KXSums(x, cols, &scratch)
+	if got := argmaxQ4KRowsWithXSums(data, x, xs, rows, cols, 144); got != 0 {
+		t.Fatalf("argmax tied token = %d, want 0", got)
+	}
+}
+
 func TestDotQ5KMatchesDequantizedDot(t *testing.T) {
 	row := make([]byte, 176)
 	row[0], row[1] = 0x00, 0x3c

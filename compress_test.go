@@ -88,6 +88,111 @@ func writeTempGGUF(t *testing.T, data []byte) string {
 	return path
 }
 
+// TestCompressModelRejectsInPlace confirms compressing a file onto itself
+// (or an equivalent path to it) is rejected before anything is touched,
+// rather than corrupting the still-mmap'd source.
+func TestCompressModelRejectsInPlace(t *testing.T) {
+	srcPath := writeTempGGUF(t, buildRequantizableLlamaGGUF())
+	before, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = CompressModel(srcPath, srcPath, CompressOptions{TargetFormat: GGMLTypeQ4_K})
+	if err == nil {
+		t.Fatal("CompressModel(same path, same path): want error, got nil")
+	}
+
+	// A relative-vs-absolute-equivalent path must be caught too, not just
+	// byte-for-byte identical strings.
+	rel, err := filepath.Rel(".", srcPath)
+	if err == nil {
+		if err := CompressModel(srcPath, rel, CompressOptions{TargetFormat: GGMLTypeQ4_K}); err == nil {
+			t.Fatal("CompressModel(abs, equivalent relative path): want error, got nil")
+		}
+	}
+
+	after, err := os.ReadFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("source file was modified despite the in-place compress being rejected")
+	}
+}
+
+// TestCompressModelRejectsSplitShard confirms pointing --compress at one
+// shard of a split GGUF fails clearly instead of silently writing a file
+// containing only that shard's tensor subset.
+func TestCompressModelRejectsSplitShard(t *testing.T) {
+	shard1, _ := splitTinyLlamaGGUF()
+	shardPath := writeTempGGUF(t, shard1)
+	outPath := filepath.Join(t.TempDir(), "out.gguf")
+
+	err := CompressModel(shardPath, outPath, CompressOptions{TargetFormat: GGMLTypeQ4_K})
+	if err == nil {
+		t.Fatal("CompressModel(split shard): want error, got nil")
+	}
+	if _, statErr := os.Stat(outPath); statErr == nil {
+		t.Error("CompressModel left a partial output file behind after rejecting a split shard")
+	}
+}
+
+// TestCompressModelOutputFloor confirms token_embd.weight/output.weight get
+// bumped to the Q6_K quality floor when the main target is lower quality,
+// and that Uniform disables the floor for callers who want strict uniform
+// quantization.
+func TestCompressModelOutputFloor(t *testing.T) {
+	srcPath := writeTempGGUF(t, buildRequantizableLlamaGGUF())
+
+	outPath := filepath.Join(t.TempDir(), "floored.gguf")
+	if err := CompressModel(srcPath, outPath, CompressOptions{TargetFormat: GGMLTypeQ4_K}); err != nil {
+		t.Fatalf("CompressModel: %v", err)
+	}
+	g := parseGGUFFile(t, outPath)
+	if got := tensorType(g, "token_embd.weight"); got != GGMLTypeQ6_K {
+		t.Errorf("token_embd.weight = %s, want Q6_K floor", got)
+	}
+	if got := tensorType(g, "output.weight"); got != GGMLTypeQ6_K {
+		t.Errorf("output.weight = %s, want Q6_K floor", got)
+	}
+	if got := tensorType(g, "blk.0.attn_q.weight"); got != GGMLTypeQ4_K {
+		t.Errorf("blk.0.attn_q.weight = %s, want the requested Q4_K (no floor applies to attention weights)", got)
+	}
+
+	uniformPath := filepath.Join(t.TempDir(), "uniform.gguf")
+	if err := CompressModel(srcPath, uniformPath, CompressOptions{TargetFormat: GGMLTypeQ4_K, Uniform: true}); err != nil {
+		t.Fatalf("CompressModel(Uniform): %v", err)
+	}
+	gu := parseGGUFFile(t, uniformPath)
+	if got := tensorType(gu, "token_embd.weight"); got != GGMLTypeQ4_K {
+		t.Errorf("Uniform=true: token_embd.weight = %s, want Q4_K (floor disabled)", got)
+	}
+}
+
+func parseGGUFFile(t *testing.T, path string) *GGUFFile {
+	t.Helper()
+	mmap, err := OpenMmap(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mmap.Close() })
+	g, err := ParseGGUF(mmap.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+func tensorType(g *GGUFFile, name string) GGMLType {
+	for _, t := range g.Tensors {
+		if t.Name == name {
+			return t.DType
+		}
+	}
+	return GGMLTypeUnknown
+}
+
 // TestCompressModelEndToEnd requantizes a small but block-size-compatible
 // synthetic F32 model to Q4_K, then loads the RESULT with the real,
 // production RunnerFromGGUFBytes and runs an actual forward pass — the

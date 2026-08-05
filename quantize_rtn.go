@@ -215,6 +215,113 @@ func QuantizeRowQ4K(row []float32, cols int) []byte {
 	return out
 }
 
+// QuantizeRowQ5K encodes cols float32 values as Q5_K: 176-byte superblocks of
+// 256 elements (f16 d + f16 dmin + the same 12B packed 6-bit scale/min table
+// as Q4_K + 32B high-bit plane + 128B low-nibble plane), decoded value =
+// d*sc*(nibble|hibit<<4) - dmin*m, a 5-bit unsigned code (0..31) split into a
+// 4-bit low nibble and one bit of the 32-byte high-bit plane
+// (simd.go:1545-1593). Shares Q4_K's joint scale/min packing exactly
+// (getScaleMinK4/packScaleMinK4All), so the same two-pass approach applies:
+// freeze the 8 sub-blocks' 6-bit scale/min codes first, then round 5-bit
+// values against the scales the decoder will actually reconstruct.
+func QuantizeRowQ5K(row []float32, cols int) []byte {
+	nSuper := cols / 256
+	out := make([]byte, nSuper*176)
+	for s := 0; s < nSuper; s++ {
+		super := row[s*256 : s*256+256]
+
+		// Pass 1: per-sub-block raw (scale, min1), 5-bit range (0..31) this
+		// time, not Q4_K's 4-bit (0..15).
+		var rawScale, rawMin1 [8]float32
+		for i := 0; i < 8; i++ {
+			sub := super[i*32 : i*32+32]
+			lo, hi := sub[0], sub[0]
+			for _, v := range sub {
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
+			}
+			sc := float32(0)
+			if hi > lo {
+				sc = (hi - lo) / 31
+			}
+			rawScale[i] = sc
+			rawMin1[i] = -lo
+		}
+		maxScale, maxMin1 := rawScale[0], rawMin1[0]
+		for i := 1; i < 8; i++ {
+			if rawScale[i] > maxScale {
+				maxScale = rawScale[i]
+			}
+			if rawMin1[i] > maxMin1 {
+				maxMin1 = rawMin1[i]
+			}
+		}
+		d := maxScale / 63
+		dmin := maxMin1 / 63
+		invD, invDmin := float32(0), float32(0)
+		if d != 0 {
+			invD = 1 / d
+		}
+		if dmin != 0 {
+			invDmin = 1 / dmin
+		}
+		var sc, m [8]byte
+		for i := 0; i < 8; i++ {
+			sc[i] = byte(clampInt(int(roundHalfAwayFromZero(rawScale[i]*invD)), 0, 63))
+			m[i] = byte(clampInt(int(roundHalfAwayFromZero(rawMin1[i]*invDmin)), 0, 63))
+		}
+		packed := packScaleMinK4All(sc, m)
+
+		base := s * 176
+		putF16(out[base:], d)
+		putF16(out[base+2:], dmin)
+		copy(out[base+4:base+16], packed[:])
+		qh := out[base+16 : base+48]
+		q := out[base+48 : base+176]
+
+		// Pass 2: same sub-block pairing as Q4_K (is=0,2,4,6 across 4
+		// iterations), but each 5-bit code splits into q's low/high nibble
+		// plus one bit of qh — u1/u2 walk the same two-bit-bits-per-iteration
+		// pattern DequantRowQ5KInto reads them back with.
+		u1, u2 := byte(1), byte(2)
+		for pair := 0; pair < 4; pair++ {
+			i0, i1 := pair*2, pair*2+1
+			d1 := d * float32(sc[i0])
+			min1_ := dmin * float32(m[i0])
+			d2 := d * float32(sc[i1])
+			min2_ := dmin * float32(m[i1])
+			invD1, invD2 := float32(0), float32(0)
+			if d1 != 0 {
+				invD1 = 1 / d1
+			}
+			if d2 != 0 {
+				invD2 = 1 / d2
+			}
+			sub0 := super[i0*32 : i0*32+32]
+			sub1 := super[i1*32 : i1*32+32]
+			qq := q[pair*32 : pair*32+32]
+			for l := 0; l < 32; l++ {
+				code1 := clampInt(int(roundHalfAwayFromZero((sub0[l]+min1_)*invD1)), 0, 31)
+				code2 := clampInt(int(roundHalfAwayFromZero((sub1[l]+min2_)*invD2)), 0, 31)
+				qq[l] = byte(code1&0x0f) | byte(code2&0x0f)<<4
+				if code1&0x10 != 0 {
+					qh[l] |= u1
+				}
+				if code2&0x10 != 0 {
+					qh[l] |= u2
+				}
+			}
+			u1 <<= 2
+			u2 <<= 2
+		}
+	}
+	return out
+}
+
 // QuantizeRowQ6K encodes cols float32 values as Q6_K: 210-byte superblocks
 // of 256 elements (128B low-nibble plane + 64B 2-bit-high plane + 16 signed
 // int8 sub-block scales + f16 d at the end), decoded value =

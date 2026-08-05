@@ -2,8 +2,6 @@
 
 package gopherllm
 
-const hasFastGQA4 = true
-
 // dotF32x4 computes four dot products against one shared input row. Keeping
 // the shared K row in NEON registers is the important GQA optimization.
 //

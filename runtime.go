@@ -1013,7 +1013,7 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	layers := r.kvCacheLayerCount()
 	old := r.workspaceCache
-	shapeCompatible := old != nil && old.layerCount() == layers && old.F16 == useF16KVCache &&
+	shapeCompatible := old != nil && old.layerCount() == layers && old.F16 == useF16KVCache.Load() &&
 		old.PerPosKDim == kDim && old.PerPosVDim == vDim
 	cache := old
 	compatible := shapeCompatible && old.MaxLen >= cacheLen
@@ -1025,7 +1025,7 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		// Geometric headroom is useful only while it stays within the same
 		// retention budget. Never make a one-off request allocate a larger
 		// temporary cache merely because the next growth step crossed 512 MiB.
-		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, useF16KVCache) > maxReusableKVCacheBytes {
+		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, useF16KVCache.Load()) > maxReusableKVCacheBytes {
 			targetLen = cacheLen
 		}
 		cache = newKVCacheAuto(layers, kDim, vDim, targetLen)

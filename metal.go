@@ -33,7 +33,7 @@ func Q4KMatvec3IntoWithXSums(wq, wk, wv Q4KMatrix, x []float32, xSums *[]float32
 	qRows := wq.Rows
 	kRows := wk.Rows
 	totalRows := qRows + kRows + wv.Rows
-	if useQ8Activations {
+	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, wq.Cols)
 		parallelRows(totalRows, func(start, end int) {
 			if qs, qe := clippedRange(start, end, 0, qRows); qs < qe {

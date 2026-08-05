@@ -8,7 +8,7 @@ import "os"
 // Keep the compact cache opt-in by default: the NEON kernels make it much
 // faster than the portable path, but f32 is still quicker on some Apple CPUs.
 // The autotuner may enable it when an end-to-end probe finds it beneficial.
-var useF16KVCache = os.Getenv("GOPHERLLM_KV_F16") == "1"
+var useF16KVCache = newAtomicBool(os.Getenv("GOPHERLLM_KV_F16") == "1")
 
 //go:noescape
 func dotF32F16NEON(a []float32, b []uint16) float32

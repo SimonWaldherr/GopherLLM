@@ -6,8 +6,8 @@ package gopherllm
 // Non-amd64 targets also expose this switch: Apple Silicon has an SDOT-backed
 // implementation, while other targets use the portable kernel when enabled.
 func withQ8Activations(enabled bool, fn func()) {
-	saved := useQ8Activations
-	useQ8Activations = enabled
-	defer func() { useQ8Activations = saved }()
+	saved := useQ8Activations.Load()
+	useQ8Activations.Store(enabled)
+	defer useQ8Activations.Store(saved)
 	fn()
 }

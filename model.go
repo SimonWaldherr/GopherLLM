@@ -574,7 +574,11 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 // the 131k-row output projection. For deterministic decoding, the sampler only
 // needs the winning token, so this saves the logits writeback and second full
 // vocab scan. Risk is limited by using it only for exact greedy-compatible
-// sampler settings; rollback is to disable the runtime fast-path.
+// sampler settings; rollback is to disable the runtime fast-path. Covers the
+// quantized formats llama.cpp's own quantize tool leaves on tied/output
+// embeddings: Q6_K (the "_M"/"_L" floor), and Q4_K/Q5_K/Q8_0 (the "_S"
+// presets and this project's own --compress skip that floor). Other
+// quantized types fall through to the general logits path below.
 func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 	if len(x) == 0 {
 		return 0, false
@@ -614,6 +618,55 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return tok, true
+	case GGMLTypeQ4_K:
+		if w.Cols%256 != 0 {
+			return 0, false
+		}
+		rowBytes := (w.Cols / 256) * 144
+		if len(w.Raw) < w.Rows*rowBytes {
+			return 0, false
+		}
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ4KXSums(x, w.Cols, scratch)
+		tok, ok := argmaxQ4KRowsQ8(w.Raw, x, xs, w.Rows, w.Cols, rowBytes)
+		if !ok {
+			tok = argmaxQ4KRowsWithXSums(w.Raw, x, xs, w.Rows, w.Cols, rowBytes)
+		}
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return tok, true
+	case GGMLTypeQ5_K:
+		if w.Cols%256 != 0 {
+			return 0, false
+		}
+		rowBytes := (w.Cols / 256) * 176
+		if len(w.Raw) < w.Rows*rowBytes {
+			return 0, false
+		}
+		// Q5_K shares Q4_K's per-sub-block scale/min structure (see
+		// MatvecQ5KInto), so the same per-32-element activation sums apply.
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ4KXSums(x, w.Cols, scratch)
+		tok, ok := argmaxQ5KRowsQ8(w.Raw, x, xs, w.Rows, w.Cols, rowBytes)
+		if !ok {
+			tok = argmaxQ5KRowsFloat(w.Raw, x, w.Rows, w.Cols, rowBytes)
+		}
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return tok, true
+	case GGMLTypeQ8_0:
+		if w.Cols%256 != 0 {
+			return 0, false
+		}
+		rowBytes := (w.Cols / 32) * 34
+		if len(w.Raw) < w.Rows*rowBytes {
+			return 0, false
+		}
+		tok, ok := argmaxQ8_0RowsQ8(w.Raw, x, w.Rows, w.Cols, rowBytes)
+		if !ok {
+			tok = argmaxQ8_0RowsFloat(w.Raw, x, w.Rows, w.Cols, rowBytes)
+		}
+		return tok, true
 	default:
 		return 0, false
 	}
@@ -648,6 +701,106 @@ func argmaxQ6KRowsWithXSums(data []byte, x, xsums []float32, rows, cols, rowByte
 			// Rows are visited in ascending order; strict > retains the
 			// lowest row index within a worker. The reduction below retains it
 			// globally too, matching argmaxFiniteToken.
+			if !localFound || v > localValue {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken)
+}
+
+// argmaxQ4KRowsWithXSums is the exact-float counterpart of argmaxQ4KRowsQ8,
+// used when the int8-activation path is unavailable or disabled.
+// dotQ4KF32WithXSums already picks the SIMD or scalar kernel internally.
+func argmaxQ4KRowsWithXSums(data []byte, x, xsums []float32, rows, cols, rowBytes int) uint32 {
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for row := start; row < end; row++ {
+			off := row * rowBytes
+			v := dotQ4KF32WithXSums(data[off:off+rowBytes], x, xsums, cols)
+			if !finiteLogit(v) {
+				continue
+			}
+			if !localFound || v > localValue {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken)
+}
+
+// argmaxQ5KRowsFloat is the exact-float counterpart of argmaxQ5KRowsQ8. Q5_K
+// has no SIMD-with-xsums float kernel (unlike Q4_K/Q6_K), so this always uses
+// the plain per-row dot product, matching MatvecQ5KInto's float fallback.
+func argmaxQ5KRowsFloat(data []byte, x []float32, rows, cols, rowBytes int) uint32 {
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for row := start; row < end; row++ {
+			off := row * rowBytes
+			v := DotQ5KF32(data[off:off+rowBytes], x, cols)
+			if !finiteLogit(v) {
+				continue
+			}
+			if !localFound || v > localValue {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken)
+}
+
+// argmaxQ8_0RowsFloat is the exact-float counterpart of argmaxQ8_0RowsQ8.
+func argmaxQ8_0RowsFloat(data []byte, x []float32, rows, cols, rowBytes int) uint32 {
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for row := start; row < end; row++ {
+			off := row * rowBytes
+			v := DotQ8_0F32(data[off:off+rowBytes], x, cols)
+			if !finiteLogit(v) {
+				continue
+			}
 			if !localFound || v > localValue {
 				localToken, localValue, localFound = row, v, true
 			}
@@ -1040,7 +1193,7 @@ func NewKVCacheF16(layers, kDim, vDim, maxLen int) *KVCache {
 // newKVCacheAuto picks f16 storage where the platform supports it (see
 // useF16KVCache) and exact f32 storage everywhere else.
 func newKVCacheAuto(layers, kDim, vDim, maxLen int) *KVCache {
-	if useF16KVCache {
+	if useF16KVCache.Load() {
 		return NewKVCacheF16(layers, kDim, vDim, maxLen)
 	}
 	return NewKVCache(layers, kDim, vDim, maxLen)
@@ -1399,6 +1552,9 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		// MLA checkpoint cannot accidentally fall through to a plausible but
 		// mathematically wrong GQA graph.
 		return LoadDeepSeek2Model(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
+	}
+	if config.Dim <= 0 || config.NLayers <= 0 || config.NHeads <= 0 {
+		return config, ModelWeights{}, fmt.Errorf("invalid model configuration: dim=%d layers=%d heads=%d", config.Dim, config.NLayers, config.NHeads)
 	}
 	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
 	if config.Arch == "exaone4" && config.NextNPredictLayers > 0 {
@@ -2164,7 +2320,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		// GQA/MQA query heads share K/V rows. Process each complete group together
 		// so the shared cacheline is fetched once, then parallelize across KV
 		// groups at contexts long enough to amortize dispatch.
-		groupedGQA := useGroupedGQAAttention && hasFastGQA4 && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0
+		groupedGQA := useGroupedGQAAttention && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0
 		if attnLen := pos - attnStart + 1; groupedGQA && attnLen >= groupedGQADecodeMinContext && config.NKVHeads > 1 {
 			parallelAttendHeadGroups(config, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else if groupedGQA && attnLen < 128 {

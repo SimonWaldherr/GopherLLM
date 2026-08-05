@@ -89,8 +89,10 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --token-neighbors <t>     Show embedding-space nearest neighbors of a token (id or text)")
 	fmt.Fprintln(os.Stderr, "  --neighbors <N>           Neighbor count for --token-neighbors (default: 12)")
 	fmt.Fprintln(os.Stderr, "  --compress                Requantize the GGUF to --compress-format via round-to-nearest and exit")
-	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target format: Q8_0 | Q4_0 | Q4_K | Q6_K")
-	fmt.Fprintln(os.Stderr, "  --compress-out <path>     Output path for --compress (required)")
+	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target format: Q8_0 | Q4_0 | Q4_K | Q5_K | Q6_K")
+	fmt.Fprintln(os.Stderr, "  --compress-out <path>     Output path for --compress (required, must differ from the source)")
+	fmt.Fprintln(os.Stderr, "  --compress-uniform        Quantize token_embd/output tensors to --compress-format too")
+	fmt.Fprintln(os.Stderr, "                            (default: floor them at Q6_K, matching llama.cpp's quantize tool)")
 }
 
 type cliConfig struct {
@@ -141,9 +143,10 @@ type cliConfig struct {
 	neighborCount           int
 	// compress requantizes modelSelector's GGUF to compressFormat via plain
 	// round-to-nearest and writes it to compressOut. See compress.go.
-	compress       bool
-	compressFormat string
-	compressOut    string
+	compress        bool
+	compressFormat  string
+	compressOut     string
+	compressUniform bool
 	// osCommandsPolicy is the raw --os-commands value: "" disables the
 	// agentic OS-command feature entirely (no endpoints registered); any
 	// other value must parse via agentos.ParsePolicy.
@@ -262,7 +265,17 @@ func run() error {
 	defer stopProfile()
 	fmt.Fprintf(os.Stderr, "System: %d threads\n", runtime.GOMAXPROCS(0))
 	metalAvailable := gopherllm.MetalAvailable()
-	if cfg.outOfCore {
+	// --compress never loads a Runner (CompressModel works directly off the
+	// source file's mmap, always single-file, always CPU), so none of
+	// --metal/--out-of-core/--auto/--prepare-quant apply to it. Printing
+	// their banners anyway would tell the operator those features are
+	// active for a run where they silently do nothing — skip the banners
+	// and say so once, instead.
+	if cfg.compress {
+		if cfg.outOfCore || cfg.useMetal || cfg.autoTune || cfg.prepareQuant {
+			fmt.Fprintln(os.Stderr, "compress: --metal/--out-of-core/--auto/--prepare-quant do not apply to compression; ignoring")
+		}
+	} else if cfg.outOfCore {
 		fmt.Fprintln(os.Stderr, "Out-of-core: enabled (CPU mmap; sparse experts stay demand-paged)")
 	} else if cfg.useMetal {
 		if !metalAvailable {
@@ -281,7 +294,7 @@ func run() error {
 	} else {
 		fmt.Fprintln(os.Stderr, "Metal: unavailable (pure Go / no CGO)")
 	}
-	if cfg.prepareQuant {
+	if cfg.prepareQuant && !cfg.compress {
 		fmt.Fprintln(os.Stderr, "Quant prep: enabled for supported quantized weights")
 	}
 	var modelPath string
@@ -828,6 +841,8 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.compressOut = v
+		case "--compress-uniform":
+			cfg.compressUniform = true
 		default:
 			if strings.HasPrefix(arg, "-") {
 				return cfg, fmt.Errorf("unknown option: %s", arg)
@@ -943,11 +958,12 @@ func runCompress(modelPath string, cfg cliConfig) error {
 	}
 	format, ok := gopherllm.ParseCompressFormat(cfg.compressFormat)
 	if !ok {
-		return fmt.Errorf("--compress-format %q is not supported (want one of: Q8_0, Q4_0, Q4_K, Q6_K)", cfg.compressFormat)
+		return fmt.Errorf("--compress-format %q is not supported (want one of: Q8_0, Q4_0, Q4_K, Q5_K, Q6_K)", cfg.compressFormat)
 	}
 	fmt.Fprintf(os.Stderr, "Compressing %s -> %s (%s)\n", modelPath, cfg.compressOut, format)
 	if err := gopherllm.CompressModel(modelPath, cfg.compressOut, gopherllm.CompressOptions{
 		TargetFormat: format,
+		Uniform:      cfg.compressUniform,
 		LogWriter:    os.Stderr,
 	}); err != nil {
 		return err

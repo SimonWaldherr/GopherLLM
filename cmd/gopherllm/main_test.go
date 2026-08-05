@@ -60,6 +60,36 @@ func TestParseCLIOutOfCore(t *testing.T) {
 	}
 }
 
+func TestParseCLICompressFlags(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--compress", "--compress-format", "Q4_K", "--compress-out", "out.gguf", "--compress-uniform"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.compress || cfg.compressFormat != "Q4_K" || cfg.compressOut != "out.gguf" || !cfg.compressUniform {
+		t.Fatalf("compress flags not recorded correctly: %+v", cfg)
+	}
+}
+
+func TestRunCompressRequiresOutPath(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--compress", "--compress-format", "Q4_K"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runCompress("model.gguf", cfg); err == nil {
+		t.Fatal("runCompress without --compress-out: want error, got nil")
+	}
+}
+
+func TestRunCompressRejectsUnknownFormat(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--compress", "--compress-format", "bogus", "--compress-out", "out.gguf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runCompress("model.gguf", cfg); err == nil {
+		t.Fatal("runCompress with an unsupported --compress-format: want error, got nil")
+	}
+}
+
 func TestParseCLIHuggingFaceList(t *testing.T) {
 	cfg, err := parseCLI([]string{"--hf-list", "bartowski/Qwen3-4B-GGUF@main", "--hf-offline"})
 	if err != nil {

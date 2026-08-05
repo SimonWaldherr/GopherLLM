@@ -33,6 +33,20 @@ var oversubscribeDispatch = runtime.GOARCH == "arm64"
 
 var configuredThreads atomic.Int64
 
+// newAtomicBool builds an already-initialized atomic.Bool for a package-level
+// var declaration (atomic.Bool's zero value is unset, and it has no literal
+// form, so a one-line `var x = newAtomicBool(cond)` needs this instead of an
+// init() func). Returns a pointer rather than a value: atomic.Bool carries a
+// noCopy guard, so returning it by value trips `go vet`'s copylocks check
+// even though nothing has touched it concurrently yet at package-init time.
+// Callers keep using x.Load()/x.Store() unchanged — those methods have
+// pointer receivers either way.
+func newAtomicBool(v bool) *atomic.Bool {
+	b := &atomic.Bool{}
+	b.Store(v)
+	return b
+}
+
 var mxfp4LUT = [...]float32{0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6}
 
 // SetNumThreads overrides the worker count used by the parallel matvec
@@ -192,7 +206,7 @@ func MatvecQ8_0Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	ensureLenNoClear(out, rows)
 	// (cols/32)*34 == (cols/256)*272 exactly when cols%256==0, so rowBytes
 	// already matches the int8-activation path's 8-block-per-256 grouping.
-	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		q8, xsc, lease := acquireQ8(x, cols)
 		parallelRows(rows, func(start, end int) {
 			dotQ8_0RowsQ8(data, q8, xsc, cols, rowBytes, start, end, *out)
@@ -219,7 +233,7 @@ func MatvecQ4_0Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	ensureLenNoClear(out, rows)
 	// The per-32-element activation sums carry Q4_0's -8 offset term exactly,
 	// like Q4_K's dmin term (see q4_0DotQ8KRow).
-	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)
 		q8, xsc, lease := acquireQ8(x, cols)
@@ -250,7 +264,7 @@ func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	if cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)
-		if useQ8Activations {
+		if useQ8Activations.Load() {
 			q8, xsc, lease := acquireQ8(x, cols)
 			parallelRows(rows, func(start, end int) {
 				dotQ4KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
@@ -290,7 +304,7 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 	ensureLenNoClear(bOut, bRows)
 	xs := fillQ4KXSums(x, aCols, xSums)
 	totalRows := aRows + bRows
-	if useQ8Activations {
+	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, aCols)
 		parallelRows(totalRows, func(start, end int) {
 			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
@@ -332,7 +346,7 @@ func MatvecQ4K2Q6KIntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bR
 	ScaleF32(q6xs, 32)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
-	if useQ8Activations {
+	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, aCols)
 		parallelRows(totalRows, func(start, end int) {
 			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
@@ -376,7 +390,7 @@ func MatvecQ5KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	ensureLenNoClear(out, rows)
 	// Q5_K shares Q4_K's per-sub-block scale/min structure, so the same
 	// per-32-element activation sums feed its dmin term.
-	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)
 		q8, xsc, lease := acquireQ8(x, cols)
@@ -403,7 +417,7 @@ func MatvecQ6KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ6KXSums16(x, cols, scratch)
 		ScaleF32(xs, 32)
-		if useQ8Activations {
+		if useQ8Activations.Load() {
 			q8, xsc, lease := acquireQ8(x, cols)
 			parallelRows(rows, func(start, end int) {
 				dotQ6KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
@@ -440,7 +454,7 @@ func MatvecQ6K2Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	xs := fillQ6KXSums16(x, aCols, scratch)
 	ScaleF32(xs, 32)
 	totalRows := aRows + bRows
-	if useQ8Activations {
+	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, aCols)
 		parallelRows(totalRows, func(start, end int) {
 			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
@@ -482,7 +496,7 @@ func MatvecQ6K3Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	ScaleF32(xs, 32)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
-	if useQ8Activations {
+	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, aCols)
 		parallelRows(totalRows, func(start, end int) {
 			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
@@ -613,7 +627,7 @@ func MatvecMXFP4Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	ensureLenNoClear(out, rows)
 	// MXFP4 is symmetric (no offset term), so the int8 path needs only the
 	// per-256-block activation scales, no xsums (see mxfp4DotQ8KRow).
-	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		q8, xsc, lease := acquireQ8(x, cols)
 		parallelRows(rows, func(start, end int) {
 			dotMXFP4RowsQ8(data, q8, xsc, cols, rowBytes, start, end, *out)

@@ -60,7 +60,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - Model discovery across the complete local LM Studio model library.
 - Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
   private/gated-model tokens, and revision selection.
-- `--compress`: requantize any GGUF to Q8_0/Q4_0/Q4_K/Q6_K in place, writing
+- `--compress`: requantize any GGUF to Q8_0/Q4_0/Q4_K/Q5_K/Q6_K in place, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
 
@@ -436,15 +436,30 @@ Requantize a GGUF to a smaller format and write it to a new file:
 bin/gopherllm /path/to/model.gguf --compress --compress-format Q4_K --compress-out smaller.gguf
 ```
 
-Supported target formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q6_K` — the formats with
-dedicated AVX2/NEON matvec kernels (see
+Supported target formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K` — the formats
+with dedicated AVX2/NEON matvec kernels (see
 [Performance Notes](#performance-notes)). Every eligible weight matrix (2-D
 or higher, row length divisible by the target format's block size — 32 for
-Q8_0/Q4_0, 256 for Q4_K/Q6_K) is dequantized, if not already plain
+Q8_0/Q4_0, 256 for Q4_K/Q5_K/Q6_K) is dequantized, if not already plain
 float, and requantized with round-to-nearest; norm/bias vectors and any
 tensor that doesn't fit the target block size are copied through unchanged.
 The result is an ordinary, independently loadable GGUF — no relationship to
-the source file is retained.
+the source file is retained, and the output is re-parsed and spot-checked
+against the plan before `--compress` reports success.
+
+The token embedding and output/LM-head tensors are floored at Q6_K rather
+than following an aggressive target format down to e.g. Q4_0 — the same
+convention llama.cpp's own `quantize` tool uses, since those two tensors are
+disproportionately sensitive to quantization error. Pass `--compress-uniform`
+to quantize them to the main target format like everything else instead.
+
+`--compress-out` must name a different file than the source: the source
+stays memory-mapped and readable throughout, so writing over it in place
+would corrupt the mapping mid-read. Compress to a new path and rename it
+afterward if you want to replace the original. A source that is one shard
+of a split/sharded GGUF (`split.count` in its metadata) is rejected with a
+clear error rather than silently compressing only that shard's tensors —
+point `--compress` at a single merged file.
 
 ```sh
 $ bin/gopherllm model-f16.gguf --compress --compress-format Q4_K --compress-out model-q4_k.gguf
@@ -1170,6 +1185,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   3B forward improved about 3-4% there. Batched prefill already has token-level
   parallelism and uses grouped GQA directly. Set `GOPHERLLM_NO_GROUPED_GQA=1`
   for an A/B rollback.
+  Non-ARM64 targets (amd64 included) run the same grouped-GQA decode
+  algorithm: the shared-row dot/AXPY step is composed from the portable,
+  AVX2-backed `DotF32`/`AxpyF32` kernels instead of a hand-fused NEON kernel,
+  but each K/V row is still read from the cache once per query-head group
+  rather than once per head, so the same bandwidth saving applies. It reuses
+  the 4k decode threshold above rather than a value re-tuned for amd64.
   Apple Silicon also uses NEON FP16 conversion, dot, and accumulation kernels
   for the optional compact KV cache; at 4k context they made the f16 attention
   benchmark about 3.7x faster than the scalar path. Exact f32 remains the
@@ -1219,7 +1240,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
-| `GOPHERLLM_NO_GROUPED_GQA` | Disable the ARM64 four-query-head grouped-GQA path (A/B benchmarking and debugging) |
+| `GOPHERLLM_NO_GROUPED_GQA` | Disable the four-query-head grouped-GQA decode path (A/B benchmarking and debugging) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on Apple Silicon) to halve KV memory |

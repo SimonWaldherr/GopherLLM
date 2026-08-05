@@ -208,9 +208,9 @@ func TestSiluMulF32MatchesScalar(t *testing.T) {
 
 // withQ8Activations runs fn with the int8-activation path forced on or off.
 func withQ8Activations(enabled bool, fn func()) {
-	saved := useQ8Activations
-	useQ8Activations = enabled && hasAVX2 && hasF16C
-	defer func() { useQ8Activations = saved }()
+	saved := useQ8Activations.Load()
+	useQ8Activations.Store(enabled && hasAVX2 && hasF16C)
+	defer useQ8Activations.Store(saved)
 	fn()
 }
 

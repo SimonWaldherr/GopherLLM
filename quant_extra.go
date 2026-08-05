@@ -559,7 +559,7 @@ func MatvecQ4_1Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 32) * 20
 	// Q4_1's +m offset term rides the same per-32-element activation sums as
 	// Q4_0's -8 term (see q4_1DotQ8KRow).
-	if useQ8Activations && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		ensureLenNoClear(out, rows)
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ4KXSums(x, cols, scratch)

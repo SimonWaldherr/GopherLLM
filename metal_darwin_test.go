@@ -249,9 +249,9 @@ func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 
 func forceExactMetalReference(t *testing.T) {
 	t.Helper()
-	saved := useQ8Activations
-	useQ8Activations = false
-	t.Cleanup(func() { useQ8Activations = saved })
+	saved := useQ8Activations.Load()
+	useQ8Activations.Store(false)
+	t.Cleanup(func() { useQ8Activations.Store(saved) })
 }
 
 func metalTestVector(n int) []float32 {

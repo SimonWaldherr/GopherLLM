@@ -79,7 +79,7 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 		return
 	}
 
-	if useQ8Activations && matvecBatchQ8(w, xs, outs) {
+	if useQ8Activations.Load() && matvecBatchQ8(w, xs, outs) {
 		return
 	}
 
@@ -367,7 +367,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 					attnStart = max(0, pos-config.SlidingWindow)
 				}
 				clear(AttnOut[t])
-				if useGroupedGQAAttention && hasFastGQA4 && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 {
+				if useGroupedGQAAttention && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 {
 					for kvH := 0; kvH < config.NKVHeads; kvH++ {
 						hStart := kvH * kvMul
 						hEnd := min(hStart+kvMul, config.NHeads)

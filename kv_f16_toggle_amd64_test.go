@@ -6,8 +6,8 @@ package gopherllm
 // generationWorkspace compatibility check keys on useF16KVCache, so cached
 // workspaces from the other mode are discarded automatically.
 func withF16KVCache(enabled bool, fn func()) {
-	saved := useF16KVCache
-	useF16KVCache = enabled && hasAVX2 && hasF16C
-	defer func() { useF16KVCache = saved }()
+	saved := useF16KVCache.Load()
+	useF16KVCache.Store(enabled && hasAVX2 && hasF16C)
+	defer useF16KVCache.Store(saved)
 	fn()
 }

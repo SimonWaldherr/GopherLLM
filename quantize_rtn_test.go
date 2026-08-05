@@ -180,6 +180,53 @@ func TestQuantizeRowQ4KAllZero(t *testing.T) {
 	}
 }
 
+func TestQuantizeRowQ5KRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(6))
+	for trial := 0; trial < 20; trial++ {
+		x := randomRow(rng, 256, 1.0+float32(trial)*0.3)
+		maxErr, deq := quantDequantMaxErr(t, x, QuantizeRowQ5K, DequantRowQ5K)
+		for i, v := range deq {
+			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+				t.Fatalf("trial %d, i=%d: dequantized to non-finite %v", trial, i, v)
+			}
+		}
+		// 5-bit code (finer than Q4_K's 4-bit) over the same double-quantized
+		// (superblock d/dmin, then 6-bit sub-block scale/min) scheme.
+		bound := (1.0+float32(trial)*0.3)*0.2 + 0.02
+		if maxErr > bound {
+			t.Fatalf("trial %d: max error %v exceeds bound %v", trial, maxErr, bound)
+		}
+	}
+}
+
+func TestQuantizeRowQ5KAllSameValue(t *testing.T) {
+	x := make([]float32, 256)
+	for i := range x {
+		x[i] = 0.5
+	}
+	packed := QuantizeRowQ5K(x, 256)
+	deq := DequantRowQ5K(packed, 256)
+	for i, v := range deq {
+		if math.IsNaN(float64(v)) {
+			t.Fatalf("i=%d: got NaN", i)
+		}
+		if abs32(v-0.5) > 0.05 {
+			t.Fatalf("i=%d: got %v, want ~0.5", i, v)
+		}
+	}
+}
+
+func TestQuantizeRowQ5KAllZero(t *testing.T) {
+	x := make([]float32, 256)
+	packed := QuantizeRowQ5K(x, 256)
+	deq := DequantRowQ5K(packed, 256)
+	for i, v := range deq {
+		if math.IsNaN(float64(v)) || v != 0 {
+			t.Fatalf("i=%d: got %v, want 0", i, v)
+		}
+	}
+}
+
 func TestQuantizeRowQ6KRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(5))
 	for trial := 0; trial < 20; trial++ {
@@ -224,6 +271,7 @@ func TestQuantizeRowSizes(t *testing.T) {
 		{"Q8_0", 256, GGMLTypeQ8_0, QuantizeRowQ8_0},
 		{"Q4_0", 256, GGMLTypeQ4_0, QuantizeRowQ4_0},
 		{"Q4_K", 512, GGMLTypeQ4_K, QuantizeRowQ4K},
+		{"Q5_K", 512, GGMLTypeQ5_K, QuantizeRowQ5K},
 		{"Q6_K", 512, GGMLTypeQ6_K, QuantizeRowQ6K},
 	}
 	for _, c := range cases {

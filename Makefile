@@ -62,8 +62,10 @@ SERVE_ADDR    ?= $(ADDR)
 CHAT          ?= 1
 ARGS          ?=
 COVER_PROFILE ?= $(CACHE_DIR)/cover.out
-COMPRESS_FORMAT ?= Q4_K
-COMPRESS_OUT    ?= $(BUILD_DIR)/compressed.gguf
+COMPRESS_FORMAT  ?= Q4_K
+COMPRESS_OUT     ?= $(BUILD_DIR)/compressed.gguf
+COMPRESS_UNIFORM ?= 0
+_COMPRESS_UNIFORM_FLAG = $(if $(filter 1 true yes on,$(COMPRESS_UNIFORM)),--compress-uniform,)
 
 export CGO_ENABLED
 export GOCACHE
@@ -198,7 +200,7 @@ list-tensors: release
 compress: release
 	@mkdir -p "$(dir $(COMPRESS_OUT))"
 	@$(BIN) --model-dir "$(MODEL_DIR)" $(_MODEL_ARG) \
-		--compress --compress-format "$(COMPRESS_FORMAT)" --compress-out "$(COMPRESS_OUT)"
+		--compress --compress-format "$(COMPRESS_FORMAT)" --compress-out "$(COMPRESS_OUT)" $(_COMPRESS_UNIFORM_FLAG)
 
 bench:
 	@mkdir -p $(GOCACHE)
@@ -346,7 +348,7 @@ help:
 	@printf "  make inspect MODEL=...               Inspect GGUF metadata and compatibility\n"
 	@printf "  make list-tensors MODEL=...          Print tensor inventory\n"
 	@printf "  make compress MODEL=... COMPRESS_FORMAT=Q4_K COMPRESS_OUT=...\n"
-	@printf "                                        Requantize a GGUF via round-to-nearest (Q8_0/Q4_0/Q4_K/Q6_K)\n"
+	@printf "                                        Requantize a GGUF via round-to-nearest (Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)\n"
 	@printf "  make bench                           Run Go microbenchmarks\n"
 	@printf "  make bench-model MODEL=...           Run CLI generation benchmark JSON with per-run output\n"
 	@printf "  make bench-model-prep MODEL=...      Run generation benchmark with --prepare-quant\n"
@@ -380,7 +382,7 @@ help:
 	@printf "  BENCH_RUNS=%s MODEL_TIMEOUT=%s SERVE_ADDR=%s CHAT=%s\n" "$(BENCH_RUNS)" "$(MODEL_TIMEOUT)" "$(SERVE_ADDR)" "$(CHAT)"
 	@printf "  KERNEL_BENCH_RUNS=%s KERNEL_BENCH_LAYER=%s\n" "$(KERNEL_BENCH_RUNS)" "$(KERNEL_BENCH_LAYER)"
 	@printf "  PREPARE_QUANT=%s\n" "$(PREPARE_QUANT)"
-	@printf "  COMPRESS_FORMAT=%s COMPRESS_OUT=%s\n" "$(COMPRESS_FORMAT)" "$(COMPRESS_OUT)"
+	@printf "  COMPRESS_FORMAT=%s COMPRESS_OUT=%s COMPRESS_UNIFORM=%s\n" "$(COMPRESS_FORMAT)" "$(COMPRESS_OUT)" "$(COMPRESS_UNIFORM)"
 	@printf "  GOCACHE=%s GOMODCACHE=%s TMP_DIR=%s\n" "$(GOCACHE)" "$(GOMODCACHE)" "$(TMP_DIR)"
 	@printf "  METAL_CC=%s METAL_CXX=%s\n" "$(METAL_CC)" "$(METAL_CXX)"
 	@printf "  METAL_SDK=%s\n" "$(METAL_SDK)"

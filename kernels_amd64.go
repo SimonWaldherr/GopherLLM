@@ -67,7 +67,17 @@ func dotF32(a, b []float32) float32 {
 // on-the-fly conversion effectively free. Halves attention bandwidth and
 // cache footprint; set GOPHERLLM_KV_F16=0 to keep the exact f32 cache
 // (A/B testing, accuracy debugging).
-var useF16KVCache = hasAVX2 && hasF16C && os.Getenv("GOPHERLLM_KV_F16") != "0"
+//
+// atomic.Bool, not a plain bool: setKVF16 is called mid-flight by
+// Runner.AutoTune's calibration loop (autotune.go), which holds only that
+// one Runner's own genLock — a server process can have multiple
+// independently-lockable Runners alive at once (the chat model plus a
+// separately loaded RAG embedding model, see server/server.go), and every
+// matvec on every Runner reads this same package-level flag with no lock of
+// its own. A plain bool here was a data race (flagged by go test -race) that
+// could also flip the KV precision out from under a concurrent Runner's
+// in-flight generationWorkspace() sizing (runtime.go).
+var useF16KVCache = newAtomicBool(hasAVX2 && hasF16C && os.Getenv("GOPHERLLM_KV_F16") != "0")
 
 //go:noescape
 func dotF32F16AVX2(a []float32, b []uint16) float32
@@ -169,7 +179,13 @@ func dotQ4_1RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByt
 // llama.cpp applies unconditionally to every K-quant matvec, so it is on by
 // default; set GOPHERLLM_Q8_ACTIVATIONS=0 to force the exact float kernels
 // (A/B testing, accuracy debugging).
-var useQ8Activations = hasAVX2 && hasF16C && os.Getenv("GOPHERLLM_Q8_ACTIVATIONS") != "0"
+//
+// atomic.Bool, not a plain bool: see useF16KVCache's comment above — the
+// same cross-Runner data race applied here (chooseToggle in autotune.go
+// flips this dozens of times per calibration run, unsynchronized against
+// every other Runner's concurrent matvec calls, e.g. server.go's separately
+// loaded RAG embedding model).
+var useQ8Activations = newAtomicBool(hasAVX2 && hasF16C && os.Getenv("GOPHERLLM_Q8_ACTIVATIONS") != "0")
 
 var (
 	q8ScratchPool     = sync.Pool{New: func() any { s := make([]int8, 0, 16384); return &s }}
@@ -235,7 +251,7 @@ func dotQ6KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByte
 // still on the old per-block float kernel: 131k rows took 51 ms instead of the
 // 17 ms the int8 kernel needs, making "skip the logits writeback" a 3x loss.
 func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
-	if !useQ8Activations || rows <= 0 || cols <= 0 || cols%256 != 0 {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
 		return 0, false
 	}
 	blocks := cols / 256
@@ -256,6 +272,116 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 			// Rows are scanned ascending, so a strict > keeps the lowest token
 			// id on ties, matching argmaxMatvecRows and argmaxFiniteToken.
 			v := q6kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	releaseQ8(q8, xsc, lease)
+	return uint32(bestToken), true
+}
+
+// argmaxQ4KRowsQ8 is the Q4_K analogue of argmaxQ6KRowsQ8: same int8-activation
+// row kernel as MatvecQ4KInto's fast path, without the logits writeback.
+// xsums must be the per-32-element sums of the original activations
+// (fillQ4KXSums).
+func argmaxQ4KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	q8p, xscp, xsumsp := &q8[0], &xsc[0], &xsums[0]
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			v := q4kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	releaseQ8(q8, xsc, lease)
+	return uint32(bestToken), true
+}
+
+// argmaxQ5KRowsQ8 is the Q5_K analogue of argmaxQ4KRowsQ8. xsums are the same
+// per-32-element sums Q5_K shares with Q4_K (fillQ4KXSums).
+func argmaxQ5KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	q8p, xscp, xsumsp := &q8[0], &xsc[0], &xsums[0]
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			v := q5kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	releaseQ8(q8, xsc, lease)
+	return uint32(bestToken), true
+}
+
+// argmaxQ8_0RowsQ8 is the Q8_0 analogue of argmaxQ4KRowsQ8. Q8_0 is symmetric
+// (no dmin term), so unlike the K-quant variants it needs no xsums.
+func argmaxQ8_0RowsQ8(data []byte, x []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	q8p, xscp := &q8[0], &xsc[0]
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			v := q8_0DotQ8KRow(&data[r*rowBytes], q8p, xscp, blocks)
 			if finiteLogit(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = r, v, true
 			}
@@ -490,15 +616,15 @@ func sumF32Groups16(x *float32, out *float32, groups int)
 
 func q8ActivationsAvailable() bool { return hasAVX2 && hasF16C }
 
-func q8ActivationsEnabled() bool { return useQ8Activations }
+func q8ActivationsEnabled() bool { return useQ8Activations.Load() }
 
-func setQ8Activations(on bool) { useQ8Activations = on && q8ActivationsAvailable() }
+func setQ8Activations(on bool) { useQ8Activations.Store(on && q8ActivationsAvailable()) }
 
 func kvF16Available() bool { return hasAVX2 && hasF16C }
 
-func kvF16Enabled() bool { return useF16KVCache }
+func kvF16Enabled() bool { return useF16KVCache.Load() }
 
-func setKVF16(on bool) { useF16KVCache = on && kvF16Available() }
+func setKVF16(on bool) { useF16KVCache.Store(on && kvF16Available()) }
 
 func cpuFeatureString() string {
 	s := "amd64"

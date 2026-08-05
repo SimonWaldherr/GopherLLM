@@ -511,12 +511,12 @@ func TestQ4KMatvecInt8MatchesFloatPath(t *testing.T) {
 	int8Out := make([]float32, 0, rows)
 	floatOut := make([]float32, 0, rows)
 
-	saved := useQ8Activations
-	t.Cleanup(func() { useQ8Activations = saved })
+	saved := useQ8Activations.Load()
+	t.Cleanup(func() { useQ8Activations.Store(saved) })
 
-	useQ8Activations = true
+	useQ8Activations.Store(true)
 	MatvecQ4KInto(data, x, rows, cols, &int8Out)
-	useQ8Activations = false
+	useQ8Activations.Store(false)
 	MatvecQ4KInto(data, x, rows, cols, &floatOut)
 
 	var dot, normA, normB float64

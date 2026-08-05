@@ -33,7 +33,14 @@ import (
 // useQ8Activations mirrors the amd64 variable of the same name. It is a var
 // rather than a const now, so the branches in the matvec entry points are live
 // and the autotuner can flip them.
-var useQ8Activations = defaultQ8Activations()
+//
+// atomic.Bool, not a plain bool: chooseToggle (autotune.go) flips this
+// repeatedly mid-calibration while holding only the calibrating Runner's own
+// genLock, but every matvec on every live Runner in the process (e.g. a
+// server's chat model plus a separately loaded RAG embedding model, see
+// server/server.go) reads it with no lock of its own — a plain bool here was
+// a data race across concurrent Runners.
+var useQ8Activations = newAtomicBool(defaultQ8Activations())
 
 func defaultQ8Activations() bool {
 	switch os.Getenv("GOPHERLLM_Q8_ACTIVATIONS") {
@@ -192,7 +199,7 @@ var batchQ8Pool = sync.Pool{New: func() any { return &batchQ8Scratch{} }}
 // re-decoding every weight row once per prompt token. Returns false (writing
 // nothing) for shapes and types it does not handle.
 func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
-	if !useQ8Activations {
+	if !useQ8Activations.Load() {
 		return false
 	}
 	p := len(xs)
@@ -253,7 +260,7 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 // kernel as the materializing matvec, skipping the logits writeback. Returns
 // false when the int8 path is off so callers keep the exact float kernel.
 func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
-	if !useQ8Activations || rows <= 0 || cols <= 0 || cols%256 != 0 {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
 		return 0, false
 	}
 	blocks := cols / 256
@@ -287,6 +294,111 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 	return uint32(bestToken), true
 }
 
+// argmaxQ4KRowsQ8 is the Q4_K analogue of argmaxQ6KRowsQ8. xsums must be the
+// per-32-element sums of the original activations (fillQ4KXSums).
+func argmaxQ4KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	defer releaseQ8(q8, xsc, lease)
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			v := q4kDotQ8KRow(data[r*rowBytes:], q8, xsc, xsums, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken), true
+}
+
+// argmaxQ5KRowsQ8 is the Q5_K analogue of argmaxQ4KRowsQ8. xsums are the same
+// per-32-element sums Q5_K shares with Q4_K (fillQ4KXSums).
+func argmaxQ5KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	defer releaseQ8(q8, xsc, lease)
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			v := q5kDotQ8KRow(data[r*rowBytes:], q8, xsc, xsums, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken), true
+}
+
+// argmaxQ8_0RowsQ8 is the Q8_0 analogue of argmaxQ4KRowsQ8. Q8_0 is symmetric
+// (no dmin term), so unlike the K-quant variants it needs no xsums.
+func argmaxQ8_0RowsQ8(data []byte, x []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	defer releaseQ8(q8, xsc, lease)
+	var mu sync.Mutex
+	bestToken := 0
+	bestValue := negInf32
+	found := false
+	parallelRows(rows, func(start, end int) {
+		localToken := start
+		localValue := negInf32
+		localFound := false
+		for r := start; r < end; r++ {
+			v := q8_0DotQ8KRow(data[r*rowBytes:], q8, xsc, blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = r, v, true
+			}
+		}
+		if !localFound {
+			return
+		}
+		mu.Lock()
+		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
+			bestToken, bestValue, found = localToken, localValue, true
+		}
+		mu.Unlock()
+	})
+	return uint32(bestToken), true
+}
+
 // The int8-activation path is now implemented everywhere, so the autotuner is
 // allowed to consider it. It reports available even without int8 assembly:
 // "available" means correct and selectable, and letting --auto measure the
@@ -295,15 +407,15 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 
 func q8ActivationsAvailable() bool { return true }
 
-func q8ActivationsEnabled() bool { return useQ8Activations }
+func q8ActivationsEnabled() bool { return useQ8Activations.Load() }
 
-func setQ8Activations(on bool) { useQ8Activations = on }
+func setQ8Activations(on bool) { useQ8Activations.Store(on) }
 
 func kvF16Available() bool { return true }
 
-func kvF16Enabled() bool { return useF16KVCache }
+func kvF16Enabled() bool { return useF16KVCache.Load() }
 
-func setKVF16(on bool) { useF16KVCache = on }
+func setKVF16(on bool) { useF16KVCache.Store(on) }
 
 func cpuFeatureString() string {
 	if hasQ8KDotAsm {

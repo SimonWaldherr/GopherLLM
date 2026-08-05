@@ -4,8 +4,14 @@ package gopherllm
 
 import "unsafe"
 
-const hasFastGQA4 = false
-
+// dotF32x4/axpyF32x4 compose the shared-row grouped-GQA algorithm out of the
+// portable DotF32/AxpyF32 primitives instead of a hand-written 4-wide kernel
+// (arm64 has one in attention_gqa_arm64.go/.s). On amd64 DotF32/AxpyF32 are
+// themselves AVX2-accelerated, so this still gets full SIMD throughput per
+// call; grouping's actual win — reading each shared K/V row from the KV cache
+// once instead of once per query head — applies regardless of instruction
+// set, so there is no hasFastGQA4 gate here: the call sites gate on kvMul==4
+// alone.
 func dotF32x4(q0, q1, q2, q3, x *float32, n int) (s0, s1, s2, s3 float32) {
 	if n <= 0 {
 		return
