@@ -263,10 +263,10 @@ func TestQuantizeRowQ6KAllZero(t *testing.T) {
 // descriptor table's cumulative offsets.
 func TestQuantizeRowSizes(t *testing.T) {
 	cases := []struct {
-		name      string
-		cols      int
-		dtype     GGMLType
-		quantize  func([]float32, int) []byte
+		name     string
+		cols     int
+		dtype    GGMLType
+		quantize func([]float32, int) []byte
 	}{
 		{"Q8_0", 256, GGMLTypeQ8_0, QuantizeRowQ8_0},
 		{"Q4_0", 256, GGMLTypeQ4_0, QuantizeRowQ4_0},
