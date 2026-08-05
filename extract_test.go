@@ -70,6 +70,24 @@ func TestClassifyOutputUsesMistralNativeThinkingMarkers(t *testing.T) {
 	}
 }
 
+func TestClassifyOutputStripsMistralToolSyntaxWithoutActiveTools(t *testing.T) {
+	r := &Runner{tok: newInstTestTokenizer(), arch: "mistral3"}
+	content, reasoning, calls := r.classifyOutput(
+		`[TOOL_CALLS]google_maps_distance[ARGS]{"origin":"Landau in Isartal","destination":"München"}`,
+		nil,
+		NewRng(1),
+	)
+	if content != "" || reasoning != "" {
+		t.Fatalf("content/reasoning = %q / %q, want empty", content, reasoning)
+	}
+	if len(calls) != 1 || calls[0].Function.Name != "google_maps_distance" {
+		t.Fatalf("calls = %#v, want one google_maps_distance call", calls)
+	}
+	if calls[0].Function.Arguments != `{"origin":"Landau in Isartal","destination":"München"}` {
+		t.Fatalf("arguments = %q", calls[0].Function.Arguments)
+	}
+}
+
 func TestThinkStreamSplitterSeparatesTagsAcrossChunks(t *testing.T) {
 	s := NewThinkStreamSplitter(false)
 	var content, reasoning strings.Builder

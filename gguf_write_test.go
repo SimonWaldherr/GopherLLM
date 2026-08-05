@@ -44,7 +44,7 @@ func TestGGUFWriterRoundTrip(t *testing.T) {
 		f32Data[i*4+2] = byte(bits >> 16)
 		f32Data[i*4+3] = byte(bits >> 24)
 	}
-	q80Data := make([]byte, 34) // one Q8_0 block: f16 scale + 32 int8
+	q80Data := make([]byte, 34)         // one Q8_0 block: f16 scale + 32 int8
 	q80Data[0], q80Data[1] = 0x00, 0x3C // f16 1.0
 	for i := 0; i < 32; i++ {
 		q80Data[2+i] = byte(int8(i - 16))

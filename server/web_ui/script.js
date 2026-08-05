@@ -379,6 +379,34 @@ function formatDuration(ms) {
   return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + " s";
 }
 
+// Older responses and locally stored chats can contain Mistral's native tool
+// protocol as visible text when the server could not classify an unsupported
+// tool name. Recover it at the presentation boundary so control syntax never
+// becomes part of the assistant's answer. The server remains authoritative for
+// new responses; this is deliberately a compatibility fallback for history.
+function recoverMistralToolCalls(text) {
+  const callMarker = "[TOOL_CALLS]";
+  const argsMarker = "[ARGS]";
+  const source = String(text || "");
+  const markerAt = source.indexOf(callMarker);
+  if (markerAt < 0) return null;
+  let rest = source.slice(markerAt);
+  const calls = [];
+  while (rest.startsWith(callMarker)) {
+    rest = rest.slice(callMarker.length);
+    const argsAt = rest.indexOf(argsMarker);
+    if (argsAt < 0) return null;
+    const name = rest.slice(0, argsAt).trim();
+    rest = rest.slice(argsAt + argsMarker.length);
+    const nextAt = rest.indexOf(callMarker);
+    const args = (nextAt < 0 ? rest : rest.slice(0, nextAt)).trim() || "{}";
+    if (!name) return null;
+    calls.push({ type: "function", function: { name, arguments: args } });
+    rest = nextAt < 0 ? "" : rest.slice(nextAt);
+  }
+  return calls.length ? { answer: source.slice(0, markerAt).trim(), calls } : null;
+}
+
 /* Renders the timeline into el, replacing any previous version. Kept as a
    plain rebuild because the list is short and a running row has to re-render
    on every tick anyway. */
@@ -464,7 +492,9 @@ function renderActivityDisclosure(el, timeline, live, before) {
     else el.appendChild(details);
   }
   details.classList.toggle("activity-live", !!live);
-  details.open = false;
+  // Keep live work visible so the user can see what is happening; collapse
+  // completed history by default to preserve the compact transcript layout.
+  details.open = !!live;
   details.querySelector("summary").textContent = activityLabel(timeline, live);
   renderAgentTimeline(details.querySelector(".agent-timeline"), timeline);
   return details;
@@ -1837,6 +1867,12 @@ function toMarkdown(chat) {
   }
 
   function finalizeAssistant(el, result) {
+    const recovered = !result.toolCalls || !result.toolCalls.length
+      ? recoverMistralToolCalls(result.answer)
+      : null;
+    if (recovered) {
+      result = Object.assign({}, result, { answer: recovered.answer, toolCalls: recovered.calls });
+    }
     const content = el.querySelector(".content");
     content.classList.remove("streaming");
     const meter = el.querySelector(":scope > .stream-meter");

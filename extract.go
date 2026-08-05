@@ -29,8 +29,17 @@ func (r *Runner) classifyOutput(raw string, tools []ToolDefinition, rng *Rng) (c
 		} else {
 			content, reasoning = extractThink(raw)
 		}
-		if len(tools) > 0 {
+		// A Mistral-family model can emit its native marker even when the
+		// caller's active tool list is empty (for example, when it requests an
+		// unsupported external tool). The marker is still protocol syntax, not
+		// user-visible answer text, so classify it instead of leaking it into
+		// the UI. Keep the active-tool guard for generic conventions, where
+		// ordinary answer text can legitimately resemble a tool payload.
+		parseToolSyntax := len(tools) > 0 || strings.Contains(content, "[TOOL_CALLS]")
+		if parseToolSyntax {
 			switch {
+			case strings.Contains(content, "[TOOL_CALLS]"):
+				content, calls = extractToolCallsMistral(content)
 			case qwen35Family(r.arch):
 				content, calls = extractToolCallsQwen35(content)
 			case kind == "mistral-inst":

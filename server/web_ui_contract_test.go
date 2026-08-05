@@ -88,6 +88,7 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		"function dialogFocusables(",
 		"function trapDialogFocus(",
 		"function renderActivityDisclosure(",
+		"function recoverMistralToolCalls(",
 		`className = "activity-details"`,
 		`button.textContent = "Details"`,
 		`button.textContent = "Copy message"`,
