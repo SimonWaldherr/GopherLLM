@@ -1217,6 +1217,35 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   matters more than decode speed (for example, large Kimi contexts on a
   unified-memory Mac). Apple Silicon converts its rows with dedicated NEON
   FP16 kernels; other non-amd64 targets use the portable scalar fallback.
+- A third, more aggressive KV cache tier stores K/V rows as Q8_0 blocks
+  (`GOPHERLLM_KV_I8=1`, off by default everywhere): one f16 scale plus 32
+  signed int8 values per 32 elements, the same row format this project's
+  `--compress` tool already writes for weight tensors. This is a
+  **memory-capacity feature, not a speed feature** — be clear-eyed about the
+  byte math before enabling it:
+
+  | format | bytes/element | vs. f32 | vs. f16 |
+  |---|---|---|---|
+  | f32 | 4 | 1x | — |
+  | f16 | 2 | 2x | 1x |
+  | int8 (Q8_0) | 1.0625 | 3.76x | 1.88x |
+
+  f16-over-f32 is a clean 2x, which is why it's the amd64 default; int8's
+  *incremental* saving over the already-default f16 cache is much smaller
+  (1.88x, not another 2x). At typical short chat context (dozens to a few
+  hundred tokens) that difference is a small fraction of a percent of total
+  per-token memory traffic — most of decode's cost is the weight matvecs, not
+  the KV-cache scan — so expect **no measurable decode-speed change** there.
+  The saving only starts displacing real DRAM traffic once resident context
+  is large (roughly the same multi-thousand-token regime that already
+  justifies this project's grouped-GQA threshold), where it can fit
+  meaningfully more context in the same memory budget than f16 alone. Only
+  enabled when every relevant dimension (`K`/`V` width and each individual
+  head's width) is a multiple of 32 — Q8_0 rows are only addressable at block
+  boundaries, so a model whose head dimension isn't 32-aligned automatically
+  falls back to the f16 or f32 cache instead of silently corrupting attention.
+  Scalar-only for now (no AVX2/NEON kernels yet); not part of `--auto`'s
+  search.
 - After mmap'ing a single-file GGUF, every page is touched once up front
   across all worker threads (`prefaultPages`) before the model is reported
   loaded. A memory-mapped file only pages in on first touch, and a forward
@@ -1244,6 +1273,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on Apple Silicon) to halve KV memory |
+| `GOPHERLLM_KV_I8` | `1` opts into the Q8_0-block KV cache tier (off by default everywhere) — a memory-capacity option, not a speed one; see the KV cache section above |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |

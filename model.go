@@ -1156,6 +1156,17 @@ type KVCache struct {
 	// and attention converts rows in-register (see kv_f16.go). Halves the
 	// cache's memory footprint and the bytes attention streams per token.
 	F16 bool
+	// I8 selects Q8_0-block row storage: K8/V8 replace K/V entirely (see
+	// kv_i8.go). ~3.76x smaller than f32 and ~1.88x smaller than f16, at the
+	// cost of a coarser, data-dependent quantization the fixed f16 conversion
+	// doesn't have. Only ever set when kvI8Eligible has already verified every
+	// relevant dimension is a multiple of 32 — the format assumes block
+	// (not element) addressability wherever it slices K8/V8 by KV head.
+	// Kept as a second bool alongside F16, not merged into one field, so the
+	// exported F16 field and NewKVCache/NewKVCacheF16 stay unchanged for any
+	// external caller; kvFormat below is the single place that resolves both
+	// bools into one tri-state so no call site re-derives it independently.
+	I8 bool
 	// Nemotron is the shared recurrent cache for Mamba-2 graphs. Hybrid
 	// Nemotron-H also uses K/V rows; pure Mamba2 leaves those dimensions empty.
 	Nemotron *NemotronHCache
@@ -1165,6 +1176,32 @@ type KVCache struct {
 	Qwen35 *Qwen35Cache
 	K16    [][]uint16
 	V16    [][]uint16
+	K8     [][]byte
+	V8     [][]byte
+}
+
+// kvFormat is the tri-state storage format a KVCache actually holds. Every
+// internal dispatch site should call (*KVCache).kvFormat() rather than
+// re-checking F16/I8 independently — that guarantees a single, consistent
+// precedence rule everywhere instead of two branches silently disagreeing on
+// a malformed cache.
+type kvFormat uint8
+
+const (
+	kvF32 kvFormat = iota
+	kvF16
+	kvI8
+)
+
+func (c *KVCache) kvFormat() kvFormat {
+	switch {
+	case c.I8:
+		return kvI8
+	case c.F16:
+		return kvF16
+	default:
+		return kvF32
+	}
 }
 
 // NewKVCache allocates an f32 cache for `layers` layers of maxLen positions
@@ -1190,34 +1227,85 @@ func NewKVCacheF16(layers, kDim, vDim, maxLen int) *KVCache {
 	return &KVCache{K16: k, V16: v, F16: true, PerPosKDim: kDim, PerPosVDim: vDim, MaxLen: maxLen}
 }
 
-// newKVCacheAuto picks f16 storage where the platform supports it (see
-// useF16KVCache) and exact f32 storage everywhere else.
-func newKVCacheAuto(layers, kDim, vDim, maxLen int) *KVCache {
-	if useF16KVCache.Load() {
-		return NewKVCacheF16(layers, kDim, vDim, maxLen)
+// NewKVCacheI8 is NewKVCache with Q8_0-block row storage. Callers must have
+// already verified kvI8Eligible(kDim, vDim, headDim, valueDim) — this
+// constructor does not re-check alignment itself, matching NewKVCacheF16's
+// contract of trusting its caller's format decision.
+func NewKVCacheI8(layers, kDim, vDim, maxLen int) *KVCache {
+	k := make([][]byte, layers)
+	v := make([][]byte, layers)
+	kRowBytes := q8RowBytes(kDim)
+	vRowBytes := q8RowBytes(vDim)
+	for i := range layers {
+		k[i] = make([]byte, maxLen*kRowBytes)
+		v[i] = make([]byte, maxLen*vRowBytes)
 	}
-	return NewKVCache(layers, kDim, vDim, maxLen)
+	return &KVCache{K8: k, V8: v, I8: true, PerPosKDim: kDim, PerPosVDim: vDim, MaxLen: maxLen}
+}
+
+// desiredKVFormat resolves the global toggles into the format a new cache
+// should be built as, applying the same I8-then-F16-then-F32 precedence
+// kvFormat uses for an existing cache. allowI8 gates I8 on this request's
+// dimensions already having passed kvI8Eligible — see generationWorkspace.
+func desiredKVFormat(allowI8 bool) kvFormat {
+	switch {
+	case allowI8 && useI8KVCache.Load():
+		return kvI8
+	case useF16KVCache.Load():
+		return kvF16
+	default:
+		return kvF32
+	}
+}
+
+// newKVCacheAuto picks the fastest storage format the platform/model shape
+// supports: int8 if explicitly enabled and allowI8 (dimension-eligible), else
+// f16 where the platform supports it (see useF16KVCache), else exact f32.
+func newKVCacheAuto(layers, kDim, vDim, maxLen int, allowI8 bool) *KVCache {
+	switch desiredKVFormat(allowI8) {
+	case kvI8:
+		return NewKVCacheI8(layers, kDim, vDim, maxLen)
+	case kvF16:
+		return NewKVCacheF16(layers, kDim, vDim, maxLen)
+	default:
+		return NewKVCache(layers, kDim, vDim, maxLen)
+	}
 }
 
 // layerCount reports the number of layers the cache was allocated for,
 // regardless of element format.
 func (c *KVCache) layerCount() int {
-	if c.F16 {
+	switch c.kvFormat() {
+	case kvI8:
+		return len(c.K8)
+	case kvF16:
 		return len(c.K16)
+	default:
+		return len(c.K)
 	}
-	return len(c.K)
 }
 
 // storeKV writes one position's K and V rows into the cache in its native
 // element format.
 func (c *KVCache) storeKV(l, pos int, k, v []float32) {
-	kStart := pos * c.PerPosKDim
-	vStart := pos * c.PerPosVDim
-	if c.F16 {
+	switch c.kvFormat() {
+	case kvI8:
+		kRowBytes := q8RowBytes(c.PerPosKDim)
+		vRowBytes := q8RowBytes(c.PerPosVDim)
+		kStart8 := pos * kRowBytes
+		vStart8 := pos * vRowBytes
+		f32ToQ8Row(c.K8[l][kStart8:kStart8+kRowBytes], k)
+		f32ToQ8Row(c.V8[l][vStart8:vStart8+vRowBytes], v)
+		return
+	case kvF16:
+		kStart := pos * c.PerPosKDim
+		vStart := pos * c.PerPosVDim
 		f32ToF16Row(c.K16[l][kStart:kStart+min(len(k), c.PerPosKDim)], k)
 		f32ToF16Row(c.V16[l][vStart:vStart+min(len(v), c.PerPosVDim)], v)
 		return
 	}
+	kStart := pos * c.PerPosKDim
+	vStart := pos * c.PerPosVDim
 	copy(c.K[l][kStart:kStart+min(len(k), c.PerPosKDim)], k)
 	copy(c.V[l][vStart:vStart+min(len(v), c.PerPosVDim)], v)
 }
@@ -1232,7 +1320,12 @@ func (c *KVCache) attendHead(l, kvH int, query []float32, keyHeadDim, valueHeadD
 // logit. GPT-OSS appends that logit to each head's softmax denominator without
 // adding a value row, which dampens attention when the learned sink wins.
 func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
-	if c.F16 {
+	switch c.kvFormat() {
+	case kvI8:
+		onlineAttentionI8WithSink(query, c.K8[l][q8RowBytes(kvH*keyHeadDim):], c.V8[l][q8RowBytes(kvH*valueHeadDim):],
+			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
+		return
+	case kvF16:
 		onlineAttentionF16WithSink(query, c.K16[l][kvH*keyHeadDim:], c.V16[l][kvH*valueHeadDim:],
 			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
 		return
@@ -1245,7 +1338,13 @@ func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, va
 // Keeping their score and value passes adjacent lets the CPU reuse each K/V
 // cacheline instead of streaming the same cache once per query head.
 func (c *KVCache) attendHeadGroup(l, kvH int, queries []float32, queryHeads, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
-	if c.F16 {
+	switch c.kvFormat() {
+	case kvI8:
+		onlineAttentionGroupI8(queries, c.K8[l][q8RowBytes(kvH*keyHeadDim):], c.V8[l][q8RowBytes(kvH*valueHeadDim):],
+			queryHeads, c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim,
+			startT, endT, scale, softcap, out)
+		return
+	case kvF16:
 		onlineAttentionGroupF16(queries, c.K16[l][kvH*keyHeadDim:], c.V16[l][kvH*valueHeadDim:],
 			queryHeads, c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim,
 			startT, endT, scale, softcap, out)
@@ -2320,7 +2419,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		// GQA/MQA query heads share K/V rows. Process each complete group together
 		// so the shared cacheline is fetched once, then parallelize across KV
 		// groups at contexts long enough to amortize dispatch.
-		groupedGQA := useGroupedGQAAttention && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0
+		groupedGQA := useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0
 		if attnLen := pos - attnStart + 1; groupedGQA && attnLen >= groupedGQADecodeMinContext && config.NKVHeads > 1 {
 			parallelAttendHeadGroups(config, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else if groupedGQA && attnLen < 128 {
@@ -2980,7 +3079,7 @@ func onlineAttentionGroup(queries, keys, values []float32, queryHeads, keyStride
 			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
 		return
 	}
-	onlineAttentionGroupEither(queries, keys, nil, values, nil, queryHeads,
+	onlineAttentionGroupEither(queries, keys, nil, nil, values, nil, nil, queryHeads,
 		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
 }
 
@@ -3042,11 +3141,21 @@ func onlineAttentionGroup4(queries, keys, values []float32, keyStride, valueStri
 }
 
 func onlineAttentionGroupF16(queries []float32, keys, values []uint16, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
-	onlineAttentionGroupEither(queries, nil, keys, nil, values, queryHeads,
+	onlineAttentionGroupEither(queries, nil, keys, nil, nil, values, nil, queryHeads,
 		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
 }
 
-func onlineAttentionGroupEither(queries []float32, keys []float32, keys16 []uint16, values []float32, values16 []uint16, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+// onlineAttentionGroupI8 is the Q8_0-KV-cache counterpart of
+// onlineAttentionGroupF16. keys8/values8 must already be sliced to the
+// correct KV head's byte offset (q8RowBytes(kvH*keyHeadDim), see
+// attendHeadGroup) — keyStride/valueStride stay in element units exactly as
+// for f32/f16, and are converted to Q8_0 byte strides internally.
+func onlineAttentionGroupI8(queries []float32, keys8, values8 []byte, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	onlineAttentionGroupEither(queries, nil, nil, keys8, nil, nil, values8, queryHeads,
+		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+}
+
+func onlineAttentionGroupEither(queries []float32, keys []float32, keys16 []uint16, keys8 []byte, values []float32, values16 []uint16, values8 []byte, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
 	span := endT - startT + 1
 	if span <= 0 || queryHeads <= 0 || len(queries) < queryHeads*keyHeadDim || len(out) < queryHeads*valueHeadDim {
 		return
@@ -3057,18 +3166,42 @@ func onlineAttentionGroupEither(queries []float32, keys []float32, keys16 []uint
 	scores := (*scratch)[:scoreLen]
 	denoms := (*scratch)[scoreLen : scoreLen+queryHeads]
 
+	// Only meaningful (and only computed) when keys8/values8 are the active
+	// format — see q8RowBytes's doc comment for why byte and element offsets
+	// are not interchangeable for Q8_0-packed rows.
+	keyByteStride := q8RowBytes(keyStride)
+	keyBlockBytes := q8RowBytes(keyHeadDim)
+
 	n := 0
+scorePass:
 	for t := startT; t <= endT; t++ {
-		kOff := t * keyStride
-		if (keys != nil && kOff+keyHeadDim > len(keys)) || (keys == nil && kOff+keyHeadDim > len(keys16)) {
-			break
-		}
-		for h := 0; h < queryHeads; h++ {
-			query := queries[h*keyHeadDim : (h+1)*keyHeadDim]
-			if keys != nil {
+		switch {
+		case keys != nil:
+			kOff := t * keyStride
+			if kOff+keyHeadDim > len(keys) {
+				break scorePass
+			}
+			for h := 0; h < queryHeads; h++ {
+				query := queries[h*keyHeadDim : (h+1)*keyHeadDim]
 				scores[h*span+n] = DotF32(query, keys[kOff:kOff+keyHeadDim]) * scale
-			} else {
+			}
+		case keys16 != nil:
+			kOff := t * keyStride
+			if kOff+keyHeadDim > len(keys16) {
+				break scorePass
+			}
+			for h := 0; h < queryHeads; h++ {
+				query := queries[h*keyHeadDim : (h+1)*keyHeadDim]
 				scores[h*span+n] = dotF32F16(query, keys16[kOff:kOff+keyHeadDim]) * scale
+			}
+		default:
+			kOff8 := t * keyByteStride
+			if kOff8+keyBlockBytes > len(keys8) {
+				break scorePass
+			}
+			for h := 0; h < queryHeads; h++ {
+				query := queries[h*keyHeadDim : (h+1)*keyHeadDim]
+				scores[h*span+n] = DotQ8_0F32(keys8[kOff8:kOff8+keyBlockBytes], query, keyHeadDim) * scale
 			}
 		}
 		n++
@@ -3082,18 +3215,35 @@ func onlineAttentionGroupEither(queries []float32, keys []float32, keys16 []uint
 		denoms[h] = attentionWeightsInPlace(scores[h*span:h*span+n], softcap)
 	}
 
+	valueByteStride := q8RowBytes(valueStride)
+	valueBlockBytes := q8RowBytes(valueHeadDim)
+
+valuePass:
 	for i := 0; i < n; i++ {
-		vOff := (startT + i) * valueStride
-		if (values != nil && vOff+valueHeadDim > len(values)) || (values == nil && vOff+valueHeadDim > len(values16)) {
-			break
-		}
-		for h := 0; h < queryHeads; h++ {
-			weight := scores[h*span+i]
-			hout := out[h*valueHeadDim : (h+1)*valueHeadDim]
-			if values != nil {
-				AxpyF32(hout, weight, values[vOff:vOff+valueHeadDim])
-			} else {
-				axpyF16(hout, weight, values16[vOff:vOff+valueHeadDim])
+		switch {
+		case values != nil:
+			vOff := (startT + i) * valueStride
+			if vOff+valueHeadDim > len(values) {
+				break valuePass
+			}
+			for h := 0; h < queryHeads; h++ {
+				AxpyF32(out[h*valueHeadDim:(h+1)*valueHeadDim], scores[h*span+i], values[vOff:vOff+valueHeadDim])
+			}
+		case values16 != nil:
+			vOff := (startT + i) * valueStride
+			if vOff+valueHeadDim > len(values16) {
+				break valuePass
+			}
+			for h := 0; h < queryHeads; h++ {
+				axpyF16(out[h*valueHeadDim:(h+1)*valueHeadDim], scores[h*span+i], values16[vOff:vOff+valueHeadDim])
+			}
+		default:
+			vOff8 := (startT + i) * valueByteStride
+			if vOff8+valueBlockBytes > len(values8) {
+				break valuePass
+			}
+			for h := 0; h < queryHeads; h++ {
+				axpyQ8Row(out[h*valueHeadDim:(h+1)*valueHeadDim], scores[h*span+i], values8[vOff8:vOff8+valueBlockBytes])
 			}
 		}
 	}
@@ -3126,22 +3276,23 @@ func attentionWeightsInPlace(scores []float32, softcap float32) float32 {
 	return denom
 }
 
-// weightedVSum finishes attention pass 2 shared by the f32 and f16 K-row
-// variants: optional softcap, max-stabilized softmax weights in place, then
-// out += sum(w_i * V_row_i) / denom. values16 is used when values is nil.
+// weightedVSum finishes attention pass 2 shared by the f32, f16, and int8
+// K-row variants: optional softcap, max-stabilized softmax weights in place,
+// then out += sum(w_i * V_row_i) / denom. values16/values8 are used when
+// values is nil.
 func weightedVSum(scores []float32, values []float32, valueStride, valueHeadDim, startT int, softcap float32, out []float32) {
 	weightedVSumWithSink(scores, values, valueStride, valueHeadDim, startT, softcap, 0, false, out)
 }
 
 func weightedVSumWithSink(scores []float32, values []float32, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {
-	weightedVSumEitherWithSink(scores, values, nil, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
+	weightedVSumEitherWithSink(scores, values, nil, nil, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
 }
 
 func weightedVSumEither(scores []float32, values []float32, values16 []uint16, valueStride, valueHeadDim, startT int, softcap float32, out []float32) {
-	weightedVSumEitherWithSink(scores, values, values16, valueStride, valueHeadDim, startT, softcap, 0, false, out)
+	weightedVSumEitherWithSink(scores, values, values16, nil, valueStride, valueHeadDim, startT, softcap, 0, false, out)
 }
 
-func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []uint16, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {
+func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []uint16, values8 []byte, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {
 	n := len(scores)
 	if n == 0 {
 		return
@@ -3169,18 +3320,27 @@ func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []u
 	if hasSink {
 		denom += float32(math.Exp(float64(sink - maxScore)))
 	}
+	valueByteStride := q8RowBytes(valueStride)
+	valueBlockBytes := q8RowBytes(valueHeadDim)
 	for i := 0; i < n; i++ {
-		vOff := (startT + i) * valueStride
 		if values != nil {
+			vOff := (startT + i) * valueStride
 			if vOff+valueHeadDim > len(values) {
 				break
 			}
 			AxpyF32(out[:valueHeadDim], scores[i], values[vOff:vOff+valueHeadDim])
-		} else {
+		} else if values16 != nil {
+			vOff := (startT + i) * valueStride
 			if vOff+valueHeadDim > len(values16) {
 				break
 			}
 			axpyF16(out[:valueHeadDim], scores[i], values16[vOff:vOff+valueHeadDim])
+		} else {
+			vOff8 := (startT + i) * valueByteStride
+			if vOff8+valueBlockBytes > len(values8) {
+				break
+			}
+			axpyQ8Row(out[:valueHeadDim], scores[i], values8[vOff8:vOff8+valueBlockBytes])
 		}
 	}
 	if denom > 0 {

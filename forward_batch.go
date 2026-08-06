@@ -367,7 +367,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 					attnStart = max(0, pos-config.SlidingWindow)
 				}
 				clear(AttnOut[t])
-				if useGroupedGQAAttention && !cache.F16 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 {
+				if useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 {
 					for kvH := 0; kvH < config.NKVHeads; kvH++ {
 						hStart := kvH * kvMul
 						hEnd := min(hStart+kvMul, config.NHeads)

@@ -106,6 +106,6 @@ func onlineAttentionF16WithSink(query []float32, keys, values []uint16, keyStrid
 		scores[n] = dotF32F16(query, keys[kOff:kOff+keyHeadDim]) * scale
 		n++
 	}
-	weightedVSumEitherWithSink(scores[:n], nil, values, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
+	weightedVSumEitherWithSink(scores[:n], nil, values, nil, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
 	attnScoresPool.Put(scratch)
 }

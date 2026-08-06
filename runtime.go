@@ -917,9 +917,16 @@ func (r *Runner) kvCacheLayerCount() int {
 
 const maxReusableKVCacheBytes int64 = 512 << 20
 
-func kvCacheBytes(layers, kDim, vDim, cacheLen int, f16 bool) int64 {
+func kvCacheBytes(layers, kDim, vDim, cacheLen int, format kvFormat) int64 {
+	if format == kvI8 {
+		// Q8_0 is 34 bytes per 32-element block (1.0625 B/elem), not a flat
+		// per-element multiplier like f32/f16 — computing bytesPerRow first
+		// keeps the block rounding exact instead of approximating it.
+		bytesPerRow := int64(q8RowBytes(kDim) + q8RowBytes(vDim))
+		return int64(layers) * bytesPerRow * int64(cacheLen)
+	}
 	elemBytes := int64(4)
-	if f16 {
+	if format == kvF16 {
 		elemBytes = 2
 	}
 	return int64(layers) * int64(kDim+vDim) * int64(cacheLen) * elemBytes
@@ -945,7 +952,7 @@ func grownKVCacheLen(current, required, limit int, config Config) int {
 // It intentionally excludes Nemotron-H's recurrent state; prefix reuse for
 // that hybrid architecture stays disabled until its state can be copied too.
 func copyKVPrefix(dst, src *KVCache, positions int) int {
-	if dst == nil || src == nil || positions <= 0 || dst.F16 != src.F16 ||
+	if dst == nil || src == nil || positions <= 0 || dst.kvFormat() != src.kvFormat() ||
 		dst.PerPosKDim != src.PerPosKDim || dst.PerPosVDim != src.PerPosVDim ||
 		dst.layerCount() != src.layerCount() {
 		return 0
@@ -953,6 +960,15 @@ func copyKVPrefix(dst, src *KVCache, positions int) int {
 	positions = min(positions, min(dst.MaxLen, src.MaxLen))
 	if positions <= 0 {
 		return 0
+	}
+	if dst.kvFormat() == kvI8 {
+		kLen8 := positions * q8RowBytes(dst.PerPosKDim)
+		vLen8 := positions * q8RowBytes(dst.PerPosVDim)
+		for layer := 0; layer < dst.layerCount(); layer++ {
+			copy(dst.K8[layer][:kLen8], src.K8[layer][:kLen8])
+			copy(dst.V8[layer][:vLen8], src.V8[layer][:vLen8])
+		}
+		return positions
 	}
 	kLen := positions * dst.PerPosKDim
 	vLen := positions * dst.PerPosVDim
@@ -1013,7 +1029,14 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	layers := r.kvCacheLayerCount()
 	old := r.workspaceCache
-	shapeCompatible := old != nil && old.layerCount() == layers && old.F16 == useF16KVCache.Load() &&
+	// allowI8/desiredFormat are computed once here and reused for both the
+	// reuse-compatibility check below and the allocation call further down —
+	// two independently-written derivations of "what format should this be"
+	// could silently disagree on a stale-cache-reuse decision without either
+	// one erroring, which is exactly the failure mode worth avoiding.
+	allowI8 := kvI8Eligible(kDim, vDim, maxHead, maxVal)
+	desiredFormat := desiredKVFormat(allowI8)
+	shapeCompatible := old != nil && old.layerCount() == layers && old.kvFormat() == desiredFormat &&
 		old.PerPosKDim == kDim && old.PerPosVDim == vDim
 	cache := old
 	compatible := shapeCompatible && old.MaxLen >= cacheLen
@@ -1025,11 +1048,11 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		// Geometric headroom is useful only while it stays within the same
 		// retention budget. Never make a one-off request allocate a larger
 		// temporary cache merely because the next growth step crossed 512 MiB.
-		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, useF16KVCache.Load()) > maxReusableKVCacheBytes {
+		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, desiredFormat) > maxReusableKVCacheBytes {
 			targetLen = cacheLen
 		}
-		cache = newKVCacheAuto(layers, kDim, vDim, targetLen)
-		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.F16)
+		cache = newKVCacheAuto(layers, kDim, vDim, targetLen, allowI8)
+		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.kvFormat())
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
 			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 && r.kind != loadedQwen35 {
