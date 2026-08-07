@@ -41,11 +41,16 @@ const (
 	GGMLTypeQ5_K    GGMLType = 13
 	GGMLTypeQ6_K    GGMLType = 14
 	GGMLTypeQ8_K    GGMLType = 15
+	GGMLTypeIQ2_XXS GGMLType = 16
+	GGMLTypeIQ2_XS  GGMLType = 17
+	GGMLTypeIQ3_XXS GGMLType = 18
+	GGMLTypeIQ1_S   GGMLType = 19
 	GGMLTypeIQ4_NL  GGMLType = 20
 	GGMLTypeIQ3_S   GGMLType = 21
 	GGMLTypeIQ2_S   GGMLType = 22
 	GGMLTypeIQ4_XS  GGMLType = 23
 	GGMLTypeF64     GGMLType = 28
+	GGMLTypeIQ1_M   GGMLType = 29
 	GGMLTypeBF16    GGMLType = 30
 	GGMLTypeTQ1_0   GGMLType = 34
 	GGMLTypeTQ2_0   GGMLType = 35
@@ -63,6 +68,7 @@ func ggmlTypeFromUint32(v uint32) GGMLType {
 	case GGMLTypeF32, GGMLTypeF16, GGMLTypeQ4_0, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1,
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
 		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeIQ3_S, GGMLTypeIQ2_S, GGMLTypeIQ4_XS,
+		GGMLTypeIQ2_XXS, GGMLTypeIQ2_XS, GGMLTypeIQ3_XXS, GGMLTypeIQ1_S, GGMLTypeIQ1_M,
 		GGMLTypeF64, GGMLTypeBF16, GGMLTypeTQ1_0, GGMLTypeTQ2_0, GGMLTypeMXFP4, GGMLTypeQ1_0, GGMLTypeQ2_0:
 		return GGMLType(v)
 	default:
@@ -108,6 +114,16 @@ func (t GGMLType) String() string {
 		return "IQ2_S"
 	case GGMLTypeIQ4_XS:
 		return "IQ4_XS"
+	case GGMLTypeIQ2_XXS:
+		return "IQ2_XXS"
+	case GGMLTypeIQ2_XS:
+		return "IQ2_XS"
+	case GGMLTypeIQ3_XXS:
+		return "IQ3_XXS"
+	case GGMLTypeIQ1_S:
+		return "IQ1_S"
+	case GGMLTypeIQ1_M:
+		return "IQ1_M"
 	case GGMLTypeF64:
 		return "F64"
 	case GGMLTypeBF16:
@@ -142,7 +158,8 @@ func (t GGMLType) BlockSize() int {
 		return 64
 	case GGMLTypeTQ1_0, GGMLTypeTQ2_0,
 		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeQ8_K,
-		GGMLTypeIQ2_S, GGMLTypeIQ3_S, GGMLTypeIQ4_XS:
+		GGMLTypeIQ2_S, GGMLTypeIQ3_S, GGMLTypeIQ4_XS,
+		GGMLTypeIQ2_XXS, GGMLTypeIQ2_XS, GGMLTypeIQ3_XXS, GGMLTypeIQ1_S, GGMLTypeIQ1_M:
 		return 256
 	default:
 		return 32
@@ -202,6 +219,16 @@ func (t GGMLType) BlockBytes() (int, bool) {
 //	       8 high-index bits + 8 packed scales
 //	IQ3_S: 110 B / 256 elems = f16 d + 64 byte codebook indices + 8 high
 //	       index bits + 32 sign bits + 4 packed scales
+//	IQ2_XXS: 66 B / 256 elems = f16 d + 32 uint16 codebook/sign indices
+//	IQ2_XS:  74 B / 256 elems = f16 d + 32 uint16 codebook indices +
+//	       8 packed scales (sign bits come from a shared lookup table)
+//	IQ3_XXS: 98 B / 256 elems = f16 d + 96 byte codebook indices (the
+//	       trailing 4 bytes per 32-elem group double as packed scale+signs)
+//	IQ1_S:   50 B / 256 elems = f16 d + 32 byte low grid-index bits +
+//	       8 uint16 high-index/scale/sign words
+//	IQ1_M:   56 B / 256 elems = 32 byte low grid-index bits + 16 byte
+//	       high-index/sign bits + 8 byte packed 3-bit scales (the block
+//	       scale is reassembled from spare high bits of the scales word)
 //	TQ1_0:  54 B / 256 elems = 48 base-3 bytes + 4 base-3 high bytes + f16 d
 //	TQ2_0:  66 B / 256 elems = 64 packed 2-bit ternary values + f16 d
 //	MXFP4: 17 B / 32 elems  = 16 nibble-packed FP4 values + 1 shared
@@ -243,6 +270,16 @@ func (t GGMLType) DataSize(n int) (int, bool) {
 		return (n / 256) * 82, true
 	case GGMLTypeIQ3_S:
 		return (n / 256) * 110, true
+	case GGMLTypeIQ2_XXS:
+		return (n / 256) * 66, true
+	case GGMLTypeIQ2_XS:
+		return (n / 256) * 74, true
+	case GGMLTypeIQ3_XXS:
+		return (n / 256) * 98, true
+	case GGMLTypeIQ1_S:
+		return (n / 256) * 50, true
+	case GGMLTypeIQ1_M:
+		return (n / 256) * 56, true
 	case GGMLTypeTQ1_0:
 		return (n / 256) * 54, true
 	case GGMLTypeTQ2_0:

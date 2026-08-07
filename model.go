@@ -522,6 +522,16 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecIQ3SInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeIQ4_XS:
 		MatvecIQ4XSInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ2_XXS:
+		MatvecIQ2XXSInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ2_XS:
+		MatvecIQ2XSInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ3_XXS:
+		MatvecIQ3XXSInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ1_S:
+		MatvecIQ1SInto(w.Raw, x, w.Rows, w.Cols, out)
+	case GGMLTypeIQ1_M:
+		MatvecIQ1MInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_1:
 		MatvecQ4_1Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ5_0:
@@ -888,6 +898,21 @@ func (w Weight) RowInto(row, cols int, out *[]float32) {
 	case GGMLTypeIQ4_XS:
 		rowBytes := (cols / 256) * 136
 		DequantRowIQ4XSInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ2_XXS:
+		rowBytes := (cols / 256) * 66
+		DequantRowIQ2XXSInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ2_XS:
+		rowBytes := (cols / 256) * 74
+		DequantRowIQ2XSInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ3_XXS:
+		rowBytes := (cols / 256) * 98
+		DequantRowIQ3XXSInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ1_S:
+		rowBytes := (cols / 256) * 50
+		DequantRowIQ1SInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
+	case GGMLTypeIQ1_M:
+		rowBytes := (cols / 256) * 56
+		DequantRowIQ1MInto(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
 	case GGMLTypeQ4_1:
 		rowBytes := (cols / 32) * 20
 		DequantRowQ4_1Into(w.Raw[row*rowBytes:min((row+1)*rowBytes, len(w.Raw))], cols, *out)
@@ -2149,6 +2174,7 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		return Weight{F32: f}, nil
 	case GGMLTypeQ8_0, GGMLTypeQ4_0, GGMLTypeIQ4_NL, GGMLTypeIQ2_S, GGMLTypeIQ3_S, GGMLTypeIQ4_XS, GGMLTypeQ4_1, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_1, GGMLTypeQ8_K,
 		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K, GGMLTypeTQ1_0, GGMLTypeTQ2_0,
+		GGMLTypeIQ2_XXS, GGMLTypeIQ2_XS, GGMLTypeIQ3_XXS, GGMLTypeIQ1_S, GGMLTypeIQ1_M,
 		GGMLTypeMXFP4, GGMLTypeQ1_0, GGMLTypeQ2_0:
 		if forceF32 {
 			f, ok := dequantTensor(info.DType, raw, numel)
@@ -2195,6 +2221,16 @@ func dequantTensor(t GGMLType, raw []byte, numel int) ([]float32, bool) {
 		return DequantRowIQ3S(raw, numel), true
 	case GGMLTypeIQ4_XS:
 		return DequantRowIQ4XS(raw, numel), true
+	case GGMLTypeIQ2_XXS:
+		return DequantRowIQ2XXS(raw, numel), true
+	case GGMLTypeIQ2_XS:
+		return DequantRowIQ2XS(raw, numel), true
+	case GGMLTypeIQ3_XXS:
+		return DequantRowIQ3XXS(raw, numel), true
+	case GGMLTypeIQ1_S:
+		return DequantRowIQ1S(raw, numel), true
+	case GGMLTypeIQ1_M:
+		return DequantRowIQ1M(raw, numel), true
 	case GGMLTypeQ4_1:
 		return DequantRowQ4_1(raw, numel), true
 	case GGMLTypeQ5_0:
@@ -2973,6 +3009,16 @@ func sameTypeQuantDot(a, b Weight, x []float32) (quantRowDot, int, bool) {
 		dot = DotIQ3SF32
 	case GGMLTypeIQ4_XS:
 		dot = DotIQ4XSF32
+	case GGMLTypeIQ2_XXS:
+		dot = DotIQ2XXSF32
+	case GGMLTypeIQ2_XS:
+		dot = DotIQ2XSF32
+	case GGMLTypeIQ3_XXS:
+		dot = DotIQ3XXSF32
+	case GGMLTypeIQ1_S:
+		dot = DotIQ1SF32
+	case GGMLTypeIQ1_M:
+		dot = DotIQ1MF32
 	case GGMLTypeQ4_1:
 		dot = DotQ4_1F32
 	case GGMLTypeQ5_0:
