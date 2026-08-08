@@ -53,7 +53,12 @@
         const { instance } = await WebAssembly.instantiateStreaming(resp, go.importObject);
         go.run(instance);
         await waitForBridge(4000);
-      })();
+      })().catch((error) => {
+        // A transient fetch, CSP, or compile failure must not poison every
+        // later retry in this tab with the same rejected Promise.
+        goInstancePromise = null;
+        throw error;
+      });
     }
     return goInstancePromise;
   }

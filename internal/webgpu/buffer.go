@@ -126,6 +126,7 @@ func (d *Device) ReadBuffer(src *Buffer, byteOffset, size int) ([]byte, error) {
 	desc.Set("size", paddedSize)
 	desc.Set("usage", gpuBufferUsage("MAP_READ", "COPY_DST"))
 	staging := d.device.Call("createBuffer", desc)
+	defer staging.Call("destroy")
 
 	encoder := d.device.Call("createCommandEncoder")
 	encoder.Call("copyBufferToBuffer", src.value, byteOffset, staging, 0, paddedSize)

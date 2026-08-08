@@ -1117,15 +1117,21 @@ func releaseModelMetalWeights(weights *ModelWeights) {
 		return
 	}
 	seen := map[*MetalWeight]bool{}
+	seenGPU := map[*GPUWeight]bool{}
 	release := func(w *Weight) {
-		if w == nil || w.Metal == nil {
+		if w == nil {
 			return
 		}
-		if !seen[w.Metal] {
+		if w.Metal != nil && !seen[w.Metal] {
 			releaseMetalWeight(w.Metal)
 			seen[w.Metal] = true
 		}
+		if w.GPU != nil && !seenGPU[w.GPU] {
+			releaseWebGPUWeight(w.GPU)
+			seenGPU[w.GPU] = true
+		}
 		w.Metal = nil
+		w.GPU = nil
 	}
 	release(&weights.TokenEmbd)
 	release(&weights.Output)

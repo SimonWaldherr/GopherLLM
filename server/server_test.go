@@ -104,6 +104,42 @@ func TestChatUIAssetsArePrivateAndSelfContained(t *testing.T) {
 	}
 }
 
+func TestChatUIWasmAssetsRevalidate(t *testing.T) {
+	wasmDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wasmDir, "gopherllm.wasm"), []byte("wasm-test"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wasmDir, "wasm_exec.js"), []byte("// wasm bootstrap"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ChatUI: true, WasmDir: wasmDir}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/wasm/gopherllm.wasm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if got := resp.Header.Get("Cache-Control"); got != "private, max-age=0, must-revalidate" {
+		t.Fatalf("cache-control = %q", got)
+	}
+	if modified := resp.Header.Get("Last-Modified"); modified != "" {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/wasm/gopherllm.wasm", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("If-Modified-Since", modified)
+		cached, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cached.Body.Close()
+		if cached.StatusCode != http.StatusNotModified {
+			t.Fatalf("conditional GET status = %d, want %d", cached.StatusCode, http.StatusNotModified)
+		}
+	}
+}
+
 func TestHandlerStartsWithoutModel(t *testing.T) {
 	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ChatUI: true}))
 	defer srv.Close()

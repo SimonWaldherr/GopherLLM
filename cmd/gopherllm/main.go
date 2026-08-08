@@ -263,6 +263,7 @@ func run() error {
 		}
 		fmt.Fprintln(os.Stderr, "No model loaded. Choose one in the Web UI or POST /models/load.")
 		return server.Serve(nil, server.ServeOptions{
+			Context:                  commandCtx,
 			Addr:                     cfg.serveAddr,
 			Defaults:                 cfg.options,
 			MaxConcurrentConnections: cfg.maxConn,
@@ -396,7 +397,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)

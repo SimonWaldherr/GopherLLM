@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // MatvecKernel is a compiled dequantizing matvec compute pipeline (Q4_K or
@@ -13,8 +14,13 @@ import (
 // RunPrepared calls against the same Device so the (relatively expensive)
 // shader compilation happens once.
 type MatvecKernel struct {
-	dev      *Device
-	pipeline *ComputePipeline
+	dev                    *Device
+	pipeline               *ComputePipeline
+	mu                     sync.Mutex
+	xBuf                   *Buffer
+	outBuf                 *Buffer
+	paramsBuf              *Buffer
+	xCapacity, outCapacity int
 }
 
 func newMatvecKernel(dev *Device, wgsl string) (*MatvecKernel, error) {
@@ -26,10 +32,35 @@ func newMatvecKernel(dev *Device, wgsl string) (*MatvecKernel, error) {
 }
 
 // NewQ4KMatvecKernel compiles the Q4_K dequantizing matvec kernel.
-func NewQ4KMatvecKernel(dev *Device) (*MatvecKernel, error) { return newMatvecKernel(dev, Q4KMatvecWGSL) }
+func NewQ4KMatvecKernel(dev *Device) (*MatvecKernel, error) {
+	return newMatvecKernel(dev, Q4KMatvecWGSL)
+}
 
 // NewQ6KMatvecKernel compiles the Q6_K dequantizing matvec kernel.
-func NewQ6KMatvecKernel(dev *Device) (*MatvecKernel, error) { return newMatvecKernel(dev, Q6KMatvecWGSL) }
+func NewQ6KMatvecKernel(dev *Device) (*MatvecKernel, error) {
+	return newMatvecKernel(dev, Q6KMatvecWGSL)
+}
+
+// Destroy releases reusable per-dispatch buffers. PreparedWeight values own
+// their own buffers and must be released separately.
+func (k *MatvecKernel) Destroy() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.xBuf != nil {
+		k.xBuf.Destroy()
+		k.xBuf = nil
+	}
+	if k.outBuf != nil {
+		k.outBuf.Destroy()
+		k.outBuf = nil
+	}
+	if k.paramsBuf != nil {
+		k.paramsBuf.Destroy()
+		k.paramsBuf = nil
+	}
+	k.xCapacity = 0
+	k.outCapacity = 0
+}
 
 // PreparedWeight is one tensor's raw quantized bytes already resident in a
 // GPU buffer, created once (see Device.PrepareWeight) and reused for every
@@ -75,6 +106,8 @@ func (d *Device) PrepareWeight(data []byte, rows, cols int) (*PreparedWeight, er
 // weight (see PrepareWeight), uploading only the small activation vector x
 // fresh on every call -- the cheap per-token cost real decode should pay.
 func (k *MatvecKernel) RunPrepared(w *PreparedWeight, x []float32) ([]float32, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	if w.rows <= 0 || w.cols <= 0 {
 		return nil, fmt.Errorf("webgpu: prepared weight has invalid shape rows=%d cols=%d", w.rows, w.cols)
 	}
@@ -88,34 +121,65 @@ func (k *MatvecKernel) RunPrepared(w *PreparedWeight, x []float32) ([]float32, e
 		return nil, fmt.Errorf("webgpu: rows (%d) exceeds this device's maxComputeWorkgroupsPerDimension (%d)", w.rows, limit)
 	}
 
-	xBuf, err := k.dev.CreateStorageBuffer(len(x)*4, f32ToBytes(x))
-	if err != nil {
-		return nil, fmt.Errorf("webgpu: uploading activation: %w", err)
+	if err := k.ensureWorkBuffers(len(x)*4, w.rows*4); err != nil {
+		return nil, err
 	}
-	outBuf, err := k.dev.CreateStorageBuffer(w.rows*4, nil)
-	if err != nil {
-		return nil, fmt.Errorf("webgpu: creating output buffer: %w", err)
+	if err := k.dev.WriteBuffer(k.xBuf, 0, f32ToBytes(x)); err != nil {
+		return nil, fmt.Errorf("webgpu: uploading activation: %w", err)
 	}
 	params := make([]byte, 8)
 	binary.LittleEndian.PutUint32(params[0:], uint32(w.cols))
 	binary.LittleEndian.PutUint32(params[4:], 0) // rowOffset: always 0 -- one PreparedWeight is one whole (unchunked) tensor
-	paramsBuf, err := k.dev.CreateStorageBuffer(8, params)
-	if err != nil {
+	if err := k.dev.WriteBuffer(k.paramsBuf, 0, params); err != nil {
 		return nil, fmt.Errorf("webgpu: uploading params: %w", err)
 	}
 
-	bindGroup := k.dev.CreateBindGroup(k.pipeline, w.buf, xBuf, outBuf, paramsBuf)
+	bindGroup := k.dev.CreateBindGroup(k.pipeline, w.buf, k.xBuf, k.outBuf, k.paramsBuf)
 	enc := k.dev.NewEncoder()
 	enc.BeginCompute()
 	enc.Dispatch(k.pipeline, bindGroup, w.rows, 1, 1)
 	enc.EndCompute()
 	enc.Submit()
 
-	outBytes, err := k.dev.ReadBuffer(outBuf, 0, w.rows*4)
+	outBytes, err := k.dev.ReadBuffer(k.outBuf, 0, w.rows*4)
 	if err != nil {
 		return nil, fmt.Errorf("webgpu: reading output: %w", err)
 	}
 	return bytesToF32(outBytes), nil
+}
+
+// ensureWorkBuffers grows reusable activation/output buffers on demand. The
+// decode loop normally keeps dimensions fixed, turning every later matvec
+// into writes plus one dispatch/readback rather than three GPU allocations.
+func (k *MatvecKernel) ensureWorkBuffers(xSize, outSize int) error {
+	if k.xBuf == nil || k.xCapacity < xSize {
+		if k.xBuf != nil {
+			k.xBuf.Destroy()
+		}
+		buf, err := k.dev.CreateStorageBuffer(xSize, nil)
+		if err != nil {
+			return fmt.Errorf("webgpu: creating activation buffer: %w", err)
+		}
+		k.xBuf, k.xCapacity = buf, xSize
+	}
+	if k.outBuf == nil || k.outCapacity < outSize {
+		if k.outBuf != nil {
+			k.outBuf.Destroy()
+		}
+		buf, err := k.dev.CreateStorageBuffer(outSize, nil)
+		if err != nil {
+			return fmt.Errorf("webgpu: creating output buffer: %w", err)
+		}
+		k.outBuf, k.outCapacity = buf, outSize
+	}
+	if k.paramsBuf == nil {
+		buf, err := k.dev.CreateStorageBuffer(8, nil)
+		if err != nil {
+			return fmt.Errorf("webgpu: creating parameter buffer: %w", err)
+		}
+		k.paramsBuf = buf
+	}
+	return nil
 }
 
 // Run is a one-shot convenience wrapper for testing/benchmarking: prepares
@@ -127,6 +191,7 @@ func (k *MatvecKernel) Run(weightBytes []byte, x []float32, rows, cols int) ([]f
 	if err != nil {
 		return nil, err
 	}
+	defer prepared.Destroy()
 	return k.RunPrepared(prepared, x)
 }
 

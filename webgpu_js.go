@@ -20,6 +20,14 @@ type GPUWeight struct {
 	typ      GGMLType
 }
 
+func releaseWebGPUWeight(w *GPUWeight) {
+	if w == nil || w.prepared == nil {
+		return
+	}
+	w.prepared.Destroy()
+	w.prepared = nil
+}
+
 var (
 	webgpuOnce    sync.Once
 	webgpuDevice  *webgpu.Device

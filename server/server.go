@@ -324,6 +324,9 @@ func (r modelLoadRequest) selector() string {
 // convenience wrapper (used by the CLI). ChatHistoryLock remains for source
 // compatibility with older hosts; the handler serializes its own file access.
 type ServeOptions struct {
+	// Context controls the lifetime of the listener. Cancelling it gracefully
+	// stops accepting requests and releases the active runner.
+	Context                  context.Context
 	Addr                     string
 	Defaults                 gopherllm.GenerationOptions
 	MaxConcurrentConnections int
@@ -381,9 +384,38 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		OSMSearchURL:          opts.OSMSearchURL,
 	})
 	defer handler.Close()
-	server := &http.Server{Addr: opts.Addr, Handler: handler, ReadHeaderTimeout: 30 * time.Second}
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	server := &http.Server{
+		Addr:              opts.Addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 30 * time.Second,
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
 	fmt.Fprintf(logw, "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
-	return server.ListenAndServe()
+	shutdownDone := make(chan struct{})
+	shutdownFinished := make(chan struct{})
+	go func() {
+		defer close(shutdownFinished)
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.Shutdown(shutdownCtx); err != nil {
+				_ = server.Close()
+			}
+		case <-shutdownDone:
+		}
+	}()
+	err := server.ListenAndServe()
+	close(shutdownDone)
+	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
+		<-shutdownFinished
+		return nil
+	}
+	return err
 }
 
 // HandlerForModel serves a Model opened through the high-level API. It is the
@@ -1335,12 +1367,16 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		if hasLocalRuntime {
 			mux.HandleFunc("/wasm/gopherllm.wasm", func(w http.ResponseWriter, req *http.Request) {
 				w.Header().Set("Content-Type", "application/wasm")
-				w.Header().Set("Cache-Control", "no-store")
+				// The filename remains stable across local builds, so require a
+				// revalidation rather than serving stale bytes. Unlike no-store,
+				// this lets the browser retain the downloaded and compiled module
+				// when it has not changed.
+				w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
 				http.ServeFile(w, req, wasmPath)
 			})
 			mux.HandleFunc("/wasm/wasm_exec.js", func(w http.ResponseWriter, req *http.Request) {
 				w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
 				http.ServeFile(w, req, wasmExecPath)
 			})
 			fmt.Fprintf(logw, "Local browser inference: serving %s at /wasm/\n", opts.WasmDir)

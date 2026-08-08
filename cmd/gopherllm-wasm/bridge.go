@@ -245,8 +245,8 @@ func jsHasVision(this js.Value, args []js.Value) any {
 // from JS — plain strings/numbers only, translated here into the Go API's
 // real types (gopherllm.ChatRole is an int enum, not JSON-friendly as-is).
 type wireMessage struct {
-	Role    string   `json:"role"`
-	Content string   `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
 	// Images is base64-encoded raw image bytes (PNG/JPEG), no "data:" prefix
 	// -- capped at one per message by the underlying renderer (see
 	// runtime.go's renderMistralInstMessages).

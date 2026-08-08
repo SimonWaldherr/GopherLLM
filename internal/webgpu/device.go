@@ -19,10 +19,10 @@ type Device struct {
 // callers need, read from the real device at acquisition time -- never
 // hardcoded, since these vary by hardware/driver (see RequestAdapterAndDevice).
 type DeviceLimits struct {
-	MaxStorageBufferBindingSize      int
-	MaxStorageBuffersPerShaderStage  int
-	MinStorageBufferOffsetAlignment  int
-	MaxComputeWorkgroupsPerDimension int
+	MaxStorageBufferBindingSize       int
+	MaxStorageBuffersPerShaderStage   int
+	MinStorageBufferOffsetAlignment   int
+	MaxComputeWorkgroupsPerDimension  int
 	MaxComputeInvocationsPerWorkgroup int
 }
 

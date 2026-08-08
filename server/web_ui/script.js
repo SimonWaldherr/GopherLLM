@@ -1135,15 +1135,34 @@ function toMarkdown(chat) {
   const attachImageEl = $("attachImage");
   const imageFileInputEl = $("imageFileInput");
   const webcamButtonEl = $("webcamButton");
+  const liveVisionButtonEl = $("liveVisionButton");
   const screenButtonEl = $("screenButton");
   const captureErrorEl = $("captureError");
   const imagePreviewRowEl = $("imagePreviewRow");
   const imagePreviewEl = $("imagePreview");
   const clearImageButtonEl = $("clearImageButton");
   const captureModalEl = $("captureModal");
+  const captureTitleEl = $("captureTitle");
   const captureVideoEl = $("captureVideo");
   const captureCancelButtonEl = $("captureCancelButton");
   const captureConfirmButtonEl = $("captureConfirmButton");
+  const captureLiveButtonEl = $("captureLiveButton");
+  const captureFootEl = $("captureFoot");
+  const liveOverlayEl = $("liveOverlay");
+  const liveStatusBadgeEl = $("liveStatusBadge");
+  const liveStatusLabelEl = $("liveStatusLabel");
+  const liveSizeRangeEl = $("liveSizeRange");
+  const liveSizeValueEl = $("liveSizeValue");
+  const livePauseButtonEl = $("livePauseButton");
+  const livePromptInputEl = $("livePromptInput");
+  const livePromptSuggestionsEl = $("livePromptSuggestions");
+  const liveOutputPanelEl = $("liveOutputPanel");
+  const liveOutputTextEl = $("liveOutputText");
+  const liveHistoryToggleEl = $("liveHistoryToggle");
+  const liveHistoryListEl = $("liveHistoryList");
+  const liveStatTTFTEl = $("liveStatTTFT");
+  const liveStatTPSEl = $("liveStatTPS");
+  const liveStatElapsedEl = $("liveStatElapsed");
   const inferenceModeEl = $("inferenceMode");
   const inferenceModeSectionEl = $("inferenceModeSection");
   const inferenceModeStatusEl = $("inferenceModeStatus");
@@ -1232,6 +1251,14 @@ function toMarkdown(chat) {
   // vision pipeline's v1 boundary -- see cleanMessage's comment.
   let pendingImage = null;
   let activeCaptureStream = null;
+  let liveVisionRunning = false;
+  let liveVisionPaused = false;
+  let liveVisionController = null;
+  let liveFrameSize = 640;
+  let liveHistory = [];
+  let liveHistoryShown = false;
+  let liveElapsedTimer = null;
+  let liveStartedAt = 0;
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
@@ -4521,6 +4548,25 @@ function toMarkdown(chat) {
       showCaptureError(err);
     }
   });
+  liveVisionButtonEl.addEventListener("click", async () => {
+    if (liveVisionRunning) {
+      closeCaptureModal();
+      return;
+    }
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
+      }
+      // The dedicated Live entry point drops straight into the immersive
+      // view (camera + prompt + streaming output) instead of the plain
+      // snapshot preview -- webcamButton/screenButton still land there
+      // first since a single capture is their whole purpose.
+      await openCaptureModal(await navigator.mediaDevices.getUserMedia({ video: true }), liveVisionButtonEl);
+      runLiveVision();
+    } catch (err) {
+      showCaptureError(err);
+    }
+  });
   screenButtonEl.addEventListener("click", async () => {
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
@@ -4541,8 +4587,37 @@ function toMarkdown(chat) {
     closeCaptureModal();
     acceptCapturedImage(dataURL);
   });
+  captureLiveButtonEl.addEventListener("click", () => {
+    if (liveVisionRunning) closeCaptureModal();
+    else runLiveVision();
+  });
   captureModalEl.addEventListener("click", (event) => {
     if (event.target === captureModalEl) closeCaptureModal();
+  });
+  liveSizeRangeEl.addEventListener("input", () => {
+    liveFrameSize = boundedNumber(liveSizeRangeEl.value, 640, 256, 960, true);
+    liveSizeValueEl.textContent = liveFrameSize + "px";
+  });
+  livePauseButtonEl.addEventListener("click", () => {
+    liveVisionPaused = !liveVisionPaused;
+    setLiveStatus(liveVisionPaused ? "paused" : "live");
+    livePauseButtonEl.classList.toggle("is-paused", liveVisionPaused);
+    livePauseButtonEl.setAttribute("aria-label", liveVisionPaused ? "Resume live vision" : "Pause live vision");
+    livePauseButtonEl.title = liveVisionPaused ? "Resume" : "Pause";
+    livePauseButtonEl.querySelector("use").setAttribute("href", liveVisionPaused ? "#i-play" : "#i-pause");
+  });
+  liveHistoryToggleEl.addEventListener("click", () => {
+    liveHistoryShown = !liveHistoryShown;
+    liveHistoryToggleEl.setAttribute("aria-expanded", String(liveHistoryShown));
+    liveHistoryToggleEl.textContent = liveHistoryShown ? "Live" : "History";
+    liveOutputTextEl.hidden = liveHistoryShown;
+    liveHistoryListEl.hidden = !liveHistoryShown;
+  });
+  livePromptSuggestionsEl.addEventListener("click", (event) => {
+    const button = event.target.closest(".live-suggestion");
+    if (!button) return;
+    livePromptInputEl.value = button.dataset.prompt || "";
+    livePromptInputEl.focus();
   });
 
   // hasLocalRuntime mirrors the server's own check (HandlerOptions.WasmDir
@@ -4628,16 +4703,20 @@ function toMarkdown(chat) {
     if (!textFile) return;
     browserModelLoadEl.disabled = true;
     try {
-      browserModelStatusEl.textContent = "reading text model file…";
-      const textBytes = new Uint8Array(await textFile.arrayBuffer());
       const visionFile = browserVisionModelFileEl.files[0];
-      let visionBytes = null;
-      if (visionFile) {
-        browserModelStatusEl.textContent = "reading vision projector file…";
-        visionBytes = new Uint8Array(await visionFile.arrayBuffer());
-      }
+      // Storage reads and WASM compilation do not depend on each other.
+      // Starting both immediately removes one full serial wait from the
+      // first local-model load, particularly noticeable for large GGUFs.
+      browserModelStatusEl.textContent = "reading model file and preparing WASM runtime…";
+      const runtimeReady = loadWasmBridgeScript();
+      const [textBuffer, visionBuffer] = await Promise.all([
+        textFile.arrayBuffer(),
+        visionFile ? visionFile.arrayBuffer() : Promise.resolve(null)
+      ]);
+      const textBytes = new Uint8Array(textBuffer);
+      const visionBytes = visionBuffer ? new Uint8Array(visionBuffer) : null;
       browserModelStatusEl.textContent = "loading into GopherLLM (this can take a while for large models)…";
-      await loadWasmBridgeScript();
+      await runtimeReady;
       await window.GopherLLMBrowser.loadModel(textBytes, visionBytes);
       browserModelStatusEl.textContent = "Model loaded. Nothing was uploaded -- it was read and parsed entirely in this tab.";
       browserModelNameEl.textContent = textFile.name;
@@ -4669,6 +4748,7 @@ function toMarkdown(chat) {
     }
     attachImageEl.hidden = !vision;
     webcamButtonEl.hidden = !vision;
+    liveVisionButtonEl.hidden = !vision;
     screenButtonEl.hidden = !vision;
   }
 
@@ -4710,6 +4790,209 @@ function toMarkdown(chat) {
     }
   }
 
+  function captureLiveFrame() {
+    const canvas = document.createElement("canvas");
+    const scale = Math.min(1, liveFrameSize / Math.max(captureVideoEl.videoWidth, 1));
+    canvas.width = Math.max(1, Math.round(captureVideoEl.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(captureVideoEl.videoHeight * scale));
+    canvas.getContext("2d").drawImage(captureVideoEl, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/jpeg", 0.8);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function setLiveStatus(mode) {
+    liveStatusBadgeEl.classList.remove("is-live", "is-paused", "is-error");
+    liveOutputPanelEl.classList.remove("is-active");
+    if (mode === "live") {
+      liveStatusBadgeEl.classList.add("is-live");
+      liveStatusLabelEl.textContent = "Live";
+      liveOutputPanelEl.classList.add("is-active");
+    } else if (mode === "paused") {
+      liveStatusBadgeEl.classList.add("is-paused");
+      liveStatusLabelEl.textContent = "Paused";
+    } else if (mode === "error") {
+      liveStatusBadgeEl.classList.add("is-error");
+      liveStatusLabelEl.textContent = "Error";
+    } else {
+      liveStatusLabelEl.textContent = "Standby";
+    }
+  }
+
+  function setLiveOutputText(text, streaming, isError) {
+    liveOutputTextEl.textContent = text;
+    liveOutputTextEl.classList.toggle("is-streaming", !!streaming);
+    liveOutputTextEl.classList.toggle("is-error", !!isError);
+    liveOutputTextEl.classList.remove("is-placeholder");
+  }
+
+  function resetLiveOutput() {
+    liveOutputTextEl.classList.remove("is-streaming", "is-error");
+    liveOutputTextEl.classList.add("is-placeholder");
+    liveOutputTextEl.textContent = "Waiting for the first frame…";
+    liveStatTTFTEl.textContent = "ttft --";
+    liveStatTPSEl.textContent = "tok/s --";
+  }
+
+  function updateLiveStats(ttft, tps) {
+    liveStatTTFTEl.textContent = "ttft " + (ttft != null ? formatDuration(ttft) : "--");
+    liveStatTPSEl.textContent = "tok/s " + (tps != null ? tps.toFixed(1) : "--");
+  }
+
+  function pushLiveHistory(text) {
+    const time = new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    liveHistory = [{ time, text }, ...liveHistory].slice(0, 50);
+    renderLiveHistory();
+  }
+
+  function renderLiveHistory() {
+    if (!liveHistory.length) {
+      liveHistoryListEl.innerHTML = '<li class="live-history-empty">No history yet.</li>';
+      return;
+    }
+    liveHistoryListEl.innerHTML = liveHistory.map((entry) =>
+      '<li><span class="live-history-time">[' + escapeHTML(entry.time) + ']</span><span>' + escapeHTML(entry.text) + '</span></li>'
+    ).join("");
+  }
+
+  function startLiveElapsedTimer() {
+    liveStartedAt = performance.now();
+    liveStatElapsedEl.textContent = "0:00";
+    stopLiveElapsedTimer();
+    liveElapsedTimer = setInterval(() => {
+      const totalSec = Math.floor((performance.now() - liveStartedAt) / 1000);
+      liveStatElapsedEl.textContent = Math.floor(totalSec / 60) + ":" + String(totalSec % 60).padStart(2, "0");
+    }, 1000);
+  }
+
+  function stopLiveElapsedTimer() {
+    if (liveElapsedTimer) {
+      clearInterval(liveElapsedTimer);
+      liveElapsedTimer = null;
+    }
+  }
+
+  async function completeLiveVision(chat, prompt, image, signal, onToken) {
+    if (preferences.inferenceMode === "browser") {
+      await loadWasmBridgeScript();
+      if (!(await window.GopherLLMBrowser.isModelLoaded())) {
+        throw new Error("No model is loaded in this browser tab. Open Settings to choose one.");
+      }
+      const options = Object.assign(samplerFields(chat.settings), { systemPrompt: chat.systemPrompt.trim() || undefined });
+      let answer = "";
+      const imageBase64 = image.slice(image.indexOf(",") + 1);
+      const result = await window.GopherLLMBrowser.generate([
+        { role: "user", content: prompt, images: [imageBase64] }
+      ], options, (token) => {
+        answer += token;
+        if (onToken) onToken(answer);
+        return liveVisionRunning;
+      });
+      return result;
+    }
+    return completeOnce([
+      { role: "user", content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: image } }
+      ] }
+    ], chat.settings, chat.systemPrompt, signal, onToken);
+  }
+
+  // Mirrors an on-device webcam-captioning loop: the prompt lives in its own
+  // field (seeded from whatever the user had typed in the composer, falling
+  // back to a sensible default) and is re-read fresh every frame, so editing
+  // it mid-run changes the next answer without restarting the loop. Nothing
+  // here is written to the chat transcript -- the overlay's output/history
+  // panel is the whole point, and it clears when the session ends.
+  async function runLiveVision() {
+    const chat = activeChat();
+    if (!chat) {
+      showToast("Start a chat before using live vision.", "error");
+      return;
+    }
+    const seedPrompt = promptEl.value.trim();
+    livePromptInputEl.value = seedPrompt || livePromptInputEl.placeholder;
+
+    liveVisionRunning = true;
+    liveVisionPaused = false;
+    liveHistory = [];
+    liveHistoryShown = false;
+    renderLiveHistory();
+    liveHistoryToggleEl.setAttribute("aria-expanded", "false");
+    liveHistoryToggleEl.textContent = "History";
+    liveOutputTextEl.hidden = false;
+    liveHistoryListEl.hidden = true;
+    resetLiveOutput();
+    liveVisionButtonEl.classList.add("is-live");
+    liveVisionButtonEl.setAttribute("aria-label", "Stop live camera");
+    liveVisionButtonEl.title = "Stop live camera";
+    captureFootEl.hidden = true;
+    liveOverlayEl.hidden = false;
+    captureTitleEl.textContent = "Live vision";
+    setLiveStatus("live");
+    startLiveElapsedTimer();
+    livePauseButtonEl.focus();
+
+    while (liveVisionRunning && activeCaptureStream) {
+      if (liveVisionPaused) {
+        await sleep(200);
+        continue;
+      }
+      const requestController = new AbortController();
+      liveVisionController = requestController;
+      const prompt = livePromptInputEl.value.trim() || livePromptInputEl.placeholder;
+      const startedAt = performance.now();
+      let ttft = null;
+      let tokenCount = 0;
+      try {
+        const image = captureLiveFrame();
+        const answer = await completeLiveVision(chat, prompt, image, requestController.signal, (partial) => {
+          if (ttft === null) ttft = performance.now() - startedAt;
+          tokenCount++;
+          setLiveOutputText(partial, true);
+        });
+        setLiveOutputText(answer, false);
+        const elapsedSec = (performance.now() - startedAt) / 1000;
+        updateLiveStats(ttft, tokenCount && elapsedSec > 0 ? tokenCount / elapsedSec : null);
+        if (answer.trim()) pushLiveHistory(answer.trim());
+        if (liveVisionRunning) setLiveStatus(liveVisionPaused ? "paused" : "live");
+      } catch (error) {
+        if (!(error && error.name === "AbortError")) {
+          setLiveStatus("error");
+          setLiveOutputText("Error: " + (error && error.message ? error.message : String(error)), false, true);
+        }
+      } finally {
+        liveVisionController = null;
+      }
+      // This is local frame-by-frame inference, not a video upload: the
+      // next frame starts only after the preceding answer is complete.
+      if (liveVisionRunning) await sleep(200);
+    }
+  }
+
+  function stopLiveVision() {
+    liveVisionRunning = false;
+    liveVisionPaused = false;
+    if (liveVisionController) liveVisionController.abort();
+    if (preferences.inferenceMode === "browser" && window.GopherLLMBrowser) window.GopherLLMBrowser.stopGeneration();
+    liveVisionController = null;
+    stopLiveElapsedTimer();
+    liveVisionButtonEl.classList.remove("is-live");
+    liveVisionButtonEl.setAttribute("aria-label", "Start live camera");
+    liveVisionButtonEl.title = "Start live camera";
+    livePauseButtonEl.classList.remove("is-paused");
+    livePauseButtonEl.setAttribute("aria-label", "Pause live vision");
+    livePauseButtonEl.title = "Pause";
+    const pauseIcon = livePauseButtonEl.querySelector("use");
+    if (pauseIcon) pauseIcon.setAttribute("href", "#i-pause");
+    liveOverlayEl.hidden = true;
+    captureFootEl.hidden = false;
+    captureTitleEl.textContent = "Capture an image";
+    setLiveStatus("standby");
+  }
+
   // Shows a live preview with Capture/Cancel rather than grabbing a frame the
   // instant permission is granted -- lets the user see what they're about to
   // send, retry a bad angle, or back out, the same as any normal camera app.
@@ -4720,10 +5003,15 @@ function toMarkdown(chat) {
     });
     captureVideoEl.srcObject = stream;
     await captureVideoEl.play();
+    liveOverlayEl.hidden = true;
+    captureFootEl.hidden = false;
+    liveSizeRangeEl.value = String(liveFrameSize);
+    liveSizeValueEl.textContent = liveFrameSize + "px";
     openDialog(captureModalEl, opener, captureConfirmButtonEl);
   }
 
   function closeCaptureModal() {
+    stopLiveVision();
     closeDialog(captureModalEl);
     captureVideoEl.srcObject = null;
     stopActiveCaptureStream();

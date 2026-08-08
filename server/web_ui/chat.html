@@ -33,6 +33,8 @@
   <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.6"/><circle cx="9" cy="10" r="1.8" fill="currentColor" stroke="none"/><path d="M4 17l5-5 3.5 3.5L16 12l4 5"/></symbol>
   <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8h3l1.6-2.2A2 2 0 0 1 10.2 5h3.6a2 2 0 0 1 1.6.8L17 8h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z"/><circle cx="12" cy="14" r="3.6"/></symbol>
   <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1.6"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="17" x2="12" y2="20"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8V4z" stroke-linejoin="round"/></symbol>
 </svg>
 
 <div class="app">
@@ -135,6 +137,7 @@
               <button id="attachImage" class="composer-icon-button" type="button" aria-label="Attach an image" title="Attach an image" hidden><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg></button>
               <input id="imageFileInput" type="file" accept="image/*" hidden>
               <button id="webcamButton" class="composer-icon-button" type="button" aria-label="Capture from webcam" title="Capture from webcam" hidden><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg></button>
+              <button id="liveVisionButton" class="composer-icon-button live-vision-toggle" type="button" aria-label="Start live camera" title="Start live camera" hidden><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg><span class="live-vision-dot" aria-hidden="true"></span></button>
               <button id="screenButton" class="composer-icon-button" type="button" aria-label="Capture the screen" title="Capture the screen" hidden><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg></button>
               <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
             </div>
@@ -662,11 +665,61 @@
       <h2 id="captureTitle">Capture an image</h2>
       <button id="captureCancelButton" class="icon-button" type="button" aria-label="Cancel capture"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
-    <div class="settings-panel-body">
-      <video id="captureVideo" class="capture-video" autoplay playsinline muted></video>
+    <div class="settings-panel-body capture-body">
+      <div class="capture-stage">
+        <video id="captureVideo" class="capture-video" autoplay playsinline muted></video>
+
+        <div id="liveOverlay" class="live-overlay" hidden>
+          <div class="live-topbar">
+            <div id="liveStatusBadge" class="live-status">
+              <span class="live-status-dot" aria-hidden="true"></span>
+              <span id="liveStatusLabel">Standby</span>
+            </div>
+            <div class="live-topbar-end">
+              <label class="live-size">
+                <span class="live-size-label">Input <b id="liveSizeValue">640px</b></span>
+                <input id="liveSizeRange" type="range" min="256" max="960" step="32" value="640" aria-label="Live frame resolution">
+              </label>
+              <button id="livePauseButton" class="icon-button live-pause-btn" type="button" aria-label="Pause live vision" title="Pause">
+                <svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="live-bottom">
+            <div class="live-prompt-panel">
+              <span class="live-panel-label">Prompt</span>
+              <textarea id="livePromptInput" rows="1" placeholder="Describe what you see in one sentence."></textarea>
+              <div id="livePromptSuggestions" class="live-suggestions">
+                <button type="button" class="live-suggestion" data-prompt="Describe what you see in one sentence.">Describe the scene</button>
+                <button type="button" class="live-suggestion" data-prompt="What is the color of my shirt?">What color is my shirt?</button>
+                <button type="button" class="live-suggestion" data-prompt="Identify any text or written content visible.">Read visible text</button>
+                <button type="button" class="live-suggestion" data-prompt="Name the object I am holding in my hand.">Name the object</button>
+              </div>
+            </div>
+
+            <div id="liveOutputPanel" class="live-output-panel">
+              <div class="live-panel-head">
+                <span class="live-panel-title">Output stream</span>
+                <button id="liveHistoryToggle" class="text-button" type="button" aria-expanded="false">History</button>
+              </div>
+              <div class="live-output-body">
+                <p id="liveOutputText" class="live-output-text"></p>
+                <ol id="liveHistoryList" class="live-history-list" hidden></ol>
+              </div>
+              <div class="live-output-foot">
+                <span id="liveStatTTFT">ttft --</span>
+                <span id="liveStatTPS">tok/s --</span>
+                <span id="liveStatElapsed">0:00</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="settings-panel-foot">
+    <div id="captureFoot" class="settings-panel-foot">
       <button id="captureConfirmButton" class="autotune-run" type="button">Capture</button>
+      <button id="captureLiveButton" class="text-button" type="button">Start live</button>
     </div>
   </div>
 </div>

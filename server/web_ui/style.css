@@ -746,12 +746,139 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
 .composer-button:hover:not(:disabled), .composer-button[aria-expanded="true"] { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
 .composer-icon-button { display: grid; place-items: center; width: 28px; height: 28px; min-width: 28px; min-height: 28px; padding: 0; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--panel); color: var(--muted); font: 500 var(--fs-2xl)/1 var(--sans); }
 .composer-icon-button:hover:not(:disabled), .composer-icon-button:focus-visible { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); color: var(--accent); }
+.live-vision-toggle { position: relative; }
+.live-vision-dot { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--stop); opacity: 0; }
+.live-vision-toggle.is-live { border-color: color-mix(in srgb, var(--accent) 55%, var(--line-strong)); color: var(--accent); }
+.live-vision-toggle.is-live .live-vision-dot { opacity: 1; animation: pulse 1.1s ease-in-out infinite; }
 .composer-options-toggle { display: inline-flex; align-items: center; gap: 4px; }
 .composer-options-toggle[aria-expanded="true"] > span[aria-hidden="true"] { transform: rotate(180deg); }
 .attachment-tray { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px 14px; }
 .image-preview-row { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px 14px; }
 .image-preview-thumb { max-height: 54px; max-width: 96px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); object-fit: cover; }
-.capture-video { display: block; width: 100%; max-height: 60vh; border-radius: var(--r-md); background: #000; }
+/* ── Capture modal (snapshot + live vision) ──────────────────────────
+   The live layout is modelled on the "output stream" pattern seen in
+   on-device webcam-captioning demos: a full-bleed camera feed with
+   glass status/controls floating on top and a docked prompt + streaming
+   answer pair along the bottom, so the feed stays the focal point. Built
+   entirely from this file's own tokens (no borrowed brand colors) so it
+   reads correctly in every theme, including classic and contrast where
+   backdrop-filter and soft shadows are unavailable. */
+#captureModal .settings-panel { width: min(1040px, 100%); max-height: min(92vh, 820px); }
+/* flex:1 + min-height:0 on both this and .capture-stage below: without
+   them, a column flex item sizes to its content's natural height instead
+   of the space the panel actually has. The video element's own intrinsic
+   aspect ratio (a 4:3 640x480 stream stretched to the panel's ~1040px
+   width demands ~780px of height) then wins over the panel's max-height,
+   and everything docked to the stage's "bottom" -- the prompt/output
+   panels -- ends up positioned hundreds of pixels below the visible area.
+   min-height:0 is what lets a flex item shrink below that content size. */
+#captureModal .settings-panel-body { padding: 0; display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: clip; }
+/* overflow:clip, not hidden: focusing a control inside the absolutely
+   positioned overlay (e.g. the pause button after starting live vision)
+   makes the browser scroll-into-view its nearest scroll container, and
+   overflow:hidden still counts as one -- it silently gave this element a
+   nonzero scrollTop and dragged the whole overlay off with it. clip keeps
+   the same visual clipping but is never a scroll container, so there is
+   nothing for scroll-into-view to move. */
+.capture-stage { position: relative; flex: 1; min-height: 0; overflow: clip; background: #000; }
+.capture-video { display: block; width: 100%; height: 100%; object-fit: cover; background: #000; }
+
+.live-overlay { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; justify-content: space-between; padding: var(--sp-4); pointer-events: none; }
+.live-overlay > * { pointer-events: auto; }
+
+.live-topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); }
+.live-topbar-end { display: flex; align-items: center; gap: var(--sp-2); }
+
+.live-status {
+  display: inline-flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-1h) var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  color: var(--ink); font: 700 var(--fs-2xs)/1 var(--mono); letter-spacing: .07em; text-transform: uppercase;
+  box-shadow: var(--shadow);
+}
+.live-status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--muted); }
+.live-status.is-live { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong)); }
+.live-status.is-live .live-status-dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+.live-status.is-paused .live-status-dot { background: var(--muted); }
+.live-status.is-error { color: var(--stop); border-color: color-mix(in srgb, var(--stop) 50%, var(--line-strong)); }
+.live-status.is-error .live-status-dot { background: var(--stop); }
+
+/* #captureModal-prefixed, not a bare .live-size: this is a <label>, and the
+   generic ".settings label { display: grid; ... }" rule a few hundred lines
+   down (same 1-class-1-type specificity, later in the cascade) would
+   otherwise win outright -- it did, silently turning this into a grid and
+   swallowing the responsive display:none below at both breakpoints. */
+#captureModal .live-size {
+  display: flex; flex-direction: column; gap: 3px; min-width: 108px;
+  padding: 5px var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+}
+.live-size-label { color: var(--muted); font: 700 var(--fs-3xs)/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.live-size-label b { color: var(--ink); font-weight: 700; }
+.live-size input[type="range"] { width: 100%; height: 3px; margin: 0; padding: 0; accent-color: var(--accent); }
+
+.live-pause-btn { background: color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); box-shadow: var(--shadow); }
+.live-pause-btn:hover { border-color: color-mix(in srgb, var(--accent) 50%, var(--line-strong)); color: var(--accent); }
+.live-pause-btn.is-paused { border-color: color-mix(in srgb, var(--accent) 55%, var(--line-strong)); color: var(--accent); }
+
+.live-bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: var(--sp-3); align-items: end; }
+
+.live-prompt-panel, .live-output-panel {
+  position: relative; display: flex; flex-direction: column;
+  border: 1px solid var(--line-strong); border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--panel) 90%, transparent);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  box-shadow: var(--shadow-pop);
+}
+.live-output-panel.is-active { border-color: color-mix(in srgb, var(--accent) 42%, var(--line-strong)); }
+.live-panel-label {
+  position: absolute; top: -9px; left: 12px; padding: 0 6px;
+  background: var(--panel); border: 1px solid var(--line-strong); border-radius: var(--r-xs);
+  color: var(--muted); font: 700 var(--fs-3xs)/1.6 var(--mono); letter-spacing: .07em; text-transform: uppercase;
+}
+/* .live-panel-title is the same typography sitting in normal flow (the
+   output panel's header row already has a border to sit on, unlike the
+   prompt panel, so its label doesn't need the floating-legend treatment
+   above -- reusing .live-panel-label here pulled it out of the flex row
+   via that absolute positioning and left the History button stranded
+   without a sibling to space-between against). */
+.live-panel-title { color: var(--muted); font: 700 var(--fs-3xs)/1.6 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+.live-prompt-panel { padding: var(--sp-3) var(--sp-2h) var(--sp-2); }
+/* Same #captureModal-prefix reasoning as .live-size above: ".settings
+   textarea" carries equal specificity and sits later in the file, so on
+   equal terms it would win -- this textarea rendered with a visible boxed
+   border and solid fill instead of blending borderless into the glass
+   panel. */
+#captureModal .live-prompt-panel textarea {
+  display: block; width: 100%; min-height: 40px; max-height: 120px; padding: var(--sp-1h) 2px; resize: none;
+  border: 0; background: transparent; color: var(--ink); font: var(--fs-md)/1.4 var(--mono); outline: none;
+}
+.live-suggestions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: var(--sp-1h); }
+.live-suggestion {
+  min-height: 22px; padding: 0 8px; border: 1px solid var(--line); border-radius: var(--r-pill);
+  background: var(--panel-2); color: var(--muted); font-size: var(--fs-3xs); font-weight: 650;
+}
+.live-suggestion:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); color: var(--accent); }
+
+.live-output-panel { height: 168px; }
+.live-panel-head { display: flex; flex: none; align-items: center; justify-content: space-between; padding: var(--sp-2) var(--sp-2h) 0; }
+.live-output-body { position: relative; flex: 1; margin-top: var(--sp-1h); overflow: clip; }
+.live-output-text {
+  height: 100%; margin: 0; padding: 0 var(--sp-2h) var(--sp-1h); overflow-y: auto;
+  color: var(--ink); font: var(--fs-sm)/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.live-output-text.is-placeholder { color: var(--muted); font-style: italic; }
+.live-output-text.is-error { color: var(--stop); }
+.live-output-text.is-streaming::after { content: ""; display: inline-block; width: 2px; height: 1em; margin-left: 2px; vertical-align: -.15em; background: var(--accent); animation: caret 1.1s ease-in-out infinite; }
+.live-history-list { position: absolute; inset: 0; margin: 0; padding: var(--sp-2) var(--sp-2h); overflow-y: auto; list-style: none; background: var(--panel); }
+.live-history-list li { display: flex; gap: var(--sp-2); padding: 4px 0; border-bottom: 1px solid var(--line); font: var(--fs-xs)/1.5 var(--mono); }
+.live-history-list li:last-child { border-bottom: 0; }
+.live-history-time { flex: none; color: var(--accent); opacity: .85; }
+.live-history-empty { padding: var(--sp-4) 0; text-align: center; color: var(--muted); font-size: var(--fs-xs); }
+.live-output-foot { display: flex; flex: none; gap: var(--sp-3); padding: var(--sp-1h) var(--sp-2h); border-top: 1px solid var(--line); color: var(--muted); font: var(--fs-3xs)/1.6 var(--mono); font-variant-numeric: tabular-nums; }
 /* flex-wrap, not a single unshrinkable row: .attachment-chip-meta carries the
    longest string ("text · 12.4 KB · text included") and used to be
    flex:none, so on a narrow phone it took whatever width it wanted and left
@@ -1061,6 +1188,9 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-primary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-library { grid-template-columns: 1fr; max-height: 330px; }
+  .live-bottom { grid-template-columns: 1fr; }
+  .live-output-panel { height: 132px; }
+  #captureModal .live-size { display: none; }
 }
 @media (max-width: 520px) {
   .header-logo, .model-name { display: none; }
@@ -1101,4 +1231,9 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .settings-memory .toggle-row { justify-self: start; }
   .wide-setting { grid-column: 1 / -1; }
   .codeblock pre { font-size: var(--fs-sm); }
+  #captureModal .settings-panel { width: 100%; height: 100%; max-height: 100%; border-radius: 0; }
+  .live-overlay { padding: var(--sp-2h); }
+  .live-suggestions { display: none; }
+  .live-output-panel { height: 108px; }
+  #captureModal .live-prompt-panel textarea { min-height: 30px; }
 }

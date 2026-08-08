@@ -13,6 +13,8 @@ func WebGPUAvailable() bool { return false }
 // SetWebGPUForceDisabled is a no-op outside a js/wasm build.
 func SetWebGPUForceDisabled(disabled bool) {}
 
+func releaseWebGPUWeight(w *GPUWeight) {}
+
 func prepareWebGPUWeight(data []byte, typ GGMLType, rows, cols int) *GPUWeight { return nil }
 
 func matvecWebGPUQ4KInto(w *GPUWeight, x []float32, rows, cols int, out *[]float32) bool {
