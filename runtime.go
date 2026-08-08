@@ -691,6 +691,12 @@ func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOp
 func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
+	// Vision embeddings are useful only while this one request may render the
+	// same image more than once. Keeping them after return turns a webcam into
+	// an unbounded cache of large float tensors (one unique image per frame),
+	// eventually increasing GC pressure and slowing every subsequent frame.
+	r.visionImageCache = nil
+	defer func() { r.visionImageCache = nil }()
 	if r.kind == loadedBERT {
 		return GenerationResult{}, fmt.Errorf("%s is an embedding model and cannot generate chat completions", r.arch)
 	}

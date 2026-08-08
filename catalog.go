@@ -40,6 +40,10 @@ type ModelEntry struct {
 	// keeps normal generation models out of the RAG model picker.
 	IsEmbedding bool
 	IsSupported bool
+	// Reasoning reports whether the GGUF advertises a reasoning/thinking mode.
+	// It is a capability, not a promise that every prompt will emit a visible
+	// chain of thought.
+	Reasoning bool
 	// ProjectorPath is a best-guess mmproj (vision projector) GGUF found
 	// alongside this entry, paired by DiscoverModels' post-scan pass; ""
 	// if none was found. Always overridable by passing an explicit
@@ -443,7 +447,38 @@ func inspectModel(root, path string) (ModelEntry, error) {
 	_, hasPooling := gguf.Metadata[arch+".pooling_type"]
 	_, hasEmbedding := gguf.Metadata["general.embedding"]
 	isEmbedding := hasPooling || hasEmbedding || containsEmbeddingModelName(lower)
-	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ContextLength: contextLength, ModelName: modelName, IsProjector: isProjector, IsEmbedding: isEmbedding, IsSupported: ArchitectureSupported(arch)}, nil
+	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ContextLength: contextLength, ModelName: modelName, IsProjector: isProjector, IsEmbedding: isEmbedding, IsSupported: ArchitectureSupported(arch), Reasoning: modelSupportsReasoning(arch, fileName, modelName, gguf)}, nil
+}
+
+// modelSupportsReasoning identifies families with a native thinking mode and
+// models whose GGUF template/name explicitly advertises one.  Architecture
+// alone is deliberately not used for every family: Mistral 3, for example,
+// ships both instruct and reasoning variants under the same architecture.
+func modelSupportsReasoning(arch, fileName, modelName string, gguf *GGUFFile) bool {
+	switch strings.ToLower(arch) {
+	case "qwen3", "qwen3moe", "qwen35", "qwen35moe", "gpt-oss", "nemotron_h", "nemotron_h_moe":
+		return true
+	}
+	label := strings.ToLower(fileName + " " + modelName)
+	for _, marker := range []string{"reasoning", "thinking", "deepseek-r1", "deepseek_r1", "qwq", "-r1", " r1"} {
+		if strings.Contains(label, marker) {
+			return true
+		}
+	}
+	for key, value := range gguf.Metadata {
+		if !strings.Contains(key, "chat_template") {
+			continue
+		}
+		template, ok := value.AsString()
+		if !ok {
+			continue
+		}
+		lower := strings.ToLower(template)
+		if strings.Contains(lower, "<think") || strings.Contains(lower, "[think]") || strings.Contains(lower, "reasoning_content") || strings.Contains(lower, "channel>thought") {
+			return true
+		}
+	}
+	return false
 }
 
 // GGUF has no universally adopted "embedding model" metadata field. These

@@ -328,6 +328,68 @@ func TestRepositoryVariantsPropagatesNotFoundError(t *testing.T) {
 	}
 }
 
+func TestSearchGGUFRepositoriesUsesBoundedGGUFFilter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/models" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+		}
+		query := r.URL.Query()
+		for key, want := range map[string]string{
+			"search":    "ministral",
+			"filter":    "gguf",
+			"sort":      "downloads",
+			"direction": "-1",
+			"limit":     "2",
+			"full":      "true",
+		} {
+			if got := query.Get(key); got != want {
+				t.Errorf("query %s = %q, want %q", key, got, want)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[
+			{"id":"mistralai/Ministral-3-3B-Instruct-GGUF","downloads":1234,"likes":56,"lastModified":"2026-08-09T12:00:00.000Z","private":false,"gated":false},
+			{"modelId":"community/private-gguf","downloads":7,"likes":2,"lastModified":"2026-08-08T12:00:00.000Z","private":true,"gated":"auto"},
+			{"id":"not-a-repository","downloads":999}
+		]`)
+	}))
+	defer server.Close()
+	t.Setenv("HF_ENDPOINT", server.URL)
+
+	results, err := SearchGGUFRepositories(context.Background(), " ministral ", 2, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("results = %#v, want 2 valid repositories", results)
+	}
+	first := results[0]
+	if first.ID != "mistralai/Ministral-3-3B-Instruct-GGUF" || first.Name != first.ID || first.Downloads != 1234 || first.Likes != 56 || first.UpdatedAt != "2026-08-09T12:00:00.000Z" || !first.GGUF || first.Private || first.Gated {
+		t.Fatalf("first result = %#v", first)
+	}
+	second := results[1]
+	if second.ID != "community/private-gguf" || !second.Private || !second.Gated || !second.GGUF {
+		t.Fatalf("second result = %#v", second)
+	}
+}
+
+func TestSearchGGUFRepositoriesValidatesAndHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := SearchGGUFRepositories(ctx, "qwen", 1, Options{}); err != context.Canceled {
+		t.Fatalf("cancelled search error = %v, want context.Canceled", err)
+	}
+	if _, err := SearchGGUFRepositories(context.Background(), "", 1, Options{}); err == nil {
+		t.Fatal("expected empty query to be rejected")
+	}
+	if _, err := SearchGGUFRepositories(context.Background(), strings.Repeat("x", maxSearchQueryRunes+1), 1, Options{}); err == nil {
+		t.Fatal("expected overlong query to be rejected")
+	}
+	if _, err := SearchGGUFRepositories(context.Background(), "qwen", MaxSearchLimit+1, Options{}); err == nil {
+		t.Fatal("expected overlarge limit to be rejected")
+	}
+}
+
 func TestResolveHuggingFaceModelFilesContextReturnsAllShardsInOrder(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

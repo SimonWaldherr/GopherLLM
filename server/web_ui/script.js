@@ -1109,10 +1109,20 @@ function toMarkdown(chat) {
   const activeModelNameEl = $("activeModelName");
   const activeModelMetaEl = $("activeModelMeta");
   const activeModelStateEl = $("activeModelState");
+  const modelLoadProgressEl = $("modelLoadProgress");
+  const modelLoadStageEl = $("modelLoadStage");
+  const modelLoadElapsedEl = $("modelLoadElapsed");
+  const modelLoadBarEl = $("modelLoadBar");
+  const modelLoadDetailEl = $("modelLoadDetail");
   const modelNameEl = $("modelName");
   const modelDownloadFormEl = $("modelDownloadForm");
   const modelDownloadRefEl = $("modelDownloadRef");
   const modelDownloadFindEl = $("modelDownloadFind");
+  const modelHubSearchFormEl = $("modelHubSearchForm");
+  const modelHubSearchQueryEl = $("modelHubSearchQuery");
+  const modelHubSearchSubmitEl = $("modelHubSearchSubmit");
+  const modelHubSearchStatusEl = $("modelHubSearchStatus");
+  const modelHubSearchResultsEl = $("modelHubSearchResults");
   const modelDownloadVariantsEl = $("modelDownloadVariants");
   const modelDownloadProgressEl = $("modelDownloadProgress");
   const modelDownloadBarFillEl = $("modelDownloadBarFill");
@@ -1213,6 +1223,11 @@ function toMarkdown(chat) {
   let tuning = false;
   let loadingModel = false;
   let loadingModelID = "";
+  let modelLoadElapsedTimer = null;
+  let modelLoadDismissTimer = null;
+  let modelLoadStageTimers = [];
+  let modelLoadStartedAt = 0;
+  let modelLoadProgressActive = false;
   let modelCatalog = [];
   // hasActiveModel drives the first-contact empty state and the idle status
   // text: it starts from the server-rendered truth (chat.html's
@@ -1224,6 +1239,9 @@ function toMarkdown(chat) {
   let pendingModelRetry = null;
   let modelDownloadBusy = false;
   let modelDownloadController = null;
+  let modelHubSearchController = null;
+  let modelHubSearchTimer = null;
+  let modelHubSearchSequence = 0;
   let loadingEmbeddingModel = false;
   let activeEmbeddingModel = "";
   let ragSearching = false;
@@ -1254,11 +1272,15 @@ function toMarkdown(chat) {
   let liveVisionRunning = false;
   let liveVisionPaused = false;
   let liveVisionController = null;
-  let liveFrameSize = 640;
+  // 384px has far fewer vision patches than the former 640px default while
+  // still being ample for a scene caption; the user can opt up for OCR.
+  let liveFrameSize = 384;
   let liveHistory = [];
   let liveHistoryShown = false;
   let liveElapsedTimer = null;
   let liveStartedAt = 0;
+  let liveFrameProgressTimer = null;
+  let liveFrameStartedAt = 0;
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
@@ -2527,7 +2549,7 @@ function toMarkdown(chat) {
   /* One-shot completion off the main conversation: batch items and goal
      rounds each need an answer without touching the chat transcript or its
      DOM. Streams so long answers can report progress while they arrive. */
-  async function completeOnce(messages, settings, systemPrompt, signal, onToken) {
+  async function completeOnce(messages, settings, systemPrompt, signal, onToken, useTools = true) {
     const response = await fetch("/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2537,8 +2559,13 @@ function toMarkdown(chat) {
         stream: true,
         stream_options: { include_usage: true },
         system_prompt: (systemPrompt || "").trim() || undefined,
-        gopherllm_wikimedia: settings.wikimediaTools === true,
-        gopherllm_openstreetmap: settings.openStreetMapTools === true
+        // A live camera loop needs the first caption token as soon as the
+        // model emits it. Agentic tools intentionally buffer a whole turn so
+        // that tool-call syntax cannot leak into the transcript; disable them
+        // for this frame-by-frame path instead of making the output look hung.
+        gopherllm_wikimedia: useTools && settings.wikimediaTools === true,
+        gopherllm_openstreetmap: useTools && settings.openStreetMapTools === true,
+        gopherllm_skills: useTools ? undefined : false
       }))
     });
     if (!response.ok) {
@@ -3015,6 +3042,13 @@ function toMarkdown(chat) {
     ].filter(Boolean);
   }
 
+  function modelCapabilities(model) {
+    return [
+      { label: model.reasoning ? "Thinking" : "No thinking", enabled: Boolean(model.reasoning) },
+      { label: model.vision ? "Vision" : "No vision", enabled: Boolean(model.vision) }
+    ];
+  }
+
   function renderActiveModelSummary(model, state) {
     const loading = state === "loading";
     activeModelSummaryEl.classList.toggle("is-loading", loading);
@@ -3027,8 +3061,83 @@ function toMarkdown(chat) {
     }
     activeModelNameEl.textContent = model.name || model.id;
     activeModelNameEl.title = model.name || model.id;
-    activeModelMetaEl.textContent = modelMeta(model).join(" · ") || model.id;
+    activeModelMetaEl.textContent = modelMeta(model).concat(modelCapabilities(model).map((capability) => capability.label)).join(" · ") || model.id;
     activeModelStateEl.textContent = loading ? "Loading…" : "Loaded";
+  }
+
+  // /models/load returns only when the runner is ready, so the browser cannot
+  // know a truthful percentage while it is reading a GGUF. These are clear
+  // lifecycle hints rather than fabricated completion numbers; the animated
+  // bar stays indeterminate until the server confirms the load.
+  const modelLoadStages = [
+    { title: "Preparing model", detail: "Checking the selected GGUF and starting a local runtime." },
+    { title: "Loading weights", detail: "Reading the model into local memory. This is usually the longest step." },
+    { title: "Preparing inference", detail: "Configuring the context window and compute backend." },
+    { title: "Still loading", detail: "Large models can take a little longer. Waiting for the server to confirm it is ready." }
+  ];
+
+  function clearModelLoadProgressTimers() {
+    if (modelLoadElapsedTimer) {
+      clearInterval(modelLoadElapsedTimer);
+      modelLoadElapsedTimer = null;
+    }
+    modelLoadStageTimers.forEach((timer) => clearTimeout(timer));
+    modelLoadStageTimers = [];
+  }
+
+  function formatModelLoadElapsed(ms) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    const minutes = Math.floor(seconds / 60);
+    return minutes ? minutes + "m " + String(seconds % 60).padStart(2, "0") + "s" : seconds + "s";
+  }
+
+  function updateModelLoadElapsed() {
+    modelLoadElapsedEl.textContent = formatModelLoadElapsed(performance.now() - modelLoadStartedAt);
+  }
+
+  function setModelLoadStage(stage) {
+    modelLoadStageEl.textContent = stage.title;
+    modelLoadDetailEl.textContent = stage.detail;
+    modelLoadBarEl.setAttribute("aria-valuetext", stage.title + ". " + stage.detail);
+  }
+
+  function startModelLoadProgress() {
+    clearModelLoadProgressTimers();
+    if (modelLoadDismissTimer) {
+      clearTimeout(modelLoadDismissTimer);
+      modelLoadDismissTimer = null;
+    }
+    modelLoadProgressActive = true;
+    modelLoadStartedAt = performance.now();
+    modelLoadProgressEl.hidden = false;
+    modelLoadProgressEl.classList.remove("is-complete");
+    setModelLoadStage(modelLoadStages[0]);
+    updateModelLoadElapsed();
+    modelLoadElapsedTimer = setInterval(updateModelLoadElapsed, 1000);
+    [900, 3600, 9000].forEach((delay, index) => {
+      modelLoadStageTimers.push(setTimeout(() => {
+        if (modelLoadProgressActive) setModelLoadStage(modelLoadStages[index + 1]);
+      }, delay));
+    });
+  }
+
+  function finishModelLoadProgress(succeeded) {
+    clearModelLoadProgressTimers();
+    modelLoadProgressActive = false;
+    if (!succeeded) {
+      modelLoadProgressEl.hidden = true;
+      modelLoadProgressEl.classList.remove("is-complete");
+      return;
+    }
+    setModelLoadStage({ title: "Model ready", detail: "The local runtime is ready for your next message." });
+    modelLoadProgressEl.classList.add("is-complete");
+    modelLoadDismissTimer = setTimeout(() => {
+      if (!modelLoadProgressActive) {
+        modelLoadProgressEl.hidden = true;
+        modelLoadProgressEl.classList.remove("is-complete");
+      }
+      modelLoadDismissTimer = null;
+    }, 650);
   }
 
   function renderModelLibrary() {
@@ -3076,6 +3185,12 @@ function toMarkdown(chat) {
         badge.textContent = label;
         meta.appendChild(badge);
       });
+      modelCapabilities(model).forEach((capability) => {
+        const badge = document.createElement("span");
+        badge.className = "model-badge model-badge-capability " + (capability.enabled ? "is-supported" : "is-unavailable");
+        badge.textContent = capability.label;
+        meta.appendChild(badge);
+      });
       const path = document.createElement("span");
       path.className = "model-card-path";
       path.textContent = model.id;
@@ -3120,7 +3235,7 @@ function toMarkdown(chat) {
       modelSelectEl.disabled = false;
       const chatModels = data.models.filter((model) => model.embedding !== true);
       modelCatalog = data.models.map((model) => Object.assign({}, model, {
-        search: [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB"].filter(Boolean).join(" ").toLowerCase()
+        search: [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB", model.reasoning ? "thinking reasoning" : "no thinking", model.vision ? "vision" : "no vision"].filter(Boolean).join(" ").toLowerCase()
       }));
       const placeholder = document.createElement("option");
       placeholder.value = "";
@@ -3135,7 +3250,8 @@ function toMarkdown(chat) {
         const option = document.createElement("option");
         option.value = model.id;
         const context = model.context_length ? " · " + modelContextLabel(model.context_length) : "";
-        option.textContent = (model.name || model.id) + (model.architecture ? " [" + model.architecture + "]" : "") + context + (model.size_gb ? " — " + model.size_gb.toFixed(1) + " GB" : "") + (!model.supported ? " (unsupported)" : "");
+        const capabilities = " · " + (model.reasoning ? "Thinking" : "No thinking") + " · " + (model.vision ? "Vision" : "No vision");
+        option.textContent = (model.name || model.id) + (model.architecture ? " [" + model.architecture + "]" : "") + context + capabilities + (model.size_gb ? " — " + model.size_gb.toFixed(1) + " GB" : "") + (!model.supported ? " (unsupported)" : "");
         option.dataset.supported = String(Boolean(model.supported));
         if (model.loaded) {
           option.selected = true;
@@ -3202,6 +3318,115 @@ function toMarkdown(chat) {
     modelDownloadStatusEl.textContent = text;
     modelDownloadStatusEl.classList.toggle("is-error", kind === "error");
     modelDownloadStatusEl.classList.toggle("is-success", kind === "success");
+  }
+
+  function formatHubCount(value) {
+    const number = Number(value) || 0;
+    return new Intl.NumberFormat(undefined, { notation: number >= 1000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(number);
+  }
+
+  function formatHubUpdated(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    return "updated " + date.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  }
+
+  function setModelHubSearchStatus(text, kind) {
+    modelHubSearchStatusEl.textContent = text;
+    modelHubSearchStatusEl.classList.toggle("is-error", kind === "error");
+  }
+
+  function clearModelHubSearchResults() {
+    modelHubSearchResultsEl.replaceChildren();
+    modelHubSearchResultsEl.hidden = true;
+  }
+
+  function cancelModelHubSearch() {
+    modelHubSearchSequence++;
+    if (modelHubSearchController) modelHubSearchController.abort();
+    modelHubSearchController = null;
+    modelHubSearchSubmitEl.disabled = false;
+  }
+
+  function renderModelHubSearchResults(models) {
+    modelHubSearchResultsEl.replaceChildren();
+    if (!models.length) {
+      clearModelHubSearchResults();
+      setModelHubSearchStatus("No GGUF repositories matched that search.");
+      return;
+    }
+    models.forEach((model) => {
+      const item = document.createElement("li");
+      item.className = "model-hub-search-result";
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "model-hub-search-action";
+      action.dataset.repository = model.id;
+      action.title = "Show GGUF variants from " + model.id;
+
+      const title = document.createElement("strong");
+      title.textContent = model.name || model.id;
+      const meta = document.createElement("span");
+      meta.className = "model-hub-search-meta";
+      const details = ["GGUF", formatHubCount(model.downloads) + " downloads", formatHubCount(model.likes) + " likes", formatHubUpdated(model.updated_at)];
+      if (model.gated) details.push("gated");
+      meta.textContent = details.filter(Boolean).join(" · ");
+      action.append(title, meta);
+      item.appendChild(action);
+      modelHubSearchResultsEl.appendChild(item);
+    });
+    modelHubSearchResultsEl.hidden = false;
+    setModelHubSearchStatus(models.length + " GGUF " + (models.length === 1 ? "repository" : "repositories") + " found. Choose one to see its variants.");
+  }
+
+  async function findModelDownloadVariants(ref) {
+    if (modelDownloadBusy) return;
+    modelDownloadFindEl.disabled = true;
+    modelDownloadVariantsEl.hidden = true;
+    modelDownloadVariantsEl.replaceChildren();
+    setModelDownloadStatus("Looking up " + ref + "…");
+    try {
+      const response = await fetch("/models/download/variants?ref=" + encodeURIComponent(ref));
+      if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
+      const data = await response.json();
+      renderModelDownloadVariants(data.repository || ref, data.revision || "main", data.variants || []);
+    } catch (error) {
+      setModelDownloadStatus("Could not list variants: " + (error.message || error), "error");
+    } finally {
+      modelDownloadFindEl.disabled = false;
+    }
+  }
+
+  async function searchModelHub(query) {
+    const text = query.trim();
+    if (!text) {
+      clearModelHubSearchResults();
+      setModelHubSearchStatus("Enter a model name to search GGUF repositories.");
+      return;
+    }
+    if (modelHubSearchController) modelHubSearchController.abort();
+    const controller = new AbortController();
+    modelHubSearchController = controller;
+    const sequence = ++modelHubSearchSequence;
+    modelHubSearchSubmitEl.disabled = true;
+    setModelHubSearchStatus("Searching Hugging Face for GGUF repositories…");
+    try {
+      const response = await fetch("/models/search?q=" + encodeURIComponent(text) + "&limit=12", { signal: controller.signal });
+      if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
+      const data = await response.json();
+      if (sequence !== modelHubSearchSequence) return;
+      renderModelHubSearchResults(Array.isArray(data.models) ? data.models : []);
+    } catch (error) {
+      if (error && error.name === "AbortError") return;
+      if (sequence !== modelHubSearchSequence) return;
+      clearModelHubSearchResults();
+      setModelHubSearchStatus("Hugging Face search failed: " + (error && error.message ? error.message : String(error)), "error");
+    } finally {
+      if (sequence === modelHubSearchSequence) {
+        modelHubSearchSubmitEl.disabled = false;
+        modelHubSearchController = null;
+      }
+    }
   }
 
   function renderModelDownloadVariants(repository, revision, variants) {
@@ -4110,7 +4335,38 @@ function toMarkdown(chat) {
     filterModelOptions();
     save();
   });
-  modelDownloadFormEl.addEventListener("submit", async (event) => {
+  modelHubSearchFormEl.addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (modelHubSearchTimer) {
+      clearTimeout(modelHubSearchTimer);
+      modelHubSearchTimer = null;
+    }
+    searchModelHub(modelHubSearchQueryEl.value);
+  });
+  modelHubSearchQueryEl.addEventListener("input", () => {
+    if (modelHubSearchTimer) clearTimeout(modelHubSearchTimer);
+    // Do not let a completed response for an earlier query replace the
+    // result list while the user is already typing the next one.
+    cancelModelHubSearch();
+    const query = modelHubSearchQueryEl.value.trim();
+    if (query.length < 2) {
+      clearModelHubSearchResults();
+      setModelHubSearchStatus(query ? "Keep typing to search the Hub." : "Enter a model name to search GGUF repositories.");
+      return;
+    }
+    modelHubSearchTimer = setTimeout(() => {
+      modelHubSearchTimer = null;
+      searchModelHub(query);
+    }, 350);
+  });
+  modelHubSearchResultsEl.addEventListener("click", (event) => {
+    const action = event.target.closest(".model-hub-search-action");
+    if (!action || !action.dataset.repository) return;
+    const ref = "hf:" + action.dataset.repository;
+    modelDownloadRefEl.value = ref;
+    findModelDownloadVariants(ref);
+  });
+  modelDownloadFormEl.addEventListener("submit", (event) => {
     event.preventDefault();
     if (modelDownloadBusy) return;
     const ref = modelDownloadRefEl.value.trim();
@@ -4118,20 +4374,7 @@ function toMarkdown(chat) {
       setModelDownloadStatus("Enter a Hugging Face repository first.", "error");
       return;
     }
-    modelDownloadFindEl.disabled = true;
-    modelDownloadVariantsEl.hidden = true;
-    modelDownloadVariantsEl.replaceChildren();
-    setModelDownloadStatus("Looking up " + ref + "…");
-    try {
-      const response = await fetch("/models/download/variants?ref=" + encodeURIComponent(ref));
-      if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
-      const data = await response.json();
-      renderModelDownloadVariants(data.repository || ref, data.revision || "main", data.variants || []);
-    } catch (error) {
-      setModelDownloadStatus("Could not list variants: " + (error.message || error), "error");
-    } finally {
-      modelDownloadFindEl.disabled = false;
-    }
+    findModelDownloadVariants(ref);
   });
   modelDownloadCancelEl.addEventListener("click", () => {
     if (modelDownloadController) modelDownloadController.abort();
@@ -4151,6 +4394,7 @@ function toMarkdown(chat) {
     const model = modelSelectEl.value;
     if (!model || busy || tuning || loadingModel) return;
     let regenerateAfterLoad = false;
+    let modelLoadSucceeded = false;
     lastContextWindow = null;
     loadingModel = true;
     loadingModelID = model;
@@ -4161,6 +4405,7 @@ function toMarkdown(chat) {
     statusEl.classList.add("busy");
     setStatus("Loading model…");
     renderModelLibrary();
+    startModelLoadProgress();
     try {
       const response = await fetch("/models/load", {
         method: "POST",
@@ -4169,6 +4414,8 @@ function toMarkdown(chat) {
       });
       if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
       const data = await response.json();
+      modelLoadSucceeded = true;
+      finishModelLoadProgress(true);
       Array.from(modelSelectEl.options).forEach((option) => { delete option.dataset.loaded; });
       const loaded = Array.from(modelSelectEl.options).find((option) => option.value === model);
       if (loaded) loaded.dataset.loaded = "true";
@@ -4198,6 +4445,7 @@ function toMarkdown(chat) {
       setIdleStatus();
       loadAutoTuneStatus();
     } catch (error) {
+      if (!modelLoadSucceeded) finishModelLoadProgress(false);
       if (previous) modelSelectEl.value = previous.value;
       setStatus("Error loading model");
       addMessage("error", "Failed to load model: " + (error.message || error));
@@ -4595,7 +4843,7 @@ function toMarkdown(chat) {
     if (event.target === captureModalEl) closeCaptureModal();
   });
   liveSizeRangeEl.addEventListener("input", () => {
-    liveFrameSize = boundedNumber(liveSizeRangeEl.value, 640, 256, 960, true);
+    liveFrameSize = boundedNumber(liveSizeRangeEl.value, 384, 256, 960, true);
     liveSizeValueEl.textContent = liveFrameSize + "px";
   });
   livePauseButtonEl.addEventListener("click", () => {
@@ -4799,6 +5047,37 @@ function toMarkdown(chat) {
     return canvas.toDataURL("image/jpeg", 0.8);
   }
 
+  // video.play() resolves once playback is requested, which can precede the
+  // first decoded camera frame. Capturing in that small gap produces a 1×1
+  // JPEG, then leaves the vision encoder apparently stuck on the placeholder.
+  // Wait for real frame dimensions so every live request starts with a usable
+  // image and surface a clear failure if the camera never delivers one.
+  function waitForLiveVideoFrame(signal) {
+    if (captureVideoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && captureVideoEl.videoWidth && captureVideoEl.videoHeight) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      let timer = null;
+      const done = (error) => {
+        captureVideoEl.removeEventListener("loadeddata", check);
+        captureVideoEl.removeEventListener("resize", check);
+        signal.removeEventListener("abort", abort);
+        if (timer) clearTimeout(timer);
+        if (error) reject(error);
+        else resolve();
+      };
+      const check = () => {
+        if (captureVideoEl.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && captureVideoEl.videoWidth && captureVideoEl.videoHeight) done();
+      };
+      const abort = () => done(new DOMException("Live vision stopped", "AbortError"));
+      captureVideoEl.addEventListener("loadeddata", check);
+      captureVideoEl.addEventListener("resize", check);
+      signal.addEventListener("abort", abort, { once: true });
+      timer = setTimeout(() => done(new Error("No camera frame arrived. Check the camera permission and try again.")), 8000);
+      check();
+    });
+  }
+
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -4831,9 +5110,28 @@ function toMarkdown(chat) {
   function resetLiveOutput() {
     liveOutputTextEl.classList.remove("is-streaming", "is-error");
     liveOutputTextEl.classList.add("is-placeholder");
-    liveOutputTextEl.textContent = "Waiting for the first frame…";
+    liveOutputTextEl.textContent = "Starting camera…";
     liveStatTTFTEl.textContent = "ttft --";
     liveStatTPSEl.textContent = "tok/s --";
+  }
+
+  function startLiveFrameProgress() {
+    stopLiveFrameProgress();
+    liveFrameStartedAt = performance.now();
+    const update = () => {
+      const seconds = Math.floor((performance.now() - liveFrameStartedAt) / 1000);
+      const suffix = seconds ? " (" + seconds + "s)" : "";
+      setLiveOutputText("Frame captured — waiting for the model response" + suffix + "…", true);
+    };
+    update();
+    liveFrameProgressTimer = setInterval(update, 1000);
+  }
+
+  function stopLiveFrameProgress() {
+    if (liveFrameProgressTimer) {
+      clearInterval(liveFrameProgressTimer);
+      liveFrameProgressTimer = null;
+    }
   }
 
   function updateLiveStats(ttft, tps) {
@@ -4875,12 +5173,35 @@ function toMarkdown(chat) {
   }
 
   async function completeLiveVision(chat, prompt, image, signal, onToken) {
+    // Live frames are a perception task, not an open-ended chat turn. Short,
+    // low-temperature answers keep the output grounded in what is actually
+    // visible instead of letting a small vision model elaborate a speculative
+    // story from one dark/noisy webcam frame.
+    const liveSettings = Object.assign({}, chat.settings, {
+      maxTokens: Math.min(64, boundedNumber(chat.settings.maxTokens, 64, 1, 4096, true)),
+      temperature: Math.min(0.3, boundedNumber(chat.settings.temperature, 0.3, 0, 2, false))
+    });
+    const liveSystemPrompt = [
+      chat.systemPrompt.trim(),
+      "You are describing one current live camera frame. State only clearly visible people, objects, colors, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly."
+    ].filter(Boolean).join("\n\n");
     if (preferences.inferenceMode === "browser") {
       await loadWasmBridgeScript();
       if (!(await window.GopherLLMBrowser.isModelLoaded())) {
         throw new Error("No model is loaded in this browser tab. Open Settings to choose one.");
       }
-      const options = Object.assign(samplerFields(chat.settings), { systemPrompt: chat.systemPrompt.trim() || undefined });
+      // The WASM bridge intentionally uses camelCase while the OpenAI HTTP
+      // endpoint uses snake_case. Passing samplerFields here used to silently
+      // ignore the live cap and decode the bridge default of 512 tokens.
+      const options = {
+        maxTokens: liveSettings.maxTokens,
+        temperature: liveSettings.temperature,
+        topP: liveSettings.topP,
+        topK: liveSettings.topK,
+        minP: liveSettings.minP,
+        repeatPenalty: liveSettings.repeatPenalty,
+		systemPrompt: liveSystemPrompt
+      };
       let answer = "";
       const imageBase64 = image.slice(image.indexOf(",") + 1);
       const result = await window.GopherLLMBrowser.generate([
@@ -4897,7 +5218,7 @@ function toMarkdown(chat) {
         { type: "text", text: prompt },
         { type: "image_url", image_url: { url: image } }
       ] }
-    ], chat.settings, chat.systemPrompt, signal, onToken);
+    ], liveSettings, liveSystemPrompt, signal, onToken, false);
   }
 
   // Mirrors an on-device webcam-captioning loop: the prompt lives in its own
@@ -4947,18 +5268,24 @@ function toMarkdown(chat) {
       let ttft = null;
       let tokenCount = 0;
       try {
+        setLiveOutputText("Waiting for a camera frame…", true);
+        await waitForLiveVideoFrame(requestController.signal);
         const image = captureLiveFrame();
+        startLiveFrameProgress();
         const answer = await completeLiveVision(chat, prompt, image, requestController.signal, (partial) => {
+          stopLiveFrameProgress();
           if (ttft === null) ttft = performance.now() - startedAt;
           tokenCount++;
           setLiveOutputText(partial, true);
         });
-        setLiveOutputText(answer, false);
+        stopLiveFrameProgress();
+        setLiveOutputText(answer || "The model returned no text for this frame.", false);
         const elapsedSec = (performance.now() - startedAt) / 1000;
         updateLiveStats(ttft, tokenCount && elapsedSec > 0 ? tokenCount / elapsedSec : null);
         if (answer.trim()) pushLiveHistory(answer.trim());
         if (liveVisionRunning) setLiveStatus(liveVisionPaused ? "paused" : "live");
       } catch (error) {
+        stopLiveFrameProgress();
         if (!(error && error.name === "AbortError")) {
           setLiveStatus("error");
           setLiveOutputText("Error: " + (error && error.message ? error.message : String(error)), false, true);
@@ -4978,6 +5305,7 @@ function toMarkdown(chat) {
     if (liveVisionController) liveVisionController.abort();
     if (preferences.inferenceMode === "browser" && window.GopherLLMBrowser) window.GopherLLMBrowser.stopGeneration();
     liveVisionController = null;
+    stopLiveFrameProgress();
     stopLiveElapsedTimer();
     liveVisionButtonEl.classList.remove("is-live");
     liveVisionButtonEl.setAttribute("aria-label", "Start live camera");

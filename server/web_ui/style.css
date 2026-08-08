@@ -993,7 +993,32 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   border: 1px solid var(--line); border-radius: var(--r-pill); background: var(--panel);
   color: var(--muted); font: 700 var(--fs-3xs)/1.2 var(--mono); white-space: nowrap;
 }
+.model-badge-capability.is-supported { border-color: color-mix(in srgb, var(--ok) 42%, var(--line)); color: var(--ok); }
+.model-badge-capability.is-unavailable { color: var(--muted); }
 .model-badge-active { border-color: color-mix(in srgb, var(--ok) 35%, var(--line)); color: var(--ok); }
+.model-load-progress {
+  display: grid; gap: 7px; margin: -2px 0 12px; padding: 10px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--line)); border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--accent) 5%, var(--panel));
+}
+.model-load-progress-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.model-load-progress-copy { min-width: 0; display: grid; gap: 1px; }
+.model-load-progress-copy strong { color: var(--ink); font-size: var(--fs-xs); font-weight: 760; }
+.model-load-elapsed { flex: none; color: var(--muted); font: 700 var(--fs-2xs)/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+.model-load-bar { position: relative; height: 7px; overflow: hidden; border-radius: var(--r-pill); background: color-mix(in srgb, var(--accent) 14%, var(--line)); }
+.model-load-bar-fill {
+  position: absolute; inset: 0 auto 0 -48%; width: 48%; border-radius: inherit;
+  background: linear-gradient(90deg, transparent, var(--accent), color-mix(in srgb, var(--accent) 64%, white), var(--accent), transparent);
+  animation: modelLoadSweep 1.25s ease-in-out infinite;
+}
+.model-load-detail { margin: 0; color: var(--muted); font-size: var(--fs-2xs); line-height: 1.4; }
+.model-load-progress.is-complete { border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); background: color-mix(in srgb, var(--ok) 6%, var(--panel)); }
+.model-load-progress.is-complete .model-load-bar-fill { inset: 0; width: 100%; background: var(--ok); animation: none; }
+@keyframes modelLoadSweep { to { transform: translateX(310%); } }
+@media (prefers-reduced-motion: reduce) {
+  .model-load-bar-fill { inset: 0 auto 0 31%; width: 38%; transform: none; }
+  .model-load-progress.is-complete .model-load-bar-fill { inset: 0; width: 100%; }
+}
 .model-search-label { color: var(--ink) !important; }
 .model-search { margin: 0; padding-left: 10px !important; }
 .model-native-select { display: none; }
@@ -1022,6 +1047,19 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .model-download-label { min-width: 0; flex: 1; margin: 0; color: var(--ink) !important; }
 .model-download-form { display: flex; align-items: flex-end; gap: 8px; }
 .model-download-form .autotune-run { flex: none; min-height: 31px; }
+.model-hub-search-form { margin-top: 2px; }
+.model-hub-search-status { margin-top: 7px; }
+.model-hub-search-results { display: grid; gap: 5px; max-height: 254px; margin: 8px 0 0; padding: 0; overflow-y: auto; list-style: none; }
+.model-hub-search-result { min-width: 0; }
+.model-hub-search-action {
+  display: grid; width: 100%; gap: 3px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg); color: var(--ink); text-align: left;
+}
+.model-hub-search-action:hover { border-color: color-mix(in srgb, var(--accent) 48%, var(--line)); background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
+.model-hub-search-action strong { overflow: hidden; font: 700 var(--fs-xs)/1.35 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+.model-hub-search-meta { overflow: hidden; color: var(--muted); font-size: var(--fs-3xs); line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.model-download-separator { display: flex; align-items: center; gap: 8px; margin: 12px 0 8px; color: var(--muted); font-size: var(--fs-3xs); font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.model-download-separator::before, .model-download-separator::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 .model-download-variants { display: grid; gap: 6px; max-height: 220px; margin: 10px 0 0; padding: 0; overflow-y: auto; list-style: none; }
 .model-download-variant { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
 .model-download-variant-copy { min-width: 0; display: grid; gap: 1px; }

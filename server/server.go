@@ -43,6 +43,11 @@ var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
 
 var inferenceRequestSeq atomic.Uint64
 
+const (
+	hfSearchTimeout     = 10 * time.Second
+	hfSearchConcurrency = 2
+)
+
 type chatTemplateData struct {
 	Title string
 	Model string
@@ -320,6 +325,30 @@ func (r modelLoadRequest) selector() string {
 	return ""
 }
 
+// modelSearchRequest is deliberately query-string-only: the browser can
+// cancel a GET while a user keeps typing, and the request does not carry any
+// sensitive model-download credential or arbitrary remote URL.
+type modelSearchRequest struct {
+	Query string
+	Limit int
+}
+
+func parseModelSearchRequest(req *http.Request) (modelSearchRequest, error) {
+	query := strings.TrimSpace(req.URL.Query().Get("q"))
+	if query == "" {
+		return modelSearchRequest{}, errors.New("missing q query parameter")
+	}
+	limit := huggingface.DefaultSearchLimit
+	if raw := strings.TrimSpace(req.URL.Query().Get("limit")); raw != "" {
+		value, err := strconv.Atoi(raw)
+		if err != nil || value < 1 || value > huggingface.MaxSearchLimit {
+			return modelSearchRequest{}, fmt.Errorf("limit must be between 1 and %d", huggingface.MaxSearchLimit)
+		}
+		limit = value
+	}
+	return modelSearchRequest{Query: query, Limit: limit}, nil
+}
+
 // ServeOptions is HandlerOptions plus the listen address, for the Serve
 // convenience wrapper (used by the CLI). ChatHistoryLock remains for source
 // compatibility with older hosts; the handler serializes its own file access.
@@ -479,6 +508,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	history := newChatHistoryStore(opts.ChatHistoryPath)
 	remote := newRemoteState()
 	sem := make(chan struct{}, opts.MaxConcurrentRequests)
+	// Model search has its own tiny outbound-request budget so repeated
+	// type-ahead queries cannot consume inference capacity or fan out into an
+	// unbounded number of Hub requests.
+	hfSearchSem := make(chan struct{}, hfSearchConcurrency)
 	var autoTuneMu sync.Mutex
 	// Serializes replacement plus its host callback. This prevents two nearly
 	// simultaneous hot-swaps from recording the models out of their actual
@@ -948,6 +981,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			Loaded        bool    `json:"loaded"`
 			Embedding     bool    `json:"embedding"`
 			Vision        bool    `json:"vision"`
+			Reasoning     bool    `json:"reasoning"`
 		}
 		if opts.ModelDir == "" {
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
@@ -979,6 +1013,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				Loaded:        e.Path == loadedPath,
 				Embedding:     e.IsEmbedding && e.IsSupported && !e.IsProjector,
 				Vision:        e.ProjectorPath != "",
+				Reasoning:     e.Reasoning,
 			})
 		}
 		writeJSON(w, map[string]any{"models": models})
@@ -1141,6 +1176,40 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		}
 		writeJSON(w, map[string]any{"repository": info.Repository, "revision": info.Revision, "variants": variants})
 	})
+	mux.HandleFunc("/models/search", withLimit(hfSearchSem, func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.ModelDir == "" {
+			http.Error(w, "model download is disabled: configure HandlerOptions.ModelDir", http.StatusNotFound)
+			return
+		}
+		search, err := parseModelSearchRequest(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(req.Context(), hfSearchTimeout)
+		defer cancel()
+		models, err := huggingface.SearchGGUFRepositories(ctx, search.Query, search.Limit, huggingface.DefaultOptions())
+		if err != nil {
+			if errors.Is(err, context.Canceled) && req.Context().Err() != nil {
+				// The browser aborted a type-ahead request. There is no client left
+				// to receive an error, and the request context already stopped the
+				// outbound Hub operation.
+				return
+			}
+			status := http.StatusBadGateway
+			if errors.Is(err, context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+			}
+			http.Error(w, err.Error(), status)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, map[string]any{"models": models})
+	}))
 	mux.HandleFunc("/models/download", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

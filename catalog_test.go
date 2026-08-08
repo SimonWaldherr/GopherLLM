@@ -59,6 +59,29 @@ func TestArchitectureSupportedCoversImplementedLoaders(t *testing.T) {
 	}
 }
 
+func TestModelSupportsReasoning(t *testing.T) {
+	plain := &GGUFFile{Metadata: map[string]MetaValue{}}
+	thinkingTemplate := &GGUFFile{Metadata: map[string]MetaValue{
+		"tokenizer.chat_template": {Kind: "str", Value: "{% if true %}<think>{% endif %}"},
+	}}
+	for _, test := range []struct {
+		name, arch, file, model string
+		gguf                    *GGUFFile
+		want                    bool
+	}{
+		{"qwen3 capability", "qwen3", "model.gguf", "Qwen3", plain, true},
+		{"template capability", "mistral3", "model.gguf", "Mistral", thinkingTemplate, true},
+		{"named reasoning model", "mistral3", "model.gguf", "Ministral Reasoning", plain, true},
+		{"plain instruct model", "mistral3", "model.gguf", "Ministral Instruct", plain, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := modelSupportsReasoning(test.arch, test.file, test.model, test.gguf); got != test.want {
+				t.Fatalf("modelSupportsReasoning() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestPromptModelSelectionAcceptsNumber(t *testing.T) {
 	entries := []ModelEntry{
 		testEntry("alpha/alpha-Q4_K_M", "llama", false),

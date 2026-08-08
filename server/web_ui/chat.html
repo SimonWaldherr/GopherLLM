@@ -301,6 +301,19 @@
             </div>
             <span id="activeModelState" class="model-badge model-badge-active">Not loaded</span>
           </div>
+          <div id="modelLoadProgress" class="model-load-progress" hidden>
+            <div class="model-load-progress-head">
+              <div class="model-load-progress-copy">
+                <span class="active-model-label">Loading locally</span>
+                <strong id="modelLoadStage" aria-live="polite">Preparing model</strong>
+              </div>
+              <span id="modelLoadElapsed" class="model-load-elapsed">0s</span>
+            </div>
+            <div id="modelLoadBar" class="model-load-bar" role="progressbar" aria-label="Model loading progress" aria-valuetext="Preparing model">
+              <span class="model-load-bar-fill" aria-hidden="true"></span>
+            </div>
+            <p id="modelLoadDetail" class="model-load-detail">GopherLLM is opening the selected GGUF in the background.</p>
+          </div>
           <label class="model-search-label" for="modelSearch">Find a model
             <input type="search" id="modelSearch" class="model-search" placeholder="Name, architecture, repository, or size…" aria-describedby="modelResultCount" autocomplete="off">
           </label>
@@ -323,9 +336,18 @@
           <div class="settings-section-head">
             <div>
               <h3>Download a model</h3>
-              <p>Fetch a GGUF from Hugging Face straight into the local model library.</p>
+              <p>Search GGUF repositories on Hugging Face or fetch a known model straight into the local library.</p>
             </div>
           </div>
+          <form id="modelHubSearchForm" class="model-download-form model-hub-search-form">
+            <label class="model-download-label" for="modelHubSearchQuery">Search Hugging Face
+              <input type="search" id="modelHubSearchQuery" placeholder="e.g. Ministral, Qwen, Gemma…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="modelHubSearchStatus">
+            </label>
+            <button id="modelHubSearchSubmit" class="autotune-run" type="submit">Search</button>
+          </form>
+          <p id="modelHubSearchStatus" class="settings-note model-hub-search-status" aria-live="polite">Showing up to 12 GGUF repositories, sorted by Hub downloads.</p>
+          <ul id="modelHubSearchResults" class="model-hub-search-results" aria-label="Hugging Face GGUF search results" hidden></ul>
+          <p class="model-download-separator" aria-hidden="true"><span>or use a repository directly</span></p>
           <form id="modelDownloadForm" class="model-download-form">
             <label class="model-download-label" for="modelDownloadRef">Hugging Face repository
               <input type="text" id="modelDownloadRef" placeholder="owner/repository or hf:owner/repository:QUANT" autocomplete="off" autocapitalize="off" spellcheck="false">
@@ -677,8 +699,8 @@
             </div>
             <div class="live-topbar-end">
               <label class="live-size">
-                <span class="live-size-label">Input <b id="liveSizeValue">640px</b></span>
-                <input id="liveSizeRange" type="range" min="256" max="960" step="32" value="640" aria-label="Live frame resolution">
+                <span class="live-size-label">Input <b id="liveSizeValue">384px</b></span>
+                <input id="liveSizeRange" type="range" min="256" max="960" step="32" value="384" aria-label="Live frame resolution">
               </label>
               <button id="livePauseButton" class="icon-button live-pause-btn" type="button" aria-label="Pause live vision" title="Pause">
                 <svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg>

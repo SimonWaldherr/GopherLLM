@@ -86,6 +86,98 @@ func TestModelsDownloadVariantsRejectsMissingRef(t *testing.T) {
 	}
 }
 
+func TestModelsSearchFindsGGUFRepositories(t *testing.T) {
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/models" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.String())
+		}
+		query := r.URL.Query()
+		if query.Get("search") != "qwen" || query.Get("filter") != "gguf" || query.Get("limit") != "2" || query.Get("sort") != "downloads" || query.Get("direction") != "-1" {
+			t.Fatalf("unexpected search query: %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"id":"Qwen/Qwen3-4B-GGUF","downloads":123,"likes":45,"lastModified":"2026-08-09T12:00:00.000Z","private":false,"gated":false}]`)
+	}))
+	defer hf.Close()
+	t.Setenv("HF_ENDPOINT", hf.URL)
+
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/models/search?q=qwen&limit=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("cache-control = %q", got)
+	}
+	var data struct {
+		Models []struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Downloads int64  `json:"downloads"`
+			Likes     int64  `json:"likes"`
+			UpdatedAt string `json:"updated_at"`
+			GGUF      bool   `json:"gguf"`
+			Private   bool   `json:"private"`
+			Gated     bool   `json:"gated"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Models) != 1 {
+		t.Fatalf("models = %#v", data.Models)
+	}
+	model := data.Models[0]
+	if model.ID != "Qwen/Qwen3-4B-GGUF" || model.Name != model.ID || model.Downloads != 123 || model.Likes != 45 || model.UpdatedAt != "2026-08-09T12:00:00.000Z" || !model.GGUF || model.Private || model.Gated {
+		t.Fatalf("model = %#v", model)
+	}
+}
+
+func TestModelsSearchValidatesRequest(t *testing.T) {
+	disabled := httptest.NewServer(NewHandler(nil, HandlerOptions{}))
+	defer disabled.Close()
+	resp, err := http.Get(disabled.URL + "/models/search?q=qwen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("disabled search status = %d, want 404", resp.StatusCode)
+	}
+
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	defer srv.Close()
+	for _, target := range []string{
+		"/models/search",
+		"/models/search?q=qwen&limit=0",
+		"/models/search?q=qwen&limit=21",
+	} {
+		response, err := http.Get(srv.URL + target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("GET %s status = %d, want 400", target, response.StatusCode)
+		}
+	}
+	response, err := http.Post(srv.URL+"/models/search?q=qwen", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST search status = %d, want 405", response.StatusCode)
+	}
+}
+
 func TestModelsDownloadRejectsInvalidRef(t *testing.T) {
 	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
 	defer srv.Close()

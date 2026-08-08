@@ -21,9 +21,27 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const hfPrefix = "hf:"
+
+const (
+	// DefaultSearchLimit keeps interactive Hub searches small enough to remain
+	// responsive and considerate of the Hub API's rate limits.
+	DefaultSearchLimit = 12
+	// MaxSearchLimit prevents a single browser request from turning into an
+	// unbounded Hub listing. Callers that need an exhaustive catalogue should
+	// use the Hugging Face tools directly rather than the interactive API.
+	MaxSearchLimit = 20
+
+	// maxSearchResponseBytes bounds metadata read from the Hub. Search results
+	// contain only repository metadata, so two MiB is ample for 20 entries and
+	// still protects the server from an unexpectedly large proxy response.
+	maxSearchResponseBytes int64 = 2 << 20
+	maxSearchQueryRunes          = 120
+)
 
 type hfReference struct {
 	Repository string
@@ -201,6 +219,158 @@ type RepositoryInfo struct {
 	Repository string
 	Revision   string
 	Variants   []RepositoryVariant
+}
+
+// SearchResult is the safe, small subset of a Hugging Face model record that
+// the browser model picker needs. GGUF means the result came from the Hub's
+// server-side GGUF filter; callers must still inspect variants before a
+// download, because the repository tree is the authoritative file listing.
+type SearchResult struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Downloads int64  `json:"downloads"`
+	Likes     int64  `json:"likes"`
+	UpdatedAt string `json:"updated_at"`
+	GGUF      bool   `json:"gguf"`
+	Private   bool   `json:"private"`
+	Gated     bool   `json:"gated"`
+}
+
+// SearchGGUFRepositories finds a small, download-sorted set of public or
+// authenticated Hugging Face model repositories matching query. It performs
+// exactly one Hub API request, respects ctx while waiting or reading, and
+// never follows pagination. The returned repositories are GGUF-filtered by
+// the Hub; use RepositoryVariants before offering a concrete download.
+//
+// A limit of zero selects DefaultSearchLimit. All other limits must be in
+// [1, MaxSearchLimit]. Search is intentionally unavailable in offline mode:
+// a local model cache has no repository search index.
+func SearchGGUFRepositories(ctx context.Context, query string, limit int, opts Options) ([]SearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	query, err := normalizeSearchQuery(query)
+	if err != nil {
+		return nil, err
+	}
+	if limit == 0 {
+		limit = DefaultSearchLimit
+	}
+	if limit < 1 || limit > MaxSearchLimit {
+		return nil, fmt.Errorf("Hugging Face search limit must be between 1 and %d", MaxSearchLimit)
+	}
+	if opts.Offline || hfBoolEnv("HF_HUB_OFFLINE") {
+		return nil, errors.New("Hugging Face search is unavailable while offline mode is enabled")
+	}
+
+	u, err := url.Parse(hfEndpoint() + "/api/models")
+	if err != nil {
+		return nil, fmt.Errorf("build Hugging Face model search request: %w", err)
+	}
+	params := u.Query()
+	params.Set("search", query)
+	// "gguf" is a Hub model tag. Keeping the filter server-side avoids one
+	// tree request per result and makes search practical on limited networks.
+	params.Set("filter", "gguf")
+	params.Set("sort", "downloads")
+	params.Set("direction", "-1")
+	params.Set("limit", strconv.Itoa(limit))
+	// The compact list endpoint normally contains the fields below, but full
+	// asks compatible Hub mirrors for tags and gated/private metadata as well.
+	params.Set("full", "true")
+	u.RawQuery = params.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	hfAuth(req)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("search Hugging Face models: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, hfStatusError(resp, "model search")
+	}
+
+	var records []hfSearchRecord
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSearchResponseBytes)).Decode(&records); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("read Hugging Face model search: %w", err)
+	}
+	results := make([]SearchResult, 0, len(records))
+	for _, record := range records {
+		id := strings.TrimSpace(record.ID)
+		if id == "" {
+			id = strings.TrimSpace(record.ModelID)
+		}
+		// The search result feeds directly into the existing downloader. Ignore
+		// malformed records rather than exposing a selector it would reject.
+		if _, err := ParseHuggingFaceReference(hfPrefix + id); err != nil {
+			continue
+		}
+		results = append(results, SearchResult{
+			ID:        id,
+			Name:      id,
+			Downloads: record.Downloads,
+			Likes:     record.Likes,
+			UpdatedAt: record.LastModified,
+			GGUF:      true,
+			Private:   record.Private,
+			Gated:     record.isGated(),
+		})
+		if len(results) == limit {
+			break
+		}
+	}
+	return results, nil
+}
+
+type hfSearchRecord struct {
+	ID           string          `json:"id"`
+	ModelID      string          `json:"modelId"`
+	Downloads    int64           `json:"downloads"`
+	Likes        int64           `json:"likes"`
+	LastModified string          `json:"lastModified"`
+	Private      bool            `json:"private"`
+	Gated        json.RawMessage `json:"gated"`
+}
+
+func (r hfSearchRecord) isGated() bool {
+	if len(r.Gated) == 0 || string(r.Gated) == "null" {
+		return false
+	}
+	var value bool
+	if err := json.Unmarshal(r.Gated, &value); err == nil {
+		return value
+	}
+	var text string
+	if err := json.Unmarshal(r.Gated, &text); err == nil {
+		return text != "" && !strings.EqualFold(text, "false")
+	}
+	return true
+}
+
+func normalizeSearchQuery(query string) (string, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return "", errors.New("Hugging Face search query is empty")
+	}
+	if utf8.RuneCountInString(query) > maxSearchQueryRunes {
+		return "", fmt.Errorf("Hugging Face search query exceeds %d characters", maxSearchQueryRunes)
+	}
+	for _, r := range query {
+		if unicode.IsControl(r) {
+			return "", errors.New("Hugging Face search query contains a control character")
+		}
+	}
+	return query, nil
 }
 
 // RepositoryVariants resolves the selectable GGUF variants in a Hugging Face
