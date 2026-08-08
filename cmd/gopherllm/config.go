@@ -85,6 +85,7 @@ var cliValueOptions = map[string]bool{
 	"-p":                   true,
 	"--serve":              true,
 	"--chat-history":       true,
+	"--wasm-dir":           true,
 	"--max-connections":    true,
 	"--max-tokens":         true,
 	"-n":                   true,

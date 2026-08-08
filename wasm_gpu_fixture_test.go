@@ -27,11 +27,11 @@ func buildTinyQuantizedMistralGGUF() []byte {
 // by this function's existence.
 func buildTinyQuantizedMistralGGUFWithSpecials(extraSpecials []string) []byte {
 	const (
-		dim    = 256
-		heads  = 4
-		kv     = 2
-		hdim   = dim / heads // 64
-		hidden = 256
+		dim       = 256
+		heads     = 4
+		kv        = 2
+		hdim      = dim / heads // 64
+		hidden    = 256
 		baseVocab = 32
 	)
 	vocab := baseVocab + len(extraSpecials)

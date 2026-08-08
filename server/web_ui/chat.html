@@ -9,7 +9,7 @@
   <meta name="color-scheme" content="light dark">
   <link rel="stylesheet" href="/style.css">
 </head>
-<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}">
+<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}" data-local-runtime="{{.HasLocalRuntime}}">
 
 <!-- Icon sprite: plain geometric outlines, hand-drawn for this page, so every
      chrome icon renders from one same-origin vector source at a consistent
@@ -30,6 +30,9 @@
   <symbol id="i-star" viewBox="0 0 24 24"><path d="M12,3 L14.12,9.09 L20.56,9.22 L15.42,13.11 L17.29,19.28 L12,15.6 L6.71,19.28 L8.58,13.11 L3.44,9.22 L9.88,9.09 Z"/></symbol>
   <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
   <symbol id="i-check" viewBox="0 0 24 24"><polyline points="4,12 9,17 20,6"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.6"/><circle cx="9" cy="10" r="1.8" fill="currentColor" stroke="none"/><path d="M4 17l5-5 3.5 3.5L16 12l4 5"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8h3l1.6-2.2A2 2 0 0 1 10.2 5h3.6a2 2 0 0 1 1.6.8L17 8h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z"/><circle cx="12" cy="14" r="3.6"/></symbol>
+  <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1.6"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="17" x2="12" y2="20"/></symbol>
 </svg>
 
 <div class="app">
@@ -120,10 +123,19 @@
             aria-required="true"
           ></textarea>
           <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
+          <div id="imagePreviewRow" class="image-preview-row" hidden>
+            <img id="imagePreview" class="image-preview-thumb" alt="Attached image preview">
+            <button id="clearImageButton" class="text-button" type="button">Remove image</button>
+          </div>
+          <p id="captureError" class="settings-note model-download-status is-error" hidden></p>
           <div class="prompt-footer">
             <div class="prompt-footer-start">
               <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
               <input id="fileInput" type="file" multiple hidden>
+              <button id="attachImage" class="composer-icon-button" type="button" aria-label="Attach an image" title="Attach an image" hidden><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg></button>
+              <input id="imageFileInput" type="file" accept="image/*" hidden>
+              <button id="webcamButton" class="composer-icon-button" type="button" aria-label="Capture from webcam" title="Capture from webcam" hidden><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg></button>
+              <button id="screenButton" class="composer-icon-button" type="button" aria-label="Capture the screen" title="Capture the screen" hidden><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg></button>
               <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
             </div>
             <div class="prompt-footer-end">
@@ -219,7 +231,58 @@
       </nav>
 
       <div id="settingsPageModel" class="settings-page" role="tabpanel" aria-labelledby="settingsTabModel" data-settings-page="model">
-        <section class="settings-section settings-model-section">
+        <section class="settings-section" id="inferenceModeSection" hidden>
+          <div class="settings-section-head">
+            <div>
+              <h3>Inference</h3>
+              <p>Run the model on this GopherLLM server, or load a GGUF straight into this browser tab (WebGPU-accelerated where available).</p>
+            </div>
+          </div>
+          <div class="settings-primary-grid workspace-fields">
+            <label>Where models run
+              <select id="inferenceMode">
+                <option value="server">GopherLLM server (backend)</option>
+                <option value="browser">This browser (WASM/WebGPU)</option>
+              </select>
+            </label>
+          </div>
+          <p id="inferenceModeStatus" class="settings-note" aria-live="polite">Browser mode runs entirely on-device: no chat data leaves this tab, but tool use, retrieval, and long-context strategies are unavailable.</p>
+        </section>
+
+        <section class="settings-section" id="browserModelSection" hidden>
+          <div class="settings-section-head">
+            <div>
+              <h3>Browser model</h3>
+              <p>Pick a GGUF text model and, optionally, a matching vision projector (mmproj) file from disk.</p>
+            </div>
+            <span id="browserGPUBadge" class="model-badge">checking WebGPU…</span>
+          </div>
+          <div id="browserModelSummary" class="active-model-summary" aria-live="polite" hidden>
+            <span class="active-model-indicator" aria-hidden="true"></span>
+            <div class="active-model-copy">
+              <span class="active-model-label">Active model</span>
+              <strong id="browserModelName">No model loaded</strong>
+              <span id="browserModelMeta"></span>
+            </div>
+            <button id="browserModelUnload" class="text-button" type="button">Switch to server</button>
+          </div>
+          <div class="model-download-form">
+            <button id="browserTextModelPick" class="text-button" type="button">Choose text model (.gguf)…</button>
+            <input id="browserTextModelFile" type="file" accept=".gguf" hidden>
+            <span id="browserTextModelName" class="field-note"></span>
+          </div>
+          <div class="model-download-form">
+            <button id="browserVisionModelPick" class="text-button" type="button">Choose vision projector (optional)…</button>
+            <input id="browserVisionModelFile" type="file" accept=".gguf" hidden>
+            <span id="browserVisionModelName" class="field-note"></span>
+          </div>
+          <div class="settings-actions">
+            <button id="browserModelLoad" class="autotune-run" type="button" disabled>Load into this browser</button>
+          </div>
+          <p id="browserModelStatus" class="settings-note" aria-live="polite">Choose a text model file to begin. Nothing is uploaded — the file is read and parsed locally.</p>
+        </section>
+
+        <section class="settings-section settings-model-section" id="serverModelSection">
           <div class="settings-section-head">
             <div>
               <h3>Local model</h3>
@@ -253,7 +316,7 @@
           </div>
         </section>
 
-        <section class="settings-section settings-download-section">
+        <section class="settings-section settings-download-section" id="modelDownloadSection">
           <div class="settings-section-head">
             <div>
               <h3>Download a model</h3>
@@ -589,6 +652,21 @@
         <div id="agentosResult" class="agentos-result"></div>
       </section>
       <p class="settings-note">The model proposes a command; its own claim of being "safe" never decides whether it runs. That is always the server's configured policy, plus your approval when the policy asks for it.</p>
+    </div>
+  </div>
+</div>
+
+<div id="captureModal" class="settings" hidden>
+  <div class="settings-panel capture-panel" role="dialog" aria-modal="true" aria-labelledby="captureTitle">
+    <div class="settings-panel-head">
+      <h2 id="captureTitle">Capture an image</h2>
+      <button id="captureCancelButton" class="icon-button" type="button" aria-label="Cancel capture"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="settings-panel-body">
+      <video id="captureVideo" class="capture-video" autoplay playsinline muted></video>
+    </div>
+    <div class="settings-panel-foot">
+      <button id="captureConfirmButton" class="autotune-run" type="button">Capture</button>
     </div>
   </div>
 </div>

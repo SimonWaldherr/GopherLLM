@@ -36,6 +36,9 @@ var chatCSS string
 //go:embed web_ui/script.js
 var chatJS string
 
+//go:embed web_ui/wasm-bridge.js
+var wasmBridgeJS string
+
 var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
 
 var inferenceRequestSeq atomic.Uint64
@@ -58,6 +61,10 @@ type chatTemplateData struct {
 	// MermaidScript the full script URL the page should load.
 	MermaidCDN    string
 	MermaidScript string
+	// HasLocalRuntime reports whether this server was started with a valid
+	// WasmDir (see HandlerOptions.WasmDir) — the page only offers the
+	// "run locally in this browser tab" inference-mode toggle when true.
+	HasLocalRuntime bool
 }
 
 type runnerState struct {
@@ -225,6 +232,14 @@ type HandlerOptions struct {
 	ModelDir string
 	// ModelPath is the initially loaded model's path (reported by /models).
 	ModelPath string
+	// WasmDir, if it contains both gopherllm.wasm and wasm_exec.js (see
+	// `make wasm-build`), enables the chat UI's "run locally in this
+	// browser tab" mode: those two files are served at /wasm/gopherllm.wasm
+	// and /wasm/wasm_exec.js, and chatTemplateData.HasLocalRuntime is set so
+	// the page can offer the toggle. Either file missing (or WasmDir unset)
+	// means that mode simply isn't offered — the rest of the server is
+	// unaffected either way.
+	WasmDir string
 	// ModelLoadOptions are retained for catalog hot-swaps, so a server started
 	// in out-of-core mode does not accidentally load the next model eagerly.
 	ModelLoadOptions gopherllm.LoadOptions
@@ -317,9 +332,11 @@ type ServeOptions struct {
 	ChatHistoryLock          *sync.Mutex
 	ModelDir                 string
 	ModelPath                string
-	ModelLoadOptions         gopherllm.LoadOptions
-	ModelLoaded              func(path string)
-	SkillsDir                string
+	// WasmDir is forwarded to HandlerOptions.WasmDir.
+	WasmDir          string
+	ModelLoadOptions gopherllm.LoadOptions
+	ModelLoaded      func(path string)
+	SkillsDir        string
 	// AppliedAutoTune carries forward a tuning already applied before Serve
 	// was called (e.g. by --auto), so GET /autotune reports it from the start.
 	AppliedAutoTune *gopherllm.AutoTuneResult
@@ -353,6 +370,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		ChatHistoryPath:       opts.ChatHistoryPath,
 		ModelDir:              opts.ModelDir,
 		ModelPath:             opts.ModelPath,
+		WasmDir:               opts.WasmDir,
 		ModelLoadOptions:      opts.ModelLoadOptions,
 		ModelLoaded:           opts.ModelLoaded,
 		SkillsDir:             opts.SkillsDir,
@@ -897,6 +915,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			Supported     bool    `json:"supported"`
 			Loaded        bool    `json:"loaded"`
 			Embedding     bool    `json:"embedding"`
+			Vision        bool    `json:"vision"`
 		}
 		if opts.ModelDir == "" {
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
@@ -927,6 +946,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				Supported:     e.IsSupported,
 				Loaded:        e.Path == loadedPath,
 				Embedding:     e.IsEmbedding && e.IsSupported && !e.IsProjector,
+				Vision:        e.ProjectorPath != "",
 			})
 		}
 		writeJSON(w, map[string]any{"models": models})
@@ -960,7 +980,11 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		newRunner, _, err := gopherllm.RunnerFromPathWithOptions(entry.Path, opts.ModelLoadOptions)
+		loadOptions := opts.ModelLoadOptions
+		if loadOptions.VisionProjectorPath == "" && len(loadOptions.VisionProjectorBytes) == 0 && entry.ProjectorPath != "" {
+			loadOptions.VisionProjectorPath = entry.ProjectorPath
+		}
+		newRunner, _, err := gopherllm.RunnerFromPathWithOptions(entry.Path, loadOptions)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -973,7 +997,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				opts.ModelLoaded(entry.Path)
 			}
 		}()
-		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.Config().MaxSeqLen, "out_of_core": newRunner.OutOfCore()})
+		writeJSON(w, map[string]any{"ok": true, "id": entry.ID, "model": modelID(newRunner), "context_length": newRunner.Config().MaxSeqLen, "out_of_core": newRunner.OutOfCore(), "vision": newRunner.HasVision()})
 	}))
 	mux.HandleFunc("/models/embed/load", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
@@ -1300,6 +1324,27 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		writeJSON(w, map[string]any{"decision": dec, "result": res})
 	}))
 	if opts.ChatUI {
+		// wasmPath/wasmExecPath point at fixed filenames under opts.WasmDir
+		// (never request-derived), so serving them directly is not a path-
+		// traversal risk. hasLocalRuntime gates both the /wasm/ routes below
+		// and the chat page's advertised HasLocalRuntime/CSP -- a WasmDir
+		// missing either file behaves exactly like an unset WasmDir.
+		wasmPath := filepath.Join(opts.WasmDir, "gopherllm.wasm")
+		wasmExecPath := filepath.Join(opts.WasmDir, "wasm_exec.js")
+		hasLocalRuntime := opts.WasmDir != "" && fileReadable(wasmPath) && fileReadable(wasmExecPath)
+		if hasLocalRuntime {
+			mux.HandleFunc("/wasm/gopherllm.wasm", func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "application/wasm")
+				w.Header().Set("Cache-Control", "no-store")
+				http.ServeFile(w, req, wasmPath)
+			})
+			mux.HandleFunc("/wasm/wasm_exec.js", func(w http.ResponseWriter, req *http.Request) {
+				w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				http.ServeFile(w, req, wasmExecPath)
+			})
+			fmt.Fprintf(logw, "Local browser inference: serving %s at /wasm/\n", opts.WasmDir)
+		}
 		mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 			if req.URL.Path != "/" {
 				http.NotFound(w, req)
@@ -1312,7 +1357,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			// CSP that permits it is a response header, so the choice travels
 			// back as a query parameter and is validated against the map above.
 			mermaid := mermaidChoice(req.URL.Query().Get("mermaid"))
-			setChatUIHeaders(w, mermaid)
+			setChatUIHeaders(w, mermaid, hasLocalRuntime)
 			w.Header().Set("content-type", "text/html; charset=utf-8")
 			model := modelID(state.get())
 			hasModel := model != ""
@@ -1320,16 +1365,17 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				model = "No model selected"
 			}
 			data := chatTemplateData{
-				Title:         "GopherLLM Chat",
-				Model:         model,
-				HasModel:      hasModel,
-				MaxTokens:     opts.Defaults.MaxTokens,
-				Temperature:   opts.Defaults.Sampler.Temperature,
-				TopP:          opts.Defaults.Sampler.TopP,
-				TopK:          opts.Defaults.Sampler.TopK,
-				MinP:          opts.Defaults.Sampler.MinP,
-				RepeatPenalty: opts.Defaults.Sampler.RepeatPenalty,
-				MermaidCDN:    mermaid,
+				Title:           "GopherLLM Chat",
+				Model:           model,
+				HasModel:        hasModel,
+				MaxTokens:       opts.Defaults.MaxTokens,
+				Temperature:     opts.Defaults.Sampler.Temperature,
+				TopP:            opts.Defaults.Sampler.TopP,
+				TopK:            opts.Defaults.Sampler.TopK,
+				MinP:            opts.Defaults.Sampler.MinP,
+				RepeatPenalty:   opts.Defaults.Sampler.RepeatPenalty,
+				MermaidCDN:      mermaid,
+				HasLocalRuntime: hasLocalRuntime,
 			}
 			if cdn, ok := mermaidCDNs[mermaid]; ok {
 				data.MermaidScript = cdn.Script
@@ -1344,15 +1390,22 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			}
 		})
 		mux.HandleFunc("/style.css", func(w http.ResponseWriter, _ *http.Request) {
-			setChatUIHeaders(w, "")
+			setChatUIHeaders(w, "", hasLocalRuntime)
 			w.Header().Set("content-type", "text/css; charset=utf-8")
 			fmt.Fprint(w, chatCSS)
 		})
 		mux.HandleFunc("/script.js", func(w http.ResponseWriter, _ *http.Request) {
-			setChatUIHeaders(w, "")
+			setChatUIHeaders(w, "", hasLocalRuntime)
 			w.Header().Set("content-type", "text/javascript; charset=utf-8")
 			fmt.Fprint(w, chatJS)
 		})
+		if hasLocalRuntime {
+			mux.HandleFunc("/wasm-bridge.js", func(w http.ResponseWriter, _ *http.Request) {
+				setChatUIHeaders(w, "", hasLocalRuntime)
+				w.Header().Set("content-type", "text/javascript; charset=utf-8")
+				fmt.Fprint(w, wasmBridgeJS)
+			})
+		}
 	}
 	return &Handler{
 		next:     remoteOrLoadedModel(state, remote, mux),
@@ -1413,7 +1466,7 @@ func mermaidChoice(raw string) string {
 	return ""
 }
 
-func setChatUIHeaders(w http.ResponseWriter, mermaidCDN string) {
+func setChatUIHeaders(w http.ResponseWriter, mermaidCDN string, allowWasm bool) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Referrer-Policy", "same-origin")
@@ -1426,7 +1479,24 @@ func setChatUIHeaders(w http.ResponseWriter, mermaidCDN string) {
 		// CDN chosen the policy stays strict.
 		style += " 'unsafe-inline'"
 	}
+	if allowWasm {
+		// Compiling same-origin-fetched WebAssembly bytes needs this even
+		// though the page never uses JS eval() — browsers gate
+		// WebAssembly.instantiate/compile behind 'wasm-unsafe-eval'
+		// specifically (not 'unsafe-eval', which stays absent) once a CSP
+		// declares script-src at all. Only added when this server was
+		// actually started with local wasm assets to offer.
+		script += " 'wasm-unsafe-eval'"
+	}
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; script-src "+script+"; style-src "+style)
+}
+
+// fileReadable reports whether path exists and is a regular, openable file
+// (not a directory) -- used only to decide whether to advertise/serve the
+// optional local-wasm-runtime assets, never on request-derived paths.
+func fileReadable(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 func displayServerURL(addr string, chatUI bool) string {

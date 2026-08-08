@@ -35,11 +35,11 @@ type PixtralVisionConfig struct {
 // RMSNorm pre-norm residual, full (non-causal) multi-head attention with 2D
 // RoPE, then a gated SiLU (or GELU, per UseGELU) FFN.
 type PixtralVisionLayerWeights struct {
-	AttnNorm             []float32 // v.blk.N.ln1
-	Q, K, V, Out         Weight    // v.blk.N.attn_{q,k,v,out}.weight
-	QB, KB, VB, OutB     []float32 // optional biases (absent in the verified Ministral-3 checkpoint)
-	FFNNorm              []float32 // v.blk.N.ln2
-	FFNGate, FFNUp, FFNDown Weight // v.blk.N.ffn_{gate,up,down}.weight
+	AttnNorm                []float32 // v.blk.N.ln1
+	Q, K, V, Out            Weight    // v.blk.N.attn_{q,k,v,out}.weight
+	QB, KB, VB, OutB        []float32 // optional biases (absent in the verified Ministral-3 checkpoint)
+	FFNNorm                 []float32 // v.blk.N.ln2
+	FFNGate, FFNUp, FFNDown Weight    // v.blk.N.ffn_{gate,up,down}.weight
 }
 
 // PixtralVisionWeights is a loaded Pixtral vision tower + projector. See

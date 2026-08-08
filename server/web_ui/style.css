@@ -749,6 +749,9 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
 .composer-options-toggle { display: inline-flex; align-items: center; gap: 4px; }
 .composer-options-toggle[aria-expanded="true"] > span[aria-hidden="true"] { transform: rotate(180deg); }
 .attachment-tray { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px 14px; }
+.image-preview-row { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px 14px; }
+.image-preview-thumb { max-height: 54px; max-width: 96px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); object-fit: cover; }
+.capture-video { display: block; width: 100%; max-height: 60vh; border-radius: var(--r-md); background: #000; }
 /* flex-wrap, not a single unshrinkable row: .attachment-chip-meta carries the
    longest string ("text · 12.4 KB · text included") and used to be
    flex:none, so on a narrow phone it took whatever width it wanted and left
@@ -785,6 +788,8 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .composer-pro select, .composer-pro input[type="number"] { min-height: 29px; padding: 4px 7px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg); color: var(--ink); font: 12px var(--sans); }
 .composer-pro .composer-power { display: inline-flex; align-items: center; gap: 6px; min-height: 29px; padding: 0 4px; }
 .composer-pro .composer-button { margin-left: auto; }
+.message-images { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.message-images img { max-height: 220px; max-width: min(100%, 320px); border: 1px solid var(--line); border-radius: var(--r-md); object-fit: contain; }
 .message-attachments { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
 .message-attachment { display: grid; gap: 2px; max-width: min(100%, 330px); padding: 7px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel-2); }
 .message-attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); font-size: var(--fs-xs); font-weight: 700; }

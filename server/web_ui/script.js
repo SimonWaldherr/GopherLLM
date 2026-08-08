@@ -781,7 +781,10 @@ function cleanMessage(value) {
     finishReason: typeof value.finishReason === "string" ? value.finishReason : "",
     prompt_cache: cleanPromptCache(value.prompt_cache),
     agent: Array.isArray(value.agent) ? value.agent.slice(0, 60) : null,
-    attachments: Array.isArray(value.attachments) ? value.attachments.map(cleanAttachment).filter(Boolean).slice(0, 8) : []
+    attachments: Array.isArray(value.attachments) ? value.attachments.map(cleanAttachment).filter(Boolean).slice(0, 8) : [],
+    // Capped at one: the vision pipeline (browser and server) only supports
+    // a single image per message in v1 -- see runtime.go's renderMistralInstMessages.
+    images: Array.isArray(value.images) ? value.images.filter((s) => typeof s === "string" && s.startsWith("data:image/")).slice(0, 1) : []
   };
 }
 
@@ -1129,6 +1132,37 @@ function toMarkdown(chat) {
   const attachFileEl = $("attachFile");
   const fileInputEl = $("fileInput");
   const attachmentTrayEl = $("attachmentTray");
+  const attachImageEl = $("attachImage");
+  const imageFileInputEl = $("imageFileInput");
+  const webcamButtonEl = $("webcamButton");
+  const screenButtonEl = $("screenButton");
+  const captureErrorEl = $("captureError");
+  const imagePreviewRowEl = $("imagePreviewRow");
+  const imagePreviewEl = $("imagePreview");
+  const clearImageButtonEl = $("clearImageButton");
+  const captureModalEl = $("captureModal");
+  const captureVideoEl = $("captureVideo");
+  const captureCancelButtonEl = $("captureCancelButton");
+  const captureConfirmButtonEl = $("captureConfirmButton");
+  const inferenceModeEl = $("inferenceMode");
+  const inferenceModeSectionEl = $("inferenceModeSection");
+  const inferenceModeStatusEl = $("inferenceModeStatus");
+  const browserModelSectionEl = $("browserModelSection");
+  const serverModelSectionEl = $("serverModelSection");
+  const modelDownloadSectionEl = $("modelDownloadSection");
+  const browserGPUBadgeEl = $("browserGPUBadge");
+  const browserModelSummaryEl = $("browserModelSummary");
+  const browserModelNameEl = $("browserModelName");
+  const browserModelMetaEl = $("browserModelMeta");
+  const browserModelUnloadEl = $("browserModelUnload");
+  const browserTextModelPickEl = $("browserTextModelPick");
+  const browserTextModelFileEl = $("browserTextModelFile");
+  const browserTextModelNameEl = $("browserTextModelName");
+  const browserVisionModelPickEl = $("browserVisionModelPick");
+  const browserVisionModelFileEl = $("browserVisionModelFile");
+  const browserVisionModelNameEl = $("browserVisionModelName");
+  const browserModelLoadEl = $("browserModelLoad");
+  const browserModelStatusEl = $("browserModelStatus");
   const promptWrapEl = $("promptWrap");
   const dropOverlayEl = $("dropOverlay");
   const exportChatsEl = $("exportChats");
@@ -1155,7 +1189,7 @@ function toMarkdown(chat) {
   const MAX_CHATS = 100;
   let chats = [];
   let activeID = "";
-  let preferences = { theme: "system", power: false, composerPro: false, goalRounds: 3, embeddingModel: "", mermaidCDN: "", storageMode: "browser", showAgentActivity: true, showUnsupportedModels: false };
+  let preferences = { theme: "system", power: false, composerPro: false, goalRounds: 3, embeddingModel: "", mermaidCDN: "", storageMode: "browser", showAgentActivity: true, showUnsupportedModels: false, inferenceMode: "server" };
   let busy = false;
   let tuning = false;
   let loadingModel = false;
@@ -1193,6 +1227,11 @@ function toMarkdown(chat) {
   let contextLimit = 0;
   let lastContextWindow = null;
   let pendingAttachments = [];
+  // A single data:image/...;base64,... URL, or null. Capped at one per
+  // message everywhere (composer, storage, both wire formats) to match the
+  // vision pipeline's v1 boundary -- see cleanMessage's comment.
+  let pendingImage = null;
+  let activeCaptureStream = null;
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
@@ -1309,6 +1348,7 @@ function toMarkdown(chat) {
     else if (activeDialog.root === settingsEl) closeSettings();
     else if (activeDialog.root === batchEl) closeBatch();
     else if (activeDialog.root === agentosEl) closeAgentOS();
+    else if (activeDialog.root === captureModalEl) closeCaptureModal();
   }
 
   function setStatus(text) {
@@ -1742,7 +1782,7 @@ function toMarkdown(chat) {
     updateContextWindowStatus();
     updatePromptCacheStatus();
     if (!busy) {
-      sendEl.disabled = tuning || ragSearching || batchRunning || (!promptEl.value.trim() && pendingAttachments.length === 0);
+      sendEl.disabled = tuning || ragSearching || batchRunning || (!promptEl.value.trim() && pendingAttachments.length === 0 && !pendingImage);
       const editing = editingIndex !== null;
       sendLabelEl.textContent = editing ? "Save & retry" : "Send";
       sendEl.classList.toggle("editing", editing);
@@ -1795,6 +1835,9 @@ function toMarkdown(chat) {
     renameChatEl.disabled = value;
     deleteChatEl.disabled = value;
     attachFileEl.disabled = value;
+    attachImageEl.disabled = value;
+    webcamButtonEl.disabled = value;
+    screenButtonEl.disabled = value;
     briefChatEl.disabled = value;
     shareChatEl.disabled = value;
     composerProToggleEl.disabled = value;
@@ -1813,7 +1856,7 @@ function toMarkdown(chat) {
     else setIdleStatus();
   }
 
-  function addMessage(role, text, attachments) {
+  function addMessage(role, text, attachments, images) {
     emptyEl.hidden = true;
     const el = document.createElement("article");
     el.className = "msg " + role;
@@ -1824,6 +1867,17 @@ function toMarkdown(chat) {
     // own restated question from the model's answer.
     else el.setAttribute("aria-label", role === "user" ? "You said" : "GopherLLM said");
     el.dataset.raw = text || "";
+    if (Array.isArray(images) && images.length) {
+      const list = document.createElement("div");
+      list.className = "message-images";
+      images.forEach((dataURL) => {
+        const img = document.createElement("img");
+        img.src = dataURL;
+        img.alt = "Attached image";
+        list.appendChild(img);
+      });
+      el.appendChild(list);
+    }
     const content = document.createElement("div");
     content.className = "content";
     if (role === "assistant" && !text) {
@@ -2053,7 +2107,7 @@ function toMarkdown(chat) {
     messagesEl.querySelectorAll(".msg").forEach((el) => el.remove());
     emptyEl.hidden = chat.messages.length > 0;
     chat.messages.forEach((message, index) => {
-      const el = addMessage(message.role, message.content, message.attachments);
+      const el = addMessage(message.role, message.content, message.attachments, message.images);
       if (message.role === "assistant") {
         finalizeAssistant(el, {
           answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
@@ -2422,7 +2476,14 @@ function toMarkdown(chat) {
   function requestFor(chat, ragContext) {
     return Object.assign(samplerFields(chat.settings), {
       messages: chat.messages.map((message) => {
-        const out = { role: message.role, content: messageContentForModel(message) };
+        const text = messageContentForModel(message);
+        const images = Array.isArray(message.images) ? message.images : [];
+        const out = {
+          role: message.role,
+          content: images.length
+            ? [{ type: "text", text }, ...images.map((dataURL) => ({ type: "image_url", image_url: { url: dataURL } }))]
+            : text
+        };
         if (message.role === "assistant" && message.tool_calls && message.tool_calls.length) out.tool_calls = message.tool_calls;
         return out;
       }),
@@ -2613,6 +2674,43 @@ function toMarkdown(chat) {
     }
   }
 
+  // Browser-mode counterpart to the server path's fetch("/v1/chat/completions"):
+  // same sampler settings and message history, but sent straight to the
+  // wasm-loaded Runner instead of the network. No RAG tool calls, no
+  // Wikipedia/OpenStreetMap tools, no server-side prompt cache or context
+  // strategy -- none of those have a meaning without a backend, so this
+  // sends the full transcript each turn and reports none of that telemetry.
+  async function generateBrowserTurn(chat, ragContext, onToken) {
+    await loadWasmBridgeScript();
+    if (!(await window.GopherLLMBrowser.isModelLoaded())) {
+      throw new Error("No model is loaded in this browser tab. Open Settings to choose one.");
+    }
+    const wireMessages = chat.messages.map((message) => {
+      const wire = { role: message.role, content: messageContentForModel(message) };
+      if (Array.isArray(message.images) && message.images.length) {
+        wire.images = message.images.map((dataURL) => dataURL.slice(dataURL.indexOf(",") + 1));
+      }
+      return wire;
+    });
+    const settings = chat.settings;
+    const wireOptions = {
+      maxTokens: settings.maxTokens,
+      temperature: settings.temperature,
+      topP: settings.topP,
+      topK: settings.topK,
+      minP: settings.minP,
+      repeatPenalty: settings.repeatPenalty,
+      systemPrompt: [chat.systemPrompt.trim(), ragContext].filter(Boolean).join("\n\n")
+    };
+    let answer = "";
+    const text = await window.GopherLLMBrowser.generate(wireMessages, wireOptions, (token) => {
+      answer += token;
+      onToken(answer, "", false);
+      return true;
+    });
+    return { answer: text, reasoning: "", toolCalls: null, usage: null, finishReason: "stop", contextWindow: null, promptCache: null };
+  }
+
   async function generate(ragContext) {
     const chat = activeChat();
     if (!chat || !chat.messages.some((message) => message.role === "user")) return;
@@ -2625,7 +2723,13 @@ function toMarkdown(chat) {
     // reading the prompt. Name the phase the user is actually waiting on.
     setStatus("Reading prompt…");
     updatePromptCacheStatus();
-    controller = new AbortController();
+    const browserMode = preferences.inferenceMode === "browser";
+    // Browser-mode generation has no fetch to abort -- stopping it goes
+    // through window.GopherLLMBrowser.stopGeneration() instead (see the
+    // sendEl click handler). Leaving controller non-null here would make
+    // that handler abort a signal nothing listens to and silently fail to
+    // stop generation.
+    controller = browserMode ? null : new AbortController();
     // Live tool activity stays compact until the user asks for its details.
     let agentEl = null;
     const onAgentTimeline = (timeline) => {
@@ -2679,34 +2783,38 @@ function toMarkdown(chat) {
       });
     };
     try {
-      const response = await fetch("/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify(requestFor(chat, ragContext))
-      });
-      if (!response.ok) {
-        const body = await response.text();
-        const fallback = body.trim();
-        let message = fallback || "HTTP " + response.status;
-        try {
-          const json = JSON.parse(body);
-          message = (json.error && (json.error.message || json.error)) || fallback || message;
-        } catch (_) {}
-        throw new Error(message);
-      }
       let result;
-      if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
-        result = await readStream(response, onToken, onAgentTimeline);
+      if (browserMode) {
+        result = await generateBrowserTurn(chat, ragContext, onToken);
       } else {
-        const data = await response.json();
-        const choice = (data.choices && data.choices[0]) || {};
-        const message = choice.message || {};
-        result = {
-          answer: message.content || "", reasoning: message.reasoning_content || "",
-          toolCalls: message.tool_calls || null, usage: data.usage || null, finishReason: choice.finish_reason || "",
-          contextWindow: data.gopherllm_context || null, promptCache: cleanPromptCache(data.gopherllm_cache)
-        };
+        const response = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify(requestFor(chat, ragContext))
+        });
+        if (!response.ok) {
+          const body = await response.text();
+          const fallback = body.trim();
+          let message = fallback || "HTTP " + response.status;
+          try {
+            const json = JSON.parse(body);
+            message = (json.error && (json.error.message || json.error)) || fallback || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
+        if ((response.headers.get("content-type") || "").includes("text/event-stream")) {
+          result = await readStream(response, onToken, onAgentTimeline);
+        } else {
+          const data = await response.json();
+          const choice = (data.choices && data.choices[0]) || {};
+          const message = choice.message || {};
+          result = {
+            answer: message.content || "", reasoning: message.reasoning_content || "",
+            toolCalls: message.tool_calls || null, usage: data.usage || null, finishReason: choice.finish_reason || "",
+            contextWindow: data.gopherllm_context || null, promptCache: cleanPromptCache(data.gopherllm_cache)
+          };
+        }
       }
       streamFinished = true;
       result.decodeMS = firstTokenAt ? performance.now() - firstTokenAt : performance.now() - startedAt;
@@ -2764,8 +2872,9 @@ function toMarkdown(chat) {
     if (busy || tuning || batchRunning || ragSearching) return;
     const text = promptEl.value.trim();
     const attachments = pendingAttachments;
+    const images = pendingImage ? [pendingImage] : [];
     let chat = activeChat();
-    if ((!text && !attachments.length) || !chat) return;
+    if ((!text && !attachments.length && !images.length) || !chat) return;
     closeCommandMenu();
     // A power command takes over the submit entirely; nothing is sent as a
     // normal chat turn.
@@ -2783,9 +2892,9 @@ function toMarkdown(chat) {
       showToast("Created an edit branch. The original chat is unchanged.", "success");
     }
     const ragContext = text ? await buildRagContext(chat, text) : "";
-    chat.messages.push({ role: "user", content: text, reasoning: "", tool_calls: null, usage: null, finishReason: "", attachments });
+    chat.messages.push({ role: "user", content: text, reasoning: "", tool_calls: null, usage: null, finishReason: "", attachments, images });
     if (!chat.titleManual && chat.messages.filter((message) => message.role === "user").length === 1) {
-      chat.title = titleFor(text || (attachments[0] && attachments[0].name));
+      chat.title = titleFor(text || (attachments[0] && attachments[0].name) || (images.length && "Image"));
       chatTitleEl.textContent = chat.title;
       chatTitleEl.title = chat.title;
     }
@@ -2793,6 +2902,7 @@ function toMarkdown(chat) {
     touch(chat);
     promptEl.value = "";
     clearPendingAttachments();
+    clearPendingImage();
     resizePrompt();
     renderConversation(true);
     renderChatList();
@@ -3033,6 +3143,7 @@ function toMarkdown(chat) {
         ragModeEl.disabled = false;
       }
       updateComposer(false);
+      updateVisionAffordances();
     } catch (_) {
       modelLibraryEl.setAttribute("aria-busy", "false");
       modelLibraryEl.replaceChildren();
@@ -4161,6 +4272,7 @@ function toMarkdown(chat) {
     if (busy) {
       event.preventDefault();
       if (controller) controller.abort();
+      else if (preferences.inferenceMode === "browser" && window.GopherLLMBrowser) window.GopherLLMBrowser.stopGeneration();
     }
   });
   form.addEventListener("submit", (event) => {
@@ -4376,6 +4488,247 @@ function toMarkdown(chat) {
   });
   storageModeEl.addEventListener("change", () => changeStorageMode(storageModeEl.value));
 
+  inferenceModeEl.addEventListener("change", () => changeInferenceMode(inferenceModeEl.value));
+  browserModelUnloadEl.addEventListener("click", () => changeInferenceMode("server"));
+  browserTextModelPickEl.addEventListener("click", () => browserTextModelFileEl.click());
+  browserTextModelFileEl.addEventListener("change", () => {
+    const file = browserTextModelFileEl.files[0];
+    browserTextModelNameEl.textContent = file ? file.name : "";
+    browserModelLoadEl.disabled = !file;
+  });
+  browserVisionModelPickEl.addEventListener("click", () => browserVisionModelFileEl.click());
+  browserVisionModelFileEl.addEventListener("change", () => {
+    const file = browserVisionModelFileEl.files[0];
+    browserVisionModelNameEl.textContent = file ? file.name : "";
+  });
+  browserModelLoadEl.addEventListener("click", loadBrowserModel);
+
+  attachImageEl.addEventListener("click", () => imageFileInputEl.click());
+  imageFileInputEl.addEventListener("change", async () => {
+    const file = imageFileInputEl.files[0];
+    imageFileInputEl.value = "";
+    if (!file) return;
+    acceptCapturedImage(await readFileAsDataURL(file));
+  });
+  clearImageButtonEl.addEventListener("click", clearPendingImage);
+  webcamButtonEl.addEventListener("click", async () => {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
+      }
+      await openCaptureModal(await navigator.mediaDevices.getUserMedia({ video: true }), webcamButtonEl);
+    } catch (err) {
+      showCaptureError(err);
+    }
+  });
+  screenButtonEl.addEventListener("click", async () => {
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        throw new Error("Screen capture is unavailable (requires HTTPS or localhost).");
+      }
+      await openCaptureModal(await navigator.mediaDevices.getDisplayMedia({ video: true }), screenButtonEl);
+    } catch (err) {
+      showCaptureError(err);
+    }
+  });
+  captureCancelButtonEl.addEventListener("click", closeCaptureModal);
+  captureConfirmButtonEl.addEventListener("click", () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = captureVideoEl.videoWidth;
+    canvas.height = captureVideoEl.videoHeight;
+    canvas.getContext("2d").drawImage(captureVideoEl, 0, 0);
+    const dataURL = canvas.toDataURL("image/png");
+    closeCaptureModal();
+    acceptCapturedImage(dataURL);
+  });
+  captureModalEl.addEventListener("click", (event) => {
+    if (event.target === captureModalEl) closeCaptureModal();
+  });
+
+  // hasLocalRuntime mirrors the server's own check (HandlerOptions.WasmDir
+  // pointing at a real gopherllm.wasm + wasm_exec.js pair, see server.go) --
+  // read from chat.html's data-local-runtime rather than re-derived, so the
+  // browser-mode option only ever appears when the server actually has
+  // something to serve at /wasm/.
+  function hasLocalRuntime() {
+    return document.body.dataset.localRuntime === "true";
+  }
+
+  function initInferenceMode() {
+    const available = hasLocalRuntime();
+    inferenceModeSectionEl.hidden = !available;
+    if (!available) preferences.inferenceMode = "server";
+    inferenceModeEl.value = preferences.inferenceMode;
+    applyInferenceMode(preferences.inferenceMode);
+    // A model file picked in an earlier session is never remembered (files
+    // are never persisted, by design -- nothing is uploaded or cached), so
+    // reopening this page in browser mode always starts back at the picker.
+    // Only the WebGPU badge, which needs no model, is worth refreshing here.
+    if (preferences.inferenceMode === "browser") updateBrowserGPUBadge();
+  }
+
+  function applyInferenceMode(mode) {
+    const browser = mode === "browser";
+    browserModelSectionEl.hidden = !browser;
+    serverModelSectionEl.hidden = browser;
+    modelDownloadSectionEl.hidden = browser;
+    inferenceModeStatusEl.textContent = browser
+      ? "Browser mode runs entirely on-device: no chat data leaves this tab, but tool use, retrieval, and long-context strategies are unavailable."
+      : "Server mode uses the model this GopherLLM server has loaded, with full access to tools and retrieval.";
+    updateVisionAffordances();
+  }
+
+  function changeInferenceMode(value) {
+    const next = value === "browser" && hasLocalRuntime() ? "browser" : "server";
+    preferences.inferenceMode = next;
+    inferenceModeEl.value = next;
+    applyInferenceMode(next);
+    save();
+    if (next === "browser") updateBrowserGPUBadge();
+  }
+
+  // Injected on demand: server-mode sessions (the common case) never fetch
+  // this file, wasm_exec.js, or the multi-MB gopherllm.wasm binary at all.
+  // Shared across callers so switching modes twice, or mashing the load
+  // button, only ever runs go.run() once per page.
+  let wasmBridgeScriptPromise = null;
+  function loadWasmBridgeScript() {
+    if (window.GopherLLMBrowser) return Promise.resolve();
+    if (!wasmBridgeScriptPromise) {
+      wasmBridgeScriptPromise = new Promise((resolve, reject) => {
+        const el = document.createElement("script");
+        el.src = "/wasm-bridge.js";
+        el.addEventListener("load", () => resolve());
+        el.addEventListener("error", () => { wasmBridgeScriptPromise = null; reject(new Error("failed to load the browser runtime loader")); });
+        document.head.appendChild(el);
+      });
+    }
+    return wasmBridgeScriptPromise;
+  }
+
+  async function updateBrowserGPUBadge() {
+    browserGPUBadgeEl.textContent = "checking WebGPU…";
+    browserGPUBadgeEl.className = "model-badge";
+    try {
+      await loadWasmBridgeScript();
+      const status = await window.GopherLLMBrowser.webgpuStatus();
+      if (status === "available") {
+        browserGPUBadgeEl.textContent = "⚡ WebGPU accelerated";
+        browserGPUBadgeEl.className = "model-badge model-badge-active";
+      } else {
+        browserGPUBadgeEl.textContent = "CPU only (WebGPU unavailable)";
+      }
+    } catch (_) {
+      browserGPUBadgeEl.textContent = "runtime unavailable";
+    }
+  }
+
+  async function loadBrowserModel() {
+    const textFile = browserTextModelFileEl.files[0];
+    if (!textFile) return;
+    browserModelLoadEl.disabled = true;
+    try {
+      browserModelStatusEl.textContent = "reading text model file…";
+      const textBytes = new Uint8Array(await textFile.arrayBuffer());
+      const visionFile = browserVisionModelFileEl.files[0];
+      let visionBytes = null;
+      if (visionFile) {
+        browserModelStatusEl.textContent = "reading vision projector file…";
+        visionBytes = new Uint8Array(await visionFile.arrayBuffer());
+      }
+      browserModelStatusEl.textContent = "loading into GopherLLM (this can take a while for large models)…";
+      await loadWasmBridgeScript();
+      await window.GopherLLMBrowser.loadModel(textBytes, visionBytes);
+      browserModelStatusEl.textContent = "Model loaded. Nothing was uploaded -- it was read and parsed entirely in this tab.";
+      browserModelNameEl.textContent = textFile.name;
+      browserModelMetaEl.textContent = visionFile ? "with vision (" + visionFile.name + ")" : "text only";
+      browserModelSummaryEl.hidden = false;
+      browserModelSummaryEl.classList.add("is-loaded");
+      updateVisionAffordances();
+      showToast("Model loaded in this browser tab.", "success");
+    } catch (err) {
+      browserModelStatusEl.textContent = "Failed to load: " + (err && err.message ? err.message : String(err));
+      showToast("Could not load the model in this browser.", "error");
+    } finally {
+      browserModelLoadEl.disabled = !browserTextModelFileEl.files.length;
+    }
+  }
+
+  // Drives whether the image-attach/webcam/screen-capture buttons show up in
+  // the composer: server mode asks the already-loaded catalog entry (see the
+  // /models "vision" field, server.go), browser mode asks the loaded Runner
+  // directly through the bridge (a no-op, near-zero-cost call once the wasm
+  // module is up).
+  async function updateVisionAffordances() {
+    let vision = false;
+    if (preferences.inferenceMode === "browser") {
+      vision = window.GopherLLMBrowser ? await window.GopherLLMBrowser.hasVision() : false;
+    } else {
+      const active = modelCatalog.find((model) => model.loaded);
+      vision = Boolean(active && active.vision);
+    }
+    attachImageEl.hidden = !vision;
+    webcamButtonEl.hidden = !vision;
+    screenButtonEl.hidden = !vision;
+  }
+
+  function readFileAsDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error || new Error("file read failed"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function showCaptureError(err) {
+    captureErrorEl.textContent = err && err.message ? err.message : String(err);
+    captureErrorEl.hidden = false;
+  }
+  function clearCaptureError() {
+    captureErrorEl.hidden = true;
+  }
+
+  function acceptCapturedImage(dataURL) {
+    pendingImage = dataURL;
+    imagePreviewEl.src = dataURL;
+    imagePreviewRowEl.hidden = false;
+    clearCaptureError();
+    updateComposer(false);
+  }
+
+  function clearPendingImage() {
+    pendingImage = null;
+    imagePreviewRowEl.hidden = true;
+    updateComposer(false);
+  }
+
+  function stopActiveCaptureStream() {
+    if (activeCaptureStream) {
+      activeCaptureStream.getTracks().forEach((track) => track.stop());
+      activeCaptureStream = null;
+    }
+  }
+
+  // Shows a live preview with Capture/Cancel rather than grabbing a frame the
+  // instant permission is granted -- lets the user see what they're about to
+  // send, retry a bad angle, or back out, the same as any normal camera app.
+  async function openCaptureModal(stream, opener) {
+    activeCaptureStream = stream;
+    stream.getVideoTracks().forEach((track) => {
+      track.addEventListener("ended", () => { if (!captureModalEl.hidden) closeCaptureModal(); });
+    });
+    captureVideoEl.srcObject = stream;
+    await captureVideoEl.play();
+    openDialog(captureModalEl, opener, captureConfirmButtonEl);
+  }
+
+  function closeCaptureModal() {
+    closeDialog(captureModalEl);
+    captureVideoEl.srcObject = null;
+    stopActiveCaptureStream();
+  }
+
   function applyPowerPreference(on) {
     preferences.power = !!on;
     powerCommandsEl.checked = preferences.power;
@@ -4552,7 +4905,8 @@ function toMarkdown(chat) {
         mermaidCDN: typeof stored.preferences.mermaidCDN === "string" ? stored.preferences.mermaidCDN : "",
         storageMode: stored.preferences.storageMode === "server" ? "server" : "browser",
         showAgentActivity: stored.preferences.showAgentActivity !== false,
-        showUnsupportedModels: stored.preferences.showUnsupportedModels === true
+        showUnsupportedModels: stored.preferences.showUnsupportedModels === true,
+        inferenceMode: stored.preferences.inferenceMode === "browser" ? "browser" : "server"
       };
     }
     if (typeof stored.activeID === "string" && chats.some((chat) => chat.id === stored.activeID)) activeID = stored.activeID;
@@ -4573,6 +4927,7 @@ function toMarkdown(chat) {
   modelShowUnsupportedEl.checked = preferences.showUnsupportedModels === true;
   setComposerProOpen(preferences.composerPro);
   goalRoundsEl.value = preferences.goalRounds;
+  initInferenceMode();
   renderWorkspace(true);
   loadModels();
   loadSkills();

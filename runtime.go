@@ -327,7 +327,7 @@ type Runner struct {
 }
 
 type visionImageCacheEntry struct {
-	embeds             [][]float32
+	embeds                 [][]float32
 	mergedRows, mergedCols int
 }
 

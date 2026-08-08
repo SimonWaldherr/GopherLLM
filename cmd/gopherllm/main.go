@@ -46,6 +46,8 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
 	fmt.Fprintln(os.Stderr, "  --chat-history <path>     Enable compressed server-side chat history at <path>")
 	fmt.Fprintln(os.Stderr, "                           Explicit model selectors always override the remembered model")
+	fmt.Fprintln(os.Stderr, "  --wasm-dir <path>         Serve gopherllm.wasm+wasm_exec.js from <path> for the chat UI's")
+	fmt.Fprintln(os.Stderr, "                           local-browser-inference mode (default: auto-detect ./bin)")
 	fmt.Fprintln(os.Stderr, "  --max-connections <N>     Max concurrent server connections")
 	fmt.Fprintln(os.Stderr, "  --max-tokens <N>          Max tokens to generate (default: 256)")
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
@@ -114,33 +116,40 @@ type cliConfig struct {
 	serveAddr               string
 	chatUI                  bool
 	chatHistoryPath         string
-	maxConn                 int
-	embed                   bool
-	bench                   bool
-	benchJSON               bool
-	benchOutput             bool
-	benchRuns               int
-	kernelBench             bool
-	kernelBenchJSON         bool
-	kernelBenchRuns         int
-	kernelBenchLayer        int
-	timeout                 time.Duration
-	cpuProfile              string
-	autoTune                bool
-	autoTuneJSON            bool
-	autoTuneRefresh         bool
-	autoTuneEffort          string
-	useMetal                bool
-	metalExplicit           bool
-	prepareQuant            bool
-	outOfCore               bool
-	inspect                 bool
-	listMetadata            bool
-	skillsDir               string
-	analyze                 bool
-	findToken               string
-	tokenNeighbors          string
-	neighborCount           int
+	// wasmDir points at a directory containing gopherllm.wasm + wasm_exec.js
+	// (see `make wasm-build`), enabling the chat UI's local-browser-inference
+	// mode. Empty disables it; resolveWasmDir applies the "bin" auto-detect
+	// default unless --wasm-dir was given explicitly (including explicitly
+	// empty, via --wasm-dir "", to opt out of auto-detection).
+	wasmDir          string
+	wasmDirSet       bool
+	maxConn          int
+	embed            bool
+	bench            bool
+	benchJSON        bool
+	benchOutput      bool
+	benchRuns        int
+	kernelBench      bool
+	kernelBenchJSON  bool
+	kernelBenchRuns  int
+	kernelBenchLayer int
+	timeout          time.Duration
+	cpuProfile       string
+	autoTune         bool
+	autoTuneJSON     bool
+	autoTuneRefresh  bool
+	autoTuneEffort   string
+	useMetal         bool
+	metalExplicit    bool
+	prepareQuant     bool
+	outOfCore        bool
+	inspect          bool
+	listMetadata     bool
+	skillsDir        string
+	analyze          bool
+	findToken        string
+	tokenNeighbors   string
+	neighborCount    int
 	// mmprojPath is a companion Pixtral-style vision-encoder GGUF loaded
 	// alongside modelSelector, enabling --image on the one-shot prompt path
 	// and image_url content on the server's chat endpoints.
@@ -261,6 +270,7 @@ func run() error {
 			ChatHistoryPath:          cfg.chatHistoryPath,
 			ChatHistoryLock:          &sync.Mutex{},
 			ModelDir:                 cfg.modelDir,
+			WasmDir:                  resolveWasmDir(cfg),
 			SkillsDir:                cfg.skillsDir,
 			ModelLoadOptions:         gopherllm.LoadOptions{OutOfCore: cfg.outOfCore},
 			AgentOS:                  agentOSRunner,
@@ -386,7 +396,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -467,6 +477,27 @@ func resumeLastModel(cfg *cliConfig, logw io.Writer) bool {
 	cfg.modelSelector = &path
 	fmt.Fprintf(logw, "Resuming last model: %s\n", path)
 	return true
+}
+
+// resolveWasmDir returns the directory server.ServeOptions.WasmDir should
+// use: cfg.wasmDir verbatim if --wasm-dir was given explicitly (including
+// empty, to opt out of auto-detection), else "bin" if it already contains
+// both files `make wasm-build` produces, else "" (the feature simply isn't
+// offered -- see HandlerOptions.WasmDir's doc comment).
+func resolveWasmDir(cfg cliConfig) string {
+	if cfg.wasmDirSet {
+		return cfg.wasmDir
+	}
+	const dir = "bin"
+	if fileExists(filepath.Join(dir, "gopherllm.wasm")) && fileExists(filepath.Join(dir, "wasm_exec.js")) {
+		return dir
+	}
+	return ""
+}
+
+func fileExists(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && !st.IsDir()
 }
 
 // runAutoTune calibrates the runtime settings for this model on this machine.
@@ -666,6 +697,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.chatHistoryPath = v
+		case "--wasm-dir":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.wasmDir, cfg.wasmDirSet = v, true
 		case "--max-connections":
 			v, err := parseNextInt(next, arg)
 			if err != nil {
