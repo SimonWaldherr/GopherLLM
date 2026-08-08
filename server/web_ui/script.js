@@ -1107,6 +1107,14 @@ function toMarkdown(chat) {
   const activeModelMetaEl = $("activeModelMeta");
   const activeModelStateEl = $("activeModelState");
   const modelNameEl = $("modelName");
+  const modelDownloadFormEl = $("modelDownloadForm");
+  const modelDownloadRefEl = $("modelDownloadRef");
+  const modelDownloadFindEl = $("modelDownloadFind");
+  const modelDownloadVariantsEl = $("modelDownloadVariants");
+  const modelDownloadProgressEl = $("modelDownloadProgress");
+  const modelDownloadBarFillEl = $("modelDownloadBarFill");
+  const modelDownloadCancelEl = $("modelDownloadCancel");
+  const modelDownloadStatusEl = $("modelDownloadStatus");
   const settingsTabEls = Array.from(document.querySelectorAll("[data-settings-tab]"));
   const settingsPageEls = Array.from(document.querySelectorAll("[data-settings-page]"));
   const chatTitleEl = $("chatTitle");
@@ -1154,6 +1162,8 @@ function toMarkdown(chat) {
   let loadingModelID = "";
   let modelCatalog = [];
   let pendingModelRetry = null;
+  let modelDownloadBusy = false;
+  let modelDownloadController = null;
   let loadingEmbeddingModel = false;
   let activeEmbeddingModel = "";
   let ragSearching = false;
@@ -2981,6 +2991,146 @@ function toMarkdown(chat) {
     }
   }
 
+  function formatDownloadSize(bytes) {
+    if (!bytes || bytes <= 0) return "unknown size";
+    const mib = bytes / (1024 * 1024);
+    if (mib < 1024) return mib.toFixed(1) + " MiB";
+    return (mib / 1024).toFixed(2) + " GiB";
+  }
+
+  // Split GGUFs are named "<prefix>-NNNNN-of-MMMMM.gguf"; pulling the shard
+  // position out of the filename lets progress read "shard 2 of 3" without
+  // the server having to say so separately.
+  function shardLabel(filename) {
+    const match = /-(\d{5})-of-(\d{5})\.gguf$/i.exec(filename || "");
+    return match ? "shard " + Number(match[1]) + " of " + Number(match[2]) : "";
+  }
+
+  function setModelDownloadStatus(text, kind) {
+    modelDownloadStatusEl.textContent = text;
+    modelDownloadStatusEl.classList.toggle("is-error", kind === "error");
+    modelDownloadStatusEl.classList.toggle("is-success", kind === "success");
+  }
+
+  function renderModelDownloadVariants(repository, revision, variants) {
+    modelDownloadVariantsEl.replaceChildren();
+    if (!variants.length) {
+      modelDownloadVariantsEl.hidden = true;
+      setModelDownloadStatus("No GGUF variants found in " + repository + ".", "error");
+      return;
+    }
+    variants.forEach((variant) => {
+      const item = document.createElement("li");
+      item.className = "model-download-variant";
+      const copy = document.createElement("div");
+      copy.className = "model-download-variant-copy";
+      const quant = document.createElement("span");
+      quant.className = "model-download-variant-quant";
+      quant.textContent = variant.quant || "unknown";
+      const meta = document.createElement("span");
+      meta.className = "model-download-variant-meta";
+      meta.textContent = formatDownloadSize(variant.size_bytes) + (variant.shards > 1 ? " · " + variant.shards + " shards" : "");
+      copy.append(quant, meta);
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "autotune-run";
+      action.textContent = "Download";
+      action.addEventListener("click", () => startModelDownload(variant.selector));
+      item.append(copy, action);
+      modelDownloadVariantsEl.appendChild(item);
+    });
+    modelDownloadVariantsEl.hidden = false;
+    const suffix = revision && revision !== "main" ? "@" + revision : "";
+    setModelDownloadStatus(variants.length + " variant" + (variants.length === 1 ? "" : "s") + " found in " + repository + suffix + ".");
+  }
+
+  // NDJSON (one JSON object per line) is Ollama's streaming wire format and
+  // what /models/download reuses; unlike the chat SSE reader this splits on
+  // single newlines rather than blank-line-delimited blocks.
+  async function readNDJSON(response, onEvent) {
+    if (!response.body) throw new Error("Streaming response has no body");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const packet = await reader.read();
+      if (packet.done) break;
+      buffer += decoder.decode(packet.value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) onEvent(JSON.parse(trimmed));
+      }
+    }
+    buffer += decoder.decode();
+    const trimmed = buffer.trim();
+    if (trimmed) onEvent(JSON.parse(trimmed));
+  }
+
+  function setModelDownloadControlsDisabled(disabled) {
+    modelDownloadFindEl.disabled = disabled;
+    modelDownloadRefEl.disabled = disabled;
+    modelDownloadVariantsEl.querySelectorAll("button").forEach((button) => { button.disabled = disabled; });
+  }
+
+  async function startModelDownload(selector) {
+    if (modelDownloadBusy) return;
+    modelDownloadBusy = true;
+    modelDownloadController = new AbortController();
+    setModelDownloadControlsDisabled(true);
+    modelDownloadProgressEl.hidden = false;
+    modelDownloadBarFillEl.style.width = "0%";
+    setModelDownloadStatus("Resolving " + selector + "…");
+    let lastFile = "";
+    try {
+      const response = await fetch("/models/download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: modelDownloadController.signal,
+        body: JSON.stringify({ ref: selector })
+      });
+      if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
+      let finalEvent = null;
+      await readNDJSON(response, (event) => {
+        if (event.status === "downloading") {
+          lastFile = event.file || lastFile;
+          const percent = event.total ? Math.min(100, Math.round((event.completed / event.total) * 100)) : 0;
+          modelDownloadBarFillEl.style.width = percent + "%";
+          const shard = shardLabel(lastFile);
+          const sizes = event.total ? " (" + formatDownloadSize(event.completed) + " / " + formatDownloadSize(event.total) + ")" : "";
+          setModelDownloadStatus("Downloading" + (shard ? " " + shard : "") + "… " + percent + "%" + sizes);
+        } else if (event.status === "placing") {
+          modelDownloadBarFillEl.style.width = "100%";
+          setModelDownloadStatus("Adding it to the local model library…");
+        } else if (event.status === "error") {
+          throw new Error(event.error || "Download failed");
+        } else if (event.status === "success") {
+          finalEvent = event;
+        }
+      });
+      if (!finalEvent) throw new Error("Download ended unexpectedly");
+      setModelDownloadStatus("Downloaded " + (finalEvent.file || selector) + ". It's now in the local model library.", "success");
+      showToast("Model downloaded.", "success");
+      modelDownloadVariantsEl.hidden = true;
+      modelDownloadVariantsEl.replaceChildren();
+      modelDownloadRefEl.value = "";
+      await loadModels();
+    } catch (error) {
+      if (error.name === "AbortError") {
+        setModelDownloadStatus("Download canceled.");
+      } else {
+        setModelDownloadStatus("Download failed: " + (error.message || error), "error");
+        showToast("Model download failed: " + (error.message || error), "error");
+      }
+    } finally {
+      modelDownloadBusy = false;
+      modelDownloadController = null;
+      setModelDownloadControlsDisabled(false);
+      modelDownloadProgressEl.hidden = true;
+    }
+  }
+
   async function loadEmbeddingModel(model) {
     if (!model || loadingEmbeddingModel) return false;
     if (activeEmbeddingModel === model) return true;
@@ -3767,6 +3917,32 @@ function toMarkdown(chat) {
     preferences.showUnsupportedModels = modelShowUnsupportedEl.checked;
     filterModelOptions();
     save();
+  });
+  modelDownloadFormEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (modelDownloadBusy) return;
+    const ref = modelDownloadRefEl.value.trim();
+    if (!ref) {
+      setModelDownloadStatus("Enter a Hugging Face repository first.", "error");
+      return;
+    }
+    modelDownloadFindEl.disabled = true;
+    modelDownloadVariantsEl.hidden = true;
+    modelDownloadVariantsEl.replaceChildren();
+    setModelDownloadStatus("Looking up " + ref + "…");
+    try {
+      const response = await fetch("/models/download/variants?ref=" + encodeURIComponent(ref));
+      if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
+      const data = await response.json();
+      renderModelDownloadVariants(data.repository || ref, data.revision || "main", data.variants || []);
+    } catch (error) {
+      setModelDownloadStatus("Could not list variants: " + (error.message || error), "error");
+    } finally {
+      modelDownloadFindEl.disabled = false;
+    }
+  });
+  modelDownloadCancelEl.addEventListener("click", () => {
+    if (modelDownloadController) modelDownloadController.abort();
   });
   modelLibraryEl.addEventListener("click", (event) => {
     const card = event.target.closest(".model-card");

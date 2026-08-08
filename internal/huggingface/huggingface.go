@@ -36,7 +36,29 @@ type hfReference struct {
 // made and only complete snapshots already in the shared cache are considered.
 type Options struct {
 	Offline bool
+	// OnProgress, when set, receives periodic byte-progress updates for each
+	// file transferred by a resolve/download call. It is throttled the same
+	// way the textual logw progress line is (roughly 4 times per second) plus
+	// one call at the start and end of each file, so a caller such as a web
+	// UI can drive a progress bar without polling or parsing log text.
+	OnProgress ProgressFunc
 }
+
+// ProgressEvent reports incremental progress for one file transferred from
+// the Hub. Done is true exactly once per file, on the final event (whether it
+// succeeded or failed; Err is set only on failure).
+type ProgressEvent struct {
+	File      string
+	Completed int64
+	Total     int64
+	Done      bool
+	Err       error
+}
+
+// ProgressFunc receives ProgressEvents. It may be called from goroutines
+// downloading different shards concurrently, so implementations that share
+// mutable state must synchronize themselves.
+type ProgressFunc func(ProgressEvent)
 
 // DefaultOptions reads the Hugging Face-compatible offline setting. Explicit
 // Options supplied by a host or the CLI can enable offline mode as well.
@@ -138,8 +160,89 @@ func ListGGUFContext(ctx context.Context, ref string, out io.Writer) error {
 // ListGGUFContextWithOptions is ListGGUFContext with explicit network policy.
 // In offline mode it lists only complete variants from the cached revision.
 func ListGGUFContextWithOptions(ctx context.Context, ref string, out io.Writer, opts Options) error {
-	if err := ctx.Err(); err != nil {
+	r, variants, err := listGGUFVariants(ctx, ref, opts)
+	if err != nil {
 		return err
+	}
+	if out == nil {
+		out = io.Discard
+	}
+	fmt.Fprintf(out, "GGUF variants in %s", r.Repository)
+	if r.Revision != "main" {
+		fmt.Fprintf(out, "@%s", r.Revision)
+	}
+	fmt.Fprintln(out, ":")
+	fmt.Fprintf(out, "%-14s %-10s %-7s %s\n", "quant", "size", "shards", "run")
+	for _, option := range variants {
+		quant := option.Quant
+		if quant == "" {
+			quant = "unknown"
+		}
+		fmt.Fprintf(out, "%-14s %-10s %-7d %s\n", quant, formatHFSize(option.SizeBytes), option.Shards, hfSelector(r.Repository, r.Revision, option))
+	}
+	return nil
+}
+
+// RepositoryVariant is one downloadable GGUF variant together with the exact
+// selector ResolveHuggingFaceModelContextWithOptions (or
+// ResolveHuggingFaceModelFilesContextWithOptions) accepts to fetch it.
+type RepositoryVariant struct {
+	Quant     string
+	SizeBytes int64
+	Shards    int
+	Selector  string
+}
+
+// RepositoryInfo is the structured result of listing a Hugging Face
+// repository's GGUF variants, for callers (such as a web UI) that want to
+// render or filter the list themselves instead of the preformatted text
+// ListGGUFContextWithOptions produces.
+type RepositoryInfo struct {
+	Repository string
+	Revision   string
+	Variants   []RepositoryVariant
+}
+
+// RepositoryVariants resolves the selectable GGUF variants in a Hugging Face
+// repository reference (accepting the same owner/repository[:quant][@rev]
+// forms as ListGGUF, with or without the "hf:" prefix) without downloading
+// anything.
+func RepositoryVariants(ctx context.Context, ref string, opts Options) (RepositoryInfo, error) {
+	r, variants, err := listGGUFVariants(ctx, ref, opts)
+	if err != nil {
+		return RepositoryInfo{}, err
+	}
+	info := RepositoryInfo{Repository: r.Repository, Revision: r.Revision, Variants: make([]RepositoryVariant, 0, len(variants))}
+	for _, option := range variants {
+		quant := option.Quant
+		if quant == "" {
+			quant = "unknown"
+		}
+		info.Variants = append(info.Variants, RepositoryVariant{
+			Quant:     quant,
+			SizeBytes: option.SizeBytes,
+			Shards:    option.Shards,
+			Selector:  hfSelector(r.Repository, r.Revision, option),
+		})
+	}
+	return info, nil
+}
+
+// Repository returns the owner/repository portion of a Hugging Face
+// reference, for callers that need to name a destination (for example, a
+// local directory) after the source repository without duplicating
+// ParseHuggingFaceReference's parsing rules.
+func Repository(ref string) (string, error) {
+	r, err := ParseHuggingFaceReference(ref)
+	if err != nil {
+		return "", err
+	}
+	return r.Repository, nil
+}
+
+func listGGUFVariants(ctx context.Context, ref string, opts Options) (hfReference, []GGUFOption, error) {
+	if err := ctx.Err(); err != nil {
+		return hfReference{}, nil, err
 	}
 	offline := opts.Offline || hfBoolEnv("HF_HUB_OFFLINE")
 	ref = strings.TrimSpace(ref)
@@ -148,26 +251,23 @@ func ListGGUFContextWithOptions(ctx context.Context, ref string, out io.Writer, 
 	}
 	r, err := ParseHuggingFaceReference(ref)
 	if err != nil {
-		return err
-	}
-	if out == nil {
-		out = io.Discard
+		return hfReference{}, nil, err
 	}
 	cache := newHFCache(r)
 	var entries []hfTreeEntry
 	if offline {
 		snapshot := cache.snapshotForRef(r.Revision)
 		if snapshot == "" {
-			return offlineCacheError(r)
+			return r, nil, offlineCacheError(r)
 		}
 		entries, err = cachedHFGGUFEntries(ctx, snapshot)
 		if err != nil {
-			return fmt.Errorf("read cached Hugging Face repository %s: %w", r.Repository, err)
+			return r, nil, fmt.Errorf("read cached Hugging Face repository %s: %w", r.Repository, err)
 		}
 	} else {
 		entries, _, err = hfListFiles(ctx, r)
 		if err != nil {
-			return err
+			return r, nil, err
 		}
 	}
 	variants := ggufOptions(entries, r.Quant)
@@ -176,36 +276,27 @@ func ListGGUFContextWithOptions(ctx context.Context, ref string, out io.Writer, 
 	}
 	if len(variants) == 0 {
 		if offline {
-			return offlineCacheError(r)
+			return r, nil, offlineCacheError(r)
 		}
-		return fmt.Errorf("no GGUF files found in Hugging Face repository %s", r.Repository)
+		return r, nil, fmt.Errorf("no GGUF files found in Hugging Face repository %s", r.Repository)
 	}
-	fmt.Fprintf(out, "GGUF variants in %s", r.Repository)
-	if r.Revision != "main" {
-		fmt.Fprintf(out, "@%s", r.Revision)
+	return r, variants, nil
+}
+
+// hfSelector builds the exact "hf:owner/repository[:quant][@revision]"
+// string that resolves back to option, for callers that print or return a
+// runnable reference alongside a listed variant.
+func hfSelector(repository, revision string, option GGUFOption) string {
+	selector := hfPrefix + repository
+	if option.Quant != "" {
+		selector += ":" + option.Quant
+	} else {
+		selector += ":" + option.File
 	}
-	fmt.Fprintln(out, ":")
-	selectorFor := func(option GGUFOption) string {
-		selector := hfPrefix + r.Repository
-		if option.Quant != "" {
-			selector += ":" + option.Quant
-		} else {
-			selector += ":" + option.File
-		}
-		if r.Revision != "main" {
-			selector += "@" + r.Revision
-		}
-		return selector
+	if revision != "main" {
+		selector += "@" + revision
 	}
-	fmt.Fprintf(out, "%-14s %-10s %-7s %s\n", "quant", "size", "shards", "run")
-	for _, option := range variants {
-		quant := option.Quant
-		if quant == "" {
-			quant = "unknown"
-		}
-		fmt.Fprintf(out, "%-14s %-10s %-7d %s\n", quant, formatHFSize(option.SizeBytes), option.Shards, selectorFor(option))
-	}
-	return nil
+	return selector
 }
 
 // ResolveHuggingFaceModel downloads (or reuses) the GGUF selected by ref and
@@ -227,12 +318,32 @@ func ResolveHuggingFaceModelContext(ctx context.Context, ref string, logw io.Wri
 // network policy. Offline mode never contacts the Hub and requires a complete
 // snapshot for the selected revision to be present in the local cache.
 func ResolveHuggingFaceModelContextWithOptions(ctx context.Context, ref string, logw io.Writer, options Options) (string, error) {
-	if err := ctx.Err(); err != nil {
+	files, err := resolveHuggingFaceFiles(ctx, ref, logw, options)
+	if err != nil {
 		return "", err
+	}
+	return files[0], nil
+}
+
+// ResolveHuggingFaceModelFilesContextWithOptions is
+// ResolveHuggingFaceModelContextWithOptions but returns every local shard
+// path, in shard order, instead of only the first. Callers that only need a
+// loadable model path should prefer ResolveHuggingFaceModelContextWithOptions;
+// this variant exists for callers that must place the complete shard set
+// somewhere else on disk (for example, linking a split model's files into a
+// model directory for local discovery), since a split GGUF cannot be loaded
+// from its first shard alone if the siblings are missing.
+func ResolveHuggingFaceModelFilesContextWithOptions(ctx context.Context, ref string, logw io.Writer, options Options) ([]string, error) {
+	return resolveHuggingFaceFiles(ctx, ref, logw, options)
+}
+
+func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, options Options) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	r, err := ParseHuggingFaceReference(ref)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if logw == nil {
 		logw = io.Discard
@@ -244,32 +355,32 @@ func ResolveHuggingFaceModelContextWithOptions(ctx context.Context, ref string, 
 		if snapshot := cache.snapshotForRef(r.Revision); snapshot != "" {
 			if files, err := cachedGGUFFiles(ctx, snapshot, r.Quant); err == nil && len(files) > 0 {
 				fmt.Fprintf(logw, "Hugging Face: offline; using cached %s\n", filepath.Base(files[0]))
-				return files[0], nil
+				return files, nil
 			}
 		}
-		return "", offlineCacheError(r)
+		return nil, offlineCacheError(r)
 	}
 	entries, commit, err := hfListFiles(ctx, r)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", ctxErr
+			return nil, ctxErr
 		}
 		// A previously resolved revision remains usable without a connection.
 		if snapshot := cache.snapshotForRef(r.Revision); snapshot != "" {
 			if files, cacheErr := cachedGGUFFiles(ctx, snapshot, r.Quant); cacheErr == nil && len(files) > 0 {
 				fmt.Fprintf(logw, "Hugging Face: offline; using cached %s\n", filepath.Base(files[0]))
-				return files[0], nil
+				return files, nil
 			}
 		}
-		return "", err
+		return nil, err
 	}
 	files, err := selectHFGGUF(entries, r.Quant)
 	if err != nil {
 		var ambiguous *ambiguousGGUFError
 		if errors.As(err, &ambiguous) {
-			return "", fmt.Errorf("%w; run `gopherllm --hf-list %s` to choose an exact selector", err, hfListReference(r))
+			return nil, fmt.Errorf("%w; run `gopherllm --hf-list %s` to choose an exact selector", err, hfListReference(r))
 		}
-		return "", err
+		return nil, err
 	}
 	if commit == "" {
 		// The public Hub currently supplies X-Repo-Commit. Keeping this
@@ -279,13 +390,13 @@ func ResolveHuggingFaceModelContextWithOptions(ctx context.Context, ref string, 
 	snapshot := cache.snapshot(commit)
 	if cached, err := cachedGGUFFiles(ctx, snapshot, r.Quant); err == nil && len(cached) > 0 {
 		if err := cache.writeRef(r.Revision, commit); err != nil {
-			return "", err
+			return nil, err
 		}
 		fmt.Fprintf(logw, "Hugging Face: using cached %s\n", filepath.Base(cached[0]))
-		return cached[0], nil
+		return cached, nil
 	}
 	if err := os.MkdirAll(snapshot, 0o755); err != nil {
-		return "", fmt.Errorf("create Hugging Face cache: %w", err)
+		return nil, fmt.Errorf("create Hugging Face cache: %w", err)
 	}
 	tasks := make([]hfDownloadTask, 0, len(files))
 	for _, name := range files {
@@ -296,20 +407,24 @@ func ResolveHuggingFaceModelContextWithOptions(ctx context.Context, ref string, 
 		}
 		tasks = append(tasks, hfDownloadTask{name: name, path: local, size: hfFileSize(entries, name)})
 	}
-	if err := downloadHFFiles(ctx, r, cache, tasks, logw); err != nil {
-		return "", err
+	if err := downloadHFFiles(ctx, r, cache, tasks, logw, options.OnProgress); err != nil {
+		return nil, err
 	}
 	if err := cache.writeRef(r.Revision, commit); err != nil {
-		return "", err
+		return nil, err
 	}
-	return filepath.Join(snapshot, filepath.FromSlash(files[0])), nil
+	resolved := make([]string, len(files))
+	for i, name := range files {
+		resolved[i] = filepath.Join(snapshot, filepath.FromSlash(name))
+	}
+	return resolved, nil
 }
 
 // downloadHFFiles downloads at most three independent GGUF shards at once.
 // The worker pool makes split-model imports materially faster without opening
 // an unbounded number of large transfers. The first failure cancels siblings;
 // their .incomplete blobs remain available for resume on the next invocation.
-func downloadHFFiles(parent context.Context, r hfReference, cache hfCache, tasks []hfDownloadTask, logw io.Writer) error {
+func downloadHFFiles(parent context.Context, r hfReference, cache hfCache, tasks []hfDownloadTask, logw io.Writer, progress ProgressFunc) error {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -333,7 +448,7 @@ func downloadHFFiles(parent context.Context, r hfReference, cache hfCache, tasks
 				if ctx.Err() != nil {
 					return
 				}
-				blob, err := hfDownload(ctx, r, task.name, cache, task.size, logw, func(n int64) { downloaded.Add(n) })
+				blob, err := hfDownload(ctx, r, task.name, cache, task.size, logw, progress, func(n int64) { downloaded.Add(n) })
 				if err == nil {
 					err = linkHFCacheFile(blob, task.path)
 				}
@@ -662,7 +777,7 @@ func safeHFFilePath(path string) bool {
 	return true
 }
 
-func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, expectedSize int64, logw io.Writer, onBytes func(int64)) (string, error) {
+func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, expectedSize int64, logw io.Writer, onProgress ProgressFunc, onBytes func(int64)) (string, error) {
 	etag, err := hfFileETag(ctx, r, name)
 	if err != nil {
 		return "", err
@@ -728,7 +843,7 @@ func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, 
 	if err != nil {
 		return "", err
 	}
-	progress := &hfProgressWriter{out: logw, name: name, total: expectedSize, completed: offset, onBytes: onBytes}
+	progress := &hfProgressWriter{out: logw, name: name, total: expectedSize, completed: offset, onBytes: onBytes, onEvent: onProgress}
 	progress.Start()
 	var bytesWritten int64
 	if bytesWritten, err = io.Copy(tmp, io.TeeReader(resp.Body, progress)); err == nil {
@@ -762,9 +877,15 @@ type hfProgressWriter struct {
 	completed int64
 	last      time.Time
 	onBytes   func(int64)
+	// onEvent mirrors the same throttled progress as onBytes/out, shaped for
+	// callers that want structured (file, completed, total) updates instead
+	// of parsing the human-readable log line.
+	onEvent ProgressFunc
 }
 
 func (p *hfProgressWriter) Start() {
+	p.last = time.Now()
+	p.emitEvent(false, nil)
 	if p.out == nil || p.out == io.Discard {
 		return
 	}
@@ -773,7 +894,6 @@ func (p *hfProgressWriter) Start() {
 	} else {
 		fmt.Fprintf(p.out, "Hugging Face: downloading %s\n", p.name)
 	}
-	p.last = time.Now()
 }
 
 func (p *hfProgressWriter) Write(data []byte) (int, error) {
@@ -781,14 +901,18 @@ func (p *hfProgressWriter) Write(data []byte) (int, error) {
 	if p.onBytes != nil {
 		p.onBytes(int64(len(data)))
 	}
-	if p.out != nil && p.out != io.Discard && time.Since(p.last) >= 250*time.Millisecond {
-		p.writeStatus()
+	if time.Since(p.last) >= 250*time.Millisecond {
 		p.last = time.Now()
+		p.emitEvent(false, nil)
+		if p.out != nil && p.out != io.Discard {
+			p.writeStatus()
+		}
 	}
 	return len(data), nil
 }
 
 func (p *hfProgressWriter) Finish(err error) {
+	p.emitEvent(true, err)
 	if p.out == nil || p.out == io.Discard {
 		return
 	}
@@ -798,6 +922,13 @@ func (p *hfProgressWriter) Finish(err error) {
 	} else {
 		fmt.Fprintln(p.out, " interrupted; it will resume on the next run")
 	}
+}
+
+func (p *hfProgressWriter) emitEvent(done bool, err error) {
+	if p.onEvent == nil {
+		return
+	}
+	p.onEvent(ProgressEvent{File: p.name, Completed: p.completed, Total: p.total, Done: done, Err: err})
 }
 
 func (p *hfProgressWriter) writeStatus() {
@@ -846,6 +977,34 @@ func safeHFETag(value string) string {
 		}
 	}
 	return value
+}
+
+// PlaceGGUFFiles links (or, when linking is unavailable, copies) each
+// resolved GGUF shard into destDir under its original filename, in the order
+// given. This lets a host such as a web UI make a Hub download show up in a
+// local model directory without duplicating storage whenever destDir shares a
+// volume with the Hugging Face cache, using the same link-then-copy fallback
+// ResolveHuggingFaceModelContextWithOptions already relies on for its own
+// blobs-to-snapshot layout. Callers choose destDir; PlaceGGUFFiles performs no
+// sanitization of it, so it must already be a path the caller trusts (for
+// example, derived from a fixed model directory plus a flattened, single
+// path-component name rather than an unvalidated repository string).
+func PlaceGGUFFiles(files []string, destDir string) ([]string, error) {
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no GGUF files to place")
+	}
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create model directory: %w", err)
+	}
+	placed := make([]string, len(files))
+	for i, file := range files {
+		dest := filepath.Join(destDir, filepath.Base(file))
+		if err := linkHFCacheFile(file, dest); err != nil {
+			return nil, fmt.Errorf("place %s: %w", filepath.Base(file), err)
+		}
+		placed[i] = dest
+	}
+	return placed, nil
 }
 
 func linkHFCacheFile(blob, snapshotFile string) error {

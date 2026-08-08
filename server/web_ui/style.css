@@ -869,6 +869,22 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .model-card-path { grid-column: 1 / -1; overflow: hidden; color: var(--muted); font: var(--fs-3xs)/1.35 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .model-library-empty { grid-column: 1 / -1; margin: 0; padding: 24px 12px; border: 1px dashed var(--line); border-radius: var(--r-md); color: var(--muted); text-align: center; }
 .model-library-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 9px; }
+
+/* ── Download a model (Hugging Face) ── */
+.model-download-label { min-width: 0; flex: 1; margin: 0; color: var(--ink) !important; }
+.model-download-form { display: flex; align-items: flex-end; gap: 8px; }
+.model-download-form .autotune-run { flex: none; min-height: 31px; }
+.model-download-variants { display: grid; gap: 6px; max-height: 220px; margin: 10px 0 0; padding: 0; overflow-y: auto; list-style: none; }
+.model-download-variant { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); }
+.model-download-variant-copy { min-width: 0; display: grid; gap: 1px; }
+.model-download-variant-quant { color: var(--ink); font: 700 var(--fs-xs)/1.3 var(--mono); }
+.model-download-variant-meta { color: var(--muted); font-size: var(--fs-3xs); }
+.model-download-variant .autotune-run { flex: none; }
+.model-download-progress { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.model-download-bar { flex: 1; height: 8px; overflow: hidden; border-radius: var(--r-pill); background: var(--line); }
+.model-download-bar-fill { display: block; height: 100%; width: 0%; border-radius: inherit; background: var(--accent); transition: width .25s ease; }
+.model-download-status.is-error { color: var(--stop); }
+.model-download-status.is-success { color: var(--ok); }
 .settings-actions { display: flex; flex-wrap: wrap; gap: 8px 14px; }
 .settings-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 12px; }
 .settings-primary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; }
@@ -1055,6 +1071,8 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .active-model-summary { grid-template-columns: auto minmax(0, 1fr); }
   .active-model-summary .model-badge-active { grid-column: 2; justify-self: start; }
   .model-library-foot { align-items: flex-start; flex-direction: column; gap: 5px; }
+  .model-download-form { flex-direction: column; align-items: stretch; }
+  .model-download-form .autotune-run { align-self: flex-start; }
   .settings-grid { grid-template-columns: 1fr 1fr; }
   .settings-primary-grid { grid-template-columns: 1fr; }
   .workspace-fields { grid-template-columns: 1fr; }

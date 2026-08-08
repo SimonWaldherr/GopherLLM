@@ -246,6 +246,27 @@
           </div>
         </section>
 
+        <section class="settings-section settings-download-section">
+          <div class="settings-section-head">
+            <div>
+              <h3>Download a model</h3>
+              <p>Fetch a GGUF from Hugging Face straight into the local model library.</p>
+            </div>
+          </div>
+          <form id="modelDownloadForm" class="model-download-form">
+            <label class="model-download-label" for="modelDownloadRef">Hugging Face repository
+              <input type="text" id="modelDownloadRef" placeholder="owner/repository or hf:owner/repository:QUANT" autocomplete="off" autocapitalize="off" spellcheck="false">
+            </label>
+            <button id="modelDownloadFind" class="autotune-run" type="submit">Find variants</button>
+          </form>
+          <ul id="modelDownloadVariants" class="model-download-variants" aria-label="Available quantizations" hidden></ul>
+          <div id="modelDownloadProgress" class="model-download-progress" hidden>
+            <div class="model-download-bar"><div id="modelDownloadBarFill" class="model-download-bar-fill"></div></div>
+            <button type="button" id="modelDownloadCancel" class="text-button">Cancel</button>
+          </div>
+          <p id="modelDownloadStatus" class="settings-note model-download-status" aria-live="polite">Paste a Hugging Face repository, e.g. bartowski/Qwen3-4B-GGUF, and find its GGUF variants.</p>
+        </section>
+
         <section class="settings-section settings-chat-section">
           <div class="settings-section-head">
             <div>

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -181,7 +182,7 @@ func TestHFDownloadResumesAnIncompleteBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HF_ENDPOINT", server.URL)
-	blob, err := hfDownload(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, "model.gguf", cache, 10, io.Discard, nil)
+	blob, err := hfDownload(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, "model.gguf", cache, 10, io.Discard, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +252,7 @@ func TestDownloadHFFilesUsesABoundedWorkerPool(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadHFFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, cache, tasks, io.Discard)
+		done <- downloadHFFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, cache, tasks, io.Discard, nil)
 	}()
 	for range tasks {
 		select {
@@ -288,5 +289,167 @@ func TestSelectHFGGUFRejectsIncompleteSplit(t *testing.T) {
 	_, err := selectHFGGUF(entries, "Q4_K_M")
 	if err == nil || !strings.Contains(err.Error(), "split is incomplete") {
 		t.Fatalf("incomplete split error = %v", err)
+	}
+}
+
+func TestRepositoryVariantsReturnsStructuredSelectors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"path":"model-Q4_K_M-00001-of-00002.gguf","type":"file","size":1048576},{"path":"model-Q4_K_M-00002-of-00002.gguf","type":"file","size":1048576},{"path":"model-Q8_0.gguf","type":"file","size":3221225472}]`)
+	}))
+	defer server.Close()
+	t.Setenv("HF_ENDPOINT", server.URL)
+
+	info, err := RepositoryVariants(context.Background(), "org/model@revision", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Repository != "org/model" || info.Revision != "revision" {
+		t.Fatalf("unexpected repository info: %#v", info)
+	}
+	if len(info.Variants) != 2 {
+		t.Fatalf("variants = %#v, want 2", info.Variants)
+	}
+	byQuant := map[string]RepositoryVariant{}
+	for _, v := range info.Variants {
+		byQuant[v.Quant] = v
+	}
+	if q4 := byQuant["Q4_K_M"]; q4.Shards != 2 || q4.SizeBytes != 2*1048576 || q4.Selector != "hf:org/model:Q4_K_M@revision" {
+		t.Fatalf("Q4_K_M variant = %#v", q4)
+	}
+	if q8 := byQuant["Q8_0"]; q8.Shards != 1 || q8.SizeBytes != 3221225472 || q8.Selector != "hf:org/model:Q8_0@revision" {
+		t.Fatalf("Q8_0 variant = %#v", q8)
+	}
+}
+
+func TestRepositoryVariantsPropagatesNotFoundError(t *testing.T) {
+	if _, err := RepositoryVariants(context.Background(), "hf:not-a-repository", Options{}); err == nil {
+		t.Fatal("expected invalid repository error")
+	}
+}
+
+func TestResolveHuggingFaceModelFilesContextReturnsAllShardsInOrder(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tree/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"path":"Qwen-Q4_K_M-00001-of-00002.gguf","type":"file"},{"path":"Qwen-Q4_K_M-00002-of-00002.gguf","type":"file"}]`)
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			blob := "blob-1"
+			if strings.Contains(r.URL.Path, "-00002-of-") {
+				blob = "blob-2"
+			}
+			w.Header().Set("X-Linked-ETag", `"`+blob+`"`)
+			if r.Method == http.MethodGet {
+				_, _ = io.WriteString(w, "gguf-data-"+blob)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("HF_ENDPOINT", server.URL)
+	t.Setenv("HF_HOME", t.TempDir())
+
+	files, err := ResolveHuggingFaceModelFilesContextWithOptions(context.Background(), "hf:org/model:Q4_K_M@revision", io.Discard, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 || !strings.HasSuffix(files[0], "00001-of-00002.gguf") || !strings.HasSuffix(files[1], "00002-of-00002.gguf") {
+		t.Fatalf("unexpected shard set: %v", files)
+	}
+	for i, want := range []string{"gguf-data-blob-1", "gguf-data-blob-2"} {
+		got, err := os.ReadFile(files[i])
+		if err != nil || string(got) != want {
+			t.Fatalf("shard %d = %q, %v; want %q", i, got, err, want)
+		}
+	}
+}
+
+func TestResolveHuggingFaceModelReportsProgress(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/tree/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[{"path":"model-Q4_K_M.gguf","type":"file","size":5}]`)
+		case strings.Contains(r.URL.Path, "/resolve/"):
+			w.Header().Set("X-Linked-ETag", `"blob"`)
+			if r.Method == http.MethodGet {
+				_, _ = io.WriteString(w, "hello")
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("HF_ENDPOINT", server.URL)
+	t.Setenv("HF_HOME", t.TempDir())
+
+	var mu sync.Mutex
+	var events []ProgressEvent
+	_, err := ResolveHuggingFaceModelContextWithOptions(context.Background(), "hf:org/model:Q4_K_M", io.Discard, Options{
+		OnProgress: func(ev ProgressEvent) {
+			mu.Lock()
+			defer mu.Unlock()
+			events = append(events, ev)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatal("expected at least one progress event")
+	}
+	last := events[len(events)-1]
+	if !last.Done || last.Err != nil || last.Completed != 5 || last.Total != 5 {
+		t.Fatalf("final progress event = %#v", last)
+	}
+}
+
+func TestPlaceGGUFFilesLinksShardsIntoDestDir(t *testing.T) {
+	src := t.TempDir()
+	shard1 := filepath.Join(src, "model-00001-of-00002.gguf")
+	shard2 := filepath.Join(src, "model-00002-of-00002.gguf")
+	if err := os.WriteFile(shard1, []byte("part1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shard2, []byte("part2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	destDir := filepath.Join(t.TempDir(), "owner--repo")
+
+	placed, err := PlaceGGUFFiles([]string{shard1, shard2}, destDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(placed) != 2 {
+		t.Fatalf("placed = %v", placed)
+	}
+	for i, want := range []string{"part1", "part2"} {
+		if filepath.Dir(placed[i]) != destDir {
+			t.Fatalf("placed[%d] dir = %q, want %q", i, filepath.Dir(placed[i]), destDir)
+		}
+		got, err := os.ReadFile(placed[i])
+		if err != nil || string(got) != want {
+			t.Fatalf("placed[%d] = %q, %v; want %q", i, got, err, want)
+		}
+	}
+}
+
+func TestPlaceGGUFFilesRejectsEmptyInput(t *testing.T) {
+	if _, err := PlaceGGUFFiles(nil, t.TempDir()); err == nil {
+		t.Fatal("expected error for an empty file list")
+	}
+}
+
+func TestRepositoryReturnsOwnerAndName(t *testing.T) {
+	repo, err := Repository("hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main")
+	if err != nil || repo != "bartowski/Qwen3-4B-GGUF" {
+		t.Fatalf("Repository = %q, %v", repo, err)
+	}
+	if _, err := Repository("hf:not-a-repository"); err == nil {
+		t.Fatal("expected error for an invalid repository")
 	}
 }

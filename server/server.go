@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"github.com/SimonWaldherr/GopherLLM/agentos"
+	"github.com/SimonWaldherr/GopherLLM/internal/huggingface"
 )
 
 //go:embed web_ui/chat.html
@@ -426,6 +428,13 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	// simultaneous hot-swaps from recording the models out of their actual
 	// swap order (for example, in a host that persists the active model).
 	var modelLoadMu sync.Mutex
+	// Guards against two requests downloading the same Hugging Face reference
+	// concurrently, which would otherwise let two goroutines append to the
+	// same .incomplete blob at once and corrupt it. Keyed by the exact
+	// normalized ref string, not a distributed lock: it only protects against
+	// this one server process racing itself (e.g. a doubled click).
+	var downloadMu sync.Mutex
+	activeDownloads := map[string]struct{}{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get()), "remote": remote.enabled()})
@@ -1045,6 +1054,107 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		}
 		writeJSON(w, map[string]any{"model": model, "embeddings": vectors})
 	}))
+	mux.HandleFunc("/models/download/variants", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.ModelDir == "" {
+			http.Error(w, "model download is disabled: configure HandlerOptions.ModelDir", http.StatusNotFound)
+			return
+		}
+		ref := strings.TrimSpace(req.URL.Query().Get("ref"))
+		if ref == "" {
+			http.Error(w, "missing ref query parameter", http.StatusBadRequest)
+			return
+		}
+		info, err := huggingface.RepositoryVariants(req.Context(), ref, huggingface.Options{})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		variants := make([]map[string]any, len(info.Variants))
+		for i, v := range info.Variants {
+			variants[i] = map[string]any{"quant": v.Quant, "size_bytes": v.SizeBytes, "shards": v.Shards, "selector": v.Selector}
+		}
+		writeJSON(w, map[string]any{"repository": info.Repository, "revision": info.Revision, "variants": variants})
+	})
+	mux.HandleFunc("/models/download", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if opts.ModelDir == "" {
+			http.Error(w, "model download is disabled: configure HandlerOptions.ModelDir", http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Ref string `json:"ref"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ref := strings.TrimSpace(body.Ref)
+		if ref == "" {
+			http.Error(w, "missing model reference", http.StatusBadRequest)
+			return
+		}
+		if !strings.HasPrefix(strings.ToLower(ref), "hf:") {
+			ref = "hf:" + ref
+		}
+		repository, err := huggingface.Repository(ref)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		downloadMu.Lock()
+		if _, busy := activeDownloads[ref]; busy {
+			downloadMu.Unlock()
+			http.Error(w, "this model is already downloading", http.StatusConflict)
+			return
+		}
+		activeDownloads[ref] = struct{}{}
+		downloadMu.Unlock()
+		defer func() {
+			downloadMu.Lock()
+			delete(activeDownloads, ref)
+			downloadMu.Unlock()
+		}()
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("content-type", "application/x-ndjson")
+		w.Header().Set("cache-control", "no-store")
+		send := func(event map[string]any) { _ = writeNDJSON(w, flusher, event) }
+		send(map[string]any{"status": "resolving", "ref": ref})
+		files, err := huggingface.ResolveHuggingFaceModelFilesContextWithOptions(req.Context(), ref, io.Discard, huggingface.Options{
+			OnProgress: func(ev huggingface.ProgressEvent) {
+				if ev.Err != nil {
+					return
+				}
+				send(map[string]any{"status": "downloading", "file": ev.File, "completed": ev.Completed, "total": ev.Total})
+			},
+		})
+		if err != nil {
+			send(map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		send(map[string]any{"status": "placing"})
+		destDir := filepath.Join(opts.ModelDir, hfRepoDirName(repository))
+		placed, err := huggingface.PlaceGGUFFiles(files, destDir)
+		if err != nil {
+			send(map[string]any{"status": "error", "error": err.Error()})
+			return
+		}
+		id := strings.TrimSuffix(filepath.Base(placed[0]), ".gguf")
+		if rel, relErr := filepath.Rel(opts.ModelDir, placed[0]); relErr == nil {
+			id = strings.TrimSuffix(rel, ".gguf")
+		}
+		send(map[string]any{"status": "success", "id": id, "path": placed[0], "file": filepath.Base(placed[0])})
+	})
 	mux.HandleFunc("/autotune", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2027,6 +2137,22 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, v any) 
 	}
 	flusher.Flush()
 	return nil
+}
+
+// hfRepoDirName turns a Hugging Face "owner/repository" reference into a
+// single path-safe directory component, mirroring the flattening
+// internal/huggingface already applies to its own on-disk cache layout
+// (newHFCache). filepath.Join-ing an unflattened repository string would let
+// a "/"-containing (or, worse, ".."-containing) value escape opts.ModelDir;
+// collapsing every separator into "--" first guarantees the result is always
+// exactly one path component appended under ModelDir.
+func hfRepoDirName(repository string) string {
+	name := strings.ReplaceAll(repository, "\\", "--")
+	name = strings.ReplaceAll(name, "/", "--")
+	if name == "" || name == "." || name == ".." {
+		name = "hf-model"
+	}
+	return name
 }
 
 // writeNDJSON writes one newline-delimited JSON object and flushes — Ollama's
