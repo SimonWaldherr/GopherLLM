@@ -126,38 +126,6 @@ func BenchmarkMatvecQ8K_1024x1024(b *testing.B) {
 	}
 }
 
-func benchIQData(rows, cols, blockBytes int) []byte {
-	data := benchBytes(rows * (cols / 256) * blockBytes)
-	for off := 0; off < len(data); off += blockBytes {
-		// A finite f16 base scale keeps the scalar codebook path comparable
-		// across benchmark runs (rather than accidentally measuring NaN flow).
-		data[off], data[off+1] = 0, 0x38 // 0.5
-	}
-	return data
-}
-
-func BenchmarkMatvecIQ2S_1024x1024(b *testing.B) {
-	data := benchIQData(1024, 1024, 82)
-	x := benchFloatSlice(1024)
-	out := make([]float32, 1024)
-	b.ReportAllocs()
-	b.SetBytes(int64(len(data) + len(x)*4))
-	for b.Loop() {
-		MatvecIQ2SInto(data, x, 1024, 1024, &out)
-	}
-}
-
-func BenchmarkMatvecIQ3S_1024x1024(b *testing.B) {
-	data := benchIQData(1024, 1024, 110)
-	x := benchFloatSlice(1024)
-	out := make([]float32, 1024)
-	b.ReportAllocs()
-	b.SetBytes(int64(len(data) + len(x)*4))
-	for b.Loop() {
-		MatvecIQ3SInto(data, x, 1024, 1024, &out)
-	}
-}
-
 func BenchmarkMatvecQ4_0QKVFused_1024x1024(b *testing.B) {
 	data := benchQ4_0Data(1024, 1024)
 	wq := Weight{Raw: data, Type: GGMLTypeQ4_0, Rows: 1024, Cols: 1024}

@@ -300,17 +300,6 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 		}
 		return out
 	}
-	iq4XSData := func() []byte {
-		out := make([]byte, rows*(cols/256)*136)
-		for block := 0; block < len(out)/136; block++ {
-			base := block * 136
-			out[base+1] = 0x3c // f16 1.0 base scale
-			for i := 2; i < 136; i++ {
-				out[base+i] = byte(rng.Intn(256))
-			}
-		}
-		return out
-	}
 	mxfp4Data := func() []byte {
 		out := make([]byte, rows*(cols/32)*17)
 		for block := 0; block < len(out)/17; block++ {
@@ -327,7 +316,6 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 		"f32":   {F32: randomVec(rng, rows*cols)},
 		"q4_0":  {Raw: legacyData(18), Type: GGMLTypeQ4_0, Rows: rows, Cols: cols},
 		"q8_0":  {Raw: legacyData(34), Type: GGMLTypeQ8_0, Rows: rows, Cols: cols},
-		"iq4xs": {Raw: iq4XSData(), Type: GGMLTypeIQ4_XS, Rows: rows, Cols: cols},
 		"q4k":   {Raw: q4kData, Type: GGMLTypeQ4_K, Rows: rows, Cols: cols},
 		"q5k":   {Raw: q5kData, Type: GGMLTypeQ5_K, Rows: rows, Cols: cols},
 		"q6k":   {Raw: q6kData, Type: GGMLTypeQ6_K, Rows: rows, Cols: cols},

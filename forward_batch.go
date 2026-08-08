@@ -123,42 +123,6 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 		if cols%32 == 0 {
 			return DequantRowQ4_0Into
 		}
-	case GGMLTypeIQ4_NL:
-		if cols%32 == 0 {
-			return DequantRowIQ4NLInto
-		}
-	case GGMLTypeIQ2_S:
-		if cols%256 == 0 {
-			return DequantRowIQ2SInto
-		}
-	case GGMLTypeIQ3_S:
-		if cols%256 == 0 {
-			return DequantRowIQ3SInto
-		}
-	case GGMLTypeIQ4_XS:
-		if cols%256 == 0 {
-			return DequantRowIQ4XSInto
-		}
-	case GGMLTypeIQ2_XXS:
-		if cols%256 == 0 {
-			return DequantRowIQ2XXSInto
-		}
-	case GGMLTypeIQ2_XS:
-		if cols%256 == 0 {
-			return DequantRowIQ2XSInto
-		}
-	case GGMLTypeIQ3_XXS:
-		if cols%256 == 0 {
-			return DequantRowIQ3XXSInto
-		}
-	case GGMLTypeIQ1_S:
-		if cols%256 == 0 {
-			return DequantRowIQ1SInto
-		}
-	case GGMLTypeIQ1_M:
-		if cols%256 == 0 {
-			return DequantRowIQ1MInto
-		}
 	case GGMLTypeQ4_1:
 		if cols%32 == 0 {
 			return DequantRowQ4_1Into
