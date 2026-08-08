@@ -14,24 +14,41 @@ import (
 // kernels, including the WebGPU backend, rather than only the F32 matvec
 // path every architecture family also has to support.
 func buildTinyQuantizedMistralGGUF() []byte {
+	return buildTinyQuantizedMistralGGUFWithSpecials(nil)
+}
+
+// buildTinyQuantizedMistralGGUFWithSpecials is buildTinyQuantizedMistralGGUF
+// plus extraSpecials appended to the vocabulary as additional single-purpose
+// tokens (e.g. "[INST]"/"[IMG]") -- used by the vision fixture, which needs
+// chatTemplateKind() to detect "mistral-inst" (via Tokenizer.SpecialID
+// lookups, see runtime.go) so image content is accepted at all. Appending
+// rather than inserting preserves every existing token ID, so
+// buildTinyQuantizedMistralGGUF()'s own golden-output tests are unaffected
+// by this function's existence.
+func buildTinyQuantizedMistralGGUFWithSpecials(extraSpecials []string) []byte {
 	const (
 		dim    = 256
 		heads  = 4
 		kv     = 2
 		hdim   = dim / heads // 64
 		hidden = 256
-		vocab  = 32
+		baseVocab = 32
 	)
+	vocab := baseVocab + len(extraSpecials)
 	toks := make([]any, vocab)
 	scores := make([]any, vocab)
 	special := []string{"<unk>", "<s>", "</s>"}
-	for i := 0; i < vocab; i++ {
+	for i := 0; i < baseVocab; i++ {
 		if i < len(special) {
 			toks[i] = special[i]
 		} else {
 			toks[i] = string(rune('a' + (i - len(special))))
 		}
 		scores[i] = float32(0)
+	}
+	for i, s := range extraSpecials {
+		toks[baseVocab+i] = s
+		scores[baseVocab+i] = float32(0)
 	}
 	arch := "mistral3"
 	kvs := []ggufKV{

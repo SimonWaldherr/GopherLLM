@@ -15,6 +15,7 @@ func main() {
 	harnessDir := flag.String("harness", "cmd/gopherllm-wasm/testdata/harness", "directory serving index.html/app.js at /")
 	binDir := flag.String("bin", "bin", "directory serving gopherllm.wasm/wasm_exec.js at /bin/")
 	modelsDir := flag.String("models", "", "optional directory serving real (large) .gguf files at /models/, e.g. the repo root -- avoids copying a multi-GB model into the harness directory")
+	demoDir := flag.String("demo", "cmd/gopherllm-wasm/demo", "directory serving the polished demo page at /demo/")
 	flag.Parse()
 
 	mux := http.NewServeMux()
@@ -23,10 +24,12 @@ func main() {
 	if *modelsDir != "" {
 		mux.Handle("/models/", http.StripPrefix("/models/", http.FileServer(http.Dir(*modelsDir))))
 	}
+	mux.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.Dir(*demoDir))))
 
 	log.Printf("serving %s at http://%s/ and %s at http://%s/bin/", *harnessDir, *addr, *binDir, *addr)
 	if *modelsDir != "" {
 		log.Printf("serving %s at http://%s/models/", *modelsDir, *addr)
 	}
+	log.Printf("serving %s at http://%s/demo/", *demoDir, *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

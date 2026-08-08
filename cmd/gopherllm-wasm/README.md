@@ -25,11 +25,30 @@ go1.16 install; the working toolchain is at
 up the wrong one, e.g. `make GO=/c/Users/waldherr/go-sdk/go/bin/go.exe wasm-build`.
 This is a local environment quirk, not a repo requirement.
 
-## Trying it in a browser
+## The demo
 
-`testdata/harness/` is a minimal page that loads the wasm module, loads a
-tiny synthetic GGUF fixture, and runs one greedy generation — this is a
-correctness harness, not the polished demo (that's a later phase).
+`demo/` is the actual user-facing page: pick a text-model GGUF (and,
+optionally, a matching Pixtral-style vision projector GGUF) via native file
+inputs, then chat — with images, if a vision projector was loaded — entirely
+in the tab. Serve it via the devserver (below) at `/demo/`. It calls
+`gopherllm_loadModelWithVision`/`gopherllm_hasVision`/`gopherllm_generate`
+(images as base64 in each message's `images` field) — the same bridge
+functions the vision-in-browser correctness harness below exercises via
+fetch, since a native OS file-picker dialog can't be driven by browser
+automation tooling (verified indirectly that way instead — see
+`webgpu-vision-test.html`).
+
+Model files are read entirely client-side via `FileReader`; nothing is
+uploaded anywhere. For a large (multi-GB) model, keep in mind a browser tab
+has to hold the whole file as one contiguous buffer at least twice, briefly
+(the read buffer, then GopherLLM's own copy) — see the 2GB-model finding
+below.
+
+## Trying the correctness harnesses in a browser
+
+`testdata/harness/` holds correctness-verification pages, not the demo
+(above) — each fetches its own tiny synthetic fixture and checks the result
+against a known-correct value, rather than taking user input.
 
 ```sh
 make wasm-build
@@ -50,15 +69,22 @@ known-correct output from a native run of the same bytes
 ## What's here
 
 - `main.go` / `bridge.go` / `promise.go` — the wasm entry point: registers
-  `gopherllm_loadModel` / `gopherllm_generate` / `gopherllm_stopGeneration` /
-  `gopherllm_isGenerating` / `gopherllm_isModelLoaded` on the JS global
-  object via `syscall/js`, bridging Go's goroutine model to JS Promises.
-  `gopherllm_generate` rejects immediately if a generation is already in
-  progress rather than silently queuing behind it; `gopherllm_loadModel`
-  signals any in-flight generation to stop before waiting for the outgoing
-  model to close, so switching models mid-generation stays responsive.
+  `gopherllm_loadModel` / `gopherllm_loadModelWithVision` / `gopherllm_hasVision` /
+  `gopherllm_generate` (its per-message wire format has an optional
+  `images: string[]` of base64-encoded PNG/JPEG bytes) /
+  `gopherllm_stopGeneration` / `gopherllm_isGenerating` / `gopherllm_isModelLoaded`
+  on the JS global object via `syscall/js`, bridging Go's goroutine model to
+  JS Promises. `gopherllm_generate` rejects immediately if a generation is
+  already in progress rather than silently queuing behind it;
+  `gopherllm_loadModel`/`gopherllm_loadModelWithVision` signal any in-flight
+  generation to stop before waiting for the outgoing model to close, so
+  switching models mid-generation stays responsive.
+- `demo/` — the polished, user-facing page (see "The demo" above).
 - `devserver/` — a trivial `net/http` static file server for manual testing;
-  not part of the wasm build itself.
+  not part of the wasm build itself. Mounts `/` (harness), `/bin/` (wasm
+  build output), `/demo/`, and optionally `/models/` (point `-models` at a
+  directory holding real, large GGUFs — e.g. the repo root — to test against
+  them without copying multi-GB files into this directory).
 - `testdata/harness/` — correctness-verification pages:
   - `index.html`/`app.js` — the CPU-only golden-output check above.
   - `webgpu-smoke.html` — validates the `internal/webgpu` plumbing itself
@@ -75,8 +101,19 @@ known-correct output from a native run of the same bytes
     confirms a full multi-layer, multi-token generation through the real
     `Weight.GPU`/`MatvecInto` wiring matches the native CPU-path output
     exactly.
+  - `webgpu-vision-test.html` — the same kind of check for the vision path:
+    loads a tiny text+vision GGUF pair (`GOPHERLLM_GEN_WASM_VISION_FIXTURE=1
+    go test -run TestGenerateWasmDemoVisionFixture -v .` regenerates both)
+    via `gopherllm_loadModelWithVision`, sends an image with
+    `gopherllm_generate`, and checks the result against the native golden
+    output — this is what actually exercises `gopherllm_loadModelWithVision`
+    end to end, since the demo's own file-picker inputs can't be driven by
+    browser automation tooling.
+  - `real-model-bench.html` — loads a real (large) model via `/models/` and
+    times generation; see the 2GB-model finding below for what happened the
+    one time this was tried against the actual Ministral 3B file.
 - `webgpu_smoke.go` / `webgpu_kernel_check.go` — the Go-side logic those
-  last two pages call into (kept out of `_test.go` files since those are
+  test-only pages call into (kept out of `_test.go` files since those are
   excluded from a normal `go build`, only compiled under `go test`).
 
 ## WebGPU backend
@@ -108,8 +145,33 @@ implemented.
 **Also not yet done**: per-layer dispatch batching. The current integration
 calls the GPU kernel once per matvec (one CPU↔GPU round trip each), which is
 *correct* — verified via `webgpu-forward-pass-test.html` producing output
-bit-identical to the CPU path — but not yet the "~3 sync points per layer"
-batched design the project plan calls for, which needs restructuring
-`ForwardBodyInto`'s per-layer loop itself, not just this leaf-level hook.
-Real tokens/sec with either approach hasn't been measured yet against a real
-(non-tiny) model.
+bit-identical to the CPU path, and via `webgpu-vision-test.html` for the
+vision path too — but not yet the "~3 sync points per layer" batched design
+the project plan calls for, which needs restructuring `ForwardBodyInto`'s
+per-layer loop itself, not just this leaf-level hook.
+
+**A real bug worth knowing about if you touch `internal/webgpu/buffer.go`**:
+`GPUQueue.writeBuffer` (and buffer/map/range sizes generally) require byte
+counts to be multiples of 4. GGUF's Q6_K block is 210 bytes, so plenty of
+real Q6_K tensors (e.g. 37 rows × 210B = 7770B) have a total size that
+*isn't* 4-aligned — this isn't hypothetical, it broke an actual browser run
+during development (`Failed to execute 'writeBuffer' ... must be a multiple
+of 4`). `CreateStorageBuffer`/`CreateUniformBuffer`/`WriteBuffer`/`ReadBuffer`
+all round up via `roundUpTo4` now; `Buffer.Size()` still reports the
+caller's logical (unrounded) size.
+
+**2GB-model finding**: the one attempt at loading the real
+`Ministral-3-3B-Instruct-2512-Q4_K_M.gguf` (2,147,023,008 bytes) in a
+sandboxed test browser failed at a plain JS `new Uint8Array(...)` allocation
+— *before* Go/wasm was ever involved — with "Array buffer allocation
+failed". Binary-searching in isolation found that sandbox's single-buffer
+ceiling sits at ~2,145.3–2,145.9 MB, just under the file's size by only
+~1–1.7 MB. That reads as a limit of that specific sandboxed container, not a
+demonstrated wasm32/browser-architecture limit — real desktop Chrome/Firefox
+on ordinary hardware routinely allocates single buffers well past 2GiB. The
+"does the real file fit in a real browser" question is genuinely still open;
+try `real-model-bench.html` yourself on real desktop hardware to find out.
+If it doesn't, the right fix is a streaming GGUF loader that never
+materializes the whole file as one JS/Go buffer (parse the header, then
+stream each tensor's bytes into its own allocation as it arrives) — not
+implemented yet.

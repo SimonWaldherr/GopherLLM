@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GopherLLM — runs entirely in your browser</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>GopherLLM <span class="tag">in your browser</span></h1>
+  <div id="gpuBadge" class="badge badge-pending">checking WebGPU…</div>
+</header>
+
+<main>
+  <section id="loadPanel" class="panel">
+    <h2>1. Load a model</h2>
+    <p class="hint">
+      Everything runs locally in this tab — no server, nothing uploaded.
+      Pick a GGUF text model (required) and, optionally, a matching
+      Pixtral-style vision projector GGUF to enable image input (from a
+      file, your webcam, or your screen — the browser asks permission for
+      each, and the captured frame never leaves this tab).
+    </p>
+    <label class="field">
+      <span>Text model (.gguf)</span>
+      <input type="file" id="textModelFile" accept=".gguf">
+    </label>
+    <label class="field">
+      <span>Vision projector (optional, .gguf)</span>
+      <input type="file" id="visionModelFile" accept=".gguf">
+    </label>
+    <button id="loadButton" disabled>Load model</button>
+    <div id="loadStatus" class="status"></div>
+  </section>
+
+  <section id="chatPanel" class="panel hidden">
+    <h2>2. Chat</h2>
+    <div id="messages"></div>
+    <div id="imagePreviewRow" class="hidden">
+      <img id="imagePreview" alt="attached image">
+      <button id="clearImageButton" type="button">✕ remove image</button>
+    </div>
+    <div id="captureError" class="status error hidden"></div>
+    <form id="chatForm">
+      <label id="attachLabel" class="hidden attach-button" for="imageFile" title="Attach an image file">📎</label>
+      <input type="file" id="imageFile" accept="image/*" class="hidden">
+      <button id="webcamButton" type="button" class="hidden attach-button" title="Capture from webcam">📷</button>
+      <button id="screenButton" type="button" class="hidden attach-button" title="Capture from screen">🖥️</button>
+      <textarea id="promptInput" placeholder="Ask something…" rows="2"></textarea>
+      <button id="sendButton" type="submit">Send</button>
+      <button id="stopButton" type="button" class="hidden">Stop</button>
+    </form>
+  </section>
+</main>
+
+<dialog id="captureModal">
+  <video id="captureVideo" autoplay muted playsinline></video>
+  <div class="capture-actions">
+    <button id="captureCancelButton" type="button" class="secondary">Cancel</button>
+    <button id="captureConfirmButton" type="button">📸 Capture</button>
+  </div>
+</dialog>
+
+<script src="/bin/wasm_exec.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

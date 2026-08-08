@@ -49,26 +49,24 @@ async function fetchWithProgress(url) {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error("fetching " + url + ": HTTP " + resp.status);
   const total = Number(resp.headers.get("Content-Length") || 0);
+  if (total <= 0) throw new Error("server did not report Content-Length; cannot pre-allocate");
+  // Pre-allocate the one big buffer up front and write each chunk directly
+  // into it, instead of accumulating chunks in an array and concatenating
+  // at the end -- that doubles peak memory (every chunk held twice: once
+  // in the array, once in the final buffer) right at the point a 2GB
+  // model is already pushing against real limits.
+  const bytes = new Uint8Array(total);
   const reader = resp.body.getReader();
-  const chunks = [];
   let received = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
+    bytes.set(value, received);
     received += value.length;
-    if (total > 0) {
-      const pct = Math.round((received / total) * 100);
-      document.getElementById("progressBar").style.width = pct + "%";
-    }
+    const pct = Math.round((received / total) * 100);
+    document.getElementById("progressBar").style.width = pct + "%";
   }
-  const bytes = new Uint8Array(received);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return bytes;
+  return received === total ? bytes : bytes.subarray(0, received);
 }
 
 async function main() {
@@ -85,12 +83,15 @@ async function main() {
 
   log("fetching Ministral-3-3B-Instruct-2512-Q4_K_M.gguf (~2GB, this will take a while)...");
   const t0Fetch = performance.now();
-  const bytes = await fetchWithProgress("/models/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf");
+  let bytes = await fetchWithProgress("/models/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf");
   log("fetched " + bytes.length + " bytes in " + ((performance.now() - t0Fetch) / 1000).toFixed(1) + "s, loading into gopherllm...");
 
   const t0Load = performance.now();
   await window.gopherllm_loadModel(bytes);
   const loadSecs = (performance.now() - t0Load) / 1000;
+  // Drop the JS-side reference now that Go has its own copy -- gopherllm_loadModel
+  // already documents this contract (see bridge.go's jsLoadModel doc comment).
+  bytes = null;
   log("model loaded in " + loadSecs.toFixed(1) + "s");
 
   const messages = JSON.stringify([{ role: "user", content: "Explain what a neural network is in one paragraph." }]);

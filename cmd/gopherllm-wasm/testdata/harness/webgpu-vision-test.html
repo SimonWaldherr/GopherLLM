@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GopherLLM vision-in-browser test</title>
+<style>
+  body { font: 14px/1.5 monospace; margin: 2rem; background: #111; color: #ddd; }
+  #log { white-space: pre-wrap; background: #000; color: #8f8; padding: 1rem; min-height: 6rem; }
+  #status.pass { color: #0f0; font-weight: bold; }
+  #status.fail { color: #f00; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>GopherLLM vision-in-browser test</h1>
+<p>Exercises gopherllm_loadModelWithVision + image content in
+gopherllm_generate -- the same bridge functions the demo page's file
+picker calls -- via fetch (automatable), since a native OS file picker
+dialog can't be driven by browser automation tooling.</p>
+<div>status: <span id="status">running...</span></div>
+<div id="log"></div>
+<script src="/bin/wasm_exec.js"></script>
+<script>
+const GOLDEN_TEXT = "h<unk>";
+
+function log(msg) {
+  console.log(msg);
+  document.getElementById("log").textContent += msg + "\n";
+}
+function setStatus(text, cls) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+async function waitForBridge(timeoutMs) {
+  const start = Date.now();
+  while (typeof window.gopherllm_loadModelWithVision !== "function") {
+    if (Date.now() - start > timeoutMs) throw new Error("bridge functions never registered");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+async function fetchBytes(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error("fetching " + url + ": HTTP " + resp.status);
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+async function main() {
+  log("fetching gopherllm.wasm...");
+  const go = new Go();
+  const resp = await fetch("/bin/gopherllm.wasm");
+  if (!resp.ok) throw new Error("fetching gopherllm.wasm: HTTP " + resp.status);
+  const { instance } = await WebAssembly.instantiateStreaming(resp, go.importObject);
+  go.run(instance);
+  await waitForBridge(2000);
+
+  log("fetching tiny-quant-model-vision.gguf + tiny-vision.gguf...");
+  const [textBytes, visionBytes] = await Promise.all([
+    fetchBytes("tiny-quant-model-vision.gguf"),
+    fetchBytes("tiny-vision.gguf"),
+  ]);
+  log("loading (text " + textBytes.length + " bytes, vision " + visionBytes.length + " bytes)...");
+  await window.gopherllm_loadModelWithVision(textBytes, visionBytes);
+  log("model loaded");
+
+  const hasVision = window.gopherllm_hasVision();
+  log("gopherllm_hasVision(): " + hasVision);
+  if (!hasVision) throw new Error("expected gopherllm_hasVision() to be true after loading a vision projector");
+
+  // A small solid-color PNG, base64-encoded inline (matches the Go test's
+  // fixture generation -- see wasm_demo_vision_fixture_test.go).
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgb(220,20,20)";
+  ctx.fillRect(0, 0, 64, 64);
+  const dataURL = canvas.toDataURL("image/png");
+  const base64 = dataURL.slice(dataURL.indexOf(",") + 1);
+
+  const messages = JSON.stringify([{ role: "user", content: "Hello", images: [base64] }]);
+  const options = JSON.stringify({
+    maxTokens: 8,
+    temperature: 0,
+    topP: 1,
+    topK: 0,
+    minP: 0,
+    repeatPenalty: 1.1,
+  });
+
+  const text = await window.gopherllm_generate(messages, options, () => true);
+  log("generation finished: " + JSON.stringify(text));
+
+  if (text === GOLDEN_TEXT) {
+    setStatus("PASS: vision-in-browser generation matches native golden output", "pass");
+  } else {
+    setStatus("FAIL: expected " + JSON.stringify(GOLDEN_TEXT) + " got " + JSON.stringify(text), "fail");
+  }
+}
+main().catch((err) => {
+  console.error(err);
+  log("FATAL: " + (err && err.message ? err.message : String(err)));
+  setStatus("ERROR: " + (err && err.message ? err.message : String(err)), "fail");
+});
+</script>
+</body>
+</html>

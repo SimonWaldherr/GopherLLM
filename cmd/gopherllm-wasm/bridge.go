@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -37,6 +38,8 @@ var (
 
 func registerCallbacks() {
 	js.Global().Set("gopherllm_loadModel", js.FuncOf(jsLoadModel))
+	js.Global().Set("gopherllm_loadModelWithVision", js.FuncOf(jsLoadModelWithVision))
+	js.Global().Set("gopherllm_hasVision", js.FuncOf(jsHasVision))
 	js.Global().Set("gopherllm_generate", js.FuncOf(jsGenerate))
 	js.Global().Set("gopherllm_stopGeneration", js.FuncOf(jsStopGeneration))
 	js.Global().Set("gopherllm_isGenerating", js.FuncOf(jsIsGenerating))
@@ -179,12 +182,75 @@ func jsLoadModel(this js.Value, args []js.Value) any {
 	})
 }
 
+// jsLoadModelWithVision(textBytes: Uint8Array, visionBytes?: Uint8Array) => Promise<boolean>
+//
+// Like jsLoadModel, but optionally also loads a paired Pixtral-style vision
+// projector GGUF (gopherllm.RunnerFromGGUFBytesWithVision), enabling
+// ChatMessage.Images on subsequent gopherllm_generate calls. Passing
+// undefined/null for visionBytes loads text-only, same as jsLoadModel.
+func jsLoadModelWithVision(this js.Value, args []js.Value) any {
+	if len(args) < 1 || args[0].IsUndefined() || args[0].IsNull() {
+		return rejectPromise(fmt.Errorf("gopherllm_loadModelWithVision: expected a Uint8Array text-model argument"))
+	}
+	textSrc := args[0]
+	textData := make([]byte, textSrc.Get("length").Int())
+	js.CopyBytesToGo(textData, textSrc)
+
+	var visionData []byte
+	if len(args) > 1 && !args[1].IsUndefined() && !args[1].IsNull() {
+		visionSrc := args[1]
+		visionData = make([]byte, visionSrc.Get("length").Int())
+		js.CopyBytesToGo(visionData, visionSrc)
+	}
+
+	return newPromise(func(resolve, reject js.Value) {
+		var r *gopherllm.Runner
+		var err error
+		if visionData != nil {
+			r, err = gopherllm.RunnerFromGGUFBytesWithVision(textData, visionData, gopherllm.LoadOptions{})
+		} else {
+			r, err = gopherllm.RunnerFromGGUFBytesWithOptions(textData, gopherllm.LoadOptions{})
+		}
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+
+		runnerMu.Lock()
+		prev := runner
+		runner = r
+		runnerMu.Unlock()
+		if prev != nil {
+			requestStopCurrent()
+			prev.Close()
+		}
+
+		resolve.Invoke(true)
+	})
+}
+
+// jsHasVision() => boolean
+//
+// Synchronous (no WebGPU/device access involved, just a field check on the
+// loaded Runner) -- safe to call directly without the newPromise wrapping
+// jsWebGPUStatus needs.
+func jsHasVision(this js.Value, args []js.Value) any {
+	runnerMu.Lock()
+	r := runner
+	runnerMu.Unlock()
+	return r != nil && r.HasVision()
+}
+
 // wireMessage/wireOptions are the JSON shapes gopherllm_generate accepts
 // from JS — plain strings/numbers only, translated here into the Go API's
 // real types (gopherllm.ChatRole is an int enum, not JSON-friendly as-is).
 type wireMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string   `json:"role"`
+	Content string   `json:"content"`
+	// Images is base64-encoded raw image bytes (PNG/JPEG), no "data:" prefix
+	// -- capped at one per message by the underlying renderer (see
+	// runtime.go's renderMistralInstMessages).
+	Images []string `json:"images,omitempty"`
 }
 
 type wireOptions struct {
@@ -236,7 +302,15 @@ func jsGenerate(this js.Value, args []js.Value) any {
 		if err != nil {
 			return rejectPromise(fmt.Errorf("gopherllm_generate: message %d: %w", i, err))
 		}
-		messages[i] = gopherllm.ChatMessage{Role: role, Content: m.Content}
+		cm := gopherllm.ChatMessage{Role: role, Content: m.Content}
+		for _, b64 := range m.Images {
+			raw, err := base64.StdEncoding.DecodeString(b64)
+			if err != nil {
+				return rejectPromise(fmt.Errorf("gopherllm_generate: message %d: decoding image: %w", i, err))
+			}
+			cm.Images = append(cm.Images, gopherllm.ImageContent{Bytes: raw})
+		}
+		messages[i] = cm
 	}
 
 	opts := wireOptions{MaxTokens: 512, Temperature: 0.7, TopP: 0.9, TopK: 40, RepeatPenalty: 1.1}
