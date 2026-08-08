@@ -87,7 +87,7 @@ _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p 
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
-.PHONY: all build release build-metal cross-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
+.PHONY: all build release build-metal cross-build wasm-build run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -113,6 +113,16 @@ cross-build:
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-arm64 ./cmd/gopherllm
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-amd64.exe ./cmd/gopherllm
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-arm64.exe ./cmd/gopherllm
+
+# wasm-build compiles the in-browser entry point (cmd/gopherllm-wasm, see
+# its README) and stages Go's own wasm_exec.js bootstrap next to it. No
+# third-party JS is involved: wasm_exec.js ships with the Go toolchain
+# itself. GOOS=js (not wasip1) since that's what a browser tab is.
+wasm-build:
+	@mkdir -p $(BUILD_DIR)
+	GOOS=js GOARCH=wasm CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -o $(BUILD_DIR)/gopherllm.wasm ./cmd/gopherllm-wasm
+	cp "$$($(GO) env GOROOT)/lib/wasm/wasm_exec.js" $(BUILD_DIR)/wasm_exec.js 2>/dev/null || \
+		cp "$$($(GO) env GOROOT)/misc/wasm/wasm_exec.js" $(BUILD_DIR)/wasm_exec.js
 
 run: release
 	@$(BIN) $(_RUN_ARGS)

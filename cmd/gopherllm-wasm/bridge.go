@@ -1,0 +1,174 @@
+//go:build js
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"syscall/js"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
+)
+
+var (
+	runnerMu sync.Mutex
+	runner   *gopherllm.Runner
+
+	// stopRequested is checked by the onToken callback threaded through
+	// GenerateChatStreamUntil; gopherllm_stopGeneration sets it, and each
+	// call to gopherllm_generate clears it before starting.
+	stopRequested atomic.Bool
+)
+
+func registerCallbacks() {
+	js.Global().Set("gopherllm_loadModel", js.FuncOf(jsLoadModel))
+	js.Global().Set("gopherllm_generate", js.FuncOf(jsGenerate))
+	js.Global().Set("gopherllm_stopGeneration", js.FuncOf(jsStopGeneration))
+}
+
+// jsLoadModel(bytes: Uint8Array) => Promise<boolean>
+//
+// bytes is copied into Go-owned memory immediately (js.CopyBytesToGo), so
+// the caller is free to drop its own reference to the source ArrayBuffer as
+// soon as this call returns — important for staying under wasm's 32-bit
+// address space with a multi-hundred-MB model.
+func jsLoadModel(this js.Value, args []js.Value) any {
+	if len(args) < 1 || args[0].IsUndefined() || args[0].IsNull() {
+		return rejectPromise(fmt.Errorf("gopherllm_loadModel: expected a Uint8Array argument"))
+	}
+	src := args[0]
+	data := make([]byte, src.Get("length").Int())
+	js.CopyBytesToGo(data, src)
+
+	return newPromise(func(resolve, reject js.Value) {
+		r, err := gopherllm.RunnerFromGGUFBytesWithOptions(data, gopherllm.LoadOptions{})
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+
+		runnerMu.Lock()
+		prev := runner
+		runner = r
+		runnerMu.Unlock()
+		if prev != nil {
+			prev.Close()
+		}
+
+		resolve.Invoke(true)
+	})
+}
+
+// wireMessage/wireOptions are the JSON shapes gopherllm_generate accepts
+// from JS — plain strings/numbers only, translated here into the Go API's
+// real types (gopherllm.ChatRole is an int enum, not JSON-friendly as-is).
+type wireMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type wireOptions struct {
+	MaxTokens     int     `json:"maxTokens"`
+	Temperature   float32 `json:"temperature"`
+	TopP          float32 `json:"topP"`
+	TopK          int     `json:"topK"`
+	MinP          float32 `json:"minP"`
+	RepeatPenalty float32 `json:"repeatPenalty"`
+	SystemPrompt  string  `json:"systemPrompt"`
+}
+
+func chatRoleFromWire(role string) (gopherllm.ChatRole, error) {
+	switch role {
+	case "system":
+		return gopherllm.ChatRoleSystem, nil
+	case "user":
+		return gopherllm.ChatRoleUser, nil
+	case "assistant":
+		return gopherllm.ChatRoleAssistant, nil
+	case "tool":
+		return gopherllm.ChatRoleTool, nil
+	default:
+		return 0, fmt.Errorf("unknown chat role %q", role)
+	}
+}
+
+// jsGenerate(messagesJSON: string, optionsJSON: string, onToken: (text: string) => boolean) => Promise<string>
+//
+// onToken is invoked once per generated token fragment; returning false from
+// it (or a prior gopherllm_stopGeneration call) stops generation early, the
+// same early-stop contract Runner.GenerateChatStreamUntil already exposes.
+// The resolved value is the full generated text.
+func jsGenerate(this js.Value, args []js.Value) any {
+	if len(args) < 3 {
+		return rejectPromise(fmt.Errorf("gopherllm_generate: expected (messagesJSON, optionsJSON, onToken)"))
+	}
+	messagesJSON := args[0].String()
+	optionsJSON := args[1].String()
+	onToken := args[2]
+
+	var wireMessages []wireMessage
+	if err := json.Unmarshal([]byte(messagesJSON), &wireMessages); err != nil {
+		return rejectPromise(fmt.Errorf("gopherllm_generate: parsing messages: %w", err))
+	}
+	messages := make([]gopherllm.ChatMessage, len(wireMessages))
+	for i, m := range wireMessages {
+		role, err := chatRoleFromWire(m.Role)
+		if err != nil {
+			return rejectPromise(fmt.Errorf("gopherllm_generate: message %d: %w", i, err))
+		}
+		messages[i] = gopherllm.ChatMessage{Role: role, Content: m.Content}
+	}
+
+	opts := wireOptions{MaxTokens: 512, Temperature: 0.7, TopP: 0.9, TopK: 40, RepeatPenalty: 1.1}
+	if optionsJSON != "" {
+		if err := json.Unmarshal([]byte(optionsJSON), &opts); err != nil {
+			return rejectPromise(fmt.Errorf("gopherllm_generate: parsing options: %w", err))
+		}
+	}
+	genOptions := gopherllm.GenerationOptions{
+		MaxTokens:    opts.MaxTokens,
+		SystemPrompt: opts.SystemPrompt,
+		Sampler: gopherllm.SamplerConfig{
+			Temperature:   opts.Temperature,
+			TopP:          opts.TopP,
+			TopK:          opts.TopK,
+			MinP:          opts.MinP,
+			RepeatPenalty: opts.RepeatPenalty,
+		},
+	}
+
+	runnerMu.Lock()
+	r := runner
+	runnerMu.Unlock()
+	if r == nil {
+		return rejectPromise(fmt.Errorf("gopherllm_generate: no model loaded; call gopherllm_loadModel first"))
+	}
+
+	stopRequested.Store(false)
+
+	return newPromise(func(resolve, reject js.Value) {
+		result, err := r.GenerateChatStreamUntil(messages, genOptions, func(token string) bool {
+			if stopRequested.Load() {
+				return false
+			}
+			// onToken is a JS function; Invoke blocks the calling goroutine
+			// until the JS call returns, which is fine here since it isn't
+			// itself async (no Promise involved on this side).
+			ret := onToken.Invoke(token)
+			return ret.IsUndefined() || ret.Truthy()
+		})
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		resolve.Invoke(result.Text)
+	})
+}
+
+// jsStopGeneration() => undefined
+func jsStopGeneration(this js.Value, args []js.Value) any {
+	stopRequested.Store(true)
+	return nil
+}
