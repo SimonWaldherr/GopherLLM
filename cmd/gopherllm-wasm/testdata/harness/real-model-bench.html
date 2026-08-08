@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GopherLLM real-model WebGPU benchmark</title>
+<style>
+  body { font: 14px/1.5 monospace; margin: 2rem; background: #111; color: #ddd; }
+  #log { white-space: pre-wrap; background: #000; color: #8f8; padding: 1rem; min-height: 6rem; }
+  #output { white-space: pre-wrap; background: #000; color: #fff; padding: 1rem; }
+  #status.pass { color: #0f0; font-weight: bold; }
+  #status.fail { color: #f00; font-weight: bold; }
+  #progress { background: #333; height: 1.2rem; width: 100%; margin: 0.5rem 0; }
+  #progressBar { background: #08f; height: 100%; width: 0%; }
+</style>
+</head>
+<body>
+<h1>GopherLLM real-model WebGPU benchmark</h1>
+<p>Loads the real Ministral-3-3B-Instruct-2512-Q4_K_M.gguf (~2GB) via
+<code>/models/</code> and measures actual generation throughput with
+WebGPU acceleration enabled (the default). This is the first real attempt
+at the full-size model in a browser tab -- both "does it fit in wasm32's
+address space" and "what's the real tok/s" are open questions until now.</p>
+<div id="progress"><div id="progressBar"></div></div>
+<div>status: <span id="status">starting...</span></div>
+<h2>log</h2>
+<div id="log"></div>
+<h2>output</h2>
+<div id="output"></div>
+<script src="/bin/wasm_exec.js"></script>
+<script>
+function log(msg) {
+  console.log(msg);
+  document.getElementById("log").textContent += msg + "\n";
+}
+function setStatus(text, cls) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+async function waitForBridge(timeoutMs) {
+  const start = Date.now();
+  while (typeof window.gopherllm_loadModel !== "function") {
+    if (Date.now() - start > timeoutMs) throw new Error("bridge functions never registered");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+async function fetchWithProgress(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error("fetching " + url + ": HTTP " + resp.status);
+  const total = Number(resp.headers.get("Content-Length") || 0);
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (total > 0) {
+      const pct = Math.round((received / total) * 100);
+      document.getElementById("progressBar").style.width = pct + "%";
+    }
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
+async function main() {
+  log("fetching gopherllm.wasm...");
+  const go = new Go();
+  const resp = await fetch("/bin/gopherllm.wasm");
+  if (!resp.ok) throw new Error("fetching gopherllm.wasm: HTTP " + resp.status);
+  const { instance } = await WebAssembly.instantiateStreaming(resp, go.importObject);
+  go.run(instance);
+  await waitForBridge(2000);
+
+  const webgpuStatus = await window.gopherllm_webgpuStatus();
+  log("gopherllm_webgpuStatus(): " + webgpuStatus);
+
+  log("fetching Ministral-3-3B-Instruct-2512-Q4_K_M.gguf (~2GB, this will take a while)...");
+  const t0Fetch = performance.now();
+  const bytes = await fetchWithProgress("/models/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf");
+  log("fetched " + bytes.length + " bytes in " + ((performance.now() - t0Fetch) / 1000).toFixed(1) + "s, loading into gopherllm...");
+
+  const t0Load = performance.now();
+  await window.gopherllm_loadModel(bytes);
+  const loadSecs = (performance.now() - t0Load) / 1000;
+  log("model loaded in " + loadSecs.toFixed(1) + "s");
+
+  const messages = JSON.stringify([{ role: "user", content: "Explain what a neural network is in one paragraph." }]);
+  const options = JSON.stringify({
+    maxTokens: 32,
+    temperature: 0,
+    topP: 1,
+    topK: 0,
+    minP: 0,
+    repeatPenalty: 1.1,
+  });
+
+  let streamed = "";
+  let tokenCount = 0;
+  let firstTokenAt = null;
+  const t0Gen = performance.now();
+  const text = await window.gopherllm_generate(messages, options, (tok) => {
+    if (firstTokenAt === null) firstTokenAt = performance.now();
+    tokenCount++;
+    streamed += tok;
+    document.getElementById("output").textContent = streamed;
+    return true;
+  });
+  const genEnd = performance.now();
+  const ttftSecs = firstTokenAt !== null ? (firstTokenAt - t0Gen) / 1000 : 0;
+  const decodeSecs = firstTokenAt !== null ? (genEnd - firstTokenAt) / 1000 : (genEnd - t0Gen) / 1000;
+  const decodeTokPerSec = tokenCount > 1 && decodeSecs > 0 ? (tokenCount - 1) / decodeSecs : 0;
+
+  log("generation finished: " + JSON.stringify(text));
+  log("token fragments: " + tokenCount + ", time-to-first-token: " + ttftSecs.toFixed(2) + "s, decode: " + decodeTokPerSec.toFixed(2) + " tok/s (post-first-token)");
+  document.getElementById("output").textContent = text;
+
+  setStatus(
+    "DONE: webgpu=" + webgpuStatus + ", load=" + loadSecs.toFixed(1) + "s, ttft=" + ttftSecs.toFixed(2) + "s, decode=" + decodeTokPerSec.toFixed(2) + " tok/s",
+    "pass"
+  );
+}
+main().catch((err) => {
+  console.error(err);
+  log("FATAL: " + (err && err.message ? err.message : String(err)));
+  setStatus("ERROR: " + (err && err.message ? err.message : String(err)), "fail");
+});
+</script>
+</body>
+</html>

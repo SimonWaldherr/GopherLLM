@@ -1,12 +1,14 @@
 # gopherllm-wasm
 
 Compiles GopherLLM's inference engine to WebAssembly so it can run entirely
-client-side in a browser tab — no server. This is Phase A of an in-browser
-demo effort: CPU-only for now (the existing pure-Go scalar kernel tier that
-already backs every non-amd64/non-arm64 build), with a hand-written WebGPU
-compute backend planned as a follow-on. No third-party JS/WASM code is used
-anywhere in this path — just the Go compiler's own `js/wasm` target, Go's own
-`wasm_exec.js` bootstrap, and (later) the browser's native WebGPU API.
+client-side in a browser tab — no server. It runs on the existing pure-Go
+scalar kernel tier (the same one that already backs every non-amd64/
+non-arm64 build) everywhere, and additionally offloads Q4_K/Q6_K matvecs to
+a hand-written WebGPU compute backend (`internal/webgpu/`) whenever
+`navigator.gpu` is available — one binary, runtime-detected, no build flag.
+No third-party JS/WASM code is used anywhere in this path — just the Go
+compiler's own `js/wasm` target, Go's own `wasm_exec.js` bootstrap, and the
+browser's native WebGPU API.
 
 ## Building
 
@@ -48,15 +50,66 @@ known-correct output from a native run of the same bytes
 ## What's here
 
 - `main.go` / `bridge.go` / `promise.go` — the wasm entry point: registers
-  `gopherllm_loadModel` / `gopherllm_generate` / `gopherllm_stopGeneration`
-  on the JS global object via `syscall/js`, bridging Go's goroutine model to
-  JS Promises.
+  `gopherllm_loadModel` / `gopherllm_generate` / `gopherllm_stopGeneration` /
+  `gopherllm_isGenerating` / `gopherllm_isModelLoaded` on the JS global
+  object via `syscall/js`, bridging Go's goroutine model to JS Promises.
+  `gopherllm_generate` rejects immediately if a generation is already in
+  progress rather than silently queuing behind it; `gopherllm_loadModel`
+  signals any in-flight generation to stop before waiting for the outgoing
+  model to close, so switching models mid-generation stays responsive.
 - `devserver/` — a trivial `net/http` static file server for manual testing;
   not part of the wasm build itself.
-- `testdata/harness/` — the correctness-verification page described above.
+- `testdata/harness/` — correctness-verification pages:
+  - `index.html`/`app.js` — the CPU-only golden-output check above.
+  - `webgpu-smoke.html` — validates the `internal/webgpu` plumbing itself
+    (device acquisition, buffer upload, shader compile, dispatch, readback)
+    with a trivial shader, independent of any model.
+  - `webgpu-kernel-test.html` — compares the hand-written Q4_K/Q6_K WGSL
+    matvec kernels against this project's existing portable Go reference,
+    using the real quantizer to generate test data (no external oracle to
+    check against, so verification is against this project's own,
+    already-tested CPU implementation).
+  - `webgpu-forward-pass-test.html` — the real end-to-end check: loads a
+    tiny *quantized* (Q4_K/Q6_K) GGUF (`GOPHERLLM_GEN_WASM_GPU_FIXTURE=1
+    go test -run TestGenerateWasmGPUFixture -v .` regenerates it) and
+    confirms a full multi-layer, multi-token generation through the real
+    `Weight.GPU`/`MatvecInto` wiring matches the native CPU-path output
+    exactly.
+- `webgpu_smoke.go` / `webgpu_kernel_check.go` — the Go-side logic those
+  last two pages call into (kept out of `_test.go` files since those are
+  excluded from a normal `go build`, only compiled under `go test`).
 
-## Not here yet
+## WebGPU backend
 
-WebGPU compute shaders, the forward-pass wiring for them, and the polished
-standalone demo page are designed but not yet implemented — see the project
-plan for the full phased breakdown.
+`internal/webgpu/` is a from-scratch wrapper over the browser's WebGPU API
+(device/buffer/shader/dispatch, mirroring how `internal/metal` wraps Metal),
+plus hand-written WGSL reimplementations of this project's own Q4_K/Q6_K
+dequantizing matvec kernels (`shader_q4k.go`, `shader_q6k.go`) — including a
+from-scratch IEEE-754 half-float decoder, since WGSL has no dependable
+`shader-f16` extension to lean on. Verified against the portable Go
+reference kernels at ~1e-6 relative error (float32 summation-order noise,
+not a bug).
+
+At the root package, `webgpu_js.go`/`webgpu_stub.go` mirror
+`metal_darwin.go`/`metal_stub.go`'s discipline exactly: `Weight.GPU` is
+populated automatically for Q4_K/Q6_K tensors whenever a WebGPU device is
+available (no `LoadOptions` flag needed — WebGPU only ever exists under
+`GOOS=js`, where Metal never does, so the two can't conflict), and
+`Weight.MatvecInto` tries it right alongside the existing Metal check.
+
+**Known limitation, not yet solved**: a tensor larger than the device's
+`maxStorageBufferBindingSize` (commonly 128MiB) — e.g. Ministral 3B's tied
+~300MB+ output/embedding projection — cannot be uploaded as one GPU buffer
+yet. `prepareWebGPUWeight` catches this and falls back to the CPU path for
+that specific tensor rather than failing the load; splitting an oversized
+tensor across multiple buffers is designed (see the project plan) but not
+implemented.
+
+**Also not yet done**: per-layer dispatch batching. The current integration
+calls the GPU kernel once per matvec (one CPU↔GPU round trip each), which is
+*correct* — verified via `webgpu-forward-pass-test.html` producing output
+bit-identical to the CPU path — but not yet the "~3 sync points per layer"
+batched design the project plan calls for, which needs restructuring
+`ForwardBodyInto`'s per-layer loop itself, not just this leaf-level hook.
+Real tokens/sec with either approach hasn't been measured yet against a real
+(non-tiny) model.

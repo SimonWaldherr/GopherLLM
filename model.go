@@ -667,6 +667,12 @@ type Weight struct {
 	Cols     int
 	Prepared *PreparedQuantizedWeight
 	Metal    *MetalWeight
+	// GPU is this tensor's WebGPU-resident copy (Q4_K/Q6_K only), non-nil
+	// only under GOOS=js with a successfully acquired WebGPU device -- see
+	// webgpu_js.go/webgpu_stub.go. Mutually exclusive with Metal in
+	// practice (disjoint build domains: darwin+cgo+metal vs. js), so
+	// MatvecInto tries both with no conflict.
+	GPU *GPUWeight
 }
 
 // Matvec computes out = W·x, allocating the result. MatvecInto is the
@@ -714,6 +720,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		if matvecMetalQ4KInto(w.Metal, x, w.Rows, w.Cols, out) {
 			return
 		}
+		if matvecWebGPUQ4KInto(w.GPU, x, w.Rows, w.Cols, out) {
+			return
+		}
 		if MatvecPreparedQ4KInto(w.Raw, w.Prepared, x, w.Rows, w.Cols, out) {
 			return
 		}
@@ -722,6 +731,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		MatvecQ5KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ6_K:
 		if matvecMetalQ6KInto(w.Metal, x, w.Rows, w.Cols, out) {
+			return
+		}
+		if matvecWebGPUQ6KInto(w.GPU, x, w.Rows, w.Cols, out) {
 			return
 		}
 		if MatvecPreparedQ6KInto(w.Raw, w.Prepared, x, w.Rows, w.Cols, out) {
@@ -2407,6 +2419,13 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		if useMetal {
 			w.Metal = prepareMetalWeight(raw, info.DType, rows, cols, borrow)
 		}
+		// prepareWebGPUWeight is a no-op (returns nil) on every non-js build
+		// and whenever no WebGPU device is available, so this is safe to call
+		// unconditionally rather than threading a new LoadOptions flag through
+		// every architecture's Load*Model function the way useMetal is:
+		// WebGPU only ever exists under GOOS=js, where useMetal is already
+		// always false, so the two GPU backends can never conflict.
+		w.GPU = prepareWebGPUWeight(raw, info.DType, rows, cols)
 		// Direct Metal weights skip redundant prepared data. Small Q/K/V handles
 		// retain prepared CPU data so fused-attention dispatch can roll back
 		// without changing results if a GPU command fails.

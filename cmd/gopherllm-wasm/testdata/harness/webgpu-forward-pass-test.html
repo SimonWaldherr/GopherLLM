@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GopherLLM WebGPU forward-pass test</title>
+<style>
+  body { font: 14px/1.5 monospace; margin: 2rem; background: #111; color: #ddd; }
+  #log { white-space: pre-wrap; background: #000; color: #8f8; padding: 1rem; min-height: 6rem; }
+  #status.pass { color: #0f0; font-weight: bold; }
+  #status.fail { color: #f00; font-weight: bold; }
+  #status.warn { color: #fa0; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>GopherLLM WebGPU forward-pass test</h1>
+<p>Loads a tiny <em>quantized</em> (Q4_K/Q6_K) mistral3 GGUF -- real
+Weight.GPU wiring, not just isolated kernel tests -- and checks the
+generated text against the known-correct native CPU-path output.</p>
+<div>status: <span id="status">running...</span></div>
+<div id="log"></div>
+<script src="/bin/wasm_exec.js"></script>
+<script>
+const GOLDEN_TEXT = "vy{brgi<unk>";
+
+function log(msg) {
+  console.log(msg);
+  document.getElementById("log").textContent += msg + "\n";
+}
+function setStatus(text, cls) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+async function waitForBridge(timeoutMs) {
+  const start = Date.now();
+  while (typeof window.gopherllm_loadModel !== "function") {
+    if (Date.now() - start > timeoutMs) throw new Error("bridge functions never registered");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+async function main() {
+  log("fetching gopherllm.wasm...");
+  const go = new Go();
+  const resp = await fetch("/bin/gopherllm.wasm");
+  if (!resp.ok) throw new Error("fetching gopherllm.wasm: HTTP " + resp.status);
+  const { instance } = await WebAssembly.instantiateStreaming(resp, go.importObject);
+  go.run(instance);
+  await waitForBridge(2000);
+
+  const webgpuStatus = await window.gopherllm_webgpuStatus();
+  log("gopherllm_webgpuStatus(): " + webgpuStatus);
+
+  const modelResp = await fetch("tiny-quant-model.gguf");
+  if (!modelResp.ok) throw new Error("fetching tiny-quant-model.gguf: HTTP " + modelResp.status);
+  const bytes = new Uint8Array(await modelResp.arrayBuffer());
+  log("fetched tiny-quant-model.gguf (" + bytes.length + " bytes), loading...");
+  await window.gopherllm_loadModel(bytes);
+  log("model loaded");
+
+  const messages = JSON.stringify([{ role: "user", content: "Hello" }]);
+  const options = JSON.stringify({
+    maxTokens: 8,
+    temperature: 0,
+    topP: 1,
+    topK: 0,
+    minP: 0,
+    repeatPenalty: 1.1,
+  });
+
+  let streamed = "";
+  const text = await window.gopherllm_generate(messages, options, (tok) => {
+    streamed += tok;
+    return true;
+  });
+  log("generation finished: " + JSON.stringify(text));
+
+  if (webgpuStatus !== "available") {
+    setStatus("WARN: WebGPU unavailable in this environment -- ran on CPU fallback, GPU path not exercised", "warn");
+    return;
+  }
+  if (text === GOLDEN_TEXT) {
+    setStatus("PASS: WebGPU-accelerated forward pass matches native CPU-path golden output", "pass");
+  } else {
+    setStatus("FAIL: expected " + JSON.stringify(GOLDEN_TEXT) + " got " + JSON.stringify(text), "fail");
+  }
+}
+main().catch((err) => {
+  console.error(err);
+  log("FATAL: " + (err && err.message ? err.message : String(err)));
+  setStatus("ERROR: " + (err && err.message ? err.message : String(err)), "fail");
+});
+</script>
+</body>
+</html>

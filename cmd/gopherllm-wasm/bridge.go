@@ -17,18 +17,93 @@ var (
 	runnerMu sync.Mutex
 	runner   *gopherllm.Runner
 
-	// stopRequested is checked by the onToken callback threaded through
-	// GenerateChatStreamUntil; gopherllm_stopGeneration sets it, and each
-	// call to gopherllm_generate clears it before starting.
-	stopRequested atomic.Bool
+	// generating guards against two overlapping gopherllm_generate calls.
+	// Runner.GenerateChatStreamUntil already serializes on the Runner's own
+	// genLock, so a second concurrent call would not race -- it would just
+	// block silently until the first one finishes, with no signal to the
+	// caller about why its promise appears to hang. Rejecting immediately
+	// instead makes that state visible.
+	generating atomic.Bool
+
+	// currentStop is the stop flag for whichever generation is presently
+	// running (nil when none is). Each gopherllm_generate call creates its
+	// own *atomic.Bool and only that call's onToken closure ever reads it --
+	// a single shared flag would let a second generate() call's startup
+	// (which needs to arm a fresh, unset flag) silently clear a stop signal
+	// that gopherllm_stopGeneration had just sent for a still-draining
+	// earlier call on the same runner.
+	currentStop atomic.Pointer[atomic.Bool]
 )
 
 func registerCallbacks() {
 	js.Global().Set("gopherllm_loadModel", js.FuncOf(jsLoadModel))
 	js.Global().Set("gopherllm_generate", js.FuncOf(jsGenerate))
 	js.Global().Set("gopherllm_stopGeneration", js.FuncOf(jsStopGeneration))
+	js.Global().Set("gopherllm_isGenerating", js.FuncOf(jsIsGenerating))
+	js.Global().Set("gopherllm_isModelLoaded", js.FuncOf(jsIsModelLoaded))
 	js.Global().Set("gopherllm_webgpuSmokeTest", js.FuncOf(jsWebGPUSmokeTest))
 	js.Global().Set("gopherllm_webgpuKernelTest", js.FuncOf(jsWebGPUKernelTest))
+	js.Global().Set("gopherllm_webgpuStatus", js.FuncOf(jsWebGPUStatus))
+	js.Global().Set("gopherllm_setWebGPUForceDisabled", js.FuncOf(jsSetWebGPUForceDisabled))
+}
+
+// jsSetWebGPUForceDisabled(disabled: boolean) => undefined
+//
+// Lets the demo/benchmark harness opt back out of GPU acceleration before
+// the next gopherllm_loadModel call, for an A/B throughput comparison
+// against the CPU path on the exact same bytes without a second wasm
+// build. No effect on a Runner already loaded.
+func jsSetWebGPUForceDisabled(this js.Value, args []js.Value) any {
+	disabled := len(args) > 0 && args[0].Truthy()
+	gopherllm.SetWebGPUForceDisabled(disabled)
+	return nil
+}
+
+// jsIsGenerating() => boolean
+func jsIsGenerating(this js.Value, args []js.Value) any {
+	return generating.Load()
+}
+
+// jsIsModelLoaded() => boolean
+func jsIsModelLoaded(this js.Value, args []js.Value) any {
+	runnerMu.Lock()
+	defer runnerMu.Unlock()
+	return runner != nil
+}
+
+// requestStopCurrent signals whatever generation is presently running, if
+// any. Safe to call when none is: currentStop is nil until the first
+// gopherllm_generate call, and a stale (already-finished) flag is a
+// harmless no-op to set.
+func requestStopCurrent() {
+	if s := currentStop.Load(); s != nil {
+		s.Store(true)
+	}
+}
+
+// jsWebGPUStatus() => Promise<string>
+//
+// Reports whether gopherllm.WebGPUAvailable() sees a usable device -- a
+// diagnostic for confirming a generation call actually took the GPU-backed
+// Weight.MatvecInto path rather than silently falling back to CPU.
+//
+// Must be a Promise, not a direct return: WebGPUAvailable's first-ever call
+// blocks synchronously on navigator.gpu.requestAdapter()/requestDevice(),
+// which only resolve via a JS microtask. A js.FuncOf callback invoked
+// directly (not wrapped in newPromise, i.e. not run on its own goroutine)
+// runs on the same goroutine JS used to call it; blocking that goroutine
+// prevents the JS call from ever returning, so the Promise's microtask can
+// never run either -- Go's wasm scheduler detects every goroutine asleep
+// with nothing left runnable and fatally exits the whole wasm instance
+// (confirmed by an earlier version of this function doing exactly that).
+func jsWebGPUStatus(this js.Value, args []js.Value) any {
+	return newPromise(func(resolve, reject js.Value) {
+		if gopherllm.WebGPUAvailable() {
+			resolve.Invoke("available")
+			return
+		}
+		resolve.Invoke("unavailable")
+	})
 }
 
 // jsWebGPUKernelTest() => Promise<string>
@@ -89,6 +164,14 @@ func jsLoadModel(this js.Value, args []js.Value) any {
 		runner = r
 		runnerMu.Unlock()
 		if prev != nil {
+			// prev.Close() blocks on prev's own genLock, so it wouldn't
+			// actually race with a generation still in flight against prev
+			// -- but it would sit there until that generation runs to
+			// completion on its own, which could be many seconds, with
+			// nothing telling the caller their loadModel promise is
+			// pending for that reason rather than stuck. Ask it to wind
+			// down first so switching models stays responsive.
+			requestStopCurrent()
 			prev.Close()
 		}
 
@@ -181,11 +264,22 @@ func jsGenerate(this js.Value, args []js.Value) any {
 		return rejectPromise(fmt.Errorf("gopherllm_generate: no model loaded; call gopherllm_loadModel first"))
 	}
 
-	stopRequested.Store(false)
+	// Runner.GenerateChatStreamUntil would serialize a second concurrent
+	// call on its own genLock rather than race, but silently blocking with
+	// no feedback reads as a hung promise from the JS side. Reject with a
+	// clear reason instead; the caller can gopherllm_stopGeneration first
+	// if that is what they actually wanted.
+	if !generating.CompareAndSwap(false, true) {
+		return rejectPromise(fmt.Errorf("gopherllm_generate: a generation is already in progress; call gopherllm_stopGeneration first"))
+	}
+
+	stop := new(atomic.Bool)
+	currentStop.Store(stop)
 
 	return newPromise(func(resolve, reject js.Value) {
+		defer generating.Store(false)
 		result, err := r.GenerateChatStreamUntil(messages, genOptions, func(token string) bool {
-			if stopRequested.Load() {
+			if stop.Load() {
 				return false
 			}
 			// onToken is a JS function; Invoke blocks the calling goroutine
@@ -203,7 +297,10 @@ func jsGenerate(this js.Value, args []js.Value) any {
 }
 
 // jsStopGeneration() => undefined
+//
+// Signals whichever generation gopherllm_generate most recently started.
+// A no-op if none is running.
 func jsStopGeneration(this js.Value, args []js.Value) any {
-	stopRequested.Store(true)
+	requestStopCurrent()
 	return nil
 }

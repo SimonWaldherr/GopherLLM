@@ -16,6 +16,12 @@ type Buffer struct {
 // Size returns the buffer's byte size.
 func (b *Buffer) Size() int { return b.size }
 
+// Destroy releases the underlying GPUBuffer's memory. No method may use b
+// afterward.
+func (b *Buffer) Destroy() {
+	b.value.Call("destroy")
+}
+
 // gpuBufferUsage reads GPUBufferUsage bitmask constants live off the global
 // object and ORs them together, rather than transcribing the W3C spec's
 // numeric values -- sidesteps any question of copying spec constants and
