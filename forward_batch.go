@@ -249,7 +249,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	usesPosEmbd := config.usesAbsolutePositionEmbd()
 	for t := 0; t < p; t++ {
 		weights.TokenEmbd.RowInto(int(tokens[t]), dim, &X[t])
-		if config.EmbeddingScale != 1 {
+		if emb, ok := buf.ImageEmbeds[startPos+t]; ok {
+			copy(X[t][:dim], emb)
+		} else if config.EmbeddingScale != 1 {
 			ScaleF32(X[t], config.EmbeddingScale)
 		}
 		if usesPosEmbd {

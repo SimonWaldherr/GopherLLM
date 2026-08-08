@@ -40,6 +40,11 @@ type ModelEntry struct {
 	// keeps normal generation models out of the RAG model picker.
 	IsEmbedding bool
 	IsSupported bool
+	// ProjectorPath is a best-guess mmproj (vision projector) GGUF found
+	// alongside this entry, paired by DiscoverModels' post-scan pass; ""
+	// if none was found. Always overridable by passing an explicit
+	// LoadOptions.VisionProjectorPath instead of relying on this guess.
+	ProjectorPath string
 }
 
 func (m ModelEntry) Status() string {
@@ -108,8 +113,63 @@ func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
 		}
 		entries = append(entries, entry)
 	}
+	pairProjectors(entries)
 	sort.Slice(entries, func(i, j int) bool { return modelSortKey(entries[i]) < modelSortKey(entries[j]) })
 	return entries, nil
+}
+
+// pairProjectors fills in ProjectorPath on every non-projector entry that
+// has a same-repository (same parent directory) mmproj companion file — the
+// layout every community GGUF repo shipping a vision-capable model uses
+// (e.g. unsloth/Ministral-3-3B-Instruct-2512-GGUF ships both the text
+// quantization and mmproj-F16.gguf side by side). When more than one
+// projector candidate exists in the same directory (F16/BF16/F32 variants
+// are common), F16 is preferred over BF16 over F32 — smallest file size
+// that still keeps full 16-bit mantissa fidelity, not a blind
+// smallest-file-wins rule that could pick a stray corrupt file.
+func pairProjectors(entries []ModelEntry) {
+	var candidates []ModelEntry
+	for _, e := range entries {
+		if e.IsProjector {
+			candidates = append(candidates, e)
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	for i := range entries {
+		if entries[i].IsProjector {
+			continue
+		}
+		var chosen *ModelEntry
+		for ci := range candidates {
+			c := &candidates[ci]
+			if c.Repository != entries[i].Repository {
+				continue
+			}
+			if chosen == nil || projectorRank(*c) < projectorRank(*chosen) {
+				chosen = c
+			}
+		}
+		if chosen != nil {
+			entries[i].ProjectorPath = chosen.Path
+		}
+	}
+}
+
+// projectorRank orders mmproj filename variants: lower is preferred.
+func projectorRank(e ModelEntry) int {
+	lower := strings.ToLower(e.FileName)
+	switch {
+	case strings.Contains(lower, "f16"):
+		return 0
+	case strings.Contains(lower, "bf16"):
+		return 1
+	case strings.Contains(lower, "f32"):
+		return 2
+	default:
+		return 3
+	}
 }
 
 // modelSortKey orders supported models before unsupported ones (unsupported

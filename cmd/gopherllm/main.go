@@ -141,6 +141,14 @@ type cliConfig struct {
 	findToken               string
 	tokenNeighbors          string
 	neighborCount           int
+	// mmprojPath is a companion Pixtral-style vision-encoder GGUF loaded
+	// alongside modelSelector, enabling --image on the one-shot prompt path
+	// and image_url content on the server's chat endpoints.
+	mmprojPath string
+	// imagePath attaches one image to the one-shot --prompt request. Only
+	// meaningful together with --mmproj (or a model directory pairing one
+	// automatically, see catalog.go's pairProjectors).
+	imagePath string
 	// compress requantizes modelSelector's GGUF to compressFormat via plain
 	// round-to-nearest and writes it to compressOut. See compress.go.
 	compress        bool
@@ -335,13 +343,19 @@ func run() error {
 			cfg.useMetal = probe.UseMetal
 		}
 	}
-	model, err := gopherllm.Open(
-		context.Background(),
-		modelPath,
+	openOpts := []gopherllm.Option{
 		gopherllm.WithLogWriter(os.Stderr),
 		gopherllm.WithPrepareQuantized(cfg.prepareQuant),
 		gopherllm.WithMetal(cfg.useMetal),
 		gopherllm.WithOutOfCore(cfg.outOfCore),
+	}
+	if cfg.mmprojPath != "" {
+		openOpts = append(openOpts, gopherllm.WithVisionProjector(cfg.mmprojPath))
+	}
+	model, err := gopherllm.Open(
+		context.Background(),
+		modelPath,
+		openOpts...,
 	)
 	if err != nil {
 		return err
@@ -412,8 +426,16 @@ func run() error {
 	if cfg.repl || cfg.prompt == "" {
 		return runREPL(runner, cfg.options, skills)
 	}
+	promptMessage := gopherllm.UserMessage(cfg.prompt)
+	if cfg.imagePath != "" {
+		imgBytes, err := os.ReadFile(cfg.imagePath)
+		if err != nil {
+			return fmt.Errorf("reading --image: %w", err)
+		}
+		promptMessage = gopherllm.UserMessageWithImages(cfg.prompt, gopherllm.ImageContent{Bytes: imgBytes})
+	}
 	result, err := runWithTimeout(cfg.timeout, func() (gopherllm.GenerationResult, error) {
-		return gopherllm.RunAgenticChat(runner, []gopherllm.ChatMessage{gopherllm.UserMessage(cfg.prompt)}, cfg.options, skills, func(s string) bool {
+		return gopherllm.RunAgenticChat(runner, []gopherllm.ChatMessage{promptMessage}, cfg.options, skills, func(s string) bool {
 			fmt.Print(s)
 			return true
 		})
@@ -598,6 +620,18 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.modelDir = v
+		case "--mmproj":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.mmprojPath = v
+		case "--image":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.imagePath = v
 		case "--list-models":
 			cfg.listModels = true
 		case "--hf-list":

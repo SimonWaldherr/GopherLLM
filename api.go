@@ -31,12 +31,14 @@ type Model struct {
 type Option func(*loadSettings)
 
 type loadSettings struct {
-	logw             io.Writer
-	threads          int
-	prepareQuantized bool
-	useMetal         bool
-	outOfCore        bool
-	prefault         MmapPrefaultMode
+	logw                 io.Writer
+	threads              int
+	prepareQuantized     bool
+	useMetal             bool
+	outOfCore            bool
+	prefault             MmapPrefaultMode
+	visionProjectorPath  string
+	visionProjectorBytes []byte
 }
 
 // WithLogWriter directs load-progress and warning diagnostics (GGUF summary,
@@ -86,6 +88,13 @@ func WithMmapPrefault(mode MmapPrefaultMode) Option {
 	return func(s *loadSettings) { s.prefault = mode }
 }
 
+// WithVisionProjector loads a companion Pixtral-style "mmproj" vision
+// encoder GGUF from path alongside the text decoder, enabling image content
+// on ChatMessage (see ImageContent, Runner.HasVision).
+func WithVisionProjector(path string) Option {
+	return func(s *loadSettings) { s.visionProjectorPath = path }
+}
+
 // Open memory-maps and loads a GGUF model file. The returned Model borrows
 // quantized weights from the mapping zero-copy; Close releases it. ctx only
 // gates the start of the load (weight loading itself is not interruptible).
@@ -128,11 +137,13 @@ func applyLoadOptions(opts []Option) loadSettings {
 
 func (s loadSettings) loadOptions() LoadOptions {
 	return LoadOptions{
-		PrepareQuantized: s.prepareQuantized,
-		UseMetal:         s.useMetal,
-		OutOfCore:        s.outOfCore,
-		Prefault:         s.prefault,
-		LogWriter:        s.logw,
+		PrepareQuantized:     s.prepareQuantized,
+		UseMetal:             s.useMetal,
+		OutOfCore:            s.outOfCore,
+		Prefault:             s.prefault,
+		LogWriter:            s.logw,
+		VisionProjectorPath:  s.visionProjectorPath,
+		VisionProjectorBytes: s.visionProjectorBytes,
 	}
 }
 

@@ -465,6 +465,16 @@ func (g *GGUFFile) GetU32Array(key string) ([]uint32, bool) {
 	return v.AsU32Array()
 }
 
+// GetF32Array reads a float32 array metadata value, e.g. a vision encoder's
+// clip.vision.image_mean/image_std.
+func (g *GGUFFile) GetF32Array(key string) ([]float32, bool) {
+	v, ok := g.Metadata[key]
+	if !ok {
+		return nil, false
+	}
+	return v.AsF32Array()
+}
+
 // ParseGGUF parses a GGUF header, logging a one-line summary to stderr.
 // ParseGGUFQuiet is the same without the log line (used by model discovery,
 // which parses every file in a directory).
@@ -569,6 +579,16 @@ func (g *GGUFFile) GetString(key string) (string, bool) {
 		return v.AsString()
 	}
 	return "", false
+}
+
+// GetBool returns def when the key is absent or has an incompatible kind.
+func (g *GGUFFile) GetBool(key string, def bool) bool {
+	if v, ok := g.Metadata[key]; ok {
+		if b, ok := v.AsBool(); ok {
+			return b
+		}
+	}
+	return def
 }
 
 // cursor is a bounds-checked little-endian reader over the raw file bytes;

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -26,6 +27,40 @@ func registerCallbacks() {
 	js.Global().Set("gopherllm_loadModel", js.FuncOf(jsLoadModel))
 	js.Global().Set("gopherllm_generate", js.FuncOf(jsGenerate))
 	js.Global().Set("gopherllm_stopGeneration", js.FuncOf(jsStopGeneration))
+	js.Global().Set("gopherllm_webgpuSmokeTest", js.FuncOf(jsWebGPUSmokeTest))
+	js.Global().Set("gopherllm_webgpuKernelTest", js.FuncOf(jsWebGPUKernelTest))
+}
+
+// jsWebGPUKernelTest() => Promise<string>
+//
+// Compares the hand-written Q4_K/Q6_K WGSL matvec kernels against this
+// project's existing portable Go reference implementation -- see
+// webgpu_kernel_test.go.
+func jsWebGPUKernelTest(this js.Value, args []js.Value) any {
+	return newPromise(func(resolve, reject js.Value) {
+		msg, err := runWebGPUKernelTest(context.Background())
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		resolve.Invoke(msg)
+	})
+}
+
+// jsWebGPUSmokeTest() => Promise<string>
+//
+// Validates the internal/webgpu plumbing (device acquisition, buffer
+// upload, shader compilation, dispatch, readback) independent of any model
+// loading -- see webgpu_smoke.go.
+func jsWebGPUSmokeTest(this js.Value, args []js.Value) any {
+	return newPromise(func(resolve, reject js.Value) {
+		msg, err := runWebGPUSmokeTest(context.Background())
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		resolve.Invoke(msg)
+	})
 }
 
 // jsLoadModel(bytes: Uint8Array) => Promise<boolean>

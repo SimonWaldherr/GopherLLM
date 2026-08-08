@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"os"
@@ -45,6 +46,10 @@ const (
 type ChatMessage struct {
 	Role    ChatRole
 	Content string
+	// Images attaches image content to a user message for a model loaded
+	// with a vision projector (Runner.HasVision). Capped at one image per
+	// message for now — see ImageContent.
+	Images []ImageContent
 	// ToolCalls is set on an assistant message that is replaying a prior turn
 	// in which the model requested one or more tool calls.
 	ToolCalls []ToolCall
@@ -54,8 +59,23 @@ type ChatMessage struct {
 	Name       string
 }
 
+// ImageContent is one encoded image (PNG/JPEG/anything image.Decode
+// understands) attached to a ChatMessage. Decoding and vision-tower encoding
+// happen lazily during rendering, not when the message is constructed.
+type ImageContent struct {
+	Bytes []byte
+}
+
 func UserMessage(content string) ChatMessage {
 	return ChatMessage{Role: ChatRoleUser, Content: content}
+}
+
+// UserMessageWithImages is UserMessage plus one or more attached images.
+// Only the first image is used today — a message carrying more than one is
+// rejected at render time with a clear error rather than silently dropping
+// the extras.
+func UserMessageWithImages(content string, images ...ImageContent) ChatMessage {
+	return ChatMessage{Role: ChatRoleUser, Content: content, Images: images}
 }
 func AssistantMessage(content string) ChatMessage {
 	return ChatMessage{Role: ChatRoleAssistant, Content: content}
@@ -230,6 +250,14 @@ type LoadOptions struct {
 	// historical full warm-up; OutOfCore changes its effective policy to core.
 	Prefault  MmapPrefaultMode
 	LogWriter io.Writer
+	// VisionProjectorPath/VisionProjectorBytes optionally load a companion
+	// Pixtral-style "mmproj" vision-encoder GGUF alongside the text decoder
+	// (mutually exclusive; Bytes takes precedence if both are set). This
+	// attaches independently of the architecture dispatch below — it is
+	// never a loadedKind of its own, since a vision encoder is a companion
+	// file, not a distinct text-decoder graph shape. See Runner.vision.
+	VisionProjectorPath  string
+	VisionProjectorBytes []byte
 }
 
 type loadedKind int
@@ -282,7 +310,29 @@ type Runner struct {
 	prefixCache    prefixCacheState
 	mappedFile     *MmapFile
 	outOfCore      bool
+	// vision, when non-nil, is a loaded Pixtral-style vision encoder paired
+	// with this Runner's text decoder (see LoadOptions.VisionProjector*).
+	// Independent of kind/loadedKind — only chat-template renderers that
+	// know how to splice image placeholders (currently Mistral-family)
+	// consult it.
+	vision           *PixtralVisionWeights
+	visionConfig     PixtralVisionConfig
+	visionMappedFile *MmapFile
+	// visionImageCache memoizes EncodeImagePixtral results within one
+	// generation call (renderMessages/context_window.go may render the same
+	// message more than once before the final call actually generates),
+	// keyed by an fnv hash of the image bytes. Cleared per call, guarded by
+	// genLock like the rest of Runner's mutable state.
+	visionImageCache map[uint64]visionImageCacheEntry
 }
+
+type visionImageCacheEntry struct {
+	embeds             [][]float32
+	mergedRows, mergedCols int
+}
+
+// HasVision reports whether this Runner has a paired vision encoder loaded.
+func (r *Runner) HasVision() bool { return r != nil && r.vision != nil }
 
 // ArchitectureSupported reports whether the loader accepts this
 // general.architecture value. Notes on specific families:
@@ -343,6 +393,14 @@ func RunnerFromGGUFBytesWithOptions(data []byte, options LoadOptions) (*Runner, 
 		return nil, fmt.Errorf("out-of-core loading requires RunnerFromPathWithOptions: byte-backed models already reside in memory")
 	}
 	return runnerFromGGUFBytes(data, false, options)
+}
+
+// RunnerFromGGUFBytesWithVision loads a text-decoder GGUF plus a paired
+// Pixtral-style vision-encoder "mmproj" GGUF, both from bytes. Sugar over
+// LoadOptions.VisionProjectorBytes.
+func RunnerFromGGUFBytesWithVision(textData, visionData []byte, options LoadOptions) (*Runner, error) {
+	options.VisionProjectorBytes = visionData
+	return RunnerFromGGUFBytesWithOptions(textData, options)
 }
 
 func runnerFromGGUFBytes(data []byte, borrowQuantized bool, options LoadOptions) (*Runner, error) {
@@ -451,6 +509,41 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		}
 		r.config, r.standard, r.kind = config, weights, loadedStandard
 	}
+
+	if len(options.VisionProjectorBytes) > 0 || options.VisionProjectorPath != "" {
+		visionData := options.VisionProjectorBytes
+		var visionFile *MmapFile
+		if len(visionData) == 0 {
+			mmap, err := OpenMmap(options.VisionProjectorPath)
+			if err != nil {
+				return nil, fmt.Errorf("loading vision projector: %w", err)
+			}
+			visionData, visionFile = mmap.Bytes(), mmap
+		}
+		visionGGUF, err := ParseGGUFQuiet(visionData)
+		if err != nil {
+			if visionFile != nil {
+				_ = visionFile.Close()
+			}
+			return nil, fmt.Errorf("loading vision projector: %w", err)
+		}
+		vc, vw, err := LoadPixtralVisionModel(visionData, visionGGUF, options.UseMetal, logw)
+		if err != nil {
+			if visionFile != nil {
+				_ = visionFile.Close()
+			}
+			return nil, fmt.Errorf("loading vision projector: %w", err)
+		}
+		if len(vw.ImgBreak) != r.config.Dim {
+			if visionFile != nil {
+				_ = visionFile.Close()
+			}
+			return nil, fmt.Errorf("loading vision projector: img_break width %d does not match text model dim %d", len(vw.ImgBreak), r.config.Dim)
+		}
+		r.vision, r.visionConfig, r.visionMappedFile = &vw, vc, visionFile
+		fmt.Fprintf(logw, "Vision: loaded Pixtral-style encoder (%d layers, %d-dim, %dx merge)\n", vc.BlockCount, vc.EmbeddingLength, vc.SpatialMergeSize)
+	}
+
 	return r, nil
 }
 
@@ -530,6 +623,11 @@ func (r *Runner) Close() error {
 	r.workspaceBuf = nil
 	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
+	r.visionImageCache = nil
+	if r.visionMappedFile != nil {
+		_ = r.visionMappedFile.Close()
+		r.visionMappedFile = nil
+	}
 	if r.mappedFile == nil {
 		return nil
 	}
@@ -616,7 +714,10 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		messages = prepared
 		contextWindow = &info
 	}
-	tokens := r.renderMessages(messages, options.SystemPrompt, options.ActiveTools())
+	tokens, imageEmbeds, err := r.renderMessagesForGeneration(messages, options.SystemPrompt, options.ActiveTools())
+	if err != nil {
+		return GenerationResult{}, err
+	}
 	if len(tokens) == 0 {
 		return GenerationResult{}, fmt.Errorf("prompt rendered to zero tokens")
 	}
@@ -632,9 +733,18 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	}
 	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
 	cache, buf := r.generationWorkspace(cacheLen)
+	buf.ImageEmbeds = imageEmbeds
+	defer func() { buf.ImageEmbeds = nil }()
 	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
 	reusedTokens := 0
-	cacheEligible := r.prefixCacheSupported(cache)
+	// Prefix-cache matching is purely token-ID based (sharedTokenPrefix): it
+	// cannot distinguish two different images that render to the same
+	// placeholder-token count, which would silently reuse a stale KV-cache
+	// prefix computed for a different image's pixels. Multimodal turns opt
+	// out of prefix-cache reuse entirely rather than risk that — image
+	// prefill already dominates a multimodal turn's cost far more than
+	// prefix-cache reuse would save.
+	cacheEligible := len(imageEmbeds) == 0 && r.prefixCacheSupported(cache)
 	cachedResidentTokens := r.prefixCache.tokens
 	cachedPromptTokens := r.prefixCache.promptTokens
 	cachedPromptLogits := r.prefixCache.promptLogits
@@ -1454,7 +1564,7 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, too
 		}
 	}
 	if r.chatTemplateKind() == "mistral-inst" {
-		if tokens, ok := r.renderMistralInstMessages(messages, systemPrompt, tools); ok {
+		if tokens, _, ok, _ := r.renderMistralInstMessages(messages, systemPrompt, tools); ok {
 			return tokens
 		}
 	}
@@ -1671,11 +1781,21 @@ func (r *Runner) renderGptOssMessages(messages []ChatMessage, systemPrompt strin
 // fall back to the older Mistral 2410 behavior of folding the system prompt
 // into the final user turn. Format verified directly against the
 // tokenizer.chat_template of a real Ministral-3-3B-Instruct-2512 GGUF.
-func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, bool) {
+// renderMistralInstMessages renders the [INST]/[/INST] Mistral-family
+// template. Its bool return follows the same "not applicable, try another
+// renderer" convention every renderMessages branch uses (true only for the
+// rare case of a vocabulary missing [INST]/[/INST]) — its error return is a
+// distinct signal: ok=true with a non-nil error means the template DID
+// apply but rendering a message's attached image failed (too many images,
+// no vision projector loaded, bad image bytes). Callers must treat that as
+// a real failure, not silently fall through to a different renderer, since
+// no other renderer understands ChatMessage.Images and would just drop the
+// image data instead of erroring.
+func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, map[int][]float32, bool, error) {
 	instTok, ok1 := r.tok.SpecialID("[INST]")
 	instEndTok, ok2 := r.tok.SpecialID("[/INST]")
 	if !(ok1 && ok2) {
-		return nil, false
+		return nil, nil, false, nil
 	}
 	sysStart, sysEnd, hasSysTokens := r.systemPromptTokens()
 	callTok := r.mistralMarker("[TOOL_CALLS]")
@@ -1717,6 +1837,7 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			tokens = append(tokens, r.mistralMarker("[/AVAILABLE_TOOLS]")...)
 		}
 	}
+	var imageEmbeds map[int][]float32
 	for i, m := range loop {
 		switch m.Role {
 		case ChatRoleAssistant:
@@ -1750,11 +1871,111 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 				content = system + "\n\n" + content
 			}
 			tokens = append(tokens, instTok)
+			if len(m.Images) > 0 {
+				if len(m.Images) > 1 {
+					return nil, nil, true, fmt.Errorf("rendering message %d: only one image per message is supported, got %d", i, len(m.Images))
+				}
+				if !r.HasVision() {
+					return nil, nil, true, fmt.Errorf("rendering message %d: message includes an image but no vision projector is loaded for this model", i)
+				}
+				imgTok, ok1 := r.tok.SpecialID("[IMG]")
+				breakTok, ok2 := r.tok.SpecialID("[IMG_BREAK]")
+				endTok, ok3 := r.tok.SpecialID("[IMG_END]")
+				if !(ok1 && ok2 && ok3) {
+					return nil, nil, true, fmt.Errorf("rendering message %d: this model's vocabulary is missing the [IMG]/[IMG_BREAK]/[IMG_END] special tokens image content requires", i)
+				}
+				embeds, mergedRows, mergedCols, err := r.encodeChatImage(m.Images[0])
+				if err != nil {
+					return nil, nil, true, fmt.Errorf("rendering message %d: %w", i, err)
+				}
+				if imageEmbeds == nil {
+					imageEmbeds = make(map[int][]float32, len(embeds)+mergedRows)
+				}
+				for row := 0; row < mergedRows; row++ {
+					for col := 0; col < mergedCols; col++ {
+						imageEmbeds[len(tokens)] = embeds[row*mergedCols+col]
+						tokens = append(tokens, imgTok)
+					}
+					if row < mergedRows-1 {
+						imageEmbeds[len(tokens)] = r.vision.ImgBreak
+						tokens = append(tokens, breakTok)
+					}
+				}
+				tokens = append(tokens, endTok)
+			}
 			tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
 			tokens = append(tokens, instEndTok)
 		}
 	}
-	return tokens, true
+	return tokens, imageEmbeds, true, nil
+}
+
+// renderMessagesForGeneration is renderMessages plus image-embedding
+// support. When no message carries images it is exactly renderMessages
+// (nil map, nil error) — every existing caller (context_window.go's
+// token-budget calculations, tests) keeps calling the plain renderMessages
+// unchanged. Only the real generation entry point (GenerateChatStreamUntil)
+// calls this, since it's the one place that needs the embeddings to splice
+// into the forward pass. When a message does carry an image, only the
+// Mistral-family template understands ChatMessage.Images, so this bypasses
+// renderMessages' generic multi-template dispatch entirely rather than
+// risking a silent fallback to a renderer that would just drop the image.
+func (r *Runner) renderMessagesForGeneration(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, map[int][]float32, error) {
+	hasImages := false
+	for i := range messages {
+		if len(messages[i].Images) > 0 {
+			hasImages = true
+			break
+		}
+	}
+	if !hasImages {
+		return r.renderMessages(messages, systemPrompt, tools), nil, nil
+	}
+	if r.chatTemplateKind() != "mistral-inst" {
+		return nil, nil, fmt.Errorf("image content requires a Mistral-family chat template (this model uses %q)", r.chatTemplateKind())
+	}
+	tokens, embeds, ok, err := r.renderMistralInstMessages(messages, systemPrompt, tools)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return nil, nil, fmt.Errorf("rendering message with image failed: this model's vocabulary is missing [INST]/[/INST]")
+	}
+	return tokens, embeds, nil
+}
+
+// encodeChatImage decodes, preprocesses, and runs one image through the
+// vision tower, memoizing by a content hash of the raw image bytes: a
+// generation call may render the same messages more than once
+// (context_window.go's budget calculations call renderMessages, not this
+// function, precisely to avoid that cost, but a caller could still call
+// this directly more than once per request) and re-running the whole vision
+// tower each time would be wasteful.
+func (r *Runner) encodeChatImage(img ImageContent) (embeds [][]float32, mergedRows, mergedCols int, err error) {
+	h := fnv.New64a()
+	h.Write(img.Bytes)
+	key := h.Sum64()
+	if entry, ok := r.visionImageCache[key]; ok {
+		return entry.embeds, entry.mergedRows, entry.mergedCols, nil
+	}
+	decoded, err := DecodeImageBytes(img.Bytes)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	vc := r.visionConfig
+	pre, err := PreprocessImagePixtral(decoded, vc.PatchSize, vc.PatchSize*vc.SpatialMergeSize, vc.ImageSize, vc.ImageMean, vc.ImageStd)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	embeds, mergedRows, mergedCols, err = EncodeImagePixtral(vc, *r.vision, pre)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if r.visionImageCache == nil {
+		r.visionImageCache = make(map[uint64]visionImageCacheEntry)
+	}
+	r.visionImageCache[key] = visionImageCacheEntry{embeds: embeds, mergedRows: mergedRows, mergedCols: mergedCols}
+	return embeds, mergedRows, mergedCols, nil
 }
 
 // mistralMarker returns literal as a single control token when the vocabulary

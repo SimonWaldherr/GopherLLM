@@ -209,14 +209,14 @@ func TestMistralTrailingAssistantIsOpenContinuation(t *testing.T) {
 	tok := newMistralToolTokenizer()
 	r := &Runner{tok: tok, arch: "ministral"}
 	// History assistant message (not last) still closes with EOS...
-	closed, _ := r.renderMistralInstMessages([]ChatMessage{
+	closed, _, _, _ := r.renderMistralInstMessages([]ChatMessage{
 		UserMessage("hi"), AssistantMessage("yo"), UserMessage("more"),
 	}, "", nil)
 	if countToken(closed, tok.EOSID) != 1 {
 		t.Fatalf("history assistant should close with EOS: %v", closed)
 	}
 	// ...but a TRAILING assistant message stays open for continuation.
-	open, _ := r.renderMistralInstMessages([]ChatMessage{
+	open, _, _, _ := r.renderMistralInstMessages([]ChatMessage{
 		UserMessage("hi"), AssistantMessage("Once upon a"),
 	}, "", nil)
 	if countToken(open, tok.EOSID) != 0 {

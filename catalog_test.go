@@ -189,6 +189,34 @@ func TestModelSortKeyPutsSupportedModelsFirstAndUsesDisplayName(t *testing.T) {
 	}
 }
 
+func TestPairProjectorsMatchesSameRepositoryAndPrefersF16(t *testing.T) {
+	textA := testEntry("ministral/ministral-Q4_K_M", "mistral3", false)
+	textA.Repository = "ministral"
+	mmprojF32 := testEntry("ministral/mmproj-F32", "clip", true)
+	mmprojF32.Repository = "ministral"
+	mmprojF32.FileName = "mmproj-F32.gguf"
+	mmprojF16 := testEntry("ministral/mmproj-F16", "clip", true)
+	mmprojF16.Repository = "ministral"
+	mmprojF16.FileName = "mmproj-F16.gguf"
+	// A text-only model in a different repository must not get paired.
+	textB := testEntry("other/other-model", "llama", false)
+	textB.Repository = "other"
+
+	entries := []ModelEntry{textA, mmprojF32, mmprojF16, textB}
+	pairProjectors(entries)
+
+	if entries[0].ProjectorPath != mmprojF16.Path {
+		t.Fatalf("ProjectorPath = %q, want the F16 variant %q", entries[0].ProjectorPath, mmprojF16.Path)
+	}
+	if entries[3].ProjectorPath != "" {
+		t.Fatalf("cross-repository entry got a ProjectorPath: %q", entries[3].ProjectorPath)
+	}
+	// Projector entries themselves are never paired with anything.
+	if entries[1].ProjectorPath != "" || entries[2].ProjectorPath != "" {
+		t.Fatal("a projector entry should never itself get a ProjectorPath")
+	}
+}
+
 func TestDiscoverModelsAndResolveModelPath(t *testing.T) {
 	root := t.TempDir()
 	modelPath := filepath.Join(root, "repo", "tiny.gguf")

@@ -54,7 +54,7 @@ func TestMistralInstRenderStructure(t *testing.T) {
 	inst := tok.TokenToID["[INST]"]
 	instEnd := tok.TokenToID["[/INST]"]
 
-	tokens, ok := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
+	tokens, _, ok, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
 	if !ok {
 		t.Fatal("renderMistralInstMessages returned ok=false")
 	}
@@ -79,8 +79,8 @@ func TestMistralInstRenderFoldsSystemIntoLastUserTurn(t *testing.T) {
 	tok := newInstTestTokenizer()
 	r := &Runner{tok: tok, arch: "ministral"}
 
-	withoutSys, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
-	withSys, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "be nice", nil)
+	withoutSys, _, _, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
+	withSys, _, _, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "be nice", nil)
 	if len(withSys) <= len(withoutSys) {
 		t.Fatalf("system prompt should lengthen the turn: with=%d without=%d", len(withSys), len(withoutSys))
 	}
@@ -93,7 +93,7 @@ func TestMistralInstRenderFoldsSystemIntoLastUserTurn(t *testing.T) {
 func TestMistralInstRenderMultiTurnClosesAssistantWithEOS(t *testing.T) {
 	tok := newInstTestTokenizer()
 	r := &Runner{tok: tok, arch: "ministral"}
-	tokens, _ := r.renderMistralInstMessages([]ChatMessage{
+	tokens, _, _, _ := r.renderMistralInstMessages([]ChatMessage{
 		UserMessage("hi"),
 		AssistantMessage("yo"),
 		UserMessage("bye"),
@@ -133,7 +133,7 @@ func TestMistralInstRenderUsesSystemPromptTokens(t *testing.T) {
 	r := &Runner{tok: tok, arch: "mistral3"}
 	inst := tok.TokenToID["[INST]"]
 
-	tokens, ok := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "be nice", nil)
+	tokens, _, ok, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "be nice", nil)
 	if !ok {
 		t.Fatal("renderMistralInstMessages returned ok=false")
 	}
@@ -154,7 +154,7 @@ func TestMistralInstRenderRequiresControlTokens(t *testing.T) {
 	tok := newInstTestTokenizer()
 	delete(tok.TokenToID, "[/INST]")
 	r := &Runner{tok: tok, arch: "ministral"}
-	if _, ok := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil); ok {
+	if _, _, ok, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil); ok {
 		t.Fatal("render should fail when [/INST] is absent")
 	}
 }

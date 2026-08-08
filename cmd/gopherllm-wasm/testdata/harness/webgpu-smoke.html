@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GopherLLM WebGPU smoke test</title>
+<style>
+  body { font: 14px/1.5 monospace; margin: 2rem; background: #111; color: #ddd; }
+  #log { white-space: pre-wrap; background: #000; color: #8f8; padding: 1rem; min-height: 4rem; }
+  #status.pass { color: #0f0; font-weight: bold; }
+  #status.fail { color: #f00; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>GopherLLM WebGPU smoke test</h1>
+<div>status: <span id="status">running...</span></div>
+<div id="log"></div>
+<script src="/bin/wasm_exec.js"></script>
+<script>
+function log(msg) {
+  console.log(msg);
+  document.getElementById("log").textContent += msg + "\n";
+}
+function setStatus(text, cls) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = cls;
+}
+async function waitForBridge(timeoutMs) {
+  const start = Date.now();
+  while (typeof window.gopherllm_webgpuSmokeTest !== "function") {
+    if (Date.now() - start > timeoutMs) throw new Error("gopherllm_webgpuSmokeTest never registered");
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+async function main() {
+  log("fetching gopherllm.wasm...");
+  const go = new Go();
+  const resp = await fetch("/bin/gopherllm.wasm");
+  if (!resp.ok) throw new Error("fetching gopherllm.wasm: HTTP " + resp.status);
+  const { instance } = await WebAssembly.instantiateStreaming(resp, go.importObject);
+  go.run(instance);
+  await waitForBridge(2000);
+  log("wasm running, calling gopherllm_webgpuSmokeTest()...");
+  const result = await window.gopherllm_webgpuSmokeTest();
+  log("result: " + result);
+  setStatus(result, "pass");
+}
+main().catch((err) => {
+  console.error(err);
+  log("FATAL: " + (err && err.message ? err.message : String(err)));
+  setStatus("ERROR: " + (err && err.message ? err.message : String(err)), "fail");
+});
+</script>
+</body>
+</html>

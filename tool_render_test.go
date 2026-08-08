@@ -118,7 +118,7 @@ func TestLlama31TemplateDateUsesJinjaAssignmentAfterDefinedCheck(t *testing.T) {
 func TestMistralRenderInjectsAvailableTools(t *testing.T) {
 	tok := newMistralToolTokenizer()
 	r := &Runner{tok: tok, arch: "ministral"}
-	tokens, ok := r.renderMistralInstMessages([]ChatMessage{UserMessage("weather?")}, "", []ToolDefinition{sampleTool()})
+	tokens, _, ok, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("weather?")}, "", []ToolDefinition{sampleTool()})
 	if !ok {
 		t.Fatal("ok=false")
 	}
@@ -140,7 +140,7 @@ func TestMistralRenderInjectsAvailableTools(t *testing.T) {
 func TestMistralRenderNoToolsOmitsMarkers(t *testing.T) {
 	tok := newMistralToolTokenizer()
 	r := &Runner{tok: tok, arch: "ministral"}
-	tokens, ok := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
+	tokens, _, ok, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
 	if !ok {
 		t.Fatal("ok=false")
 	}
@@ -157,7 +157,7 @@ func TestMistralRenderReplaysAssistantToolCalls(t *testing.T) {
 		{Role: ChatRoleAssistant, ToolCalls: []ToolCall{{ID: "abc123XYZ", Type: "function", Function: ToolCallFunction{Name: "get_weather", Arguments: `{"city": "Berlin"}`}}}},
 		ToolResultMessage("abc123XYZ", "get_weather", "18C, sunny"),
 	}
-	tokens, ok := r.renderMistralInstMessages(messages, "", []ToolDefinition{sampleTool()})
+	tokens, _, ok, _ := r.renderMistralInstMessages(messages, "", []ToolDefinition{sampleTool()})
 	if !ok {
 		t.Fatal("ok=false")
 	}

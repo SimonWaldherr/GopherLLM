@@ -1619,6 +1619,12 @@ type DecodeBuffer struct {
 	Gemma4PLE      []float32
 	Gemma4PLEInput []float32
 	batch          batchDecodeBuffer
+	// ImageEmbeds maps an absolute sequence position to a vision-projector
+	// embedding that must overwrite the ordinary token-embedding-table
+	// lookup at that position (see runtime.go's image-placeholder token
+	// splicing). Set once per generation call, cleared afterward so it can
+	// never leak into an unrelated later request reusing this pooled buffer.
+	ImageEmbeds map[int][]float32
 }
 
 type ExpertScore struct {
@@ -2581,7 +2587,9 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	}
 	ropeIsInterleaved := ropeInterleaved(config.Arch)
 	weights.TokenEmbd.RowInto(int(token), dim, &buf.X)
-	if config.EmbeddingScale != 1 {
+	if emb, ok := buf.ImageEmbeds[pos]; ok {
+		copy(buf.X[:dim], emb)
+	} else if config.EmbeddingScale != 1 {
 		ScaleF32(buf.X[:dim], config.EmbeddingScale)
 	}
 	if config.usesAbsolutePositionEmbd() {

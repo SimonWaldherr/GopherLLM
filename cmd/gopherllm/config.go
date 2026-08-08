@@ -78,6 +78,8 @@ var cliValueOptions = map[string]bool{
 	"--preset":             true,
 	"--model":              true,
 	"--model-dir":          true,
+	"--mmproj":             true,
+	"--image":              true,
 	"--hf-list":            true,
 	"--prompt":             true,
 	"-p":                   true,

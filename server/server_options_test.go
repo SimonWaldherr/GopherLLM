@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/base64"
+
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 
 	"testing"
@@ -86,5 +88,39 @@ func TestApiMessagesRoleMapping(t *testing.T) {
 		if msgs[i].Role != w {
 			t.Fatalf("msg %d role = %v, want %v", i, msgs[i].Role, w)
 		}
+	}
+}
+
+func TestApiMessagesExtractsBase64ImageURL(t *testing.T) {
+	raw := []byte{1, 2, 3, 4, 5}
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw)
+	msgs := apiMessages([]APIMessage{
+		{Role: "user", Content: []any{
+			map[string]any{"type": "text", "text": "what is this"},
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": dataURL}},
+		}},
+	})
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	if msgs[0].Content != "what is this" {
+		t.Fatalf("Content = %q", msgs[0].Content)
+	}
+	if len(msgs[0].Images) != 1 || string(msgs[0].Images[0].Bytes) != string(raw) {
+		t.Fatalf("Images = %+v, want one image with bytes %v", msgs[0].Images, raw)
+	}
+}
+
+func TestApiMessagesSkipsRemoteImageURL(t *testing.T) {
+	msgs := apiMessages([]APIMessage{
+		{Role: "user", Content: []any{
+			map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/cat.png"}},
+		}},
+	})
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	if len(msgs[0].Images) != 0 {
+		t.Fatalf("Images = %+v, want none (remote fetch is intentionally not implemented)", msgs[0].Images)
 	}
 }

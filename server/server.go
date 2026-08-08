@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1500,7 +1501,53 @@ func apiMessages(items []APIMessage) []gopherllm.ChatMessage {
 		case "tool", "function", "ipython":
 			role = gopherllm.ChatRoleTool
 		}
-		out = append(out, gopherllm.ChatMessage{Role: role, Content: contentText(item.Content), ToolCalls: item.ToolCalls, ToolCallID: item.ToolCallID, Name: item.Name})
+		out = append(out, gopherllm.ChatMessage{Role: role, Content: contentText(item.Content), Images: contentImages(item.Content), ToolCalls: item.ToolCalls, ToolCallID: item.ToolCallID, Name: item.Name})
+	}
+	return out
+}
+
+// contentImages extracts image content from an OpenAI-style multi-part
+// content array's "image_url" parts (mirroring contentText's "text" parts).
+// Only base64 data: URLs are decoded (data:image/png;base64,... — the
+// common form for local/self-hosted API clients, requiring no network
+// access). A plain http(s):// image URL is intentionally NOT fetched here:
+// having the server fetch an arbitrary caller-supplied URL is a
+// server-side-request-forgery-shaped feature that needs an explicit,
+// off-by-default opt-in and its own review, not a default-on convenience;
+// such a part is simply skipped rather than silently treated as unusable
+// text; a future revision can add an explicit opt-in flag for it.
+func contentImages(v any) []gopherllm.ImageContent {
+	parts, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []gopherllm.ImageContent
+	for _, p := range parts {
+		m, ok := p.(map[string]any)
+		if !ok || m["type"] != "image_url" {
+			continue
+		}
+		urlField, ok := m["image_url"].(map[string]any)
+		if !ok {
+			continue
+		}
+		url, ok := urlField["url"].(string)
+		if !ok {
+			continue
+		}
+		const dataPrefix = "data:"
+		if !strings.HasPrefix(url, dataPrefix) {
+			continue
+		}
+		comma := strings.IndexByte(url, ',')
+		if comma < 0 || !strings.Contains(url[:comma], ";base64") {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(url[comma+1:])
+		if err != nil {
+			continue
+		}
+		out = append(out, gopherllm.ImageContent{Bytes: decoded})
 	}
 	return out
 }
