@@ -327,9 +327,10 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 		return nil, err
 	}
 
-	if deepSeek2Family(cfg.Arch) {
-		// Kimi and DeepSeek-V2/V3 use a plain, always-on shared SwiGLU expert.
-		// There is intentionally no ffn_gate_inp_shexp routing/gating tensor.
+	if deepSeek2Family(cfg.Arch) || cfg.Arch == "granitemoe" {
+		// Kimi, DeepSeek-V2/V3, and GraniteMoE all use a plain, always-on
+		// shared SwiGLU expert added unweighted to the routed output. There
+		// is intentionally no ffn_gate_inp_shexp routing/gating tensor.
 		sharedNames := []string{prefix + "ffn_gate_shexp.weight", prefix + "ffn_up_shexp.weight", prefix + "ffn_down_shexp.weight"}
 		if cfg.ExpertSharedCount > 0 && !hasAnyTensor(tensors, sharedNames...) {
 			return nil, fmt.Errorf("%s: expert_shared_count=%d requires ffn_gate_shexp, ffn_up_shexp, and ffn_down_shexp", cfg.Arch, cfg.ExpertSharedCount)

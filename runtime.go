@@ -314,9 +314,13 @@ type Runner struct {
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
+		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "granitemoe", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
 		return true
 	case "smollm3", "exaone4":
+		return true
+	case "gpt2", "gptneox", "gptj", "bloom", "mpt", "falcon", "starcoder", "starcoder2":
+		return true
+	case "chatglm", "glm4", "command-r", "minicpm":
 		return true
 	case "olmo2":
 		return true

@@ -246,10 +246,15 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	GateUp := [][]float32(nil)
 	Hidden := reuseBatchViews(&b.HiddenFlat, &b.Hidden, p, hDim)
 
+	usesPosEmbd := config.usesAbsolutePositionEmbd()
 	for t := 0; t < p; t++ {
 		weights.TokenEmbd.RowInto(int(tokens[t]), dim, &X[t])
 		if config.EmbeddingScale != 1 {
 			ScaleF32(X[t], config.EmbeddingScale)
+		}
+		if usesPosEmbd {
+			weights.PositionEmbd.RowInto(startPos+t, dim, &buf.PosEmbd)
+			addInPlace(X[t][:dim], buf.PosEmbd[:dim])
 		}
 	}
 
@@ -343,6 +348,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 
 		// Attention is independent per token, so spread the chunk across workers.
+		alibi := config.usesALiBi()
 		attend := func(ts, te int) {
 			for t := ts; t < te; t++ {
 				pos := startPos + t
@@ -351,7 +357,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 					attnStart = max(0, pos-config.SlidingWindow)
 				}
 				clear(AttnOut[t])
-				if useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 {
+				if useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !alibi {
 					for kvH := 0; kvH < config.NKVHeads; kvH++ {
 						hStart := kvH * kvMul
 						hEnd := min(hStart+kvMul, config.NHeads)
@@ -366,9 +372,13 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				} else {
 					for h := 0; h < config.NHeads; h++ {
 						kvH := h / kvMul
-						cache.attendHead(l, kvH, Q[t][h*headDim:h*headDim+headDim],
+						var alibiSlope float32
+						if alibi {
+							alibiSlope = aLiBiSlope(h, config.NHeads, config.ALiBiMaxBias)
+						}
+						cache.attendHeadWithSink(l, kvH, Q[t][h*headDim:h*headDim+headDim],
 							headDim, valueDim, attnStart, pos, scale,
-							config.AttnLogitSoftcap,
+							config.AttnLogitSoftcap, alibiSlope, 0, false,
 							AttnOut[t][h*valueDim:h*valueDim+valueDim])
 					}
 				}
@@ -403,7 +413,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				normalizeDecoderInto(config, X[t], layer.FFNNorm, layer.FFNNormBias, &XN[t])
 			}
 		}
-		if config.Arch == "phi2" {
+		if config.usesPlainMLP() {
 			matvecBatch(layer.W3, XN, Up)
 			for t := 0; t < p; t++ {
 				addInPlace(Up[t], layer.FFNUpBias)
@@ -422,9 +432,15 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 		activateFFN := func(ts, te int) {
 			for t := ts; t < te; t++ {
-				if config.Arch == "phi2" {
-					for i := 0; i < hDim; i++ {
-						Hidden[t][i] = geluExact(Up[t][i])
+				if config.usesPlainMLP() {
+					if config.UseExactGELU {
+						for i := 0; i < hDim; i++ {
+							Hidden[t][i] = geluExact(Up[t][i])
+						}
+					} else {
+						for i := 0; i < hDim; i++ {
+							Hidden[t][i] = geluTanhScalar(Up[t][i])
+						}
 					}
 				} else if config.UseGELU {
 					geluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])

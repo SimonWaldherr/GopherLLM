@@ -117,7 +117,7 @@ func TestOnlineAttentionI8MatchesF32(t *testing.T) {
 	outF32 := make([]float32, headDim)
 	outI8 := make([]float32, headDim)
 	onlineAttention(q, kfQ, vfQ, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, outF32)
-	onlineAttentionI8WithSink(q, k8, v8, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, 0, false, outI8)
+	onlineAttentionI8WithSink(q, k8, v8, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, 0, 0, false, outI8)
 	cos, err := CosineSimilarity(outF32, outI8)
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +130,7 @@ func TestOnlineAttentionI8MatchesF32(t *testing.T) {
 	clear(outF32)
 	clear(outI8)
 	onlineAttention(q, kfQ, vfQ, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 50, outF32)
-	onlineAttentionI8WithSink(q, k8, v8, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 50, 0, false, outI8)
+	onlineAttentionI8WithSink(q, k8, v8, headDim, headDim, headDim, headDim, 0, ctx-1, scale, 50, 0, 0, false, outI8)
 	cos, err = CosineSimilarity(outF32, outI8)
 	if err != nil {
 		t.Fatal(err)

@@ -109,12 +109,24 @@ func TestCosineSimilarityRejectsInvalidInputs(t *testing.T) {
 }
 
 func TestRopeInterleavedArchitectureSelection(t *testing.T) {
-	for _, arch := range []string{"llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "internlm2"} {
+	// llama.cpp's llama_model_rope_type() (src/llama-model.cpp) classifies
+	// these under "operating on pairs of consecutive head values" (i.e.
+	// interleaved), verified directly against current upstream source on
+	// 2026-08-08: granite/granite_moe, command-r, chatglm, and minicpm all
+	// sit in that same case block as llama/mistral/internlm2.
+	for _, arch := range []string{
+		"llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "internlm2",
+		"granite", "granitemoe", "command-r", "chatglm", "glm4", "minicpm", "gptj",
+	} {
 		if !ropeInterleaved(arch) {
 			t.Fatalf("ropeInterleaved(%q) = false, want true", arch)
 		}
 	}
-	for _, arch := range []string{"qwen2", "phi3", "granite", "deepseek2"} {
+	// deepseek2 is intentionally excluded here even though upstream classifies
+	// it as interleaved too: GopherLLM's MLA forward path (deepseek2.go) never
+	// consults ropeInterleaved at all, hardcoding its own rotation convention
+	// directly, so this generic switch's value for it is moot dead code.
+	for _, arch := range []string{"qwen2", "phi3", "deepseek2"} {
 		if ropeInterleaved(arch) {
 			t.Fatalf("ropeInterleaved(%q) = true, want false", arch)
 		}

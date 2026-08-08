@@ -80,6 +80,14 @@ type Config struct {
 	// ships it as bool-array metadata; Gemma 2's alternating pattern is
 	// synthesized); nil means SlidingWindow applies to every layer.
 	UseGELU           bool
+	// UseExactGELU selects erf-based exact GELU over the tanh approximation
+	// for architectures whose FFN is plain (see usesPlainMLP): Phi-2 uses
+	// exact GELU; GPT-2/GPT-NeoX/GPT-J/BLOOM/MPT/StarCoder/StarCoder2 use
+	// the tanh approximation ("gelu_new"/"gelu_pytorch_tanh") instead.
+	UseExactGELU      bool
+	// ALiBiMaxBias configures BLOOM/MPT's additive per-head linear
+	// attention-score bias (see Config.usesALiBi); zero means disabled.
+	ALiBiMaxBias      float32
 	AttnLogitSoftcap  float32
 	FinalLogitSoftcap float32
 	SWAPattern        []bool
@@ -188,6 +196,10 @@ func (c Config) layerUsesRoPE(il int) bool {
 		return (il+1)%4 != 0
 	case "exaone4":
 		return c.SlidingWindow <= 0 || c.layerUsesSWA(il)
+	case "gpt2", "bloom", "mpt", "starcoder":
+		// These position tokens via a learned absolute embedding (GPT-2/
+		// StarCoder) or ALiBi (BLOOM/MPT) instead of RoPE.
+		return false
 	default:
 		return true
 	}
@@ -202,10 +214,66 @@ func (c Config) usesPostNormOnly() bool {
 
 // sharesParallelBranchNorm identifies architectures whose attention and FFN
 // branches consume the same normalized block input. Parallel StableLM variants
-// use a learned LayerNorm for both branches; Phi-2 does the same with its
-// ungated-GELU MLP.
+// use a learned LayerNorm for both branches; Phi-2 and GPT-J do the same with
+// their ungated MLP. Falcon's parallel-residual variants deliberately are NOT
+// included here even though 7B checkpoints also share one norm: Falcon's
+// tensor loader aliases AttnNorm/FFNNorm to the same weights when there is
+// only one, so the ordinary independent-norm path already produces the
+// identical (if slightly redundant) result for both Falcon sizes.
 func (c Config) sharesParallelBranchNorm() bool {
-	return c.ParallelResidual && (c.Arch == "phi2" || c.Arch == "stablelm")
+	return c.ParallelResidual && (c.Arch == "phi2" || c.Arch == "stablelm" || c.Arch == "gptj" || c.Arch == "command-r")
+}
+
+// usesAbsolutePositionEmbd reports whether this architecture positions
+// tokens with a learned absolute position-embedding table (gathered by
+// sequence position and added to the token embedding once, before layer 0)
+// instead of RoPE or ALiBi. Only GPT-2 and StarCoder v1 do this among
+// supported architectures.
+func (c Config) usesAbsolutePositionEmbd() bool {
+	return c.Arch == "gpt2" || c.Arch == "starcoder"
+}
+
+// usesALiBi reports whether this architecture positions tokens with an
+// additive per-head linear attention-score bias (Attention with Linear
+// Biases) instead of RoPE or a learned position embedding. BLOOM hardcodes
+// its max-bias to 8.0; MPT reads it from a GGUF key (0 means disabled, but
+// every released checkpoint enables it).
+func (c Config) usesALiBi() bool {
+	return c.Arch == "bloom" || (c.Arch == "mpt" && c.ALiBiMaxBias > 0)
+}
+
+// aLiBiSlope returns head h's linear-bias slope for BLOOM/MPT's ALiBi
+// positional mechanism. Heads are split at n2, the largest power of two not
+// exceeding nHeads: heads below n2 follow one geometric sequence (m0), and
+// any remaining heads (only when nHeads is not itself a power of two) follow
+// a second, twice-as-fine sequence (m1) starting from every other exponent.
+// For power-of-two head counts this collapses to the textbook
+// slope_h = 2^(-maxBias*(h+1)/nHeads).
+func aLiBiSlope(h, nHeads int, maxBias float32) float32 {
+	n2 := 1
+	for n2*2 <= nHeads {
+		n2 *= 2
+	}
+	if h < n2 {
+		m0 := math.Pow(2, -float64(maxBias)/float64(n2))
+		return float32(math.Pow(m0, float64(h+1)))
+	}
+	m1 := math.Pow(2, -float64(maxBias)/float64(2*n2))
+	return float32(math.Pow(m1, float64(2*(h-n2)+1)))
+}
+
+// usesPlainMLP reports whether this architecture's FFN is a plain
+// (non-gated) up-projection -> activation -> down-projection MLP using only
+// W3 (up) and W2 (down), with no W1/gate tensor and no elementwise gate
+// multiply. UseExactGELU distinguishes Phi-2's exact GELU from the rest of
+// this family's tanh-approximation GELU.
+func (c Config) usesPlainMLP() bool {
+	switch c.Arch {
+	case "phi2", "gpt2", "gptneox", "gptj", "bloom", "mpt", "starcoder", "starcoder2":
+		return true
+	default:
+		return false
+	}
 }
 
 // usesFullProjectionQKNorm distinguishes OLMo 2/3's one RMSNorm over the
@@ -301,7 +369,10 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		}
 	}
 	normEps := gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5)
-	if p == "stablelm" || p == "phi2" {
+	switch p {
+	case "stablelm", "phi2", "gpt2", "gptneox", "gptj", "bloom", "mpt", "falcon", "starcoder", "starcoder2", "command-r":
+		// These architectures use mean/variance LayerNorm (with an explicit
+		// epsilon key of its own) rather than RMSNorm.
 		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
 	}
 	hiddenDim := int(gguf.GetU32(p+".feed_forward_length", 0))
@@ -357,10 +428,14 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
 		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
 		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
-		UseLayerNorm:              arch == "stablelm" || arch == "phi2",
-		ParallelResidual:          parallelResidual || arch == "phi2",
-		UseGELU:                   gemmaFamily(arch) || arch == "phi2",
-		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
+		UseLayerNorm: arch == "stablelm" || arch == "phi2" || arch == "gpt2" || arch == "gptneox" ||
+			arch == "gptj" || arch == "bloom" || arch == "mpt" || arch == "falcon" ||
+			arch == "starcoder" || arch == "starcoder2" || arch == "command-r",
+		ParallelResidual:  parallelResidual || arch == "phi2" || arch == "gptj" || arch == "falcon" || arch == "command-r",
+		UseGELU:           gemmaFamily(arch) || arch == "phi2",
+		UseExactGELU:      arch == "phi2",
+		ALiBiMaxBias:      aLiBiMaxBias(gguf, arch, p),
+		AttnLogitSoftcap:  gguf.GetF32(p+".attn_logit_softcapping", 0),
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
@@ -395,6 +470,42 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 			cfg.QwenRecurrentLayers, _ = v.AsBoolArray()
 		}
 	}
+	if p == "command-r" {
+		// llama.cpp's Command-R graph multiplies logits by the raw GGUF
+		// value directly; the generic path below divides by Config.LogitScale,
+		// so store the reciprocal to reproduce the same multiply.
+		if cfg.LogitScale != 0 {
+			cfg.LogitScale = 1 / cfg.LogitScale
+		}
+	}
+	if p == "minicpm" {
+		// Older MiniCPM 1B/2B exports omit these three keys entirely;
+		// llama.cpp substitutes these exact hardcoded defaults rather than
+		// leaving the multipliers inert at 1.
+		if _, ok := gguf.Metadata[p+".embedding_scale"]; !ok {
+			cfg.EmbeddingScale = 12.0
+		}
+		if _, ok := gguf.Metadata[p+".residual_scale"]; !ok && cfg.NLayers > 0 {
+			cfg.ResidualScale = float32(1.4 / math.Sqrt(float64(cfg.NLayers)))
+		}
+		if _, ok := gguf.Metadata[p+".logit_scale"]; !ok && dim > 0 {
+			cfg.LogitScale = 256.0 / float32(dim)
+		}
+	}
+	if p == "minicpm3" {
+		// MiniCPM3 never writes these three keys at all; llama.cpp hardcodes
+		// them directly in its graph (its own source carries a "TODO: if the
+		// model varies, these need to be read from the model" comment).
+		cfg.EmbeddingScale = 12.0
+		if cfg.NLayers > 0 {
+			cfg.ResidualScale = float32(1.4 / math.Sqrt(float64(cfg.NLayers)))
+		}
+		if dim > 0 {
+			// The reference graph multiplies logits by 256/n_embd; store the
+			// reciprocal so the generic 1/LogitScale apply reproduces it.
+			cfg.LogitScale = float32(dim) / 256.0
+		}
+	}
 	if p == "exaone4" {
 		// EXAONE 4 rotates only its SWA blocks, so the optional SWA-specific
 		// base is the one the active RoPE table must use.
@@ -410,6 +521,21 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		}
 	}
 	return cfg
+}
+
+// aLiBiMaxBias returns the ALiBi max-bias value (0 disables ALiBi). BLOOM
+// hardcodes 8.0 unconditionally (llama.cpp does not read it from any GGUF
+// key for this arch); MPT reads it from an explicit key that is 0 whenever
+// the source checkpoint had ALiBi disabled.
+func aLiBiMaxBias(gguf *GGUFFile, arch, p string) float32 {
+	switch arch {
+	case "bloom":
+		return 8.0
+	case "mpt":
+		return gguf.GetF32(p+".attention.max_alibi_bias", 0)
+	default:
+		return 0
+	}
 }
 
 func u32ArrayAsInts(gguf *GGUFFile, key string) []int {
@@ -1031,6 +1157,12 @@ type LayerWeights struct {
 
 type ModelWeights struct {
 	TokenEmbd      Weight
+	// PositionEmbd is the learned absolute position-embedding table used by
+	// GPT-2 and StarCoder (v1): its row at each sequence position is added to
+	// the token embedding once, before layer 0. Zero-valued (Rows==0, F32
+	// nil) for every RoPE/ALiBi-based architecture, which is the overwhelming
+	// majority — see Config.usesAbsolutePositionEmbd.
+	PositionEmbd   Weight
 	OutputNorm     []float32
 	OutputNormBias []float32
 	Output         Weight
@@ -1293,25 +1425,25 @@ func (c *KVCache) storeKV(l, pos int, k, v []float32) {
 // attendHead runs online attention for one query head against this cache's
 // rows, dispatching to the storage format's kernel set.
 func (c *KVCache) attendHead(l, kvH int, query []float32, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
-	c.attendHeadWithSink(l, kvH, query, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, false, out)
+	c.attendHeadWithSink(l, kvH, query, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, 0, false, out)
 }
 
 // attendHeadWithSink is attendHead with an optional learned no-value sink
 // logit. GPT-OSS appends that logit to each head's softmax denominator without
 // adding a value row, which dampens attention when the learned sink wins.
-func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
+func (c *KVCache) attendHeadWithSink(l, kvH int, query []float32, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, alibiSlope, sink float32, hasSink bool, out []float32) {
 	switch c.kvFormat() {
 	case kvI8:
 		onlineAttentionI8WithSink(query, c.K8[l][q8RowBytes(kvH*keyHeadDim):], c.V8[l][q8RowBytes(kvH*valueHeadDim):],
-			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
+			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, alibiSlope, sink, hasSink, out)
 		return
 	case kvF16:
 		onlineAttentionF16WithSink(query, c.K16[l][kvH*keyHeadDim:], c.V16[l][kvH*valueHeadDim:],
-			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
+			c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, alibiSlope, sink, hasSink, out)
 		return
 	}
 	onlineAttentionWithSink(query, c.K[l][kvH*keyHeadDim:], c.V[l][kvH*valueHeadDim:],
-		c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, sink, hasSink, out)
+		c.PerPosKDim, c.PerPosVDim, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, alibiSlope, sink, hasSink, out)
 }
 
 // attendHeadGroup evaluates all query heads that share one GQA/MQA KV head.
@@ -1346,6 +1478,9 @@ func (c *KVCache) attendHeadGroup(l, kvH int, queries []float32, queryHeads, key
 // requests.
 type DecodeBuffer struct {
 	X        []float32
+	// PosEmbd is scratch space for the gathered absolute-position-embedding
+	// row (GPT-2/StarCoder v1 only; see Config.usesAbsolutePositionEmbd).
+	PosEmbd  []float32
 	XN       []float32
 	XN2      []float32
 	Q        []float32
@@ -1661,6 +1796,13 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	if err != nil {
 		return config, ModelWeights{}, err
 	}
+	var positionEmbd Weight
+	if config.usesAbsolutePositionEmbd() {
+		positionEmbd, err = loadWeight(data, gguf.DataOffset, "position_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
+		if err != nil {
+			return config, ModelWeights{}, err
+		}
+	}
 	outputNorm, err := loadF32Vec(data, gguf.DataOffset, "output_norm.weight", tensorIdx, inferred)
 	if err != nil {
 		return config, ModelWeights{}, err
@@ -1704,7 +1846,7 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		}
 	}
 	return config, ModelWeights{
-		TokenEmbd: tokenEmbd, OutputNorm: outputNorm,
+		TokenEmbd: tokenEmbd, PositionEmbd: positionEmbd, OutputNorm: outputNorm,
 		OutputNormBias: outputNormBias,
 		Output:         output,
 		OutputBias:     outputBias,
@@ -1787,7 +1929,29 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	prefix := fmt.Sprintf("blk.%d.", l)
 	var attnNorm []float32
 	var err error
-	if config.usesPostNormOnly() {
+	// Falcon's FFN input norm is never its own tensor: 7B checkpoints reuse
+	// the single attn_norm for both branches, while 40B/180B ("new decoder
+	// architecture") carry a second attn_norm_2 that — despite the naming —
+	// feeds the ATTENTION branch, leaving the base attn_norm feeding FFN. See
+	// Config.sharesParallelBranchNorm's doc comment for why this is handled
+	// here (tensor aliasing) rather than as a forward-pass special case.
+	var falconFFNNorm []float32
+	if config.Arch == "falcon" {
+		base, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
+		if err != nil {
+			return LayerWeights{}, err
+		}
+		if _, hasNorm2 := tensors[prefix+"attn_norm_2.weight"]; hasNorm2 {
+			attnNorm, err = loadF32Vec(data, dataOffset, prefix+"attn_norm_2.weight", tensors, inferred)
+			if err != nil {
+				return LayerWeights{}, err
+			}
+			falconFFNNorm = base
+		} else {
+			attnNorm = base
+			falconFFNNorm = base
+		}
+	} else if config.usesPostNormOnly() {
 		attnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
 	} else {
 		attnNorm, err = loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
@@ -1822,7 +1986,9 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		return LayerWeights{}, err
 	}
 	var ffnNorm []float32
-	if config.usesPostNormOnly() || config.sharesParallelBranchNorm() {
+	if config.Arch == "falcon" {
+		ffnNorm = falconFFNNorm
+	} else if config.usesPostNormOnly() || config.sharesParallelBranchNorm() {
 		ffnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
 	} else {
 		ffnNorm, err = loadF32Vec(data, dataOffset, prefix+"ffn_norm.weight", tensors, inferred)
@@ -1843,7 +2009,7 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		if config.Arch == "phi2" {
+		if config.usesPlainMLP() {
 			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
 			if err != nil {
 				return LayerWeights{}, err
@@ -1913,6 +2079,12 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		if len(ffnUpBias) != config.HiddenDim || len(ffnDownBias) != config.Dim {
 			return LayerWeights{}, fmt.Errorf("phi2 requires %d-element ffn_up.bias and %d-element ffn_down.bias", config.HiddenDim, config.Dim)
 		}
+	} else if config.usesPlainMLP() {
+		// GPT-2/GPT-NeoX/GPT-J/BLOOM/MPT/StarCoder/StarCoder2's plain MLP
+		// biases. Unlike phi2 these are not strictly required (GPT-J and a
+		// few community exports omit them), so fall back to zero-filled.
+		ffnUpBias = loadOptionalF32Vec(data, dataOffset, prefix+"ffn_up.bias", tensors, inferred, config.HiddenDim)
+		ffnDownBias = loadOptionalF32Vec(data, dataOffset, prefix+"ffn_down.bias", tensors, inferred, config.Dim)
 	}
 	if config.Arch == "gpt-oss" {
 		if len(attnSinks) != config.NHeads {
@@ -1922,15 +2094,16 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 			return LayerWeights{}, fmt.Errorf("gpt-oss requires %d-element attn_output.bias", config.Dim)
 		}
 	}
+	bq, bk, bv := loadQKVBias(data, dataOffset, prefix, tensors, inferred, qRows, kRows, vRows)
 	return LayerWeights{
 		AttnNorm:     attnNorm,
 		AttnNormBias: loadOptionalF32Vec(data, dataOffset, prefix+"attn_norm.bias", tensors, inferred, len(attnNorm)),
 		WQ:           wq,
-		BQ:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_q.bias", tensors, inferred, qRows),
+		BQ:           bq,
 		WK:           wk,
-		BK:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_k.bias", tensors, inferred, kRows),
+		BK:           bk,
 		WV:           wv,
-		BV:           loadOptionalF32Vec(data, dataOffset, prefix+"attn_v.bias", tensors, inferred, vRows),
+		BV:           bv,
 		WQKV:         wqkv,
 		HasQKV:       hasQKV,
 		WO:           wo,
@@ -1954,6 +2127,27 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 		PostFFNNorm:  postFFNNorm,
 		AttnSinks:    attnSinks,
 	}, nil
+}
+
+// loadQKVBias loads Q/K/V projection biases, preferring a single fused
+// attn_qkv.bias tensor (GPT-2/GPT-NeoX/BLOOM/MPT/StarCoder/ChatGLM's
+// convention: one bias tensor covering Q rows, then K rows, then V rows,
+// matching their fused attn_qkv.weight row layout) and falling back to
+// separate attn_q.bias/attn_k.bias/attn_v.bias tensors otherwise. Returns
+// zero-filled slices of the expected length when no bias tensor exists at
+// all, matching loadOptionalF32Vec's existing no-bias contract.
+func loadQKVBias(data []byte, dataOffset int, prefix string, tensors map[string]TensorInfo, inferred map[string]int, qRows, kRows, vRows int) (bq, bk, bv []float32) {
+	if _, ok := tensors[prefix+"attn_qkv.bias"]; ok {
+		fused := loadOptionalF32Vec(data, dataOffset, prefix+"attn_qkv.bias", tensors, inferred, qRows+kRows+vRows)
+		bq = append([]float32(nil), fused[:qRows]...)
+		bk = append([]float32(nil), fused[qRows:qRows+kRows]...)
+		bv = append([]float32(nil), fused[qRows+kRows:qRows+kRows+vRows]...)
+		return bq, bk, bv
+	}
+	bq = loadOptionalF32Vec(data, dataOffset, prefix+"attn_q.bias", tensors, inferred, qRows)
+	bk = loadOptionalF32Vec(data, dataOffset, prefix+"attn_k.bias", tensors, inferred, kRows)
+	bv = loadOptionalF32Vec(data, dataOffset, prefix+"attn_v.bias", tensors, inferred, vRows)
+	return bq, bk, bv
 }
 
 // loadOptionalF32VecNil loads a float vector tensor, returning nil (not a
@@ -2329,6 +2523,10 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 	if config.EmbeddingScale != 1 {
 		ScaleF32(buf.X[:dim], config.EmbeddingScale)
 	}
+	if config.usesAbsolutePositionEmbd() {
+		weights.PositionEmbd.RowInto(pos, dim, &buf.PosEmbd)
+		addInPlace(buf.X[:dim], buf.PosEmbd[:dim])
+	}
 	for l := range config.NLayers {
 		layer := weights.Layers[l]
 		if config.usesPostNormOnly() {
@@ -2391,7 +2589,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		// GQA/MQA query heads share K/V rows. Process each complete group together
 		// so the shared cacheline is fetched once, then parallelize across KV
 		// groups at contexts long enough to amortize dispatch.
-		groupedGQA := useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0
+		groupedGQA := useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !config.usesALiBi()
 		if attnLen := pos - attnStart + 1; groupedGQA && attnLen >= groupedGQADecodeMinContext && config.NKVHeads > 1 {
 			parallelAttendHeadGroups(config, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else if groupedGQA && attnLen < 128 {
@@ -2432,15 +2630,21 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			// Keep all three stages in one command buffer when the measured
 			// Q4_K/Q4_K/Q6_K shape matches. Any unsupported shape or GPU failure falls
 			// through to the unchanged CPU/GPU path; removing this branch is rollback.
-			fusedMetalFFN := config.Arch != "phi2" && !layer.HasGateUp && !config.UseGELU &&
+			fusedMetalFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
 				matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
 			if !fusedMetalFFN {
-				if config.Arch == "phi2" {
+				if config.usesPlainMLP() {
 					layer.W3.MatvecInto(buf.XN2, &buf.Up)
 					addInPlace(buf.Up, layer.FFNUpBias)
 					ensureLenNoClear(&buf.Hidden, config.HiddenDim)
-					for i := range config.HiddenDim {
-						buf.Hidden[i] = geluExact(buf.Up[i])
+					if config.UseExactGELU {
+						for i := range config.HiddenDim {
+							buf.Hidden[i] = geluExact(buf.Up[i])
+						}
+					} else {
+						for i := range config.HiddenDim {
+							buf.Hidden[i] = geluTanhScalar(buf.Up[i])
+						}
 					}
 					layer.W2.MatvecInto(buf.Hidden, &buf.Proj)
 					addInPlace(buf.Proj, layer.FFNDownBias)
@@ -2497,6 +2701,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 func attendHeadsRange(config *Config, layer *LayerWeights, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul, hStart, hEnd int) {
 	headDim := config.HeadDim
 	valueDim := config.ValueDim
+	alibi := config.usesALiBi()
 	for h := hStart; h < hEnd; h++ {
 		kvH := h / kvMul
 		qOff := h * headDim
@@ -2505,8 +2710,12 @@ func attendHeadsRange(config *Config, layer *LayerWeights, cache *KVCache, buf *
 		if hasSink {
 			sink = layer.AttnSinks[h]
 		}
+		var alibiSlope float32
+		if alibi {
+			alibiSlope = aLiBiSlope(h, config.NHeads, config.ALiBiMaxBias)
+		}
 		cache.attendHeadWithSink(l, kvH, buf.Q[qOff:qOff+headDim], headDim, valueDim,
-			attnStart, pos, scale, config.AttnLogitSoftcap, sink, hasSink,
+			attnStart, pos, scale, config.AttnLogitSoftcap, alibiSlope, sink, hasSink,
 			buf.AttnOut[outOff:outOff+valueDim])
 	}
 }
@@ -2752,7 +2961,8 @@ func applyPreparedRope(vec []float32, headDim, nHeads, half, nCache int, sin, co
 
 func ropeInterleaved(arch string) bool {
 	switch arch {
-	case "llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "smollm3", "internlm2":
+	case "llama", "llama2", "llama3", "mistral", "mistral3", "mixtral", "ministral", "smollm3", "internlm2",
+		"chatglm", "glm4", "gptj", "command-r", "minicpm", "granite", "granitemoe":
 		return true
 	default:
 		return false
@@ -3008,10 +3218,10 @@ const groupedGQADecodeMinContext = 4096
 // on the dev laptop the two-pass form is ~1.15x faster at 4k-16k context
 // and numerically it uses the true maximum rather than a running one.
 func onlineAttention(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
-	onlineAttentionWithSink(query, keys, values, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, false, out)
+	onlineAttentionWithSink(query, keys, values, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, 0, 0, false, out)
 }
 
-func onlineAttentionWithSink(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
+func onlineAttentionWithSink(query, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, alibiSlope, sink float32, hasSink bool, out []float32) {
 	span := endT - startT + 1
 	if span <= 0 {
 		return
@@ -3026,7 +3236,7 @@ func onlineAttentionWithSink(query, keys, values []float32, keyStride, valueStri
 		if kOff+keyHeadDim > len(keys) {
 			break
 		}
-		scores[n] = DotF32(query, keys[kOff:kOff+keyHeadDim]) * scale
+		scores[n] = DotF32(query, keys[kOff:kOff+keyHeadDim])*scale + alibiSlope*float32(t-endT)
 		n++
 	}
 	weightedVSumWithSink(scores[:n], values, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)

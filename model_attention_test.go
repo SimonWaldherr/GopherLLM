@@ -161,7 +161,7 @@ func TestParallelAttendHeadsMatchesDirectLoop(t *testing.T) {
 	for h := 0; h < nHeads; h++ {
 		off := h * headDim
 		cache.attendHeadWithSink(0, h, q[off:off+headDim], headDim, headDim,
-			0, ctx-1, scale, 0, layer.AttnSinks[h], true, want[off:off+headDim])
+			0, ctx-1, scale, 0, 0, layer.AttnSinks[h], true, want[off:off+headDim])
 	}
 
 	buf := &DecodeBuffer{Q: q, AttnOut: make([]float32, len(want))}

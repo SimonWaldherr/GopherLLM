@@ -106,7 +106,7 @@ func setKVI8(on bool) { useI8KVCache.Store(on) }
 // correct KV head's byte offset (q8RowBytes(kvH*keyHeadDim), see
 // attendHeadWithSink) — keyStride/valueStride stay in element units exactly
 // as for f32/f16 and are converted to Q8_0 byte strides internally.
-func onlineAttentionI8WithSink(query []float32, keys8, values8 []byte, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, sink float32, hasSink bool, out []float32) {
+func onlineAttentionI8WithSink(query []float32, keys8, values8 []byte, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap, alibiSlope, sink float32, hasSink bool, out []float32) {
 	span := endT - startT + 1
 	if span <= 0 {
 		return
@@ -124,7 +124,7 @@ func onlineAttentionI8WithSink(query []float32, keys8, values8 []byte, keyStride
 		if kOff8+keyBlockBytes > len(keys8) {
 			break
 		}
-		scores[n] = DotQ8_0F32(keys8[kOff8:kOff8+keyBlockBytes], query, keyHeadDim) * scale
+		scores[n] = DotQ8_0F32(keys8[kOff8:kOff8+keyBlockBytes], query, keyHeadDim)*scale + alibiSlope*float32(t-endT)
 		n++
 	}
 	weightedVSumEitherWithSink(scores[:n], nil, nil, values8, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
