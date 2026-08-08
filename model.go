@@ -79,12 +79,12 @@ type Config struct {
 	// restricts the sliding window to layers whose entry is true (Gemma 4
 	// ships it as bool-array metadata; Gemma 2's alternating pattern is
 	// synthesized); nil means SlidingWindow applies to every layer.
-	UseGELU           bool
+	UseGELU bool
 	// UseExactGELU selects erf-based exact GELU over the tanh approximation
 	// for architectures whose FFN is plain (see usesPlainMLP): Phi-2 uses
 	// exact GELU; GPT-2/GPT-NeoX/GPT-J/BLOOM/MPT/StarCoder/StarCoder2 use
 	// the tanh approximation ("gelu_new"/"gelu_pytorch_tanh") instead.
-	UseExactGELU      bool
+	UseExactGELU bool
 	// ALiBiMaxBias configures BLOOM/MPT's additive per-head linear
 	// attention-score bias (see Config.usesALiBi); zero means disabled.
 	ALiBiMaxBias      float32
@@ -171,6 +171,17 @@ func deepSeek2Family(arch string) bool {
 	return arch == "deepseek2" || arch == "kimi_k2"
 }
 
+// usesUngatedSharedExpert reports architectures whose sparse-MoE layers have
+// an always-on shared expert added directly to the routed output, with no
+// sigmoid/softmax gate of its own — as opposed to Qwen2-MoE's shared expert,
+// which is gated by its own router logit (ffn_gate_inp_shexp). GraniteMoE
+// shares this mechanism with the DeepSeek2 family despite being otherwise
+// unrelated to it, so this is deliberately its own helper rather than folded
+// into deepSeek2Family.
+func usesUngatedSharedExpert(arch string) bool {
+	return deepSeek2Family(arch) || arch == "granitemoe"
+}
+
 // layerUsesSWA reports whether layer il attends with the sliding window (true)
 // or over the full context (false, or when no window is configured).
 func (c Config) layerUsesSWA(il int) bool {
@@ -222,6 +233,37 @@ func (c Config) usesPostNormOnly() bool {
 // identical (if slightly redundant) result for both Falcon sizes.
 func (c Config) sharesParallelBranchNorm() bool {
 	return c.ParallelResidual && (c.Arch == "phi2" || c.Arch == "stablelm" || c.Arch == "gptj" || c.Arch == "command-r")
+}
+
+// usesLayerNorm reports whether this architecture normalizes with
+// mean/variance LayerNorm instead of RMSNorm. This single list is the source
+// of truth for both Config.UseLayerNorm and which architectures read their
+// epsilon from the "*.attention.layer_norm_epsilon" key instead of the
+// generic RMS one (see the switch in ConfigFromGGUF) — the two questions
+// have the same answer for every architecture GopherLLM supports, so a
+// single helper keeps them from silently drifting apart.
+func usesLayerNorm(arch string) bool {
+	switch arch {
+	case "stablelm", "phi2", "gpt2", "gptneox", "gptj", "bloom", "mpt", "falcon", "starcoder", "starcoder2", "command-r":
+		return true
+	default:
+		return false
+	}
+}
+
+// forcesParallelResidual reports architectures whose parallel-residual block
+// structure (attention and FFN both computed from the same input, summed
+// into one residual add) is an architectural constant rather than a
+// per-checkpoint GGUF flag. Contrast with the generic
+// "{arch}.use_parallel_residual" key read earlier in ConfigFromGGUF, which
+// covers GPT-NeoX/StableLM-style architectures where it varies by file.
+func forcesParallelResidual(arch string) bool {
+	switch arch {
+	case "phi2", "gptj", "falcon", "command-r":
+		return true
+	default:
+		return false
+	}
 }
 
 // usesAbsolutePositionEmbd reports whether this architecture positions
@@ -369,10 +411,9 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		}
 	}
 	normEps := gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5)
-	switch p {
-	case "stablelm", "phi2", "gpt2", "gptneox", "gptj", "bloom", "mpt", "falcon", "starcoder", "starcoder2", "command-r":
-		// These architectures use mean/variance LayerNorm (with an explicit
-		// epsilon key of its own) rather than RMSNorm.
+	if usesLayerNorm(p) {
+		// LayerNorm architectures carry an explicit epsilon key of their own
+		// rather than the generic RMSNorm one.
 		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
 	}
 	hiddenDim := int(gguf.GetU32(p+".feed_forward_length", 0))
@@ -428,14 +469,12 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		RopeYarnBetaFast:          gguf.GetF32(p+".rope.scaling.yarn_beta_fast", 32),
 		RopeYarnBetaSlow:          gguf.GetF32(p+".rope.scaling.yarn_beta_slow", 1),
 		RopeYarnLogMultiplier:     gguf.GetF32(p+".rope.scaling.yarn_log_multiplier", 1),
-		UseLayerNorm: arch == "stablelm" || arch == "phi2" || arch == "gpt2" || arch == "gptneox" ||
-			arch == "gptj" || arch == "bloom" || arch == "mpt" || arch == "falcon" ||
-			arch == "starcoder" || arch == "starcoder2" || arch == "command-r",
-		ParallelResidual:  parallelResidual || arch == "phi2" || arch == "gptj" || arch == "falcon" || arch == "command-r",
-		UseGELU:           gemmaFamily(arch) || arch == "phi2",
-		UseExactGELU:      arch == "phi2",
-		ALiBiMaxBias:      aLiBiMaxBias(gguf, arch, p),
-		AttnLogitSoftcap:  gguf.GetF32(p+".attn_logit_softcapping", 0),
+		UseLayerNorm:              usesLayerNorm(arch),
+		ParallelResidual:          parallelResidual || forcesParallelResidual(arch),
+		UseGELU:                   gemmaFamily(arch) || arch == "phi2",
+		UseExactGELU:              arch == "phi2",
+		ALiBiMaxBias:              aLiBiMaxBias(gguf, p),
+		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
 		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
@@ -470,41 +509,13 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 			cfg.QwenRecurrentLayers, _ = v.AsBoolArray()
 		}
 	}
-	if p == "command-r" {
-		// llama.cpp's Command-R graph multiplies logits by the raw GGUF
-		// value directly; the generic path below divides by Config.LogitScale,
-		// so store the reciprocal to reproduce the same multiply.
-		if cfg.LogitScale != 0 {
-			cfg.LogitScale = 1 / cfg.LogitScale
-		}
-	}
-	if p == "minicpm" {
-		// Older MiniCPM 1B/2B exports omit these three keys entirely;
-		// llama.cpp substitutes these exact hardcoded defaults rather than
-		// leaving the multipliers inert at 1.
-		if _, ok := gguf.Metadata[p+".embedding_scale"]; !ok {
-			cfg.EmbeddingScale = 12.0
-		}
-		if _, ok := gguf.Metadata[p+".residual_scale"]; !ok && cfg.NLayers > 0 {
-			cfg.ResidualScale = float32(1.4 / math.Sqrt(float64(cfg.NLayers)))
-		}
-		if _, ok := gguf.Metadata[p+".logit_scale"]; !ok && dim > 0 {
-			cfg.LogitScale = 256.0 / float32(dim)
-		}
-	}
-	if p == "minicpm3" {
-		// MiniCPM3 never writes these three keys at all; llama.cpp hardcodes
-		// them directly in its graph (its own source carries a "TODO: if the
-		// model varies, these need to be read from the model" comment).
-		cfg.EmbeddingScale = 12.0
-		if cfg.NLayers > 0 {
-			cfg.ResidualScale = float32(1.4 / math.Sqrt(float64(cfg.NLayers)))
-		}
-		if dim > 0 {
-			// The reference graph multiplies logits by 256/n_embd; store the
-			// reciprocal so the generic 1/LogitScale apply reproduces it.
-			cfg.LogitScale = float32(dim) / 256.0
-		}
+	switch p {
+	case "command-r":
+		applyCommandRLogitScale(&cfg)
+	case "minicpm":
+		applyMiniCPMScaleDefaults(&cfg, gguf, p, dim)
+	case "minicpm3":
+		applyMiniCPM3HardcodedScales(&cfg, dim)
 	}
 	if p == "exaone4" {
 		// EXAONE 4 rotates only its SWA blocks, so the optional SWA-specific
@@ -523,12 +534,57 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	return cfg
 }
 
+// applyCommandRLogitScale corrects the direction of Command-R's logit_scale.
+// llama.cpp's graph multiplies logits by the raw GGUF value directly; the
+// generic path in ProjectLogitsInto divides by Config.LogitScale, so this
+// stores the reciprocal to reproduce the same multiply.
+func applyCommandRLogitScale(cfg *Config) {
+	if cfg.LogitScale != 0 {
+		cfg.LogitScale = 1 / cfg.LogitScale
+	}
+}
+
+// applyMiniCPMScaleDefaults fills MiniCPM's three multiplier fields with
+// llama.cpp's exact hardcoded defaults whenever the corresponding GGUF key
+// is absent — older MiniCPM 1B/2B exports omit them entirely rather than
+// writing an explicit 1/0.
+func applyMiniCPMScaleDefaults(cfg *Config, gguf *GGUFFile, p string, dim int) {
+	if _, ok := gguf.Metadata[p+".embedding_scale"]; !ok {
+		cfg.EmbeddingScale = 12.0
+	}
+	if _, ok := gguf.Metadata[p+".residual_scale"]; !ok && cfg.NLayers > 0 {
+		cfg.ResidualScale = float32(1.4 / math.Sqrt(float64(cfg.NLayers)))
+	}
+	if _, ok := gguf.Metadata[p+".logit_scale"]; !ok && dim > 0 {
+		cfg.LogitScale = 256.0 / float32(dim)
+	}
+}
+
+// applyMiniCPM3HardcodedScales sets MiniCPM3's three multiplier fields
+// unconditionally: unlike MiniCPM, its GGUF never writes these keys at all,
+// so llama.cpp hardcodes them directly in its graph (its own source carries
+// a "TODO: if the model varies, these need to be read from the model"
+// comment acknowledging this is a one-checkpoint-family simplification).
+// The logit multiply is stored as its reciprocal so the generic
+// 1/Config.LogitScale apply in ProjectLogitsInto reproduces it.
+func applyMiniCPM3HardcodedScales(cfg *Config, dim int) {
+	cfg.EmbeddingScale = 12.0
+	if cfg.NLayers > 0 {
+		cfg.ResidualScale = float32(1.4 / math.Sqrt(float64(cfg.NLayers)))
+	}
+	if dim > 0 {
+		cfg.LogitScale = float32(dim) / 256.0
+	}
+}
+
 // aLiBiMaxBias returns the ALiBi max-bias value (0 disables ALiBi). BLOOM
 // hardcodes 8.0 unconditionally (llama.cpp does not read it from any GGUF
 // key for this arch); MPT reads it from an explicit key that is 0 whenever
-// the source checkpoint had ALiBi disabled.
-func aLiBiMaxBias(gguf *GGUFFile, arch, p string) float32 {
-	switch arch {
+// the source checkpoint had ALiBi disabled. Neither architecture has a
+// namespace alias, so the GGUF metadata prefix p is also the public
+// architecture label here.
+func aLiBiMaxBias(gguf *GGUFFile, p string) float32 {
+	switch p {
 	case "bloom":
 		return 8.0
 	case "mpt":
@@ -1156,7 +1212,7 @@ type LayerWeights struct {
 }
 
 type ModelWeights struct {
-	TokenEmbd      Weight
+	TokenEmbd Weight
 	// PositionEmbd is the learned absolute position-embedding table used by
 	// GPT-2 and StarCoder (v1): its row at each sequence position is added to
 	// the token embedding once, before layer 0. Zero-valued (Rows==0, F32
@@ -1477,7 +1533,7 @@ func (c *KVCache) attendHeadGroup(l, kvH int, queries []float32, queryHeads, key
 // activation slabs. Not safe for concurrent use; Runner.genLock serializes
 // requests.
 type DecodeBuffer struct {
-	X        []float32
+	X []float32
 	// PosEmbd is scratch space for the gathered absolute-position-embedding
 	// row (GPT-2/StarCoder v1 only; see Config.usesAbsolutePositionEmbd).
 	PosEmbd  []float32
@@ -1925,31 +1981,36 @@ func validateGemma4DenseLayout(config Config, tensors map[string]TensorInfo) err
 	return nil
 }
 
+// loadFalconNorms resolves Falcon's attn_norm/attn_norm_2 aliasing. 7B
+// checkpoints carry one LayerNorm (attn_norm) that feeds both the attention
+// and FFN branches; 40B/180B ("new decoder architecture") checkpoints carry
+// a second attn_norm_2 that — despite the naming — feeds the ATTENTION
+// branch, leaving the base attn_norm feeding FFN. See
+// Config.sharesParallelBranchNorm's doc comment for why this is handled here
+// as tensor aliasing rather than as a forward-pass special case.
+func loadFalconNorms(data []byte, dataOffset int, prefix string, tensors map[string]TensorInfo, inferred map[string]int) (attnNorm, ffnNorm []float32, err error) {
+	base, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, hasNorm2 := tensors[prefix+"attn_norm_2.weight"]; hasNorm2 {
+		attnNorm, err = loadF32Vec(data, dataOffset, prefix+"attn_norm_2.weight", tensors, inferred)
+		if err != nil {
+			return nil, nil, err
+		}
+		return attnNorm, base, nil
+	}
+	return base, base, nil
+}
+
 func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal, lazyScalarWeights bool, qRows, kRows, vRows int) (LayerWeights, error) {
 	prefix := fmt.Sprintf("blk.%d.", l)
-	var attnNorm []float32
+	var attnNorm, falconFFNNorm []float32
 	var err error
-	// Falcon's FFN input norm is never its own tensor: 7B checkpoints reuse
-	// the single attn_norm for both branches, while 40B/180B ("new decoder
-	// architecture") carry a second attn_norm_2 that — despite the naming —
-	// feeds the ATTENTION branch, leaving the base attn_norm feeding FFN. See
-	// Config.sharesParallelBranchNorm's doc comment for why this is handled
-	// here (tensor aliasing) rather than as a forward-pass special case.
-	var falconFFNNorm []float32
 	if config.Arch == "falcon" {
-		base, err := loadF32Vec(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)
+		attnNorm, falconFFNNorm, err = loadFalconNorms(data, dataOffset, prefix, tensors, inferred)
 		if err != nil {
 			return LayerWeights{}, err
-		}
-		if _, hasNorm2 := tensors[prefix+"attn_norm_2.weight"]; hasNorm2 {
-			attnNorm, err = loadF32Vec(data, dataOffset, prefix+"attn_norm_2.weight", tensors, inferred)
-			if err != nil {
-				return LayerWeights{}, err
-			}
-			falconFFNNorm = base
-		} else {
-			attnNorm = base
-			falconFFNNorm = base
 		}
 	} else if config.usesPostNormOnly() {
 		attnNorm = loadOptionalF32VecNil(data, dataOffset, prefix+"attn_norm.weight", tensors, inferred)

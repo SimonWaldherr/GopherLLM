@@ -327,7 +327,7 @@ func loadSparseMoEWeights(data []byte, dataOffset int, prefix string, cfg Config
 		return nil, err
 	}
 
-	if deepSeek2Family(cfg.Arch) || cfg.Arch == "granitemoe" {
+	if usesUngatedSharedExpert(cfg.Arch) {
 		// Kimi, DeepSeek-V2/V3, and GraniteMoE all use a plain, always-on
 		// shared SwiGLU expert added unweighted to the routed output. There
 		// is intentionally no ffn_gate_inp_shexp routing/gating tensor.
