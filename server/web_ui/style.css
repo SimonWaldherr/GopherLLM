@@ -528,6 +528,10 @@ h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; }
 .status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ok); }
 .status.busy .status-dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+/* Steady (not pulsing) accent, distinct from both "Ready" (--ok green) and
+   "busy" (pulsing accent): having no model loaded yet is an expected setup
+   step, not an error, so this deliberately avoids --stop's alarm red. */
+.status.no-model .status-dot { background: var(--accent); }
 .icon-button {
   display: grid; place-items: center; width: 33px; height: 33px; min-width: 0; min-height: 0;
   border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel); color: var(--ink);
@@ -552,6 +556,18 @@ body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; col
 .empty p { max-width: 440px; margin: 0 auto; }
 .empty .hint { font-size: var(--fs-sm); }
 .suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--sp-2); margin: var(--sp-5) 0 var(--sp-4); }
+/* Both the "ready to chat" and "no model loaded" variants stay in the DOM
+   at all times (see chat.html) so the suggestion buttons' click handlers,
+   wired once at page init, never get destroyed by rebuilding this markup —
+   only the data-has-model attribute below decides which one is visible. */
+.empty[data-has-model="true"] .empty-no-model { display: none; }
+.empty[data-has-model="false"] .empty-ready { display: none; }
+.empty-cta {
+  min-height: 40px; margin-top: var(--sp-3); padding: 0 var(--sp-5); border: 1px solid transparent; border-radius: var(--r-pill);
+  background: var(--accent); color: var(--accent-ink); font-size: var(--fs-sm); font-weight: 700;
+  transition: transform .15s, filter .15s;
+}
+.empty-cta:hover { filter: brightness(1.06); transform: translateY(-1px); }
 .suggestion {
   min-width: 0; min-height: 36px; padding: 0 var(--sp-3); border: 1px solid var(--line-strong); border-radius: var(--r-pill);
   background: var(--panel); color: var(--ink); box-shadow: var(--shadow); font-size: var(--fs-sm); font-weight: 600;

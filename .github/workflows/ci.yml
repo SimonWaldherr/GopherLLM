@@ -47,3 +47,18 @@ jobs:
 
       - name: Build all release targets
         run: make cross-build
+
+  wasm-build:
+    name: Wasm build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build the browser wasm module
+        run: make wasm-build

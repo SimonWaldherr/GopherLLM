@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GopherLLM wasm harness</title>
+<style>
+  body { font: 14px/1.5 monospace; margin: 2rem; background: #111; color: #ddd; }
+  h1 { font-size: 1.1rem; }
+  #log { white-space: pre-wrap; background: #000; color: #8f8; padding: 1rem; min-height: 6rem; }
+  #output { white-space: pre-wrap; background: #000; color: #fff; padding: 1rem; }
+  #status.pass { color: #0f0; font-weight: bold; }
+  #status.fail { color: #f00; font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>GopherLLM wasm harness (Phase A: CPU-only, no WebGPU yet)</h1>
+<p>Loads gopherllm.wasm, a tiny synthetic mistral3 GGUF, and runs one greedy
+generation. Compares the result against the known-correct native output.</p>
+<div>status: <span id="status">running...</span></div>
+<h2>log</h2>
+<div id="log"></div>
+<h2>output</h2>
+<div id="output"></div>
+<script src="/bin/wasm_exec.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

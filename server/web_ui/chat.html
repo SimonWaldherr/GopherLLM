@@ -82,16 +82,23 @@
 
     <main id="scroll" aria-label="Conversation">
       <div class="messages" id="messages" role="log" aria-label="Message history" aria-live="off" aria-relevant="additions">
-        <div class="empty" id="empty">
+        <div class="empty" id="empty" data-has-model="{{.HasModel}}">
           <div class="empty-mark" aria-hidden="true">✦</div>
-          <div class="empty-title">Your private local workspace</div>
-          <p>Prompts are sent only to this GopherLLM server. Your chat history stays in this browser.</p>
-          <div class="suggestions" aria-label="Try a prompt">
-            <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms.">Explain a concept</button>
-            <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email.">Draft an email</button>
-            <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n">Review code</button>
+          <div class="empty-ready">
+            <div class="empty-title">Your private local workspace</div>
+            <p>Prompts are sent only to this GopherLLM server. Your chat history stays in this browser.</p>
+            <div class="suggestions" aria-label="Try a prompt">
+              <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms.">Explain a concept</button>
+              <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email.">Draft an email</button>
+              <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n">Review code</button>
+            </div>
+            <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
           </div>
-          <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
+          <div class="empty-no-model">
+            <div class="empty-title">No model loaded yet</div>
+            <p>Pick a GGUF from your model directory, or download one from Hugging Face, to get started.</p>
+            <button type="button" class="empty-cta" id="emptyChooseModel">Choose a model</button>
+          </div>
         </div>
       </div>
       <button id="jumpLatest" class="jump-latest" type="button" hidden>Jump to latest <svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></button>

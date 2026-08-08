@@ -40,8 +40,13 @@ var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
 var inferenceRequestSeq atomic.Uint64
 
 type chatTemplateData struct {
-	Title         string
-	Model         string
+	Title string
+	Model string
+	// HasModel is false exactly when Model has already been replaced with
+	// the "No model selected" placeholder below — the template uses it to
+	// render the first-contact empty state honestly instead of showing the
+	// same "ready to chat" welcome screen whether or not a model is loaded.
+	HasModel      bool
 	MaxTokens     int
 	Temperature   float32
 	TopP          float32
@@ -1309,12 +1314,14 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			setChatUIHeaders(w, mermaid)
 			w.Header().Set("content-type", "text/html; charset=utf-8")
 			model := modelID(state.get())
-			if model == "" {
+			hasModel := model != ""
+			if !hasModel {
 				model = "No model selected"
 			}
 			data := chatTemplateData{
 				Title:         "GopherLLM Chat",
 				Model:         model,
+				HasModel:      hasModel,
 				MaxTokens:     opts.Defaults.MaxTokens,
 				Temperature:   opts.Defaults.Sampler.Temperature,
 				TopP:          opts.Defaults.Sampler.TopP,

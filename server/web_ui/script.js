@@ -1161,6 +1161,13 @@ function toMarkdown(chat) {
   let loadingModel = false;
   let loadingModelID = "";
   let modelCatalog = [];
+  // hasActiveModel drives the first-contact empty state and the idle status
+  // text: it starts from the server-rendered truth (chat.html's
+  // data-has-model, set from chatTemplateData.HasModel) so there is no flash
+  // of "Ready" before the first /models fetch resolves, then gets kept in
+  // sync by renderModelLibrary() whenever the model list is refreshed.
+  let hasActiveModel = emptyEl.dataset.hasModel === "true";
+  setIdleStatus();
   let pendingModelRetry = null;
   let modelDownloadBusy = false;
   let modelDownloadController = null;
@@ -1306,6 +1313,31 @@ function toMarkdown(chat) {
 
   function setStatus(text) {
     statusTextEl.textContent = text;
+  }
+
+  // setIdleStatus is what every "an operation just finished" call site should
+  // use instead of setStatus("Ready") directly: idle only truly means ready
+  // when a model is actually loaded, otherwise it means the honest opposite.
+  function setIdleStatus() {
+    setStatus(hasActiveModel ? "Ready" : "No model loaded");
+    statusEl.classList.toggle("no-model", !hasActiveModel);
+  }
+
+  // renderEmptyState toggles the first-contact welcome screen between its
+  // normal "ready to chat" content and a "no model loaded yet" call to
+  // action. Both variants stay in the DOM at all times (see chat.html) so
+  // this never has to rebuild — and never has to re-wire — the suggestion
+  // buttons' click handlers, which are attached once at page init.
+  function renderEmptyState(hasModel) {
+    emptyEl.dataset.hasModel = hasModel ? "true" : "false";
+  }
+
+  // openModelPicker jumps straight to Settings' Model tab, the one place a
+  // GGUF gets chosen or downloaded. Shared by the first-contact empty state,
+  // the "no model loaded" send-error action, and changeModelForMessage.
+  function openModelPicker(opener) {
+    setSettingsTab("model");
+    openSettings(modelSearchEl, opener);
   }
 
   /* "system" means: set no data-theme at all, so the prefers-color-scheme
@@ -1777,7 +1809,8 @@ function toMarkdown(chat) {
     sendEl.classList.toggle("stop", value);
     sendEl.setAttribute("aria-label", value ? "Stop generating" : "Send message");
     statusEl.classList.toggle("busy", value);
-    setStatus(value ? "Thinking…" : "Ready");
+    if (value) setStatus("Thinking…");
+    else setIdleStatus();
   }
 
   function addMessage(role, text, attachments) {
@@ -1991,7 +2024,7 @@ function toMarkdown(chat) {
     el.appendChild(wrap);
   }
 
-  function addRetryAction(el) {
+  function addRetryAction(el, offerModelPicker) {
     const wrap = messageFooter(el);
     const action = document.createElement("button");
     action.className = "message-action";
@@ -1999,6 +2032,18 @@ function toMarkdown(chat) {
     action.textContent = "Retry";
     action.addEventListener("click", () => { if (!busy) generate(); });
     wrap.appendChild(action);
+    // A plain "Retry" is a dead end when the request failed because no
+    // model was loaded at all — retrying reproduces the exact same error.
+    // Offer the one action that actually fixes it, right next to Retry.
+    if (offerModelPicker) {
+      const chooseModel = document.createElement("button");
+      chooseModel.className = "message-action message-change-model";
+      chooseModel.type = "button";
+      chooseModel.textContent = "Choose a model";
+      chooseModel.setAttribute("aria-label", "Open settings to choose a model");
+      chooseModel.addEventListener("click", () => openModelPicker(chooseModel));
+      wrap.appendChild(chooseModel);
+    }
     el.appendChild(wrap);
   }
 
@@ -2680,7 +2725,7 @@ function toMarkdown(chat) {
       save();
       lastContextWindow = contextWindowFromValue(result.contextWindow, chat);
       updateComposer(false);
-      setStatus("Ready");
+      setIdleStatus();
     } catch (error) {
       streamFinished = true;
       lastContextWindow = null;
@@ -2700,8 +2745,9 @@ function toMarkdown(chat) {
         showToast("Generation stopped");
       } else {
         assistantEl.remove();
-        const errorEl = addMessage("error", "Error: " + (error && error.message ? error.message : "Request failed"));
-        addRetryAction(errorEl);
+        const errorMessage = error && error.message ? error.message : "Request failed";
+        const errorEl = addMessage("error", "Error: " + errorMessage);
+        addRetryAction(errorEl, /no model is loaded/i.test(errorMessage));
         showToast("The answer could not be generated. Retry the last message.", "error");
       }
     } finally {
@@ -2774,8 +2820,7 @@ function toMarkdown(chat) {
     if (!chat || !chat.messages[index] || chat.messages[index].role !== "assistant") return;
     if (!chat.messages.slice(0, index).some((message) => message.role === "user")) return;
     pendingModelRetry = { chatID: chat.id, index };
-    setSettingsTab("model");
-    openSettings(modelSearchEl, opener);
+    openModelPicker(opener);
     showToast("Choose another model to regenerate the same question.", "success");
   }
 
@@ -2908,6 +2953,15 @@ function toMarkdown(chat) {
     const active = chatModels.find((model) => model.loaded);
     const loading = chatModels.find((model) => model.id === loadingModelID);
     renderActiveModelSummary(loading || active || null, loading ? "loading" : "loaded");
+    renderEmptyState(Boolean(active));
+    if (hasActiveModel !== Boolean(active)) {
+      hasActiveModel = Boolean(active);
+      // Loading/thinking/tuning already show their own status text; only
+      // reassert the idle text when the page is actually idle, so this
+      // refresh (which can run at any time, e.g. after a poll) never stomps
+      // a status message that is currently accurate for a different reason.
+      if (!busy && !tuning && !loadingModel) setIdleStatus();
+    }
   }
 
   function filterModelOptions() {
@@ -2921,7 +2975,7 @@ function toMarkdown(chat) {
       const data = await response.json();
       if (!data.models || !data.models.length) {
         modelLibraryEl.setAttribute("aria-busy", "false");
-        modelLibraryEl.querySelector(".model-library-empty").textContent = "No GGUF models found in the configured model directory.";
+        modelLibraryEl.querySelector(".model-library-empty").textContent = "No GGUF models found in the configured model directory. Download one below to get started.";
         modelResultCountEl.textContent = "0 models";
         return;
       }
@@ -3374,7 +3428,7 @@ function toMarkdown(chat) {
       addActions(assistantEl, stored, chat.messages.length - 1);
       touch(chat);
       save();
-      setStatus("Ready");
+      setIdleStatus();
     } catch (error) {
       assistantEl.remove();
       if (error && error.name === "AbortError") showToast("Expert run stopped");
@@ -3525,7 +3579,7 @@ function toMarkdown(chat) {
       addActions(assistantEl, stored, chat.messages.length - 1);
       touch(chat);
       save();
-      setStatus("Ready");
+      setIdleStatus();
     } catch (error) {
       if (error && error.name === "AbortError") {
         if (best) {
@@ -3735,7 +3789,7 @@ function toMarkdown(chat) {
       batchController = null;
       setBatchRunning(false);
       statusEl.classList.remove("busy");
-      setStatus("Ready");
+      setIdleStatus();
       renderBatchResults();
     }
   }
@@ -4003,7 +4057,7 @@ function toMarkdown(chat) {
       updateComposer(false);
       renderChatList();
       save();
-      setStatus("Ready");
+      setIdleStatus();
       loadAutoTuneStatus();
     } catch (error) {
       if (previous) modelSelectEl.value = previous.value;
@@ -4055,7 +4109,7 @@ function toMarkdown(chat) {
       modelSelectEl.disabled = modelSelectWasDisabled;
       renderModelLibrary();
       statusEl.classList.remove("busy");
-      setStatus("Ready");
+      setIdleStatus();
       updateComposer(false);
     }
   });
@@ -4188,6 +4242,8 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
+  const emptyChooseModelEl = $("emptyChooseModel");
+  if (emptyChooseModelEl) emptyChooseModelEl.addEventListener("click", (event) => openModelPicker(event.currentTarget));
   [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, skillsToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
