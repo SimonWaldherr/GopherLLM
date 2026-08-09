@@ -698,6 +698,68 @@ const PERSONAS = {
   translator: "You are a precise translator. Preserve meaning, tone, formatting, names, and technical terms. Return only the translation unless asked otherwise."
 };
 
+/* A workflow is a practical starting point for a job, not a second hidden
+   model configuration. Every value is still editable in Settings, and the
+   selected profile is stored with the chat so a reopened conversation keeps
+   the same intent. The conservative defaults are deliberate: research
+   explicitly opts into the bounded retrieval tools, while coding/vision keep
+   their output focused and cheap to decode. */
+const WORKFLOWS = {
+  custom: {
+    label: "Custom / current settings",
+    description: "Keep the current persona, sampler, context, and tool settings.",
+  },
+  general: {
+    label: "General assistant",
+    description: "Questions, planning, explanations, and everyday tasks.",
+    persona: "general",
+    systemPrompt: PERSONAS.general,
+    settings: { maxTokens: 768, temperature: .55, topP: .9, topK: 40, minP: 0, repeatPenalty: 1.1, contextWindowMode: "recent", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: true }
+  },
+  coding: {
+    label: "Coding & development",
+    description: "Code review, debugging, implementation plans, and safe patches.",
+    persona: "code",
+    systemPrompt: PERSONAS.code + " Prefer small, testable changes. When repository context is missing, ask for the relevant files instead of inventing APIs.",
+    settings: { maxTokens: 1536, temperature: .2, topP: .9, topK: 40, minP: .05, repeatPenalty: 1.08, contextWindowMode: "autoCompress", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: true }
+  },
+  research: {
+    label: "Research & fact-checking",
+    description: "Evidence-oriented answers with source-aware uncertainty and retrieval tools.",
+    persona: "general",
+    systemPrompt: PERSONAS.general + " Separate established facts, retrieved evidence, and inference. Name sources when tools provide them and never pretend an unavailable source was checked.",
+    settings: { maxTokens: 1024, temperature: .3, topP: .9, topK: 40, minP: .05, repeatPenalty: 1.1, contextWindowMode: "autoCompress", ragMode: true, wikimediaTools: true, openStreetMapTools: true, skillsTools: true }
+  },
+  writing: {
+    label: "Writing & ideation",
+    description: "Drafting, editing, brainstorming, and adapting tone while preserving your voice.",
+    persona: "writer",
+    systemPrompt: PERSONAS.writer,
+    settings: { maxTokens: 1200, temperature: .85, topP: .95, topK: 50, minP: 0, repeatPenalty: 1.05, contextWindowMode: "recent", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: false }
+  },
+  translation: {
+    label: "Translation",
+    description: "Faithful translation with terminology, formatting, and tone preserved.",
+    persona: "translator",
+    systemPrompt: PERSONAS.translator,
+    settings: { maxTokens: 1024, temperature: .15, topP: .9, topK: 30, minP: 0, repeatPenalty: 1.08, contextWindowMode: "recent", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: false }
+  },
+  vision: {
+    label: "Vision & scene description",
+    description: "Short, grounded descriptions, OCR prompts, and webcam/live-frame questions.",
+    persona: "general",
+    systemPrompt: PERSONAS.general + " For images, describe only visible evidence, distinguish readable text from guesses, and keep the answer concise. Ask for an image when none is attached.",
+    settings: { maxTokens: 512, temperature: .2, topP: .9, topK: 30, minP: 0, repeatPenalty: 1.05, contextWindowMode: "recent", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: false }
+  },
+  extraction: {
+    label: "Structured extraction",
+    description: "Batch files, support tickets, logs, and tables with consistent, compact output.",
+    persona: "general",
+    systemPrompt: PERSONAS.general + " Extract only what is present in the input. Follow the requested schema exactly, use null for missing values, and return no markdown unless requested.",
+    settings: { maxTokens: 768, temperature: .1, topP: .9, topK: 20, minP: 0, repeatPenalty: 1.1, contextWindowMode: "autoCompress", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: false }
+  }
+};
+
 function makeID() {
   if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
   return "chat-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
@@ -797,7 +859,7 @@ function newChat(defaults) {
   const now = Date.now();
   return {
     id: makeID(), title: "New chat", titleManual: false, createdAt: now, updatedAt: now,
-    model: "", persona: "custom", systemPrompt: "", draft: "", pinned: false,
+    model: "", workflow: "custom", persona: "custom", systemPrompt: "", draft: "", pinned: false,
     settings: cleanSettings({}, defaults), messages: []
   };
 }
@@ -813,6 +875,7 @@ function cleanChat(value, defaults) {
     createdAt: Number.isFinite(value.createdAt) ? value.createdAt : Date.now(),
     updatedAt: Number.isFinite(value.updatedAt) ? value.updatedAt : Date.now(),
     model: typeof value.model === "string" ? value.model.slice(0, 500) : "",
+    workflow: Object.prototype.hasOwnProperty.call(WORKFLOWS, value.workflow) ? value.workflow : "custom",
     persona: Object.prototype.hasOwnProperty.call(PERSONAS, value.persona) ? value.persona : "custom",
     systemPrompt: typeof value.systemPrompt === "string" ? value.systemPrompt.slice(0, 100000) : "",
     draft: typeof value.draft === "string" ? value.draft.slice(0, 100000) : "",
@@ -995,6 +1058,8 @@ function renderTemplate(template, item, index) {
 
 function toMarkdown(chat) {
   const lines = ["# " + chat.title, ""];
+  const workflow = WORKFLOWS[chat.workflow];
+  if (workflow && chat.workflow !== "custom") lines.push("Workflow: " + workflow.label, "");
   if (chat.systemPrompt.trim()) lines.push("## Instructions", "", chat.systemPrompt.trim(), "");
   for (const message of chat.messages) {
     lines.push(message.role === "user" ? "## You" : "## Assistant", "", message.content || "(no text)", "");
@@ -1039,6 +1104,8 @@ function toMarkdown(chat) {
   const composerProToggleEl = $("composerProToggle");
   const composerProPanelEl = $("composerProPanel");
   const composerSettingsEl = $("composerSettings");
+  const workflowSelectEl = $("workflowSelect");
+  const workflowHelpEl = $("workflowHelp");
   const personaEl = $("personaSelect");
   const systemPromptEl = $("systemPrompt");
   const briefingEl = $("briefing");
@@ -1144,9 +1211,16 @@ function toMarkdown(chat) {
   const attachmentTrayEl = $("attachmentTray");
   const attachImageEl = $("attachImage");
   const imageFileInputEl = $("imageFileInput");
+  const cameraCaptureGroupEl = $("cameraCaptureGroup");
+  const cameraCaptureMenuEl = $("cameraCaptureMenu");
+  const cameraCaptureSnapshotEl = $("cameraCaptureSnapshot");
   const webcamButtonEl = $("webcamButton");
   const liveVisionButtonEl = $("liveVisionButton");
+  const screenCaptureGroupEl = $("screenCaptureGroup");
+  const screenCaptureMenuEl = $("screenCaptureMenu");
+  const screenCaptureSnapshotEl = $("screenCaptureSnapshot");
   const screenButtonEl = $("screenButton");
+  const liveScreenButtonEl = $("liveScreenButton");
   const captureErrorEl = $("captureError");
   const imagePreviewRowEl = $("imagePreviewRow");
   const imagePreviewEl = $("imagePreview");
@@ -1165,8 +1239,10 @@ function toMarkdown(chat) {
   const liveSizeValueEl = $("liveSizeValue");
   const livePauseButtonEl = $("livePauseButton");
   const livePromptInputEl = $("livePromptInput");
+  const liveAlertToggleEl = $("liveAlertToggle");
   const livePromptSuggestionsEl = $("livePromptSuggestions");
   const liveOutputPanelEl = $("liveOutputPanel");
+  const liveOutputStatusEl = $("liveOutputStatus");
   const liveOutputTextEl = $("liveOutputText");
   const liveHistoryToggleEl = $("liveHistoryToggle");
   const liveHistoryListEl = $("liveHistoryList");
@@ -1269,6 +1345,8 @@ function toMarkdown(chat) {
   // vision pipeline's v1 boundary -- see cleanMessage's comment.
   let pendingImage = null;
   let activeCaptureStream = null;
+  let captureMode = "camera";
+  let liveCaptureMode = "camera";
   let liveVisionRunning = false;
   let liveVisionPaused = false;
   let liveVisionController = null;
@@ -1281,6 +1359,16 @@ function toMarkdown(chat) {
   let liveStartedAt = 0;
   let liveFrameProgressTimer = null;
   let liveFrameStartedAt = 0;
+  let liveLastAnswer = "";
+  let liveAlertEnabled = false;
+  let liveAlertAudioContext = null;
+  let liveAlertLastAt = 0;
+  // Reused across every captured frame instead of creating a fresh <canvas>
+  // per loop iteration -- a live session can run for many minutes at several
+  // frames a minute, and re-acquiring a 2D context each time is unnecessary
+  // allocation/GC churn for no benefit.
+  let liveFrameCanvasEl = null;
+  let liveFrameCanvasCtx = null;
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
@@ -1840,6 +1928,51 @@ function toMarkdown(chat) {
     }
   }
 
+  function renderWorkflowHelp(workflowID) {
+    if (!workflowHelpEl) return;
+    const workflow = WORKFLOWS[workflowID] || WORKFLOWS.custom;
+    workflowHelpEl.textContent = workflow.description;
+  }
+
+  function applyWorkflow(workflowID, announceChoice = true) {
+    const workflow = WORKFLOWS[workflowID];
+    const chat = activeChat();
+    if (!workflow || !chat) return;
+    workflowSelectEl.value = workflowID;
+    if (workflowID === "custom") {
+      chat.workflow = "custom";
+      renderWorkflowHelp("custom");
+      updateSettings();
+      if (announceChoice) showToast("Custom settings kept.", "success");
+      return;
+    }
+    const settings = workflow.settings;
+    maxTokensEl.value = settings.maxTokens;
+    temperatureEl.value = settings.temperature;
+    topPEl.value = settings.topP;
+    topKEl.value = settings.topK;
+    minPEl.value = settings.minP;
+    repeatPenaltyEl.value = settings.repeatPenalty;
+    seedEl.value = "";
+    stopSequencesEl.value = "";
+    contextWindowModeEl.value = settings.contextWindowMode;
+    // Research can use semantic history when an embedding model is available;
+    // do not show a checked-but-disabled toggle on a text-only installation.
+    ragModeEl.checked = settings.ragMode && !ragModeEl.disabled && Boolean(ragModelEl.value);
+    wikimediaToolsEl.checked = settings.wikimediaTools;
+    openStreetMapToolsEl.checked = settings.openStreetMapTools;
+    if (skillsToolsEl) skillsToolsEl.checked = settings.skillsTools;
+    personaEl.value = workflow.persona;
+    systemPromptEl.value = workflow.systemPrompt;
+    chat.workflow = workflowID;
+    renderWorkflowHelp(workflowID);
+    updateSettings();
+    if (announceChoice) {
+      showToast("Workflow applied: " + workflow.label, "success");
+      announce(workflow.label + " workflow applied.");
+    }
+  }
+
   function syncControls(withDraft) {
     const chat = activeChat();
     if (!chat) return;
@@ -1871,6 +2004,8 @@ function toMarkdown(chat) {
     openStreetMapToolsEl.checked = chat.settings.openStreetMapTools === true;
     if (skillsToolsEl) skillsToolsEl.checked = chat.settings.skillsTools !== false;
     composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
+    workflowSelectEl.value = Object.prototype.hasOwnProperty.call(WORKFLOWS, chat.workflow) ? chat.workflow : "custom";
+    renderWorkflowHelp(workflowSelectEl.value);
     personaEl.value = Object.prototype.hasOwnProperty.call(PERSONAS, chat.persona) ? chat.persona : "custom";
     systemPromptEl.value = chat.systemPrompt;
     updateComposer(false);
@@ -1878,6 +2013,7 @@ function toMarkdown(chat) {
 
   function setBusy(value) {
     busy = value;
+    if (value) closeCaptureMenus();
     modelSelectEl.disabled = value;
     if (modelCatalog.length) renderModelLibrary();
     newChatEl.disabled = value;
@@ -1885,8 +2021,12 @@ function toMarkdown(chat) {
     deleteChatEl.disabled = value;
     attachFileEl.disabled = value;
     attachImageEl.disabled = value;
+    cameraCaptureSnapshotEl.disabled = value;
     webcamButtonEl.disabled = value;
+    liveVisionButtonEl.disabled = value;
+    screenCaptureSnapshotEl.disabled = value;
     screenButtonEl.disabled = value;
+    liveScreenButtonEl.disabled = value;
     briefChatEl.disabled = value;
     shareChatEl.disabled = value;
     composerProToggleEl.disabled = value;
@@ -2213,6 +2353,7 @@ function toMarkdown(chat) {
       createdAt: now,
       updatedAt: now,
       model: source.model,
+      workflow: source.workflow,
       persona: source.persona,
       systemPrompt: source.systemPrompt,
       draft: "",
@@ -3004,7 +3145,9 @@ function toMarkdown(chat) {
     // next request's budget.
     lastContextWindow = null;
     chat.systemPrompt = systemPromptEl.value.slice(0, 100000);
+    chat.workflow = Object.prototype.hasOwnProperty.call(WORKFLOWS, workflowSelectEl.value) ? workflowSelectEl.value : "custom";
     chat.persona = Object.prototype.hasOwnProperty.call(PERSONAS, personaEl.value) ? personaEl.value : "custom";
+    renderWorkflowHelp(chat.workflow);
     tempValueEl.textContent = Number(chat.settings.temperature).toFixed(2);
     composerContextWindowEl.value = chat.settings.contextWindowMode;
     composerMaxTokensEl.value = chat.settings.maxTokens;
@@ -4629,8 +4772,15 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
+  document.querySelectorAll(".workflow-suggestion").forEach((button) => {
+    button.addEventListener("click", () => {
+      applyWorkflow(button.dataset.workflow);
+      promptEl.focus();
+    });
+  });
   const emptyChooseModelEl = $("emptyChooseModel");
   if (emptyChooseModelEl) emptyChooseModelEl.addEventListener("click", (event) => openModelPicker(event.currentTarget));
+  workflowSelectEl.addEventListener("change", () => applyWorkflow(workflowSelectEl.value));
   [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, skillsToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
@@ -4786,44 +4936,89 @@ function toMarkdown(chat) {
     acceptCapturedImage(await readFileAsDataURL(file));
   });
   clearImageButtonEl.addEventListener("click", clearPendingImage);
-  webcamButtonEl.addEventListener("click", async () => {
+  function closeCaptureMenus() {
+    [
+      [cameraCaptureMenuEl, webcamButtonEl],
+      [screenCaptureMenuEl, screenButtonEl]
+    ].forEach(([menu, trigger]) => {
+      menu.hidden = true;
+      trigger.setAttribute("aria-expanded", "false");
+    });
+  }
+
+  function toggleCaptureMenu(menu, trigger) {
+    const opening = menu.hidden;
+    closeCaptureMenus();
+    if (!opening) return;
+    menu.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    const first = menu.querySelector('[role="menuitem"]');
+    if (first) first.focus();
+  }
+
+  // Live vision only ever consumes one downscaled frame every couple hundred
+  // ms (see runLiveVision's sleep(200) pacing and liveFrameSize's 960px cap),
+  // but an unconstrained getUserMedia/getDisplayMedia call keeps decoding a
+  // full-resolution stream at the device's native frame rate the whole time
+  // -- CPU/GPU/battery spent on frames that are thrown away unread. These are
+  // "ideal" hints, not hard caps, so a single high-quality snapshot capture
+  // (the other consumer of these constraints) still gets a sharp frame.
+  const CAMERA_CAPTURE_CONSTRAINTS = { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15, max: 30 } } };
+  const SCREEN_CAPTURE_CONSTRAINTS = { video: { frameRate: { ideal: 5, max: 15 } } };
+
+  webcamButtonEl.addEventListener("click", () => toggleCaptureMenu(cameraCaptureMenuEl, webcamButtonEl));
+  screenButtonEl.addEventListener("click", () => toggleCaptureMenu(screenCaptureMenuEl, screenButtonEl));
+  cameraCaptureSnapshotEl.addEventListener("click", async () => {
+    closeCaptureMenus();
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
       }
-      await openCaptureModal(await navigator.mediaDevices.getUserMedia({ video: true }), webcamButtonEl);
+      await openCaptureModal(await navigator.mediaDevices.getUserMedia(CAMERA_CAPTURE_CONSTRAINTS), webcamButtonEl, "camera");
     } catch (err) {
       showCaptureError(err);
     }
   });
   liveVisionButtonEl.addEventListener("click", async () => {
-    if (liveVisionRunning) {
-      closeCaptureModal();
-      return;
-    }
+    closeCaptureMenus();
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
       }
       // The dedicated Live entry point drops straight into the immersive
-      // view (camera + prompt + streaming output) instead of the plain
-      // snapshot preview -- webcamButton/screenButton still land there
-      // first since a single capture is their whole purpose.
-      await openCaptureModal(await navigator.mediaDevices.getUserMedia({ video: true }), liveVisionButtonEl);
+      // view (camera + prompt + streaming output). The grouped composer
+      // button has already made the capture-vs-live choice at this point.
+      await openCaptureModal(await navigator.mediaDevices.getUserMedia(CAMERA_CAPTURE_CONSTRAINTS), liveVisionButtonEl, "camera");
       runLiveVision();
     } catch (err) {
       showCaptureError(err);
     }
   });
-  screenButtonEl.addEventListener("click", async () => {
+  screenCaptureSnapshotEl.addEventListener("click", async () => {
+    closeCaptureMenus();
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
         throw new Error("Screen capture is unavailable (requires HTTPS or localhost).");
       }
-      await openCaptureModal(await navigator.mediaDevices.getDisplayMedia({ video: true }), screenButtonEl);
+      await openCaptureModal(await navigator.mediaDevices.getDisplayMedia(SCREEN_CAPTURE_CONSTRAINTS), screenButtonEl, "screen");
     } catch (err) {
       showCaptureError(err);
     }
+  });
+  liveScreenButtonEl.addEventListener("click", async () => {
+    closeCaptureMenus();
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        throw new Error("Screen capture is unavailable (requires HTTPS or localhost).");
+      }
+      await openCaptureModal(await navigator.mediaDevices.getDisplayMedia(SCREEN_CAPTURE_CONSTRAINTS), liveScreenButtonEl, "screen");
+      runLiveVision();
+    } catch (err) {
+      showCaptureError(err);
+    }
+  });
+  document.addEventListener("click", (event) => {
+    if (!event.target.closest(".capture-action-group")) closeCaptureMenus();
   });
   captureCancelButtonEl.addEventListener("click", closeCaptureModal);
   captureConfirmButtonEl.addEventListener("click", () => {
@@ -4858,6 +5053,7 @@ function toMarkdown(chat) {
     liveHistoryShown = !liveHistoryShown;
     liveHistoryToggleEl.setAttribute("aria-expanded", String(liveHistoryShown));
     liveHistoryToggleEl.textContent = liveHistoryShown ? "Live" : "History";
+    liveOutputStatusEl.hidden = liveHistoryShown;
     liveOutputTextEl.hidden = liveHistoryShown;
     liveHistoryListEl.hidden = !liveHistoryShown;
   });
@@ -4865,7 +5061,22 @@ function toMarkdown(chat) {
     const button = event.target.closest(".live-suggestion");
     if (!button) return;
     livePromptInputEl.value = button.dataset.prompt || "";
+    if (button.dataset.alert === "true") {
+      liveAlertToggleEl.checked = true;
+      liveAlertEnabled = true;
+      ensureLiveAlertAudio();
+      setLiveOutputStatus("Sound alert armed for clearly visible danger", false);
+    }
     livePromptInputEl.focus();
+  });
+  liveAlertToggleEl.addEventListener("change", () => {
+    liveAlertEnabled = liveAlertToggleEl.checked;
+    if (liveAlertEnabled) {
+      ensureLiveAlertAudio();
+      setLiveOutputStatus("Sound alert armed for clearly visible danger", false);
+    } else {
+      setLiveOutputStatus("Sound alert disabled", false);
+    }
   });
 
   // hasLocalRuntime mirrors the server's own check (HandlerOptions.WasmDir
@@ -4981,7 +5192,7 @@ function toMarkdown(chat) {
     }
   }
 
-  // Drives whether the image-attach/webcam/screen-capture buttons show up in
+  // Drives whether the image-attach/webcam/screen-capture/live-screen buttons show up in
   // the composer: server mode asks the already-loaded catalog entry (see the
   // /models "vision" field, server.go), browser mode asks the loaded Runner
   // directly through the bridge (a no-op, near-zero-cost call once the wasm
@@ -4995,9 +5206,8 @@ function toMarkdown(chat) {
       vision = Boolean(active && active.vision);
     }
     attachImageEl.hidden = !vision;
-    webcamButtonEl.hidden = !vision;
-    liveVisionButtonEl.hidden = !vision;
-    screenButtonEl.hidden = !vision;
+    cameraCaptureGroupEl.hidden = !vision;
+    screenCaptureGroupEl.hidden = !vision;
   }
 
   function readFileAsDataURL(file) {
@@ -5038,13 +5248,35 @@ function toMarkdown(chat) {
     }
   }
 
+  // Encodes via toBlob rather than the synchronous toDataURL: JPEG encoding
+  // a live frame (up to 960px, i.e. a full screen-share crop) on the main
+  // thread would otherwise stall token rendering and the pause/stop buttons
+  // for the duration of every single capture. toBlob hands the encode off
+  // the main thread in every evergreen browser, so the UI stays responsive
+  // while a frame is compressed.
   function captureLiveFrame() {
-    const canvas = document.createElement("canvas");
     const scale = Math.min(1, liveFrameSize / Math.max(captureVideoEl.videoWidth, 1));
-    canvas.width = Math.max(1, Math.round(captureVideoEl.videoWidth * scale));
-    canvas.height = Math.max(1, Math.round(captureVideoEl.videoHeight * scale));
-    canvas.getContext("2d").drawImage(captureVideoEl, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", 0.8);
+    const width = Math.max(1, Math.round(captureVideoEl.videoWidth * scale));
+    const height = Math.max(1, Math.round(captureVideoEl.videoHeight * scale));
+    if (!liveFrameCanvasEl) {
+      liveFrameCanvasEl = document.createElement("canvas");
+      // Live frames come from a camera/screen feed and never carry an alpha
+      // channel; telling the context that up front lets the browser skip
+      // alpha compositing work on every draw.
+      liveFrameCanvasCtx = liveFrameCanvasEl.getContext("2d", { alpha: false });
+    }
+    if (liveFrameCanvasEl.width !== width) liveFrameCanvasEl.width = width;
+    if (liveFrameCanvasEl.height !== height) liveFrameCanvasEl.height = height;
+    liveFrameCanvasCtx.drawImage(captureVideoEl, 0, 0, width, height);
+    return new Promise((resolve, reject) => {
+      liveFrameCanvasEl.toBlob((blob) => {
+        if (!blob) { reject(new Error("Encoding the live frame failed.")); return; }
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error("reading the encoded frame failed"));
+        reader.readAsDataURL(blob);
+      }, "image/jpeg", 0.8);
+    });
   }
 
   // video.play() resolves once playback is requested, which can precede the
@@ -5100,6 +5332,59 @@ function toMarkdown(chat) {
     }
   }
 
+  function setLiveOutputStatus(text, isError) {
+    liveOutputStatusEl.textContent = text;
+    liveOutputStatusEl.classList.toggle("is-error", !!isError);
+  }
+
+  function ensureLiveAlertAudio() {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    try {
+      if (!liveAlertAudioContext) liveAlertAudioContext = new AudioContextClass();
+      if (liveAlertAudioContext.state === "suspended") liveAlertAudioContext.resume().catch(() => {});
+      return liveAlertAudioContext;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function playLiveAlertTone() {
+    if (!liveAlertEnabled) return false;
+    const now = performance.now();
+    // A slow model may emit the marker more than once or repeat it on adjacent
+    // frames. Rate limiting keeps a safety tone useful instead of turning it
+    // into an audible loop.
+    if (now - liveAlertLastAt < 3000) return false;
+    const audio = ensureLiveAlertAudio();
+    if (!audio) return false;
+    try {
+      liveAlertLastAt = now;
+      const start = audio.currentTime;
+      const gain = audio.createGain();
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.22, start + 0.012);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.42);
+      gain.connect(audio.destination);
+      const oscillator = audio.createOscillator();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(880, start);
+      oscillator.frequency.setValueAtTime(660, start + 0.2);
+      oscillator.connect(gain);
+      oscillator.start(start);
+      oscillator.stop(start + 0.44);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function parseLiveAlert(text) {
+    const raw = String(text || "");
+    const alert = /\[ALERT\]/i.test(raw);
+    return { alert, text: raw.replace(/\s*\[ALERT\]\s*/gi, " ").replace(/\s{2,}/g, " ").trim() };
+  }
+
   function setLiveOutputText(text, streaming, isError) {
     liveOutputTextEl.textContent = text;
     liveOutputTextEl.classList.toggle("is-streaming", !!streaming);
@@ -5108,9 +5393,11 @@ function toMarkdown(chat) {
   }
 
   function resetLiveOutput() {
+    liveLastAnswer = "";
+    setLiveOutputStatus("Waiting for the first frame…", false);
     liveOutputTextEl.classList.remove("is-streaming", "is-error");
     liveOutputTextEl.classList.add("is-placeholder");
-    liveOutputTextEl.textContent = "Starting camera…";
+    liveOutputTextEl.textContent = "No response yet — the first frame is being prepared.";
     liveStatTTFTEl.textContent = "ttft --";
     liveStatTPSEl.textContent = "tok/s --";
   }
@@ -5121,7 +5408,10 @@ function toMarkdown(chat) {
     const update = () => {
       const seconds = Math.floor((performance.now() - liveFrameStartedAt) / 1000);
       const suffix = seconds ? " (" + seconds + "s)" : "";
-      setLiveOutputText("Frame captured — waiting for the model response" + suffix + "…", true);
+      // Keep the last complete answer in place while the next frame is being
+      // decoded. The phase/status line carries progress, so a slow model no
+      // longer makes the useful answer disappear behind a placeholder.
+      setLiveOutputStatus("Frame captured — waiting for the model response" + suffix + "…", false);
     };
     update();
     liveFrameProgressTimer = setInterval(update, 1000);
@@ -5181,9 +5471,16 @@ function toMarkdown(chat) {
       maxTokens: Math.min(64, boundedNumber(chat.settings.maxTokens, 64, 1, 4096, true)),
       temperature: Math.min(0.3, boundedNumber(chat.settings.temperature, 0.3, 0, 2, false))
     });
+    const livePromptInstruction = liveCaptureMode === "screen"
+      ? "You are describing one current live screen frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly."
+      : "You are describing one current live camera frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly.";
+    const liveAlertInstruction = liveAlertEnabled
+      ? "A local sound alert is armed. If and only if an immediate, clearly visible danger is present, prefix the answer with [ALERT]. Otherwise never output [ALERT]. Do not infer danger from uncertainty."
+      : "Never output [ALERT].";
     const liveSystemPrompt = [
       chat.systemPrompt.trim(),
-      "You are describing one current live camera frame. State only clearly visible people, objects, colors, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly."
+      livePromptInstruction,
+      liveAlertInstruction
     ].filter(Boolean).join("\n\n");
     if (preferences.inferenceMode === "browser") {
       await loadWasmBridgeScript();
@@ -5221,7 +5518,20 @@ function toMarkdown(chat) {
     ], liveSettings, liveSystemPrompt, signal, onToken, false);
   }
 
-  // Mirrors an on-device webcam-captioning loop: the prompt lives in its own
+  function setLiveCaptureButtonState(running, mode) {
+    const buttons = [
+      { button: liveVisionButtonEl, kind: "camera", label: "camera" },
+      { button: liveScreenButtonEl, kind: "screen", label: "screen" }
+    ];
+    buttons.forEach(({ button, kind, label }) => {
+      const active = running && mode === kind;
+      button.classList.toggle("is-live", active);
+      button.setAttribute("aria-label", active ? "Stop live " + label : "Start live " + label);
+      button.title = active ? "Stop live " + label : "Start live " + label;
+    });
+  }
+
+  // Mirrors an on-device camera/screen-captioning loop: the prompt lives in its own
   // field (seeded from whatever the user had typed in the composer, falling
   // back to a sensible default) and is re-read fresh every frame, so editing
   // it mid-run changes the next answer without restarting the loop. Nothing
@@ -5238,20 +5548,22 @@ function toMarkdown(chat) {
 
     liveVisionRunning = true;
     liveVisionPaused = false;
+    liveCaptureMode = captureMode;
+    liveAlertEnabled = liveAlertToggleEl.checked;
+    if (liveAlertEnabled) ensureLiveAlertAudio();
     liveHistory = [];
     liveHistoryShown = false;
     renderLiveHistory();
     liveHistoryToggleEl.setAttribute("aria-expanded", "false");
     liveHistoryToggleEl.textContent = "History";
     liveOutputTextEl.hidden = false;
+    liveOutputStatusEl.hidden = false;
     liveHistoryListEl.hidden = true;
     resetLiveOutput();
-    liveVisionButtonEl.classList.add("is-live");
-    liveVisionButtonEl.setAttribute("aria-label", "Stop live camera");
-    liveVisionButtonEl.title = "Stop live camera";
+    setLiveCaptureButtonState(true, liveCaptureMode);
     captureFootEl.hidden = true;
     liveOverlayEl.hidden = false;
-    captureTitleEl.textContent = "Live vision";
+    captureTitleEl.textContent = liveCaptureMode === "screen" ? "Live screen" : "Live vision";
     setLiveStatus("live");
     startLiveElapsedTimer();
     livePauseButtonEl.focus();
@@ -5265,30 +5577,49 @@ function toMarkdown(chat) {
       liveVisionController = requestController;
       const prompt = livePromptInputEl.value.trim() || livePromptInputEl.placeholder;
       const startedAt = performance.now();
+      const previousAnswer = liveLastAnswer;
       let ttft = null;
       let tokenCount = 0;
+      let frameAlertTriggered = false;
+      let frameAlertPlayed = false;
       try {
-        setLiveOutputText("Waiting for a camera frame…", true);
+        setLiveOutputStatus(liveCaptureMode === "screen" ? "Waiting for a screen frame…" : "Waiting for a camera frame…", false);
         await waitForLiveVideoFrame(requestController.signal);
-        const image = captureLiveFrame();
+        const image = await captureLiveFrame();
         startLiveFrameProgress();
         const answer = await completeLiveVision(chat, prompt, image, requestController.signal, (partial) => {
           stopLiveFrameProgress();
           if (ttft === null) ttft = performance.now() - startedAt;
           tokenCount++;
-          setLiveOutputText(partial, true);
+          const parsed = parseLiveAlert(partial);
+          if (parsed.alert) {
+            frameAlertTriggered = true;
+            if (liveAlertEnabled && !frameAlertPlayed) frameAlertPlayed = playLiveAlertTone();
+          }
+          setLiveOutputStatus(frameAlertTriggered ? (frameAlertPlayed ? "Sound alert triggered — generating response…" : "Potential danger detected — generating response…") : "Generating response…", false);
+          setLiveOutputText(parsed.text || (frameAlertTriggered ? "Potential danger detected…" : partial), true);
         });
         stopLiveFrameProgress();
-        setLiveOutputText(answer || "The model returned no text for this frame.", false);
+        const parsedAnswer = parseLiveAlert(answer);
+        if (parsedAnswer.alert) {
+          frameAlertTriggered = true;
+          if (liveAlertEnabled && !frameAlertPlayed) frameAlertPlayed = playLiveAlertTone();
+        }
+        const generatedAnswer = parsedAnswer.text;
+        liveLastAnswer = generatedAnswer || "The model returned no text for this frame.";
+        setLiveOutputText(liveLastAnswer, false);
+        setLiveOutputStatus(frameAlertTriggered ? (frameAlertPlayed ? "Sound alert triggered · Last response updated" : "Danger marker detected · Last response updated") : "Last response updated", false);
         const elapsedSec = (performance.now() - startedAt) / 1000;
         updateLiveStats(ttft, tokenCount && elapsedSec > 0 ? tokenCount / elapsedSec : null);
-        if (answer.trim()) pushLiveHistory(answer.trim());
+        if (generatedAnswer) pushLiveHistory(generatedAnswer);
         if (liveVisionRunning) setLiveStatus(liveVisionPaused ? "paused" : "live");
       } catch (error) {
         stopLiveFrameProgress();
         if (!(error && error.name === "AbortError")) {
           setLiveStatus("error");
-          setLiveOutputText("Error: " + (error && error.message ? error.message : String(error)), false, true);
+          setLiveOutputStatus("Error: " + (error && error.message ? error.message : String(error)), true);
+          if (previousAnswer) setLiveOutputText(previousAnswer, false);
+          else setLiveOutputText("No response was generated for this frame.", false, true);
         }
       } finally {
         liveVisionController = null;
@@ -5307,9 +5638,9 @@ function toMarkdown(chat) {
     liveVisionController = null;
     stopLiveFrameProgress();
     stopLiveElapsedTimer();
-    liveVisionButtonEl.classList.remove("is-live");
-    liveVisionButtonEl.setAttribute("aria-label", "Start live camera");
-    liveVisionButtonEl.title = "Start live camera";
+    liveAlertEnabled = false;
+    liveAlertToggleEl.checked = false;
+    setLiveCaptureButtonState(false, liveCaptureMode);
     livePauseButtonEl.classList.remove("is-paused");
     livePauseButtonEl.setAttribute("aria-label", "Pause live vision");
     livePauseButtonEl.title = "Pause";
@@ -5317,14 +5648,16 @@ function toMarkdown(chat) {
     if (pauseIcon) pauseIcon.setAttribute("href", "#i-pause");
     liveOverlayEl.hidden = true;
     captureFootEl.hidden = false;
-    captureTitleEl.textContent = "Capture an image";
+    captureTitleEl.textContent = captureMode === "screen" ? "Capture screen" : "Capture an image";
+    captureLiveButtonEl.textContent = captureMode === "screen" ? "Start live screen" : "Start live";
     setLiveStatus("standby");
   }
 
   // Shows a live preview with Capture/Cancel rather than grabbing a frame the
   // instant permission is granted -- lets the user see what they're about to
   // send, retry a bad angle, or back out, the same as any normal camera app.
-  async function openCaptureModal(stream, opener) {
+  async function openCaptureModal(stream, opener, mode = "camera") {
+    captureMode = mode === "screen" ? "screen" : "camera";
     activeCaptureStream = stream;
     stream.getVideoTracks().forEach((track) => {
       track.addEventListener("ended", () => { if (!captureModalEl.hidden) closeCaptureModal(); });
@@ -5333,6 +5666,8 @@ function toMarkdown(chat) {
     await captureVideoEl.play();
     liveOverlayEl.hidden = true;
     captureFootEl.hidden = false;
+    captureTitleEl.textContent = captureMode === "screen" ? "Capture screen" : "Capture an image";
+    captureLiveButtonEl.textContent = captureMode === "screen" ? "Start live screen" : "Start live";
     liveSizeRangeEl.value = String(liveFrameSize);
     liveSizeValueEl.textContent = liveFrameSize + "px";
     openDialog(captureModalEl, opener, captureConfirmButtonEl);
@@ -5500,6 +5835,7 @@ function toMarkdown(chat) {
       chatSearchEl.focus();
     }
     if (event.key === "Escape" && sidebarEl.classList.contains("is-open")) setSidebar(false);
+    if (event.key === "Escape" && (!cameraCaptureMenuEl.hidden || !screenCaptureMenuEl.hidden)) closeCaptureMenus();
   });
   window.addEventListener("beforeunload", save);
 

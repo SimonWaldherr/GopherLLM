@@ -97,6 +97,13 @@
               <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email.">Draft an email</button>
               <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n">Review code</button>
             </div>
+            <p class="workflow-label">Start with a workflow</p>
+            <div class="workflow-suggestions" aria-label="Choose a workflow">
+              <button type="button" class="workflow-suggestion" data-workflow="coding">Coding</button>
+              <button type="button" class="workflow-suggestion" data-workflow="research">Research</button>
+              <button type="button" class="workflow-suggestion" data-workflow="writing">Writing</button>
+              <button type="button" class="workflow-suggestion" data-workflow="vision">Vision</button>
+            </div>
             <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
           </div>
           <div class="empty-no-model">
@@ -136,9 +143,20 @@
               <input id="fileInput" type="file" multiple hidden>
               <button id="attachImage" class="composer-icon-button" type="button" aria-label="Attach an image" title="Attach an image" hidden><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg></button>
               <input id="imageFileInput" type="file" accept="image/*" hidden>
-              <button id="webcamButton" class="composer-icon-button" type="button" aria-label="Capture from webcam" title="Capture from webcam" hidden><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg></button>
-              <button id="liveVisionButton" class="composer-icon-button live-vision-toggle" type="button" aria-label="Start live camera" title="Start live camera" hidden><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg><span class="live-vision-dot" aria-hidden="true"></span></button>
-              <button id="screenButton" class="composer-icon-button" type="button" aria-label="Capture the screen" title="Capture the screen" hidden><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg></button>
+              <div id="cameraCaptureGroup" class="capture-action-group" hidden>
+                <button id="webcamButton" class="composer-icon-button capture-group-trigger" type="button" aria-label="Camera capture options" title="Camera: capture or live" aria-haspopup="menu" aria-expanded="false" aria-controls="cameraCaptureMenu"><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg><span class="capture-group-trigger-label">Camera</span><svg class="capture-group-chevron" aria-hidden="true"><use href="#i-chevron"/></svg></button>
+                <div id="cameraCaptureMenu" class="capture-action-menu" role="menu" aria-label="Camera actions" hidden>
+                  <button id="cameraCaptureSnapshot" class="capture-menu-item" type="button" role="menuitem">Capture image</button>
+                  <button id="liveVisionButton" class="capture-menu-item" type="button" role="menuitem">Start live camera</button>
+                </div>
+              </div>
+              <div id="screenCaptureGroup" class="capture-action-group" hidden>
+                <button id="screenButton" class="composer-icon-button capture-group-trigger" type="button" aria-label="Screen capture options" title="Screen: capture or live" aria-haspopup="menu" aria-expanded="false" aria-controls="screenCaptureMenu"><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg><span class="capture-group-trigger-label">Screen</span><svg class="capture-group-chevron" aria-hidden="true"><use href="#i-chevron"/></svg></button>
+                <div id="screenCaptureMenu" class="capture-action-menu" role="menu" aria-label="Screen actions" hidden>
+                  <button id="screenCaptureSnapshot" class="capture-menu-item" type="button" role="menuitem">Capture screen</button>
+                  <button id="liveScreenButton" class="capture-menu-item" type="button" role="menuitem">Start live screen</button>
+                </div>
+              </div>
               <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
             </div>
             <div class="prompt-footer-end">
@@ -370,6 +388,18 @@
             </div>
           </div>
           <div class="settings-primary-grid">
+            <label>Use-case workflow
+              <select id="workflowSelect" aria-describedby="workflowHelp">
+                <option value="custom">Custom / current settings</option>
+                <option value="general">General assistant</option>
+                <option value="coding">Coding &amp; development</option>
+                <option value="research">Research &amp; fact-checking</option>
+                <option value="writing">Writing &amp; ideation</option>
+                <option value="translation">Translation</option>
+                <option value="vision">Vision &amp; scene description</option>
+                <option value="extraction">Structured extraction</option>
+              </select>
+            </label>
             <label>Persona
               <select id="personaSelect">
                 <option value="custom">Custom</option>
@@ -390,6 +420,7 @@
               </select>
             </label>
           </div>
+          <p id="workflowHelp" class="settings-note workflow-help" aria-live="polite">Choose a workflow to apply a task-focused starting point. You can fine-tune every setting afterward.</p>
           <label class="settings-instructions">Instructions
             <span>Optional guidance that applies only to this chat.</span>
             <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
@@ -712,11 +743,13 @@
             <div class="live-prompt-panel">
               <span class="live-panel-label">Prompt</span>
               <textarea id="livePromptInput" rows="1" placeholder="Describe what you see in one sentence."></textarea>
+              <label class="live-alert-toggle"><input id="liveAlertToggle" type="checkbox"><span>Sound alert on danger <small>(local beep)</small></span></label>
               <div id="livePromptSuggestions" class="live-suggestions">
                 <button type="button" class="live-suggestion" data-prompt="Describe what you see in one sentence.">Describe the scene</button>
                 <button type="button" class="live-suggestion" data-prompt="What is the color of my shirt?">What color is my shirt?</button>
                 <button type="button" class="live-suggestion" data-prompt="Identify any text or written content visible.">Read visible text</button>
                 <button type="button" class="live-suggestion" data-prompt="Name the object I am holding in my hand.">Name the object</button>
+                <button type="button" class="live-suggestion" data-alert="true" data-prompt="Describe the scene. If you see an immediate danger, mark it with [ALERT].">Danger alert</button>
               </div>
             </div>
 
@@ -726,6 +759,7 @@
                 <button id="liveHistoryToggle" class="text-button" type="button" aria-expanded="false">History</button>
               </div>
               <div class="live-output-body">
+                <p id="liveOutputStatus" class="live-output-status" aria-live="polite">Waiting for the first frame…</p>
                 <p id="liveOutputText" class="live-output-text"></p>
                 <ol id="liveHistoryList" class="live-history-list" hidden></ol>
               </div>

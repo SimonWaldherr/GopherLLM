@@ -44,11 +44,22 @@ type ModelEntry struct {
 	// It is a capability, not a promise that every prompt will emit a visible
 	// chain of thought.
 	Reasoning bool
-	// ProjectorPath is a best-guess mmproj (vision projector) GGUF found
-	// alongside this entry, paired by DiscoverModels' post-scan pass; ""
-	// if none was found. Always overridable by passing an explicit
-	// LoadOptions.VisionProjectorPath instead of relying on this guess.
+	// ProjectorPath is a verified-compatible Pixtral mmproj (vision projector)
+	// GGUF found alongside this entry, paired by DiscoverModels' post-scan
+	// pass; "" if none was found. The pair is restricted to the exact parent
+	// directory, a Pixtral projector, equal text/projector dimensions, and the
+	// Mistral image-template tokens the runtime can render. Always overridable
+	// by passing an explicit LoadOptions.VisionProjectorPath.
 	ProjectorPath string
+
+	// The following catalog-only fields retain just enough header information
+	// to pair a text model with a projector without loading either model's
+	// weights. They intentionally remain private: callers should use the
+	// already-sanitised ProjectorPath capability rather than reproduce the
+	// compatibility rules themselves.
+	visionDimension        int
+	visionTemplateCapable  bool
+	visionPixtralProjector bool
 }
 
 func (m ModelEntry) Status() string {
@@ -122,19 +133,24 @@ func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
 	return entries, nil
 }
 
-// pairProjectors fills in ProjectorPath on every non-projector entry that
-// has a same-repository (same parent directory) mmproj companion file — the
-// layout every community GGUF repo shipping a vision-capable model uses
-// (e.g. unsloth/Ministral-3-3B-Instruct-2512-GGUF ships both the text
-// quantization and mmproj-F16.gguf side by side). When more than one
-// projector candidate exists in the same directory (F16/BF16/F32 variants
-// are common), F16 is preferred over BF16 over F32 — smallest file size
-// that still keeps full 16-bit mantissa fidelity, not a blind
-// smallest-file-wins rule that could pick a stray corrupt file.
+// pairProjectors fills in ProjectorPath only for a text model whose same-
+// directory companion is runnable through the currently implemented Pixtral
+// path. A neighbouring "mmproj" file alone is not enough: Qwen/Gemma and
+// other projector graphs use different encoders, and a projection-width
+// mismatch corrupts the decoder input even when both files load. The text
+// model must also contain the Mistral [INST]/[IMG] markers consumed by
+// renderMistralInstMessages. This deliberately prefers a false negative to
+// advertising a Vision badge for a model that will reject an image request.
+//
+// When more than one compatible projector candidate exists in the same
+// directory (F16/BF16/F32 variants are common), F16 is preferred over BF16
+// over F32 — smallest file size that still keeps full 16-bit mantissa
+// fidelity, not a blind smallest-file-wins rule that could pick a stray
+// corrupt file.
 func pairProjectors(entries []ModelEntry) {
 	var candidates []ModelEntry
 	for _, e := range entries {
-		if e.IsProjector {
+		if e.IsProjector && e.visionPixtralProjector && e.visionDimension > 0 {
 			candidates = append(candidates, e)
 		}
 	}
@@ -142,13 +158,19 @@ func pairProjectors(entries []ModelEntry) {
 		return
 	}
 	for i := range entries {
-		if entries[i].IsProjector {
+		if entries[i].IsProjector || !entries[i].IsSupported || entries[i].IsEmbedding || !entries[i].visionTemplateCapable || entries[i].visionDimension <= 0 {
 			continue
 		}
 		var chosen *ModelEntry
 		for ci := range candidates {
 			c := &candidates[ci]
-			if c.Repository != entries[i].Repository {
+			// Repository is a display label (the final path component), so it
+			// is not a safe identity: two unrelated directories can share it.
+			// Pair only files physically next to one another.
+			if filepath.Clean(filepath.Dir(c.Path)) != filepath.Clean(filepath.Dir(entries[i].Path)) {
+				continue
+			}
+			if c.visionDimension != entries[i].visionDimension {
 				continue
 			}
 			if chosen == nil || projectorRank(*c) < projectorRank(*chosen) {
@@ -159,6 +181,32 @@ func pairProjectors(entries []ModelEntry) {
 			entries[i].ProjectorPath = chosen.Path
 		}
 	}
+}
+
+// PairedVisionProjectorPath returns the automatically safe Pixtral projector
+// next to modelPath, if one exists. It starts at modelPath's containing
+// directory and never accepts a merely similarly named projector outside the
+// model's exact parent directory. An explicit --mmproj remains the caller's
+// override; this helper is for the no-explicit-projector case.
+func PairedVisionProjectorPath(modelPath string) (string, error) {
+	modelPath = catalogCanonicalPath(modelPath)
+	entries, err := DiscoverModels(filepath.Dir(modelPath), io.Discard)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if !entry.IsProjector && catalogCanonicalPath(entry.Path) == modelPath {
+			return entry.ProjectorPath, nil
+		}
+	}
+	return "", nil
+}
+
+func catalogCanonicalPath(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		return filepath.Clean(absolute)
+	}
+	return filepath.Clean(path)
 }
 
 // projectorRank orders mmproj filename variants: lower is preferred.
@@ -447,7 +495,79 @@ func inspectModel(root, path string) (ModelEntry, error) {
 	_, hasPooling := gguf.Metadata[arch+".pooling_type"]
 	_, hasEmbedding := gguf.Metadata["general.embedding"]
 	isEmbedding := hasPooling || hasEmbedding || containsEmbeddingModelName(lower)
-	return ModelEntry{ID: id, Repository: repository, FileName: fileName, Path: path, SizeBytes: st.Size(), Architecture: arch, ContextLength: contextLength, ModelName: modelName, IsProjector: isProjector, IsEmbedding: isEmbedding, IsSupported: ArchitectureSupported(arch), Reasoning: modelSupportsReasoning(arch, fileName, modelName, gguf)}, nil
+	entry := ModelEntry{
+		ID:            id,
+		Repository:    repository,
+		FileName:      fileName,
+		Path:          path,
+		SizeBytes:     st.Size(),
+		Architecture:  arch,
+		ContextLength: contextLength,
+		ModelName:     modelName,
+		IsProjector:   isProjector,
+		IsEmbedding:   isEmbedding,
+		IsSupported:   ArchitectureSupported(arch),
+		Reasoning:     modelSupportsReasoning(arch, fileName, modelName, gguf),
+	}
+	if isProjector {
+		entry.visionDimension, entry.visionPixtralProjector = pixtralProjectorCatalogInfo(gguf)
+	} else {
+		entry.visionDimension, entry.visionTemplateCapable = pixtralTextCatalogInfo(gguf, entry.IsSupported, entry.IsEmbedding)
+	}
+	return entry, nil
+}
+
+// pixtralProjectorCatalogInfo performs the header-level portion of
+// LoadPixtralVisionModel's compatibility contract. It intentionally checks
+// the exact projector type understood by the runtime instead of treating all
+// "clip" GGUFs as interchangeable.
+func pixtralProjectorCatalogInfo(gguf *GGUFFile) (projectionDim int, ok bool) {
+	if gguf == nil || !gguf.GetBool("clip.has_vision_encoder", false) {
+		return 0, false
+	}
+	projectorType, _ := gguf.GetString("clip.projector_type")
+	if projectorType != "pixtral" {
+		return 0, false
+	}
+	projectionDim = int(gguf.GetU32("clip.vision.projection_dim", 0))
+	return projectionDim, projectionDim > 0
+}
+
+// pixtralTextCatalogInfo checks the text-side requirements for GopherLLM's
+// current image renderer. A Pixtral embedding can only be spliced into a
+// model with the Mistral [INST] template (or its equivalent special-token
+// fallback) and all of its image markers; accepting just any decoder with
+// the same hidden width would make the catalog promise a feature that
+// renderMessagesForGeneration rejects.
+func pixtralTextCatalogInfo(gguf *GGUFFile, supported, embedding bool) (dimension int, ok bool) {
+	if gguf == nil || !supported || embedding {
+		return 0, false
+	}
+	dimension = ConfigFromGGUF(gguf).Dim
+	if dimension <= 0 {
+		return 0, false
+	}
+	tokenizer, err := TokenizerFromMetadata(gguf.Metadata)
+	if err != nil {
+		return dimension, false
+	}
+	template, hasTemplate := gguf.GetString("tokenizer.chat_template")
+	hasMistralTemplate := hasTemplate && strings.Contains(template, "[INST]") && strings.Contains(template, "[/INST]")
+	hasMistralTokens := false
+	if _, hasInst := tokenizer.SpecialID("[INST]"); hasInst {
+		if _, hasInstEnd := tokenizer.SpecialID("[/INST]"); hasInstEnd {
+			hasMistralTokens = true
+		}
+	}
+	if !hasMistralTemplate && !hasMistralTokens {
+		return dimension, false
+	}
+	for _, marker := range []string{"[INST]", "[/INST]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"} {
+		if _, exists := tokenizer.SpecialID(marker); !exists {
+			return dimension, false
+		}
+	}
+	return dimension, true
 }
 
 // modelSupportsReasoning identifies families with a native thinking mode and

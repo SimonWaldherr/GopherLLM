@@ -8,6 +8,78 @@ import (
 	"testing"
 )
 
+// TestPixtralRope2DAlternatesAxisFrequencies locks down Pixtral's distinct
+// row/column 2D-RoPE frequency layout. The reference creates theta^(-2i/D),
+// then assigns its even entries to rows and odd entries to columns before
+// applying adjacent-pair RoPE independently within each axis half.
+func TestPixtralRope2DAlternatesAxisFrequencies(t *testing.T) {
+	const (
+		headDim = 8
+		theta   = float32(10000)
+		row     = 3
+		col     = 5
+	)
+	rowInv, colInv := buildPixtralRope2DInvFreq(headDim, theta)
+	if len(rowInv) != headDim/4 || len(colInv) != headDim/4 {
+		t.Fatalf("frequency lengths = %d/%d, want %d/%d", len(rowInv), len(colInv), headDim/4, headDim/4)
+	}
+	for j := range rowInv {
+		wantRow := float32(1 / math.Pow(float64(theta), float64(4*j)/headDim))
+		wantCol := float32(1 / math.Pow(float64(theta), float64(4*j+2)/headDim))
+		if math.Abs(float64(rowInv[j]-wantRow)) > 1e-6 {
+			t.Errorf("rowInv[%d] = %v, want %v", j, rowInv[j], wantRow)
+		}
+		if math.Abs(float64(colInv[j]-wantCol)) > 1e-6 {
+			t.Errorf("colInv[%d] = %v, want %v", j, colInv[j], wantCol)
+		}
+		if rowInv[j] == colInv[j] {
+			t.Errorf("rowInv[%d] and colInv[%d] must use alternating source frequencies, both are %v", j, j, rowInv[j])
+		}
+	}
+
+	var sin, cos []float32
+	half, pairs := preparePixtralRope2DScratch(row, col, headDim, rowInv, colInv, &sin, &cos)
+	if half != headDim/2 || pairs != headDim/2 {
+		t.Fatalf("half/pairs = %d/%d, want %d/%d", half, pairs, headDim/2, headDim/2)
+	}
+	for j := range rowInv {
+		wantRowSin, wantRowCos := math.Sincos(float64(float32(row) * rowInv[j]))
+		wantColSin, wantColCos := math.Sincos(float64(float32(col) * colInv[j]))
+		if math.Abs(float64(sin[j])-wantRowSin) > 1e-6 || math.Abs(float64(cos[j])-wantRowCos) > 1e-6 {
+			t.Errorf("row angle %d = sin/cos %v/%v, want %v/%v", j, sin[j], cos[j], wantRowSin, wantRowCos)
+		}
+		if math.Abs(float64(sin[len(rowInv)+j])-wantColSin) > 1e-6 || math.Abs(float64(cos[len(rowInv)+j])-wantColCos) > 1e-6 {
+			t.Errorf("column angle %d = sin/cos %v/%v, want %v/%v", j, sin[len(rowInv)+j], cos[len(rowInv)+j], wantColSin, wantColCos)
+		}
+	}
+
+	// The combined table is consumed as adjacent pairs in each half of a
+	// vision-attention head: (0,1), (2,3) for rows, then (4,5), (6,7) for
+	// columns. A split-half rotation would incorrectly pair row values with
+	// column values instead.
+	vec := []float32{1, 0, 1, 0, 1, 0, 1, 0}
+	applyPreparedRope(vec, headDim, 1, half, pairs, sin, cos, true)
+	for i := 0; i < headDim/2; i++ {
+		if i%2 == 0 {
+			if math.Abs(float64(vec[i]-cos[i/2])) > 1e-6 {
+				t.Errorf("interleaved pair %d first component = %v, want cos=%v", i/2, vec[i], cos[i/2])
+			}
+		} else if math.Abs(float64(vec[i]-sin[i/2])) > 1e-6 {
+			t.Errorf("interleaved pair %d second component = %v, want sin=%v", i/2, vec[i], sin[i/2])
+		}
+	}
+	for i := headDim / 2; i < headDim; i++ {
+		pair := i / 2
+		if i%2 == 0 {
+			if math.Abs(float64(vec[i]-cos[pair])) > 1e-6 {
+				t.Errorf("interleaved column pair %d first component = %v, want cos=%v", pair, vec[i], cos[pair])
+			}
+		} else if math.Abs(float64(vec[i]-sin[pair])) > 1e-6 {
+			t.Errorf("interleaved column pair %d second component = %v, want sin=%v", pair, vec[i], sin[pair])
+		}
+	}
+}
+
 // TestPixtralVisionRealMMProjLoadsAndEncodes is an opt-in plausibility check
 // against a real downloaded mmproj GGUF (no text model needed -- this only
 // exercises LoadPixtralVisionModel/EncodeImagePixtral in isolation). It

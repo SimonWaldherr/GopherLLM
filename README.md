@@ -12,6 +12,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 ## Contents
 
 - [Features](#features)
+- [Use cases](#use-cases)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
@@ -63,6 +64,41 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 - `--compress`: requantize any GGUF to Q8_0/Q4_0/Q4_K/Q5_K/Q6_K in place, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
+
+## Use cases
+
+GopherLLM is useful wherever a model should run close to the data and remain
+under the operator's control:
+
+- **Private everyday assistant:** run chat, drafting, summarization, and
+  translation locally; browser conversations remain in the browser unless
+  server history is explicitly enabled.
+- **Developer copilot:** use the coding workflow for review, debugging,
+  implementation plans, and repository-aware skills. The optional AgentOS
+  panel keeps command execution behind the server policy and an approval step.
+- **Research and fact checking:** enable the research workflow to combine the
+  local model with bounded Wikipedia/Wikidata/OpenStreetMap lookups and, when
+  configured, semantic search over saved conversations. Retrieved evidence is
+  kept separate from model inference so uncertainty remains visible.
+- **Documents and operations:** batch-process CSV/TSV, JSONL, Markdown,
+  XLSX/ODS, and text files with one prompt, then export JSON, CSV, or Markdown
+  results. The structured-extraction workflow is tuned for consistent output.
+- **Vision and live assistance:** compatible Pixtral/Ministral models can
+  describe uploaded images, webcam frames, or a shared screen. Camera and
+  screen sources both support continuous live analysis; the vision workflow
+  keeps prompts short and grounded, while the live panel exposes frame size,
+  pause, latest-answer, and history controls for latency-sensitive use. An
+  explicitly armed local sound alert can emit a short browser beep when the
+  model marks a clearly visible danger with `[ALERT]`.
+- **Local service or embedded app:** use the OpenAI- and Ollama-compatible
+  endpoints from an existing client, or import the Go package directly. The
+  same model can be tuned once and served without a cloud dependency.
+
+In the browser chat, **Settings → Model & chat → Use-case workflow** applies a
+task-focused starting point for sampling, context handling, tools, and persona.
+It never prevents manual adjustment; selecting **Custom / current settings**
+keeps the current values. The four most common workflows are also available on
+the empty-chat screen.
 
 ## Requirements
 

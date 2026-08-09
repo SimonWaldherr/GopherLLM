@@ -153,7 +153,8 @@ type cliConfig struct {
 	// mmprojPath is a companion Pixtral-style vision-encoder GGUF loaded
 	// alongside modelSelector, enabling --image on the one-shot prompt path
 	// and image_url content on the server's chat endpoints.
-	mmprojPath string
+	mmprojPath    string
+	mmprojPathSet bool
 	// imagePath attaches one image to the one-shot --prompt request. Only
 	// meaningful together with --mmproj (or a model directory pairing one
 	// automatically, see catalog.go's pairProjectors).
@@ -273,7 +274,7 @@ func run() error {
 			ModelDir:                 cfg.modelDir,
 			WasmDir:                  resolveWasmDir(cfg),
 			SkillsDir:                cfg.skillsDir,
-			ModelLoadOptions:         gopherllm.LoadOptions{OutOfCore: cfg.outOfCore},
+			ModelLoadOptions:         serverModelLoadOptions(cfg),
 			AgentOS:                  agentOSRunner,
 		})
 	}
@@ -336,6 +337,23 @@ func run() error {
 	if cfg.compress {
 		return runCompress(modelPath, cfg)
 	}
+	// A nearby compatible Pixtral projector is part of a multimodal model
+	// release, not an optional UI-only extra. Make the normal initial CLI
+	// path behave like /models/load: use the catalog's conservative pairing
+	// when --mmproj was not explicitly supplied. Do not put this automatic
+	// path into cfg.mmprojPath: later server hot-swaps must discover each
+	// selected model's own companion, while an explicit --mmproj intentionally
+	// remains an override for all loads.
+	visionProjectorPath := cfg.mmprojPath
+	if !cfg.mmprojPathSet {
+		paired, pairErr := gopherllm.PairedVisionProjectorPath(modelPath)
+		if pairErr != nil {
+			fmt.Fprintf(os.Stderr, "Vision: automatic projector discovery skipped: %v\n", pairErr)
+		} else if paired != "" {
+			visionProjectorPath = paired
+			fmt.Fprintf(os.Stderr, "Vision: automatically paired %s\n", filepath.Base(paired))
+		}
+	}
 	// Metal is fixed when the weights load, so auto-tuning (which runs against
 	// an already-loaded Runner) cannot reach it. Decide it here instead, by
 	// actually measuring both ways. An explicit --metal is the operator's call
@@ -360,8 +378,8 @@ func run() error {
 		gopherllm.WithMetal(cfg.useMetal),
 		gopherllm.WithOutOfCore(cfg.outOfCore),
 	}
-	if cfg.mmprojPath != "" {
-		openOpts = append(openOpts, gopherllm.WithVisionProjector(cfg.mmprojPath))
+	if visionProjectorPath != "" {
+		openOpts = append(openOpts, gopherllm.WithVisionProjector(visionProjectorPath))
 	}
 	model, err := gopherllm.Open(
 		context.Background(),
@@ -397,7 +415,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: cfg.outOfCore}, AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -494,6 +512,23 @@ func resolveWasmDir(cfg cliConfig) string {
 		return dir
 	}
 	return ""
+}
+
+// serverModelLoadOptions keeps catalog hot-swaps on the same runtime path as
+// the initial CLI load. The explicit --mmproj value belongs here because it
+// is a user override; an automatically discovered projector is deliberately
+// not retained, so each later catalog selection can receive its own verified
+// companion in the /models/load handler.
+func serverModelLoadOptions(cfg cliConfig) gopherllm.LoadOptions {
+	options := gopherllm.LoadOptions{
+		PrepareQuantized: cfg.prepareQuant,
+		UseMetal:         cfg.useMetal,
+		OutOfCore:        cfg.outOfCore,
+	}
+	if cfg.mmprojPathSet && cfg.mmprojPath != "" {
+		options.VisionProjectorPath = cfg.mmprojPath
+	}
+	return options
 }
 
 func fileExists(path string) bool {
@@ -657,7 +692,7 @@ func parseCLI(args []string) (cliConfig, error) {
 			if err != nil {
 				return cfg, err
 			}
-			cfg.mmprojPath = v
+			cfg.mmprojPath, cfg.mmprojPathSet = v, true
 		case "--image":
 			v, err := next(arg)
 			if err != nil {

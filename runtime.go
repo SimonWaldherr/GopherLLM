@@ -751,6 +751,13 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// prefill already dominates a multimodal turn's cost far more than
 	// prefix-cache reuse would save.
 	cacheEligible := len(imageEmbeds) == 0 && r.prefixCacheSupported(cache)
+	// A multimodal request overwrites the reusable workspace with image-derived
+	// KV rows. It cannot reuse a text prefix itself, but must also invalidate a
+	// previously retained text prefix so the next text-only request cannot match
+	// placeholder token IDs against stale image state.
+	if len(imageEmbeds) > 0 {
+		r.clearPrefixCache()
+	}
 	cachedResidentTokens := r.prefixCache.tokens
 	cachedPromptTokens := r.prefixCache.promptTokens
 	cachedPromptLogits := r.prefixCache.promptLogits
@@ -1969,7 +1976,10 @@ func (r *Runner) encodeChatImage(img ImageContent) (embeds [][]float32, mergedRo
 		return nil, 0, 0, err
 	}
 	vc := r.visionConfig
-	pre, err := PreprocessImagePixtral(decoded, vc.PatchSize, vc.PatchSize*vc.SpatialMergeSize, vc.ImageSize, vc.ImageMean, vc.ImageStd)
+	// Dynamic Pixtral sizing is token-budgeted, not just longest-edge limited.
+	// Matching this grid exactly keeps the number and layout of substituted
+	// [IMG]/[IMG_BREAK] embeddings equal to the checkpoint's reference path.
+	pre, err := PreprocessImagePixtralDynamic(decoded, vc.PatchSize, vc.SpatialMergeSize, vc.ImageMinTokens, vc.ImageMaxTokens, vc.ImageMean, vc.ImageStd)
 	if err != nil {
 		return nil, 0, 0, err
 	}

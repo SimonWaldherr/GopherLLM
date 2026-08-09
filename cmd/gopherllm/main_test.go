@@ -60,6 +60,37 @@ func TestParseCLIOutOfCore(t *testing.T) {
 	}
 }
 
+func TestServerModelLoadOptionsRetainsOnlyExplicitVisionProjector(t *testing.T) {
+	explicit := serverModelLoadOptions(cliConfig{
+		prepareQuant:  true,
+		useMetal:      true,
+		mmprojPath:    "/models/explicit-mmproj.gguf",
+		mmprojPathSet: true,
+	})
+	if !explicit.PrepareQuantized || !explicit.UseMetal || explicit.OutOfCore || explicit.VisionProjectorPath != "/models/explicit-mmproj.gguf" {
+		t.Fatalf("explicit server load options = %+v", explicit)
+	}
+
+	// Automatically discovered projectors are attached only to the initial
+	// model load. Keeping no path here lets a later /models/load selection use
+	// its own catalog-paired companion rather than incorrectly reusing the
+	// previous model's mmproj.
+	automatic := serverModelLoadOptions(cliConfig{outOfCore: true})
+	if !automatic.OutOfCore || automatic.VisionProjectorPath != "" {
+		t.Fatalf("automatic server load options = %+v", automatic)
+	}
+}
+
+func TestParseCLITracksExplicitEmptyMMProjOverride(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--mmproj", ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.mmprojPathSet || cfg.mmprojPath != "" {
+		t.Fatalf("--mmproj empty override = path:%q set:%v", cfg.mmprojPath, cfg.mmprojPathSet)
+	}
+}
+
 func TestParseCLICompressFlags(t *testing.T) {
 	cfg, err := parseCLI([]string{"model.gguf", "--compress", "--compress-format", "Q4_K", "--compress-out", "out.gguf", "--compress-uniform"})
 	if err != nil {

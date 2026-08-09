@@ -90,6 +90,47 @@ func TestPreprocessImagePixtralRoundToExceedsPatchSize(t *testing.T) {
 	}
 }
 
+func TestPixtralDynamicImageSizeMatchesMergedTokenGrid(t *testing.T) {
+	// The reference Pixtral dynamic preprocessor rounds this common webcam
+	// frame to 392x196 (14x7 merged tokens), not 392x224.
+	if w, h := pixtralDynamicImageSize(384, 201, 28, 8*28*28, 1024*28*28); w != 392 || h != 196 {
+		t.Fatalf("dynamic size = %dx%d, want 392x196", w, h)
+	}
+	img := solidNRGBA(384, 201, 12, 34, 56)
+	pre, err := PreprocessImagePixtralDynamic(img, 14, 2, 8, 1024, [3]float32{}, [3]float32{1, 1, 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pre.Rows != 14 || pre.Cols != 28 {
+		t.Fatalf("dynamic patch grid = %dx%d, want 14x28", pre.Rows, pre.Cols)
+	}
+	if pre.Rows/2 != 7 || pre.Cols/2 != 14 {
+		t.Fatalf("dynamic merged grid = %dx%d, want 7x14", pre.Rows/2, pre.Cols/2)
+	}
+}
+
+func TestResizeBilinearNormalizedMatchesPixtralReference(t *testing.T) {
+	// mtmd's Pixtral path uses align-corners interpolation and truncates the
+	// intermediate RGB result to uint8. A pixel-center float resize would
+	// produce different values at positions 1 and 2 here.
+	img := image.NewNRGBA(image.Rect(0, 0, 3, 1))
+	img.SetNRGBA(0, 0, color.NRGBA{R: 0, G: 10, B: 20, A: 255})
+	img.SetNRGBA(1, 0, color.NRGBA{R: 100, G: 110, B: 120, A: 255})
+	img.SetNRGBA(2, 0, color.NRGBA{R: 200, G: 210, B: 220, A: 255})
+	got := resizeBilinearNormalized(img, 4, 1, [3]float32{}, [3]float32{1, 1, 1})
+	want := [][3]uint8{{0, 10, 20}, {66, 76, 86}, {133, 143, 153}, {200, 210, 220}}
+	if len(got) != len(want)*3 {
+		t.Fatalf("resized values = %d, want %d", len(got), len(want)*3)
+	}
+	for x, pixel := range want {
+		for c, raw := range pixel {
+			if delta := math.Abs(float64(got[x*3+c] - float32(raw)/255)); delta > 1e-6 {
+				t.Errorf("pixel %d channel %d = %.8f, want %.8f", x, c, got[x*3+c], float32(raw)/255)
+			}
+		}
+	}
+}
+
 // TestPreprocessImagePixtralChannelLayout verifies the flattened patch
 // vector is ordered [channel][kh][kw] with channel slowest-varying, matching
 // the patch_embd weight's expected column order (pixtral_vision.go).

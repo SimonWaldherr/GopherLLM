@@ -20,9 +20,11 @@ type PixtralVisionConfig struct {
 	HeadCount         int     // clip.vision.attention.head_count (plain MHA -- no separate KV head count)
 	HeadDim           int     // clip.vision.attention.head_dim, or EmbeddingLength/HeadCount if absent
 	Epsilon           float32 // clip.vision.attention.layer_norm_epsilon
-	ImageSize         int     // clip.vision.image_size (max longest edge, pixels)
+	ImageSize         int     // clip.vision.image_size (legacy/static preprocessing bound, pixels)
 	PatchSize         int     // clip.vision.patch_size
 	SpatialMergeSize  int     // clip.vision.spatial_merge_size (2x2 merge for Ministral-3)
+	ImageMinTokens    int     // dynamic Pixtral input lower bound, after spatial merge
+	ImageMaxTokens    int     // dynamic Pixtral input upper bound, after spatial merge
 	ProjectionDim     int     // clip.vision.projection_dim -- must match the paired LLM's Dim
 	ImageMean         [3]float32
 	ImageStd          [3]float32
@@ -164,6 +166,9 @@ func LoadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal bool, logw io.
 		EmbeddingLength: embLen, FeedForwardLength: ffnLen, BlockCount: blockCount,
 		HeadCount: headCount, HeadDim: headDim, Epsilon: epsilon,
 		ImageSize: imageSize, PatchSize: patchSize, SpatialMergeSize: mergeSize,
+		// Pixtral GGUFs do not currently carry these limits as metadata. They
+		// are the model-family defaults used by the reference implementation.
+		ImageMinTokens: 8, ImageMaxTokens: 1024,
 		ProjectionDim: projDim, ImageMean: imgMean, ImageStd: imgStd,
 		UseSiLU: useSiLU, UseGELU: useGELU, RopeTheta: 10000,
 	}
@@ -283,32 +288,36 @@ func LoadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal bool, logw io.
 	return config, weights, nil
 }
 
-// buildPixtralRope2DInvFreq returns the shared per-axis inverse RoPE
-// frequencies for 2D (row, column) position encoding: headDim/4 values,
-// reused for both the row and column axes (each axis gets half of the
-// headDim/2 total rotary pairs). Same theta^(-2j/ropeDim) formula RoPE
-// always uses, with ropeDim=headDim/2 since each axis only rotates half the
-// head dimension.
-func buildPixtralRope2DInvFreq(headDim int, theta float32) []float32 {
+// buildPixtralRope2DInvFreq builds the row- and column-axis inverse
+// frequencies for Pixtral's split 2D RoPE. Pixtral first constructs its usual
+// one-dimensional sequence f_i = theta^(-2i/headDim), then assigns alternating
+// frequencies to the two axes: row_j=f_(2j), col_j=f_(2j+1).
+//
+// These must be distinct sequences. Reusing the row frequencies for the column
+// axis leaves uniform images plausible but corrupts the geometry of real scenes.
+func buildPixtralRope2DInvFreq(headDim int, theta float32) (rowInv, colInv []float32) {
 	quarter := headDim / 4
-	inv := make([]float32, quarter)
-	axisRopeDim := float64(headDim / 2)
-	for j := range quarter {
-		inv[j] = float32(1 / math.Pow(float64(theta), float64(2*j)/axisRopeDim))
+	rowInv = make([]float32, quarter)
+	colInv = make([]float32, quarter)
+	if headDim <= 0 || theta <= 0 {
+		return rowInv, colInv
 	}
-	return inv
+	for j := range quarter {
+		rowInv[j] = float32(1 / math.Pow(float64(theta), float64(4*j)/float64(headDim)))
+		colInv[j] = float32(1 / math.Pow(float64(theta), float64(4*j+2)/float64(headDim)))
+	}
+	return rowInv, colInv
 }
 
 // preparePixtralRope2DScratch packs one combined sin/cos buffer for a patch
 // at (row, col): the first headDim/4 entries are the row axis's angles, the
-// next headDim/4 are the column axis's -- consumed unchanged by
-// applyPreparedRope(..., interleaved=false), whose (i, i+half) pairing with
-// half=headDim/2 exactly matches this layout (this is the standard
-// "rotate_half" RoPE convention every Mistral-family model already uses,
-// just fed a row/col-combined frequency source instead of a 1D sequence
-// position).
-func preparePixtralRope2DScratch(row, col, headDim int, invFreq []float32, sinScratch, cosScratch *[]float32) (half, nCache int) {
-	quarter := len(invFreq)
+// next headDim/4 are the column axis's alternating-frequency angles. Pixtral
+// rotates adjacent pairs *within* each axis half: row pairs occupy dimensions
+// 0..headDim/2-1 and column pairs headDim/2..headDim-1. This is distinct from
+// the text decoder's split-half/NeoX convention, so callers must pass
+// interleaved=true to applyPreparedRope.
+func preparePixtralRope2DScratch(row, col, headDim int, rowInv, colInv []float32, sinScratch, cosScratch *[]float32) (half, nCache int) {
+	quarter := min(len(rowInv), len(colInv))
 	half = headDim / 2
 	if quarter <= 0 || half <= 0 {
 		return 0, 0
@@ -317,11 +326,11 @@ func preparePixtralRope2DScratch(row, col, headDim int, invFreq []float32, sinSc
 	ensureLenNoClear(cosScratch, half)
 	sin, cos := *sinScratch, *cosScratch
 	for j := 0; j < quarter; j++ {
-		s, c := math.Sincos(float64(float32(row) * invFreq[j]))
+		s, c := math.Sincos(float64(float32(row) * rowInv[j]))
 		sin[j], cos[j] = float32(s), float32(c)
 	}
 	for j := 0; j < quarter; j++ {
-		s, c := math.Sincos(float64(float32(col) * invFreq[j]))
+		s, c := math.Sincos(float64(float32(col) * colInv[j]))
 		sin[quarter+j], cos[quarter+j] = float32(s), float32(c)
 	}
 	return half, half
@@ -343,8 +352,15 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 		return nil, 0, 0, fmt.Errorf("encoding image: invalid patch grid %dx%d for %d patches", img.Rows, img.Cols, n)
 	}
 	merge := max(1, vc.SpatialMergeSize)
-	if img.Rows%merge != 0 || img.Cols%merge != 0 {
-		return nil, 0, 0, fmt.Errorf("encoding image: patch grid %dx%d not divisible by spatial merge size %d", img.Rows, img.Cols, merge)
+	// The runtime's dynamic Pixtral preprocessor aligns images to
+	// patchSize*merge, so production grids form complete merge windows. Keep
+	// floor semantics here for callers of the legacy preprocessor: the
+	// reference projector's unfold naturally drops an incomplete bottom/right
+	// window rather than inventing padded visual tokens.
+	mergedRows = img.Rows / merge
+	mergedCols = img.Cols / merge
+	if mergedRows == 0 || mergedCols == 0 {
+		return nil, 0, 0, fmt.Errorf("encoding image: patch grid %dx%d is smaller than spatial merge size %d", img.Rows, img.Cols, merge)
 	}
 	dim := vc.EmbeddingLength
 	headDim := vc.HeadDim
@@ -370,7 +386,7 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 		rmsNormInto(x[i], weights.PreNorm, vc.Epsilon, &x[i])
 	}
 
-	invFreq := buildPixtralRope2DInvFreq(headDim, vc.RopeTheta)
+	rowInvFreq, colInvFreq := buildPixtralRope2DInvFreq(headDim, vc.RopeTheta)
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 
 	q := make([][]float32, n)
@@ -410,9 +426,12 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 				addInPlace(v[i], layer.VB[:dim])
 			}
 			row, col := i/img.Cols, i%img.Cols
-			half, nCache := preparePixtralRope2DScratch(row, col, headDim, invFreq, &sinScratch, &cosScratch)
-			applyPreparedRope(q[i], headDim, heads, half, nCache, sinScratch, cosScratch, false)
-			applyPreparedRope(k[i], headDim, heads, half, nCache, sinScratch, cosScratch, false)
+			half, nCache := preparePixtralRope2DScratch(row, col, headDim, rowInvFreq, colInvFreq, &sinScratch, &cosScratch)
+			// Pixtral's two 2D axes each use conventional adjacent-pair RoPE.
+			// Do not use the Mistral text decoder's NeoX/split-half rotation here:
+			// that would rotate a row component against a column component.
+			applyPreparedRope(q[i], headDim, heads, half, nCache, sinScratch, cosScratch, true)
+			applyPreparedRope(k[i], headDim, heads, half, nCache, sinScratch, cosScratch, true)
 		}
 
 		attendOne := func(i int, scores []float32) {
@@ -488,8 +507,6 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 		rmsNormInto(x[i], weights.InputNorm, vc.Epsilon, &x[i])
 	}
 
-	mergedRows = img.Rows / merge
-	mergedCols = img.Cols / merge
 	mergedN := mergedRows * mergedCols
 	mergedVecLen := dim * merge * merge
 	mergedIn := make([][]float32, mergedN)

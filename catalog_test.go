@@ -215,12 +215,18 @@ func TestModelSortKeyPutsSupportedModelsFirstAndUsesDisplayName(t *testing.T) {
 func TestPairProjectorsMatchesSameRepositoryAndPrefersF16(t *testing.T) {
 	textA := testEntry("ministral/ministral-Q4_K_M", "mistral3", false)
 	textA.Repository = "ministral"
+	textA.visionDimension = 3072
+	textA.visionTemplateCapable = true
 	mmprojF32 := testEntry("ministral/mmproj-F32", "clip", true)
 	mmprojF32.Repository = "ministral"
 	mmprojF32.FileName = "mmproj-F32.gguf"
+	mmprojF32.visionDimension = 3072
+	mmprojF32.visionPixtralProjector = true
 	mmprojF16 := testEntry("ministral/mmproj-F16", "clip", true)
 	mmprojF16.Repository = "ministral"
 	mmprojF16.FileName = "mmproj-F16.gguf"
+	mmprojF16.visionDimension = 3072
+	mmprojF16.visionPixtralProjector = true
 	// A text-only model in a different repository must not get paired.
 	textB := testEntry("other/other-model", "llama", false)
 	textB.Repository = "other"
@@ -238,6 +244,87 @@ func TestPairProjectorsMatchesSameRepositoryAndPrefersF16(t *testing.T) {
 	if entries[1].ProjectorPath != "" || entries[2].ProjectorPath != "" {
 		t.Fatal("a projector entry should never itself get a ProjectorPath")
 	}
+}
+
+func TestDiscoverModelsPairsOnlyRunnablePixtralVisionModels(t *testing.T) {
+	root := t.TempDir()
+	write := func(relative string, data []byte) string {
+		t.Helper()
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	goodTextPath := write(filepath.Join("safe", "model.gguf"), buildVisionCatalogTextGGUF(8, true))
+	goodProjectorPath := write(filepath.Join("safe", "mmproj-F16.gguf"), buildVisionCatalogProjectorGGUF("pixtral", 8, true))
+	// Neither a non-Pixtral encoder nor a matching filename with the wrong
+	// decoder width is a usable companion. The latter has a better filename
+	// rank than no candidate, so this also proves compatibility is checked
+	// before the F16/BF16/F32 preference.
+	write(filepath.Join("safe", "mmproj-Qwen-F16.gguf"), buildVisionCatalogProjectorGGUF("qwen2vl", 8, true))
+	write(filepath.Join("safe", "mmproj-wrong-F16.gguf"), buildVisionCatalogProjectorGGUF("pixtral", 16, true))
+
+	noTemplatePath := write(filepath.Join("no-mistral-markers", "model.gguf"), buildVisionCatalogTextGGUF(8, false))
+	write(filepath.Join("no-mistral-markers", "mmproj-F16.gguf"), buildVisionCatalogProjectorGGUF("pixtral", 8, true))
+
+	// These two directories deliberately share the same final name. Pairing
+	// by ModelEntry.Repository alone would cross-wire them; exact parent paths
+	// must keep each model isolated.
+	firstTextPath := write(filepath.Join("first", "shared", "model.gguf"), buildVisionCatalogTextGGUF(8, true))
+	write(filepath.Join("second", "shared", "mmproj-F16.gguf"), buildVisionCatalogProjectorGGUF("pixtral", 8, true))
+
+	entries, err := DiscoverModels(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byPath := make(map[string]ModelEntry, len(entries))
+	for _, entry := range entries {
+		byPath[entry.Path] = entry
+	}
+	if got := byPath[goodTextPath].ProjectorPath; got != goodProjectorPath {
+		t.Fatalf("safe ProjectorPath = %q, want %q", got, goodProjectorPath)
+	}
+	if got := byPath[noTemplatePath].ProjectorPath; got != "" {
+		t.Fatalf("Mistral-token-incompatible ProjectorPath = %q, want empty", got)
+	}
+	if got := byPath[firstTextPath].ProjectorPath; got != "" {
+		t.Fatalf("cross-directory ProjectorPath = %q, want empty", got)
+	}
+	if got, err := PairedVisionProjectorPath(goodTextPath); err != nil || got != goodProjectorPath {
+		t.Fatalf("PairedVisionProjectorPath() = %q, %v; want %q, nil", got, err, goodProjectorPath)
+	}
+}
+
+func buildVisionCatalogTextGGUF(dim uint32, imageTemplate bool) []byte {
+	tokens := []any{"<unk>", "<s>", "</s>"}
+	template := "{{ '[INST]' }}{{ '[IMG]' }}{{ '[/INST]' }}"
+	if imageTemplate {
+		tokens = append(tokens, "[INST]", "[/INST]", "[IMG]", "[IMG_BREAK]", "[IMG_END]")
+	} else {
+		template = "{{ '<|user|>' }}"
+	}
+	return buildGGUF(3, []ggufKV{
+		{"general.architecture", ggufStr, "mistral3"},
+		{"mistral3.embedding_length", ggufU32, dim},
+		{"mistral3.context_length", ggufU32, uint32(128)},
+		{"tokenizer.ggml.model", ggufStr, "llama"},
+		{"tokenizer.ggml.tokens", ggufArr, ggufArray{ggufStr, tokens}},
+		{"tokenizer.chat_template", ggufStr, template},
+	}, nil)
+}
+
+func buildVisionCatalogProjectorGGUF(projectorType string, projectionDim uint32, hasVision bool) []byte {
+	return buildGGUF(3, []ggufKV{
+		{"general.architecture", ggufStr, "clip"},
+		{"clip.has_vision_encoder", ggufBool, hasVision},
+		{"clip.projector_type", ggufStr, projectorType},
+		{"clip.vision.projection_dim", ggufU32, projectionDim},
+	}, nil)
 }
 
 func TestDiscoverModelsAndResolveModelPath(t *testing.T) {
