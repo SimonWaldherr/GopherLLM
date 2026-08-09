@@ -3526,7 +3526,10 @@ valuePass:
 func attentionWeightsInPlace(scores []float32, softcap float32) float32 {
 	if softcap > 0 {
 		for i, s := range scores {
-			scores[i] = softcap * float32(math.Tanh(float64(s/softcap)))
+			// Attention runs this once per cached position and head on every
+			// decode token. Keep it in f32 just like the activation and final
+			// logit-softcap paths rather than widening every score into libm.
+			scores[i] = softcap * fastTanhF32(s/softcap)
 		}
 	}
 	maxScore := scores[0]
@@ -3537,7 +3540,7 @@ func attentionWeightsInPlace(scores []float32, softcap float32) float32 {
 	}
 	var denom float32
 	for i, s := range scores {
-		w := float32(math.Exp(float64(s - maxScore)))
+		w := fastExpF32(s - maxScore)
 		scores[i] = w
 		denom += w
 	}
@@ -3567,7 +3570,7 @@ func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []u
 	}
 	if softcap > 0 {
 		for i, s := range scores {
-			scores[i] = softcap * float32(math.Tanh(float64(s/softcap)))
+			scores[i] = softcap * fastTanhF32(s/softcap)
 		}
 	}
 	maxScore := scores[0]
@@ -3581,12 +3584,12 @@ func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []u
 	}
 	var denom float32
 	for i, s := range scores {
-		w := float32(math.Exp(float64(s - maxScore)))
+		w := fastExpF32(s - maxScore)
 		scores[i] = w
 		denom += w
 	}
 	if hasSink {
-		denom += float32(math.Exp(float64(sink - maxScore)))
+		denom += fastExpF32(sink - maxScore)
 	}
 	valueByteStride := q8RowBytes(valueStride)
 	valueBlockBytes := q8RowBytes(valueHeadDim)

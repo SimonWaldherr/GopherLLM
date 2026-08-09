@@ -530,6 +530,54 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
 
 Open `http://127.0.0.1:8080/chat` for the browser UI.
 
+### Deployment profiles
+
+Choose an explicit server profile when starting the chat UI. The profile is
+enforced by the HTTP server; hiding a control in the browser is never the only
+protection.
+
+| Profile | Intended use | Inference and control boundary |
+| --- | --- | --- |
+| `local` (default) | One person on one laptop | The listener must use a loopback address. The owner can select models, download, tune, and change settings. |
+| `managed` | Shared server | Users can generate replies. Model changes, downloads, embedding-model loads, tuning, remote credentials, and agentic OS actions require the administrator token. |
+| `browser` | Server-hosted web app with on-device inference | The server serves the UI and WASM runtime only. Each browser tab picks and runs its own GGUF with WASM/WebGPU; server inference and its model controls are disabled. |
+
+Personal/local setup:
+
+```sh
+bin/gopherllm --model-dir /path/to/models --serve 127.0.0.1:8080 --chat \
+  --deployment local
+```
+
+Managed server setup (put the token file under the service account with
+restricted permissions):
+
+```sh
+bin/gopherllm --model-dir /srv/gopherllm/models --model my-model \
+  --serve 0.0.0.0:8080 --chat --deployment managed \
+  --admin-token-file /etc/gopherllm/admin-token
+```
+
+The administrator can paste that token into the **Server administration**
+section of the chat UI for the current tab, or send it as
+`X-GopherLLM-Admin-Token` / `Authorization: Bearer ...` to the API. The token
+is not written into browser storage, URLs, logs, or `--print-config` output.
+Use HTTPS and normal user authentication at a reverse proxy before exposing a
+managed server to a network: the built-in token protects operational controls,
+not end-user identity or transport security.
+
+Browser-only setup:
+
+```sh
+make wasm-build
+bin/gopherllm --serve 0.0.0.0:8080 --deployment browser --wasm-dir ./bin
+```
+
+This profile deliberately rejects a server-side `--model`: the browser opens a
+GGUF selected from the user's device and runs it there. Prompts, images, and
+model bytes are not sent to GopherLLM's inference API. WebGPU, camera, and
+screen capture require HTTPS outside `localhost`.
+
 The CLI remembers every successfully loaded **local** GGUF, whether it was
 used for a one-shot prompt, REPL, benchmark, server startup, or selected
 through the browser/API model picker. Later commands can omit the model
@@ -1156,9 +1204,13 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   regardless of platform detection) and must be enabled with `--metal` at
   runtime (also automatic from the `make` targets above; pass it yourself for
   a manually built binary). The selective
-  path fuses mixed Q4_K/Q4_K/Q6_K Q/K/V projections into one command buffer and
-  offloads Q4_K attention-output, Q4_K gate/up + SiLU + Q6_K FFN-down in one
-  command buffer, and Q6_K vocabulary-output projections. Deterministic decode
+  path fuses sufficiently large mixed Q4_K/Q4_K/Q6_K Q/K/V projections into
+  one command buffer and offloads large Q4_K projections, Q4_K gate/up + SiLU
+  + Q6_K FFN-down in one command buffer, and Q6_K vocabulary-output
+  projections. Narrow GQA K/V and 3K-5K-row attention-output projections stay
+  on the faster CPU Q8_K/SIMD path; on the measured M2 Max, forcing those
+  Ministral 3B/14B shapes through Metal was 35-65% slower per kernel.
+  Deterministic decode
   (`--temp 0` or `--top-k 1`) also applies the bounded recent-token repeat
   penalty on-device before reducing the vocabulary output to its argmax. This
   keeps the default repeat penalty from forcing a 131k-logit readback and CPU
@@ -1207,7 +1259,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   expf polynomial (~1e-7 relative error) instead of per-element `math.Exp`.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
   spread across the worker pool at longer contexts, and single-token matvec work
-  is over-chunked so performance cores absorb efficiency-core stragglers. The
+  is split into eight ranges per worker so performance cores absorb
+  efficiency-core stragglers. This increased Ministral 3 14B decode from 6.67
+  to 7.70 tok/s (+15%) in the local 48-token benchmark while remaining neutral
+  within noise on Ministral 3 3B. The
   dispatch coordinator computes one shard itself instead of parking, and Q8
   activation scratch is returned without a per-projection closure allocation.
   The worker pool remains sized to the configured runtime even when a kernel

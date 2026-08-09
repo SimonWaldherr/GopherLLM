@@ -10,6 +10,7 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/server"
 )
 
 const (
@@ -57,7 +58,12 @@ type fileRuntimeConfig struct {
 }
 
 type fileServerConfig struct {
-	Address         *string `json:"address,omitempty"`
+	Address    *string `json:"address,omitempty"`
+	Deployment *string `json:"deployment,omitempty"`
+	// AdminTokenFile is deliberately a file reference rather than the token
+	// itself. Deployment secrets should live in an environment variable or a
+	// permission-restricted file, and --print-config must never reproduce one.
+	AdminTokenFile  *string `json:"admin_token_file,omitempty"`
 	Chat            *bool   `json:"chat,omitempty"`
 	ChatHistoryPath *string `json:"chat_history_path,omitempty"`
 	MaxConnections  *int    `json:"max_connections,omitempty"`
@@ -84,6 +90,9 @@ var cliValueOptions = map[string]bool{
 	"--prompt":             true,
 	"-p":                   true,
 	"--serve":              true,
+	"--deployment":         true,
+	"--admin-token":        true,
+	"--admin-token-file":   true,
 	"--chat-history":       true,
 	"--wasm-dir":           true,
 	"--max-connections":    true,
@@ -265,6 +274,16 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		if s.Address != nil {
 			cfg.serveAddr = *s.Address
 		}
+		if s.Deployment != nil {
+			mode, err := server.ParseDeploymentMode(*s.Deployment)
+			if err != nil {
+				return fmt.Errorf("config server.deployment: %w", err)
+			}
+			cfg.deploymentMode = mode
+		}
+		if s.AdminTokenFile != nil {
+			cfg.adminTokenFile = *s.AdminTokenFile
+		}
 		if s.Chat != nil {
 			cfg.chatUI = *s.Chat
 		}
@@ -367,6 +386,8 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	}
 	type effectiveServerConfig struct {
 		Address         string `json:"address,omitempty"`
+		Deployment      string `json:"deployment,omitempty"`
+		AdminTokenFile  string `json:"admin_token_file,omitempty"`
 		Chat            bool   `json:"chat,omitempty"`
 		ChatHistoryPath string `json:"chat_history_path,omitempty"`
 		MaxConnections  int    `json:"max_connections,omitempty"`
@@ -420,9 +441,11 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	if cfg.modelSelector != nil {
 		result.Model = *cfg.modelSelector
 	}
-	if cfg.serveAddr != "" || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
+	if cfg.serveAddr != "" || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
 		result.Server = &effectiveServerConfig{
 			Address:         cfg.serveAddr,
+			Deployment:      string(cfg.deploymentMode),
+			AdminTokenFile:  cfg.adminTokenFile,
 			Chat:            cfg.chatUI,
 			ChatHistoryPath: cfg.chatHistoryPath,
 			MaxConnections:  cfg.maxConn,

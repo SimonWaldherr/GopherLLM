@@ -556,6 +556,18 @@ let serverStorageConfigured = false;
 let serverWorkspaceConflict = false;
 let serverWorkspaceReady = false;
 
+function deploymentModeValue() {
+  return (document.body && document.body.dataset.deploymentMode) || "local";
+}
+
+function usesBrowserOnlyDeployment() {
+  return document.body && document.body.dataset.browserOnly === "true";
+}
+
+function usesSharedServerDeployment() {
+  return deploymentModeValue() === "managed" || usesBrowserOnlyDeployment();
+}
+
 function openDB() {
   if (dbPromise) return dbPromise;
   if (!("indexedDB" in window)) return Promise.reject(new Error("IndexedDB unavailable"));
@@ -619,7 +631,10 @@ async function writeBrowserWorkspace(value) {
 
 async function readWorkspace() {
   const local = await readBrowserWorkspace();
-  const requestedMode = local && local.preferences && local.preferences.storageMode === "server" ? "server" : "browser";
+  // Managed and on-device browser deployments deliberately never share the
+  // process-wide server history file: without end-user identities it would be
+  // one user's workspace visible to another. Keep every browser private.
+  const requestedMode = usesSharedServerDeployment() ? "browser" : (local && local.preferences && local.preferences.storageMode === "server" ? "server" : "browser");
   workspaceStorageMode = requestedMode;
   if (requestedMode !== "server") return local;
   try {
@@ -1122,6 +1137,15 @@ function toMarkdown(chat) {
   const settingsEl = $("settings");
   const settingsCloseEl = $("settingsClose");
   const settingsDoneEl = $("settingsDone");
+  const settingsSearchEl = $("settingsSearch");
+  const settingsSearchEmptyEl = $("settingsSearchEmpty");
+  const settingsSearchEmptyQueryEl = $("settingsSearchEmptyQuery");
+  const settingsSearchEmptyHintEl = $("settingsSearchEmptyHint");
+	const managedAccessNoticeEl = $("managedAccessNotice");
+	const adminUnlockFormEl = $("adminUnlockForm");
+	const adminTokenInputEl = $("adminTokenInput");
+	const adminUnlockEl = $("adminUnlock");
+	const adminAccessStatusEl = $("adminAccessStatus");
   const skillsNoteEl = $("skillsNote");
   const autoTuneEffortEl = $("autoTuneEffort");
   const autoTuneRunEl = $("autoTuneRun");
@@ -1239,7 +1263,10 @@ function toMarkdown(chat) {
   const liveSizeValueEl = $("liveSizeValue");
   const livePauseButtonEl = $("livePauseButton");
   const livePromptInputEl = $("livePromptInput");
-  const liveAlertToggleEl = $("liveAlertToggle");
+  const liveActionConditionEl = $("liveActionCondition");
+  const liveActionSoundEl = $("liveActionSound");
+  const liveActionNotifyEl = $("liveActionNotify");
+  const liveActionMarkEl = $("liveActionMark");
   const livePromptSuggestionsEl = $("livePromptSuggestions");
   const liveOutputPanelEl = $("liveOutputPanel");
   const liveOutputStatusEl = $("liveOutputStatus");
@@ -1318,6 +1345,42 @@ function toMarkdown(chat) {
   let modelHubSearchController = null;
   let modelHubSearchTimer = null;
   let modelHubSearchSequence = 0;
+	const browserOnlyDeployment = usesBrowserOnlyDeployment();
+	const adminRequiredDeployment = document.body.dataset.adminRequired === "true";
+	let adminAuthorized = !adminRequiredDeployment;
+	// This closure-only token is deliberately never persisted in a workspace,
+	// cookie, localStorage, or URL. Refreshing the tab relocks server controls.
+	let adminToken = "";
+
+	function adminFetch(resource, options) {
+		const init = Object.assign({}, options || {});
+		const headers = new Headers(init.headers || {});
+		if (adminToken) headers.set("Authorization", "Bearer " + adminToken);
+		init.headers = headers;
+		return fetch(resource, init);
+	}
+
+	function syncDeploymentControls() {
+		if (managedAccessNoticeEl) {
+			managedAccessNoticeEl.hidden = !adminRequiredDeployment;
+			if (adminRequiredDeployment) {
+				adminUnlockFormEl.hidden = adminAuthorized;
+				adminAccessStatusEl.textContent = adminAuthorized
+					? "Administrator controls are unlocked for this tab. Refresh to lock them again."
+					: "Administrator access is locked in this tab.";
+			}
+		}
+		document.querySelectorAll("[data-admin-control]").forEach((element) => {
+			element.hidden = browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized);
+		});
+		if (browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized)) {
+			storageModeEl.value = "browser";
+			if (browserOnlyDeployment) storageModeEl.disabled = true;
+			if (ragModeEl) ragModeEl.disabled = true;
+			if (ragModelEl) ragModelEl.disabled = true;
+			if (adminRequiredDeployment && !adminAuthorized) agentOSEnabled = false;
+		}
+	}
   let loadingEmbeddingModel = false;
   let activeEmbeddingModel = "";
   let ragSearching = false;
@@ -1360,9 +1423,16 @@ function toMarkdown(chat) {
   let liveFrameProgressTimer = null;
   let liveFrameStartedAt = 0;
   let liveLastAnswer = "";
-  let liveAlertEnabled = false;
+  // User-defined trigger: liveActionCondition is free text describing the
+  // situation to watch for (e.g. "someone enters the room"), and
+  // liveActionsArmed picks which of LIVE_ACTIONS the model may invoke when
+  // that situation is on screen. Neither the condition nor any action is
+  // hardcoded to "danger" anymore -- the alert tone is just one of several
+  // actions the model can reach for, chosen by the user per session.
+  let liveActionCondition = "";
+  let liveActionsArmed = { alert: false, notify: false, mark: false };
   let liveAlertAudioContext = null;
-  let liveAlertLastAt = 0;
+  let liveActionLastAt = { alert: 0, notify: 0 };
   // Reused across every captured frame instead of creating a fresh <canvas>
   // per loop iteration -- a live session can run for many minutes at several
   // frames a minute, and re-acquiring a 2D context each time is unnecessary
@@ -1514,6 +1584,14 @@ function toMarkdown(chat) {
   // the "no model loaded" send-error action, and changeModelForMessage.
   function openModelPicker(opener) {
     setSettingsTab("model");
+	if (browserOnlyDeployment) {
+		openSettings(browserTextModelPickEl, opener);
+		return;
+	}
+	if (adminRequiredDeployment && !adminAuthorized) {
+		openSettings(adminTokenInputEl, opener);
+		return;
+	}
     openSettings(modelSearchEl, opener);
   }
 
@@ -3364,6 +3442,7 @@ function toMarkdown(chat) {
   }
 
   async function loadModels() {
+	if (browserOnlyDeployment) return;
     try {
       const response = await fetch("/models");
       if (!response.ok) throw new Error("HTTP " + response.status);
@@ -3430,6 +3509,10 @@ function toMarkdown(chat) {
       }
       updateComposer(false);
       updateVisionAffordances();
+		// Catalog hydration also initializes the embedding controls. Reapply the
+		// deployment policy afterwards so a managed non-admin tab cannot regain
+		// a server-side embedding-model loader through this async path.
+		syncDeploymentControls();
     } catch (_) {
       modelLibraryEl.setAttribute("aria-busy", "false");
       modelLibraryEl.replaceChildren();
@@ -3529,7 +3612,7 @@ function toMarkdown(chat) {
     modelDownloadVariantsEl.replaceChildren();
     setModelDownloadStatus("Looking up " + ref + "…");
     try {
-      const response = await fetch("/models/download/variants?ref=" + encodeURIComponent(ref));
+      const response = await adminFetch("/models/download/variants?ref=" + encodeURIComponent(ref));
       if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
       const data = await response.json();
       renderModelDownloadVariants(data.repository || ref, data.revision || "main", data.variants || []);
@@ -3554,7 +3637,7 @@ function toMarkdown(chat) {
     modelHubSearchSubmitEl.disabled = true;
     setModelHubSearchStatus("Searching Hugging Face for GGUF repositories…");
     try {
-      const response = await fetch("/models/search?q=" + encodeURIComponent(text) + "&limit=12", { signal: controller.signal });
+      const response = await adminFetch("/models/search?q=" + encodeURIComponent(text) + "&limit=12", { signal: controller.signal });
       if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
       const data = await response.json();
       if (sequence !== modelHubSearchSequence) return;
@@ -3644,7 +3727,7 @@ function toMarkdown(chat) {
     setModelDownloadStatus("Resolving " + selector + "…");
     let lastFile = "";
     try {
-      const response = await fetch("/models/download", {
+      const response = await adminFetch("/models/download", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: modelDownloadController.signal,
@@ -3692,6 +3775,10 @@ function toMarkdown(chat) {
   }
 
   async function loadEmbeddingModel(model) {
+	if (browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized)) {
+		showToast("An administrator must enable or change the server embedding model.", "error");
+		return false;
+	}
     if (!model || loadingEmbeddingModel) return false;
     if (activeEmbeddingModel === model) return true;
     loadingEmbeddingModel = true;
@@ -3700,7 +3787,7 @@ function toMarkdown(chat) {
     ragStatusEl.hidden = false;
     ragStatusEl.textContent = "Loading embedding model…";
     try {
-      const response = await fetch("/models/embed/load", {
+      const response = await adminFetch("/models/embed/load", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model })
@@ -3725,6 +3812,7 @@ function toMarkdown(chat) {
   }
 
   async function loadSkills() {
+	if (browserOnlyDeployment) return;
     try {
       const response = await fetch("/v1/skills");
       if (!response.ok) return;
@@ -3745,8 +3833,12 @@ function toMarkdown(chat) {
      and /os stays out of the power-command palette entirely, same as the
      skills row above. */
   async function loadAgentOSStatus() {
+	if (browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized)) {
+		agentOSEnabled = false;
+		return;
+	}
     try {
-      const response = await fetch("/agentos/status");
+      const response = await adminFetch("/agentos/status");
       if (!response.ok) return;
       const data = await response.json();
       agentOSEnabled = data && data.enabled === true;
@@ -3781,8 +3873,9 @@ function toMarkdown(chat) {
   }
 
   async function loadAutoTuneStatus() {
+	if (browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized)) return;
     try {
-      const response = await fetch("/autotune");
+      const response = await adminFetch("/autotune");
       if (!response.ok) throw new Error("HTTP " + response.status);
       autoTuneStatusEl.textContent = formatAutoTuneStatus(await response.json());
     } catch (_) {
@@ -4334,6 +4427,10 @@ function toMarkdown(chat) {
   }
 
   function openAgentOS(prefill) {
+	if (browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized)) {
+		showToast("Agent OS actions are available only to an administrator.", "error");
+		return;
+	}
     resetAgentOSPanels();
     agentosPolicyNoteEl.textContent = agentOSPolicyNote();
     if (prefill) agentosInstructionEl.value = prefill;
@@ -4405,7 +4502,7 @@ function toMarkdown(chat) {
     agentosProposeEl.disabled = true;
     resetAgentOSPanels();
     try {
-      const response = await fetch("/agentos/propose", {
+      const response = await adminFetch("/agentos/propose", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ instruction })
@@ -4442,7 +4539,7 @@ function toMarkdown(chat) {
         renderAgentOSResult(null, "Denied — not run.");
         return;
       }
-      const response = await fetch("/agentos/execute", {
+      const response = await adminFetch("/agentos/execute", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ proposal: agentOSProposal, approved: true })
@@ -4550,7 +4647,7 @@ function toMarkdown(chat) {
     renderModelLibrary();
     startModelLoadProgress();
     try {
-      const response = await fetch("/models/load", {
+      const response = await adminFetch("/models/load", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ model })
@@ -4619,7 +4716,7 @@ function toMarkdown(chat) {
     setStatus("Tuning (" + eta + ")…");
     autoTuneStatusEl.textContent = "Tuning now (" + eta + ") — generation is paused until this finishes.";
     try {
-      const response = await fetch("/autotune/run", {
+      const response = await adminFetch("/autotune/run", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ effort })
@@ -4729,10 +4826,82 @@ function toMarkdown(chat) {
     });
     settingsPageEls.forEach((page) => { page.hidden = page.dataset.settingsPage !== selected.dataset.settingsTab; });
     if (focusTab) selected.focus();
+    // Switching tabs changes which match count is "active" for the empty-
+    // state message; re-evaluate it against the tab just switched to.
+    if (settingsSearchEl.value.trim()) applySettingsSearch();
   }
+
+  // The settings panel has grown to four tabs and several dozen individual
+  // options -- textContent search across each top-level section is the
+  // cheapest way to make all of it findable without hand-maintaining a
+  // separate search index. Cached per section since section contents are
+  // static once rendered (nothing here is re-templated at runtime).
+  const settingsSectionTextCache = new WeakMap();
+  function settingsSectionSearchText(section) {
+    let text = settingsSectionTextCache.get(section);
+    if (text === undefined) {
+      text = section.textContent.toLowerCase();
+      settingsSectionTextCache.set(section, text);
+    }
+    return text;
+  }
+
+  function applySettingsSearch() {
+    const query = settingsSearchEl.value.trim().toLowerCase();
+    const tabLabels = {};
+    settingsTabEls.forEach((tab) => { tabLabels[tab.dataset.settingsTab] = tab.textContent.trim(); });
+    const tabMatchCounts = {};
+    settingsPageEls.forEach((page) => {
+      let matches = 0;
+      page.querySelectorAll(":scope > .settings-section").forEach((section) => {
+        const visible = !query || settingsSectionSearchText(section).includes(query);
+        section.classList.toggle("search-hidden", !visible);
+        // A match inside a collapsed disclosure (the "Download a model"
+        // section) would otherwise be invisible even though its parent
+        // section is shown -- open it for the duration of the search, but
+        // only restore the user's own state (not force it back closed) once
+        // the query is cleared.
+        const details = section.querySelector(":scope > details.settings-disclosure");
+        if (details) {
+          if (query && visible && !details.open) {
+            details.open = true;
+            details.dataset.searchOpened = "true";
+          } else if ((!query || !visible) && details.dataset.searchOpened === "true") {
+            details.open = false;
+            delete details.dataset.searchOpened;
+          }
+        }
+        if (visible) matches++;
+      });
+      tabMatchCounts[page.dataset.settingsPage] = matches;
+    });
+    settingsTabEls.forEach((tab) => {
+      tab.classList.toggle("has-no-matches", Boolean(query) && tabMatchCounts[tab.dataset.settingsTab] === 0);
+    });
+    const activeTab = settingsTabEls.find((tab) => tab.classList.contains("is-active"));
+    const activeKey = activeTab ? activeTab.dataset.settingsTab : null;
+    const noResults = Boolean(query) && activeKey && tabMatchCounts[activeKey] === 0;
+    settingsSearchEmptyEl.hidden = !noResults;
+    if (noResults) {
+      settingsSearchEmptyQueryEl.textContent = settingsSearchEl.value.trim();
+      const otherTabs = Object.keys(tabMatchCounts).filter((key) => key !== activeKey && tabMatchCounts[key] > 0);
+      settingsSearchEmptyHintEl.textContent = otherTabs.length ? " Try " + otherTabs.map((key) => tabLabels[key]).join(", ") + "." : "";
+    }
+  }
+
+  function clearSettingsSearch() {
+    if (!settingsSearchEl.value) return;
+    settingsSearchEl.value = "";
+    applySettingsSearch();
+  }
+
+  settingsSearchEl.addEventListener("input", applySettingsSearch);
 
   function openSettings(initialFocus, opener) {
     settingsToggleEl.setAttribute("aria-expanded", "true");
+    // A stale filter from the last visit would silently hide sections the
+    // user never searched for this time -- start every visit unfiltered.
+    clearSettingsSearch();
     openDialog(settingsEl, opener || settingsToggleEl, initialFocus || settingsCloseEl);
   }
   function closeSettings() {
@@ -4761,6 +4930,35 @@ function toMarkdown(chat) {
   });
   settingsCloseEl.addEventListener("click", closeSettings);
   settingsDoneEl.addEventListener("click", closeSettings);
+	if (adminUnlockEl) {
+		adminUnlockEl.addEventListener("click", async () => {
+			if (!adminRequiredDeployment || adminAuthorized) return;
+			const candidate = adminTokenInputEl.value.trim();
+			if (!candidate) {
+				adminAccessStatusEl.textContent = "Enter the administrator token to unlock shared server controls.";
+				adminTokenInputEl.focus();
+				return;
+			}
+			adminUnlockEl.disabled = true;
+			adminAccessStatusEl.textContent = "Checking administrator access…";
+			try {
+				adminToken = candidate;
+				const response = await adminFetch("/deployment", { cache: "no-store" });
+				const status = response.ok ? await response.json() : null;
+				if (!status || status.admin !== true) throw new Error("The token was not accepted.");
+				adminAuthorized = true;
+				adminTokenInputEl.value = "";
+				syncDeploymentControls();
+				await Promise.all([loadModels(), loadAutoTuneStatus(), loadAgentOSStatus()]);
+				showToast("Administrator controls unlocked for this tab.", "success");
+			} catch (error) {
+				adminToken = "";
+				adminAccessStatusEl.textContent = error && error.message ? error.message : "The token was not accepted.";
+			} finally {
+				adminUnlockEl.disabled = false;
+			}
+		});
+	}
   settingsEl.addEventListener("click", (event) => {
     if (event.target === settingsEl) closeSettings();
   });
@@ -5060,24 +5258,33 @@ function toMarkdown(chat) {
   livePromptSuggestionsEl.addEventListener("click", (event) => {
     const button = event.target.closest(".live-suggestion");
     if (!button) return;
-    livePromptInputEl.value = button.dataset.prompt || "";
-    if (button.dataset.alert === "true") {
-      liveAlertToggleEl.checked = true;
-      liveAlertEnabled = true;
-      ensureLiveAlertAudio();
-      setLiveOutputStatus("Sound alert armed for clearly visible danger", false);
+    // "Danger alert" has no data-prompt of its own -- it only arms a
+    // condition/action and leaves whatever the user already typed alone.
+    if (button.dataset.prompt) livePromptInputEl.value = button.dataset.prompt;
+    if (button.dataset.condition) {
+      liveActionConditionEl.value = button.dataset.condition;
+      (button.dataset.arm || "").split(",").filter(Boolean).forEach((key) => {
+        if (key === "alert") liveActionSoundEl.checked = true;
+        else if (key === "notify") liveActionNotifyEl.checked = true;
+        else if (key === "mark") liveActionMarkEl.checked = true;
+      });
+      syncLiveActionsFromControls();
+      if (liveActionsArmed.alert) ensureLiveAlertAudio();
+      if (liveActionsArmed.notify) ensureNotifyPermission();
+      setLiveOutputStatus("Actions armed for: " + liveActionCondition, false);
     }
     livePromptInputEl.focus();
   });
-  liveAlertToggleEl.addEventListener("change", () => {
-    liveAlertEnabled = liveAlertToggleEl.checked;
-    if (liveAlertEnabled) {
-      ensureLiveAlertAudio();
-      setLiveOutputStatus("Sound alert armed for clearly visible danger", false);
-    } else {
-      setLiveOutputStatus("Sound alert disabled", false);
-    }
+  [liveActionSoundEl, liveActionNotifyEl, liveActionMarkEl].forEach((el) => {
+    el.addEventListener("change", () => {
+      syncLiveActionsFromControls();
+      if (liveActionSoundEl.checked) ensureLiveAlertAudio();
+      if (liveActionNotifyEl.checked) ensureNotifyPermission();
+      const armed = liveActionsArmed.alert || liveActionsArmed.notify || liveActionsArmed.mark;
+      setLiveOutputStatus(armed && liveActionCondition ? "Actions armed for: " + liveActionCondition : "Actions disarmed", false);
+    });
   });
+  liveActionConditionEl.addEventListener("input", syncLiveActionsFromControls);
 
   // hasLocalRuntime mirrors the server's own check (HandlerOptions.WasmDir
   // pointing at a real gopherllm.wasm + wasm_exec.js pair, see server.go) --
@@ -5090,9 +5297,17 @@ function toMarkdown(chat) {
 
   function initInferenceMode() {
     const available = hasLocalRuntime();
-    inferenceModeSectionEl.hidden = !available;
-    if (!available) preferences.inferenceMode = "server";
+    // In browser deployment the server is only an application host. There is
+    // no backend fallback by design, so make the on-device route explicit and
+    // non-switchable instead of showing a setting that can never succeed.
+    inferenceModeSectionEl.hidden = !available && !browserOnlyDeployment;
+    if (browserOnlyDeployment) preferences.inferenceMode = "browser";
+    // A managed deployment is an operator-selected server runtime.  A user
+    // may change their own chat preferences, but must not side-step the
+    // server model by loading an arbitrary local GGUF in this tab.
+    else if (adminRequiredDeployment || !available) preferences.inferenceMode = "server";
     inferenceModeEl.value = preferences.inferenceMode;
+    inferenceModeEl.disabled = browserOnlyDeployment || adminRequiredDeployment;
     applyInferenceMode(preferences.inferenceMode);
     // A model file picked in an earlier session is never remembered (files
     // are never persisted, by design -- nothing is uploaded or cached), so
@@ -5102,18 +5317,26 @@ function toMarkdown(chat) {
   }
 
   function applyInferenceMode(mode) {
-    const browser = mode === "browser";
+    const browser = browserOnlyDeployment || (!adminRequiredDeployment && mode === "browser");
     browserModelSectionEl.hidden = !browser;
-    serverModelSectionEl.hidden = browser;
-    modelDownloadSectionEl.hidden = browser;
+    serverModelSectionEl.hidden = browser || (adminRequiredDeployment && !adminAuthorized);
+    modelDownloadSectionEl.hidden = browser || (adminRequiredDeployment && !adminAuthorized);
+    browserModelUnloadEl.hidden = browserOnlyDeployment;
     inferenceModeStatusEl.textContent = browser
-      ? "Browser mode runs entirely on-device: no chat data leaves this tab, but tool use, retrieval, and long-context strategies are unavailable."
-      : "Server mode uses the model this GopherLLM server has loaded, with full access to tools and retrieval.";
+      ? (browserOnlyDeployment
+        ? "This deployment runs only in this browser. Choose a GGUF from this device; it is not uploaded to the server. WebGPU is used when available."
+        : "Browser mode runs entirely on-device: no chat data leaves this tab, but tool use, retrieval, and long-context strategies are unavailable.")
+      : (adminRequiredDeployment
+        ? "This managed server uses the model selected by its administrator."
+        : "Server mode uses the model this GopherLLM server has loaded, with full access to tools and retrieval.");
+    syncDeploymentControls();
     updateVisionAffordances();
   }
 
   function changeInferenceMode(value) {
-    const next = value === "browser" && hasLocalRuntime() ? "browser" : "server";
+    const next = browserOnlyDeployment
+      ? "browser"
+      : (adminRequiredDeployment ? "server" : (value === "browser" && hasLocalRuntime() ? "browser" : "server"));
     preferences.inferenceMode = next;
     inferenceModeEl.value = next;
     applyInferenceMode(next);
@@ -5182,6 +5405,15 @@ function toMarkdown(chat) {
       browserModelMetaEl.textContent = visionFile ? "with vision (" + visionFile.name + ")" : "text only";
       browserModelSummaryEl.hidden = false;
       browserModelSummaryEl.classList.add("is-loaded");
+      // Browser / on-device deployments never receive a server-side catalog
+      // refresh, so mark the model active here just as loadModels() does for
+      // a server model. Without this, the composer remained in its misleading
+      // "No model loaded" state after a successful local GGUF load.
+      setModelName(textFile.name);
+      hasActiveModel = true;
+      renderEmptyState(true);
+      setIdleStatus();
+      updateComposer(false);
       updateVisionAffordances();
       showToast("Model loaded in this browser tab.", "success");
     } catch (err) {
@@ -5349,17 +5581,21 @@ function toMarkdown(chat) {
     }
   }
 
+  function ensureNotifyPermission() {
+    if (!("Notification" in window) || Notification.permission !== "default") return;
+    Notification.requestPermission().catch(() => {});
+  }
+
   function playLiveAlertTone() {
-    if (!liveAlertEnabled) return false;
     const now = performance.now();
     // A slow model may emit the marker more than once or repeat it on adjacent
     // frames. Rate limiting keeps a safety tone useful instead of turning it
     // into an audible loop.
-    if (now - liveAlertLastAt < 3000) return false;
+    if (now - liveActionLastAt.alert < 3000) return false;
     const audio = ensureLiveAlertAudio();
     if (!audio) return false;
     try {
-      liveAlertLastAt = now;
+      liveActionLastAt.alert = now;
       const start = audio.currentTime;
       const gain = audio.createGain();
       gain.gain.setValueAtTime(0.0001, start);
@@ -5379,10 +5615,70 @@ function toMarkdown(chat) {
     }
   }
 
-  function parseLiveAlert(text) {
+  function fireLiveNotification(text) {
+    if (!("Notification" in window) || Notification.permission !== "granted") return false;
+    const now = performance.now();
+    // OS notifications persist in a tray/notification center, so they are
+    // more disruptive to repeat than the sound tone -- give them a longer
+    // cooldown than playLiveAlertTone's.
+    if (now - liveActionLastAt.notify < 5000) return false;
+    liveActionLastAt.notify = now;
+    try {
+      new Notification("GopherLLM live vision", { body: (text || "").trim().slice(0, 200) || "Flagged frame detected.", tag: "gopherllm-live-vision" });
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // The catalog the model chooses from -- see completeLiveVision, which only
+  // offers the user's currently-armed subset of these markers, and
+  // parseLiveActions, which strips whichever ones come back out of the
+  // displayed text. "mark" has no immediate side effect here; runLiveVision
+  // applies it when the frame's answer is pushed into the history log.
+  const LIVE_ACTIONS = {
+    alert: { marker: "ALERT", hint: "sound an audible alarm -- for anything needing the user's immediate attention" },
+    notify: { marker: "NOTIFY", hint: "send a system notification -- for something worth flagging even if the user is not watching this tab" },
+    mark: { marker: "MARK", hint: "silently bookmark this moment in the history log -- for something worth remembering later but not urgent" }
+  };
+  const LIVE_ACTION_MARKER_RE = /\[(ALERT|NOTIFY|MARK)\]/gi;
+
+  function parseLiveActions(text) {
     const raw = String(text || "");
-    const alert = /\[ALERT\]/i.test(raw);
-    return { alert, text: raw.replace(/\s*\[ALERT\]\s*/gi, " ").replace(/\s{2,}/g, " ").trim() };
+    const actions = new Set();
+    LIVE_ACTION_MARKER_RE.lastIndex = 0;
+    let match;
+    while ((match = LIVE_ACTION_MARKER_RE.exec(raw))) {
+      const key = Object.keys(LIVE_ACTIONS).find((k) => LIVE_ACTIONS[k].marker === match[1].toUpperCase());
+      if (key) actions.add(key);
+    }
+    return { actions, text: raw.replace(LIVE_ACTION_MARKER_RE, " ").replace(/\s{2,}/g, " ").trim() };
+  }
+
+  // Dispatches the immediate side effect for one detected action. "mark" is
+  // intentionally absent -- it is applied to the history entry directly by
+  // its caller instead of firing here.
+  function fireLiveAction(key, text) {
+    if (key === "alert") return playLiveAlertTone();
+    if (key === "notify") return fireLiveNotification(text);
+    return false;
+  }
+
+  function describeLiveActionStatus(triggered) {
+    const labels = [];
+    if (triggered.has("alert")) labels.push("Alert");
+    if (triggered.has("notify")) labels.push("Notification");
+    if (triggered.has("mark")) labels.push("Marked");
+    return labels.join(" · ");
+  }
+
+  function syncLiveActionsFromControls() {
+    liveActionCondition = liveActionConditionEl.value.trim();
+    liveActionsArmed = {
+      alert: liveActionSoundEl.checked,
+      notify: liveActionNotifyEl.checked,
+      mark: liveActionMarkEl.checked
+    };
   }
 
   function setLiveOutputText(text, streaming, isError) {
@@ -5429,9 +5725,9 @@ function toMarkdown(chat) {
     liveStatTPSEl.textContent = "tok/s " + (tps != null ? tps.toFixed(1) : "--");
   }
 
-  function pushLiveHistory(text) {
+  function pushLiveHistory(text, marked) {
     const time = new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-    liveHistory = [{ time, text }, ...liveHistory].slice(0, 50);
+    liveHistory = [{ time, text, marked: !!marked }, ...liveHistory].slice(0, 50);
     renderLiveHistory();
   }
 
@@ -5441,7 +5737,8 @@ function toMarkdown(chat) {
       return;
     }
     liveHistoryListEl.innerHTML = liveHistory.map((entry) =>
-      '<li><span class="live-history-time">[' + escapeHTML(entry.time) + ']</span><span>' + escapeHTML(entry.text) + '</span></li>'
+      '<li class="' + (entry.marked ? "is-marked" : "") + '"><span class="live-history-time">[' + escapeHTML(entry.time) + ']</span><span>' +
+      (entry.marked ? "📌 " : "") + escapeHTML(entry.text) + '</span></li>'
     ).join("");
   }
 
@@ -5474,13 +5771,22 @@ function toMarkdown(chat) {
     const livePromptInstruction = liveCaptureMode === "screen"
       ? "You are describing one current live screen frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly."
       : "You are describing one current live camera frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly.";
-    const liveAlertInstruction = liveAlertEnabled
-      ? "A local sound alert is armed. If and only if an immediate, clearly visible danger is present, prefix the answer with [ALERT]. Otherwise never output [ALERT]. Do not infer danger from uncertainty."
-      : "Never output [ALERT].";
+    // Only offer the markers the user actually armed, so the model never
+    // reaches for an action nothing is listening for. The trigger condition
+    // itself is the user's own words, not a hardcoded "danger" -- this is
+    // the same mechanism whether they're watching for a delivery, a pet on
+    // the counter, or an actual hazard.
+    const armedActionKeys = Object.keys(LIVE_ACTIONS).filter((key) => liveActionsArmed[key]);
+    const liveActionInstruction = liveActionCondition && armedActionKeys.length
+      ? "A local action system is armed. Only when the current frame clearly matches this user-defined situation: \"" + liveActionCondition +
+        "\", prefix the answer with the matching marker(s) below (more than one only if more than one clearly applies). " +
+        "Never use a marker speculatively or when the situation does not clearly match.\n" +
+        armedActionKeys.map((key) => "- [" + LIVE_ACTIONS[key].marker + "]: " + LIVE_ACTIONS[key].hint + ".").join("\n")
+      : "Never output [ALERT], [NOTIFY], or [MARK].";
     const liveSystemPrompt = [
       chat.systemPrompt.trim(),
       livePromptInstruction,
-      liveAlertInstruction
+      liveActionInstruction
     ].filter(Boolean).join("\n\n");
     if (preferences.inferenceMode === "browser") {
       await loadWasmBridgeScript();
@@ -5549,8 +5855,9 @@ function toMarkdown(chat) {
     liveVisionRunning = true;
     liveVisionPaused = false;
     liveCaptureMode = captureMode;
-    liveAlertEnabled = liveAlertToggleEl.checked;
-    if (liveAlertEnabled) ensureLiveAlertAudio();
+    syncLiveActionsFromControls();
+    if (liveActionsArmed.alert) ensureLiveAlertAudio();
+    if (liveActionsArmed.notify) ensureNotifyPermission();
     liveHistory = [];
     liveHistoryShown = false;
     renderLiveHistory();
@@ -5580,8 +5887,13 @@ function toMarkdown(chat) {
       const previousAnswer = liveLastAnswer;
       let ttft = null;
       let tokenCount = 0;
-      let frameAlertTriggered = false;
-      let frameAlertPlayed = false;
+      // Actions the model has claimed apply to this frame (frameActionsTriggered)
+      // vs. the ones that actually fired their side effect (frameActionsFired) --
+      // distinct because a slow model can repeat a marker across streamed
+      // partials, and each action's own rate limit (see fireLiveAction) decides
+      // whether a repeat actually re-fires.
+      let frameActionsTriggered = new Set();
+      let frameActionsFired = new Set();
       try {
         setLiveOutputStatus(liveCaptureMode === "screen" ? "Waiting for a screen frame…" : "Waiting for a camera frame…", false);
         await waitForLiveVideoFrame(requestController.signal);
@@ -5591,27 +5903,29 @@ function toMarkdown(chat) {
           stopLiveFrameProgress();
           if (ttft === null) ttft = performance.now() - startedAt;
           tokenCount++;
-          const parsed = parseLiveAlert(partial);
-          if (parsed.alert) {
-            frameAlertTriggered = true;
-            if (liveAlertEnabled && !frameAlertPlayed) frameAlertPlayed = playLiveAlertTone();
-          }
-          setLiveOutputStatus(frameAlertTriggered ? (frameAlertPlayed ? "Sound alert triggered — generating response…" : "Potential danger detected — generating response…") : "Generating response…", false);
-          setLiveOutputText(parsed.text || (frameAlertTriggered ? "Potential danger detected…" : partial), true);
+          const parsed = parseLiveActions(partial);
+          parsed.actions.forEach((key) => {
+            frameActionsTriggered.add(key);
+            if (liveActionsArmed[key] && key !== "mark" && !frameActionsFired.has(key) && fireLiveAction(key, parsed.text)) frameActionsFired.add(key);
+          });
+          const statusLabel = describeLiveActionStatus(frameActionsTriggered);
+          setLiveOutputStatus((statusLabel ? statusLabel + " — generating response…" : "Generating response…"), false);
+          setLiveOutputText(parsed.text || (statusLabel ? "Flagged…" : partial), true);
         });
         stopLiveFrameProgress();
-        const parsedAnswer = parseLiveAlert(answer);
-        if (parsedAnswer.alert) {
-          frameAlertTriggered = true;
-          if (liveAlertEnabled && !frameAlertPlayed) frameAlertPlayed = playLiveAlertTone();
-        }
+        const parsedAnswer = parseLiveActions(answer);
+        parsedAnswer.actions.forEach((key) => {
+          frameActionsTriggered.add(key);
+          if (liveActionsArmed[key] && key !== "mark" && !frameActionsFired.has(key) && fireLiveAction(key, parsedAnswer.text)) frameActionsFired.add(key);
+        });
         const generatedAnswer = parsedAnswer.text;
         liveLastAnswer = generatedAnswer || "The model returned no text for this frame.";
         setLiveOutputText(liveLastAnswer, false);
-        setLiveOutputStatus(frameAlertTriggered ? (frameAlertPlayed ? "Sound alert triggered · Last response updated" : "Danger marker detected · Last response updated") : "Last response updated", false);
+        const finalStatusLabel = describeLiveActionStatus(frameActionsTriggered);
+        setLiveOutputStatus((finalStatusLabel ? finalStatusLabel + " · Last response updated" : "Last response updated"), false);
         const elapsedSec = (performance.now() - startedAt) / 1000;
         updateLiveStats(ttft, tokenCount && elapsedSec > 0 ? tokenCount / elapsedSec : null);
-        if (generatedAnswer) pushLiveHistory(generatedAnswer);
+        if (generatedAnswer) pushLiveHistory(generatedAnswer, liveActionsArmed.mark && frameActionsTriggered.has("mark"));
         if (liveVisionRunning) setLiveStatus(liveVisionPaused ? "paused" : "live");
       } catch (error) {
         stopLiveFrameProgress();
@@ -5638,8 +5952,14 @@ function toMarkdown(chat) {
     liveVisionController = null;
     stopLiveFrameProgress();
     stopLiveElapsedTimer();
-    liveAlertEnabled = false;
-    liveAlertToggleEl.checked = false;
+    // Force deliberate re-arming on the next session rather than leaving a
+    // watch condition silently active in the background once the camera or
+    // screen share it was written for has already stopped.
+    liveActionsArmed = { alert: false, notify: false, mark: false };
+    liveActionSoundEl.checked = false;
+    liveActionNotifyEl.checked = false;
+    liveActionMarkEl.checked = false;
+    liveActionConditionEl.value = "";
     setLiveCaptureButtonState(false, liveCaptureMode);
     livePauseButtonEl.classList.remove("is-paused");
     livePauseButtonEl.setAttribute("aria-label", "Pause live vision");
@@ -5868,6 +6188,8 @@ function toMarkdown(chat) {
     chat.model = modelNameEl.textContent || "";
     chats = [chat];
   }
+	if (usesSharedServerDeployment()) preferences.storageMode = "browser";
+	if (browserOnlyDeployment) preferences.inferenceMode = "browser";
   if (!activeID) activeID = chats.slice().sort((a, b) => b.updatedAt - a.updatedAt)[0].id;
   applyTheme(preferences.theme);
   applyPowerPreference(preferences.power);
@@ -5880,9 +6202,12 @@ function toMarkdown(chat) {
   setComposerProOpen(preferences.composerPro);
   goalRoundsEl.value = preferences.goalRounds;
   initInferenceMode();
+	syncDeploymentControls();
   renderWorkspace(true);
-  loadModels();
-  loadSkills();
-  loadAutoTuneStatus();
-  loadAgentOSStatus();
+	if (!browserOnlyDeployment) {
+		loadModels();
+		loadSkills();
+		loadAutoTuneStatus();
+		loadAgentOSStatus();
+	}
 }());

@@ -118,7 +118,10 @@ func TestMetalQ4K2Q6KMatvecMatchesCPU(t *testing.T) {
 		t.Skip(MetalError())
 	}
 	forceExactMetalReference(t)
-	const qRows, kRows, vRows, cols = 4096, 1024, 1024, 256
+	// Exercise a shape that the production dispatch heuristic admits. Narrow
+	// GQA K/V projections deliberately remain on CPU because their Metal
+	// command-buffer overhead exceeds the saved compute.
+	const qRows, kRows, vRows, cols = metalQ4KDirectMinRows, metalQ4KDirectMinRows, metalQ6KDirectMinRows, 256
 	rng := rand.New(rand.NewSource(95))
 	qData := make([]byte, 0, qRows*144)
 	kData := make([]byte, 0, kRows*144)

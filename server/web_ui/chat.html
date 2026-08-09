@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{.Title}}</title>
-  <meta name="description" content="Private, local chat interface for GopherLLM.">
+  <meta name="description" content="GopherLLM chat interface for local, managed-server, and on-device browser inference.">
   <meta name="robots" content="noindex, nofollow">
   <meta name="color-scheme" content="light dark">
   <link rel="stylesheet" href="/style.css">
 </head>
-<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}" data-local-runtime="{{.HasLocalRuntime}}">
+<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}" data-local-runtime="{{.HasLocalRuntime}}" data-deployment-mode="{{.DeploymentMode}}" data-browser-only="{{.BrowserOnly}}" data-admin-required="{{.AdminRequired}}" data-admin-authorized="{{.AdminAuthorized}}">
 
 <!-- Icon sprite: plain geometric outlines, hand-drawn for this page, so every
      chrome icon renders from one same-origin vector source at a consistent
@@ -35,6 +35,10 @@
   <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1.6"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="17" x2="12" y2="20"/></symbol>
   <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8V4z" stroke-linejoin="round"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H10l-4.5 4v-4H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z"/></symbol>
+  <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L4 17l3 3 5.3-5.3a4 4 0 0 0 5.4-5.4l-2.8 2.8-2.8-2.8z" stroke-linejoin="round"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><line x1="6" y1="4" x2="6" y2="20"/><circle cx="6" cy="9" r="1.8" fill="currentColor" stroke="none"/><line x1="12" y1="4" x2="12" y2="20"/><circle cx="12" cy="15" r="1.8" fill="currentColor" stroke="none"/><line x1="18" y1="4" x2="18" y2="20"/><circle cx="18" cy="7" r="1.8" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-layout" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="9" x2="9" y2="21"/></symbol>
 </svg>
 
 <div class="app">
@@ -42,7 +46,7 @@
     <div class="sidebar-brand">
       <span class="logo" aria-hidden="true">G</span>
       <span>GopherLLM</span>
-      <span class="local-badge">Local</span>
+      <span id="deploymentBadge" class="local-badge">{{if .BrowserOnly}}On-device{{else if .AdminRequired}}Server{{else}}Local{{end}}</span>
     </div>
     <button id="newChat" class="new-chat" type="button"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg> New chat</button>
     <label class="chat-search">
@@ -90,8 +94,8 @@
         <div class="empty" id="empty" data-has-model="{{.HasModel}}">
           <div class="empty-mark" aria-hidden="true">✦</div>
           <div class="empty-ready">
-            <div class="empty-title">Your private local workspace</div>
-            <p>Prompts are sent only to this GopherLLM server. Your chat history stays in this browser.</p>
+            <div class="empty-title">{{if .BrowserOnly}}Your on-device workspace{{else if .AdminRequired}}Your GopherLLM workspace{{else}}Your private local workspace{{end}}</div>
+            <p>{{if .BrowserOnly}}The selected model runs in this browser tab. Your chat history stays in this browser.{{else if .AdminRequired}}Prompts are sent to this GopherLLM server. Your chat history stays in this browser.{{else}}Prompts are sent only to this GopherLLM server. Your chat history stays in this browser.{{end}}</p>
             <div class="suggestions" aria-label="Try a prompt">
               <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms.">Explain a concept</button>
               <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email.">Draft an email</button>
@@ -108,8 +112,8 @@
           </div>
           <div class="empty-no-model">
             <div class="empty-title">No model loaded yet</div>
-            <p>Pick a GGUF from your model directory, or download one from Hugging Face, to get started.</p>
-            <button type="button" class="empty-cta" id="emptyChooseModel">Choose a model</button>
+            <p>{{if .BrowserOnly}}Choose a GGUF from this device to run it on-device in this browser. The file is not uploaded to the server.{{else if .AdminRequired}}An administrator must choose the model for this shared server.{{else}}Pick a GGUF from your model directory, or download one from Hugging Face, to get started.{{end}}</p>
+            <button type="button" class="empty-cta" id="emptyChooseModel">{{if .AdminRequired}}View settings{{else}}Choose a model{{end}}</button>
           </div>
         </div>
       </div>
@@ -244,12 +248,34 @@
       <button id="settingsClose" class="icon-button" type="button" aria-label="Close settings"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
     <div class="settings-panel-body">
-      <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
-        <button class="settings-tab is-active" type="button" role="tab" id="settingsTabModel" aria-controls="settingsPageModel" aria-selected="true" data-settings-tab="model">Model &amp; chat</button>
-        <button class="settings-tab" type="button" role="tab" id="settingsTabCapabilities" aria-controls="settingsPageCapabilities" aria-selected="false" tabindex="-1" data-settings-tab="capabilities">Capabilities</button>
-        <button class="settings-tab" type="button" role="tab" id="settingsTabGeneration" aria-controls="settingsPageGeneration" aria-selected="false" tabindex="-1" data-settings-tab="generation">Generation</button>
-        <button class="settings-tab" type="button" role="tab" id="settingsTabWorkspace" aria-controls="settingsPageWorkspace" aria-selected="false" tabindex="-1" data-settings-tab="workspace">Workspace</button>
-      </nav>
+	  <section id="managedAccessNotice" class="settings-section" hidden>
+		<div class="settings-section-head">
+		  <div>
+			<h3>Server administration</h3>
+			<p>Users can chat and keep their own preferences. Loading models, downloads, tuning, remote credentials, and OS actions require an administrator.</p>
+		  </div>
+		</div>
+		<div id="adminUnlockForm" class="settings-primary-grid workspace-fields">
+		  <label>Admin token
+			<input id="adminTokenInput" type="password" autocomplete="off" spellcheck="false" placeholder="Paste administrator token">
+		  </label>
+		  <div class="settings-actions"><button id="adminUnlock" class="autotune-run" type="button">Unlock admin controls</button></div>
+		</div>
+		<p id="adminAccessStatus" class="settings-note" aria-live="polite">Administrator access is locked in this tab.</p>
+	  </section>
+      <div class="settings-toolbar">
+        <label class="settings-search">
+          <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+          <input id="settingsSearch" type="search" placeholder="Search settings…" aria-label="Search settings" autocomplete="off">
+        </label>
+        <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button class="settings-tab is-active" type="button" role="tab" id="settingsTabModel" aria-controls="settingsPageModel" aria-selected="true" data-settings-tab="model"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span>Model &amp; chat</span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabCapabilities" aria-controls="settingsPageCapabilities" aria-selected="false" tabindex="-1" data-settings-tab="capabilities"><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span>Capabilities</span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabGeneration" aria-controls="settingsPageGeneration" aria-selected="false" tabindex="-1" data-settings-tab="generation"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Generation</span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabWorkspace" aria-controls="settingsPageWorkspace" aria-selected="false" tabindex="-1" data-settings-tab="workspace"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg><span>Workspace</span></button>
+        </nav>
+      </div>
+      <p id="settingsSearchEmpty" class="settings-search-empty" hidden>No settings match “<span id="settingsSearchEmptyQuery"></span>”.<span id="settingsSearchEmptyHint"></span></p>
 
       <div id="settingsPageModel" class="settings-page" role="tabpanel" aria-labelledby="settingsTabModel" data-settings-page="model">
         <section class="settings-section" id="inferenceModeSection" hidden>
@@ -303,7 +329,7 @@
           <p id="browserModelStatus" class="settings-note" aria-live="polite">Choose a text model file to begin. Nothing is uploaded — the file is read and parsed locally.</p>
         </section>
 
-        <section class="settings-section settings-model-section" id="serverModelSection">
+        <section class="settings-section settings-model-section" id="serverModelSection" data-admin-control>
           <div class="settings-section-head">
             <div>
               <h3>Local model</h3>
@@ -350,34 +376,37 @@
           </div>
         </section>
 
-        <section class="settings-section settings-download-section" id="modelDownloadSection">
-          <div class="settings-section-head">
-            <div>
-              <h3>Download a model</h3>
-              <p>Search GGUF repositories on Hugging Face or fetch a known model straight into the local library.</p>
+        <section class="settings-section settings-download-section" id="modelDownloadSection" data-admin-control>
+          <details class="settings-disclosure">
+            <summary class="settings-section-head">
+              <div>
+                <h3>Download a model</h3>
+                <p>Search GGUF repositories on Hugging Face or fetch a known model straight into the local library.</p>
+              </div>
+              <svg class="icon settings-disclosure-chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+            </summary>
+            <form id="modelHubSearchForm" class="model-download-form model-hub-search-form">
+              <label class="model-download-label" for="modelHubSearchQuery">Search Hugging Face
+                <input type="search" id="modelHubSearchQuery" placeholder="e.g. Ministral, Qwen, Gemma…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="modelHubSearchStatus">
+              </label>
+              <button id="modelHubSearchSubmit" class="autotune-run" type="submit">Search</button>
+            </form>
+            <p id="modelHubSearchStatus" class="settings-note model-hub-search-status" aria-live="polite">Showing up to 12 GGUF repositories, sorted by Hub downloads.</p>
+            <ul id="modelHubSearchResults" class="model-hub-search-results" aria-label="Hugging Face GGUF search results" hidden></ul>
+            <p class="model-download-separator" aria-hidden="true"><span>or use a repository directly</span></p>
+            <form id="modelDownloadForm" class="model-download-form">
+              <label class="model-download-label" for="modelDownloadRef">Hugging Face repository
+                <input type="text" id="modelDownloadRef" placeholder="owner/repository or hf:owner/repository:QUANT" autocomplete="off" autocapitalize="off" spellcheck="false">
+              </label>
+              <button id="modelDownloadFind" class="autotune-run" type="submit">Find variants</button>
+            </form>
+            <ul id="modelDownloadVariants" class="model-download-variants" aria-label="Available quantizations" hidden></ul>
+            <div id="modelDownloadProgress" class="model-download-progress" hidden>
+              <div class="model-download-bar"><div id="modelDownloadBarFill" class="model-download-bar-fill"></div></div>
+              <button type="button" id="modelDownloadCancel" class="text-button">Cancel</button>
             </div>
-          </div>
-          <form id="modelHubSearchForm" class="model-download-form model-hub-search-form">
-            <label class="model-download-label" for="modelHubSearchQuery">Search Hugging Face
-              <input type="search" id="modelHubSearchQuery" placeholder="e.g. Ministral, Qwen, Gemma…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="modelHubSearchStatus">
-            </label>
-            <button id="modelHubSearchSubmit" class="autotune-run" type="submit">Search</button>
-          </form>
-          <p id="modelHubSearchStatus" class="settings-note model-hub-search-status" aria-live="polite">Showing up to 12 GGUF repositories, sorted by Hub downloads.</p>
-          <ul id="modelHubSearchResults" class="model-hub-search-results" aria-label="Hugging Face GGUF search results" hidden></ul>
-          <p class="model-download-separator" aria-hidden="true"><span>or use a repository directly</span></p>
-          <form id="modelDownloadForm" class="model-download-form">
-            <label class="model-download-label" for="modelDownloadRef">Hugging Face repository
-              <input type="text" id="modelDownloadRef" placeholder="owner/repository or hf:owner/repository:QUANT" autocomplete="off" autocapitalize="off" spellcheck="false">
-            </label>
-            <button id="modelDownloadFind" class="autotune-run" type="submit">Find variants</button>
-          </form>
-          <ul id="modelDownloadVariants" class="model-download-variants" aria-label="Available quantizations" hidden></ul>
-          <div id="modelDownloadProgress" class="model-download-progress" hidden>
-            <div class="model-download-bar"><div id="modelDownloadBarFill" class="model-download-bar-fill"></div></div>
-            <button type="button" id="modelDownloadCancel" class="text-button">Cancel</button>
-          </div>
-          <p id="modelDownloadStatus" class="settings-note model-download-status" aria-live="polite">Paste a Hugging Face repository, e.g. bartowski/Qwen3-4B-GGUF, and find its GGUF variants.</p>
+            <p id="modelDownloadStatus" class="settings-note model-download-status" aria-live="polite">Paste a Hugging Face repository, e.g. bartowski/Qwen3-4B-GGUF, and find its GGUF variants.</p>
+          </details>
         </section>
 
         <section class="settings-section settings-chat-section">
@@ -518,7 +547,7 @@
           </div>
         </section>
 
-        <section class="settings-section">
+		<section class="settings-section" data-admin-control>
           <div class="settings-section-head">
             <div>
               <h3>Performance</h3>
@@ -743,13 +772,20 @@
             <div class="live-prompt-panel">
               <span class="live-panel-label">Prompt</span>
               <textarea id="livePromptInput" rows="1" placeholder="Describe what you see in one sentence."></textarea>
-              <label class="live-alert-toggle"><input id="liveAlertToggle" type="checkbox"><span>Sound alert on danger <small>(local beep)</small></span></label>
+              <div class="live-actions">
+                <input id="liveActionCondition" type="text" class="live-action-condition" placeholder="Watch for… (e.g. someone enters the room)" maxlength="200" aria-label="Situation to watch for">
+                <div class="live-action-toggles">
+                  <label class="live-action-toggle" title="Sound an audible alarm"><input id="liveActionSound" type="checkbox"><span>🔊 Sound</span></label>
+                  <label class="live-action-toggle" title="Send a system notification"><input id="liveActionNotify" type="checkbox"><span>🔔 Notify</span></label>
+                  <label class="live-action-toggle" title="Bookmark this moment in the history log"><input id="liveActionMark" type="checkbox"><span>📌 Mark</span></label>
+                </div>
+              </div>
               <div id="livePromptSuggestions" class="live-suggestions">
                 <button type="button" class="live-suggestion" data-prompt="Describe what you see in one sentence.">Describe the scene</button>
                 <button type="button" class="live-suggestion" data-prompt="What is the color of my shirt?">What color is my shirt?</button>
                 <button type="button" class="live-suggestion" data-prompt="Identify any text or written content visible.">Read visible text</button>
                 <button type="button" class="live-suggestion" data-prompt="Name the object I am holding in my hand.">Name the object</button>
-                <button type="button" class="live-suggestion" data-alert="true" data-prompt="Describe the scene. If you see an immediate danger, mark it with [ALERT].">Danger alert</button>
+                <button type="button" class="live-suggestion" data-condition="An immediate, clearly visible danger to a person is present" data-arm="alert">Danger alert</button>
               </div>
             </div>
 

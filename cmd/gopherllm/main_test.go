@@ -1,9 +1,12 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/SimonWaldherr/GopherLLM/agentos"
+	"github.com/SimonWaldherr/GopherLLM/server"
 )
 
 func TestParseCLISamplerFlags(t *testing.T) {
@@ -57,6 +60,36 @@ func TestParseCLIOutOfCore(t *testing.T) {
 	}
 	if !cfg.outOfCore {
 		t.Fatal("--out-of-core was not recorded")
+	}
+}
+
+func TestParseCLIDeploymentModesAndAdminTokenSources(t *testing.T) {
+	cfg, err := parseCLI([]string{"--serve", "127.0.0.1:8080", "--deployment", "managed", "--admin-token-file", "/run/secrets/admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.deploymentMode != server.DeploymentManaged || cfg.adminTokenFile != "/run/secrets/admin" {
+		t.Fatalf("managed CLI config = %+v", cfg)
+	}
+	if _, err := parseCLI([]string{"--deployment", "browser"}); err == nil {
+		t.Fatal("browser deployment without --serve was accepted")
+	}
+	if _, err := parseCLI([]string{"--serve", "127.0.0.1:8080", "--deployment", "not-a-mode"}); err == nil {
+		t.Fatal("unknown deployment mode was accepted")
+	}
+
+	t.Setenv("GOPHERLLM_ADMIN_TOKEN", "from-environment")
+	value, err := resolveAdminToken(cliConfig{})
+	if err != nil || value != "from-environment" {
+		t.Fatalf("environment admin token = %q, %v", value, err)
+	}
+	path := filepath.Join(t.TempDir(), "admin-token")
+	if err := os.WriteFile(path, []byte("from-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	value, err = resolveAdminToken(cliConfig{adminTokenFile: path})
+	if err != nil || value != "from-file" {
+		t.Fatalf("file admin token = %q, %v", value, err)
 	}
 }
 
@@ -128,6 +161,42 @@ func TestParseCLIHuggingFaceList(t *testing.T) {
 	}
 	if cfg.hfList != "bartowski/Qwen3-4B-GGUF@main" || !cfg.hfOffline {
 		t.Fatalf("hf list/offline = %q/%v", cfg.hfList, cfg.hfOffline)
+	}
+}
+
+func TestParseCLIHuggingFaceLocalAppCommands(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantServer string
+		wantChat   bool
+		wantRepl   bool
+	}{
+		{
+			name:     "terminal chat",
+			args:     []string{"hf:org/model:Q4_K_M@main", "--repl"},
+			wantRepl: true,
+		},
+		{
+			name:       "browser server",
+			args:       []string{"hf:org/model:Q4_K_M@main", "--serve", "127.0.0.1:8080", "--chat"},
+			wantServer: "127.0.0.1:8080",
+			wantChat:   true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := parseCLI(tc.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.modelSelector == nil || *cfg.modelSelector != "hf:org/model:Q4_K_M@main" {
+				t.Fatalf("model selector = %v, want hf:org/model:Q4_K_M@main", cfg.modelSelector)
+			}
+			if cfg.serveAddr != tc.wantServer || cfg.chatUI != tc.wantChat || cfg.repl != tc.wantRepl {
+				t.Fatalf("server/chat/repl = %q/%v/%v, want %q/%v/%v", cfg.serveAddr, cfg.chatUI, cfg.repl, tc.wantServer, tc.wantChat, tc.wantRepl)
+			}
+		})
 	}
 }
 

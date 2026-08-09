@@ -43,6 +43,10 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --prompt <text>           Input prompt (interactive if omitted)")
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
 	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
+	fmt.Fprintln(os.Stderr, "  --deployment <mode>       Server profile: local | managed | browser (default: local)")
+	fmt.Fprintln(os.Stderr, "                           local binds only loopback; managed protects shared settings; browser runs models in each browser")
+	fmt.Fprintln(os.Stderr, "  --admin-token-file <path> Read the managed-server admin token from a file (preferred over CLI tokens)")
+	fmt.Fprintln(os.Stderr, "  --admin-token <token>     Managed-server admin token (or use GOPHERLLM_ADMIN_TOKEN)")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
 	fmt.Fprintln(os.Stderr, "  --chat-history <path>     Enable compressed server-side chat history at <path>")
 	fmt.Fprintln(os.Stderr, "                           Explicit model selectors always override the remembered model")
@@ -114,6 +118,9 @@ type cliConfig struct {
 	listTensors             bool
 	repl                    bool
 	serveAddr               string
+	deploymentMode          server.DeploymentMode
+	adminToken              string
+	adminTokenFile          string
 	chatUI                  bool
 	chatHistoryPath         string
 	// wasmDir points at a directory containing gopherllm.wasm + wasm_exec.js
@@ -222,6 +229,31 @@ func run() error {
 	if err := cfg.options.Validate(); err != nil {
 		return err
 	}
+	if cfg.deploymentMode == server.DeploymentManaged {
+		adminToken, err := resolveAdminToken(cfg)
+		if err != nil {
+			return err
+		}
+		cfg.adminToken = adminToken
+	}
+	if cfg.deploymentMode == server.DeploymentBrowser {
+		if cfg.modelSelector != nil || cfg.mmprojPathSet || cfg.imagePath != "" || cfg.repl || cfg.prompt != "" || cfg.embed || cfg.bench || cfg.kernelBench || cfg.autoTune || cfg.compress {
+			return fmt.Errorf("browser deployment runs models only in each browser tab; remove server-model, prompt, benchmark, and tuning options")
+		}
+		// A browser deployment is an application, not a headless API profile;
+		// turn on the chat UI so a valid WASM/WebGPU entry point is always
+		// available even when the operator did not also spell out --chat.
+		cfg.chatUI = true
+		return server.Serve(nil, server.ServeOptions{
+			Context:                  commandCtx,
+			Addr:                     cfg.serveAddr,
+			DeploymentMode:           cfg.deploymentMode,
+			Defaults:                 cfg.options,
+			MaxConcurrentConnections: cfg.maxConn,
+			ChatUI:                   true,
+			WasmDir:                  resolveWasmDir(cfg),
+		})
+	}
 	if cfg.benchRuns <= 0 {
 		return fmt.Errorf("--bench-runs must be greater than 0")
 	}
@@ -266,6 +298,8 @@ func run() error {
 		return server.Serve(nil, server.ServeOptions{
 			Context:                  commandCtx,
 			Addr:                     cfg.serveAddr,
+			DeploymentMode:           cfg.deploymentMode,
+			AdminToken:               cfg.adminToken,
 			Defaults:                 cfg.options,
 			MaxConcurrentConnections: cfg.maxConn,
 			ChatUI:                   cfg.chatUI,
@@ -415,7 +449,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -536,6 +570,32 @@ func fileExists(path string) bool {
 	return err == nil && !st.IsDir()
 }
 
+const maxAdminTokenBytes = 64 << 10
+
+// resolveAdminToken keeps the credential out of the generated configuration
+// and process output. A command-line value is useful for short-lived local
+// testing; production deployments should prefer a restricted token file or
+// GOPHERLLM_ADMIN_TOKEN so it does not appear in a process list.
+func resolveAdminToken(cfg cliConfig) (string, error) {
+	if token := strings.TrimSpace(cfg.adminToken); token != "" {
+		return token, nil
+	}
+	if path := strings.TrimSpace(cfg.adminTokenFile); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read admin token file %s: %w", path, err)
+		}
+		if len(data) > maxAdminTokenBytes {
+			return "", fmt.Errorf("admin token file %s is larger than %d bytes", path, maxAdminTokenBytes)
+		}
+		if token := strings.TrimSpace(string(data)); token != "" {
+			return token, nil
+		}
+		return "", fmt.Errorf("admin token file %s is empty", path)
+	}
+	return strings.TrimSpace(os.Getenv("GOPHERLLM_ADMIN_TOKEN")), nil
+}
+
 // runAutoTune calibrates the runtime settings for this model on this machine.
 // It reports whether the command is finished (--auto-json prints the result and
 // exits). A cached tuning is reused unless --auto-refresh was passed, so the
@@ -613,7 +673,7 @@ func buildAgentOSRunner(cfg cliConfig) (*agentos.Runner, error) {
 }
 
 func parseCLI(args []string) (cliConfig, error) {
-	cfg := cliConfig{modelDir: gopherllm.DefaultModelDir(), preset: "balanced", options: gopherllm.DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8}
+	cfg := cliConfig{modelDir: gopherllm.DefaultModelDir(), preset: "balanced", options: gopherllm.DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8, deploymentMode: server.DeploymentLocal}
 	configPath, err := configPathFromArgs(args)
 	if err != nil {
 		return cfg, err
@@ -725,6 +785,28 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.serveAddr = v
+		case "--deployment":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			mode, err := server.ParseDeploymentMode(v)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.deploymentMode = mode
+		case "--admin-token":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.adminToken = v
+		case "--admin-token-file":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.adminTokenFile = v
 		case "--chat":
 			cfg.chatUI = true
 		case "--chat-history":
@@ -973,6 +1055,9 @@ func parseCLI(args []string) (cliConfig, error) {
 	}
 	if cfg.chatUI && cfg.serveAddr == "" {
 		return cfg, fmt.Errorf("--chat requires --serve <addr>")
+	}
+	if cfg.deploymentMode != server.DeploymentLocal && cfg.serveAddr == "" {
+		return cfg, fmt.Errorf("--deployment %s requires --serve <addr>", cfg.deploymentMode)
 	}
 	if cfg.maxConn <= 0 {
 		return cfg, fmt.Errorf("--max-connections must be greater than 0")

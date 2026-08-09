@@ -70,6 +70,14 @@ type chatTemplateData struct {
 	// WasmDir (see HandlerOptions.WasmDir) — the page only offers the
 	// "run locally in this browser tab" inference-mode toggle when true.
 	HasLocalRuntime bool
+	// DeploymentMode describes the server policy without exposing any secret.
+	// BrowserOnly forces the UI into its on-device WASM/WebGPU path, while
+	// AdminRequired lets a managed deployment keep ordinary chat preferences
+	// visible but hide server-wide controls until an administrator authorizes.
+	DeploymentMode  string
+	BrowserOnly     bool
+	AdminRequired   bool
+	AdminAuthorized bool
 }
 
 type runnerState struct {
@@ -219,6 +227,15 @@ func (s *runnerState) autoTuneStatus() map[string]any {
 
 // HandlerOptions configures the mountable HTTP API handler.
 type HandlerOptions struct {
+	// DeploymentMode selects the ownership boundary for inference and shared
+	// server settings. The zero value is DeploymentLocal for backward
+	// compatibility. See DeploymentMode for the semantics of local, managed,
+	// and browser deployments.
+	DeploymentMode DeploymentMode
+	// AdminToken protects server-wide management routes in managed mode. It is
+	// never returned by an endpoint or inserted into the Web UI. API clients may
+	// send it through X-GopherLLM-Admin-Token or Authorization: Bearer.
+	AdminToken string
 	// Defaults are the generation settings requests inherit unless they
 	// override individual fields.
 	Defaults gopherllm.GenerationOptions
@@ -357,6 +374,8 @@ type ServeOptions struct {
 	// stops accepting requests and releases the active runner.
 	Context                  context.Context
 	Addr                     string
+	DeploymentMode           DeploymentMode
+	AdminToken               string
 	Defaults                 gopherllm.GenerationOptions
 	MaxConcurrentConnections int
 	ChatUI                   bool
@@ -391,11 +410,23 @@ type ServeOptions struct {
 //	handler := gopherllm.NewHandler(model.Runner(), gopherllm.HandlerOptions{...})
 //	mux.Handle("/llm/", http.StripPrefix("/llm", handler))
 func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
+	mode, err := ParseDeploymentMode(string(opts.DeploymentMode))
+	if err != nil {
+		return err
+	}
+	if err := validateDeploymentOptions(mode, opts.AdminToken, opts.Addr, opts.WasmDir, opts.ChatUI, true); err != nil {
+		return err
+	}
+	if mode == DeploymentBrowser && initialRunner != nil {
+		return errors.New("browser deployment must not be started with a server-side model runner")
+	}
 	logw := opts.LogWriter
 	if logw == nil {
 		logw = os.Stderr
 	}
 	handler := NewHandler(initialRunner, HandlerOptions{
+		DeploymentMode:        mode,
+		AdminToken:            opts.AdminToken,
 		Defaults:              opts.Defaults,
 		MaxConcurrentRequests: opts.MaxConcurrentConnections,
 		ChatUI:                opts.ChatUI,
@@ -438,7 +469,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		case <-shutdownDone:
 		}
 	}()
-	err := server.ListenAndServe()
+	err = server.ListenAndServe()
 	close(shutdownDone)
 	if errors.Is(err, http.ErrServerClosed) && ctx.Err() != nil {
 		<-shutdownFinished
@@ -466,6 +497,38 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	logw := opts.LogWriter
 	if logw == nil {
 		logw = io.Discard
+	}
+	if _, err := ParseDeploymentMode(string(opts.DeploymentMode)); err != nil {
+		// NewHandler predates error returns. Keep this direct-library path
+		// fail-closed: newDeploymentAccess turns an invalid mode into managed
+		// mode without a usable token, so privileged routes stay unavailable.
+		fmt.Fprintf(logw, "Warning: invalid deployment mode: %v; privileged routes are disabled\n", err)
+	}
+	deployment := newDeploymentAccess(opts.DeploymentMode, opts.AdminToken)
+	if deployment.mode != DeploymentLocal && strings.TrimSpace(opts.ChatHistoryPath) != "" {
+		// A single shared history file has no user identity boundary. Managed
+		// and browser deployments therefore keep workspaces in each browser,
+		// rather than letting one user read or replace another user's chats.
+		fmt.Fprintln(logw, "Chat history: server-side shared storage is disabled outside local deployment")
+		opts.ChatHistoryPath = ""
+	}
+	if deployment.mode.browserOnly() {
+		// Browser deployment is an on-device inference profile, not a thin UI
+		// in front of an accidentally resident server model. The route policy
+		// below blocks server inference too; clearing the catalog prevents the
+		// UI from discovering or changing server-side model state.
+		if initialRunner != nil {
+			// NewHandler cannot return a configuration error. Release the runner
+			// rather than retaining model weights that this deployment promises
+			// never to execute on the server. Serve rejects this configuration
+			// before it gets here; this is the fail-closed library fallback.
+			_ = initialRunner.Close()
+			initialRunner = nil
+			fmt.Fprintln(logw, "Browser deployment: released the supplied server-side model runner")
+		}
+		opts.ModelDir = ""
+		opts.ModelPath = ""
+		opts.AgentOS = nil
 	}
 	opts.ModelDir = strings.TrimSpace(opts.ModelDir)
 	if opts.MaxConcurrentRequests <= 0 {
@@ -525,8 +588,19 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	var downloadMu sync.Mutex
 	activeDownloads := map[string]struct{}{}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, map[string]any{"ok": true, "model": modelID(state.get()), "remote": remote.enabled()})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
+		status := deployment.status(req)
+		status["ok"] = true
+		status["model"] = modelID(state.get())
+		status["remote"] = remote.enabled()
+		writeJSON(w, status)
+	})
+	mux.HandleFunc("/deployment", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, deployment.status(req))
 	})
 	mux.HandleFunc("/chat/storage", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
@@ -969,11 +1043,11 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	mux.HandleFunc("/api/version", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"version": "gopherllm-ollama-compat"})
 	})
-	mux.HandleFunc("/models", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/models", func(w http.ResponseWriter, req *http.Request) {
 		type modelInfo struct {
 			ID            string  `json:"id"`
 			Name          string  `json:"name"`
-			Path          string  `json:"path"`
+			Path          string  `json:"path,omitempty"`
 			Architecture  string  `json:"architecture"`
 			ContextLength int     `json:"context_length"`
 			SizeGB        float64 `json:"size_gb"`
@@ -993,6 +1067,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			return
 		}
 		loadedPath := state.getPath()
+		includePaths := deployment.mode == DeploymentLocal || deployment.adminAuthorized(req)
 		models := make([]modelInfo, 0, len(entries))
 		for _, e := range entries {
 			if e.IsProjector {
@@ -1002,10 +1077,9 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			if name == "" {
 				name = e.FileName
 			}
-			models = append(models, modelInfo{
+			info := modelInfo{
 				ID:            e.ID,
 				Name:          name,
-				Path:          e.Path,
 				Architecture:  e.Architecture,
 				ContextLength: e.ContextLength,
 				SizeGB:        float64(e.SizeBytes) / (1024 * 1024 * 1024),
@@ -1014,7 +1088,11 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				Embedding:     e.IsEmbedding && e.IsSupported && !e.IsProjector,
 				Vision:        e.ProjectorPath != "",
 				Reasoning:     e.Reasoning,
-			})
+			}
+			if includePaths {
+				info.Path = e.Path
+			}
+			models = append(models, info)
 		}
 		writeJSON(w, map[string]any{"models": models})
 	})
@@ -1481,6 +1559,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				RepeatPenalty:   opts.Defaults.Sampler.RepeatPenalty,
 				MermaidCDN:      mermaid,
 				HasLocalRuntime: hasLocalRuntime,
+				DeploymentMode:  string(deployment.mode),
+				BrowserOnly:     deployment.mode.browserOnly(),
+				AdminRequired:   deployment.mode.adminRequired(),
+				AdminAuthorized: deployment.adminAuthorized(req),
 			}
 			if cdn, ok := mermaidCDNs[mermaid]; ok {
 				data.MermaidScript = cdn.Script
@@ -1513,7 +1595,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		}
 	}
 	return &Handler{
-		next:     remoteOrLoadedModel(state, remote, mux),
+		next:     deployment.wrap(remoteOrLoadedModel(state, remote, mux)),
 		state:    state,
 		embedder: embedder,
 	}

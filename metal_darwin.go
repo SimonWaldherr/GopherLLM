@@ -66,7 +66,12 @@ func metalWeightUsesDirect(w *MetalWeight) bool {
 	}
 	switch w.typ {
 	case GGMLTypeQ4_K:
-		return w.rows >= metalQ4KDirectMinRows || (w.rows >= 3072 && w.cols >= 4096)
+		// Q4_K attention-output projections in Mistral-family GQA models are
+		// typically 3K-5K rows. On an M2 Max their CPU Q8_K/NEON path is
+		// 35-50% faster than a standalone Metal dispatch; reserve direct GPU
+		// work for the large FFN/vocabulary-shaped matrices that amortize the
+		// command-buffer boundary.
+		return w.rows >= metalQ4KDirectMinRows
 	case GGMLTypeQ6_K:
 		return w.rows >= metalQ6KDirectMinRows
 	default:
@@ -113,7 +118,12 @@ func matvecMetalQ4K2Into(a, b *MetalWeight, x []float32, aRows, bRows, cols int,
 }
 
 func matvecMetalQ4K2Q6KInto(qWeight, kWeight, vWeight *MetalWeight, x []float32, qRows, kRows, vRows, cols int, q, k, v *[]float32) bool {
-	if qWeight == nil || kWeight == nil || vWeight == nil ||
+	// GQA models such as Ministral/Devstral have only 1K K/V rows. Although
+	// fusing Q/K/V removes two command buffers, those narrow projections still
+	// do not amortize one GPU round-trip: real Ministral 3B/14B measurements
+	// put this path 45-65% behind the fused CPU kernel. MHA-sized projections
+	// remain eligible because each individual weight clears the direct gate.
+	if !metalWeightUsesDirect(qWeight) || !metalWeightUsesDirect(kWeight) || !metalWeightUsesDirect(vWeight) ||
 		qWeight.q4 == nil || kWeight.q4 == nil || vWeight.q6 == nil ||
 		qWeight.typ != GGMLTypeQ4_K || kWeight.typ != GGMLTypeQ4_K || vWeight.typ != GGMLTypeQ6_K ||
 		qWeight.rows != qRows || kWeight.rows != kRows || vWeight.rows != vRows ||

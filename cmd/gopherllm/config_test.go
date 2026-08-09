@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/SimonWaldherr/GopherLLM/server"
 )
 
 func writeTestConfig(t *testing.T, contents string) string {
@@ -137,5 +139,34 @@ func TestWriteEffectiveConfigPreservesExplicitMetalDisable(t *testing.T) {
 	reloaded, err := parseCLI([]string{"--config", reloadedPath})
 	if err != nil || !reloaded.metalExplicit || reloaded.useMetal {
 		t.Fatalf("explicit Metal disable was not preserved: cfg=%+v err=%v", reloaded, err)
+	}
+}
+
+func TestManagedDeploymentConfigKeepsTokenOutOfPrintedConfig(t *testing.T) {
+	path := writeTestConfig(t, `{
+  "version": 1,
+  "server": {
+    "address": "127.0.0.1:8080",
+    "deployment": "managed",
+    "admin_token_file": "/run/secrets/gopherllm-admin"
+  }
+}`)
+	cfg, err := parseCLI([]string{"--config", path, "--admin-token", "never-print-this"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.deploymentMode != server.DeploymentManaged || cfg.adminTokenFile != "/run/secrets/gopherllm-admin" || cfg.adminToken != "never-print-this" {
+		t.Fatalf("managed deployment config = %+v", cfg)
+	}
+	var out bytes.Buffer
+	if err := writeEffectiveConfig(&out, cfg); err != nil {
+		t.Fatal(err)
+	}
+	printed := out.String()
+	if strings.Contains(printed, "never-print-this") {
+		t.Fatalf("effective config leaked admin token: %s", printed)
+	}
+	if !strings.Contains(printed, `"deployment": "managed"`) || !strings.Contains(printed, `"admin_token_file": "/run/secrets/gopherllm-admin"`) {
+		t.Fatalf("effective config lost safe managed deployment settings: %s", printed)
 	}
 }

@@ -26,7 +26,7 @@ import (
 	"sync/atomic"
 )
 
-// oversubscribeDispatch issues 4x more matvec chunks than workers so faster
+// oversubscribeDispatch issues more matvec chunks than workers so faster
 // cores absorb stragglers — a win on heterogeneous big.LITTLE parts (Apple
 // Silicon), pure channel-wakeup overhead on homogeneous x86 cores.
 var oversubscribeDispatch = runtime.GOARCH == "arm64"
@@ -1690,7 +1690,7 @@ func parallelRows(rows int, fn func(start, end int)) {
 }
 
 // parallelRowsBatched keeps one coarse range per worker. A batch row already
-// performs many dot products, so the 4x ARM overdispatch used to balance short
+// performs many dot products, so the ARM overdispatch used to balance short
 // decode rows adds scheduling overhead instead. The regular parallelRows path
 // remains unchanged, providing a local rollback for this prefill-only tuning.
 func parallelRowsBatched(rows int, fn func(start, end int)) {
@@ -1733,7 +1733,7 @@ func dispatchParallelMode(threads, rows int, allowOversubscribe bool, fn func(st
 	// one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
 	if allowOversubscribe && oversubscribeDispatch && rows >= threads*128 {
-		chunks = min(threads*4, cap(pool.jobs))
+		chunks = min(threads*8, cap(pool.jobs))
 	}
 	// Keep the calling goroutine useful: it owns one chunk while the persistent
 	// workers consume the rest. This preserves `threads` total compute
