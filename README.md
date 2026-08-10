@@ -128,8 +128,7 @@ under the operator's control:
 In the browser chat, **Settings → Model & chat → Use-case workflow** applies a
 task-focused starting point for sampling, context handling, tools, and persona.
 It never prevents manual adjustment; selecting **Custom / current settings**
-keeps the current values. The four most common workflows are also available on
-the empty-chat screen.
+keeps the current values.
 
 ## Example AI integrations
 

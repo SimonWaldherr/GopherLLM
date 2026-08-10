@@ -12,15 +12,16 @@ function renderOrders() {
     const button = document.createElement("button");
     button.type = "button"; button.className = "order"; button.setAttribute("role", "radio");
     button.setAttribute("aria-checked", String(selectedOrder === order.number));
-    button.innerHTML = `<span aria-hidden="true">${selectedOrder === order.number ? "●" : "○"}</span><span><b>${order.product}</b><small>${order.number} · bought ${order.purchased_at}</small></span><span class="price">${order.price}</span>`;
+    const dot = document.createElement("span"); dot.setAttribute("aria-hidden", "true"); dot.textContent = selectedOrder === order.number ? "●" : "○";
+    const label = document.createElement("span");
+    const name = document.createElement("b"); name.textContent = order.product;
+    const meta = document.createElement("small"); meta.textContent = order.number + " · bought " + order.purchased_at;
+    label.append(name, meta);
+    const price = document.createElement("span"); price.className = "price"; price.textContent = order.price;
+    button.replaceChildren(dot, label, price);
     button.addEventListener("click", () => { selectedOrder = order.number; renderOrders(); });
     return button;
   }));
-}
-
-function cleanModelJSON(content) {
-  const withoutThink = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-  return JSON.parse(withoutThink.replace(/^```(?:json)?\s*|\s*```$/g, ""));
 }
 
 function showResult(data) {
@@ -41,11 +42,8 @@ form.addEventListener("submit", async (event) => {
   submit.disabled = true; submit.textContent = "Preparing local draft…"; status.hidden = false; status.textContent = "Contacting the local GopherLLM server…"; result.hidden = true;
   try {
     const response = await fetch("/api/assist", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ order, issue_type: $("issueType").value, details }) });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error?.message || payload.error || "The local model did not respond.");
-    const content = payload.draft;
-    if (!content) throw new Error("The local model returned no customer-support draft.");
-    showResult(cleanModelJSON(content));
+    if (!response.ok) throw new Error((await response.text()) || "The local model did not respond.");
+    showResult(await response.json());
   } catch (cause) {
     status.textContent = "No draft was generated."; error.textContent = cause.message || String(cause);
   } finally { submit.disabled = false; submit.textContent = "Ask local support assistant"; }

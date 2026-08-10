@@ -30,7 +30,9 @@ capture), then use the controls in the live overlay:
 
 For scripted or batch testing outside the browser UI, `main.go` in this
 directory sends one or more already-captured frames through the same
-evidence-only prompt pattern:
+evidence-only prompt pattern, one model call per frame (GopherLLM's chat
+renderer supports at most one image per message), printing each frame's
+description on its own line prefixed with its path:
 
 ```sh
 go run ./examples/pool-lifeguard-assist \

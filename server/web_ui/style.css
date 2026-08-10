@@ -575,14 +575,6 @@ body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; col
   transition: border-color .15s, color .15s, transform .15s;
 }
 .suggestion:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); transform: translateY(-1px); }
-.workflow-label { margin-top: var(--sp-4); color: var(--muted); font-size: var(--fs-2xs); font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
-.workflow-suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--sp-1h); margin-top: var(--sp-2); }
-.workflow-suggestion {
-  min-height: 30px; padding: 0 var(--sp-2h); border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line)); border-radius: var(--r-pill);
-  background: color-mix(in srgb, var(--accent) 5%, var(--panel)); color: var(--accent); font-size: var(--fs-2xs); font-weight: 700;
-  transition: border-color .15s, background .15s, transform .15s;
-}
-.workflow-suggestion:hover:not(:disabled) { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); transform: translateY(-1px); }
 kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: var(--r-xs); background: var(--panel); color: var(--ink); font: var(--fs-xs)/1.4 var(--mono); }
 
 /* ── Message cards ──
@@ -768,10 +760,6 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
 .capture-menu-item { min-height: 32px; padding: 0 10px; border: 0; border-radius: var(--r-sm); background: transparent; color: var(--ink); text-align: left; font-size: var(--fs-xs); font-weight: 650; white-space: nowrap; }
 .capture-menu-item:hover, .capture-menu-item:focus-visible { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); color: var(--accent); }
 .capture-menu-item.is-live { color: var(--accent); }
-.live-vision-toggle { position: relative; }
-.live-vision-dot { position: absolute; top: 3px; right: 3px; width: 6px; height: 6px; border-radius: 50%; background: var(--stop); opacity: 0; }
-.live-vision-toggle.is-live { border-color: color-mix(in srgb, var(--accent) 55%, var(--line-strong)); color: var(--accent); }
-.live-vision-toggle.is-live .live-vision-dot { opacity: 1; animation: pulse 1.1s ease-in-out infinite; }
 .composer-options-toggle { display: inline-flex; align-items: center; gap: 4px; }
 .composer-options-toggle[aria-expanded="true"] > span[aria-hidden="true"] { transform: rotate(180deg); }
 .attachment-tray { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px 14px; }

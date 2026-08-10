@@ -30,19 +30,14 @@ func main() {
 		log.Fatal("-model, -mmproj, and -frames are required")
 	}
 
-	var images []gopherllm.ImageContent
+	var paths []string
 	for _, path := range strings.Split(*frames, ",") {
 		path = strings.TrimSpace(path)
-		if path == "" {
-			continue
+		if path != "" {
+			paths = append(paths, path)
 		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			log.Fatalf("read frame %q: %v", path, err)
-		}
-		images = append(images, gopherllm.ImageContent{Bytes: data})
 	}
-	if len(images) == 0 {
+	if len(paths) == 0 {
 		log.Fatal("-frames did not contain any usable image path")
 	}
 
@@ -60,18 +55,33 @@ func main() {
 			"State only what is visible in one sentence. If unclear, say so and ask the operator to check the zone.",
 		*zone,
 	)
-	result, err := model.Chat(context.Background(), []gopherllm.ChatMessage{
-		gopherllm.UserMessageWithImages(prompt, images...),
-	},
-		gopherllm.WithSystemPrompt("You are a secondary pair of eyes for an already-supervised pool or spa, not a drowning-detection or emergency-decision system. "+
-			"Describe only clearly visible evidence in the supplied frame(s) for the named zone. Say clearly when the view is unclear, obstructed, or insufficient. "+
-			"Never state that a person is drowning or in medical distress; instead describe what is visible and recommend the operator check the zone in person. "+
-			"Do not recommend contacting emergency services, sounding alarms, or any action beyond a human operator check."),
-		gopherllm.WithMaxTokens(180),
-		gopherllm.WithTemperature(0.2),
-	)
-	if err != nil {
-		log.Fatalf("describe zone: %v", err)
+	systemPrompt := "You are a secondary pair of eyes for an already-supervised pool or spa, not a drowning-detection or emergency-decision system. " +
+		"Describe only clearly visible evidence in the supplied frame for the named zone. Say clearly when the view is unclear, obstructed, or insufficient. " +
+		"Never state that a person is drowning or in medical distress; instead describe what is visible and recommend the operator check the zone in person. " +
+		"Do not recommend contacting emergency services, sounding alarms, or any action beyond a human operator check."
+
+	// GopherLLM's chat renderer supports at most one image per message, so
+	// multiple frames each get their own Chat call rather than one call
+	// with every image attached.
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			log.Fatalf("read frame %q: %v", path, err)
+		}
+		result, err := model.Chat(context.Background(), []gopherllm.ChatMessage{
+			gopherllm.UserMessageWithImages(prompt, gopherllm.ImageContent{Bytes: data}),
+		},
+			gopherllm.WithSystemPrompt(systemPrompt),
+			gopherllm.WithMaxTokens(180),
+			gopherllm.WithTemperature(0.2),
+		)
+		if err != nil {
+			log.Fatalf("describe frame %q: %v", path, err)
+		}
+		if len(paths) > 1 {
+			fmt.Printf("%s: %s\n", path, strings.TrimSpace(result.Text))
+		} else {
+			fmt.Println(strings.TrimSpace(result.Text))
+		}
 	}
-	fmt.Println(strings.TrimSpace(result.Text))
 }

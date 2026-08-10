@@ -507,7 +507,11 @@ function prettyJSON(value) {
   try { return JSON.stringify(JSON.parse(value), null, 2); } catch (_) { return value; }
 }
 
-function splitThinkText(raw) {
+/* Untrimmed core: kept separate from splitThinkText() so createThinkSplitter()
+   below can carry the exact pre-trim answer/reasoning forward between calls
+   without re-deriving them (trimming is only safe to apply once, at the
+   edges of the full accumulated string -- see createThinkSplitter). */
+function splitThinkTextRaw(raw) {
   const openTag = "<think>";
   const closeTag = "</think>";
   let rest = raw || "";
@@ -540,7 +544,40 @@ function splitThinkText(raw) {
     reasoning.push(rest.slice(0, closeAt));
     rest = rest.slice(closeAt + closeTag.length);
   }
-  return { answer: answer.trim(), reasoning: reasoning.join("\n\n").trim(), hasThink, isThinking };
+  return { answer, reasoning: reasoning.join("\n\n"), hasThink, isThinking };
+}
+
+function splitThinkText(raw) {
+  const result = splitThinkTextRaw(raw);
+  return { answer: result.answer.trim(), reasoning: result.reasoning.trim(), hasThink: result.hasThink, isThinking: result.isThinking };
+}
+
+/* Streaming call sites (generate()'s onToken, completeOnce()'s stream
+   callback) feed splitThinkText the whole answer-so-far on every token, so a
+   naive splitThinkText(answer) call re-scans the entire buffer from the
+   start each time -- O(length) work per token, O(length^2) over a full
+   answer. Once past any think block, a newly arrived chunk containing no "<"
+   cannot contain (or start) a tag, so it can be appended to the previous
+   result directly instead of re-parsed; this makes a call returned by this
+   factory O(1) amortized once the (typically short, front-loaded) think
+   block has closed. Falls back to a full splitThinkTextRaw() rescan whenever
+   that can't be guaranteed, so output always matches splitThinkText(next)
+   exactly. One splitter per stream -- state does not reset itself. */
+function createThinkSplitter() {
+  let lastRaw = "";
+  let state = splitThinkTextRaw("");
+  return function split(next) {
+    next = next || "";
+    const grew = next.length >= lastRaw.length && next.startsWith(lastRaw);
+    const appended = grew ? next.slice(lastRaw.length) : "";
+    if (grew && !state.isThinking && !appended.includes("<")) {
+      state = { answer: state.answer + appended, reasoning: state.reasoning, hasThink: state.hasThink, isThinking: false };
+    } else {
+      state = splitThinkTextRaw(next);
+    }
+    lastRaw = next;
+    return { answer: state.answer.trim(), reasoning: state.reasoning.trim(), hasThink: state.hasThink, isThinking: state.isThinking };
+  };
 }
 
 /* IndexedDB is the primary local workspace store. localStorage is a fallback
@@ -1717,8 +1754,9 @@ function toMarkdown(chat) {
       if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
       return b.updatedAt - a.updatedAt;
     }).filter((chat) => {
+      if (!needle) return true;
       const text = chat.title + "\n" + chat.systemPrompt + "\n" + chat.messages.slice(-8).map((message) => message.content).join("\n");
-      return !needle || text.toLowerCase().includes(needle);
+      return text.toLowerCase().includes(needle);
     });
     chatListEl.replaceChildren();
     if (!visible.length) {
@@ -2421,6 +2459,33 @@ function toMarkdown(chat) {
     updateComposer(false);
   }
 
+  /* Appends exactly the chat's newest message to the existing DOM instead of
+     tearing down and re-parsing every prior message (markdown, Mermaid,
+     code-copy buttons and all) the way renderConversation() does. Callers
+     that just pushed one message onto an already-rendered chat -- submit,
+     /goal, and expert one-shots -- use this so a turn costs O(1) instead of
+     O(conversation length). */
+  function appendLatestMessage() {
+    const chat = activeChat();
+    if (!chat || !chat.messages.length) return;
+    const index = chat.messages.length - 1;
+    const message = chat.messages[index];
+    emptyEl.hidden = true;
+    const el = addMessage(message.role, message.content, message.attachments, message.images);
+    if (message.role === "assistant") {
+      finalizeAssistant(el, {
+        answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
+        usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache,
+        agent: message.agent, decodeMS: 0
+      });
+    }
+    addActions(el, message, index);
+    followStream = true;
+    scrollEl.scrollTop = scrollEl.scrollHeight;
+    jumpLatestEl.hidden = true;
+    updateComposer(false);
+  }
+
   function renderWorkspace(withDraft) {
     syncControls(withDraft);
     renderChatList();
@@ -2510,30 +2575,6 @@ function toMarkdown(chat) {
     promptEl.focus();
   }
 
-  function renameChat(id) {
-    const chat = chats.find((item) => item.id === id);
-    if (!chat || busy) return;
-    const title = window.prompt("Name this chat", chat.title);
-    if (title === null) return;
-    if (!title.trim()) {
-      showToast("A chat name cannot be empty.", "error");
-      return;
-    }
-    chat.title = title.trim().slice(0, 160);
-    chat.titleManual = true;
-    touch(chat);
-    // renameChat only ever fires on the active chat (see the renameChatEl
-    // listener below), so a direct header update is enough — no need for
-    // renderWorkspace(false)'s full renderConversation(true), which would
-    // tear down and re-parse every message (markdown, Mermaid, the lot)
-    // just to change a title, snapping open disclosures shut and jumping
-    // the scroll position for a rename that touched none of that.
-    chatTitleEl.textContent = chat.title;
-    chatTitleEl.title = chat.title;
-    renderChatList();
-    save();
-  }
-
   function togglePinChat(id) {
     const chat = chats.find((item) => item.id === id);
     if (!chat || busy) return;
@@ -2576,9 +2617,10 @@ function toMarkdown(chat) {
     chat.title = choice.trim().slice(0, 160);
     chat.titleManual = true;
     touch(chat);
-    // Same reasoning as renameChat: this only ever needs to update a sidebar
-    // row's title, plus the header when the renamed chat happens to be the
-    // one open right now — never a full transcript re-render.
+    // This only ever needs to update a sidebar row's title, plus the header
+    // when the renamed chat happens to be the one open right now — never a
+    // full transcript re-render (renderWorkspace's renderConversation(true)
+    // would tear down and re-parse every message just for a title change).
     if (id === activeID) {
       chatTitleEl.textContent = chat.title;
       chatTitleEl.title = chat.title;
@@ -2830,7 +2872,8 @@ function toMarkdown(chat) {
       const choice = (data.choices && data.choices[0]) || {};
       return splitThinkText((choice.message || {}).content || "").answer;
     }
-    const out = await readStream(response, (answer) => { if (onToken) onToken(splitThinkText(answer).answer); });
+    const split = createThinkSplitter();
+    const out = await readStream(response, (answer) => { if (onToken) onToken(split(answer).answer); });
     return splitThinkText(out.answer || "").answer;
   }
 
@@ -3061,8 +3104,9 @@ function toMarkdown(chat) {
       tokens: () => tokenCount,
       thinking: () => thinkingNow
     });
+    const splitStream = createThinkSplitter();
     const onToken = (answer, nextReasoning, thinking) => {
-      const parsed = splitThinkText(answer);
+      const parsed = splitStream(answer);
       latest = parsed.answer;
       reasoning = nextReasoning || parsed.reasoning;
       assistantEl.dataset.raw = latest;
@@ -3206,7 +3250,7 @@ function toMarkdown(chat) {
     clearPendingAttachments();
     clearPendingImage();
     resizePrompt();
-    renderConversation(true);
+    appendLatestMessage();
     renderChatList();
     save();
     await generate(ragContext);
@@ -4032,7 +4076,7 @@ function toMarkdown(chat) {
     const commandText = "/" + kind + (instruction ? " " + instruction : "");
     chat.messages.push({ role: "user", content: commandText, reasoning: "", tool_calls: null, usage: null, finishReason: "" });
     touch(chat);
-    renderConversation(true);
+    appendLatestMessage();
     renderChatList();
     save();
     const assistantEl = addMessage("assistant", "");
@@ -4154,7 +4198,7 @@ function toMarkdown(chat) {
       chatTitleEl.title = chat.title;
     }
     touch(chat);
-    renderConversation(true);
+    appendLatestMessage();
     renderChatList();
     save();
 
@@ -4825,7 +4869,7 @@ function toMarkdown(chat) {
   });
 
   newChatEl.addEventListener("click", createChat);
-  renameChatEl.addEventListener("click", () => renameChat(activeID));
+  renameChatEl.addEventListener("click", () => manageChat(activeID));
   deleteChatEl.addEventListener("click", () => deleteChat(activeID));
   shareChatEl.addEventListener("click", shareActiveChat);
   briefChatEl.addEventListener("click", openBriefing);
@@ -4999,12 +5043,6 @@ function toMarkdown(chat) {
       promptEl.focus();
     });
   });
-  document.querySelectorAll(".workflow-suggestion").forEach((button) => {
-    button.addEventListener("click", () => {
-      applyWorkflow(button.dataset.workflow);
-      promptEl.focus();
-    });
-  });
   const emptyChooseModelEl = $("emptyChooseModel");
   if (emptyChooseModelEl) emptyChooseModelEl.addEventListener("click", (event) => openModelPicker(event.currentTarget));
   workflowSelectEl.addEventListener("change", () => applyWorkflow(workflowSelectEl.value));
@@ -5123,7 +5161,12 @@ function toMarkdown(chat) {
         known.add(chat.id);
       });
       if (!incoming.length) throw new Error("empty");
-      chats = incoming.concat(chats).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_CHATS);
+      // Ids were just deduped against `known` above, so every entry here is
+      // unique -- anything past MAX_CHATS is dropped outright, same as
+      // limitChats(), and its cache entry (if any) should go with it.
+      const merged = incoming.concat(chats).sort((a, b) => b.updatedAt - a.updatedAt);
+      chats = merged.slice(0, MAX_CHATS);
+      merged.slice(MAX_CHATS).forEach((chat) => historyCharsCache.delete(chat.id));
       activeID = incoming[0].id;
       editingIndex = null;
       editStateEl.hidden = true;
@@ -5196,54 +5239,44 @@ function toMarkdown(chat) {
 
   webcamButtonEl.addEventListener("click", () => toggleCaptureMenu(cameraCaptureMenuEl, webcamButtonEl));
   screenButtonEl.addEventListener("click", () => toggleCaptureMenu(screenCaptureMenuEl, screenButtonEl));
-  cameraCaptureSnapshotEl.addEventListener("click", async () => {
+
+  /* Snapshot and Live entry points for both camera and screen share the same
+     feature-detect / acquire-stream / open-modal / report-error skeleton;
+     only the device kind, the constraints, and the element focus should
+     return to on close differ. Returns whether the modal opened, so a Live
+     caller knows whether to continue into runLiveVision(). */
+  async function startCapture(kind, opener) {
     closeCaptureMenus();
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
+      let stream;
+      if (kind === "camera") {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
+        }
+        stream = await navigator.mediaDevices.getUserMedia(CAMERA_CAPTURE_CONSTRAINTS);
+      } else {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+          throw new Error("Screen capture is unavailable (requires HTTPS or localhost).");
+        }
+        stream = await navigator.mediaDevices.getDisplayMedia(SCREEN_CAPTURE_CONSTRAINTS);
       }
-      await openCaptureModal(await navigator.mediaDevices.getUserMedia(CAMERA_CAPTURE_CONSTRAINTS), webcamButtonEl, "camera");
+      await openCaptureModal(stream, opener, kind);
+      return true;
     } catch (err) {
       showCaptureError(err);
+      return false;
     }
-  });
+  }
+  cameraCaptureSnapshotEl.addEventListener("click", () => startCapture("camera", webcamButtonEl));
+  // The dedicated Live entry point drops straight into the immersive view
+  // (camera + prompt + streaming output). The grouped composer button has
+  // already made the capture-vs-live choice at this point.
   liveVisionButtonEl.addEventListener("click", async () => {
-    closeCaptureMenus();
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error("Camera access is unavailable (requires HTTPS or localhost).");
-      }
-      // The dedicated Live entry point drops straight into the immersive
-      // view (camera + prompt + streaming output). The grouped composer
-      // button has already made the capture-vs-live choice at this point.
-      await openCaptureModal(await navigator.mediaDevices.getUserMedia(CAMERA_CAPTURE_CONSTRAINTS), liveVisionButtonEl, "camera");
-      runLiveVision();
-    } catch (err) {
-      showCaptureError(err);
-    }
+    if (await startCapture("camera", liveVisionButtonEl)) runLiveVision();
   });
-  screenCaptureSnapshotEl.addEventListener("click", async () => {
-    closeCaptureMenus();
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-        throw new Error("Screen capture is unavailable (requires HTTPS or localhost).");
-      }
-      await openCaptureModal(await navigator.mediaDevices.getDisplayMedia(SCREEN_CAPTURE_CONSTRAINTS), screenButtonEl, "screen");
-    } catch (err) {
-      showCaptureError(err);
-    }
-  });
+  screenCaptureSnapshotEl.addEventListener("click", () => startCapture("screen", screenButtonEl));
   liveScreenButtonEl.addEventListener("click", async () => {
-    closeCaptureMenus();
-    try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-        throw new Error("Screen capture is unavailable (requires HTTPS or localhost).");
-      }
-      await openCaptureModal(await navigator.mediaDevices.getDisplayMedia(SCREEN_CAPTURE_CONSTRAINTS), liveScreenButtonEl, "screen");
-      runLiveVision();
-    } catch (err) {
-      showCaptureError(err);
-    }
+    if (await startCapture("screen", liveScreenButtonEl)) runLiveVision();
   });
   document.addEventListener("click", (event) => {
     if (!event.target.closest(".capture-action-group")) closeCaptureMenus();
@@ -6207,8 +6240,12 @@ function toMarkdown(chat) {
   if (showAgentActivityEl) {
     showAgentActivityEl.addEventListener("change", () => {
       preferences.showAgentActivity = showAgentActivityEl.checked;
-      // Re-render so turning it off clears existing timelines immediately.
-      renderConversation(false);
+      // A pure visibility change: hide/show the disclosures already in the
+      // DOM instead of tearing down and re-parsing the whole conversation
+      // (markdown, Mermaid, the lot) just to flip one toggle.
+      messagesEl.querySelectorAll(".activity-details").forEach((details) => {
+        details.hidden = !showAgentActivityEl.checked;
+      });
       save();
     });
   }
