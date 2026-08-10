@@ -766,6 +766,20 @@ const WORKFLOWS = {
     systemPrompt: PERSONAS.general + " For images, describe only visible evidence, distinguish readable text from guesses, and keep the answer concise. Ask for an image when none is attached.",
     settings: { maxTokens: 512, temperature: .2, topP: .9, topK: 30, minP: 0, repeatPenalty: 1.05, contextWindowMode: "recent", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: false }
   },
+  safety: {
+    label: "Safety camera triage",
+    description: "Live webcam or screen monitoring for danger, crowding, smoke, fire, or distress.",
+    persona: "general",
+    systemPrompt: PERSONAS.general + " For live images, state only visible evidence. Prefer 'unclear' over guessing. When asked to triage risk, focus on immediate danger signals such as people in distress, water hazards, smoke, fire, collapse, or crowding, and keep the answer short.",
+    settings: { maxTokens: 256, temperature: .1, topP: .85, topK: 20, minP: 0, repeatPenalty: 1.05, contextWindowMode: "recent", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: false }
+  },
+  support: {
+    label: "Support & claims intake",
+    description: "Tickets, complaints, warranty cases, and customer replies with clear next steps.",
+    persona: "general",
+    systemPrompt: PERSONAS.general + " Gather missing order details, classify the issue, and draft a concise customer-facing reply. If troubleshooting is appropriate, suggest practical first steps such as restart, another cable, or a different charger. If a device smells burnt or becomes unusually hot, escalate immediately and advise the customer not to keep charging it.",
+    settings: { maxTokens: 1024, temperature: .25, topP: .9, topK: 40, minP: .05, repeatPenalty: 1.08, contextWindowMode: "autoCompress", ragMode: false, wikimediaTools: false, openStreetMapTools: false, skillsTools: true }
+  },
   extraction: {
     label: "Structured extraction",
     description: "Batch files, support tickets, logs, and tables with consistent, compact output.",
@@ -1259,10 +1273,15 @@ function toMarkdown(chat) {
   const liveOverlayEl = $("liveOverlay");
   const liveStatusBadgeEl = $("liveStatusBadge");
   const liveStatusLabelEl = $("liveStatusLabel");
+  const liveHealthCameraEl = $("liveHealthCamera");
+  const liveHealthModelEl = $("liveHealthModel");
+  const liveHealthInferenceEl = $("liveHealthInference");
   const liveSizeRangeEl = $("liveSizeRange");
   const liveSizeValueEl = $("liveSizeValue");
+  const liveContextModeEl = $("liveContextMode");
   const livePauseButtonEl = $("livePauseButton");
   const livePromptInputEl = $("livePromptInput");
+  const liveZoneInputEl = $("liveZoneInput");
   const liveActionConditionEl = $("liveActionCondition");
   const liveActionSoundEl = $("liveActionSound");
   const liveActionNotifyEl = $("liveActionNotify");
@@ -1416,6 +1435,14 @@ function toMarkdown(chat) {
   // 384px has far fewer vision patches than the former 640px default while
   // still being ample for a scene caption; the user can opt up for OCR.
   let liveFrameSize = 384;
+  // The temporal profiles sample the actual media stream independently of inference:
+  // it is never assembled from earlier model requests or answers.
+  let liveContextMode = "current";
+  const liveTimelineFrames = [];
+  let liveTimelineTimer = null;
+  let liveTimelineCapturePending = false;
+  let liveTimelineEpoch = 0;
+  let liveLastSuccessAt = 0;
   let liveHistory = [];
   let liveHistoryShown = false;
   let liveElapsedTimer = null;
@@ -1439,6 +1466,8 @@ function toMarkdown(chat) {
   // allocation/GC churn for no benefit.
   let liveFrameCanvasEl = null;
   let liveFrameCanvasCtx = null;
+  let liveTimelineCanvasEl = null;
+  let liveTimelineCanvasCtx = null;
   let saveTimer = null;
   let saveQueue = Promise.resolve();
   let toastTimer = null;
@@ -5154,9 +5183,10 @@ function toMarkdown(chat) {
     if (first) first.focus();
   }
 
-  // Live vision only ever consumes one downscaled frame every couple hundred
-  // ms (see runLiveVision's sleep(200) pacing and liveFrameSize's 960px cap),
-  // but an unconstrained getUserMedia/getDisplayMedia call keeps decoding a
+  // Live vision consumes a downscaled current frame per inference. The
+  // optional five-frame timeline samples only once a second, rather than
+  // retaining every decoded 25/30fps camera frame. An unconstrained
+  // getUserMedia/getDisplayMedia call otherwise keeps decoding a
   // full-resolution stream at the device's native frame rate the whole time
   // -- CPU/GPU/battery spent on frames that are thrown away unread. These are
   // "ideal" hints, not hard caps, so a single high-quality snapshot capture
@@ -5238,6 +5268,10 @@ function toMarkdown(chat) {
   liveSizeRangeEl.addEventListener("input", () => {
     liveFrameSize = boundedNumber(liveSizeRangeEl.value, 384, 256, 960, true);
     liveSizeValueEl.textContent = liveFrameSize + "px";
+  });
+  liveContextModeEl.addEventListener("change", () => {
+    liveContextMode = liveContextModeEl.value;
+    if (liveVisionRunning) restartLiveTimelineSampler();
   });
   livePauseButtonEl.addEventListener("click", () => {
     liveVisionPaused = !liveVisionPaused;
@@ -5395,11 +5429,14 @@ function toMarkdown(chat) {
         textFile.arrayBuffer(),
         visionFile ? visionFile.arrayBuffer() : Promise.resolve(null)
       ]);
-      const textBytes = new Uint8Array(textBuffer);
-      const visionBytes = visionBuffer ? new Uint8Array(visionBuffer) : null;
+      let textBytes = new Uint8Array(textBuffer);
+      let visionBytes = visionBuffer ? new Uint8Array(visionBuffer) : null;
       browserModelStatusEl.textContent = "loading into GopherLLM (this can take a while for large models)…";
       await runtimeReady;
-      await window.GopherLLMBrowser.loadModel(textBytes, visionBytes);
+      const loadPromise = window.GopherLLMBrowser.loadModel(textBytes, visionBytes);
+      textBytes = null;
+      visionBytes = null;
+      await loadPromise;
       browserModelStatusEl.textContent = "Model loaded. Nothing was uploaded -- it was read and parsed entirely in this tab.";
       browserModelNameEl.textContent = textFile.name;
       browserModelMetaEl.textContent = visionFile ? "with vision (" + visionFile.name + ")" : "text only";
@@ -5486,28 +5523,135 @@ function toMarkdown(chat) {
   // for the duration of every single capture. toBlob hands the encode off
   // the main thread in every evergreen browser, so the UI stays responsive
   // while a frame is compressed.
-  function captureLiveFrame() {
+  function captureLiveFrame(canvasKind = "request") {
     const scale = Math.min(1, liveFrameSize / Math.max(captureVideoEl.videoWidth, 1));
     const width = Math.max(1, Math.round(captureVideoEl.videoWidth * scale));
     const height = Math.max(1, Math.round(captureVideoEl.videoHeight * scale));
-    if (!liveFrameCanvasEl) {
-      liveFrameCanvasEl = document.createElement("canvas");
+    const isTimeline = canvasKind === "timeline";
+    if (!(isTimeline ? liveTimelineCanvasEl : liveFrameCanvasEl)) {
+      const canvas = document.createElement("canvas");
       // Live frames come from a camera/screen feed and never carry an alpha
       // channel; telling the context that up front lets the browser skip
       // alpha compositing work on every draw.
-      liveFrameCanvasCtx = liveFrameCanvasEl.getContext("2d", { alpha: false });
+      const context = canvas.getContext("2d", { alpha: false });
+      if (isTimeline) {
+        liveTimelineCanvasEl = canvas;
+        liveTimelineCanvasCtx = context;
+      } else {
+        liveFrameCanvasEl = canvas;
+        liveFrameCanvasCtx = context;
+      }
     }
-    if (liveFrameCanvasEl.width !== width) liveFrameCanvasEl.width = width;
-    if (liveFrameCanvasEl.height !== height) liveFrameCanvasEl.height = height;
-    liveFrameCanvasCtx.drawImage(captureVideoEl, 0, 0, width, height);
+    const canvas = isTimeline ? liveTimelineCanvasEl : liveFrameCanvasEl;
+    const context = isTimeline ? liveTimelineCanvasCtx : liveFrameCanvasCtx;
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
+    context.drawImage(captureVideoEl, 0, 0, width, height);
     return new Promise((resolve, reject) => {
-      liveFrameCanvasEl.toBlob((blob) => {
+      canvas.toBlob((blob) => {
         if (!blob) { reject(new Error("Encoding the live frame failed.")); return; }
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
         reader.onerror = () => reject(reader.error || new Error("reading the encoded frame failed"));
         reader.readAsDataURL(blob);
       }, "image/jpeg", 0.8);
+    });
+  }
+
+  function stopLiveTimelineSampler() {
+    if (liveTimelineTimer) clearInterval(liveTimelineTimer);
+    liveTimelineTimer = null;
+    liveTimelineCapturePending = false;
+    liveTimelineEpoch++;
+    liveTimelineFrames.length = 0;
+  }
+
+  function liveTimelineFrameLimit() {
+    return liveContextMode === "timeline" ? 10 : 5;
+  }
+
+  function liveTimelineCollageLimit() {
+    // Ten equally-sized tiles hide the detail that the operator needs. Keep
+    // six representative samples over ten seconds instead.
+    return liveContextMode === "timeline" ? 6 : 5;
+  }
+
+  async function sampleLiveTimelineFrame() {
+    if (liveContextMode === "current" || !liveVisionRunning || liveTimelineCapturePending || !captureVideoEl.videoWidth || !captureVideoEl.videoHeight) return;
+    const epoch = liveTimelineEpoch;
+    liveTimelineCapturePending = true;
+    try {
+      const image = await captureLiveFrame("timeline");
+      // A previous camera/session may finish JPEG encoding after a restart.
+      // Do not leak that old image into the new stream's timeline.
+      if (epoch !== liveTimelineEpoch || !liveVisionRunning || liveContextMode === "current") return;
+      liveTimelineFrames.push({ image, capturedAt: new Date() });
+      if (liveTimelineFrames.length > liveTimelineFrameLimit()) liveTimelineFrames.shift();
+    } catch (_) {
+      // The inference loop reports capture errors; a missed background sample
+      // merely leaves the next collage with fewer distinct moments.
+    } finally {
+      liveTimelineCapturePending = false;
+    }
+  }
+
+  function restartLiveTimelineSampler() {
+    stopLiveTimelineSampler();
+    if (liveContextMode === "current" || !liveVisionRunning) return;
+    sampleLiveTimelineFrame();
+    liveTimelineTimer = setInterval(sampleLiveTimelineFrame, 1000);
+  }
+
+  function loadImageForCanvas(dataURL) {
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Loading a timeline frame failed."));
+      image.src = dataURL;
+    });
+  }
+
+  function timelineTimestamp(date) {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+
+  async function buildLiveTimelineCollage() {
+    const sourceFrames = liveTimelineFrames.slice(-liveTimelineFrameLimit());
+    const frameLimit = liveTimelineCollageLimit();
+    const frames = sourceFrames.length <= frameLimit
+      ? sourceFrames
+      : Array.from({ length: frameLimit }, (_, index) => sourceFrames[Math.round(index * (sourceFrames.length - 1) / (frameLimit - 1))]);
+    if (frames.length < 2) return null;
+    const images = await Promise.all(frames.map((frame) => loadImageForCanvas(frame.image)));
+    const cellWidth = 256;
+    const cellHeight = Math.max(1, Math.round(images[0].height * cellWidth / Math.max(images[0].width, 1)));
+    const labelHeight = 26;
+    const columns = frames.length <= 2 ? frames.length : 3;
+    const rows = Math.ceil(frames.length / columns);
+    const canvas = document.createElement("canvas");
+    canvas.width = columns * cellWidth;
+    canvas.height = rows * (cellHeight + labelHeight);
+    const context = canvas.getContext("2d", { alpha: false });
+    context.fillStyle = "#101818";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    images.forEach((image, index) => {
+      const x = (index % columns) * cellWidth;
+      const y = Math.floor(index / columns) * (cellHeight + labelHeight);
+      context.drawImage(image, x, y, cellWidth, cellHeight);
+      context.fillStyle = "rgba(0, 0, 0, .72)";
+      context.fillRect(x, y + cellHeight, cellWidth, labelHeight);
+      context.fillStyle = "#fff";
+      context.font = "600 13px ui-monospace, SFMono-Regular, Menlo, monospace";
+      context.fillText(timelineTimestamp(frames[index].capturedAt), x + 8, y + cellHeight + 17);
+    });
+    return new Promise((resolve, reject) => {
+      canvas.toBlob((blob) => {
+        if (!blob) { reject(new Error("Encoding the timeline collage failed.")); return; }
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error || new Error("Reading the timeline collage failed."));
+        reader.readAsDataURL(blob);
+      }, "image/jpeg", 0.82);
     });
   }
 
@@ -5562,6 +5706,21 @@ function toMarkdown(chat) {
     } else {
       liveStatusLabelEl.textContent = "Standby";
     }
+  }
+
+  function liveModelHealth() {
+    if (preferences.inferenceMode === "browser") {
+      return browserModelNameEl.textContent.trim() ? "Model: local browser model" : "Model: not loaded";
+    }
+    return Array.from(modelSelectEl.options).some((option) => option.dataset.loaded === "true")
+      ? "Model: local server model"
+      : "Model: not loaded";
+  }
+
+  function setLiveHealth(camera, inference) {
+    liveHealthCameraEl.textContent = "Camera: " + camera;
+    liveHealthModelEl.textContent = liveModelHealth();
+    liveHealthInferenceEl.textContent = "Inference: " + inference;
   }
 
   function setLiveOutputStatus(text, isError) {
@@ -5759,7 +5918,7 @@ function toMarkdown(chat) {
     }
   }
 
-  async function completeLiveVision(chat, prompt, image, signal, onToken) {
+  async function completeLiveVision(chat, prompt, image, signal, onToken, hasTimeline) {
     // Live frames are a perception task, not an open-ended chat turn. Short,
     // low-temperature answers keep the output grounded in what is actually
     // visible instead of letting a small vision model elaborate a speculative
@@ -5768,6 +5927,12 @@ function toMarkdown(chat) {
       maxTokens: Math.min(64, boundedNumber(chat.settings.maxTokens, 64, 1, 4096, true)),
       temperature: Math.min(0.3, boundedNumber(chat.settings.temperature, 0.3, 0, 2, false))
     });
+    const frameContext = hasTimeline
+      ? "You are seeing a timestamped collage of real frames sampled one second apart from the same live feed. Compare only clearly visible changes across the panels; it is not every camera frame and it cannot establish safety or an emergency."
+      : "You are seeing one freshly captured current frame."
+    const zoneContext = liveZoneInputEl.value.trim()
+      ? "The operator labels this view: " + liveZoneInputEl.value.trim() + ". Include that label only when it helps make the response actionable."
+      : "The operator has not labelled this camera view; do not invent a location."
     const livePromptInstruction = liveCaptureMode === "screen"
       ? "You are describing one current live screen frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly."
       : "You are describing one current live camera frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly.";
@@ -5785,6 +5950,8 @@ function toMarkdown(chat) {
       : "Never output [ALERT], [NOTIFY], or [MARK].";
     const liveSystemPrompt = [
       chat.systemPrompt.trim(),
+      frameContext,
+      zoneContext,
       livePromptInstruction,
       liveActionInstruction
     ].filter(Boolean).join("\n\n");
@@ -5855,6 +6022,7 @@ function toMarkdown(chat) {
     liveVisionRunning = true;
     liveVisionPaused = false;
     liveCaptureMode = captureMode;
+    liveContextMode = ["current", "change", "timeline"].includes(liveContextModeEl.value) ? liveContextModeEl.value : "current";
     syncLiveActionsFromControls();
     if (liveActionsArmed.alert) ensureLiveAlertAudio();
     if (liveActionsArmed.notify) ensureNotifyPermission();
@@ -5873,6 +6041,8 @@ function toMarkdown(chat) {
     captureTitleEl.textContent = liveCaptureMode === "screen" ? "Live screen" : "Live vision";
     setLiveStatus("live");
     startLiveElapsedTimer();
+    restartLiveTimelineSampler();
+    setLiveHealth("starting…", "waiting for first frame");
     livePauseButtonEl.focus();
 
     while (liveVisionRunning && activeCaptureStream) {
@@ -5897,7 +6067,10 @@ function toMarkdown(chat) {
       try {
         setLiveOutputStatus(liveCaptureMode === "screen" ? "Waiting for a screen frame…" : "Waiting for a camera frame…", false);
         await waitForLiveVideoFrame(requestController.signal);
-        const image = await captureLiveFrame();
+        setLiveHealth("live", "capturing frame");
+        const timelineImage = liveContextMode === "current" ? null : await buildLiveTimelineCollage();
+        const image = timelineImage || await captureLiveFrame();
+        setLiveHealth("live", timelineImage ? "analysing timeline" : "analysing current frame");
         startLiveFrameProgress();
         const answer = await completeLiveVision(chat, prompt, image, requestController.signal, (partial) => {
           stopLiveFrameProgress();
@@ -5911,7 +6084,7 @@ function toMarkdown(chat) {
           const statusLabel = describeLiveActionStatus(frameActionsTriggered);
           setLiveOutputStatus((statusLabel ? statusLabel + " — generating response…" : "Generating response…"), false);
           setLiveOutputText(parsed.text || (statusLabel ? "Flagged…" : partial), true);
-        });
+        }, !!timelineImage);
         stopLiveFrameProgress();
         const parsedAnswer = parseLiveActions(answer);
         parsedAnswer.actions.forEach((key) => {
@@ -5920,6 +6093,8 @@ function toMarkdown(chat) {
         });
         const generatedAnswer = parsedAnswer.text;
         liveLastAnswer = generatedAnswer || "The model returned no text for this frame.";
+        liveLastSuccessAt = Date.now();
+        setLiveHealth("live", "last success just now");
         setLiveOutputText(liveLastAnswer, false);
         const finalStatusLabel = describeLiveActionStatus(frameActionsTriggered);
         setLiveOutputStatus((finalStatusLabel ? finalStatusLabel + " · Last response updated" : "Last response updated"), false);
@@ -5931,6 +6106,7 @@ function toMarkdown(chat) {
         stopLiveFrameProgress();
         if (!(error && error.name === "AbortError")) {
           setLiveStatus("error");
+          setLiveHealth("live", "error");
           setLiveOutputStatus("Error: " + (error && error.message ? error.message : String(error)), true);
           if (previousAnswer) setLiveOutputText(previousAnswer, false);
           else setLiveOutputText("No response was generated for this frame.", false, true);
@@ -5952,6 +6128,8 @@ function toMarkdown(chat) {
     liveVisionController = null;
     stopLiveFrameProgress();
     stopLiveElapsedTimer();
+    stopLiveTimelineSampler();
+    setLiveHealth("stopped", liveLastSuccessAt ? "last success recorded" : "not run");
     // Force deliberate re-arming on the next session rather than leaving a
     // watch condition silently active in the background once the camera or
     // screen share it was written for has already stopped.

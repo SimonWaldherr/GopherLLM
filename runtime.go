@@ -242,6 +242,14 @@ type LoadInfo struct {
 type LoadOptions struct {
 	PrepareQuantized bool
 	UseMetal         bool
+	// BorrowQuantized keeps packed quantized tensors as views into the input
+	// byte slice instead of copying each tensor. The Runner retains the
+	// backing storage for as long as those weights are live, so callers must
+	// not mutate the input while the Runner is in use. This is useful for
+	// browser/WASM loads, where the input has already been copied into the Go
+	// heap and a second full model-sized copy can exceed the address-space
+	// budget.
+	BorrowQuantized bool
 	// OutOfCore keeps scalar and quantized matrices as views of a real mmap,
 	// disables GPU/prepared copies, and avoids prewarming sparse expert banks.
 	// It requires a single-file GGUF opened from a filesystem path.
@@ -392,7 +400,7 @@ func RunnerFromGGUFBytesWithOptions(data []byte, options LoadOptions) (*Runner, 
 	if options.OutOfCore {
 		return nil, fmt.Errorf("out-of-core loading requires RunnerFromPathWithOptions: byte-backed models already reside in memory")
 	}
-	return runnerFromGGUFBytes(data, false, options)
+	return runnerFromGGUFBytes(data, options.BorrowQuantized, options)
 }
 
 // RunnerFromGGUFBytesWithVision loads a text-decoder GGUF plus a paired
@@ -527,7 +535,13 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 			}
 			return nil, fmt.Errorf("loading vision projector: %w", err)
 		}
-		vc, vw, err := LoadPixtralVisionModel(visionData, visionGGUF, options.UseMetal, logw)
+		var vc PixtralVisionConfig
+		var vw PixtralVisionWeights
+		if options.BorrowQuantized {
+			vc, vw, err = loadPixtralVisionModel(visionData, visionGGUF, options.UseMetal, true, logw)
+		} else {
+			vc, vw, err = LoadPixtralVisionModel(visionData, visionGGUF, options.UseMetal, logw)
+		}
 		if err != nil {
 			if visionFile != nil {
 				_ = visionFile.Close()

@@ -42,6 +42,14 @@ func (e *Encoder) EndCompute() {
 	e.pass = js.Value{}
 }
 
+// CopyBuffer records a buffer-to-buffer copy in this encoder. Call it after
+// EndCompute when copying a compute output into a MAP_READ staging buffer;
+// keeping both operations in one command buffer avoids an extra queue submit
+// and an avoidable CPU/GPU synchronization point per matvec.
+func (e *Encoder) CopyBuffer(src *Buffer, srcOffset int, dst *Buffer, dstOffset, size int) {
+	e.encoder.Call("copyBufferToBuffer", src.value, srcOffset, dst.value, dstOffset, size)
+}
+
 // Submit finishes recording and submits the command buffer to the device
 // queue. The Encoder must not be reused afterward.
 func (e *Encoder) Submit() {

@@ -62,9 +62,50 @@ func testQ4K(dev *webgpu.Device, rows, cols int, x []float32) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("compiling kernel: %w", err)
 	}
-	gpuOut, err := kernel.Run(data, x, rows, cols)
+	defer kernel.Destroy()
+	prepared, err := dev.PrepareWeight(data, rows, cols)
+	if err != nil {
+		return "", fmt.Errorf("preparing weight: %w", err)
+	}
+	defer prepared.Destroy()
+	gpuOut, err := kernel.RunPrepared(prepared, x)
 	if err != nil {
 		return "", fmt.Errorf("running kernel: %w", err)
+	}
+	// The second call is intentional: it exercises the decode-time fast path
+	// where the same bind group, GPU readback buffer, and JS upload views are
+	// reused after mapAsync/unmap has completed once.
+	gpuOutReuse, err := kernel.RunPrepared(prepared, x)
+	if err != nil {
+		return "", fmt.Errorf("rerunning prepared kernel: %w", err)
+	}
+	if _, err := compareRows(gpuOut, gpuOutReuse); err != nil {
+		return "", fmt.Errorf("prepared reuse mismatch: %w", err)
+	}
+	// Grow the shared activation buffer, then return to this smaller matrix.
+	// This specifically verifies WriteBufferView's explicit size argument: the
+	// capacity-sized Uint8Array must not write its stale FFN-sized tail into a
+	// smaller projection's input buffer.
+	largeCols := cols * 2
+	largeX := syntheticRow(largeCols, 1001)
+	var largeData []byte
+	for r := 0; r < rows; r++ {
+		largeData = append(largeData, gopherllm.QuantizeRowQ4K(syntheticRow(largeCols, r+1000), largeCols)...)
+	}
+	largePrepared, err := dev.PrepareWeight(largeData, rows, largeCols)
+	if err != nil {
+		return "", fmt.Errorf("preparing larger weight: %w", err)
+	}
+	defer largePrepared.Destroy()
+	if _, err := kernel.RunPrepared(largePrepared, largeX); err != nil {
+		return "", fmt.Errorf("running larger prepared kernel: %w", err)
+	}
+	gpuOutAfterGrow, err := kernel.RunPrepared(prepared, x)
+	if err != nil {
+		return "", fmt.Errorf("rerunning smaller prepared kernel after growth: %w", err)
+	}
+	if _, err := compareRows(cpuOut, gpuOutAfterGrow); err != nil {
+		return "", fmt.Errorf("smaller prepared result after growth: %w", err)
 	}
 	maxRelErr, err := compareRows(cpuOut, gpuOut)
 	if err != nil {
@@ -85,9 +126,43 @@ func testQ6K(dev *webgpu.Device, rows, cols int, x []float32) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("compiling kernel: %w", err)
 	}
-	gpuOut, err := kernel.Run(data, x, rows, cols)
+	defer kernel.Destroy()
+	prepared, err := dev.PrepareWeight(data, rows, cols)
+	if err != nil {
+		return "", fmt.Errorf("preparing weight: %w", err)
+	}
+	defer prepared.Destroy()
+	gpuOut, err := kernel.RunPrepared(prepared, x)
 	if err != nil {
 		return "", fmt.Errorf("running kernel: %w", err)
+	}
+	gpuOutReuse, err := kernel.RunPrepared(prepared, x)
+	if err != nil {
+		return "", fmt.Errorf("rerunning prepared kernel: %w", err)
+	}
+	if _, err := compareRows(gpuOut, gpuOutReuse); err != nil {
+		return "", fmt.Errorf("prepared reuse mismatch: %w", err)
+	}
+	largeCols := cols * 2
+	largeX := syntheticRow(largeCols, 2001)
+	var largeData []byte
+	for r := 0; r < rows; r++ {
+		largeData = append(largeData, gopherllm.QuantizeRowQ6K(syntheticRow(largeCols, r+2000), largeCols)...)
+	}
+	largePrepared, err := dev.PrepareWeight(largeData, rows, largeCols)
+	if err != nil {
+		return "", fmt.Errorf("preparing larger weight: %w", err)
+	}
+	defer largePrepared.Destroy()
+	if _, err := kernel.RunPrepared(largePrepared, largeX); err != nil {
+		return "", fmt.Errorf("running larger prepared kernel: %w", err)
+	}
+	gpuOutAfterGrow, err := kernel.RunPrepared(prepared, x)
+	if err != nil {
+		return "", fmt.Errorf("rerunning smaller prepared kernel after growth: %w", err)
+	}
+	if _, err := compareRows(cpuOut, gpuOutAfterGrow); err != nil {
+		return "", fmt.Errorf("smaller prepared result after growth: %w", err)
 	}
 	maxRelErr, err := compareRows(cpuOut, gpuOut)
 	if err != nil {

@@ -156,7 +156,7 @@ func jsLoadModel(this js.Value, args []js.Value) any {
 	js.CopyBytesToGo(data, src)
 
 	return newPromise(func(resolve, reject js.Value) {
-		r, err := gopherllm.RunnerFromGGUFBytesWithOptions(data, gopherllm.LoadOptions{})
+		r, err := gopherllm.RunnerFromGGUFBytesWithOptions(data, gopherllm.LoadOptions{BorrowQuantized: true})
 		if err != nil {
 			reject.Invoke(err.Error())
 			return
@@ -206,10 +206,11 @@ func jsLoadModelWithVision(this js.Value, args []js.Value) any {
 	return newPromise(func(resolve, reject js.Value) {
 		var r *gopherllm.Runner
 		var err error
+		loadOptions := gopherllm.LoadOptions{BorrowQuantized: true}
 		if visionData != nil {
-			r, err = gopherllm.RunnerFromGGUFBytesWithVision(textData, visionData, gopherllm.LoadOptions{})
+			r, err = gopherllm.RunnerFromGGUFBytesWithVision(textData, visionData, loadOptions)
 		} else {
-			r, err = gopherllm.RunnerFromGGUFBytesWithOptions(textData, gopherllm.LoadOptions{})
+			r, err = gopherllm.RunnerFromGGUFBytesWithOptions(textData, loadOptions)
 		}
 		if err != nil {
 			reject.Invoke(err.Error())

@@ -114,11 +114,14 @@ cross-build:
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-amd64.exe ./cmd/gopherllm
 	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-arm64.exe ./cmd/gopherllm
 
-# wasm-build compiles the in-browser entry point (cmd/gopherllm-wasm, see
-# its README) and stages Go's own wasm_exec.js bootstrap next to it. No
-# third-party JS is involved: wasm_exec.js ships with the Go toolchain
-# itself. GOOS=js (not wasip1) since that's what a browser tab is.
-wasm-build:
+# wasm-build refreshes the native server first, then compiles the in-browser
+# entry point (cmd/gopherllm-wasm, see its README) and stages Go's own
+# wasm_exec.js bootstrap next to it. Keeping the native build here prevents a
+# browser deployment from accidentally launching a stale bin/gopherllm after
+# CLI options have changed. No third-party JS is involved: wasm_exec.js ships
+# with the Go toolchain itself. GOOS=js (not wasip1) since that's what a browser
+# tab is.
+wasm-build: build
 	@mkdir -p $(BUILD_DIR)
 	GOOS=js GOARCH=wasm CGO_ENABLED=0 $(GO) build $(GOFLAGS) -trimpath -o $(BUILD_DIR)/gopherllm.wasm ./cmd/gopherllm-wasm
 	cp "$$($(GO) env GOROOT)/lib/wasm/wasm_exec.js" $(BUILD_DIR)/wasm_exec.js 2>/dev/null || \

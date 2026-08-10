@@ -5,8 +5,9 @@ package webgpu
 import (
 	"encoding/binary"
 	"fmt"
-	"math"
 	"sync"
+	"syscall/js"
+	"unsafe"
 )
 
 // MatvecKernel is a compiled dequantizing matvec compute pipeline (Q4_K or
@@ -20,7 +21,13 @@ type MatvecKernel struct {
 	xBuf                   *Buffer
 	outBuf                 *Buffer
 	paramsBuf              *Buffer
+	readbackBuf            *Buffer
 	xCapacity, outCapacity int
+	readbackCapacity       int
+	xUploadView            js.Value
+	paramsUploadView       js.Value
+	params                 [8]byte
+	workGeneration         uint64
 }
 
 func newMatvecKernel(dev *Device, wgsl string) (*MatvecKernel, error) {
@@ -58,8 +65,16 @@ func (k *MatvecKernel) Destroy() {
 		k.paramsBuf.Destroy()
 		k.paramsBuf = nil
 	}
+	if k.readbackBuf != nil {
+		k.readbackBuf.Destroy()
+		k.readbackBuf = nil
+	}
 	k.xCapacity = 0
 	k.outCapacity = 0
+	k.readbackCapacity = 0
+	k.xUploadView = js.Value{}
+	k.paramsUploadView = js.Value{}
+	k.workGeneration++
 }
 
 // PreparedWeight is one tensor's raw quantized bytes already resident in a
@@ -72,12 +87,29 @@ func (k *MatvecKernel) Destroy() {
 type PreparedWeight struct {
 	buf        *Buffer
 	rows, cols int
+
+	// A bind group only changes when the kernel replaces one of its reusable
+	// activation/output/parameter buffers. Caching it with the prepared
+	// weight avoids rebuilding four JS descriptor objects for every decoded
+	// token while still invalidating it correctly after a buffer grows.
+	boundKernel    *MatvecKernel
+	bindGroup      js.Value
+	bindGeneration uint64
 }
 
 // Destroy releases the GPU buffer backing this prepared weight. No method
 // may use w afterward.
 func (w *PreparedWeight) Destroy() {
-	w.buf.Destroy()
+	if w == nil {
+		return
+	}
+	if w.buf != nil {
+		w.buf.Destroy()
+		w.buf = nil
+	}
+	w.boundKernel = nil
+	w.bindGroup = js.Value{}
+	w.bindGeneration = 0
 }
 
 // PrepareWeight uploads data (one tensor's raw on-disk quantized bytes, in
@@ -105,53 +137,80 @@ func (d *Device) PrepareWeight(data []byte, rows, cols int) (*PreparedWeight, er
 // RunPrepared computes out[i] = dot(row_i, x) against an already-uploaded
 // weight (see PrepareWeight), uploading only the small activation vector x
 // fresh on every call -- the cheap per-token cost real decode should pay.
+// It is the allocating convenience form of RunPreparedInto.
 func (k *MatvecKernel) RunPrepared(w *PreparedWeight, x []float32) ([]float32, error) {
+	if w == nil {
+		return nil, fmt.Errorf("webgpu: prepared weight is nil")
+	}
+	out := make([]float32, w.rows)
+	if err := k.RunPreparedInto(w, x, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// RunPreparedInto is RunPrepared without a result allocation. out must have
+// room for w.rows values. Real model decode should use this method because
+// its destination is already a reusable activation scratch slice; avoiding
+// the intermediate []float32 and copy removes a full output-vector
+// allocation from every WebGPU matvec.
+func (k *MatvecKernel) RunPreparedInto(w *PreparedWeight, x, out []float32) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if w.rows <= 0 || w.cols <= 0 {
-		return nil, fmt.Errorf("webgpu: prepared weight has invalid shape rows=%d cols=%d", w.rows, w.cols)
+	if w == nil || w.buf == nil || w.rows <= 0 || w.cols <= 0 {
+		return fmt.Errorf("webgpu: prepared weight has invalid shape")
 	}
 	if len(x) != w.cols {
-		return nil, fmt.Errorf("webgpu: activation length %d does not match weight cols %d", len(x), w.cols)
+		return fmt.Errorf("webgpu: activation length %d does not match weight cols %d", len(x), w.cols)
+	}
+	if len(out) < w.rows {
+		return fmt.Errorf("webgpu: output length %d is smaller than weight rows %d", len(out), w.rows)
 	}
 	if w.cols%256 != 0 {
-		return nil, fmt.Errorf("webgpu: cols (%d) must be a multiple of 256 (the Q4_K/Q6_K block size)", w.cols)
+		return fmt.Errorf("webgpu: cols (%d) must be a multiple of 256 (the Q4_K/Q6_K block size)", w.cols)
 	}
 	if limit := k.dev.limits.MaxComputeWorkgroupsPerDimension; limit > 0 && w.rows > limit {
-		return nil, fmt.Errorf("webgpu: rows (%d) exceeds this device's maxComputeWorkgroupsPerDimension (%d)", w.rows, limit)
+		return fmt.Errorf("webgpu: rows (%d) exceeds this device's maxComputeWorkgroupsPerDimension (%d)", w.rows, limit)
 	}
 
 	if err := k.ensureWorkBuffers(len(x)*4, w.rows*4); err != nil {
-		return nil, err
+		return err
 	}
-	if err := k.dev.WriteBuffer(k.xBuf, 0, f32ToBytes(x)); err != nil {
-		return nil, fmt.Errorf("webgpu: uploading activation: %w", err)
-	}
-	params := make([]byte, 8)
-	binary.LittleEndian.PutUint32(params[0:], uint32(w.cols))
-	binary.LittleEndian.PutUint32(params[4:], 0) // rowOffset: always 0 -- one PreparedWeight is one whole (unchunked) tensor
-	if err := k.dev.WriteBuffer(k.paramsBuf, 0, params); err != nil {
-		return nil, fmt.Errorf("webgpu: uploading params: %w", err)
-	}
+	// js.CopyBytesToJS performs the required WASM-memory -> JS copy
+	// synchronously. Reinterpreting the float slice avoids first serializing
+	// every value into a separate Go []byte; WASM memory and WebGPU buffer
+	// mappings use the same little-endian IEEE-754 representation.
+	js.CopyBytesToJS(k.xUploadView, float32SliceBytes(x))
+	k.dev.WriteBufferView(k.xBuf, 0, k.xUploadView, len(x)*4)
+	binary.LittleEndian.PutUint32(k.params[0:], uint32(w.cols))
+	binary.LittleEndian.PutUint32(k.params[4:], 0) // rowOffset: always 0 -- one PreparedWeight is one whole (unchunked) tensor
+	js.CopyBytesToJS(k.paramsUploadView, k.params[:])
+	k.dev.WriteBufferView(k.paramsBuf, 0, k.paramsUploadView, len(k.params))
 
-	bindGroup := k.dev.CreateBindGroup(k.pipeline, w.buf, k.xBuf, k.outBuf, k.paramsBuf)
+	bindGroup := k.bindGroupFor(w)
 	enc := k.dev.NewEncoder()
 	enc.BeginCompute()
 	enc.Dispatch(k.pipeline, bindGroup, w.rows, 1, 1)
 	enc.EndCompute()
+	// The old path submitted compute, then Device.ReadBuffer created a second
+	// command buffer and a fresh staging allocation. Keeping the copy in this
+	// command buffer reduces every matvec to one queue submission and reuses a
+	// mapped staging buffer across all decode steps.
+	outputBytes := w.rows * 4
+	enc.CopyBuffer(k.outBuf, 0, k.readbackBuf, 0, outputBytes)
 	enc.Submit()
 
-	outBytes, err := k.dev.ReadBuffer(k.outBuf, 0, w.rows*4)
-	if err != nil {
-		return nil, fmt.Errorf("webgpu: reading output: %w", err)
+	if err := k.dev.ReadMappedBufferInto(k.readbackBuf, 0, float32SliceBytes(out[:w.rows])); err != nil {
+		return fmt.Errorf("webgpu: reading output: %w", err)
 	}
-	return bytesToF32(outBytes), nil
+	return nil
 }
 
 // ensureWorkBuffers grows reusable activation/output buffers on demand. The
 // decode loop normally keeps dimensions fixed, turning every later matvec
 // into writes plus one dispatch/readback rather than three GPU allocations.
 func (k *MatvecKernel) ensureWorkBuffers(xSize, outSize int) error {
+	buffersChanged := false
 	if k.xBuf == nil || k.xCapacity < xSize {
 		if k.xBuf != nil {
 			k.xBuf.Destroy()
@@ -161,6 +220,8 @@ func (k *MatvecKernel) ensureWorkBuffers(xSize, outSize int) error {
 			return fmt.Errorf("webgpu: creating activation buffer: %w", err)
 		}
 		k.xBuf, k.xCapacity = buf, xSize
+		k.xUploadView = js.Global().Get("Uint8Array").New(xSize)
+		buffersChanged = true
 	}
 	if k.outBuf == nil || k.outCapacity < outSize {
 		if k.outBuf != nil {
@@ -171,6 +232,18 @@ func (k *MatvecKernel) ensureWorkBuffers(xSize, outSize int) error {
 			return fmt.Errorf("webgpu: creating output buffer: %w", err)
 		}
 		k.outBuf, k.outCapacity = buf, outSize
+		buffersChanged = true
+	}
+	if k.readbackBuf == nil || k.readbackCapacity < outSize {
+		if k.readbackBuf != nil {
+			k.readbackBuf.Destroy()
+		}
+		buf, err := k.dev.CreateReadbackBuffer(outSize)
+		if err != nil {
+			return fmt.Errorf("webgpu: creating readback buffer: %w", err)
+		}
+		k.readbackBuf, k.readbackCapacity = buf, outSize
+		buffersChanged = true
 	}
 	if k.paramsBuf == nil {
 		buf, err := k.dev.CreateStorageBuffer(8, nil)
@@ -178,8 +251,24 @@ func (k *MatvecKernel) ensureWorkBuffers(xSize, outSize int) error {
 			return fmt.Errorf("webgpu: creating parameter buffer: %w", err)
 		}
 		k.paramsBuf = buf
+		k.paramsUploadView = js.Global().Get("Uint8Array").New(len(k.params))
+		buffersChanged = true
+	}
+	if buffersChanged {
+		k.workGeneration++
 	}
 	return nil
+}
+
+func (k *MatvecKernel) bindGroupFor(w *PreparedWeight) js.Value {
+	if w.boundKernel == k && w.bindGeneration == k.workGeneration {
+		return w.bindGroup
+	}
+	bindGroup := k.dev.CreateBindGroup(k.pipeline, w.buf, k.xBuf, k.outBuf, k.paramsBuf)
+	w.boundKernel = k
+	w.bindGroup = bindGroup
+	w.bindGeneration = k.workGeneration
+	return bindGroup
 }
 
 // Run is a one-shot convenience wrapper for testing/benchmarking: prepares
@@ -195,18 +284,14 @@ func (k *MatvecKernel) Run(weightBytes []byte, x []float32, rows, cols int) ([]f
 	return k.RunPrepared(prepared, x)
 }
 
-func f32ToBytes(v []float32) []byte {
-	out := make([]byte, len(v)*4)
-	for i, f := range v {
-		binary.LittleEndian.PutUint32(out[i*4:], math.Float32bits(f))
+// float32SliceBytes exposes a float32 slice's existing IEEE-754 bytes for
+// one synchronous JS bridge call. It does not retain the Go backing array or
+// hand a Go pointer to JavaScript; js.CopyBytesToJS/js.CopyBytesToGo copy the
+// bytes before returning. Empty input is supported for completeness, though
+// matvec activations and outputs are always non-empty.
+func float32SliceBytes(v []float32) []byte {
+	if len(v) == 0 {
+		return nil
 	}
-	return out
-}
-
-func bytesToF32(b []byte) []float32 {
-	out := make([]float32, len(b)/4)
-	for i := range out {
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
-	}
-	return out
+	return unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(v))), len(v)*4)
 }

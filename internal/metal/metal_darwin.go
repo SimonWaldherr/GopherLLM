@@ -204,6 +204,9 @@ static const char* gllm_q6k_source =
 "  if (sublane == 0) { out[row] = sum; }\n"
 "}\n"
 "struct ArgmaxResult { float value; uint index; };\n"
+"static inline bool gllm_argmax_better(float candidate, uint candidate_index, float best, uint best_index) {\n"
+"  return candidate > best || (candidate == best && candidate_index < best_index);\n"
+"}\n"
 "kernel void gllm_argmax_f32(\n"
 "    device float* values [[buffer(0)]],\n"
 "    device ArgmaxResult* result [[buffer(1)]],\n"
@@ -211,9 +214,14 @@ static const char* gllm_q6k_source =
 "    const device uint* recent [[buffer(3)]],\n"
 "    constant uint& recent_count [[buffer(4)]],\n"
 "    constant float& repeat_penalty [[buffer(5)]],\n"
-"    uint tid [[thread_index_in_threadgroup]]) {\n"
-"  threadgroup float shared_values[256];\n"
-"  threadgroup uint shared_indices[256];\n"
+"    uint tid [[thread_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]],\n"
+"    uint simdgroup [[simdgroup_index_in_threadgroup]]) {\n"
+"  // One winner per hardware SIMD group replaces the old 256-way shared-memory\n"
+"  // tree. Vocabulary argmax runs once per decoded token, so removing seven\n"
+"  // threadgroup barriers is material for the 128K-token Ministral vocabularies.\n"
+"  threadgroup float simd_values[8];\n"
+"  threadgroup uint simd_indices[8];\n"
 "  if (tid == 0 && repeat_penalty != 1.0f) {\n"
 "    for (uint j = 0; j < recent_count; ++j) {\n"
 "      uint i = recent[j];\n"
@@ -229,23 +237,39 @@ static const char* gllm_q6k_source =
 "  for (uint i = tid; i < n; i += 256) {\n"
 "    float v = values[i];\n"
 "    if (!isfinite(v)) { v = -INFINITY; }\n"
-"    if (v > best || (v == best && i < best_index)) { best = v; best_index = i; }\n"
+"    if (gllm_argmax_better(v, i, best, best_index)) { best = v; best_index = i; }\n"
 "  }\n"
-"  shared_values[tid] = best;\n"
-"  shared_indices[tid] = best_index;\n"
+"  for (uint offset = 16; offset > 0; offset >>= 1) {\n"
+"    float other = simd_shuffle_down(best, offset);\n"
+"    uint other_index = simd_shuffle_down(best_index, offset);\n"
+"    if (lane < offset && gllm_argmax_better(other, other_index, best, best_index)) {\n"
+"      best = other;\n"
+"      best_index = other_index;\n"
+"    }\n"
+"  }\n"
+"  if (lane == 0) {\n"
+"    simd_values[simdgroup] = best;\n"
+"    simd_indices[simdgroup] = best_index;\n"
+"  }\n"
 "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"  for (uint stride = 128; stride > 0; stride >>= 1) {\n"
-"    if (tid < stride) {\n"
-"      float other = shared_values[tid + stride];\n"
-"      uint other_index = shared_indices[tid + stride];\n"
-"      if (other > shared_values[tid] || (other == shared_values[tid] && other_index < shared_indices[tid])) {\n"
-"        shared_values[tid] = other;\n"
-"        shared_indices[tid] = other_index;\n"
+"  if (simdgroup == 0) {\n"
+"    if (lane < 8) {\n"
+"      best = simd_values[lane];\n"
+"      best_index = simd_indices[lane];\n"
+"    } else {\n"
+"      best = -INFINITY;\n"
+"      best_index = 0;\n"
+"    }\n"
+"    for (uint offset = 16; offset > 0; offset >>= 1) {\n"
+"      float other = simd_shuffle_down(best, offset);\n"
+"      uint other_index = simd_shuffle_down(best_index, offset);\n"
+"      if (lane < offset && gllm_argmax_better(other, other_index, best, best_index)) {\n"
+"        best = other;\n"
+"        best_index = other_index;\n"
 "      }\n"
 "    }\n"
-"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (lane == 0) { result[0].value = best; result[0].index = best_index; }\n"
 "  }\n"
-"  if (tid == 0) { result[0].value = shared_values[0]; result[0].index = shared_indices[0]; }\n"
 "}\n";
 
 static int gllm_metal_rows_per_group(int rows) {
@@ -680,13 +704,13 @@ static int gllm_metal_q4k2_silu_q6k(
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 		gllm_metal_encode_q4k(enc, gate, gate->x);
 		gllm_metal_encode_q4k(enc, up, gate->x);
-		[enc endEncoding];
-
-		enc = [cb computeCommandEncoder];
+		// These dispatches have explicit buffer dependencies, so Metal executes
+		// them in order within one compute encoder. Keeping the complete SwiGLU
+		// path in that encoder avoids two encoder-finalization/scheduling points
+		// per transformer layer. This is especially relevant for Ministral and
+		// Devstral, whose 26+ FFNs dominate decode once narrow GQA projections
+		// correctly stay on the CPU path.
 		gllm_metal_encode_silu(enc, gate->out, up->out, down->x, (uint32_t)gate->rows);
-		[enc endEncoding];
-
-		enc = [cb computeCommandEncoder];
 		gllm_metal_encode_q6k(enc, down, down->x);
 		[enc endEncoding];
 		[cb commit];
@@ -750,8 +774,9 @@ static int gllm_metal_q6k_argmax(void* handle, const float* x, const uint32_t* r
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 		gllm_metal_encode_q6k(enc, w, w->x);
-		[enc endEncoding];
-		enc = [cb computeCommandEncoder];
+		// The reduction consumes w->out written by the preceding dispatch.
+		// A compute encoder preserves that ordering, and avoiding a second
+		// encoder matters on every greedy decode token for large vocabularies.
 		gllm_metal_encode_argmax(enc, w, recent_count, repeat_penalty);
 		[enc endEncoding];
 		[cb commit];

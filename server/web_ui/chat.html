@@ -57,6 +57,7 @@
     </label>
     <div id="chatList" class="chat-list" role="navigation" aria-label="Chat history"></div>
     <div class="sidebar-footer">
+      <p class="engine-note">Inference engine · optional workspace UI</p>
       <p class="local-note"><span aria-hidden="true">●</span> Saved only in this browser</p>
     </div>
   </aside>
@@ -100,13 +101,7 @@
               <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms.">Explain a concept</button>
               <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email.">Draft an email</button>
               <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n">Review code</button>
-            </div>
-            <p class="workflow-label">Start with a workflow</p>
-            <div class="workflow-suggestions" aria-label="Choose a workflow">
-              <button type="button" class="workflow-suggestion" data-workflow="coding">Coding</button>
-              <button type="button" class="workflow-suggestion" data-workflow="research">Research</button>
-              <button type="button" class="workflow-suggestion" data-workflow="writing">Writing</button>
-              <button type="button" class="workflow-suggestion" data-workflow="vision">Vision</button>
+              <button type="button" class="suggestion" data-prompt="Classify this support request, ask for the missing order details, and draft a short customer reply with first troubleshooting steps.">Support ticket</button>
             </div>
             <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
           </div>
@@ -278,6 +273,20 @@
       <p id="settingsSearchEmpty" class="settings-search-empty" hidden>No settings match “<span id="settingsSearchEmptyQuery"></span>”.<span id="settingsSearchEmptyHint"></span></p>
 
       <div id="settingsPageModel" class="settings-page" role="tabpanel" aria-labelledby="settingsTabModel" data-settings-page="model">
+        <section class="settings-section engine-overview" aria-labelledby="engineOverviewTitle">
+          <div class="settings-section-head">
+            <div>
+              <h3 id="engineOverviewTitle">Inference engine first</h3>
+              <p>GopherLLM is a Go inference engine. This chat workspace is optional: use the runtime directly, its OpenAI- or Ollama-compatible API, or this UI.</p>
+            </div>
+          </div>
+          <ul class="engine-overview-list">
+            <li><strong>Standalone</strong><span>Run local GGUF models with GopherLLM’s own runtime — no separate inference server or web UI is required.</span></li>
+            <li><strong>Compatible server</strong><span>Route chat requests through a configured OpenAI-compatible upstream, such as Ollama, llama.cpp, LM Studio, or RustyLLM when it exposes that API.</span></li>
+          </ul>
+          <p class="settings-note engine-overview-note">A trusted GopherLLM server configures the upstream through <code>/remote</code>; this workspace never stores upstream credentials.</p>
+        </section>
+
         <section class="settings-section" id="inferenceModeSection" hidden>
           <div class="settings-section-head">
             <div>
@@ -753,14 +762,29 @@
 
         <div id="liveOverlay" class="live-overlay" hidden>
           <div class="live-topbar">
-            <div id="liveStatusBadge" class="live-status">
-              <span class="live-status-dot" aria-hidden="true"></span>
-              <span id="liveStatusLabel">Standby</span>
+            <div class="live-status-stack">
+              <div id="liveStatusBadge" class="live-status">
+                <span class="live-status-dot" aria-hidden="true"></span>
+                <span id="liveStatusLabel">Standby</span>
+              </div>
+              <div id="liveHealth" class="live-health" aria-live="polite">
+                <span id="liveHealthCamera">Camera: standby</span>
+                <span id="liveHealthModel">Model: unknown</span>
+                <span id="liveHealthInference">Inference: waiting</span>
+              </div>
             </div>
             <div class="live-topbar-end">
               <label class="live-size">
                 <span class="live-size-label">Input <b id="liveSizeValue">384px</b></span>
                 <input id="liveSizeRange" type="range" min="256" max="960" step="32" value="384" aria-label="Live frame resolution">
+              </label>
+              <label class="live-context">
+                <span class="live-size-label">Context</span>
+                <select id="liveContextMode" aria-label="Live vision frame context">
+                  <option value="current">Current frame</option>
+                  <option value="change">Change · 5 sec</option>
+                  <option value="timeline">Timeline · 10 sec</option>
+                </select>
               </label>
               <button id="livePauseButton" class="icon-button live-pause-btn" type="button" aria-label="Pause live vision" title="Pause">
                 <svg class="icon" aria-hidden="true"><use href="#i-pause"/></svg>
@@ -773,6 +797,7 @@
               <span class="live-panel-label">Prompt</span>
               <textarea id="livePromptInput" rows="1" placeholder="Describe what you see in one sentence."></textarea>
               <div class="live-actions">
+                <input id="liveZoneInput" type="text" class="live-zone-input" placeholder="Zone / camera (e.g. Pool A)" maxlength="80" aria-label="Observed pool zone or camera">
                 <input id="liveActionCondition" type="text" class="live-action-condition" placeholder="Watch for… (e.g. someone enters the room)" maxlength="200" aria-label="Situation to watch for">
                 <div class="live-action-toggles">
                   <label class="live-action-toggle" title="Sound an audible alarm"><input id="liveActionSound" type="checkbox"><span>🔊 Sound</span></label>
@@ -786,6 +811,7 @@
                 <button type="button" class="live-suggestion" data-prompt="Identify any text or written content visible.">Read visible text</button>
                 <button type="button" class="live-suggestion" data-prompt="Name the object I am holding in my hand.">Name the object</button>
                 <button type="button" class="live-suggestion" data-condition="An immediate, clearly visible danger to a person is present" data-arm="alert">Danger alert</button>
+                <button type="button" class="live-suggestion" data-prompt="Watch this live feed for smoke, fire, crowding, water hazard, collapse, or visible distress. Answer in one short sentence and say if the scene is unclear.">Safety triage</button>
               </div>
             </div>
 

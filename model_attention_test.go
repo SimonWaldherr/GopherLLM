@@ -53,6 +53,53 @@ func TestGQA4SharedRowKernelsMatchSeparateOperations(t *testing.T) {
 	}
 }
 
+func TestGQA4SharedF16RowKernelsMatchSeparateOperations(t *testing.T) {
+	rng := rand.New(rand.NewSource(22))
+	for _, n := range []int{1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 95, 128} {
+		q := [4][]float32{}
+		out := [4][]float32{}
+		wantOut := [4][]float32{}
+		x := make([]uint16, n)
+		for i := range x {
+			x[i] = F32ToF16(rng.Float32()*2 - 1)
+		}
+		for h := range q {
+			q[h] = make([]float32, n)
+			out[h] = make([]float32, n)
+			wantOut[h] = make([]float32, n)
+			for i := range q[h] {
+				q[h][i] = rng.Float32()*2 - 1
+				out[h][i] = rng.Float32()*2 - 1
+				wantOut[h][i] = out[h][i]
+			}
+		}
+
+		got0, got1, got2, got3 := dotF32F16x4(
+			&q[0][0], &q[1][0], &q[2][0], &q[3][0], &x[0], n)
+		gotDots := [...]float32{got0, got1, got2, got3}
+		for h, got := range gotDots {
+			want := dotF32F16(q[h], x)
+			if diff := math.Abs(float64(got - want)); diff > 1e-5 {
+				t.Fatalf("n=%d dot %d = %g, want %g (diff %g)", n, h, got, want, diff)
+			}
+		}
+
+		alpha := [...]float32{0.25, -0.5, 0.75, 1.25}
+		for h := range wantOut {
+			axpyF16(wantOut[h], alpha[h], x)
+		}
+		axpyF32F16x4(&out[0][0], &out[1][0], &out[2][0], &out[3][0],
+			alpha[0], alpha[1], alpha[2], alpha[3], &x[0], n)
+		for h := range out {
+			for i, got := range out[h] {
+				if got != wantOut[h][i] {
+					t.Fatalf("n=%d axpy %d[%d] = %g, want %g", n, h, i, got, wantOut[h][i])
+				}
+			}
+		}
+	}
+}
+
 func TestGroupedGQAAttentionMatchesSeparateHeads(t *testing.T) {
 	const (
 		queryHeads = 4

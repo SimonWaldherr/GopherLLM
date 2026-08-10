@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Northstar Support · GopherLLM demo</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div><p class="eyebrow">LOCAL DEMO · GopherLLM</p><h1>Northstar Support</h1></div>
+      <p class="privacy">Processed by your local GopherLLM server</p>
+    </header>
+    <div class="warning"><strong>Demo only.</strong> A human agent confirms every outcome. This UI does not make refunds, warranty, safety, or legal decisions.</div>
+    <section class="layout">
+      <form id="claimForm" class="card" novalidate>
+        <p class="kicker">1 · Customer intake</p>
+        <h2>Which order needs help?</h2>
+        <div id="orders" class="orders" role="radiogroup" aria-label="Recent orders"></div>
+        <label>Issue type
+          <select id="issueType"><option>Does not work</option><option>Damaged on arrival</option><option>Charging / power</option><option>Wrong item</option><option>Other</option></select>
+        </label>
+        <label>Describe what happened
+          <textarea id="details" maxlength="4000" placeholder="For example: The speaker will not turn on after charging overnight."></textarea>
+        </label>
+        <p class="hint">Do not enter payment data, passwords, or unnecessary personal data.</p>
+        <button id="submit" type="submit">Ask local support assistant</button>
+        <p id="formError" class="error" role="alert"></p>
+      </form>
+      <section class="card result" aria-labelledby="resultTitle">
+        <p class="kicker">2 · Human review queue</p>
+        <h2 id="resultTitle">Draft response</h2>
+        <p id="status" class="status">Choose an order and describe the issue.</p>
+        <div id="result" hidden>
+          <div class="badges"><span id="classification" class="badge"></span><span id="priority" class="badge"></span></div>
+          <h3>Suggested next steps</h3><ul id="actions"></ul>
+          <h3>Customer-facing draft</h3><blockquote id="reply"></blockquote>
+          <p id="safety" class="safety" hidden></p>
+          <div class="review"><strong>Human review required</strong><span>This is a draft; confirm the facts and local policy before sending.</span></div>
+        </div>
+      </section>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -110,6 +110,52 @@ func BenchmarkGQAAttention_ctx4096(b *testing.B) {
 	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttention(b, 4096, true) })
 }
 
+func benchmarkGQAAttentionF16(b *testing.B, ctx int, mode string) {
+	const queryHeads, headDim = 4, 128
+	queries := benchFloatSlice(queryHeads * headDim)
+	keys := make([]uint16, ctx*headDim)
+	values := make([]uint16, ctx*headDim)
+	for i := range keys {
+		keys[i] = F32ToF16(float32(i%17-8) / 16)
+		values[i] = F32ToF16(float32(i%23-11) / 16)
+	}
+	out := make([]float32, len(queries))
+	scale := float32(0.08838)
+	b.ReportAllocs()
+	b.SetBytes(int64(2 * ctx * headDim * 2))
+	for b.Loop() {
+		clear(out)
+		switch mode {
+		case "grouped":
+			onlineAttentionGroupF16(queries, keys, values, queryHeads,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
+		case "generic":
+			// The former grouped implementation: keep it as a directly
+			// comparable baseline for the shared-row NEON f16 primitives.
+			onlineAttentionGroupEither(queries, nil, keys, nil, nil, values, nil, queryHeads,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0, out)
+		default:
+			for h := 0; h < queryHeads; h++ {
+				off := h * headDim
+				onlineAttentionF16(queries[off:off+headDim], keys, values,
+					headDim, headDim, headDim, headDim, 0, ctx-1, scale, 0,
+					out[off:off+headDim])
+			}
+		}
+	}
+}
+
+func BenchmarkGQAAttentionF16_ctx4096(b *testing.B) {
+	b.Run("separate", func(b *testing.B) { benchmarkGQAAttentionF16(b, 4096, "separate") })
+	b.Run("generic", func(b *testing.B) { benchmarkGQAAttentionF16(b, 4096, "generic") })
+	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttentionF16(b, 4096, "grouped") })
+}
+
+func BenchmarkGQAAttentionF16_ctx32768(b *testing.B) {
+	b.Run("generic", func(b *testing.B) { benchmarkGQAAttentionF16(b, 32768, "generic") })
+	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttentionF16(b, 32768, "grouped") })
+}
+
 func BenchmarkGQAAttention_ctx32768(b *testing.B) {
 	b.Run("separate", func(b *testing.B) { benchmarkGQAAttention(b, 32768, false) })
 	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttention(b, 32768, true) })

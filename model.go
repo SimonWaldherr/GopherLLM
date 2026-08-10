@@ -3409,8 +3409,72 @@ func onlineAttentionGroup4(queries, keys, values []float32, keyStride, valueStri
 }
 
 func onlineAttentionGroupF16(queries []float32, keys, values []uint16, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	if queryHeads == 4 {
+		onlineAttentionGroup4F16(queries, keys, values, keyStride, valueStride,
+			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+		return
+	}
 	onlineAttentionGroupEither(queries, nil, keys, nil, nil, values, nil, queryHeads,
 		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+}
+
+// onlineAttentionGroup4F16 is the compact-KV equivalent of
+// onlineAttentionGroup4. Mistral/Ministral/Devstral use four query heads per
+// KV head, so its ARM64 NEON primitives decode each shared half-precision K/V
+// row once instead of once per query head.
+func onlineAttentionGroup4F16(queries []float32, keys, values []uint16, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	const queryHeads = 4
+	span := endT - startT + 1
+	if span <= 0 || keyHeadDim <= 0 || valueHeadDim <= 0 || len(queries) < queryHeads*keyHeadDim || len(out) < queryHeads*valueHeadDim {
+		return
+	}
+	scratch := attnScoresPool.Get().(*[]float32)
+	scoreLen := queryHeads * span
+	ensureLenNoClear(scratch, scoreLen+queryHeads)
+	scores := (*scratch)[:scoreLen]
+	denoms := (*scratch)[scoreLen : scoreLen+queryHeads]
+
+	n := 0
+	for t := startT; t <= endT; t++ {
+		kOff := t * keyStride
+		if kOff+keyHeadDim > len(keys) {
+			break
+		}
+		s0, s1, s2, s3 := dotF32F16x4(
+			&queries[0], &queries[keyHeadDim], &queries[2*keyHeadDim], &queries[3*keyHeadDim],
+			&keys[kOff], keyHeadDim)
+		scores[n] = s0 * scale
+		scores[span+n] = s1 * scale
+		scores[2*span+n] = s2 * scale
+		scores[3*span+n] = s3 * scale
+		n++
+	}
+	if n == 0 {
+		attnScoresPool.Put(scratch)
+		return
+	}
+	for h := 0; h < queryHeads; h++ {
+		denoms[h] = attentionWeightsInPlace(scores[h*span:h*span+n], softcap)
+	}
+
+	out0 := out[:valueHeadDim]
+	out1 := out[valueHeadDim : 2*valueHeadDim]
+	out2 := out[2*valueHeadDim : 3*valueHeadDim]
+	out3 := out[3*valueHeadDim : 4*valueHeadDim]
+	for i := 0; i < n; i++ {
+		vOff := (startT + i) * valueStride
+		if vOff+valueHeadDim > len(values) {
+			break
+		}
+		axpyF32F16x4(&out0[0], &out1[0], &out2[0], &out3[0],
+			scores[i], scores[span+i], scores[2*span+i], scores[3*span+i],
+			&values[vOff], valueHeadDim)
+	}
+	ScaleF32(out0, 1/denoms[0])
+	ScaleF32(out1, 1/denoms[1])
+	ScaleF32(out2, 1/denoms[2])
+	ScaleF32(out3, 1/denoms[3])
+	attnScoresPool.Put(scratch)
 }
 
 // onlineAttentionGroupI8 is the Q8_0-KV-cache counterpart of

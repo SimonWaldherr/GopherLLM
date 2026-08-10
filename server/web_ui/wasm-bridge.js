@@ -65,11 +65,15 @@
 
   async function loadModel(textBytes, visionBytes) {
     await ensureLoaded();
-    if (visionBytes) {
-      await window.gopherllm_loadModelWithVision(textBytes, visionBytes);
-    } else {
-      await window.gopherllm_loadModelWithVision(textBytes);
-    }
+    // The Go bridge copies these views synchronously before returning its
+    // Promise. Drop the JS-side references immediately afterwards so model
+    // loading does not retain a second full copy while Go parses the GGUF.
+    const pending = visionBytes
+      ? window.gopherllm_loadModelWithVision(textBytes, visionBytes)
+      : window.gopherllm_loadModelWithVision(textBytes);
+    textBytes = null;
+    visionBytes = null;
+    await pending;
   }
 
   async function hasVision() {

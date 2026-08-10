@@ -2,9 +2,16 @@
 
 [![DOI](https://zenodo.org/badge/1264366305.svg)](https://doi.org/10.5281/zenodo.21197831)
 
-GopherLLM is a local GGUF inference tool written in Go. It can run one-shot prompts,
-interactive REPL sessions, embeddings, model inspection, benchmark runs, and an HTTP
-server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
+GopherLLM is a local GGUF inference engine written in Go. It runs models directly
+in-process and can be used on its own through the Go package or CLI: no Ollama,
+llama.cpp, LM Studio, RustyLLM, HTTP server, or browser UI is required. One-shot
+prompts, interactive REPL sessions, embeddings, model inspection, and benchmark runs
+all use that engine.
+
+The bundled HTTP server and browser chat are optional ways to expose the engine. They
+also integrate with an existing OpenAI-compatible inference server, so GopherLLM can
+be used beside Ollama, llama.cpp, LM Studio, RustyLLM, or a hosted provider when that
+server exposes the compatible chat API.
 
 **[Project website](https://simonwaldherr.github.io/GopherLLM/)** ·
 **[Go package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM)**
@@ -12,6 +19,7 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
 ## Contents
 
 - [Features](#features)
+- [Engine first: standalone or connected](#engine-first-standalone-or-connected)
 - [Use cases](#use-cases)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
@@ -65,6 +73,25 @@ server with OpenAI-compatible, Ollama-compatible, and built-in endpoints.
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
 
+## Engine first: standalone or connected
+
+GopherLLM is an inference engine first, not a web-UI wrapper around another
+runtime. The module-root `gopherllm` package loads and executes GGUF models in
+the calling process. The CLI uses that same engine, and applications can embed
+it without starting a local service or spawning a child process.
+
+| If you want to… | Use GopherLLM as… | What is optional |
+| --- | --- | --- |
+| Run a local GGUF directly | a Go library or CLI | UI, HTTP server, Ollama, llama.cpp, LM Studio, RustyLLM, and any other runtime |
+| Add local inference to an application | the importable `gopherllm` package | GopherLLM's bundled server and chat UI |
+| Expose a loaded GopherLLM model to clients | the optional `server` package / CLI server | a separate inference server; GopherLLM provides OpenAI- and Ollama-compatible endpoints itself |
+| Keep the GopherLLM chat workspace while using an existing runtime | the optional OpenAI-compatible remote-chat proxy | a local GGUF in GopherLLM; configure Ollama, llama.cpp, LM Studio, RustyLLM, or another compatible upstream instead |
+
+An external runtime is therefore an integration choice, not a prerequisite or
+replacement for the core engine. See [Use as a Go Library](#use-as-a-go-library)
+for direct embedding and [OpenAI-compatible remote APIs](#openai-compatible-remote-apis)
+for the optional upstream path.
+
 ## Use cases
 
 GopherLLM is useful wherever a model should run close to the data and remain
@@ -90,6 +117,10 @@ under the operator's control:
   pause, latest-answer, and history controls for latency-sensitive use. An
   explicitly armed local sound alert can emit a short browser beep when the
   model marks a clearly visible danger with `[ALERT]`.
+- **Operational intake and triage:** use the extraction workflow for
+  ticket classification, warranty checks, complaint handling, and other
+  structured workflows where the model should ask for missing fields, keep
+  the conversation on task, and produce a consistent next step.
 - **Local service or embedded app:** use the OpenAI- and Ollama-compatible
   endpoints from an existing client, or import the Go package directly. The
   same model can be tuned once and served without a cloud dependency.
@@ -99,6 +130,45 @@ task-focused starting point for sampling, context handling, tools, and persona.
 It never prevents manual adjustment; selecting **Custom / current settings**
 keeps the current values. The four most common workflows are also available on
 the empty-chat screen.
+
+## Example AI integrations
+
+For the local pool/spa operator-assistance proof of concept—including its
+safety limits, research notes, and the substantial work still required for a
+product—see [Pool Lifeguard Assist](examples/pool-lifeguard-assist/README.md).
+For a fictional local customer-support workflow with human review, see
+[Complaints Assistant](examples/complaints-assistant/README.md).
+Further direct-package examples are available for
+[local image inspection](examples/vision-inspector/README.md),
+[JSONL ticket triage](examples/ticket-triage/README.md), and an
+[application-owned reply service](examples/embedded-reply-service/README.md).
+
+The examples below are demo patterns, not production safety systems. They are
+useful for prototyping, operator assistance, and product exploration, but they
+still need policy, human review, logging, escalation rules, and domain-specific
+validation before you rely on them in a real deployment.
+
+GopherLLM works well when the model sits inside a real workflow rather than a
+generic chat box. A few examples are already well matched to the built-in
+vision and extraction paths:
+
+- **Safety camera / live triage:** ask the model to watch a webcam or screen
+  feed for emergency signals such as drowning, crowding, smoke, fire, collapse,
+  or obvious distress. Keep the prompt short, insist on visible evidence only,
+  and let the model return a one-line status plus an escalation flag.
+- **Support and complaints:** present the customer with their recent orders,
+  ask for the affected product, purchase date, price, and a short free-text
+  description, then have the model classify the case, draft the reply, and
+  suggest first-line troubleshooting steps such as restart, another cable, or
+  checking power and charging behavior. If the device smells burnt or gets
+  unusually hot while charging, the model should escalate immediately and
+  warn not to keep charging it.
+- **Image context strategy:** the Live vision **Context** control offers a
+  low-latency current frame or a timestamped five-frame timeline. The timeline
+  samples the real camera or screen stream once per second and keeps only its
+  five newest samples; it is not five 25-fps frames and it is not a history of
+  earlier AI requests. The collage gives a prototype model limited temporal
+  context for visible motion and state changes, not reliable event detection.
 
 ## Requirements
 
@@ -599,11 +669,17 @@ selection.
 
 ### OpenAI-compatible remote APIs
 
-As a lower-priority alternative to a local GGUF, the server can proxy its chat
-endpoint to an OpenAI-compatible API. This covers OpenAI and local compatible
-servers such as Ollama, llama.cpp, and LM Studio. Configure it on the trusted
-local server; the key is kept only in server memory and is never returned by
-the configuration endpoint:
+GopherLLM never needs a separate inference server to run its own GGUF engine.
+When an existing runtime is already part of a deployment, its optional server
+can instead proxy `/v1/chat/completions` to an OpenAI-compatible upstream. This
+lets the GopherLLM chat UI and API sit alongside OpenAI or local servers such
+as Ollama, llama.cpp, LM Studio, and RustyLLM, provided the selected upstream
+offers that API shape. This proxy is intentionally a chat route; local GGUF
+generation, embeddings, and the other engine features remain available without
+an upstream.
+
+Configure it on the trusted local server; the key is kept only in server memory
+and is never returned by the configuration endpoint:
 
 ```sh
 curl http://127.0.0.1:8080/remote \

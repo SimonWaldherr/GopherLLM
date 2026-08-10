@@ -294,3 +294,177 @@ axpy4_tail:
 
 axpy4_done:
 	RET
+
+// Four f32 dot products against one f16 row. The f16 row is expanded once
+// into V17/V18 and consumed by all four query heads before the next load.
+// This is the compact-KV counterpart to dotF32x4.
+// func dotF32F16x4NEON(q0, q1, q2, q3 *float32, x *uint16, n int) (s0, s1, s2, s3 float32)
+TEXT ·dotF32F16x4NEON(SB), NOSPLIT|NOFRAME, $0-64
+	MOVD q0+0(FP), R0
+	MOVD q1+8(FP), R1
+	MOVD q2+16(FP), R2
+	MOVD q3+24(FP), R3
+	MOVD x+32(FP), R4
+	MOVD n+40(FP), R5
+	LSR  $3, R5, R5
+
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+	VEOR V2.B16, V2.B16, V2.B16
+	VEOR V3.B16, V3.B16, V3.B16
+	VEOR V4.B16, V4.B16, V4.B16
+	VEOR V5.B16, V5.B16, V5.B16
+	VEOR V6.B16, V6.B16, V6.B16
+	VEOR V7.B16, V7.B16, V7.B16
+	CBZ  R5, dotf16x4_reduce
+
+dotf16x4_loop8:
+	VLD1.P 16(R4), [V16.H8]
+	WORD   $0x0e217a11 // fcvtl  v17.4s, v16.4h
+	WORD   $0x4e217a12 // fcvtl2 v18.4s, v16.8h
+
+	VLD1.P 16(R0), [V19.S4]
+	VLD1.P 16(R0), [V20.S4]
+	VFMLA  V19.S4, V17.S4, V0.S4
+	VFMLA  V20.S4, V18.S4, V1.S4
+
+	VLD1.P 16(R1), [V19.S4]
+	VLD1.P 16(R1), [V20.S4]
+	VFMLA  V19.S4, V17.S4, V2.S4
+	VFMLA  V20.S4, V18.S4, V3.S4
+
+	VLD1.P 16(R2), [V19.S4]
+	VLD1.P 16(R2), [V20.S4]
+	VFMLA  V19.S4, V17.S4, V4.S4
+	VFMLA  V20.S4, V18.S4, V5.S4
+
+	VLD1.P 16(R3), [V19.S4]
+	VLD1.P 16(R3), [V20.S4]
+	VFMLA  V19.S4, V17.S4, V6.S4
+	VFMLA  V20.S4, V18.S4, V7.S4
+
+	SUB $1, R5, R5
+	CBNZ R5, dotf16x4_loop8
+
+dotf16x4_reduce:
+	FMOVS $(1.0), F31
+	VDUP  V31.S[0], V31.S4
+	VFMLA V1.S4, V31.S4, V0.S4
+	VFMLA V3.S4, V31.S4, V2.S4
+	VFMLA V5.S4, V31.S4, V4.S4
+	VFMLA V7.S4, V31.S4, V6.S4
+
+	VMOV V0.S[0], R6
+	VMOV V0.S[1], R7
+	VMOV V0.S[2], R8
+	VMOV V0.S[3], R9
+	FMOVS R6, F24
+	FMOVS R7, F20
+	FMOVS R8, F21
+	FMOVS R9, F22
+	FADDS F20, F24
+	FADDS F22, F21
+	FADDS F21, F24
+
+	VMOV V2.S[0], R6
+	VMOV V2.S[1], R7
+	VMOV V2.S[2], R8
+	VMOV V2.S[3], R9
+	FMOVS R6, F25
+	FMOVS R7, F20
+	FMOVS R8, F21
+	FMOVS R9, F22
+	FADDS F20, F25
+	FADDS F22, F21
+	FADDS F21, F25
+
+	VMOV V4.S[0], R6
+	VMOV V4.S[1], R7
+	VMOV V4.S[2], R8
+	VMOV V4.S[3], R9
+	FMOVS R6, F26
+	FMOVS R7, F20
+	FMOVS R8, F21
+	FMOVS R9, F22
+	FADDS F20, F26
+	FADDS F22, F21
+	FADDS F21, F26
+
+	VMOV V6.S[0], R6
+	VMOV V6.S[1], R7
+	VMOV V6.S[2], R8
+	VMOV V6.S[3], R9
+	FMOVS R6, F27
+	FMOVS R7, F20
+	FMOVS R8, F21
+	FMOVS R9, F22
+	FADDS F20, F27
+	FADDS F22, F21
+	FADDS F21, F27
+
+	FMOVS F24, s0+48(FP)
+	FMOVS F25, s1+52(FP)
+	FMOVS F26, s2+56(FP)
+	FMOVS F27, s3+60(FP)
+	RET
+
+// Four f32 AXPYs against one f16 row. It expands the shared V row once and
+// applies all four attention weights while the converted values are live in
+// NEON registers.
+// func axpyF32F16x4NEON(out0, out1, out2, out3 *float32, a0, a1, a2, a3 float32, x *uint16, n int)
+TEXT ·axpyF32F16x4NEON(SB), NOSPLIT|NOFRAME, $0-64
+	MOVD out0+0(FP), R0
+	MOVD out1+8(FP), R1
+	MOVD out2+16(FP), R2
+	MOVD out3+24(FP), R3
+	MOVD R0, R6
+	MOVD R1, R7
+	MOVD R2, R8
+	MOVD R3, R9
+	FMOVS a0+32(FP), F24
+	FMOVS a1+36(FP), F25
+	FMOVS a2+40(FP), F26
+	FMOVS a3+44(FP), F27
+	MOVD x+48(FP), R4
+	MOVD n+56(FP), R5
+	LSR  $3, R5, R5
+	VDUP V24.S[0], V24.S4
+	VDUP V25.S[0], V25.S4
+	VDUP V26.S[0], V26.S4
+	VDUP V27.S[0], V27.S4
+	CBZ  R5, axpyf16x4_done
+
+axpyf16x4_loop8:
+	VLD1.P 16(R4), [V16.H8]
+	WORD   $0x0e217a11 // fcvtl  v17.4s, v16.4h
+	WORD   $0x4e217a12 // fcvtl2 v18.4s, v16.8h
+
+	VLD1.P 16(R6), [V0.S4]
+	VLD1.P 16(R6), [V1.S4]
+	VFMLA  V17.S4, V24.S4, V0.S4
+	VFMLA  V18.S4, V24.S4, V1.S4
+	VST1.P [V0.S4, V1.S4], 32(R0)
+
+	VLD1.P 16(R7), [V2.S4]
+	VLD1.P 16(R7), [V3.S4]
+	VFMLA  V17.S4, V25.S4, V2.S4
+	VFMLA  V18.S4, V25.S4, V3.S4
+	VST1.P [V2.S4, V3.S4], 32(R1)
+
+	VLD1.P 16(R8), [V4.S4]
+	VLD1.P 16(R8), [V5.S4]
+	VFMLA  V17.S4, V26.S4, V4.S4
+	VFMLA  V18.S4, V26.S4, V5.S4
+	VST1.P [V4.S4, V5.S4], 32(R2)
+
+	VLD1.P 16(R9), [V6.S4]
+	VLD1.P 16(R9), [V7.S4]
+	VFMLA  V17.S4, V27.S4, V6.S4
+	VFMLA  V18.S4, V27.S4, V7.S4
+	VST1.P [V6.S4, V7.S4], 32(R3)
+
+	SUB  $1, R5, R5
+	CBNZ R5, axpyf16x4_loop8
+
+axpyf16x4_done:
+	RET

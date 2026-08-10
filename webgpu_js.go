@@ -129,11 +129,6 @@ func matvecWebGPU(w *GPUWeight, wantType GGMLType, kernel *webgpu.MatvecKernel, 
 	if w == nil || w.typ != wantType || kernel == nil {
 		return false
 	}
-	result, err := kernel.RunPrepared(w.prepared, x)
-	if err != nil {
-		return false
-	}
 	ensureLenNoClear(out, rows)
-	copy(*out, result)
-	return true
+	return kernel.RunPreparedInto(w.prepared, x, *out) == nil
 }

@@ -9,3 +9,4 @@ scratch/p.prof
 /data
 /archive-web
 *.pprof
+/pool-lifeguard-assist

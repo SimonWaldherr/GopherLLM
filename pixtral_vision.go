@@ -96,6 +96,10 @@ type PixtralVisionWeights struct {
 // place of image-placeholder tokens (see EncodeImagePixtral's return shape
 // and runtime.go's renderMistralInstMessages).
 func LoadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal bool, logw io.Writer) (PixtralVisionConfig, PixtralVisionWeights, error) {
+	return loadPixtralVisionModel(data, gguf, useMetal, false, logw)
+}
+
+func loadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal, borrowQuantized bool, logw io.Writer) (PixtralVisionConfig, PixtralVisionWeights, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
@@ -176,7 +180,7 @@ func LoadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal bool, logw io.
 	tensors := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, false, false, useMetal)
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrowQuantized, false, useMetal)
 	}
 
 	patchLen := 3 * patchSize * patchSize

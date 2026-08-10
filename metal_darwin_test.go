@@ -250,6 +250,30 @@ func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 	}
 }
 
+func TestMetalQ6KArgmaxTieBreaksLowestToken(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	// The SIMD-group reduction in the Metal argmax kernel must retain the
+	// sampler's deterministic lowest-index tie break. A zero Q6_K matrix makes
+	// every vocabulary logit exactly equal without relying on random data.
+	const rows, cols = metalQ6KDirectMinRows, 256
+	data := make([]byte, rows*210)
+	w := prepareMetalWeight(data, GGMLTypeQ6_K, rows, cols, false)
+	if w == nil {
+		t.Fatalf("prepare zero Q6_K Metal weight: %s", MetalError())
+	}
+	defer releaseMetalWeight(w)
+
+	x := metalTestVector(cols)
+	for _, recent := range [][]uint32{nil, {0, 17, 0}} {
+		token, ok := argmaxMetalQ6KPenalized(w, x, recent, 1.7)
+		if !ok || token != 0 {
+			t.Fatalf("Metal tied argmax token = %d, ok=%v, want 0", token, ok)
+		}
+	}
+}
+
 func forceExactMetalReference(t *testing.T) {
 	t.Helper()
 	saved := useQ8Activations.Load()

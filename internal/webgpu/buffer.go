@@ -89,6 +89,21 @@ func (d *Device) CreateUniformBuffer(size int) (*Buffer, error) {
 	return &Buffer{value: d.device.Call("createBuffer", desc), size: size}, nil
 }
 
+// CreateReadbackBuffer allocates a MAP_READ staging buffer. Compute outputs
+// cannot be mapped directly, so callers copy into one of these buffers after
+// ending their compute pass and then call ReadMappedBufferInto. Keeping a
+// staging buffer alive across decode steps is materially cheaper than
+// allocating/destroying a GPUBuffer for every matvec result.
+func (d *Device) CreateReadbackBuffer(size int) (*Buffer, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("webgpu: buffer size must be positive, got %d", size)
+	}
+	desc := newObject()
+	desc.Set("size", roundUpTo4(size))
+	desc.Set("usage", gpuBufferUsage("MAP_READ", "COPY_DST"))
+	return &Buffer{value: d.device.Call("createBuffer", desc), size: size}, nil
+}
+
 // WriteBuffer uploads data into buf at byteOffset via the device queue.
 // queue.writeBuffer is synchronous from the caller's perspective (the
 // browser copies immediately) -- no map/unmap dance needed for uploads,
@@ -106,6 +121,17 @@ func (d *Device) WriteBuffer(buf *Buffer, byteOffset int, data []byte) error {
 	js.CopyBytesToJS(arr, data)
 	d.queue.Call("writeBuffer", buf.value, byteOffset, arr)
 	return nil
+}
+
+// WriteBufferView writes size bytes from an existing Uint8Array view to buf
+// without allocating another JS typed array. It is intended for hot paths
+// that keep a capacity-sized upload view around (activation vectors and
+// scalar parameters in MatvecKernel). Because the view is Uint8Array,
+// WebGPU interprets its dataOffset and size arguments in bytes. Supplying
+// size is important after a buffer has grown for a large FFN activation: a
+// later smaller projection must not re-upload the unused tail capacity.
+func (d *Device) WriteBufferView(buf *Buffer, byteOffset int, view js.Value, size int) {
+	d.queue.Call("writeBuffer", buf.value, byteOffset, view, 0, size)
 }
 
 // ReadBuffer copies size bytes starting at byteOffset out of src (which
@@ -133,14 +159,40 @@ func (d *Device) ReadBuffer(src *Buffer, byteOffset, size int) ([]byte, error) {
 	cmdBuf := encoder.Call("finish")
 	d.queue.Call("submit", js.ValueOf([]any{cmdBuf}))
 
-	mapMode := js.Global().Get("GPUMapMode").Get("READ")
-	if _, err := await(staging.Call("mapAsync", mapMode, 0, paddedSize)); err != nil {
-		return nil, fmt.Errorf("webgpu: mapAsync: %w", err)
-	}
-	rangeVal := staging.Call("getMappedRange", 0, paddedSize)
-	view := js.Global().Get("Uint8Array").New(rangeVal)
 	out := make([]byte, paddedSize)
-	js.CopyBytesToGo(out, view)
-	staging.Call("unmap")
+	if err := d.ReadMappedBufferInto(&Buffer{value: staging, size: paddedSize}, 0, out); err != nil {
+		return nil, err
+	}
 	return out[:size], nil
+}
+
+// ReadMappedBufferInto maps an already-submitted MAP_READ buffer and copies
+// its bytes into dst. The caller is responsible for recording and submitting
+// the copy into src first. dst must be 4-byte aligned in length, matching the
+// WebGPU map range requirement. This deliberately accepts a caller-owned
+// destination so hot paths can reuse Go memory instead of allocating a fresh
+// byte slice per GPU dispatch.
+func (d *Device) ReadMappedBufferInto(src *Buffer, byteOffset int, dst []byte) error {
+	if src == nil {
+		return fmt.Errorf("webgpu: read source is nil")
+	}
+	if byteOffset < 0 || byteOffset%4 != 0 {
+		return fmt.Errorf("webgpu: read offset must be a non-negative multiple of 4, got %d", byteOffset)
+	}
+	if len(dst) <= 0 || len(dst)%4 != 0 {
+		return fmt.Errorf("webgpu: mapped read size must be a positive multiple of 4, got %d", len(dst))
+	}
+	if byteOffset+len(dst) > src.size {
+		return fmt.Errorf("webgpu: mapped read range [%d,%d) exceeds buffer size %d", byteOffset, byteOffset+len(dst), src.size)
+	}
+
+	mapMode := js.Global().Get("GPUMapMode").Get("READ")
+	if _, err := await(src.value.Call("mapAsync", mapMode, byteOffset, len(dst))); err != nil {
+		return fmt.Errorf("webgpu: mapAsync: %w", err)
+	}
+	defer src.value.Call("unmap")
+	rangeVal := src.value.Call("getMappedRange", byteOffset, len(dst))
+	view := js.Global().Get("Uint8Array").New(rangeVal)
+	js.CopyBytesToGo(dst, view)
+	return nil
 }

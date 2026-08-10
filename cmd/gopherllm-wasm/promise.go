@@ -2,7 +2,10 @@
 
 package main
 
-import "syscall/js"
+import (
+	"fmt"
+	"syscall/js"
+)
 
 // newPromise runs run in a new goroutine and returns a JS Promise that
 // settles from whatever run does with the resolve/reject functions it's
@@ -14,7 +17,14 @@ import "syscall/js"
 func newPromise(run func(resolve, reject js.Value)) js.Value {
 	executor := js.FuncOf(func(this js.Value, args []js.Value) any {
 		resolve, reject := args[0], args[1]
-		go run(resolve, reject)
+		go func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					reject.Invoke(fmt.Sprintf("gopherllm wasm panic: %v", recovered))
+				}
+			}()
+			run(resolve, reject)
+		}()
 		return nil
 	})
 	// The executor closure must outlive the Promise constructor call (the
