@@ -410,7 +410,41 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 		ffnHidden[i] = make([]float32, vc.FeedForwardLength)
 	}
 
-	var sinScratch, cosScratch []float32
+	// A patch's 2D RoPE angles depend only on its (row, col) position, not on
+	// the block — but they used to be rebuilt inside the block loop, so every
+	// image cost blockCount * n * headDim/2 math.Sincos calls instead of
+	// n * headDim/2. The table below is the same numbers, computed once: for a
+	// 32x32 grid through 8 blocks that is 8x fewer transcendental evaluations,
+	// and it grows with block count on real towers (24+ blocks).
+	//
+	// Cost is n*headDim floats (a 1024-patch grid at headDim=64 is 512 KB),
+	// which is small next to the activations already live at this point.
+	var ropeSin, ropeCos []float32
+	ropeHalf := 0
+	{
+		var sinScratch, cosScratch []float32
+		for i := range n {
+			row, col := i/img.Cols, i%img.Cols
+			half, _ := preparePixtralRope2DScratch(row, col, headDim, rowInvFreq, colInvFreq, &sinScratch, &cosScratch)
+			if i == 0 {
+				ropeHalf = half
+				if half > 0 {
+					ropeSin = make([]float32, n*half)
+					ropeCos = make([]float32, n*half)
+				}
+			}
+			if ropeHalf > 0 {
+				copy(ropeSin[i*ropeHalf:(i+1)*ropeHalf], sinScratch[:ropeHalf])
+				copy(ropeCos[i*ropeHalf:(i+1)*ropeHalf], cosScratch[:ropeHalf])
+			}
+		}
+	}
+
+	// Head-major staging buffers for K and V, allocated once and refilled each
+	// block (see the transpose below).
+	kHead := make([]float32, heads*n*headDim)
+	vHead := make([]float32, heads*n*headDim)
+
 	for li := range weights.Layers {
 		layer := &weights.Layers[li]
 		for i := range x {
@@ -429,34 +463,71 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 			if len(layer.VB) >= dim {
 				addInPlace(v[i], layer.VB[:dim])
 			}
-			row, col := i/img.Cols, i%img.Cols
-			half, nCache := preparePixtralRope2DScratch(row, col, headDim, rowInvFreq, colInvFreq, &sinScratch, &cosScratch)
 			// Pixtral's two 2D axes each use conventional adjacent-pair RoPE.
 			// Do not use the Mistral text decoder's NeoX/split-half rotation here:
 			// that would rotate a row component against a column component.
-			applyPreparedRope(q[i], headDim, heads, half, nCache, sinScratch, cosScratch, true)
-			applyPreparedRope(k[i], headDim, heads, half, nCache, sinScratch, cosScratch, true)
+			if ropeHalf > 0 {
+				sin := ropeSin[i*ropeHalf : (i+1)*ropeHalf]
+				cos := ropeCos[i*ropeHalf : (i+1)*ropeHalf]
+				applyPreparedRope(q[i], headDim, heads, ropeHalf, ropeHalf, sin, cos, true)
+				applyPreparedRope(k[i], headDim, heads, ropeHalf, ropeHalf, sin, cos, true)
+			}
+		}
+
+		// Re-lay K and V head-major before attending: kHead[h] is a single
+		// contiguous [n][headDim] block, so the scores loop below walks memory
+		// sequentially.
+		//
+		// Previously it indexed k[j][off:off+headDim] with j as the loop
+		// variable, which strides across n separate per-token allocations and
+		// touches one headDim-sized fragment of each — the worst case for the
+		// prefetcher, repeated n*heads times per block. The transpose costs
+		// O(n*dim) per block against the O(n^2*heads*headDim) reads it feeds,
+		// so it pays for itself many times over on any real grid.
+		for j := range n {
+			kj, vj := k[j], v[j]
+			for h := range heads {
+				off := h * headDim
+				base := h*n*headDim + j*headDim
+				copy(kHead[base:base+headDim], kj[off:off+headDim])
+				copy(vHead[base:base+headDim], vj[off:off+headDim])
+			}
 		}
 
 		attendOne := func(i int, scores []float32) {
 			for h := 0; h < heads; h++ {
 				off := h * headDim
 				query := q[i][off : off+headDim]
+				kh := kHead[h*n*headDim : (h+1)*n*headDim]
+				vh := vHead[h*n*headDim : (h+1)*n*headDim]
 				maxScore := float32(-math.MaxFloat32)
 				for j := 0; j < n; j++ {
-					scores[j] = DotF32(query, k[j][off:off+headDim]) * scale
+					scores[j] = DotF32(query, kh[j*headDim:(j+1)*headDim]) * scale
 					maxScore = max(maxScore, scores[j])
 				}
 				denom := float32(0)
 				for j := 0; j < n; j++ {
-					scores[j] = float32(math.Exp(float64(scores[j] - maxScore)))
+					// fastExpF32 rather than math.Exp(float64(...)): this is
+					// the hottest loop in the whole tower, running
+					// n*n*heads*blocks times (a 32x32 grid over 8 blocks is
+					// 67M evaluations), and it was the one place in the engine
+					// still paying for a float64 round-trip into libm. The
+					// text decoder's attention already uses this kernel and
+					// pins it against libm in
+					// TestAttentionWeightsFastMathMatchesLibm; fastExpF32 is
+					// accurate to about one ulp, far inside the noise of the
+					// quantized weights feeding it.
+					scores[j] = fastExpF32(scores[j] - maxScore)
 					denom += scores[j]
 				}
 				out := attnOut[i][off : off+headDim]
 				clear(out)
 				if denom > 0 {
+					// One reciprocal for the row instead of a divide per
+					// element of the value-weighted sum.
+					inv := 1 / denom
 					for j := 0; j < n; j++ {
-						AxpyF32(out, scores[j]/denom, v[j][off:off+headDim])
+						AxpyF32(out, scores[j]*inv, vh[j*headDim:(j+1)*headDim])
 					}
 				}
 			}
@@ -489,17 +560,20 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 		}
 		matvecBatch(layer.FFNGate, normed, ffnGateOut)
 		matvecBatch(layer.FFNUp, normed, ffnHidden)
+		// The gated activation is the same SwiGLU the text decoder runs, so it
+		// goes through the same kernel: siluMulF32 is AVX2 on amd64 and NEON on
+		// arm64, where this was an open-coded scalar loop with a float64
+		// round-trip per element. GELU keeps the exact erf form — clip.use_gelu
+		// towers are rare (Pixtral sets use_silu) and switching them to the
+		// tanh approximation would be a numerics change, not an optimization.
 		for i := range x {
-			for j := range ffnHidden[i] {
-				g := ffnGateOut[i][j]
-				var act float32
-				if vc.UseGELU && !vc.UseSiLU {
-					act = geluExact(g)
-				} else {
-					act = g / (1 + float32(math.Exp(float64(-g))))
+			if vc.UseGELU && !vc.UseSiLU {
+				for j := range ffnHidden[i] {
+					ffnHidden[i][j] = geluExact(ffnGateOut[i][j]) * ffnHidden[i][j]
 				}
-				ffnHidden[i][j] = act * ffnHidden[i][j]
+				continue
 			}
+			siluMulF32(ffnGateOut[i], ffnHidden[i], ffnHidden[i])
 		}
 		matvecBatch(layer.FFNDown, ffnHidden, normed)
 		for i := range x {
