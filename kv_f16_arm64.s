@@ -1,11 +1,17 @@
-//go:build darwin && arm64
+//go:build arm64
 
 #include "textflag.h"
 
-// Apple Silicon f16 KV-cache kernels. Go's arm64 assembler does not yet
-// expose FCVTL/FCVTL2/FCVTN/FCVTN2 mnemonics, so their architectural
-// encodings are emitted with WORD. All functions process eight elements per
-// iteration; the Go wrappers handle tails.
+// arm64 f16 KV-cache kernels. Go's arm64 assembler does not yet expose
+// FCVTL/FCVTL2/FCVTN/FCVTN2 mnemonics, so their architectural encodings are
+// emitted with WORD. All functions process eight elements per iteration; the
+// Go wrappers handle tails.
+//
+// No feature probe guards these. FCVTL/FCVTN are half<->single CONVERSION
+// instructions, mandatory in baseline ARMv8.0 NEON — unlike FEAT_FP16 half
+// ARITHMETIC, which this file never uses, and unlike the SDOT kernels in
+// q8k_dot_arm64.s, which do need a runtime check. attention_gqa_arm64.s has
+// been emitting the same encodings on bare arm64 all along.
 
 // func dotF32F16NEON(a []float32, b []uint16) float32
 TEXT ·dotF32F16NEON(SB), NOSPLIT|NOFRAME, $0-52

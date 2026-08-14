@@ -258,6 +258,121 @@ func TestQuantizeRowQ6KAllZero(t *testing.T) {
 	}
 }
 
+// TestPackQ3KScalesRoundTrip exhaustively checks packQ3KScales against the
+// real decoder's q3KScales (quant_extra.go), the Q3_K analogue of
+// TestPackScaleMinK4AllRoundTrip above.
+func TestPackQ3KScalesRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	for trial := 0; trial < 200; trial++ {
+		var sc [16]byte
+		for i := range sc {
+			sc[i] = byte(rng.Intn(64))
+		}
+		packed := packQ3KScales(sc)
+		got := q3KScales(packed[:])
+		for j := 0; j < 16; j++ {
+			if byte(got[j]) != sc[j] {
+				t.Fatalf("trial %d, j=%d: got %d, want %d; sc=%v packed=%v", trial, j, got[j], sc[j], sc, packed)
+			}
+		}
+	}
+}
+
+func TestPackQ3KScalesBoundaryValues(t *testing.T) {
+	cases := [][16]byte{
+		{},
+		{63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63},
+		{63, 0, 63, 0, 63, 0, 63, 0, 63, 0, 63, 0, 63, 0, 63, 0},
+		{0, 63, 0, 63, 0, 63, 0, 63, 0, 63, 0, 63, 0, 63, 0, 63},
+	}
+	for _, sc := range cases {
+		packed := packQ3KScales(sc)
+		got := q3KScales(packed[:])
+		for j := 0; j < 16; j++ {
+			if byte(got[j]) != sc[j] {
+				t.Fatalf("j=%d: got %d, want %d; sc=%v", j, got[j], sc[j], sc)
+			}
+		}
+	}
+}
+
+func TestQuantizeRowQ2KRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(8))
+	for trial := 0; trial < 20; trial++ {
+		x := randomRow(rng, 256, 1.0+float32(trial)*0.3)
+		maxErr, deq := quantDequantMaxErr(t, x, QuantizeRowQ2K, DequantRowQ2K)
+		for i, v := range deq {
+			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+				t.Fatalf("trial %d, i=%d: dequantized to non-finite %v", trial, i, v)
+			}
+		}
+		// 2-bit code over a per-16-sub-block range further coarsened by
+		// independent 4-bit scale/min quantization: coarser than Q4_K's
+		// 4-bit code, generous but not unbounded.
+		bound := (1.0+float32(trial)*0.3)*0.6 + 0.02
+		if maxErr > bound {
+			t.Fatalf("trial %d: max error %v exceeds bound %v", trial, maxErr, bound)
+		}
+	}
+}
+
+func TestQuantizeRowQ2KAllSameValue(t *testing.T) {
+	x := make([]float32, 256)
+	for i := range x {
+		x[i] = 0.5
+	}
+	packed := QuantizeRowQ2K(x, 256)
+	deq := DequantRowQ2K(packed, 256)
+	for i, v := range deq {
+		if math.IsNaN(float64(v)) {
+			t.Fatalf("i=%d: got NaN", i)
+		}
+		if abs32(v-0.5) > 0.05 {
+			t.Fatalf("i=%d: got %v, want ~0.5", i, v)
+		}
+	}
+}
+
+func TestQuantizeRowQ2KAllZero(t *testing.T) {
+	x := make([]float32, 256)
+	packed := QuantizeRowQ2K(x, 256)
+	deq := DequantRowQ2K(packed, 256)
+	for i, v := range deq {
+		if math.IsNaN(float64(v)) || v != 0 {
+			t.Fatalf("i=%d: got %v, want 0", i, v)
+		}
+	}
+}
+
+func TestQuantizeRowQ3KRoundTrip(t *testing.T) {
+	rng := rand.New(rand.NewSource(9))
+	for trial := 0; trial < 20; trial++ {
+		x := randomRow(rng, 256, 1.0+float32(trial)*0.3)
+		maxErr, deq := quantDequantMaxErr(t, x, QuantizeRowQ3K, DequantRowQ3K)
+		for i, v := range deq {
+			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+				t.Fatalf("trial %d, i=%d: dequantized to non-finite %v", trial, i, v)
+			}
+		}
+		// 3-bit-equivalent code (-4..3) over a per-16-sub-block signed scale.
+		bound := (1.0+float32(trial)*0.3)*0.4 + 0.02
+		if maxErr > bound {
+			t.Fatalf("trial %d: max error %v exceeds bound %v", trial, maxErr, bound)
+		}
+	}
+}
+
+func TestQuantizeRowQ3KAllZero(t *testing.T) {
+	x := make([]float32, 256)
+	packed := QuantizeRowQ3K(x, 256)
+	deq := DequantRowQ3K(packed, 256)
+	for i, v := range deq {
+		if math.IsNaN(float64(v)) || v != 0 {
+			t.Fatalf("i=%d: got %v, want 0", i, v)
+		}
+	}
+}
+
 // TestQuantizeRowSizes confirms every encoder's output length matches
 // GGMLType.DataSize, which the GGUF writer relies on for the tensor
 // descriptor table's cumulative offsets.
@@ -273,6 +388,8 @@ func TestQuantizeRowSizes(t *testing.T) {
 		{"Q4_K", 512, GGMLTypeQ4_K, QuantizeRowQ4K},
 		{"Q5_K", 512, GGMLTypeQ5_K, QuantizeRowQ5K},
 		{"Q6_K", 512, GGMLTypeQ6_K, QuantizeRowQ6K},
+		{"Q2_K", 512, GGMLTypeQ2_K, QuantizeRowQ2K},
+		{"Q3_K", 512, GGMLTypeQ3_K, QuantizeRowQ3K},
 	}
 	for _, c := range cases {
 		want, ok := c.dtype.DataSize(c.cols)

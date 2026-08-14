@@ -100,77 +100,173 @@ func TestGQA4SharedF16RowKernelsMatchSeparateOperations(t *testing.T) {
 	}
 }
 
-func TestGroupedGQAAttentionMatchesSeparateHeads(t *testing.T) {
-	const (
-		queryHeads = 4
-		headDim    = 32
-		ctx        = 67
-	)
-	rng := rand.New(rand.NewSource(42))
-	queries := make([]float32, queryHeads*headDim)
-	keys := make([]float32, ctx*headDim)
-	values := make([]float32, ctx*headDim)
-	for i := range queries {
-		queries[i] = rng.Float32()*2 - 1
-	}
-	for i := range keys {
-		keys[i] = rng.Float32()*2 - 1
-		values[i] = rng.Float32()*2 - 1
-	}
+// queryHeadCounts covers the specialized 4-head SIMD path (onlineAttentionGroup4
+// et al.) and the generic onlineAttentionGroupEither fallback used for every
+// other GQA/MQA ratio — both must agree with per-head attention exactly, since
+// the ForwardBodyInto/forwardBatchInto dispatch gate now enables grouping for
+// any kvMul > 1, not just 4 (see groupedGQA in model.go/forward_batch.go).
+var queryHeadCounts = []int{1, 2, 4, 6, 8}
 
-	for _, softcap := range []float32{0, 2.5} {
-		want := make([]float32, len(queries))
-		got := make([]float32, len(queries))
-		scale := float32(1 / math.Sqrt(headDim))
-		for h := 0; h < queryHeads; h++ {
-			off := h * headDim
-			onlineAttention(queries[off:off+headDim], keys, values,
-				headDim, headDim, headDim, headDim, 0, ctx-1, scale, softcap,
-				want[off:off+headDim])
+func TestGroupedGQAAttentionMatchesSeparateHeads(t *testing.T) {
+	const headDim = 32
+	rng := rand.New(rand.NewSource(42))
+	for _, queryHeads := range queryHeadCounts {
+		const ctx = 67
+		queries := make([]float32, queryHeads*headDim)
+		keys := make([]float32, ctx*headDim)
+		values := make([]float32, ctx*headDim)
+		for i := range queries {
+			queries[i] = rng.Float32()*2 - 1
 		}
-		onlineAttentionGroup(queries, keys, values, queryHeads,
-			headDim, headDim, headDim, headDim, 0, ctx-1, scale, softcap, got)
-		for i := range got {
-			if diff := math.Abs(float64(got[i] - want[i])); diff > 1e-6 {
-				t.Fatalf("softcap=%g output[%d] = %g, want %g (diff %g)", softcap, i, got[i], want[i], diff)
+		for i := range keys {
+			keys[i] = rng.Float32()*2 - 1
+			values[i] = rng.Float32()*2 - 1
+		}
+
+		for _, softcap := range []float32{0, 2.5} {
+			want := make([]float32, len(queries))
+			got := make([]float32, len(queries))
+			scale := float32(1 / math.Sqrt(headDim))
+			for h := 0; h < queryHeads; h++ {
+				off := h * headDim
+				onlineAttention(queries[off:off+headDim], keys, values,
+					headDim, headDim, headDim, headDim, 0, ctx-1, scale, softcap,
+					want[off:off+headDim])
+			}
+			onlineAttentionGroup(queries, keys, values, queryHeads,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, softcap, got)
+			for i := range got {
+				if diff := math.Abs(float64(got[i] - want[i])); diff > 1e-6 {
+					t.Fatalf("queryHeads=%d softcap=%g output[%d] = %g, want %g (diff %g)", queryHeads, softcap, i, got[i], want[i], diff)
+				}
 			}
 		}
 	}
 }
 
 func TestGroupedGQAAttentionF16MatchesSeparateHeads(t *testing.T) {
-	const (
-		queryHeads = 4
-		headDim    = 32
-		ctx        = 67
-	)
+	const headDim = 32
 	rng := rand.New(rand.NewSource(84))
-	queries := make([]float32, queryHeads*headDim)
-	keys := make([]uint16, ctx*headDim)
-	values := make([]uint16, ctx*headDim)
-	for i := range queries {
-		queries[i] = rng.Float32()*2 - 1
-	}
-	for i := range keys {
-		keys[i] = F32ToF16(rng.Float32()*2 - 1)
-		values[i] = F32ToF16(rng.Float32()*2 - 1)
-	}
-
-	want := make([]float32, len(queries))
-	got := make([]float32, len(queries))
-	scale := float32(1 / math.Sqrt(headDim))
-	for h := 0; h < queryHeads; h++ {
-		off := h * headDim
-		onlineAttentionF16(queries[off:off+headDim], keys, values,
-			headDim, headDim, headDim, headDim, 0, ctx-1, scale, 2.5,
-			want[off:off+headDim])
-	}
-	onlineAttentionGroupF16(queries, keys, values, queryHeads,
-		headDim, headDim, headDim, headDim, 0, ctx-1, scale, 2.5, got)
-	for i := range got {
-		if diff := math.Abs(float64(got[i] - want[i])); diff > 1e-6 {
-			t.Fatalf("output[%d] = %g, want %g (diff %g)", i, got[i], want[i], diff)
+	for _, queryHeads := range queryHeadCounts {
+		const ctx = 67
+		queries := make([]float32, queryHeads*headDim)
+		keys := make([]uint16, ctx*headDim)
+		values := make([]uint16, ctx*headDim)
+		for i := range queries {
+			queries[i] = rng.Float32()*2 - 1
 		}
+		for i := range keys {
+			keys[i] = F32ToF16(rng.Float32()*2 - 1)
+			values[i] = F32ToF16(rng.Float32()*2 - 1)
+		}
+
+		want := make([]float32, len(queries))
+		got := make([]float32, len(queries))
+		scale := float32(1 / math.Sqrt(headDim))
+		for h := 0; h < queryHeads; h++ {
+			off := h * headDim
+			onlineAttentionF16(queries[off:off+headDim], keys, values,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, 2.5,
+				want[off:off+headDim])
+		}
+		onlineAttentionGroupF16(queries, keys, values, queryHeads,
+			headDim, headDim, headDim, headDim, 0, ctx-1, scale, 2.5, got)
+		for i := range got {
+			if diff := math.Abs(float64(got[i] - want[i])); diff > 1e-6 {
+				t.Fatalf("queryHeads=%d output[%d] = %g, want %g (diff %g)", queryHeads, i, got[i], want[i], diff)
+			}
+		}
+	}
+}
+
+// TestGroupedGQAAttentionI8MatchesSeparateHeads is the Q8_0-KV-cache analogue
+// of the F32/F16 tests above. onlineAttentionGroupI8 had no correctness test
+// at all before the dispatch gate started allowing kvI8 caches into the
+// grouped path (previously grouping only ever ran on a kvF32 cache).
+func TestGroupedGQAAttentionI8MatchesSeparateHeads(t *testing.T) {
+	const headDim = 32
+	rng := rand.New(rand.NewSource(91))
+	for _, queryHeads := range queryHeadCounts {
+		const ctx = 67
+		queries := make([]float32, queryHeads*headDim)
+		keysF := randomVec(rng, ctx*headDim)
+		valuesF := randomVec(rng, ctx*headDim)
+		keys8 := make([]byte, 0, ctx*q8RowBytes(headDim))
+		values8 := make([]byte, 0, ctx*q8RowBytes(headDim))
+		for i := range queries {
+			queries[i] = rng.Float32()*2 - 1
+		}
+		for t := 0; t < ctx; t++ {
+			keys8 = append(keys8, QuantizeRowQ8_0(keysF[t*headDim:(t+1)*headDim], headDim)...)
+			values8 = append(values8, QuantizeRowQ8_0(valuesF[t*headDim:(t+1)*headDim], headDim)...)
+		}
+
+		want := make([]float32, len(queries))
+		got := make([]float32, len(queries))
+		scale := float32(1 / math.Sqrt(headDim))
+		for h := 0; h < queryHeads; h++ {
+			off := h * headDim
+			onlineAttentionI8WithSink(queries[off:off+headDim], keys8, values8,
+				headDim, headDim, headDim, headDim, 0, ctx-1, scale, 2.5, 0, 0, false,
+				want[off:off+headDim])
+		}
+		onlineAttentionGroupI8(queries, keys8, values8, queryHeads,
+			headDim, headDim, headDim, headDim, 0, ctx-1, scale, 2.5, got)
+		for i := range got {
+			if diff := math.Abs(float64(got[i] - want[i])); diff > 1e-6 {
+				t.Fatalf("queryHeads=%d output[%d] = %g, want %g (diff %g)", queryHeads, i, got[i], want[i], diff)
+			}
+		}
+	}
+}
+
+// TestAttendHeadGroupsRangeMatchesPerHeadDispatch exercises attendHeadGroupsRange
+// itself — the exact function ForwardBodyInto's groupedGQA branch calls — across
+// all three KV cache formats and a kvMul that is NOT 4, so it covers both
+// relaxations to the groupedGQA gate (model.go/forward_batch.go): kvMul > 1
+// instead of kvMul == 4, and no format restriction instead of kvF32-only.
+func TestAttendHeadGroupsRangeMatchesPerHeadDispatch(t *testing.T) {
+	const (
+		nHeads   = 6
+		nKVHeads = 2 // kvMul = 3, deliberately not 4
+		kvMul    = nHeads / nKVHeads
+		headDim  = 8
+		ctx      = 11
+	)
+	rng := rand.New(rand.NewSource(103))
+	config := Config{NHeads: nHeads, NKVHeads: nKVHeads, HeadDim: headDim, ValueDim: headDim}
+
+	newCache := map[string]func() *KVCache{
+		"f32": func() *KVCache { return NewKVCache(1, nKVHeads*headDim, nKVHeads*headDim, ctx) },
+		"f16": func() *KVCache { return NewKVCacheF16(1, nKVHeads*headDim, nKVHeads*headDim, ctx) },
+		"i8":  func() *KVCache { return NewKVCacheI8(1, nKVHeads*headDim, nKVHeads*headDim, ctx) },
+	}
+	for name, build := range newCache {
+		t.Run(name, func(t *testing.T) {
+			cache := build()
+			for pos := 0; pos < ctx; pos++ {
+				k := randomVec(rng, nKVHeads*headDim)
+				v := randomVec(rng, nKVHeads*headDim)
+				cache.storeKV(0, pos, k, v)
+			}
+			q := randomVec(rng, nHeads*headDim)
+			scale := float32(1 / math.Sqrt(headDim))
+
+			want := make([]float32, nHeads*headDim)
+			for h := 0; h < nHeads; h++ {
+				off := h * headDim
+				cache.attendHeadWithSink(0, h/kvMul, q[off:off+headDim], headDim, headDim,
+					0, ctx-1, scale, 0, 0, 0, false, want[off:off+headDim])
+			}
+
+			buf := &DecodeBuffer{Q: q, AttnOut: make([]float32, nHeads*headDim)}
+			attendHeadGroupsRange(&config, cache, buf, 0, ctx-1, 0, scale, kvMul, 0, nKVHeads)
+			for i, got := range buf.AttnOut {
+				if diff := math.Abs(float64(got - want[i])); diff > 1e-6 {
+					t.Fatalf("%s: output[%d] = %g, want %g (diff %g)", name, i, got, want[i], diff)
+				}
+			}
+		})
 	}
 }
 

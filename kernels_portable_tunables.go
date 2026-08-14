@@ -134,6 +134,20 @@ func dotMXFP4RowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, st
 	}
 }
 
+func dotQ2KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
+	blocks := cols / 256
+	for r := start; r < end; r++ {
+		out[r] = q2kDotQ8KRow(data[r*rowBytes:], q8, xscale, xsums, blocks)
+	}
+}
+
+func dotQ3KRowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
+	blocks := cols / 256
+	for r := start; r < end; r++ {
+		out[r] = q3kDotQ8KRow(data[r*rowBytes:], q8, xscale, blocks)
+	}
+}
+
 // q8kRowLayout describes how one weight type lays out a 256-element
 // superchunk and how many activation-sum slots it needs per token, so the
 // batched path and the single matvec agree on both.
@@ -165,6 +179,13 @@ func q8kLayoutFor(t GGMLType, blocks int) (q8kRowLayout, bool) {
 		return q8kRowLayout{blocks * 136, 1, func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
 			return mxfp4DotQ8KRow(row, q8, xsc, blocks)
 		}}, true
+	case GGMLTypeQ2_K:
+		return q8kRowLayout{blocks * 84, blocks * 16, q2kDotQ8KRow}, true
+	case GGMLTypeQ3_K:
+		// Symmetric like Q8_0/MXFP4: no offset term, one dummy sums slot.
+		return q8kRowLayout{blocks * 110, 1, func(row []byte, q8 []int8, xsc, _ []float32, blocks int) float32 {
+			return q3kDotQ8KRow(row, q8, xsc, blocks)
+		}}, true
 	}
 	return q8kRowLayout{}, false
 }
@@ -177,6 +198,8 @@ func fillQ8KXSums(t GGMLType, x []float32, cols int, sub *[]float32) {
 	case GGMLTypeQ6_K:
 		fillQ6KXSums16(x, cols, sub)
 		ScaleF32(*sub, 32)
+	case GGMLTypeQ2_K:
+		fillQ6KXSums16(x, cols, sub)
 	}
 }
 

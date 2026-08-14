@@ -1296,7 +1296,7 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
 - On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K, Q5_K, Q6_K,
-  Q8_0, Q4_0, Q4_1, and MXFP4 matvecs default to int8-activation full-row kernels: the activation
+  Q8_0, Q4_0, Q4_1, MXFP4, Q2_K, and Q3_K matvecs default to int8-activation full-row kernels: the activation
   vector is quantized once per matvec to int8 with one scale per 256-element
   block (llama.cpp's Q8_K convention, `q8kQuantize`), and each weight row is
   processed by a single assembly call (`q4kDotQ8KRow` / `q5kDotQ8KRow` /
@@ -1312,6 +1312,26 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   cosine 0.999 of it — the same accuracy tradeoff llama.cpp makes by default).
   `GOPHERLLM_DISABLE_SIMD=1` still forces portable scalar
   kernels everywhere.
+  Q3_K is the newest of these and the one that gains most: its high bit is a
+  per-*element* −4 bias rather than the per-sub-block constant the other
+  K-quants carry, which is why it had no SIMD path for so long. It factors as
+  `Σ(u + 4h)·a − 4·Σa`, keeping `u + 4h ≤ 7` inside `VPMADDUBSW`'s unsigned
+  operand and costing one extra multiply-add against a vector of ones. Median
+  of five interleaved runs on a 4096-column row: 54.8 µs scalar to 1.47 µs,
+  about 37x.
+- The same int8-activation kernels run on **every** arm64 target, not just
+  Apple Silicon. They are hand-encoded `SDOT` (`FEAT_DotProd`), which is
+  optional before ARMv8.4, so they used to be gated to `darwin && arm64` where
+  the feature is guaranteed — leaving Graviton, Ampere, Snapdragon, Raspberry
+  Pi 5 and Android on the portable scalar path for the hottest kernel in the
+  engine. A startup probe (`/proc/self/auxv` `HWCAP_ASIMDDP` on Linux and
+  Android, `IsProcessorFeaturePresent` on Windows, unconditional on Apple)
+  now replaces that build gate. A CPU without dotprod keeps exactly its old
+  behaviour: every per-format self-check reports unusable and each entry point
+  returns its portable counterpart. The f16 KV-cache and grouped-GQA f16
+  attention kernels were widened the same way, and need no probe at all —
+  `FCVTL`/`FCVTN` are baseline ARMv8.0 conversion instructions, unlike
+  `FEAT_FP16` arithmetic.
 - Prompt processing (prefill) is batched. With the int8 path active, each raw
   quantized weight row is streamed from memory exactly once per prompt chunk and
   dotted against all prompt tokens' pre-quantized int8 activations in
@@ -1357,10 +1377,24 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   but each K/V row is still read from the cache once per query-head group
   rather than once per head, so the same bandwidth saving applies. It reuses
   the 4k decode threshold above rather than a value re-tuned for amd64.
-  Apple Silicon also uses NEON FP16 conversion, dot, and accumulation kernels
+  Grouping is not limited to the 4:1 ratio or to the exact-f32 KV cache: any
+  GQA/MQA layout with more than one query head per KV head goes through
+  `attendHeadGroup`, which picks the dedicated 4-head kernel when it applies
+  and a generic shared-row fallback (`onlineAttentionGroupEither`) for every
+  other ratio, and the f16/int8-block KV cache tiers have their own grouped
+  kernels (`onlineAttentionGroupF16`/`onlineAttentionGroupI8`) so switching
+  `GOPHERLLM_KV_F16`/`GOPHERLLM_KV_I8` no longer silently falls back to the
+  ungrouped per-head path. This widens the shared-row win to the many
+  non-4:1 GQA/MQA architectures (Falcon, StarCoder2, ChatGLM/GLM4, Command-R,
+  and others) and, since f16 is the default KV cache on fast x86-64, to the
+  default configuration generally — previously the grouped path only ever
+  ran with `GOPHERLLM_KV_F16=0` forcing the exact f32 cache.
+  ARM64 also uses NEON FP16 conversion, dot, and accumulation kernels
   for the optional compact KV cache; at 4k context they made the f16 attention
   benchmark about 3.7x faster than the scalar path. Exact f32 remains the
-  default there because it was still faster on the measured M2 Max.
+  default there because it was still faster on the measured M2 Max. These were
+  Apple-only until the `FCVTL`/`FCVTN` kernels were un-gated from `darwin`;
+  they are baseline ARMv8.0, so every arm64 target gets them.
 - Set `GOPHERLLM_DISABLE_YARN=1` to skip YaRN RoPE scaling for models that declare
   it.
 - Split GGUFs (llama.cpp's `gguf-split` naming convention,
@@ -1381,7 +1415,7 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   On non-amd64 systems the exact f32 cache remains the default; set
   `GOPHERLLM_KV_F16=1` to opt into the compact cache when memory capacity
   matters more than decode speed (for example, large Kimi contexts on a
-  unified-memory Mac). Apple Silicon converts its rows with dedicated NEON
+  unified-memory Mac). ARM64 converts its rows with dedicated NEON
   FP16 kernels; other non-amd64 targets use the portable scalar fallback.
 - A third, more aggressive KV cache tier stores K/V rows as Q8_0 blocks
   (`GOPHERLLM_KV_I8=1`, off by default everywhere): one f16 scale plus 32
@@ -1432,13 +1466,13 @@ details in the bullets they annotate):
 | Variable | Effect |
 |---|---|
 | `GOPHERLLM_MODEL_DIR` | Default model directory when `--model-dir` is not given (`RUSTY_LLM_MODEL_DIR` remains a deprecated fallback) |
-| `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection) |
+| `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection on x86-64, `FEAT_DotProd` detection on arm64) |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
-| `GOPHERLLM_NO_GROUPED_GQA` | Disable the four-query-head grouped-GQA decode path (A/B benchmarking and debugging) |
-| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4 matvecs (x86-64) |
+| `GOPHERLLM_NO_GROUPED_GQA` | Disable the grouped-GQA/MQA decode path (any ratio, any KV cache format) (A/B benchmarking and debugging) |
+| `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4/Q2_K/Q3_K matvecs (x86-64, and arm64 with `FEAT_DotProd`) |
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
-| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on Apple Silicon) to halve KV memory |
+| `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on all of arm64) to halve KV memory |
 | `GOPHERLLM_KV_I8` | `1` opts into the Q8_0-block KV cache tier (off by default everywhere) — a memory-capacity option, not a speed one; see the KV cache section above |
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
@@ -1455,9 +1489,10 @@ The loader currently accepts GGUF files whose `general.architecture` is one of:
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, qwen3, qwen3moe,
 qwen35, qwen35moe,
 deepseek2, kimi_k2,
-phi2, phi3, granite (dense), exaone, exaone4, smollm3, internlm2, stablelm,
+phi2, phi3, granite (dense), granitemoe, exaone, exaone4, smollm3, internlm2, stablelm,
 olmo2, gpt-oss, gemma, gemma2, gemma3, gemma4,
-nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert
+nemotron_h, nemotron_h_moe, mamba2, bert, nomic-bert,
+gpt2, gptneox, gptj, bloom, mpt, falcon, starcoder, starcoder2, chatglm, glm4, command-r, minicpm
 ```
 
 The architecture value is only accepted when its execution graph and expected
@@ -1471,7 +1506,8 @@ because some tensor names happen to match. The main coverage is:
 | Qwen | Qwen2/2.5, QwQ, dense/sparse Qwen3 and Qwen3 Coder, plus experimental text-only Qwen3.5/3.6 hybrid exports |
 | DeepSeek / Kimi | Modern DeepSeek-V2/V3 and Kimi K2 MLA layouts |
 | Gemma | Gemma 1–3 and native dense/MoE/E2B Gemma 4 text graphs |
-| Other decoders | Phi-2, Phi-3/3.5, dense Granite, EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
+| Other decoders | Phi-2, Phi-3/3.5, dense/sparse Granite (GraniteMoE), EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
+| Classic / vendor decoders | GPT-2, GPT-NeoX, GPT-J, BLOOM (ALiBi), MPT (ALiBi), Falcon, StarCoder/StarCoder2, ChatGLM, GLM4 (dense), Command-R, MiniCPM |
 | Recurrent / hybrid | Mamba2 and Nemotron-H / Nemotron-H-MoE |
 | Embeddings | BERT and Nomic-BERT (`/v1/embeddings`, not chat generation) |
 
@@ -1482,9 +1518,8 @@ Important upstream GGUF families that are **not implemented yet**:
 | Llama 4 | Its architecture-specific attention/normalization graph and model validation |
 | Phi-MoE | Sparse expert routing and the architecture-specific expert graph |
 | OLMoE | Its sparse expert router and expert execution graph |
-| Command-R / Cohere2 | Their attention, normalization, and tokenizer/chat conventions |
-| GLM4 / GLM4-MoE, MiniMax M2, LFM2 | Dedicated dense, sparse, or hybrid execution graphs |
-| Falcon, GPT-NeoX/GPT-2, StarCoder2 | Non-Llama block layouts and their tokenizer conventions |
+| Cohere2 | Its attention, normalization, and tokenizer/chat conventions (Command-R itself is implemented) |
+| GLM4-MoE, MiniMax M2, LFM2 | Dedicated sparse or hybrid execution graphs (dense GLM4 is implemented) |
 | Jamba, RWKV, Hyena-family hybrids | Recurrent/state-space cache and mixing kernels |
 | Multimodal Qwen/Gemma/Llama models | Vision projector loading, visual-token injection, and multimodal positional encoding |
 | Standalone MTP/assistant draft files (`deepseek4_mtp*`, `gemma4-assistant`) | A parent-model speculative-decoding runtime; these auxiliary GGUFs are not standalone chat models |

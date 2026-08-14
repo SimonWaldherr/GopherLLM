@@ -1,4 +1,4 @@
-//go:build darwin && arm64
+//go:build arm64
 
 package gopherllm
 
@@ -10,8 +10,8 @@ import (
 
 // THIS IS THE TEST THAT VALIDATES THE HAND-ENCODED SDOT KERNELS.
 //
-// The assembly in q8k_dot_darwin_arm64.s emits SDOT as a raw WORD because Go's
-// arm64 assembler has no mnemonic for it, so the encoding is not checked by any
+// The assembly in q8k_dot_arm64.s emits SDOT as a raw WORD because Go's arm64
+// assembler has no mnemonic for it, so the encoding is not checked by any
 // assembler and cannot be checked by Go's disassembler either. It was also
 // written on a non-arm64 machine, where it can be cross-compiled but not run.
 //
@@ -23,11 +23,28 @@ import (
 // kernel is fixed.
 //
 //	go test -run Q8K ./...
+//
+// Since the kernels stopped being darwin-only these tests run on any arm64
+// part, including ones without FEAT_DotProd where calling the assembly at all
+// is a SIGILL. requireDotProd is what keeps that from turning a legitimately
+// unsupported CPU into a crashed test binary.
+
+// requireDotProd skips a test that calls SDOT assembly directly on a CPU
+// without FEAT_DotProd. It deliberately skips rather than passes: on such a
+// part the assembly is genuinely unreachable, so reporting success would claim
+// coverage the run did not have.
+func requireDotProd(t *testing.T) {
+	t.Helper()
+	if !hasDotProd {
+		t.Skip("CPU has no FEAT_DotProd (SDOT); the int8 kernels run portable here")
+	}
+}
 
 // TestDotInt8AsmPinsSDOT checks SDOT in isolation, before any block format is
 // layered on. A wrong WORD encoding shows up here as a wrong number (or a
 // SIGILL) with nothing else in the way.
 func TestDotInt8AsmPinsSDOT(t *testing.T) {
+	requireDotProd(t)
 	// A hand-computed case first, so a systematic error (e.g. lanes summed
 	// wrongly, or unsigned instead of signed) is unambiguous.
 	a := make([]int8, 16)
@@ -81,6 +98,7 @@ func TestDotInt8AsmPinsSDOT(t *testing.T) {
 // sub-block accumulation, still before any scale is applied, so a layout error
 // is separated from a scale error.
 func TestQ4KQ8Dots8AsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4243))
 	for iter := range 64 {
 		q := make([]byte, 128)
@@ -119,6 +137,7 @@ func TestQ4KQ8Dots8AsmMatchesPortable(t *testing.T) {
 // kernel has to step over every scale. An off-by-two would read weights shifted
 // by one byte and still produce plausible magnitudes.
 func TestQ8_0Q8Dots8AsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4250))
 	for iter := range 64 {
 		row := make([]byte, 272)
@@ -151,6 +170,7 @@ func TestQ8_0Q8Dots8AsmMatchesPortable(t *testing.T) {
 // Poisoning only the scale bytes must not change any dot product — the sharpest
 // test that the stride skips exactly the scale and nothing else.
 func TestQ8_0Q8Dots8AsmIgnoresScaleBytes(t *testing.T) {
+	requireDotProd(t)
 	row := make([]byte, 272)
 	for i := range row {
 		row[i] = 3
@@ -178,6 +198,7 @@ func TestQ8_0Q8Dots8AsmIgnoresScaleBytes(t *testing.T) {
 }
 
 func TestQ8_0DotQ8KRowAsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4251))
 	for _, cols := range []int{256, 1024, 3072, 4096} {
 		blocks := cols / 256
@@ -200,6 +221,7 @@ func TestQ8_0DotQ8KRowAsmMatchesPortable(t *testing.T) {
 // immediate corrupts exactly one quarter of the block — which is why the qh
 // pattern here has to exercise all eight bit positions.
 func TestQ5KQ8Dots8AsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4248))
 	for iter := range 64 {
 		q := make([]byte, 128)
@@ -239,6 +261,7 @@ func TestQ5KQ8Dots8AsmMatchesPortable(t *testing.T) {
 // An all-ones qh must set the fifth bit of every quant, and an all-zero qh must
 // set none — the cheapest way to catch a mask or shift direction mistake.
 func TestQ5KQ8Dots8AsmBitplaneExtremes(t *testing.T) {
+	requireDotProd(t)
 	q8 := make([]int8, 256)
 	for i := range q8 {
 		q8[i] = 1
@@ -267,6 +290,7 @@ func TestQ5KQ8Dots8AsmBitplaneExtremes(t *testing.T) {
 }
 
 func TestQ5KDotQ8KRowAsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4249))
 	for _, cols := range []int{256, 1024, 3072, 4096} {
 		blocks := cols / 256
@@ -291,6 +315,7 @@ func TestQ5KDotQ8KRowAsmMatchesPortable(t *testing.T) {
 // indexing that lets the Go side walk sc[0..15] straight against out[0..15].
 // An off-by-one there is invisible in aggregate but wrong per scale.
 func TestQ6KQ8Dots16AsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4246))
 	for iter := range 64 {
 		ql := make([]byte, 128)
@@ -333,6 +358,7 @@ func TestQ6KQ8Dots16AsmMatchesPortable(t *testing.T) {
 }
 
 func TestQ6KDotQ8KRowAsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4247))
 	for _, cols := range []int{256, 1024, 3072, 4096} {
 		blocks := cols / 256
@@ -357,6 +383,7 @@ func TestQ6KDotQ8KRowAsmMatchesPortable(t *testing.T) {
 // portable path and the differential tests here proved nothing about the
 // assembly — they would be comparing the portable kernel against itself.
 func TestQ8KSelfChecksPassed(t *testing.T) {
+	requireDotProd(t)
 	for name, ok := range map[string]bool{
 		"Q4_K":  q4kDotAsmOK,
 		"Q5_K":  q5kDotAsmOK,
@@ -377,6 +404,7 @@ func TestQ8KSelfChecksPassed(t *testing.T) {
 // one. Table-driven so a fourth legacy format is a table entry, not a fourth
 // copy of the body.
 func TestLegacyFormatRowKernelsMatchPortable(t *testing.T) {
+	requireDotProd(t)
 	cases := []struct {
 		name string
 		row  func(rng *rand.Rand, cols int) []byte
@@ -425,6 +453,7 @@ func TestLegacyFormatRowKernelsMatchPortable(t *testing.T) {
 // where index 1 maps to +1 and everything else to 0 makes each output equal the
 // activation the low or high nibble should have selected.
 func TestMXFP4Q8Dots8AsmDeinterleaves(t *testing.T) {
+	requireDotProd(t)
 	row := make([]byte, 136)
 	q8 := make([]int8, 256)
 	for i := range q8 {
@@ -467,6 +496,7 @@ func TestMXFP4Q8Dots8AsmDeinterleaves(t *testing.T) {
 // TestQ4KDotQ8KRowAsmMatchesPortable is the end-to-end check: the assembly-backed
 // row kernel against the portable one, over realistic rows.
 func TestQ4KDotQ8KRowAsmMatchesPortable(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4244))
 	for _, cols := range []int{256, 1024, 3072, 4096, 9216} {
 		blocks := cols / 256
@@ -500,6 +530,7 @@ func TestQ4KDotQ8KRowAsmMatchesPortable(t *testing.T) {
 // matvec paths agree on a real weight shape, which is the property that
 // actually matters to generation quality.
 func TestQ4KMatvecInt8MatchesFloatPath(t *testing.T) {
+	requireDotProd(t)
 	rng := rand.New(rand.NewSource(4245))
 	const rows, cols = 96, 1024
 	data := make([]byte, 0, rows*(cols/256)*144)

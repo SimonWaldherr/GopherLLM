@@ -2683,7 +2683,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		// GQA/MQA query heads share K/V rows. Process each complete group together
 		// so the shared cacheline is fetched once, then parallelize across KV
 		// groups at contexts long enough to amortize dispatch.
-		groupedGQA := useGroupedGQAAttention && cache.kvFormat() == kvF32 && kvMul == 4 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !config.usesALiBi()
+		groupedGQA := useGroupedGQAAttention && kvMul > 1 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !config.usesALiBi()
 		if attnLen := pos - attnStart + 1; groupedGQA && attnLen >= groupedGQADecodeMinContext && config.NKVHeads > 1 {
 			parallelAttendHeadGroups(config, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else if groupedGQA && attnLen < 128 {

@@ -124,3 +124,32 @@ func randomMXFP4Row(rng *rand.Rand, cols int) []byte {
 	}
 	return row
 }
+
+// randomQ2KRow: 84-byte superblocks — 16 scale bytes, 64 bytes of 2-bit-packed
+// quants, then f16 d and f16 dmin at the end.
+func randomQ2KRow(rng *rand.Rand, cols int) []byte {
+	row := make([]byte, (cols/256)*84)
+	for b := 0; b < cols/256; b++ {
+		block := row[b*84 : (b+1)*84]
+		for i := 0; i < 80; i++ {
+			block[i] = byte(rng.Intn(256))
+		}
+		block[80], block[81] = byte(rng.Intn(256)), 0x2c
+		block[82], block[83] = byte(rng.Intn(256)), 0x1c
+	}
+	return row
+}
+
+// randomQ3KRow: 110-byte superblocks — 32-byte hmask, 64 bytes of
+// 2-bit-packed quants, 12 packed 6-bit scale bytes, then f16 d at the end.
+func randomQ3KRow(rng *rand.Rand, cols int) []byte {
+	row := make([]byte, (cols/256)*110)
+	for b := 0; b < cols/256; b++ {
+		block := row[b*110 : (b+1)*110]
+		for i := 0; i < 108; i++ {
+			block[i] = byte(rng.Intn(256))
+		}
+		block[108], block[109] = byte(rng.Intn(256)), 0x2c
+	}
+	return row
+}

@@ -1,8 +1,8 @@
-//go:build darwin && arm64
+//go:build arm64
 
 #include "textflag.h"
 
-// NEON int8 dot-product kernels for the Q8K activation path on Apple Silicon.
+// NEON int8 dot-product kernels for the Q8K activation path on arm64.
 //
 // WHY WORD ENCODINGS
 //
@@ -21,12 +21,19 @@
 //   bit21=0, bits20..16=Rm, bits15..12=1001, bits11..10=01,
 //   bits9..5=Rn, bits4..0=Rd
 //
-// SDOT is FEAT_DotProd, mandatory from ARMv8.4. Every Apple Silicon part (M1
-// and later, and A11 and later) implements it, which is why this file is gated
-// on darwin && arm64 and needs no runtime feature probe. The same gate is
-// already used by kv_f16_arm64.go for the same reason. Do NOT relax the tag to
-// bare arm64: ARMv8.0/8.2 Linux and Android parts exist without dotprod and
-// would take SIGILL.
+// SDOT is FEAT_DotProd: optional in ARMv8.2, mandatory from ARMv8.4. Executing
+// it on a part without it is a SIGILL, so NOTHING in this file may run until
+// hasDotProd (dotprod_arm64.go) has confirmed the CPU implements it. That
+// contract is enforced in exactly one place: the q4kDotAsmOK-style init
+// variables in q8k_dot_arm64.go short-circuit on hasDotProd before calling any
+// validate* function, and every kernel entry point is already guarded by its
+// *DotAsmOK flag. Do not call a function from this file on any other path.
+//
+// This file was previously gated darwin && arm64 precisely because every Apple
+// Silicon part (M1 and later, A11 and later) has dotprod, making a probe
+// unnecessary there. The runtime probe replaces that gate so Graviton, Ampere,
+// Snapdragon, Raspberry Pi 5 and Android also get these kernels instead of
+// falling back to the portable scalar path.
 
 #define SDOT(Vd, Vn, Vm) WORD $(0x4E809400 | ((Vm)<<16) | ((Vn)<<5) | (Vd))
 
@@ -540,4 +547,183 @@ reduce:
 	VADDV V16.S4, V18
 	FMOVS F18, R4
 	MOVW  R4, ret+24(FP)
+	RET
+
+// Q2SUB0/Q2SUB build one 16-element Q2_K sub-block into V16 as unsigned
+// codes 0..3. VUSHR cannot encode a zero shift, so shift 0 gets its own
+// macro rather than a degenerate VUSHR $0.
+#define Q2SUB0(Vq) \
+	VAND V20.B16, Vq.B16, V16.B16
+
+#define Q2SUB(Vq, SHIFT) \
+	VUSHR $SHIFT, Vq.B16, V16.B16 \
+	VAND V20.B16, V16.B16, V16.B16
+
+// Q2EMIT dots the sub-block in V16 against the next 16 activations and
+// appends the int32 result. SDOT accumulates, so V18 is cleared first.
+#define Q2EMIT \
+	VLD1.P 16(R1), [V6.B16]        \
+	VEOR V18.B16, V18.B16, V18.B16 \
+	SDOT(18, 16, 6)                \
+	VADDV V18.S4, V19              \
+	FMOVS F19, R5                  \
+	MOVW.P R5, 4(R2)
+
+// func q2kQ8Dots16Asm(qs *byte, q8 *int8, out *int32)
+//
+// Computes the 16 per-sub-block int32 dot products of ONE Q2_K block: the
+// unsigned 2-bit codes against the int8 activations, before any scale or min
+// is applied. qs points at the block's 64 packed quant bytes (block[16:80]),
+// q8 at the block's 256 activations, out at 16 int32s.
+//
+// Q2_K packs 16 sub-blocks of 16 elements as two 32-byte chunks; within a
+// chunk, element l of sub-block (shift/2)*2 + half is
+// (qs[chunk*32 + half*16 + l] >> shift) & 3 for shift 0/2/4/6. Sub-block
+// index therefore advances 0..15 in exactly the order emitted below, which is
+// why both the activation pointer and the output pointer can simply
+// post-increment.
+//
+// The codes are non-negative, so SDOT's signed interpretation is safe without
+// any bias fixup — unlike Q3_K below. The scale/min nibbles and the dmin term
+// stay in Go (see q2kDotQ8KRow), matching every other kernel in this file.
+TEXT ·q2kQ8Dots16Asm(SB), NOSPLIT|NOFRAME, $0-24
+	MOVD qs+0(FP), R0
+	MOVD q8+8(FP), R1
+	MOVD out+16(FP), R2
+
+	VMOVI $3, V20.B16 // 2-bit code mask
+
+	MOVD $2, R4 // two 32-byte chunks
+
+q2k_chunk:
+	VLD1.P 32(R0), [V0.B16, V1.B16] // V0 = half 0, V1 = half 1
+
+	Q2SUB0(V0)
+	Q2EMIT
+	Q2SUB0(V1)
+	Q2EMIT
+	Q2SUB(V0, 2)
+	Q2EMIT
+	Q2SUB(V1, 2)
+	Q2EMIT
+	Q2SUB(V0, 4)
+	Q2EMIT
+	Q2SUB(V1, 4)
+	Q2EMIT
+	Q2SUB(V0, 6)
+	Q2EMIT
+	Q2SUB(V1, 6)
+	Q2EMIT
+
+	SUB  $1, R4
+	CBNZ R4, q2k_chunk
+	RET
+
+// Q3EMIT is Q2EMIT with Q3_K's register assignment: this kernel needs a
+// fourth pointer for the hmask plane, so the activations are in R2 and the
+// output in R3 rather than R1/R2.
+#define Q3EMIT \
+	VLD1.P 16(R2), [V6.B16]        \
+	VEOR V18.B16, V18.B16, V18.B16 \
+	SDOT(18, 16, 6)                \
+	VADDV V18.S4, V19              \
+	FMOVS F19, R5                  \
+	MOVW.P R5, 4(R3)
+
+// Q3SUB* build one 16-element Q3_K sub-block into V16 as SIGNED codes -4..3.
+//
+// The quant is v = ((q >> shift) & 3) - 4*(1 - h), h being this element's bit
+// HBIT of the hmask plane. Rearranged, v = (u | 4h) - 4: u occupies bits 0-1
+// and 4h bit 2, so they are disjoint and VORR does the work of an add. The
+// result is a signed int8, which is exactly what SDOT wants — so on NEON the
+// bias needs no activation-sum term at all, unlike the AVX2 kernel where
+// VPMADDUBSW's unsigned operand forces the Σ(u+4h)·a − 4·Σa factorisation.
+//
+// Two degenerate-shift variants exist because VUSHR cannot encode $0: HBIT is
+// 0 only for chunk 0 shift 0, and SHIFT is 0 once per chunk.
+#define Q3SUB_S0H0(Vq, Vh) \
+	VAND V20.B16, Vq.B16, V16.B16  \
+	VAND V21.B16, Vh.B16, V17.B16  \
+	VSHL $2, V17.B16, V17.B16      \
+	VORR V17.B16, V16.B16, V16.B16 \
+	VSUB V22.B16, V16.B16, V16.B16
+
+#define Q3SUB_S0(Vq, Vh, HBIT) \
+	VAND V20.B16, Vq.B16, V16.B16  \
+	VUSHR $HBIT, Vh.B16, V17.B16   \
+	VAND V21.B16, V17.B16, V17.B16 \
+	VSHL $2, V17.B16, V17.B16      \
+	VORR V17.B16, V16.B16, V16.B16 \
+	VSUB V22.B16, V16.B16, V16.B16
+
+#define Q3SUB(Vq, Vh, SHIFT, HBIT) \
+	VUSHR $SHIFT, Vq.B16, V16.B16  \
+	VAND V20.B16, V16.B16, V16.B16 \
+	VUSHR $HBIT, Vh.B16, V17.B16   \
+	VAND V21.B16, V17.B16, V17.B16 \
+	VSHL $2, V17.B16, V17.B16      \
+	VORR V17.B16, V16.B16, V16.B16 \
+	VSUB V22.B16, V16.B16, V16.B16
+
+// func q3kQ8Dots16Asm(qs *byte, hmask *byte, q8 *int8, out *int32)
+//
+// Computes the 16 per-sub-block int32 dot products of ONE Q3_K block, with
+// the per-element high-bit bias already applied, so Go only has to apply the
+// six-bit scales (dl = scale - 32) and the block scale. qs points at the 64
+// packed quant bytes (block[32:96]), hmask at the 32-byte bit-plane
+// (block[0:32]), q8 at the 256 activations, out at 16 int32s.
+//
+// The quant packing is Q2_K's, so the sub-block walk is identical; what
+// differs is that each of the eight (chunk, shift) pairs takes a different
+// BIT of the same 32-byte hmask plane — bit chunk*4 + shift/2, continuing
+// across the chunk boundary exactly as the portable kernel's m <<= 1 does.
+// The plane is therefore loaded once, without post-increment, and reused.
+TEXT ·q3kQ8Dots16Asm(SB), NOSPLIT|NOFRAME, $0-32
+	MOVD qs+0(FP), R0
+	MOVD hmask+8(FP), R1
+	MOVD q8+16(FP), R2
+	MOVD out+24(FP), R3
+
+	VMOVI $3, V20.B16 // 2-bit code mask
+	VMOVI $1, V21.B16 // hmask bit mask
+	VMOVI $4, V22.B16 // the -4 bias
+
+	VLD1 (R1), [V4.B16, V5.B16]     // hmask: V4 = half 0, V5 = half 1
+	VLD1.P 32(R0), [V0.B16, V1.B16] // qs chunk 0
+	VLD1.P 32(R0), [V2.B16, V3.B16] // qs chunk 1
+
+	Q3SUB_S0H0(V0, V4)
+	Q3EMIT
+	Q3SUB_S0H0(V1, V5)
+	Q3EMIT
+	Q3SUB(V0, V4, 2, 1)
+	Q3EMIT
+	Q3SUB(V1, V5, 2, 1)
+	Q3EMIT
+	Q3SUB(V0, V4, 4, 2)
+	Q3EMIT
+	Q3SUB(V1, V5, 4, 2)
+	Q3EMIT
+	Q3SUB(V0, V4, 6, 3)
+	Q3EMIT
+	Q3SUB(V1, V5, 6, 3)
+	Q3EMIT
+
+	Q3SUB_S0(V2, V4, 4)
+	Q3EMIT
+	Q3SUB_S0(V3, V5, 4)
+	Q3EMIT
+	Q3SUB(V2, V4, 2, 5)
+	Q3EMIT
+	Q3SUB(V3, V5, 2, 5)
+	Q3EMIT
+	Q3SUB(V2, V4, 4, 6)
+	Q3EMIT
+	Q3SUB(V3, V5, 4, 6)
+	Q3EMIT
+	Q3SUB(V2, V4, 6, 7)
+	Q3EMIT
+	Q3SUB(V3, V5, 6, 7)
+	Q3EMIT
+
 	RET

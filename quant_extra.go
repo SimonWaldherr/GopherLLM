@@ -493,9 +493,37 @@ func MatvecQ8KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 }
 
 func MatvecQ2KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
-	matvecScalarRows((cols/256)*84, DotQ2KF32)(data, x, rows, cols, out)
+	rowBytes := (cols / 256) * 84
+	ensureLenNoClear(out, rows)
+	// Q2_K's min term needs the per-16-element activation sums, same grouping
+	// Q6_K's offset term uses (see q2kDotQ8KRow), unscaled.
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		scratch := xsumsScratchPool.Get().(*[]float32)
+		xs := fillQ6KXSums16(x, cols, scratch)
+		q8, xsc, lease := acquireQ8(x, cols)
+		parallelRows(rows, func(start, end int) {
+			dotQ2KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
+		})
+		releaseQ8(q8, xsc, lease)
+		*scratch = xs
+		xsumsScratchPool.Put(scratch)
+		return
+	}
+	matvecScalarRows(rowBytes, DotQ2KF32)(data, x, rows, cols, out)
 }
 
 func MatvecQ3KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
-	matvecScalarRows((cols/256)*110, DotQ3KF32)(data, x, rows, cols, out)
+	rowBytes := (cols / 256) * 110
+	ensureLenNoClear(out, rows)
+	// Q3_K is symmetric (no dmin/offset term), so the int8 path needs only the
+	// per-256-block activation scales, no xsums (see q3kDotQ8KRow).
+	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
+		q8, xsc, lease := acquireQ8(x, cols)
+		parallelRows(rows, func(start, end int) {
+			dotQ3KRowsQ8(data, q8, xsc, cols, rowBytes, start, end, *out)
+		})
+		releaseQ8(q8, xsc, lease)
+		return
+	}
+	matvecScalarRows(rowBytes, DotQ3KF32)(data, x, rows, cols, out)
 }

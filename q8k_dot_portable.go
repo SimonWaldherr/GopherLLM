@@ -1,4 +1,4 @@
-//go:build !amd64 && !(darwin && arm64)
+//go:build !amd64 && !arm64
 
 package gopherllm
 
@@ -48,4 +48,12 @@ func q4_1DotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) 
 
 func mxfp4DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
 	return mxfp4DotQ8KRowPortable(row, q8, xscales, blocks)
+}
+
+func q2kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	return q2kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
+}
+
+func q3kDotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	return q3kDotQ8KRowPortable(row, q8, xscales, blocks)
 }

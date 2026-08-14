@@ -782,6 +782,263 @@ q41q8k_done:
 	VZEROUPPER
 	RET
 
+// Q2KQ8CHUNK processes one 2-bit-shift extraction of a 32-byte qs chunk
+// already loaded in SRC (one of the row's two 32-byte quant groups),
+// producing the sc-weighted integer dot for the two 16-element sub-blocks
+// that share this shift position — half 0 in SRC's low 128 bits, half 1 in
+// its high 128 bits, matching q[half*16+l]'s memory layout exactly, so no
+// lane shuffling is needed to split them. Y14 must hold the per-byte 0x03
+// mask. SCOFF/SCOFF2 are int16 stack slots (the 0(SP) scale array built in
+// q2kDotQ8KRow) holding half 0/half 1's d-scale nibble (sc&0x0f), Q8OFF the
+// matching 32-byte activation offset. Mirrors Q4KQ8CHUNK/Q6KQ8QUAD's
+// broadcast-scale-then-VPMADDWD combine.
+#define Q2KQ8CHUNK(SRC, SHIFT, Q8OFF, SCOFF, SCOFF2) \
+	VPSRLW $SHIFT, SRC, Y1 \
+	VPAND Y14, Y1, Y1 \
+	VPMADDUBSW Q8OFF(DI), Y1, Y3 \
+	VPBROADCASTW SCOFF(SP), X5 \
+	VPBROADCASTW SCOFF2(SP), X6 \
+	VINSERTI128 $1, X6, Y5, Y5 \
+	VPMADDWD Y5, Y3, Y3 \
+	VPADDD Y3, Y12, Y12
+
+// func q2kDotQ8KRow(q *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
+// Full-row Q2_K x int8-activation dot product. Each 84-byte superblock packs
+// 16 sub-blocks of 16 elements: 16 scale bytes (low nibble = d-scale 0..15,
+// high nibble = min-scale 0..15, one byte per sub-block — no joint 6-bit
+// table like Q4_K/Q5_K), 64 bytes of 2-bit-packed quants (four 2-bit codes
+// per byte, extracted at shifts 0/2/4/6), then f16 d at +80 and f16 dmin at
+// +82. q8/xscales are as in q4kDotQ8KRow; xsums must hold the per-16-element
+// float sums of the ORIGINAL activations (fillQ6KXSums16 — Q2_K shares
+// Q6_K's 16-element sub-block grouping, unlike Q4_K/Q5_K's 32-element one),
+// unscaled, for the exact min term (dmin*(sc>>4)*xsum, no extra factor
+// unlike Q6_K's -32-offset scaling).
+TEXT ·q2kDotQ8KRow(SB), NOSPLIT, $32-44
+	MOVQ q+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ xsums+24(FP), R9
+	MOVQ blocks+32(FP), CX
+	MOVL $0x03030303, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14      // Y14 = per-byte 0x03 mask
+	MOVL $0x0f0f0f0f, AX
+	MOVQ AX, X13
+	VPBROADCASTD X13, Y13      // X13 = per-byte 0x0f mask (16 bytes; Y13 unused beyond this)
+	VXORPS Y11, Y11, Y11       // Y11 = accF (d*sc integer-dot term)
+	VXORPS Y10, Y10, Y10       // Y10 = accM (dmin*min*xsum term)
+	TESTQ CX, CX
+	JLE q2kq8k_done
+q2kq8k_block:
+	// d (f16 at +80) and dmin (f16 at +82)
+	MOVL 80(SI), AX
+	MOVQ AX, X8
+	VCVTPH2PS X8, X8          // X8 = [d, dmin, ., .]
+	// d-scale nibbles (sc&0x0f) for all 16 sub-blocks -> int16 stack array,
+	// consumed by Q2KQ8CHUNK's SCOFF/SCOFF2 below.
+	VMOVDQU (SI), X0          // 16 scale bytes
+	VPAND X13, X0, X1
+	VPMOVZXBW X1, Y1
+	VMOVDQU Y1, 0(SP)
+	// min term: accM += dmin * sum(min_i * xsums_i), folded as two groups of
+	// 8 lanes (mirrors q6kDotQ8KRow's offset-term reduction) before the
+	// single horizontal reduce at the very end of the row.
+	VPMOVZXBD (SI), Y2
+	VPSRLD $4, Y2, Y2
+	VCVTDQ2PS Y2, Y2
+	VMULPS (R9), Y2, Y2
+	VPMOVZXBD 8(SI), Y3
+	VPSRLD $4, Y3, Y3
+	VCVTDQ2PS Y3, Y3
+	VFMADD231PS 32(R9), Y3, Y2
+	VPSHUFD $0x55, X8, X4      // X4[0] = dmin
+	VBROADCASTSS X4, Y4
+	VFMADD231PS Y4, Y2, Y10
+	// integer dots: accI (Y12) collects sc-weighted sub-block dots. The two
+	// 32-byte qs chunks (n=0 at +16, n=128 at +48) are each loaded once and
+	// reused across their four shift extractions.
+	VPXOR Y12, Y12, Y12
+	VMOVDQU 16(SI), Y0
+	Q2KQ8CHUNK(Y0, 0, 0, 0, 2)
+	Q2KQ8CHUNK(Y0, 2, 32, 4, 6)
+	Q2KQ8CHUNK(Y0, 4, 64, 8, 10)
+	Q2KQ8CHUNK(Y0, 6, 96, 12, 14)
+	VMOVDQU 48(SI), Y0
+	Q2KQ8CHUNK(Y0, 0, 128, 16, 18)
+	Q2KQ8CHUNK(Y0, 2, 160, 20, 22)
+	Q2KQ8CHUNK(Y0, 4, 192, 24, 26)
+	Q2KQ8CHUNK(Y0, 6, 224, 28, 30)
+	// accF += float(accI) * (d * activation scale)
+	VCVTDQ2PS Y12, Y12
+	VMULSS (R8), X8, X6
+	VBROADCASTSS X6, Y6
+	VFMADD231PS Y6, Y12, Y11
+	ADDQ $84, SI
+	ADDQ $256, DI
+	ADDQ $4, R8
+	ADDQ $64, R9
+	DECQ CX
+	JNZ q2kq8k_block
+q2kq8k_done:
+	VSUBPS Y10, Y11, Y11
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VMOVSS X11, ret+40(FP)
+	VZEROUPPER
+	RET
+
+// Q3KQ8CHUNK processes one 2-bit-shift extraction of a 32-byte qs chunk, the
+// same walk Q2KQ8CHUNK does, plus Q3_K's high-bit correction.
+//
+// Q3_K's quant is v = ((q >> shift) & 3) - 4*(1 - h), where h is this
+// element's bit HBIT of the 32-byte hmask plane: a per-ELEMENT signed offset,
+// not the per-sub-block constant that Q2_K/Q4_K/Q5_K factor into an xsums
+// term. That is why this format had no fast kernel. It does factor, just
+// differently — into the ACTIVATION sum rather than a weight-side constant:
+//
+//	v   = u - 4 + 4h                  (u = (q >> shift) & 3, h in {0,1})
+//	Σv·a = Σ(u + 4h)·a - 4·Σa
+//
+// and w = u + 4h lands in 0..7, so it is still a valid unsigned operand for
+// VPMADDUBSW. The correction therefore costs one extra VPMADDUBSW against a
+// vector of ones (which is exactly Σa per pair) and a shift/subtract, with no
+// xsums array and no float term — Q3_K stays symmetric, unlike Q4_1/Q2_K.
+//
+// Intermediate ranges, since VPMADDUBSW saturates: w·a pairs reach 2·7·128 =
+// 1792, 4·Σa reaches 4·256 = 1024, and their difference stays well inside
+// int16. The subsequent VPMADDWD against dl (-32..31) cannot overflow int32.
+//
+// Y9 holds the hmask plane, Y14 the per-byte 0x03 mask, and Y15 the per-byte
+// 0x01 mask, which doubles as the all-ones multiplicand for the Σa term.
+#define Q3KQ8CHUNK(SRC, SHIFT, HBIT, Q8OFF, SCOFF, SCOFF2) \
+	VPSRLW $SHIFT, SRC, Y1 \
+	VPAND Y14, Y1, Y1 \
+	VPSRLW $HBIT, Y9, Y2 \
+	VPAND Y15, Y2, Y2 \
+	VPSLLW $2, Y2, Y2 \
+	VPADDB Y2, Y1, Y1 \
+	VPMADDUBSW Q8OFF(DI), Y1, Y3 \
+	VPMADDUBSW Q8OFF(DI), Y15, Y4 \
+	VPSLLW $2, Y4, Y4 \
+	VPSUBW Y4, Y3, Y3 \
+	VPBROADCASTW SCOFF(SP), X5 \
+	VPBROADCASTW SCOFF2(SP), X6 \
+	VINSERTI128 $1, X6, Y5, Y5 \
+	VPMADDWD Y5, Y3, Y3 \
+	VPADDD Y3, Y12, Y12
+
+// func q3kDotQ8KRow(q *byte, q8 *int8, xscales *float32, blocks int) float32
+// Full-row Q3_K x int8-activation dot product. The 110-byte superblock is a
+// 32-byte hmask bit-plane at +0, 64 bytes of 2-bit-packed quants at +32 (the
+// Q2_K packing: four codes per byte at shifts 0/2/4/6), 12 packed 6-bit
+// scale bytes at +96, and the f16 d at +108. There are 16 sub-blocks of 16
+// elements, each with its own scale dl = scale - 32.
+//
+// Unlike Q4_K/Q5_K/Q2_K there is no dmin/min term to accumulate: Q3_K is
+// symmetric once the hmask correction is folded in (see Q3KQ8CHUNK), so this
+// kernel carries no xsums argument and needs no second accumulator.
+//
+// Stack frame: 0..15 the 16 unpacked 6-bit scale bytes, 32..63 those scales
+// biased by -32 and widened to int16 for Q3KQ8CHUNK's VPBROADCASTW.
+TEXT ·q3kDotQ8KRow(SB), NOSPLIT, $64-36
+	MOVQ q+0(FP), SI
+	MOVQ q8+8(FP), DI
+	MOVQ xscales+16(FP), R8
+	MOVQ blocks+24(FP), CX
+	MOVL $0x03030303, AX
+	MOVQ AX, X14
+	VPBROADCASTD X14, Y14      // Y14 = per-byte 0x03 mask
+	MOVL $0x01010101, AX
+	MOVQ AX, X15
+	VPBROADCASTD X15, Y15      // Y15 = per-byte 0x01 mask / all-ones operand
+	MOVL $0x00200020, AX
+	MOVQ AX, X13
+	VPBROADCASTD X13, Y13      // Y13 = int16 32, the scale bias
+	VXORPS Y11, Y11, Y11       // Y11 = accF
+	TESTQ CX, CX
+	JLE q3kq8k_done
+q3kq8k_block:
+	// d is the last two bytes of the block; load exactly two so the final
+	// block cannot read past the end of the row.
+	MOVWLZX 108(SI), AX
+	MOVQ AX, X8
+	VCVTPH2PS X8, X8           // X8[0] = d
+	// Unpack the 12 packed scale bytes into 16 six-bit scales. This is
+	// q3KScales' shuffle with the shift folded into the mask: the original
+	// (((tmp >> k) & 0x03030303) << 4) is the same as isolating bits 4..5 of
+	// each byte after a single shift, since both operands stay byte-aligned.
+	MOVL 96(SI), R10           // aux0 = scale bytes 0..3
+	MOVL 100(SI), R11          // aux1 = scale bytes 4..7
+	MOVL 104(SI), R12          // tmp  = scale bytes 8..11 (the high 2 bits)
+	MOVL R10, R13
+	ANDL $0x0f0f0f0f, R13
+	MOVL R12, AX
+	SHLL $4, AX
+	ANDL $0x30303030, AX
+	ORL AX, R13
+	MOVL R13, 0(SP)            // out[0..3]
+	MOVL R11, R13
+	ANDL $0x0f0f0f0f, R13
+	MOVL R12, AX
+	SHLL $2, AX
+	ANDL $0x30303030, AX
+	ORL AX, R13
+	MOVL R13, 4(SP)            // out[4..7]
+	MOVL R10, R13
+	SHRL $4, R13
+	ANDL $0x0f0f0f0f, R13
+	MOVL R12, AX
+	ANDL $0x30303030, AX
+	ORL AX, R13
+	MOVL R13, 8(SP)            // out[8..11]
+	MOVL R11, R13
+	SHRL $4, R13
+	ANDL $0x0f0f0f0f, R13
+	MOVL R12, AX
+	SHRL $2, AX
+	ANDL $0x30303030, AX
+	ORL AX, R13
+	MOVL R13, 12(SP)           // out[12..15]
+	VPMOVZXBW 0(SP), Y1        // 16 scales -> int16
+	VPSUBW Y13, Y1, Y1         // dl = scale - 32
+	VMOVDQU Y1, 32(SP)
+	// integer dots: accI (Y12) collects dl-weighted sub-block dots. The
+	// hmask plane is loaded once and reused by all eight chunks, each taking
+	// a different bit of it (HBIT 0..7, continuing across the two qs chunks
+	// exactly as the portable kernel's m <<= 1 does).
+	VPXOR Y12, Y12, Y12
+	VMOVDQU (SI), Y9
+	VMOVDQU 32(SI), Y0
+	Q3KQ8CHUNK(Y0, 0, 0, 0, 32, 34)
+	Q3KQ8CHUNK(Y0, 2, 1, 32, 36, 38)
+	Q3KQ8CHUNK(Y0, 4, 2, 64, 40, 42)
+	Q3KQ8CHUNK(Y0, 6, 3, 96, 44, 46)
+	VMOVDQU 64(SI), Y0
+	Q3KQ8CHUNK(Y0, 0, 4, 128, 48, 50)
+	Q3KQ8CHUNK(Y0, 2, 5, 160, 52, 54)
+	Q3KQ8CHUNK(Y0, 4, 6, 192, 56, 58)
+	Q3KQ8CHUNK(Y0, 6, 7, 224, 60, 62)
+	// accF += float(accI) * (d * activation scale)
+	VCVTDQ2PS Y12, Y12
+	VMULSS (R8), X8, X6
+	VBROADCASTSS X6, Y6
+	VFMADD231PS Y6, Y12, Y11
+	ADDQ $110, SI
+	ADDQ $256, DI
+	ADDQ $4, R8
+	DECQ CX
+	JNZ q3kq8k_block
+q3kq8k_done:
+	VEXTRACTF128 $1, Y11, X1
+	VADDPS X1, X11, X11
+	VHADDPS X11, X11, X11
+	VHADDPS X11, X11, X11
+	VMOVSS X11, ret+32(FP)
+	VZEROUPPER
+	RET
+
 // mxfp4MagLUT maps an FP4 e2m1 code (0..15) to 2x its magnitude — doubling
 // {0, 0.5, 1, 1.5, 2, 3, 4, 6} makes every value an exact small integer
 // {0,1,2,3,4,6,8,12}, so the dot product can run through the same int8

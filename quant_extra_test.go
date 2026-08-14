@@ -256,7 +256,14 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 		}
 		x := randomVec(rng, c.cols)
 		out := []float32{}
-		c.matvec(data, x, rows, c.cols, &out)
+		// This test checks that Matvec's row-tiled/parallelized implementation
+		// agrees with calling Dot per row directly — a structural check, not an
+		// int8-quantization accuracy one (that's covered separately by the
+		// per-type cosine-similarity tests). Several of these types now have an
+		// approximate int8-activation fast path that Dot's exact float
+		// arithmetic doesn't take, so force the exact path here to keep this an
+		// exact-vs-exact comparison regardless of which types gain one next.
+		withQ8Activations(false, func() { c.matvec(data, x, rows, c.cols, &out) })
 		for r := 0; r < rows; r++ {
 			want := c.dot(data[r*c.rowBytes:(r+1)*c.rowBytes], x, c.cols)
 			if math.Abs(float64(out[r]-want)) > 1e-3*math.Max(1, math.Abs(float64(want))) {
@@ -264,6 +271,36 @@ func TestExtraQuantMatvecMatchesPerRowDot(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestQ3KQ8MatvecCloseToFloat holds MatvecQ3KInto's int8-activation path
+// (portable on every platform — Q3_K has no AVX2 kernel yet) to the same
+// cosine bound as the other quant types' matvecs.
+func TestQ3KQ8MatvecCloseToFloat(t *testing.T) {
+	if !q8ActivationsAvailable() {
+		t.Skip("int8 activation path unavailable on this target")
+	}
+	rng := rand.New(rand.NewSource(43))
+	const rows, cols = 96, 1024
+	rowBytes := (cols / 256) * 110
+	data := make([]byte, 0, rows*rowBytes)
+	for range rows {
+		row := make([]byte, rowBytes)
+		for i := range row {
+			row[i] = byte(rng.Intn(256))
+		}
+		for b := 0; b+110 <= len(row); b += 110 {
+			putF16Half(row[b+108:])
+		}
+		data = append(data, row...)
+	}
+	x := randomVec(rng, cols)
+
+	fout := []float32{}
+	withQ8Activations(false, func() { MatvecQ3KInto(data, x, rows, cols, &fout) })
+	qout := []float32{}
+	withQ8Activations(true, func() { MatvecQ3KInto(data, x, rows, cols, &qout) })
+	requireCosine(t, "q3k", fout, qout)
 }
 
 func TestF64LoadConversion(t *testing.T) {

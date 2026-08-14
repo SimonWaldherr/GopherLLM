@@ -171,6 +171,47 @@ func dotQ4_1RowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowByt
 	}
 }
 
+// q2kDotQ8KRow is the Q2_K analogue of q4kDotQ8KRow: a full-row
+// int8-activation dot product over 84-byte Q2_K superblocks (16 sub-blocks
+// of 16 elements, one packed scale/min byte per sub-block, no joint 6-bit
+// table like Q4_K/Q5_K). xsums are the per-16-element float sums of the
+// ORIGINAL activations (fillQ6KXSums16 — Q2_K shares Q6_K's 16-element
+// grouping, unlike Q4_K/Q5_K's 32-element one), unscaled, for the exact min
+// term.
+//
+//go:noescape
+func q2kDotQ8KRow(q *byte, q8 *int8, xscales *float32, xsums *float32, blocks int) float32
+
+// q3kDotQ8KRow computes one Q3_K row dot. Q3_K's high-bit correction is a
+// per-ELEMENT signed offset (each element's own hmask bit decides whether its
+// code is biased by -4), not the per-sub-block constant that Q2_K/Q4_K/Q5_K
+// factor into a weight-side xsums term. It still factors, but into the
+// activation sum instead — Σ(u + 4h)·a - 4·Σa, with u + 4h ≤ 7 so the main
+// term stays a plain unsigned VPMADDUBSW. See Q3KQ8CHUNK in kernels_amd64.s
+// for the derivation and the overflow argument.
+//
+// Because the correction lands on Σa rather than on a scaled constant, Q3_K
+// needs no xsums argument at all: it is symmetric, like Q8_0 and MXFP4.
+//
+//go:noescape
+func q3kDotQ8KRow(q *byte, q8 *int8, xscales *float32, blocks int) float32
+
+func dotQ2KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
+	blocks := cols / 256
+	for r := start; r < end; r++ {
+		off := r * rowBytes
+		out[r] = q2kDotQ8KRow(&data[off], &q8[0], &xscale[0], &xsums[0], blocks)
+	}
+}
+
+func dotQ3KRowsQ8(data []byte, q8 []int8, xscale []float32, cols, rowBytes, start, end int, out []float32) {
+	blocks := cols / 256
+	for r := start; r < end; r++ {
+		off := r * rowBytes
+		out[r] = q3kDotQ8KRow(&data[off], &q8[0], &xscale[0], blocks)
+	}
+}
+
 // useQ8Activations enables the int8-activation fast path for Q4_K and Q6_K
 // matvecs: the activation vector is quantized once per matvec to int8 with
 // one scale per 256-element block (llama.cpp's Q8_K convention) and each
@@ -462,6 +503,17 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 		kernel = func(row *byte, q8 *int8, xsc *float32, _ *float32, blocks int) float32 {
 			return mxfp4DotQ8KRow(row, q8, xsc, blocks)
 		}
+	case GGMLTypeQ2_K:
+		rowBytes = blocks * 84
+		sumsPerTok = blocks * 16
+		kernel = q2kDotQ8KRow
+	case GGMLTypeQ3_K:
+		rowBytes = blocks * 110
+		// Symmetric: no offset term, one dummy xsums slot per token.
+		sumsPerTok = 1
+		kernel = func(row *byte, q8 *int8, xsc *float32, _ *float32, blocks int) float32 {
+			return q3kDotQ8KRow(row, q8, xsc, blocks)
+		}
 	default:
 		return false
 	}
@@ -490,6 +542,8 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 		case GGMLTypeQ6_K:
 			fillQ6KXSums16(xs[t], cols, &sub)
 			ScaleF32(sub, 32)
+		case GGMLTypeQ2_K:
+			fillQ6KXSums16(xs[t], cols, &sub)
 		}
 	}
 

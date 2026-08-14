@@ -427,6 +427,208 @@ func quantizeQ6KCode(x, scale float32) byte {
 	return byte(clampInt(int(roundHalfAwayFromZero(x*inv))+32, 0, 63))
 }
 
+// QuantizeRowQ2K encodes cols float32 values as Q2_K: 84-byte superblocks of
+// 256 elements (16 scale bytes — low nibble a 4-bit d-code 0..15, high
+// nibble a 4-bit min-code 0..15 per sub-block, no cross-sub-block joint
+// packing like Q4_K's — plus 64 bytes of 2-bit-packed quants, then f16 d and
+// f16 dmin), decoded value = d*(sc&0xf)*q - dmin*(sc>>4), 16 sub-blocks of
+// 16 elements each (quant_extra.go:230-263).
+//
+// Two passes per superblock, like QuantizeRowQ4K: pass 1 finds each
+// sub-block's ideal (scale, min) from its actual [lo,hi] range; d/dmin are
+// shared across all 16 sub-blocks and so aren't known until every one has
+// been seen, even though — unlike Q4_K — each sub-block's own 4-bit codes
+// live in an independent byte with no joint bit-packing to freeze first.
+// Pass 2 rounds the 2-bit codes against the scale/min the decoder will
+// actually reconstruct (d*scCode, dmin*mCode), not the ideal float ones.
+func QuantizeRowQ2K(row []float32, cols int) []byte {
+	nSuper := cols / 256
+	out := make([]byte, nSuper*84)
+	for s := 0; s < nSuper; s++ {
+		super := row[s*256 : s*256+256]
+
+		// Pass 1: per-sub-block raw (scale, min1) where decoded value ==
+		// rawScale*q - rawMin1, q in [0,3].
+		var rawScale, rawMin1 [16]float32
+		for i := 0; i < 16; i++ {
+			sub := super[i*16 : i*16+16]
+			lo, hi := sub[0], sub[0]
+			for _, v := range sub {
+				if v < lo {
+					lo = v
+				}
+				if v > hi {
+					hi = v
+				}
+			}
+			sc := float32(0)
+			if hi > lo {
+				sc = (hi - lo) / 3
+			}
+			rawScale[i] = sc
+			rawMin1[i] = -lo
+		}
+		maxScale, maxMin1 := rawScale[0], rawMin1[0]
+		for i := 1; i < 16; i++ {
+			if rawScale[i] > maxScale {
+				maxScale = rawScale[i]
+			}
+			if rawMin1[i] > maxMin1 {
+				maxMin1 = rawMin1[i]
+			}
+		}
+		d := maxScale / 15
+		dmin := maxMin1 / 15
+		invD, invDmin := float32(0), float32(0)
+		if d != 0 {
+			invD = 1 / d
+		}
+		if dmin != 0 {
+			invDmin = 1 / dmin
+		}
+
+		base := s * 84
+		scales := out[base : base+16]
+		qs := out[base+16 : base+80]
+
+		// Pass 2: round each sub-block's 2-bit codes against the scale the
+		// decoder will actually use, then pack them into the qs plane at the
+		// same (nIdx, shiftAmt, subHalf) position DequantRowQ2KInto reads
+		// them from — sub-block i's 16 codes share a byte with three other
+		// sub-blocks (one per shift position), so this ORs into a byte that
+		// starts zeroed rather than assigning it outright.
+		for i := 0; i < 16; i++ {
+			scCode := byte(clampInt(int(roundHalfAwayFromZero(rawScale[i]*invD)), 0, 15))
+			mCode := byte(clampInt(int(roundHalfAwayFromZero(rawMin1[i]*invDmin)), 0, 15))
+			scales[i] = scCode | mCode<<4
+
+			dl := d * float32(scCode)
+			ml := dmin * float32(mCode)
+			invDl := float32(0)
+			if dl != 0 {
+				invDl = 1 / dl
+			}
+			sub := super[i*16 : i*16+16]
+			nIdx := i / 8
+			within := i % 8
+			shiftAmt := (within / 2) * 2
+			subHalf := within % 2
+			chunk := qs[nIdx*32 : nIdx*32+32]
+			for l := 0; l < 16; l++ {
+				code := clampInt(int(roundHalfAwayFromZero((sub[l]+ml)*invDl)), 0, 3)
+				chunk[subHalf*16+l] |= byte(code) << shiftAmt
+			}
+		}
+		putF16(out[base+80:], d)
+		putF16(out[base+82:], dmin)
+	}
+	return out
+}
+
+// packQ3KScales is the inverse of q3KScales (quant_extra.go): given 16
+// unsigned 6-bit scale codes, produce the 12-byte jointly-packed table
+// Q3_K stores them in. Derived algebraically from q3KScales' kmask shuffle
+// (see quantize_rtn_test.go for the exhaustive round-trip check this gets
+// before being trusted in QuantizeRowQ3K — this packing is the single most
+// bug-prone piece of the encoder, exactly like Q4_K's packScaleMinK4All).
+func packQ3KScales(sc [16]byte) [12]byte {
+	var out [12]byte
+	for k := 0; k < 4; k++ {
+		out[k] = (sc[k] & 0x0f) | (sc[8+k]&0x0f)<<4
+		out[4+k] = (sc[4+k] & 0x0f) | (sc[12+k]&0x0f)<<4
+		out[8+k] = (sc[k]>>4)&0x03 | ((sc[4+k]>>4)&0x03)<<2 | ((sc[8+k]>>4)&0x03)<<4 | ((sc[12+k]>>4)&0x03)<<6
+	}
+	return out
+}
+
+// QuantizeRowQ3K encodes cols float32 values as Q3_K: 110-byte superblocks
+// of 256 elements (32-byte hmask + 64 bytes of 2-bit-packed low quants + 12
+// jointly-packed 6-bit scale bytes + f16 d), decoded value =
+// d*(sc-32)*(q-hi*4), sc a 6-bit code biased by 32, q the 2-bit low code, hi
+// a bit from hmask (quant_extra.go:309-368).
+//
+// Single pass, unlike Q4_K/Q2_K: Q3_K's per-element code already covers the
+// full -4..3 range a sub-block needs (the hmask bit folds the -4 offset in
+// per element, not as a separate superblock-wide min), so there is no
+// separate min term whose scale must be solved for jointly across
+// sub-blocks — only the (sign-preserving, Q4_0/Q6_K-style) signed scale.
+func QuantizeRowQ3K(row []float32, cols int) []byte {
+	nSuper := cols / 256
+	out := make([]byte, nSuper*110)
+	for s := 0; s < nSuper; s++ {
+		super := row[s*256 : s*256+256]
+
+		// extreme[i] keeps the SIGN of sub-block i's largest-magnitude value
+		// (Q4_0/Q6_K's asymmetric-code trick: the per-element code range
+		// -4..3 is asymmetric, so scale_i = extreme_i/-4 maps that extreme to
+		// code -4 or 3 exactly regardless of its sign).
+		var extreme [16]float32
+		var globalAbsmax float32
+		for i := 0; i < 16; i++ {
+			sub := super[i*16 : i*16+16]
+			var a float32
+			for _, v := range sub {
+				if m := abs32(v); m > a {
+					a = m
+					extreme[i] = v
+				}
+			}
+			if a > globalAbsmax {
+				globalAbsmax = a
+			}
+		}
+		// Max representable magnitude is (sc-32)*code with |sc-32|<=32 and
+		// |code|<=4, so the global scale unit is globalAbsmax/(32*4).
+		d := globalAbsmax / (32 * 4)
+		invD := float32(0)
+		if d != 0 {
+			invD = 1 / d
+		}
+		var sc [16]byte
+		for i := 0; i < 16; i++ {
+			target := extreme[i] / -4
+			raw := clampInt(int(roundHalfAwayFromZero(target*invD))+32, 0, 63)
+			sc[i] = byte(raw)
+		}
+
+		base := s * 110
+		hmask := out[base : base+32]
+		qs := out[base+32 : base+96]
+		packed := packQ3KScales(sc)
+		copy(out[base+96:base+108], packed[:])
+		putF16(out[base+108:], d)
+
+		for i := 0; i < 16; i++ {
+			dl := d * float32(int(sc[i])-32)
+			invDl := float32(0)
+			if dl != 0 {
+				invDl = 1 / dl
+			}
+			sub := super[i*16 : i*16+16]
+			nIdx := i / 8
+			within := i % 8
+			shiftIdx := within / 2
+			shiftAmt := shiftIdx * 2
+			subHalf := within % 2
+			chunk := qs[nIdx*32 : nIdx*32+32]
+			m := byte(1) << uint(nIdx*4+shiftIdx)
+			for l := 0; l < 16; l++ {
+				// code&3 gives the correct 2-bit stored value for any code in
+				// -4..3 even when negative: Go's two's-complement & computes
+				// code mod 4, which for -4..-1 is exactly code+4 — the value
+				// DequantRowQ3KInto's "q - hi*4" expects back out once the
+				// hmask bit below marks it as the negative branch.
+				code := clampInt(int(roundHalfAwayFromZero(sub[l]*invDl)), -4, 3)
+				chunk[subHalf*16+l] |= byte(code&3) << shiftAmt
+				if code >= 0 {
+					hmask[subHalf*16+l] |= m
+				}
+			}
+		}
+	}
+	return out
+}
+
 func abs32(v float32) float32 {
 	if v < 0 {
 		return -v

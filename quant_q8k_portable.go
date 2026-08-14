@@ -290,3 +290,96 @@ func mxfp4DotQ8KRowPortable(row []byte, q8 []int8, xscales []float32, blocks int
 	}
 	return sum
 }
+
+// q2kDotQ8KRowPortable computes one Q2_K row dot product against
+// Q8K-quantized activations. Structurally identical to DotQ2KF32
+// (quant_extra.go) — same 16-sub-blocks-of-16 walk with a running y/is index
+// — except the per-element accumulation is against the int8-quantized
+// activations (q8) instead of the original floats, with the per-sub-block
+// scale sc&0x0f folded into the row's shared int32 accumulator (like
+// q4kDotQ8KRowPortable's sc1*lo+sc2*hi) rather than applied per element, and
+// a single d*xscales[b] float multiply closing out each superblock. xsums
+// must hold the per-16-element float sums of the ORIGINAL (unquantized)
+// activations, because the min term (dmin*(sc>>4)) stays in exact float —
+// the same convention fillQ6KXSums16 already serves Q6_K with.
+func q2kDotQ8KRowPortable(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	var sum float32
+	for b := range blocks {
+		block := row[b*84 : (b+1)*84]
+		scales := block[0:16]
+		qs := block[16:80]
+		d := F16ToF32(binaryLE16(block[80:]))
+		dmin := F16ToF32(binaryLE16(block[82:]))
+		q8b := q8[b*256 : b*256+256]
+		var blockInt int32
+		var minTerm float32
+		is := 0
+		y := 0
+		for n := 0; n < 256; n += 128 {
+			q := qs[(n/128)*32 : (n/128)*32+32]
+			for shift := 0; shift < 8; shift += 2 {
+				for half := 0; half < 2; half++ {
+					sc := scales[is]
+					var qdot int32
+					for l := 0; l < 16; l++ {
+						qv := (q[half*16+l] >> shift) & 3
+						qdot += int32(qv) * int32(q8b[y+l])
+					}
+					blockInt += int32(sc&0x0f) * qdot
+					minTerm += float32(sc>>4) * xsums[b*16+is]
+					is++
+					y += 16
+				}
+			}
+		}
+		sum += d*xscales[b]*float32(blockInt) - dmin*minTerm
+	}
+	return sum
+}
+
+// q3kDotQ8KRowPortable computes one Q3_K row dot product against
+// Q8K-quantized activations. Q3_K is symmetric (no dmin/min term, unlike
+// Q2_K/Q4_K/Q5_K), but its high-bit correction is NOT a per-sub-block
+// constant offset: DotQ3KF32's "v -= 4" fires per ELEMENT depending on that
+// element's own hmask bit, so unlike the other K-quants this cannot be
+// factored into "unsigned dot minus a shared xsum term" — it needs a genuine
+// signed per-element value (range -4..3, a biased 3-bit code) dotted
+// directly against q8. No xsums argument exists because there is no
+// separable offset left once that per-element value is computed exactly.
+func q3kDotQ8KRowPortable(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	var sum float32
+	for b := range blocks {
+		block := row[b*110 : (b+1)*110]
+		hmask := block[0:32]
+		qs := block[32:96]
+		scales := q3KScales(block[96:108])
+		d := F16ToF32(binaryLE16(block[108:]))
+		q8b := q8[b*256 : b*256+256]
+		var blockInt int32
+		is := 0
+		m := byte(1)
+		y := 0
+		for n := 0; n < 256; n += 128 {
+			q := qs[(n/128)*32 : (n/128)*32+32]
+			for shift := 0; shift < 8; shift += 2 {
+				for half := 0; half < 2; half++ {
+					dl := int32(scales[is]) - 32
+					is++
+					var qdot int32
+					for l := 0; l < 16; l++ {
+						v := int32((q[half*16+l] >> shift) & 3)
+						if hmask[half*16+l]&m == 0 {
+							v -= 4
+						}
+						qdot += v * int32(q8b[y+l])
+					}
+					blockInt += dl * qdot
+					y += 16
+				}
+				m <<= 1
+			}
+		}
+		sum += d * xscales[b] * float32(blockInt)
+	}
+	return sum
+}

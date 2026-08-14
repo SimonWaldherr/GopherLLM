@@ -1,4 +1,4 @@
-//go:build darwin && arm64
+//go:build arm64
 
 package gopherllm
 
@@ -9,7 +9,7 @@ import (
 	"slices"
 )
 
-// Apple Silicon int8-activation kernels.
+// arm64 int8-activation kernels.
 //
 // SDOT (FEAT_DotProd) multiplies four int8 pairs and accumulates into an int32
 // lane, so one instruction retires 16 int8 MACs across a 128-bit vector. The
@@ -18,16 +18,23 @@ import (
 // and roughly three quarters of the multiply instructions.
 //
 // The split of work is deliberate and uniform across all seven formats:
-// assembly does the unpack and the integer dots (see q8k_dot_darwin_arm64.s),
-// Go decodes the scales and does the float combination. Scale decode runs 8 or
+// assembly does the unpack and the integer dots (see q8k_dot_arm64.s), Go
+// decodes the scales and does the float combination. Scale decode runs 8 or
 // 16 times per 256 elements against 32-64 SDOTs, so keeping it in Go costs
 // almost nothing and keeps each kernel small enough to review by eye.
 //
-// hasQ8KDotAsm is true here, which also makes the int8-activation path the
-// default on Apple Silicon (see defaultQ8Activations in
-// kernels_portable_tunables.go). GOPHERLLM_Q8_ACTIVATIONS=0 forces the exact
-// float kernels back on for A/B testing or if a numerical problem is suspected.
-const hasQ8KDotAsm = true
+// SDOT is optional before ARMv8.4, so these kernels are reachable only after
+// hasDotProd (dotprod_arm64.go) confirms the CPU has it. On a part without
+// dotprod every *DotAsmOK below is false and each entry point returns its
+// portable counterpart, which is the exact behaviour non-Apple arm64 targets
+// had when this file was gated to darwin && arm64.
+//
+// hasQ8KDotAsm therefore tracks the probe rather than the build tag. It also
+// decides whether the int8-activation path is the default (see
+// defaultQ8Activations in kernels_portable_tunables.go);
+// GOPHERLLM_Q8_ACTIVATIONS=0 forces the exact float kernels back on for A/B
+// testing or if a numerical problem is suspected.
+var hasQ8KDotAsm = hasDotProd
 
 /* ── Assembly entry points ───────────────────────────────────────────────── */
 
@@ -79,6 +86,18 @@ func mxfp4Q8Dots8Asm(row *byte, q8 *int8, lut *int8, out *int32)
 //go:noescape
 func dotInt8Asm(a, b *int8, n int) int32
 
+// q2kQ8Dots16Asm: 16 sub-block dots. qs is the 64 packed 2-bit-code bytes.
+//
+//go:noescape
+func q2kQ8Dots16Asm(qs *byte, q8 *int8, out *int32)
+
+// q3kQ8Dots16Asm: 16 sub-block dots, with the per-element high-bit bias
+// already applied. qs is the 64 packed 2-bit-code bytes, hmask the 32-byte
+// bit-plane.
+//
+//go:noescape
+func q3kQ8Dots16Asm(qs *byte, hmask *byte, q8 *int8, out *int32)
+
 // mxfp4DoubledLUT8 narrows the portable kernel's table to the int8 form VTBL
 // needs. Every entry is within [-12, 12], so nothing is lost.
 var mxfp4DoubledLUT8 = func() [16]int8 {
@@ -102,16 +121,28 @@ var mxfp4DoubledLUT8 = func() [16]int8 {
 // unpack its portable counterpart uses. On mismatch the process keeps running on
 // the portable path, which is correct everywhere, and says so on stderr. This
 // costs one 256-element block per format at startup and removes the need to
-// trust untested assembly. q8k_dot_darwin_arm64_test.go covers the same ground
-// far more thoroughly; these are the belt to that suite's braces.
+// trust untested assembly. q8k_dot_arm64_test.go covers the same ground far
+// more thoroughly; these are the belt to that suite's braces.
+//
+// The self-checks matter more now that this file is no longer Apple-only: they
+// run against whatever arm64 part the binary landed on, so a lane-order or
+// signedness bug that only manifests on some other microarchitecture degrades
+// to the portable kernel with a diagnostic instead of silently corrupting
+// logits.
+// Each flag short-circuits on hasDotProd FIRST. That ordering is load-bearing,
+// not stylistic: validate* executes SDOT, so calling one on a CPU without
+// FEAT_DotProd would SIGILL during package init, before any user code runs. The
+// && also means a non-dotprod part pays nothing for these checks.
 var (
-	q4kDotAsmOK   = validateQ4KQ8Dots8Asm()
-	q5kDotAsmOK   = validateQ5KQ8Dots8Asm()
-	q6kDotAsmOK   = validateQ6KQ8Dots16Asm()
-	q8_0DotAsmOK  = validateQ8_0Q8Dots8Asm()
-	q4_0DotAsmOK  = validateQ4_0Q8Dots8Asm()
-	q4_1DotAsmOK  = validateQ4_1Q8Dots8Asm()
-	mxfp4DotAsmOK = validateMXFP4Q8Dots8Asm()
+	q4kDotAsmOK   = hasDotProd && validateQ4KQ8Dots8Asm()
+	q5kDotAsmOK   = hasDotProd && validateQ5KQ8Dots8Asm()
+	q6kDotAsmOK   = hasDotProd && validateQ6KQ8Dots16Asm()
+	q8_0DotAsmOK  = hasDotProd && validateQ8_0Q8Dots8Asm()
+	q4_0DotAsmOK  = hasDotProd && validateQ4_0Q8Dots8Asm()
+	q4_1DotAsmOK  = hasDotProd && validateQ4_1Q8Dots8Asm()
+	mxfp4DotAsmOK = hasDotProd && validateMXFP4Q8Dots8Asm()
+	q2kDotAsmOK   = hasDotProd && validateQ2KQ8Dots16Asm()
+	q3kDotAsmOK   = hasDotProd && validateQ3KQ8Dots16Asm()
 )
 
 // q8kSelfCheck reports a kernel mismatch once and returns whether the kernel is
@@ -195,6 +226,60 @@ func validateQ5KQ8Dots8Asm() bool {
 	got := make([]int32, 8)
 	q5kQ8Dots8Asm(&q[0], &qh[0], &q8[0], &got[0])
 	return q8kSelfCheck("Q5_K", got, want)
+}
+
+// validateQ2KQ8Dots16Asm walks the 2-bit codes independently of the kernel's
+// chunk/shift/half structure: sub-block is takes its codes from
+// qs[(is/8)*32 + (is%2)*16 + l] at shift 2*((is/2)%4). Deriving the indices
+// from is (rather than from a nested loop shaped like the assembly) is what
+// makes a transposed sub-block order show up as a mismatch.
+func validateQ2KQ8Dots16Asm() bool {
+	qs := q8kSelfCheckBytes(64, 37, 11)
+	q8 := q8kSelfCheckActivations()
+	want := make([]int32, 16)
+	for is := range 16 {
+		chunk := (is / 8) * 32
+		shift := uint(2 * ((is / 2) % 4))
+		half := (is % 2) * 16
+		var dot int32
+		for l := range 16 {
+			dot += int32((qs[chunk+half+l]>>shift)&3) * int32(q8[is*16+l])
+		}
+		want[is] = dot
+	}
+	got := make([]int32, 16)
+	q2kQ8Dots16Asm(&qs[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q2_K", got, want)
+}
+
+// validateQ3KQ8Dots16Asm additionally pins the hmask bit assignment, which is
+// the one thing that cannot be checked by inspection: sub-block is takes bit
+// is/2 of hmask[(is%2)*16 + l], continuing across the chunk boundary. A kernel
+// that reused one bit for all eight groups, or reset the bit per chunk, fails
+// here rather than silently corrupting logits.
+func validateQ3KQ8Dots16Asm() bool {
+	qs := q8kSelfCheckBytes(64, 41, 3)
+	hmask := q8kSelfCheckBytes(32, 23, 19)
+	q8 := q8kSelfCheckActivations()
+	want := make([]int32, 16)
+	for is := range 16 {
+		chunk := (is / 8) * 32
+		shift := uint(2 * ((is / 2) % 4))
+		half := (is % 2) * 16
+		hbit := uint(is / 2)
+		var dot int32
+		for l := range 16 {
+			v := int32((qs[chunk+half+l] >> shift) & 3)
+			if hmask[half+l]&(1<<hbit) == 0 {
+				v -= 4
+			}
+			dot += v * int32(q8[is*16+l])
+		}
+		want[is] = dot
+	}
+	got := make([]int32, 16)
+	q3kQ8Dots16Asm(&qs[0], &hmask[0], &q8[0], &got[0])
+	return q8kSelfCheck("Q3_K", got, want)
 }
 
 func validateQ6KQ8Dots16Asm() bool {
@@ -474,6 +559,63 @@ func mxfp4DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float3
 			}
 			sum += math.Float32frombits(e<<23) * 0.5 * xscale * float32(qdots[j])
 		}
+	}
+	return sum
+}
+
+// q2kDotQ8KRow computes one Q2_K row dot. Q2_K's 16 sub-blocks of 16 elements
+// each carry a packed scale/min byte (low nibble = d-scale, high nibble =
+// min-scale), so the structure is Q4_K's split differently: the integer dots
+// come from assembly, the nibble decode and the exact-float dmin term stay
+// here. xsums are the per-16-element sums of the ORIGINAL activations
+// (fillQ6KXSums16 — Q2_K shares Q6_K's 16-element grouping), unscaled.
+func q2kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
+	if !q2kDotAsmOK {
+		return q2kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
+	}
+	var qdots [16]int32
+	var sum float32
+	for b := range blocks {
+		block := row[b*84 : (b+1)*84]
+		scales := block[0:16]
+		d := F16ToF32(binaryLE16(block[80:]))
+		dmin := F16ToF32(binaryLE16(block[82:]))
+		q2kQ8Dots16Asm(&block[16], &q8[b*256], &qdots[0])
+		var blockInt int32
+		var minTerm float32
+		for i := range 16 {
+			sc := scales[i]
+			blockInt += int32(sc&0x0f) * qdots[i]
+			minTerm += float32(sc>>4) * xsums[b*16+i]
+		}
+		sum += d*xscales[b]*float32(blockInt) - dmin*minTerm
+	}
+	return sum
+}
+
+// q3kDotQ8KRow computes one Q3_K row dot. The kernel returns dots that already
+// include the per-element -4 high-bit bias (see Q3SUB* in q8k_dot_arm64.s),
+// because SDOT is signed×signed and the biased code -4..3 is a valid int8 —
+// so, unlike the AVX2 kernel, no activation-sum correction is needed. Go is
+// left with the six-bit scale unpack and dl = scale - 32.
+//
+// Q3_K is symmetric, so there is no xsums argument and no min term.
+func q3kDotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
+	if !q3kDotAsmOK {
+		return q3kDotQ8KRowPortable(row, q8, xscales, blocks)
+	}
+	var qdots [16]int32
+	var sum float32
+	for b := range blocks {
+		block := row[b*110 : (b+1)*110]
+		scales := q3KScales(block[96:108])
+		d := F16ToF32(binaryLE16(block[108:]))
+		q3kQ8Dots16Asm(&block[32], &block[0], &q8[b*256], &qdots[0])
+		var blockInt int32
+		for i := range 16 {
+			blockInt += (int32(scales[i]) - 32) * qdots[i]
+		}
+		sum += d * xscales[b] * float32(blockInt)
 	}
 	return sum
 }

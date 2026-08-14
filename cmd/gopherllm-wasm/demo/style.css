@@ -1,22 +1,33 @@
 :root {
   color-scheme: dark;
-  --bg: #0f1115;
-  --panel: #171a21;
-  --border: #2a2f3a;
-  --text: #e6e8ec;
-  --muted: #8b93a3;
-  --accent: #4f8cff;
-  --accent-fg: #05070d;
-  --ok: #37c874;
+  --bg: #121417;
+  --panel: #1c1f23;
+  --panel-2: #23272c;
+  --border: #333940;
+  --border-strong: #454c56;
+  --text: #e8eaed;
+  --muted: #99a1aa;
+  --accent: #58d0ad;
+  --accent-deep: #1f7a63;
+  --accent-fg: #08281f;
   --warn: #f0a63c;
   --bad: #f0553c;
+
+  --r-sm: 8px;
+  --r-md: 11px;
+  --r-lg: 14px;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.35), 0 8px 24px rgba(0, 0, 0, 0.3);
+  --shadow-pop: 0 16px 40px -8px rgba(0, 0, 0, 0.6);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 32%, transparent);
 }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
@@ -24,26 +35,83 @@ body {
   flex-direction: column;
 }
 
-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--border);
+/* Keyboard focus -- one consistent treatment for every interactive element
+   (buttons, file inputs and their picker button, textarea, dialog controls). */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
 }
 
-header h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+}
+
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+header h1 {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 1.1rem;
+  margin: 0;
+  font-weight: 600;
+}
+/* Brand mark: a small rounded-square gradient tile with a "G", pure CSS
+   (no image asset) so the tab reads as the same product as the main app. */
+header h1::before {
+  content: "G";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.8rem;
+  height: 1.8rem;
+  flex-shrink: 0;
+  border-radius: var(--r-sm);
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+  color: var(--accent-fg);
+  font-weight: 800;
+  font-size: 1rem;
+  box-shadow: var(--shadow-sm);
+}
 header .tag { color: var(--muted); font-weight: 400; }
 
 .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
   font-size: 0.8rem;
-  padding: 0.3rem 0.7rem;
+  padding: 0.3rem 0.75rem;
   border-radius: 999px;
   border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
 }
-.badge-pending { color: var(--muted); }
-.badge-ok { color: var(--ok); border-color: var(--ok); }
-.badge-warn { color: var(--warn); border-color: var(--warn); }
+.badge::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+.badge-pending::before { animation: badge-pulse 1.4s ease-in-out infinite; }
+.badge-ok { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+.badge-warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--border)); }
+
+@keyframes badge-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
 
 main {
   flex: 1;
@@ -60,37 +128,66 @@ main {
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-md);
   padding: 1.25rem;
 }
 .panel h2 { margin: 0 0 0.5rem; font-size: 0.95rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
 .hint { color: var(--muted); font-size: 0.9rem; margin: 0 0 1rem; }
 
 .field { display: block; margin-bottom: 0.75rem; }
-.field span { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.25rem; }
+.field span { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.25rem; transition: color 0.15s ease; }
+.field:focus-within span { color: var(--accent); }
 .field input[type="file"] {
   width: 100%;
   color: var(--text);
   font-size: 0.85rem;
 }
 
+/* Native file-picker button, re-skinned to match the rest of the button
+   system instead of the raw browser default. */
+input[type="file"]::file-selector-button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0.45rem 0.9rem;
+  margin-right: 0.75rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+input[type="file"]::file-selector-button:hover {
+  background: var(--panel);
+  border-color: var(--border-strong);
+}
+input[type="file"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
 button {
   background: var(--accent);
   color: var(--accent-fg);
   border: none;
-  border-radius: 8px;
-  padding: 0.5rem 1.1rem;
+  border-radius: var(--r-sm);
+  padding: 0.55rem 1.1rem;
   font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: filter 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
 }
-button:disabled { opacity: 0.4; cursor: not-allowed; }
-button:hover:not(:disabled) { filter: brightness(1.1); }
+button:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
+button:hover:not(:disabled) { filter: brightness(1.08); transform: translateY(-1px); }
+button:active:not(:disabled) { filter: brightness(0.96); transform: translateY(0); }
 #stopButton { background: var(--bad); color: white; }
 
 .status { margin-top: 0.75rem; font-size: 0.85rem; color: var(--muted); white-space: pre-wrap; }
 .status.error { color: var(--bad); }
-.status.ok { color: var(--ok); }
+.status.ok { color: var(--accent); }
 
 .hidden { display: none !important; }
 
@@ -105,41 +202,82 @@ button:hover:not(:disabled) { filter: brightness(1.1); }
   min-height: 200px;
   max-height: 50vh;
 }
-.msg { padding: 0.6rem 0.9rem; border-radius: 10px; max-width: 85%; white-space: pre-wrap; }
-.msg-user { align-self: flex-end; background: var(--accent); color: var(--accent-fg); }
-.msg-assistant { align-self: flex-start; background: #20242e; border: 1px solid var(--border); }
-.msg img { max-width: 200px; border-radius: 8px; display: block; margin-bottom: 0.4rem; }
+.msg {
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--r-md);
+  max-width: 85%;
+  white-space: pre-wrap;
+  box-shadow: var(--shadow-sm);
+}
+.msg-user {
+  align-self: flex-end;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-bottom-right-radius: 4px;
+}
+.msg-assistant {
+  align-self: flex-start;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+.msg img { max-width: 200px; border-radius: var(--r-sm); display: block; margin-bottom: 0.4rem; }
 
 #imagePreviewRow { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.5rem; }
-#imagePreview { max-height: 60px; border-radius: 6px; }
-#clearImageButton { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400; padding: 0.2rem 0.6rem; font-size: 0.8rem; }
+#imagePreview { max-height: 60px; border-radius: var(--r-sm); box-shadow: var(--shadow-sm); }
+#clearImageButton { background: transparent; color: var(--muted); border: 1px solid var(--border); font-weight: 400; padding: 0.2rem 0.6rem; font-size: 0.8rem; box-shadow: none; }
+#clearImageButton:hover { background: var(--panel-2); color: var(--text); transform: none; filter: none; }
 
-#chatForm { display: flex; align-items: flex-end; gap: 0.5rem; }
+#chatForm {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.5rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 0.5rem;
+}
 .attach-button {
   cursor: pointer;
   font-size: 1.3rem;
-  padding: 0.4rem 0.6rem;
-  border-radius: 8px;
+  line-height: 1;
+  padding: 0.45rem 0.65rem;
+  border-radius: var(--r-sm);
   border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  box-shadow: none;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
+.attach-button:hover { background: var(--panel); border-color: var(--border-strong); transform: none; filter: none; }
+
 #promptInput {
   flex: 1;
+  min-width: 0;
   resize: none;
-  background: #0d0f14;
+  background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   color: var(--text);
   padding: 0.6rem 0.8rem;
   font: inherit;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+#promptInput::placeholder { color: var(--muted); }
+#promptInput:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 
 #captureModal {
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--r-lg);
   background: var(--panel);
   color: var(--text);
   padding: 1rem;
   max-width: min(90vw, 640px);
+  box-shadow: var(--shadow-pop);
 }
 #captureModal::backdrop {
   background: rgba(0, 0, 0, 0.6);
@@ -149,7 +287,7 @@ button:hover:not(:disabled) { filter: brightness(1.1); }
   display: block;
   width: 100%;
   max-height: 60vh;
-  border-radius: 10px;
+  border-radius: var(--r-md);
   background: #000;
 }
 .capture-actions {
@@ -162,4 +300,26 @@ button:hover:not(:disabled) { filter: brightness(1.1); }
   background: transparent;
   color: var(--muted);
   border: 1px solid var(--border);
+  box-shadow: none;
+}
+.capture-actions button.secondary:hover { background: var(--panel-2); color: var(--text); filter: none; }
+
+/* Phone-width tuning: tighten spacing so the header, panels and the
+   icon-buttons + textarea + send composer row stay usable and don't overflow. */
+@media (max-width: 520px) {
+  header { padding: 0.7rem 1rem; gap: 0.5rem; }
+  header h1 { font-size: 1rem; gap: 0.5rem; }
+  header h1::before { width: 1.5rem; height: 1.5rem; font-size: 0.85rem; }
+  .badge { font-size: 0.72rem; padding: 0.25rem 0.6rem; }
+
+  main { padding: 0.85rem; gap: 1rem; }
+  .panel { padding: 0.9rem; border-radius: var(--r-md); }
+
+  #messages { max-height: 55vh; min-height: 140px; }
+  .msg { max-width: 92%; }
+
+  #chatForm { padding: 0.4rem; gap: 0.35rem; }
+  .attach-button { font-size: 1.05rem; padding: 0.4rem 0.5rem; }
+  #promptInput { padding: 0.5rem 0.6rem; }
+  #sendButton, #stopButton { padding: 0.55rem 0.8rem; font-size: 0.85rem; }
 }

@@ -457,3 +457,282 @@ func BenchmarkTinyPhi2BatchedPrefillReuse(b *testing.B) {
 		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
 	}
 }
+
+// The 14 architectures below (GPT-2 through GraniteMoE) were added in
+// acc7c42 with correctness coverage in model_families_extra_test.go but no
+// performance benchmarks, so a regression on any of them could ship
+// unnoticed. Each reuses that file's tiny-GGUF builder verbatim and follows
+// the same "abcdefgh" + fallback-token-ids pattern as runExtraArchSmoke,
+// since these builders' gpt2-BPE tokenizer.ggml.model with a plain a-z vocab
+// (no merges table) can encode to zero tokens.
+
+func extraBenchTokens(r *Runner) []uint32 {
+	tokens := r.tok.Encode("abcdefgh")
+	if len(tokens) == 0 {
+		tokens = []uint32{2, 3, 4, 5}
+	}
+	return tokens
+}
+
+func BenchmarkTinyGPT2BatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyGPT2GGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyGPTNeoXBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyGPTNeoXGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyGPTJBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyGPTJGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyBLOOMBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyBLOOMGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyMPTBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyMPTGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+// buildTinyFalconGGUF (the 40B/180B "new decoder architecture" variant with a
+// separate attn_norm_2) is the more structurally demanding of the two Falcon
+// GGUF shapes model_families_extra_test.go exercises, so it is the one
+// reused here.
+func BenchmarkTinyFalconBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyFalconGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyStarCoderBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyStarCoderGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyStarCoder2BatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyStarCoder2GGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyChatGLMBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyChatGLMGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyGLM4BatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyGLM4GGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyCommandRBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyCommandRGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyMiniCPMBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyMiniCPMGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+func BenchmarkTinyGraniteBatchedPrefillReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyGraniteGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		ForwardBatchInto(r.config, r.standard, cache, buf, tokens, 0, true, &logits)
+	}
+}
+
+// GraniteMoE has sparse experts, so canBatchPrefill() is false for it and
+// ForwardBatchInto (which has no MoE routing) is not a code path real
+// traffic ever takes for this architecture. Benchmark the per-token decode
+// path instead, mirroring runExtraArchSmoke's MoE fallback in
+// model_families_extra_test.go.
+func BenchmarkTinyGraniteMoEDecodeReuse(b *testing.B) {
+	r, err := RunnerFromGGUFBytes(buildTinyGraniteMoEGGUF())
+	if err != nil {
+		b.Fatal(err)
+	}
+	tokens := extraBenchTokens(r)
+	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
+	cache := NewKVCache(r.config.NLayers, kDim, vDim, len(tokens)+1)
+	buf := NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
+	logits := []float32{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		for pos, tok := range tokens {
+			logits = Forward(r.config, r.standard, cache, buf, tok, pos)
+		}
+	}
+	_ = logits
+}

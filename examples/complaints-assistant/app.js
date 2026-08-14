@@ -7,6 +7,16 @@ let selectedOrder = null;
 const $ = (id) => document.getElementById(id);
 const ordersEl = $("orders"), form = $("claimForm"), submit = $("submit"), error = $("formError"), status = $("status"), result = $("result");
 
+// The backend's supportSystemPrompt (main.go) constrains "priority" to this
+// fixed enum. Humanize it for display while data.priority (the raw value)
+// stays available for the safety-state check below. Anything unrecognized
+// falls back to the "needs review" label rather than showing raw text.
+const PRIORITY_LABELS = {
+  normal: "Normal",
+  needs_human_review: "Needs human review",
+  safety_review: "Safety review",
+};
+
 function renderOrders() {
   ordersEl.replaceChildren(...orders.map((order) => {
     const button = document.createElement("button");
@@ -26,8 +36,9 @@ function renderOrders() {
 
 function showResult(data) {
   $("classification").textContent = data.classification || "Needs review";
-  const priority = $("priority"); priority.textContent = data.priority || "needs_human_review";
-  priority.classList.toggle("safety", data.priority === "safety_review");
+  const priority = $("priority"); const rawPriority = data.priority || "needs_human_review";
+  priority.textContent = PRIORITY_LABELS[rawPriority] || PRIORITY_LABELS.needs_human_review;
+  priority.classList.toggle("safety", rawPriority === "safety_review");
   $("actions").replaceChildren(...(Array.isArray(data.recommended_actions) ? data.recommended_actions : ["Review the customer description."]).map((action) => { const item = document.createElement("li"); item.textContent = action; return item; }));
   $("reply").textContent = data.customer_reply || "A human agent needs to prepare a reply.";
   const safety = $("safety"); safety.textContent = data.safety_notice || ""; safety.hidden = !data.safety_notice;

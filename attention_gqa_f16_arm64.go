@@ -1,4 +1,4 @@
-//go:build darwin && arm64
+//go:build arm64
 
 package gopherllm
 
@@ -8,6 +8,13 @@ import "unsafe"
 // K/V row only once. Mistral-family GQA uses four query heads for each KV head,
 // so this avoids three of the four FCVTL conversions and K/V loads in the
 // compact-cache attention path.
+//
+// These need no feature probe. Unlike the SDOT kernels, the only extension
+// instructions here are FCVTL/FCVTL2 (half-to-single conversion), which are
+// baseline ARMv8.0 NEON — mandatory on every arm64 part. The assembly they bind
+// to has always lived in attention_gqa_arm64.s, which is built for bare arm64;
+// only these Go declarations were gated to darwin, so non-Apple arm64 was
+// compiling the kernels and then not calling them.
 
 //go:noescape
 func dotF32F16x4NEON(q0, q1, q2, q3 *float32, x *uint16, n int) (s0, s1, s2, s3 float32)
