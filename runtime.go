@@ -1647,6 +1647,10 @@ func (r *Runner) renderMessages(messages []ChatMessage, systemPrompt string, too
 		if tokens, ok := r.renderChatMLMessages(generic, genericSystem); ok {
 			return tokens
 		}
+	case "alpaca-chat":
+		if tokens, ok := r.renderAlpacaMessages(generic, genericSystem); ok {
+			return tokens
+		}
 	case "phi4-chat":
 		if tokens, ok := r.renderPhi4Messages(generic, genericSystem); ok {
 			return tokens
@@ -2540,6 +2544,64 @@ func marshalKimiToolDefinitions(tools []ToolDefinition) ([]byte, error) {
 	return json.Marshal(payload)
 }
 
+// renderAlpacaMessages reproduces Upstage SOLAR's instruct template, the one
+// SauerkrautLM-SOLAR-Instruct and the other SOLAR derivatives ship:
+//
+//	### System:\n{system}\n\n### User:\n{user}\n\n### Assistant:\n{assistant}
+//
+// with a trailing "### Assistant:\n" as the generation prompt. Note the
+// asymmetry, which is in the original template and is deliberately preserved
+// here: system and user turns are followed by a blank line, an assistant turn
+// is not — the next "### User:" block supplies its own separation.
+//
+// The format carries no special tokens, so unlike the ChatML/Gemma renderers
+// there is nothing to look up and nothing that can be missing; it only needs
+// the BOS the tokenizer already prepends. It therefore always succeeds, but
+// keeps the (tokens, ok) shape its siblings use so the dispatch table in
+// renderMessages stays uniform.
+func (r *Runner) renderAlpacaMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
+	return r.tok.Encode(alpacaPrompt(messages, systemPrompt)), true
+}
+
+// alpacaPrompt is split out from the renderer so the exact template text can
+// be asserted directly, without a tokenizer round-trip in the way: the whole
+// point of this format is the literal "### Role:" spelling and its spacing.
+func alpacaPrompt(messages []ChatMessage, systemPrompt string) string {
+	var b strings.Builder
+	hasSystem := false
+	for _, m := range messages {
+		hasSystem = hasSystem || m.Role == ChatRoleSystem
+	}
+	if s := strings.TrimSpace(systemPrompt); s != "" && !hasSystem {
+		b.WriteString("### System:\n")
+		b.WriteString(s)
+		b.WriteString("\n\n")
+	}
+	for _, m := range messages {
+		content := strings.TrimSpace(m.Content)
+		switch m.Role {
+		case ChatRoleSystem:
+			// The template skips a system turn with empty content rather than
+			// emitting a bare header.
+			if content == "" {
+				continue
+			}
+			b.WriteString("### System:\n")
+			b.WriteString(content)
+			b.WriteString("\n\n")
+		case ChatRoleAssistant:
+			b.WriteString("### Assistant:\n")
+			b.WriteString(content)
+		default:
+			b.WriteString("### User:\n")
+			b.WriteString(content)
+			b.WriteString("\n\n")
+		}
+	}
+	b.WriteString("### Assistant:\n")
+	return b.String()
+}
+
 func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt string) ([]uint32, bool) {
 	imStart, ok1 := r.tok.SpecialID("<|im_start|>")
 	imEnd, ok2 := r.tok.SpecialID("<|im_end|>")
@@ -3021,6 +3083,16 @@ func (r *Runner) chatTemplateKind() string {
 					return "granite-chat"
 				case strings.Contains(s, "<start_of_turn>") && strings.Contains(s, "<end_of_turn>"):
 					return "gemma-chat"
+				case strings.Contains(s, "### User:") && strings.Contains(s, "### Assistant:"):
+					// Upstage SOLAR's instruct template, inherited by every
+					// SOLAR fine-tune (SauerkrautLM-SOLAR-Instruct among them)
+					// and shared by a wide class of older Alpaca/Orca-style
+					// community checkpoints. It uses no special tokens at all,
+					// which is exactly why it needs detecting: without this
+					// case it falls through to renderPlainMessages, whose
+					// "User: "/"Assistant: " markers are close enough to look
+					// plausible and different enough to be out of distribution.
+					return "alpaca-chat"
 				}
 			}
 		}

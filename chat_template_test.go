@@ -179,3 +179,83 @@ func TestChatTemplateKindDetectsMistralInst(t *testing.T) {
 		t.Fatalf("chatTemplateKind (tokens) = %q, want mistral-inst", kind)
 	}
 }
+
+// SauerkrautLM-SOLAR-Instruct — and every other SOLAR derivative — ships
+// Upstage's "### Role:" template, which uses no special tokens at all. Before
+// this was detected it fell through to renderPlainMessages, whose
+// "User: "/"Assistant: " markers are similar enough to look right in a diff
+// and wrong enough to be out of distribution for the model.
+func TestChatTemplateKindDetectsAlpaca(t *testing.T) {
+	// The verbatim chat_template from upstage/SOLAR-10.7B-Instruct-v1.0.
+	const solarTemplate = "{% for message in messages %}{% if message['role'] == 'system' %}" +
+		"{% if message['content']%}{{'### System:\n' + message['content']+'\n\n'}}{% endif %}" +
+		"{% elif message['role'] == 'user' %}{{'### User:\n' + message['content']+'\n\n'}}" +
+		"{% elif message['role'] == 'assistant' %}{{'### Assistant:\n'  + message['content']}}{% endif %}" +
+		"{% if loop.last and add_generation_prompt %}{{ '### Assistant:\n' }}{% endif %}{% endfor %}"
+
+	r := &Runner{
+		tok: newInstTestTokenizer(),
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "string", Value: solarTemplate},
+		}},
+	}
+	if kind := r.chatTemplateKind(); kind != "alpaca-chat" {
+		t.Fatalf("chatTemplateKind = %q, want alpaca-chat", kind)
+	}
+}
+
+// ChatML also contains the word "Assistant" in some templates; make sure the
+// more specific kinds still win over the new case.
+func TestChatTemplateKindAlpacaDoesNotShadowChatML(t *testing.T) {
+	r := &Runner{
+		tok: newInstTestTokenizer(),
+		gguf: &GGUFFile{Metadata: map[string]MetaValue{
+			"tokenizer.chat_template": {Kind: "string", Value: "{% for m in messages %}<|im_start|>{{m.role}}\n{{m.content}}<|im_end|>{% endfor %}"},
+		}},
+	}
+	if kind := r.chatTemplateKind(); kind != "chatml" {
+		t.Fatalf("chatTemplateKind = %q, want chatml", kind)
+	}
+}
+
+func TestAlpacaPromptMatchesSOLARTemplate(t *testing.T) {
+	got := alpacaPrompt([]ChatMessage{
+		UserMessage("Wie geht es dir?"),
+		AssistantMessage("Gut, danke."),
+		UserMessage("Und jetzt?"),
+	}, "Du sprichst Deutsch.")
+
+	// System and user turns are followed by a blank line; an assistant turn is
+	// not — that asymmetry is in Upstage's own template and models trained on
+	// it are sensitive to the spacing.
+	want := "### System:\nDu sprichst Deutsch.\n\n" +
+		"### User:\nWie geht es dir?\n\n" +
+		"### Assistant:\nGut, danke." +
+		"### User:\nUnd jetzt?\n\n" +
+		"### Assistant:\n"
+	if got != want {
+		t.Fatalf("alpacaPrompt =\n%q\nwant\n%q", got, want)
+	}
+}
+
+// An explicit system message must not be duplicated by the systemPrompt
+// argument, and an empty system turn emits no bare header.
+func TestAlpacaPromptSystemHandling(t *testing.T) {
+	got := alpacaPrompt([]ChatMessage{
+		{Role: ChatRoleSystem, Content: "Sei praezise."},
+		UserMessage("hi"),
+	}, "Diese soll ignoriert werden.")
+	want := "### System:\nSei praezise.\n\n### User:\nhi\n\n### Assistant:\n"
+	if got != want {
+		t.Fatalf("explicit system: alpacaPrompt = %q, want %q", got, want)
+	}
+
+	got = alpacaPrompt([]ChatMessage{
+		{Role: ChatRoleSystem, Content: "   "},
+		UserMessage("hi"),
+	}, "")
+	want = "### User:\nhi\n\n### Assistant:\n"
+	if got != want {
+		t.Fatalf("empty system: alpacaPrompt = %q, want %q", got, want)
+	}
+}

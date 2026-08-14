@@ -223,7 +223,15 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		gopherllm.PrintModelList(entries)
+		// Models already pulled with Ollama are listed alongside the model
+		// directory's own files: they are ordinary GGUFs in a content-addressed
+		// store, so there is no reason to make the user re-download them. A
+		// missing Ollama install is simply an empty list.
+		ollama, err := gopherllm.DiscoverOllamaModelsDefault(os.Stderr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Skipping Ollama store: %v\n", err)
+		}
+		gopherllm.PrintModelList(append(entries, ollama...))
 		return nil
 	}
 	if err := cfg.options.Validate(); err != nil {

@@ -139,8 +139,11 @@ For a fictional local customer-support workflow with human review, see
 [Complaints Assistant](examples/complaints-assistant/README.md).
 Further direct-package examples are available for
 [local image inspection](examples/vision-inspector/README.md),
-[JSONL ticket triage](examples/ticket-triage/README.md), and an
-[application-owned reply service](examples/embedded-reply-service/README.md).
+[JSONL ticket triage](examples/ticket-triage/README.md), an
+[application-owned reply service](examples/embedded-reply-service/README.md),
+and [every model source at once](examples/model-sources/README.md) — a model
+directory, an existing Ollama store, and the Hugging Face Hub, all converging
+on the same local `.gguf` path.
 
 The examples below are demo patterns, not production safety systems. They are
 useful for prototyping, operator assistance, and product exploration, but they
@@ -361,11 +364,38 @@ in `net/http`, `html/template`, or the web assets:
 | Import | You get | Transitive deps |
 |---|---|---|
 | `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 102 |
+| `github.com/SimonWaldherr/GopherLLM/huggingface` | Hub search, variant listing, and `owner/repo` → local GGUF resolution | 192 |
 | `github.com/SimonWaldherr/GopherLLM/server` | the above **plus** the OpenAI-/Ollama-compatible HTTP API and the `/chat` web UI | 194 |
 
 A minimal inference-only binary is ~3.4 MB against ~9.1 MB for the full CLI.
 `TestInferencePackageStaysFreeOfServerDependencies` enforces the boundary
 against the real dependency graph, so it cannot regress silently.
+
+Hub access is a separate import for the same reason: it needs `net/http`, which
+drags in `crypto/tls` and the HTTP/2 stack. A program that only ever opens a
+local file never pays for that, and one that wants
+`hf:owner/repo` resolution opts in explicitly:
+
+```go
+path, err := huggingface.Resolve(ctx, "hf:owner/repo:model-Q4_K_M.gguf", os.Stderr, huggingface.DefaultOptions())
+if err != nil {
+    return err
+}
+model, err := gopherllm.Open(ctx, path)
+```
+
+Models already pulled with Ollama need no download at all — they are ordinary
+GGUF blobs in a content-addressed store, so `DiscoverOllamaModels` reads them in
+place, keyed by the same `name:tag` you would pass to `ollama run`:
+
+```go
+entries, err := gopherllm.DiscoverOllamaModelsDefault(os.Stderr)
+```
+
+`--list-models` includes them automatically. Set `OLLAMA_MODELS` when the store
+is not at `~/.ollama/models`. This is the third side of the Ollama integration:
+GopherLLM already serves Ollama-compatible endpoints and can proxy to an Ollama
+server, and now reuses its local models too.
 
 For applications that expose the model over HTTP themselves, the entire
 OpenAI-/Ollama-compatible API mounts as a plain `http.Handler` — under any
@@ -1580,6 +1610,16 @@ template conventions (self-opened `<think>` blocks and the newer forced-open
 templates whose output begins mid-reasoning). Mistral-family models support
 assistant-message prefill: a conversation ending in an assistant message
 leaves the turn open so generation continues it.
+
+Upstage SOLAR's `### System:` / `### User:` / `### Assistant:` template is
+detected as its own family (`alpaca-chat`) and rendered exactly, including the
+asymmetric spacing the original uses — system and user turns are followed by a
+blank line, assistant turns are not. It uses no special tokens, so without
+explicit detection it fell through to the generic `User: `/`Assistant: `
+fallback, which is close enough to look correct and different enough to be out
+of distribution. This covers every SOLAR derivative, including
+SauerkrautLM-SOLAR-Instruct, plus the wider class of Alpaca/Orca-style
+community fine-tunes that share the format.
 
 Phi-3 (including the Phi-3.5 GGUFs that declare `phi3`), dense Granite,
 EXAONE 3, and InternLM2 use GopherLLM's standard pre-norm RoPE/GQA/SwiGLU

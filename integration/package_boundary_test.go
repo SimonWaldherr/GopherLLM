@@ -50,3 +50,28 @@ func TestServerPackageStillProvidesTheHTTPSurface(t *testing.T) {
 		}
 	}
 }
+
+// TestHuggingFacePackageIsTheOptInNetworkSurface pins the reason the Hub
+// client lives in its own package rather than in the root one: net/http is
+// exactly what the root package must not carry, so Hub access has to be
+// something a caller opts into by importing it.
+//
+// Without this, the natural "just re-export it from the root package for
+// convenience" change silently reintroduces crypto/tls and the HTTP/2 stack
+// into every program that only ever loads a local file.
+func TestHuggingFacePackageIsTheOptInNetworkSurface(t *testing.T) {
+	out, err := exec.Command("go", "list", "-deps", "github.com/SimonWaldherr/GopherLLM/huggingface").CombinedOutput()
+	if err != nil {
+		t.Skipf("go list unavailable: %v (%s)", err, out)
+	}
+	deps := string(out)
+	// It is the network surface, so it must actually have the client...
+	if !strings.Contains(deps, "net/http") {
+		t.Error("huggingface package does not depend on net/http; is it still a Hub client?")
+	}
+	// ...and it must not drag the whole inference engine along with it, so a
+	// downloader-only tool stays small.
+	if strings.Contains(deps, "html/template") {
+		t.Error("huggingface package pulled in html/template; templating belongs in the server subpackage")
+	}
+}
