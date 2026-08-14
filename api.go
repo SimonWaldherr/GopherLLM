@@ -72,10 +72,14 @@ func WithMetal(enabled bool) Option {
 	return func(s *loadSettings) { s.useMetal = enabled }
 }
 
-// WithOutOfCore loads a single-file GGUF through a CPU-only demand-paged mmap
-// path. Scalar F16/F32/BF16 weights stay in their on-disk form rather than
-// expanding into an owned float32 copy, and sparse MoE expert banks are not
-// prewarmed. It cannot be combined with Metal or prepared quantized weights.
+// WithOutOfCore loads a GGUF through a CPU-only demand-paged mmap path.
+// Scalar F16/F32/BF16 weights stay in their on-disk form rather than expanding
+// into an owned float32 copy, and sparse MoE expert banks are not prewarmed.
+// It cannot be combined with Metal or prepared quantized weights.
+//
+// Split (sharded) models are supported and are the main reason to use this:
+// each shard stays mapped separately and no merged copy is ever materialised,
+// so peak memory tracks resident pages rather than model size.
 func WithOutOfCore(enabled bool) Option {
 	return func(s *loadSettings) { s.outOfCore = enabled }
 }

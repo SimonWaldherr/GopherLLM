@@ -728,6 +728,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 		}
 		MatvecQ4KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ5_K:
+		if matvecMetalQ5KInto(w.Metal, x, w.Rows, w.Cols, out) {
+			return
+		}
 		MatvecQ5KInto(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ6_K:
 		if matvecMetalQ6KInto(w.Metal, x, w.Rows, w.Cols, out) {
@@ -2248,6 +2251,18 @@ func loadOptionalF32VecNil(data []byte, dataOffset int, name string, tensors map
 	return v
 }
 
+// tensorContainer resolves where a tensor's bytes live and at what offset
+// within that slice. It is the single point that understands TensorInfo.Shard,
+// which is what keeps out-of-core split-GGUF support from having to thread a
+// multi-file tensor source through all 130-odd loadWeight call sites.
+func tensorContainer(data []byte, dataOffset int, info TensorInfo) ([]byte, int) {
+	if info.Shard != nil {
+		// Offset is already relative to the shard's tensor region.
+		return info.Shard, int(info.Offset)
+	}
+	return data, dataOffset + int(info.Offset)
+}
+
 func indexTensors(gguf *GGUFFile) map[string]TensorInfo {
 	out := make(map[string]TensorInfo, len(gguf.Tensors))
 	for _, t := range gguf.Tensors {
@@ -2265,22 +2280,37 @@ func inferTensorSizes(data []byte, gguf *GGUFFile) map[string]int {
 		off uint64
 		idx int
 	}
-	offs := make([]offIdx, len(gguf.Tensors))
+	// Tensors carrying their own Shard live in separate offset spaces, so a
+	// single global sort would compute gaps between tensors in different
+	// files and size them nonsensically. Group by shard identity first; the
+	// nil-Shard (single-file) case collapses to exactly one group, which is
+	// the original behaviour byte for byte.
+	groups := make(map[*byte][]offIdx)
+	limits := make(map[*byte]uint64)
 	for i, t := range gguf.Tensors {
-		offs[i] = offIdx{t.Offset, i}
+		var key *byte
+		limit := uint64(len(data) - gguf.DataOffset)
+		if t.Shard != nil {
+			key = &t.Shard[0]
+			limit = uint64(len(t.Shard))
+		}
+		groups[key] = append(groups[key], offIdx{t.Offset, i})
+		limits[key] = limit
 	}
-	sort.Slice(offs, func(i, j int) bool { return offs[i].off < offs[j].off })
-	out := make(map[string]int, len(offs))
-	for i, oi := range offs {
-		next := uint64(len(data) - gguf.DataOffset)
-		if i+1 < len(offs) {
-			next = offs[i+1].off
+	out := make(map[string]int, len(gguf.Tensors))
+	for key, offs := range groups {
+		sort.Slice(offs, func(i, j int) bool { return offs[i].off < offs[j].off })
+		for i, oi := range offs {
+			next := limits[key]
+			if i+1 < len(offs) {
+				next = offs[i+1].off
+			}
+			size := 0
+			if next > oi.off {
+				size = int(next - oi.off)
+			}
+			out[gguf.Tensors[oi.idx].Name] = size
 		}
-		size := 0
-		if next > oi.off {
-			size = int(next - oi.off)
-		}
-		out[gguf.Tensors[oi.idx].Name] = size
 	}
 	return out
 }
@@ -2340,18 +2370,22 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 	if !ok {
 		byteSize = inferred[name]
 	}
+	// container is the byte range this tensor actually lives in: the whole
+	// model buffer for a single-file GGUF, or just this tensor's own shard
+	// mapping for an out-of-core split model. Everything below is expressed
+	// against it, so the two layouts share one code path.
+	container, offset := tensorContainer(data, dataOffset, info)
 	if inferredSize := inferred[name]; inferredSize > 0 {
-		end := dataOffset + int(info.Offset) + byteSize
-		if end > len(data) || byteSize == 0 {
+		end := offset + byteSize
+		if end > len(container) || byteSize == 0 {
 			byteSize = inferredSize
 		}
 	}
-	offset := dataOffset + int(info.Offset)
-	if offset < 0 || offset > len(data) {
+	if offset < 0 || offset > len(container) {
 		return Weight{}, fmt.Errorf("tensor %s offset out of range", name)
 	}
-	rawEnd := min(offset+byteSize, len(data))
-	raw := data[offset:rawEnd]
+	rawEnd := min(offset+byteSize, len(container))
+	raw := container[offset:rawEnd]
 	if len(raw) < byteSize {
 		if info.DType == GGMLTypeF32 || info.DType == GGMLTypeF16 || info.DType == GGMLTypeBF16 {
 			return Weight{}, fmt.Errorf("tensor %s exceeds file length", name)

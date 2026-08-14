@@ -1257,16 +1257,22 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
   scale/min data plus selected Q6_K scale data, then switches supported rows to
   prepared kernels.
-- Use `--out-of-core` when a single-file GGUF, especially a large sparse-MoE
+- Use `--out-of-core` when a GGUF, especially a large sparse-MoE
   model, does not fit comfortably in RAM or Apple unified memory. It keeps the
   model CPU-only, disables Metal and prepared-quant copies, leaves F16/F32/BF16
   matrices as mmap-backed scalar bytes, and does not prewarm the rank-3 expert
   banks (including fused `ffn_gate_up_exps` layouts). The operating system
   pages selected experts in on demand; this is not
   a hard RSS limit, so a cold expert can add SSD/page-fault latency and dense
-  models that are far larger than RAM can still thrash. It intentionally rejects
-  `--metal`, `--prepare-quant`, `--auto`, byte-backed loads, and split GGUFs
-  (current split support merges shards into RAM). Library users can use
+  models that are far larger than RAM can still thrash.
+  **Split (sharded) GGUFs are supported out-of-core and are the main reason to
+  reach for it** — every checkpoint big enough to need demand paging ships as
+  `-00001-of-000NN.gguf` shards. Each shard stays mapped independently and no
+  merged copy is materialised, so peak memory tracks resident pages rather than
+  model size; the default (non-out-of-core) split path still concatenates the
+  shards into one buffer, which needs RAM for the whole model.
+  It intentionally rejects `--metal`, `--prepare-quant`, `--auto`, and byte-backed loads.
+  Library users can use
   `gopherllm.WithOutOfCore(true)` and optionally
   `WithMmapPrefault(gopherllm.MmapPrefaultNone)` for fully lazy paging.
 - Use `--temp 0 --top-k 1` for deterministic greedy output.

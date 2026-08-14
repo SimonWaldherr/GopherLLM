@@ -316,7 +316,12 @@ type Runner struct {
 	workspaceBuf   *DecodeBuffer
 	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
-	mappedFile     *MmapFile
+	mappedFile *MmapFile
+	// extraMappedFiles holds the additional shard mappings of an out-of-core
+	// split GGUF. Those models have no single mappedFile: every weight is a
+	// view into one of these, so all of them must outlive the Runner and all
+	// of them are closed by Close.
+	extraMappedFiles []*MmapFile
 	outOfCore      bool
 	// vision, when non-nil, is a loaded Pixtral-style vision encoder paired
 	// with this Runner's text decoder (see LoadOptions.VisionProjector*).
@@ -583,15 +588,13 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	}
 	if header, herr := ParseGGUFQuiet(mmap.Bytes()); herr == nil {
 		if _, count, ok := splitInfo(header); ok && count > 1 {
-			if options.OutOfCore {
-				_ = mmap.Close()
-				return nil, LoadInfo{}, fmt.Errorf("out-of-core loading does not support split GGUFs: shards are currently merged into memory; combine the shards first")
-			}
-			r, mergedBytes, err := loadSplitRunner(path, header, mmap, options)
+			r, modelBytes, err := loadSplitRunner(path, header, mmap, options)
 			if err != nil {
 				return nil, LoadInfo{}, err
 			}
-			return r, LoadInfo{FileSizeBytes: int(mergedBytes), LoadTime: time.Since(t0), OutOfCore: false}, nil
+			// Out-of-core keeps every shard mapped and reports the mapped
+			// size; the merging path reports the size of the copy it made.
+			return r, LoadInfo{FileSizeBytes: int(modelBytes), LoadTime: time.Since(t0), OutOfCore: options.OutOfCore}, nil
 		}
 		if mmap.IsMapped() {
 			prefaultMappedModel(mmap.Bytes(), header, options)
@@ -642,10 +645,25 @@ func (r *Runner) Close() error {
 		_ = r.visionMappedFile.Close()
 		r.visionMappedFile = nil
 	}
-	if r.mappedFile == nil {
-		return nil
+	// Close every shard of an out-of-core split model, keeping the first
+	// error but never leaving a mapping behind: on Windows a live mapping
+	// keeps the file locked.
+	var err error
+	for _, m := range r.extraMappedFiles {
+		if m == nil {
+			continue
+		}
+		if cerr := m.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 	}
-	err := r.mappedFile.Close()
+	r.extraMappedFiles = nil
+	if r.mappedFile == nil {
+		return err
+	}
+	if cerr := r.mappedFile.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
 	r.mappedFile = nil
 	return err
 }

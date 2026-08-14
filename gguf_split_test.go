@@ -155,7 +155,10 @@ func TestLoadSplitGGUFRejectsNonConformingFilename(t *testing.T) {
 	}
 }
 
-func TestOutOfCoreRejectsSplitGGUFWithoutCopyingShards(t *testing.T) {
+// Out-of-core split loading is the case that matters for genuinely large
+// models: every model big enough to want demand paging ships sharded, and the
+// merging path would materialise all of it in anonymous memory first.
+func TestOutOfCoreSplitGGUFLoadsWithoutMerging(t *testing.T) {
 	dir := t.TempDir()
 	shard1, shard2 := splitTinyLlamaGGUF()
 	path1 := filepath.Join(dir, "tiny-split-00001-of-00002.gguf")
@@ -166,7 +169,88 @@ func TestOutOfCoreRejectsSplitGGUFWithoutCopyingShards(t *testing.T) {
 	if err := os.WriteFile(path2, shard2, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := RunnerFromPathWithOptions(path1, LoadOptions{OutOfCore: true}); err == nil {
-		t.Fatal("expected out-of-core split GGUF load to fail instead of merging shards into memory")
+
+	r, info, err := RunnerFromPathWithOptions(path1, LoadOptions{OutOfCore: true})
+	if err != nil {
+		t.Fatalf("out-of-core split load: %v", err)
+	}
+	defer r.Close()
+
+	if !info.OutOfCore {
+		t.Fatal("LoadInfo.OutOfCore = false; the split path silently fell back to merging")
+	}
+	if len(r.GGUF().Tensors) != 12 {
+		t.Fatalf("tensor count = %d, want 12 across both shards", len(r.GGUF().Tensors))
+	}
+	// Every tensor must resolve through its own shard view rather than a
+	// merged buffer — that is the property that keeps the model off the heap.
+	for _, tensor := range r.GGUF().Tensors {
+		if tensor.Shard == nil {
+			t.Fatalf("tensor %s has no shard view; it was merged into memory", tensor.Name)
+		}
+	}
+	// Two distinct shard mappings must be retained, and both must still be
+	// open — the weights alias them for the Runner's whole lifetime.
+	if got := len(r.extraMappedFiles); got != 2 {
+		t.Fatalf("retained shard mappings = %d, want 2", got)
+	}
+
+	// The model has to actually run: a wrong per-shard offset rebase would
+	// still load and only show up as garbage here.
+	opts := DefaultGenerationOptions()
+	opts.MaxTokens = 3
+	opts.SystemPrompt = ""
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+	if _, err := r.Generate("a b c", opts); err != nil {
+		t.Fatalf("generate on out-of-core split model: %v", err)
+	}
+}
+
+// The out-of-core and merging paths must agree exactly. They resolve tensor
+// bytes through different code (per-shard views vs one concatenated buffer),
+// so a rebasing bug in either shows up as different logits for the same input.
+func TestOutOfCoreSplitMatchesMergedSplit(t *testing.T) {
+	write := func(dir string) string {
+		shard1, shard2 := splitTinyLlamaGGUF()
+		path1 := filepath.Join(dir, "tiny-split-00001-of-00002.gguf")
+		path2 := filepath.Join(dir, "tiny-split-00002-of-00002.gguf")
+		if err := os.WriteFile(path1, shard1, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path2, shard2, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path1
+	}
+
+	merged, _, err := RunnerFromPathWithOptions(write(t.TempDir()), LoadOptions{})
+	if err != nil {
+		t.Fatalf("merged load: %v", err)
+	}
+	defer merged.Close()
+
+	ooc, _, err := RunnerFromPathWithOptions(write(t.TempDir()), LoadOptions{OutOfCore: true})
+	if err != nil {
+		t.Fatalf("out-of-core load: %v", err)
+	}
+	defer ooc.Close()
+
+	opts := DefaultGenerationOptions()
+	opts.MaxTokens = 6
+	opts.SystemPrompt = ""
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	want, err := merged.Generate("a b c", opts)
+	if err != nil {
+		t.Fatalf("merged generate: %v", err)
+	}
+	got, err := ooc.Generate("a b c", opts)
+	if err != nil {
+		t.Fatalf("out-of-core generate: %v", err)
+	}
+	if got.Text != want.Text {
+		t.Fatalf("out-of-core split output %q != merged split output %q", got.Text, want.Text)
 	}
 }

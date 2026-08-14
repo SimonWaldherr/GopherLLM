@@ -18,6 +18,10 @@ func matvecMetalQ4KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) boo
 	return false
 }
 
+func matvecMetalQ5KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) bool {
+	return false
+}
+
 func matvecMetalQ6KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) bool {
 	return false
 }

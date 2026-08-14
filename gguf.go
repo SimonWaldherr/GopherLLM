@@ -435,6 +435,18 @@ type TensorInfo struct {
 	Dims   []uint64
 	DType  GGMLType
 	Offset uint64
+
+	// Shard, when non-nil, holds THIS tensor's own mapped byte range and
+	// Offset is relative to it rather than to the model-wide DataOffset. It
+	// exists for out-of-core split GGUFs, where each shard keeps its own mmap
+	// and there is deliberately no single contiguous model buffer to offset
+	// into — see loadSplitRunnerOutOfCore.
+	//
+	// A nil Shard is the ordinary single-file layout, so every existing
+	// caller and every GGUF this package writes is unaffected. Resolution
+	// goes through tensorContainer, which is the only place that needs to
+	// know the difference.
+	Shard []byte
 }
 
 // Numel returns the total element count (product of Dims).

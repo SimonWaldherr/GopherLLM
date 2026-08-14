@@ -10,8 +10,10 @@ import (
 
 const (
 	metalQ4KPrepareMinRows = 1024
+	metalQ5KPrepareMinRows = 1024
 	metalQ6KPrepareMinRows = 1024
 	metalQ4KDirectMinRows  = 8192
+	metalQ5KDirectMinRows  = 3072
 	metalQ6KDirectMinRows  = 3072
 )
 
@@ -19,6 +21,7 @@ var metalFusedFFNEnabled = os.Getenv("GOPHERLLM_METAL_FUSED_FFN") != "0"
 
 type MetalWeight struct {
 	q4   *metalbackend.Weight
+	q5   *metalbackend.Weight
 	q6   *metalbackend.Weight
 	typ  GGMLType
 	rows int
@@ -46,6 +49,11 @@ func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int, borrow bool) 
 			return nil
 		}
 		w.q4 = metalbackend.PrepareQ4K(data, rows, cols, borrow)
+	case GGMLTypeQ5_K:
+		if rows < metalQ5KPrepareMinRows {
+			return nil
+		}
+		w.q5 = metalbackend.PrepareQ5K(data, rows, cols, borrow)
 	case GGMLTypeQ6_K:
 		if rows < metalQ6KPrepareMinRows {
 			return nil
@@ -54,7 +62,7 @@ func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int, borrow bool) 
 	default:
 		return nil
 	}
-	if w.q4 == nil && w.q6 == nil {
+	if w.q4 == nil && w.q5 == nil && w.q6 == nil {
 		return nil
 	}
 	return w
@@ -72,6 +80,12 @@ func metalWeightUsesDirect(w *MetalWeight) bool {
 		// work for the large FFN/vocabulary-shaped matrices that amortize the
 		// command-buffer boundary.
 		return w.rows >= metalQ4KDirectMinRows
+	case GGMLTypeQ5_K:
+		// Q5_K carries Q4_K's scale structure with an extra bitplane, so its
+		// CPU kernel is slightly slower per row than Q4_K's while the GPU cost
+		// is nearly identical — the crossover therefore sits at the Q6_K
+		// threshold rather than Q4_K's higher one.
+		return w.rows >= metalQ5KDirectMinRows
 	case GGMLTypeQ6_K:
 		return w.rows >= metalQ6KDirectMinRows
 	default:
@@ -85,6 +99,14 @@ func matvecMetalQ4KInto(w *MetalWeight, x []float32, rows, cols int, out *[]floa
 	}
 	ensureLenNoClear(out, rows)
 	return metalbackend.MatvecQ4K(w.q4, x, *out)
+}
+
+func matvecMetalQ5KInto(w *MetalWeight, x []float32, rows, cols int, out *[]float32) bool {
+	if !metalWeightUsesDirect(w) || w.q5 == nil || w.typ != GGMLTypeQ5_K || w.rows != rows || w.cols != cols || len(x) < cols {
+		return false
+	}
+	ensureLenNoClear(out, rows)
+	return metalbackend.MatvecQ5K(w.q5, x, *out)
 }
 
 func matvecMetalQ6KInto(w *MetalWeight, x []float32, rows, cols int, out *[]float32) bool {
