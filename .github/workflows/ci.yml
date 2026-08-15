@@ -48,6 +48,35 @@ jobs:
       - name: Build all release targets
         run: make cross-build
 
+  no-image-decoders:
+    # The noimagedecoders tag drops image/png and image/jpeg (and with them
+    # compress/zlib, compress/flate, hash/adler32 and hash/crc32) from the
+    # inference library's dependency closure. Nothing in the default build
+    # exercises that configuration, so without this job it would rot silently:
+    # the first untagged import of either decoder makes the tag a no-op, and
+    # the first compile error behind it goes unnoticed until someone tries the
+    # build. TestImageDecodersAreDroppable catches the former, this job the
+    # latter.
+    name: Build without image decoders
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build -tags noimagedecoders ./...
+
+      - name: Vet
+        run: go vet -tags noimagedecoders ./...
+
+      - name: Test
+        run: go test -tags noimagedecoders ./...
+
   wasm-build:
     name: Wasm build
     runs-on: ubuntu-latest

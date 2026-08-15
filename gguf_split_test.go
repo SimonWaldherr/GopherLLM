@@ -87,6 +87,83 @@ func splitTinyLlamaGGUF() (shard1, shard2 []byte) {
 	return buildGGUF(3, shard1KVs, part1Tensors), buildGGUF(3, shard2KVs, part2Tensors)
 }
 
+// splitPathPrefix is a guard as much as a parser: everything it accepts turns
+// into an OpenMmap of a reconstructed sibling path, so a name it accepts too
+// loosely surfaces as a confusing "failed to open shard" rather than as the
+// "this file is not part of a split" error the caller wants.
+func TestSplitPathPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		path   string
+		prefix string
+		ok     bool
+	}{
+		// Accepted.
+		{"tiny-split-00001-of-00002.gguf", "tiny-split", true},
+		{"/models/llama-70b-00003-of-00015.gguf", "/models/llama-70b", true},
+		{`C:\models\llama-70b-00003-of-00015.gguf`, `C:\models\llama-70b`, true},
+		// The prefix may be empty: the suffix alone is a legal filename.
+		{"-00001-of-00002.gguf", "", true},
+		// The suffix is fixed-length and end-anchored, so a prefix that itself
+		// looks like a shard suffix is not ambiguous — only the trailing
+		// occurrence is the suffix, which is what the old greedy (.*) also did.
+		{"m-00001-of-00002-00003-of-00004.gguf", "m-00001-of-00002", true},
+		// Deliberately accepted where the regexp rejected it: '.' did not match
+		// '\n', but a newline is a legal byte in a POSIX filename and the prefix
+		// is only ever concatenated back into sibling paths.
+		{"dir\nname-00001-of-00002.gguf", "dir\nname", true},
+
+		// Rejected: wrong number of digits in either field.
+		{"m-0001-of-00002.gguf", "", false},
+		{"m-000001-of-00002.gguf", "", false},
+		{"m-00001-of-0002.gguf", "", false},
+		{"m-00001-of-000002.gguf", "", false},
+		// Rejected: non-digits in either field.
+		{"m-0000a-of-00002.gguf", "", false},
+		{"m-00001-of-0000x.gguf", "", false},
+		// Rejected: a sign is not a digit. strconv.Atoi would accept both of
+		// these, which is exactly why the digits are checked by hand.
+		{"m--0001-of-00002.gguf", "", false},
+		{"m-+0001-of-00002.gguf", "", false},
+		{"m-00001-of--0002.gguf", "", false},
+		// Rejected: the fixed literals around the digits.
+		{"m 00001-of-00002.gguf", "", false},
+		{"m-00001-oF-00002.gguf", "", false},
+		{"m-00001_of_00002.gguf", "", false},
+		// Rejected: wrong extension, and the case-sensitive .gguf test. Both
+		// spellings are five bytes long, so only the extension check can be
+		// what rejects them.
+		{"model-00001-of-00002.ggml", "", false},
+		{"model-00001-of-00002.GGUF", "", false},
+		// Rejected: shorter than the suffix itself, including by one byte.
+		{"", "", false},
+		{"model.gguf", "", false},
+		{"-00001-of-0002.gguf", "", false},
+	} {
+		prefix, ok := splitPathPrefix(tc.path)
+		if ok != tc.ok || prefix != tc.prefix {
+			t.Errorf("splitPathPrefix(%q) = (%q, %v), want (%q, %v)", tc.path, prefix, ok, tc.prefix, tc.ok)
+		}
+	}
+}
+
+// splitPathPrefix and splitShardPath are used as a pair — the prefix parsed out
+// of the path the user passed is fed straight back in to name every sibling —
+// so they have to round-trip for the shard indices that actually occur.
+func TestSplitShardPathRoundTrips(t *testing.T) {
+	for _, prefix := range []string{"", "m", "tiny-split", "/models/llama-70b", "already-00001-of-00002"} {
+		for _, count := range []int{2, 15, 99999} {
+			for _, index := range []int{1, count} {
+				path := splitShardPath(prefix, index, count)
+				got, ok := splitPathPrefix(path)
+				if !ok || got != prefix {
+					t.Errorf("splitPathPrefix(splitShardPath(%q, %d, %d)) = (%q, %v), want (%q, true)",
+						prefix, index, count, got, ok, prefix)
+				}
+			}
+		}
+	}
+}
+
 func TestLoadSplitGGUFMergesShards(t *testing.T) {
 	dir := t.TempDir()
 	shard1, shard2 := splitTinyLlamaGGUF()

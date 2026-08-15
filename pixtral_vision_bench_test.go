@@ -42,29 +42,45 @@ func benchVec(rng *rand.Rand, n int) []float32 {
 	return v
 }
 
+// benchF16Weight leaves the matrix in the f16 form mmproj files are actually
+// published in — which is what the vision loader now keeps, instead of
+// expanding every tensor into an owned float32 copy.
+func benchF16Weight(rng *rand.Rand, rows, cols int) Weight {
+	raw := make([]byte, rows*cols*2)
+	for i := range rows * cols {
+		h := F32ToF16(rng.Float32()*0.1 - 0.05)
+		raw[i*2], raw[i*2+1] = byte(h), byte(h>>8)
+	}
+	return Weight{Raw: raw, Type: GGMLTypeF16, Rows: rows, Cols: cols}
+}
+
 func benchVisionWeights(rng *rand.Rand, vc PixtralVisionConfig) PixtralVisionWeights {
+	return benchVisionWeightsTyped(rng, vc, benchF32Weight)
+}
+
+func benchVisionWeightsTyped(rng *rand.Rand, vc PixtralVisionConfig, mk func(*rand.Rand, int, int) Weight) PixtralVisionWeights {
 	dim := vc.EmbeddingLength
 	ff := vc.FeedForwardLength
 	merge := vc.SpatialMergeSize
 	w := PixtralVisionWeights{
-		PatchEmbd:   benchF32Weight(rng, dim, 3*vc.PatchSize*vc.PatchSize),
+		PatchEmbd:   mk(rng, dim, 3*vc.PatchSize*vc.PatchSize),
 		PreNorm:     benchVec(rng, dim),
 		InputNorm:   benchVec(rng, dim),
-		PatchMerger: benchF32Weight(rng, dim, dim*merge*merge),
-		Proj1:       benchF32Weight(rng, vc.ProjectionDim, dim),
-		Proj2:       benchF32Weight(rng, vc.ProjectionDim, vc.ProjectionDim),
+		PatchMerger: mk(rng, dim, dim*merge*merge),
+		Proj1:       mk(rng, vc.ProjectionDim, dim),
+		Proj2:       mk(rng, vc.ProjectionDim, vc.ProjectionDim),
 	}
 	for range vc.BlockCount {
 		w.Layers = append(w.Layers, PixtralVisionLayerWeights{
 			AttnNorm: benchVec(rng, dim),
-			Q:        benchF32Weight(rng, dim, dim),
-			K:        benchF32Weight(rng, dim, dim),
-			V:        benchF32Weight(rng, dim, dim),
-			Out:      benchF32Weight(rng, dim, dim),
+			Q:        mk(rng, dim, dim),
+			K:        mk(rng, dim, dim),
+			V:        mk(rng, dim, dim),
+			Out:      mk(rng, dim, dim),
 			FFNNorm:  benchVec(rng, dim),
-			FFNGate:  benchF32Weight(rng, ff, dim),
-			FFNUp:    benchF32Weight(rng, ff, dim),
-			FFNDown:  benchF32Weight(rng, dim, ff),
+			FFNGate:  mk(rng, ff, dim),
+			FFNUp:    mk(rng, ff, dim),
+			FFNDown:  mk(rng, dim, ff),
 		})
 	}
 	return w
@@ -94,18 +110,28 @@ func BenchmarkEncodeImagePixtral(b *testing.B) {
 		{"grid16x16", 16, 16},
 		{"grid32x32", 32, 32},
 	} {
-		b.Run(tc.name, func(b *testing.B) {
-			rng := rand.New(rand.NewSource(7))
-			vc := benchVisionConfig(8)
-			w := benchVisionWeights(rng, vc)
-			img := benchPreprocessedImage(rng, vc, tc.rows, tc.cols)
-			b.ResetTimer()
-			for b.Loop() {
-				if _, _, _, err := EncodeImagePixtral(vc, w, img); err != nil {
-					b.Fatal(err)
+		for _, wt := range []struct {
+			name string
+			mk   func(*rand.Rand, int, int) Weight
+		}{
+			// f16 is what a real mmproj ships as, so it is the case that
+			// matters; f32 is kept for comparison.
+			{"f16", benchF16Weight},
+			{"f32", benchF32Weight},
+		} {
+			b.Run(tc.name+"/"+wt.name, func(b *testing.B) {
+				rng := rand.New(rand.NewSource(7))
+				vc := benchVisionConfig(8)
+				w := benchVisionWeightsTyped(rng, vc, wt.mk)
+				img := benchPreprocessedImage(rng, vc, tc.rows, tc.cols)
+				b.ResetTimer()
+				for b.Loop() {
+					if _, _, _, err := EncodeImagePixtral(vc, w, img); err != nil {
+						b.Fatal(err)
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 }
 

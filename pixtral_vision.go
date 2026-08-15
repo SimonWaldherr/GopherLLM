@@ -179,8 +179,17 @@ func loadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal, borrowQuantiz
 
 	tensors := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
+	// lazyScalars: keep f16 tensors in their on-disk form instead of expanding
+	// them into owned float32. mmproj files are published as f16, so expanding
+	// doubled both the tower's resident size and the bytes every projection
+	// streams — and the f16 row dot is a vector kernel on both amd64 (F16C)
+	// and arm64 (FCVTL), so the conversion is free in-register. Borrowing is
+	// only requested when the caller retains the mapping (runtime.go keeps
+	// visionMappedFile alive for the Runner's lifetime); the exported
+	// LoadPixtralVisionModel still passes borrowQuantized=false and therefore
+	// still gets owned copies.
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrowQuantized, false, useMetal)
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrowQuantized, false, useMetal, true)
 	}
 
 	patchLen := 3 * patchSize * patchSize
@@ -192,6 +201,22 @@ func loadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal, borrowQuantiz
 	patchEmbd, err := load("v.patch_embd.weight")
 	if err != nil {
 		return config, PixtralVisionWeights{}, fmt.Errorf("loading vision projector: %w", err)
+	}
+	// Restate the conv2d kernel as the matrix the encoder actually multiplies
+	// by. loadWeight derives Rows/Cols generically from Dims[1]/Dims[0], which
+	// for this four-dimensional tensor are the two spatial axes (patch x
+	// patch) rather than the [embLen, 3*patch^2] linear layer that a
+	// stride==kernel convolution is equivalent to (see this function's doc
+	// comment, step 1).
+	//
+	// Only a borrowed tensor carries those fields into the matvec: an owned
+	// copy is a bare []float32 whose shape the caller re-derives from the
+	// activation width, which is why the wrong values were harmless until
+	// scalar tensors started being kept raw. Left uncorrected, the first
+	// projection writes embLen=patchSize outputs per patch and every later
+	// stage silently operates on truncated activations.
+	if patchEmbd.F32 == nil {
+		patchEmbd.Rows, patchEmbd.Cols = embLen, patchLen
 	}
 	patchEmbdB := loadOptionalF32Vec(data, gguf.DataOffset, "v.patch_embd.bias", tensors, inferred, embLen)
 
@@ -290,6 +315,21 @@ func loadPixtralVisionModel(data []byte, gguf *GGUFFile, useMetal, borrowQuantiz
 		Proj1: proj1, Proj1B: proj1B, Proj2: proj2, Proj2B: proj2B, ImgBreak: imgBreak,
 	}
 	return config, weights, nil
+}
+
+// negMaxF32 is the softmax running-maximum seed. Typed rather than untyped:
+// the attention loop seeds four float32 accumulators from it with :=, which
+// an untyped constant would infer as float64.
+const negMaxF32 float32 = -math.MaxFloat32
+
+// recipOrZero returns 1/d, or 0 when d is not positive. A head whose weights
+// all underflowed has nothing to contribute, and returning zero keeps its
+// already-cleared output row rather than turning it into NaN.
+func recipOrZero(d float32) float32 {
+	if d > 0 {
+		return 1 / d
+	}
+	return 0
 }
 
 // buildPixtralRope2DInvFreq builds the row- and column-axis inverse
@@ -532,19 +572,86 @@ func EncodeImagePixtral(vc PixtralVisionConfig, weights PixtralVisionWeights, im
 				}
 			}
 		}
+		// attendQuad is attendOne for four queries at once, and it exists for
+		// bandwidth rather than arithmetic. attendOne streams this head's whole
+		// K block and then its whole V block for every single query, so a block
+		// reads n*heads*2*n*headDim floats — at a 32x32 grid that is ~2 GB per
+		// block, which is why attention dominated the profile even after the
+		// head-major relayout made those reads sequential.
+		//
+		// Sharing each K/V row across four queries cuts that traffic 4x. The
+		// shape is exactly what dotF32x4/axpyF32x4 were written for in grouped
+		// attention (four query heads against one shared K/V row), so on arm64
+		// this lands on hand-written NEON kernels that keep the shared row in
+		// registers across all four; elsewhere the portable composition still
+		// gets the traffic reduction, because the shared row stays in L1 across
+		// its four uses.
+		attendQuad := func(i0 int, scores []float32) {
+			for h := 0; h < heads; h++ {
+				off := h * headDim
+				kh := kHead[h*n*headDim : (h+1)*n*headDim]
+				vh := vHead[h*n*headDim : (h+1)*n*headDim]
+				q0 := q[i0][off : off+headDim]
+				q1 := q[i0+1][off : off+headDim]
+				q2 := q[i0+2][off : off+headDim]
+				q3 := q[i0+3][off : off+headDim]
+				s0 := scores[0*n : 1*n]
+				s1 := scores[1*n : 2*n]
+				s2 := scores[2*n : 3*n]
+				s3 := scores[3*n : 4*n]
+
+				m0, m1, m2, m3 := negMaxF32, negMaxF32, negMaxF32, negMaxF32
+				for j := 0; j < n; j++ {
+					a, b, c, d := dotF32x4(&q0[0], &q1[0], &q2[0], &q3[0], &kh[j*headDim], headDim)
+					a, b, c, d = a*scale, b*scale, c*scale, d*scale
+					s0[j], s1[j], s2[j], s3[j] = a, b, c, d
+					m0, m1, m2, m3 = max(m0, a), max(m1, b), max(m2, c), max(m3, d)
+				}
+
+				// Each query has its own max and normalizer; a zero denominator
+				// becomes a zero reciprocal so its output stays cleared rather
+				// than producing NaN.
+				var d0, d1, d2, d3 float32
+				for j := 0; j < n; j++ {
+					s0[j] = fastExpF32(s0[j] - m0)
+					s1[j] = fastExpF32(s1[j] - m1)
+					s2[j] = fastExpF32(s2[j] - m2)
+					s3[j] = fastExpF32(s3[j] - m3)
+					d0, d1, d2, d3 = d0+s0[j], d1+s1[j], d2+s2[j], d3+s3[j]
+				}
+				inv0, inv1 := recipOrZero(d0), recipOrZero(d1)
+				inv2, inv3 := recipOrZero(d2), recipOrZero(d3)
+
+				out0 := attnOut[i0][off : off+headDim]
+				out1 := attnOut[i0+1][off : off+headDim]
+				out2 := attnOut[i0+2][off : off+headDim]
+				out3 := attnOut[i0+3][off : off+headDim]
+				clear(out0)
+				clear(out1)
+				clear(out2)
+				clear(out3)
+				for j := 0; j < n; j++ {
+					axpyF32x4(&out0[0], &out1[0], &out2[0], &out3[0],
+						s0[j]*inv0, s1[j]*inv1, s2[j]*inv2, s3[j]*inv3,
+						&vh[j*headDim], headDim)
+				}
+			}
+		}
+
 		attend := func(start, end int) {
-			scores := make([]float32, n)
-			for i := start; i < end; i++ {
+			scores := make([]float32, 4*n)
+			i := start
+			for ; i+4 <= end; i += 4 {
+				attendQuad(i, scores)
+			}
+			for ; i < end; i++ {
 				attendOne(i, scores)
 			}
 		}
 		if n >= 64 && heads > 1 {
 			parallelChunks(n, attend)
 		} else {
-			scores := make([]float32, n)
-			for i := range x {
-				attendOne(i, scores)
-			}
+			attend(0, n)
 		}
 
 		matvecBatch(layer.Out, attnOut, normed)

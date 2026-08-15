@@ -1,10 +1,10 @@
 package gopherllm
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -874,8 +874,19 @@ func medianFloat(v []float64) float64 {
 
 // autoTuneKey identifies "this model on this machine": tuning transfers between
 // runs only when both the model geometry/quantization and the hardware match.
+//
+// The hash is FNV-1a, not SHA-256, because nothing here is adversarial: the key
+// only names a file in the caller's own cache directory, and the worst a
+// collision can do is transfer one set of tuning knobs between two models that
+// happened to hash alike. Paying for a cryptographic hash is not free in a
+// library — importing crypto/sha256 anywhere in the root package drags the
+// FIPS-140 crypto tree (aes, gcm, sha3, hmac, drbg, entropy, sysrand, ...) into
+// the dependency closure of every program that merely embeds GopherLLM, which
+// is a real cost to charge an embedder for two cache keys. fnv.New128a sums 16
+// bytes, so the 24-hex-character truncation below still yields the same 96-bit
+// key as before.
 func (r *Runner) autoTuneKey() string {
-	h := sha256.New()
+	h := fnv.New128a()
 	fmt.Fprintf(h, "v1|%s|%s|dim=%d|layers=%d|heads=%d/%d|hidden=%d|vocab=%d|out=%v|embd=%v|metal=%t|prepared=%t|%s",
 		r.arch, hostFingerprint(),
 		r.config.Dim, r.config.NLayers, r.config.NHeads, r.config.NKVHeads,

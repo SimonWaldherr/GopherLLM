@@ -33,15 +33,66 @@ package gopherllm
 
 import (
 	"fmt"
-	"regexp"
 )
 
-// splitFilePattern matches "<prefix>-NNNNN-of-MMMMM.gguf" (5-digit,
-// zero-padded, as produced by llama.cpp's gguf-split and llama_split_path).
-var splitFilePattern = regexp.MustCompile(`^(.*)-(\d{5})-of-(\d{5})\.gguf$`)
+// splitPathPrefix is the inverse of splitShardPath: it recognises
+// "<prefix>-NNNNN-of-MMMMM.gguf" (5-digit, zero-padded, as produced by
+// llama.cpp's gguf-split and llama_split_path) and returns the shared prefix
+// that names the whole shard set. ok is false for anything else.
+//
+// Only the prefix is consumed by callers — the authoritative shard count comes
+// from each shard's split.count metadata, never from the filename — but the two
+// numeric fields are still validated, because that validation is the whole
+// point of the call: it establishes that the file really was named by
+// gguf-split, and therefore that its siblings can be found by feeding the
+// prefix back through splitShardPath.
+//
+// The suffix is anchored to the end of the string and has a fixed length, so
+// there is exactly one offset it can occupy and the prefix is unambiguously
+// everything before it. (This used to be a regexp with a greedy (.*) prefix
+// group, which for the same reason could only ever match at that one offset;
+// hand-parsing it keeps regexp — ~458 KB of binary — out of the library's
+// dependency closure for this, its single use.)
+//
+// One deliberate behaviour change from that regexp: '.' does not match '\n'
+// without (?s), so a path containing a newline anywhere before the suffix used
+// to be rejected. Newlines are legal in POSIX filenames and nothing downstream
+// cares (the prefix is only ever concatenated back into sibling paths), so such
+// a path is now accepted — the old rejection was an artefact of the regexp
+// engine's defaults rather than a rule about how shards may be named.
+func splitPathPrefix(path string) (prefix string, ok bool) {
+	const suffixLen = len("-NNNNN-of-MMMMM.gguf")
+	if len(path) < suffixLen {
+		return "", false
+	}
+	s := path[len(path)-suffixLen:]
+	// The extension test is case-sensitive, as the regexp was: gguf-split emits
+	// lowercase, and a ".GGUF" sibling would not be found under the name we
+	// reconstruct for it anyway.
+	if s[0] != '-' || s[6:10] != "-of-" || s[15:] != ".gguf" {
+		return "", false
+	}
+	if !splitFieldIsDigits(s[1:6]) || !splitFieldIsDigits(s[10:15]) {
+		return "", false
+	}
+	return path[:len(path)-suffixLen], true
+}
+
+// splitFieldIsDigits stands in for the regexp's \d, which is ASCII-only, and is
+// called with the two fixed-width numeric fields of a shard filename. It checks
+// the bytes itself rather than round-tripping through strconv.Atoi, which
+// accepts a leading '+' or '-' and would let "-0001" pass as a shard number.
+func splitFieldIsDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
 
 // splitShardPath builds the filename for shard number (1-based) of count,
-// given the shared prefix extracted by splitFilePattern.
+// given the shared prefix extracted by splitPathPrefix.
 func splitShardPath(prefix string, index, count int) string {
 	return fmt.Sprintf("%s-%05d-of-%05d.gguf", prefix, index, count)
 }
@@ -97,12 +148,11 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 
 	firstNo, count, _ := splitInfo(firstGGUF)
 
-	m := splitFilePattern.FindStringSubmatch(path)
-	if m == nil {
+	prefix, isSplitFilename := splitPathPrefix(path)
+	if !isSplitFilename {
 		return nil, 0, fmt.Errorf("model declares split.count=%d but its filename %q does not match the "+
 			"<prefix>-NNNNN-of-MMMMM.gguf split convention; rename it to match its sibling shards", count, path)
 	}
-	prefix := m[1]
 
 	shards = make([]shard, count)
 	for i := 1; i <= count; i++ {

@@ -50,9 +50,42 @@ func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]flo
 // prompt reads the weights ~once instead of P times. Prefill is memory-bandwidth
 // bound, so this is close to a P-fold speedup for the matvecs.
 
+// dotRowIntoBatch writes one weight row's dot product against every token into
+// column r of each output.
+//
+// The naive form — DotF32(row, xs[t]) per token — is what every target other
+// than arm64 still runs, and it is the right choice there. On arm64, dotF32x4
+// is a hand-written 4-wide NEON kernel that holds the shared row in registers
+// while consuming four token vectors against it (attention_gqa_arm64.s, written
+// for the transposed case: four query heads against one shared K row), so
+// tiling the token loop through it reuses each row four times per load.
+//
+// The tiled flag is gated on hasFastDotF32x4 rather than applied everywhere,
+// because where dotF32x4 is a portable composition of four DotF32 calls the
+// tiling is pure overhead: measured on amd64 it cost ~1.4x on the vision tower.
+// The win is register-level row reuse, not an algorithmic change, so it exists
+// only where the kernel does.
+//
+// This is the batched/prefill path, so it covers vision-tower encoding — where
+// every block runs seven of these over the full patch grid — as well as text
+// prefill.
+func dotRowIntoBatch(row []float32, xs, outs [][]float32, r, p, cols int, tiled bool) {
+	t := 0
+	if tiled {
+		for ; t+4 <= p; t += 4 {
+			s0, s1, s2, s3 := dotF32x4(&xs[t][0], &xs[t+1][0], &xs[t+2][0], &xs[t+3][0], &row[0], cols)
+			outs[t][r], outs[t+1][r] = s0, s1
+			outs[t+2][r], outs[t+3][r] = s2, s3
+		}
+	}
+	for ; t < p; t++ {
+		outs[t][r] = DotF32(row, xs[t])
+	}
+}
+
 // matvecBatch computes outs[p][r] = dot(weightRow_r, xs[p]) for every token p and
 // row r. For quantized weights it dequantizes each row ONCE (the expensive
-// nibble-unpack + scale step) into a scratch buffer, then does P cheap AVX2 float
+// nibble-unpack + scale step) into a scratch buffer, then does P cheap float
 // dots against it. Prefill matvecs are compute-bound, so amortizing the
 // dequantization across the whole prompt chunk is the win. outs[p] must be
 // pre-sized to the weight's row count.
@@ -66,17 +99,53 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 		return
 	}
 
+	// tiled reports whether the 4-wide token kernel can be used: it takes bare
+	// pointers, so every token vector must be at least cols long.
+	tiled := hasFastDotF32x4 && p >= 4
+	if tiled {
+		for t := 0; t < p; t++ {
+			if len(xs[t]) < cols {
+				tiled = false
+				break
+			}
+		}
+	}
+
 	if w.F32 != nil {
 		rows := len(w.F32) / cols
 		parallelRowsBatched(rows, func(start, end int) {
 			for r := start; r < end; r++ {
 				row := w.F32[r*cols : (r+1)*cols]
-				for t := 0; t < p; t++ {
-					outs[t][r] = DotF32(row, xs[t])
-				}
+				dotRowIntoBatch(row, xs, outs, r, p, cols, tiled)
 			}
 		})
 		return
+	}
+
+	// Raw (unexpanded) F16/BF16/F32 weights: keep the same weight-stationary
+	// shape as the F32 path above rather than falling through to the
+	// per-token fallback, which would re-read the whole matrix once per token.
+	// For f16 the row dot is a real vector kernel (see rawScalarDot), so this
+	// reads half the bytes of an expanded F32 copy and converts in-register.
+	//
+	// This is the path out-of-core models take for every scalar matrix, and
+	// the one a vision tower's f16 mmproj takes for all seven of its
+	// per-block projections.
+	if rawScalarWeight(w) && w.Rows > 0 && w.Cols == cols {
+		if width := scalarBytesPerElement(w.Type); width > 0 {
+			rowBytes := cols * width
+			if len(w.Raw) >= w.Rows*rowBytes {
+				parallelRowsBatched(w.Rows, func(start, end int) {
+					for r := start; r < end; r++ {
+						off := r * rowBytes
+						for t := 0; t < p; t++ {
+							outs[t][r] = rawScalarDot(w.Raw, w.Type, off, xs[t], cols)
+						}
+					}
+				})
+				return
+			}
+		}
 	}
 
 	if useQ8Activations.Load() && matvecBatchQ8(w, xs, outs) {
@@ -102,9 +171,7 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 		deq := *scratch
 		for r := start; r < end; r++ {
 			dequant(w.Raw[r*rowBytes:(r+1)*rowBytes], cols, deq)
-			for t := 0; t < p; t++ {
-				outs[t][r] = DotF32(deq, xs[t])
-			}
+			dotRowIntoBatch(deq, xs, outs, r, p, cols, tiled)
 		}
 		*scratch = deq[:0]
 		batchDequantScratchPool.Put(scratch)

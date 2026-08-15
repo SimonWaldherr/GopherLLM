@@ -21,6 +21,7 @@ server exposes the compatible chat API.
 - [Features](#features)
 - [Engine first: standalone or connected](#engine-first-standalone-or-connected)
 - [Use cases](#use-cases)
+- [Example AI integrations](#example-ai-integrations)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
@@ -193,8 +194,13 @@ variable (see [Make Targets](#make-targets)) that `make` targets use to fill in
 
 The checked-in Go module intentionally has no third-party dependencies: its
 `go.mod` contains only this module and the Go version, and `make deps-check`
-enforces that policy. The embedded chat UI is also self-contained; it does not
-load packages, fonts, or scripts from a CDN.
+enforces that policy. The embedded chat UI is self-contained as well: by default
+it loads no packages, fonts, or scripts, and its `script-src` stays `'self'`.
+The single exception is opt-in per request — `?mermaid=jsdelivr` (or `unpkg`,
+`cdnjs`) on the chat page loads a diagram renderer from that one operator-chosen
+origin, and widens the CSP by exactly that origin. It is a query parameter
+rather than the default because embedding ~2.8 MB of Mermaid in every binary,
+for a feature most sessions never use, is the worse trade.
 
 The module-root Go files form the public `gopherllm` package, so core package
 sources remain there to preserve the stable import path
@@ -363,13 +369,35 @@ in `net/http`, `html/template`, or the web assets:
 
 | Import | You get | Transitive deps |
 |---|---|---|
-| `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 102 |
+| `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 90 |
 | `github.com/SimonWaldherr/GopherLLM/huggingface` | Hub search, variant listing, and `owner/repo` → local GGUF resolution | 192 |
-| `github.com/SimonWaldherr/GopherLLM/server` | the above **plus** the OpenAI-/Ollama-compatible HTTP API and the `/chat` web UI | 194 |
+| `github.com/SimonWaldherr/GopherLLM/server` | the above **plus** the OpenAI-/Ollama-compatible HTTP API and the `/chat` web UI | 213 |
 
-A minimal inference-only binary is ~3.4 MB against ~9.1 MB for the full CLI.
 `TestInferencePackageStaysFreeOfServerDependencies` enforces the boundary
 against the real dependency graph, so it cannot regress silently.
+
+Those counts are all standard library — the module has no `require` block, no
+`go.sum` and no vendor directory — but stdlib is not the same as free, since an
+embedder compiles every package in the closure. The root package therefore
+avoids `crypto/sha256` and `regexp`, each of which cost far more than its single
+use was worth, and `TestInferencePackageStaysFreeOfTheCryptoAndRegexpTrees` pins
+that.
+
+The PNG and JPEG decoders are the remaining optional chunk. Vision needs them,
+so they are a build-time knob rather than a removal:
+
+```sh
+go build -tags noimagedecoders ./...
+```
+
+That takes the root package from 90 transitive dependencies to 83, dropping
+`image/png` and `image/jpeg` along with `compress/zlib`, `compress/flate`,
+`hash/adler32` and `hash/crc32`. The public API is unchanged either way —
+`image.Image` stays in `DecodeImageBytes`' and `PreprocessImagePixtral`'s
+signatures — and so is the default build; what the tag costs is PNG and JPEG
+input to the vision path. Because Go's image-format registry is process-global,
+a program built with the tag can take back just the formats it wants with its
+own `import _ "image/png"`.
 
 Hub access is a separate import for the same reason: it needs `net/http`, which
 drags in `crypto/tls` and the HTTP/2 stack. A program that only ever opens a

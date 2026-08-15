@@ -187,7 +187,26 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		"function restartLiveTimelineSampler(",
 		"function liveTimelineFrameLimit(",
 		"function setLiveHealth(",
-		"sampled one second apart",
+		// The collage prompt states the panel count and the measured time span
+		// instead of asserting a fixed sampling rate. The rate is set by a
+		// main-thread timer that cannot tick while browser-mode inference holds
+		// the thread, so a hardcoded "sampled one second apart" described the
+		// image wrongly exactly when it mattered most.
+		"captured over the last ",
+		" seconds and arranged oldest first",
+		"Panels that looked ",
+		// Multi-frame plumbing: budgeted layout, motion-based selection, and
+		// on-demand capture are what make the timeline modes affordable and
+		// actually multi-frame. Losing any of them silently reverts the mode to
+		// "one expensive picture of a static scene".
+		"function planCollageLayout(",
+		"function selectDistinctFrames(",
+		"function fillLiveTimelineBurst(",
+		"function frameSignature(",
+		"function frameDifference(",
+		"function liveTimelineWindowSeconds(",
+		"const LIVE_MOTION_THRESHOLD = ",
+		"const MIN_CELL_WIDTH = ",
 		"function startLiveFrameProgress(",
 		"function setLiveOutputStatus(",
 		"function setLiveCaptureButtonState(",
@@ -209,7 +228,12 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		`model.vision ? "Vision" : "No vision"`,
 		"maxTokens: liveSettings.maxTokens",
 		"maxTokens: Math.min(64",
-		"You are describing one current live camera frame.",
+		// Single-frame and collage requests get different instructions: one
+		// describes a frame, the other describes what changed between panels.
+		// The wording is built from `source` so screen capture and camera stay
+		// in step without a second copy of each sentence.
+		"You are describing one current live \" + source + \" frame.",
+		"You are describing how one live \" + source + \" view changed across the panels.",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("chat script missing interaction contract %q", want)

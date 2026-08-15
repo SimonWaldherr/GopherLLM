@@ -4,18 +4,31 @@ import (
 	"bytes"
 	"fmt"
 	"image"
-	_ "image/jpeg"
-	_ "image/png"
 	"math"
 )
 
 // DecodeImageBytes decodes a PNG/JPEG image from raw bytes using the
-// standard library's format-sniffing image.Decode (the blank image/jpeg and
-// image/png imports above register those two decoders; no third-party code
-// or go.mod entry is involved, both packages ship with the Go toolchain).
+// standard library's format-sniffing image.Decode. The decoders themselves
+// are registered by the blank imports in image_decoders.go, which the
+// noimagedecoders build tag removes to keep seven stdlib packages out of a
+// text-only consumer's dependency closure; no third-party code or go.mod
+// entry is involved either way, every package concerned ships with the Go
+// toolchain.
+//
+// image.Decode is called unconditionally, including in the build where this
+// package registered nothing, because the format registry is global: a
+// consumer who opted out may have re-registered PNG or some other format
+// from its own import, and that has to keep working. The tag only changes
+// what happens once a decode has already failed, and then only to say why —
+// someone who fed a perfectly valid PNG to a stripped-down build cannot
+// otherwise tell a corrupt file from a missing decoder, since the stdlib
+// reports both as "image: unknown format".
 func DecodeImageBytes(data []byte) (image.Image, error) {
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
+		if !imageDecodersLinked {
+			return nil, fmt.Errorf(`decoding image: %w: this binary was built with -tags noimagedecoders, so the standard image/png and image/jpeg decoders are not linked in; rebuild without that tag, or blank-import the formats you need (import _ "image/png") somewhere in your own program to register them`, err)
+		}
 		return nil, fmt.Errorf("decoding image: %w", err)
 	}
 	return img, nil

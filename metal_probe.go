@@ -1,10 +1,10 @@
 package gopherllm
 
 import (
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -58,13 +58,17 @@ func (p MetalProbe) SummaryLine() string {
 
 // metalProbeKey identifies a model+machine pairing. The file's size and
 // modification time stand in for its contents, which is enough to notice a
-// swapped or re-quantized model without hashing gigabytes.
+// swapped or re-quantized model without hashing gigabytes. FNV-1a for the same
+// reason as autoTuneKey: this only names a file in the caller's cache
+// directory, so there is no adversary to defend against, and a cryptographic
+// hash would pull the whole crypto tree into the dependency closure of every
+// program embedding this library.
 func metalProbeKey(path string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return "", err
 	}
-	h := sha256.New()
+	h := fnv.New128a()
 	fmt.Fprintf(h, "metal-v%d|%s|%d|%d|%s",
 		metalProbeVersion, filepath.Base(path), info.Size(), info.ModTime().UnixNano(), hostFingerprint())
 	return hex.EncodeToString(h.Sum(nil))[:24], nil

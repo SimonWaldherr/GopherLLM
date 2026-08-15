@@ -5609,22 +5609,121 @@ function toMarkdown(chat) {
     return liveContextMode === "timeline" ? 6 : 5;
   }
 
+  // The window each mode advertises in its own UI label ("Change · 5 sec",
+  // "Timeline · 10 sec"). Frames older than this are not merely surplus, they
+  // make that label a lie, so they are discarded rather than shown.
+  function liveTimelineWindowSeconds() {
+    return liveContextMode === "timeline" ? 10 : 5;
+  }
+
+  /* A frame's motion signature: mean luma over a coarse grid, small enough
+     (SIG_W x SIG_H bytes) to keep one per buffered frame and to diff two of
+     them in a few hundred operations.
+
+     This exists so the collage can spend its pixel budget on moments that
+     actually differ. A parked camera pointed at an empty corridor otherwise
+     produces six identical tiles, which costs six times the vision tokens of
+     one tile and tells the model exactly as much as one tile would. */
+  const SIG_W = 32;
+  const SIG_H = 18;
+  let liveSignatureCanvasCtx = null;
+
+  function frameSignature() {
+    if (!liveSignatureCanvasCtx) {
+      const canvas = document.createElement("canvas");
+      canvas.width = SIG_W;
+      canvas.height = SIG_H;
+      liveSignatureCanvasCtx = canvas.getContext("2d", { alpha: false, willReadFrequently: true });
+    }
+    const context = liveSignatureCanvasCtx;
+    try {
+      context.drawImage(captureVideoEl, 0, 0, SIG_W, SIG_H);
+      const { data } = context.getImageData(0, 0, SIG_W, SIG_H);
+      const luma = new Uint8Array(SIG_W * SIG_H);
+      for (let i = 0; i < luma.length; i++) {
+        // Rec. 601 luma, integer-weighted: chroma changes matter far less than
+        // brightness structure for "did something move here".
+        luma[i] = (data[i * 4] * 77 + data[i * 4 + 1] * 150 + data[i * 4 + 2] * 29) >> 8;
+      }
+      return luma;
+    } catch (_) {
+      // getImageData throws on a tainted canvas. Camera and screen-share
+      // streams are same-origin so this should not happen, but a null
+      // signature degrades to "assume it moved" rather than losing the frame.
+      return null;
+    }
+  }
+
+  // Mean absolute luma difference, 0..255. Null signatures compare as "moved"
+  // so an unreadable frame is never silently dropped as a duplicate.
+  function frameDifference(a, b) {
+    if (!a || !b || a.length !== b.length) return 255;
+    let sum = 0;
+    for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+    return sum / a.length;
+  }
+
+  /* Below this mean-luma delta two frames are treated as the same moment.
+     Sensor noise on a still camera sits around 1-2; a person crossing a
+     quarter of the view moves it well past 10. Six is comfortably above the
+     noise floor without discarding slow drift. */
+  const LIVE_MOTION_THRESHOLD = 6;
+
   async function sampleLiveTimelineFrame() {
     if (liveContextMode === "current" || !liveVisionRunning || liveTimelineCapturePending || !captureVideoEl.videoWidth || !captureVideoEl.videoHeight) return;
     const epoch = liveTimelineEpoch;
     liveTimelineCapturePending = true;
     try {
+      // Taken before the (awaited) JPEG encode so the signature describes the
+      // same instant as the frame it labels.
+      const signature = frameSignature();
       const image = await captureLiveFrame("timeline");
       // A previous camera/session may finish JPEG encoding after a restart.
       // Do not leak that old image into the new stream's timeline.
       if (epoch !== liveTimelineEpoch || !liveVisionRunning || liveContextMode === "current") return;
-      liveTimelineFrames.push({ image, capturedAt: new Date() });
+      liveTimelineFrames.push({ image, capturedAt: new Date(), signature });
       if (liveTimelineFrames.length > liveTimelineFrameLimit()) liveTimelineFrames.shift();
     } catch (_) {
       // The inference loop reports capture errors; a missed background sample
       // merely leaves the next collage with fewer distinct moments.
     } finally {
       liveTimelineCapturePending = false;
+    }
+  }
+
+  /* Fill the timeline buffer by capturing a short burst right now.
+
+     The 1 Hz background sampler is a timer, and a timer is a main-thread
+     event. In browser inference mode the wasm module holds the main thread
+     for the whole of each generation (see wasm-bridge.js: go.run() is not in
+     a worker), so no tick fires while the model is thinking -- a 30-second
+     inference yields at most one sample per cycle. The buffer then holds
+     moments 30 seconds apart while the prompt claims they are one second
+     apart, and below two frames the collage silently degrades to a single
+     frame.
+
+     Sampling on demand is immune to that: it runs in the gap between
+     generations, where the thread is ours. */
+  async function fillLiveTimelineBurst(count, signal) {
+    const gapMs = 250;
+    // Captures `count` NEW frames rather than topping the buffer up to a
+    // total: between two browser-mode generations the buffer is typically
+    // full AND entirely stale, so "it already holds enough" is exactly the
+    // wrong test.
+    for (let i = 0; i < count; i++) {
+      if (!liveVisionRunning || liveVisionPaused || (signal && signal.aborted)) return;
+      if (!captureVideoEl.videoWidth || !captureVideoEl.videoHeight) return;
+      const epoch = liveTimelineEpoch;
+      try {
+        const signature = frameSignature();
+        const image = await captureLiveFrame("timeline");
+        if (epoch !== liveTimelineEpoch || !liveVisionRunning) return;
+        liveTimelineFrames.push({ image, capturedAt: new Date(), signature });
+        if (liveTimelineFrames.length > liveTimelineFrameLimit()) liveTimelineFrames.shift();
+      } catch (_) {
+        return;
+      }
+      if (i + 1 < count) await sleep(gapMs);
     }
   }
 
@@ -5644,40 +5743,171 @@ function toMarkdown(chat) {
     });
   }
 
-  function timelineTimestamp(date) {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  // Frames are labelled by age, not wall-clock time. "-4.2s" is what the
+  // question is actually about ("what changed since then"), it survives the
+  // sampler running at an irregular rate, and it needs roughly half the label
+  // width of "14:23:45" -- which matters because the label strip is charged
+  // against the same pixel budget as the imagery.
+  function timelineAgeLabel(date, now) {
+    const seconds = Math.max(0, (now - date) / 1000);
+    if (seconds < 0.35) return "now";
+    return "-" + seconds.toFixed(1) + "s";
   }
 
-  async function buildLiveTimelineCollage() {
-    const sourceFrames = liveTimelineFrames.slice(-liveTimelineFrameLimit());
-    const frameLimit = liveTimelineCollageLimit();
-    const frames = sourceFrames.length <= frameLimit
-      ? sourceFrames
-      : Array.from({ length: frameLimit }, (_, index) => sourceFrames[Math.round(index * (sourceFrames.length - 1) / (frameLimit - 1))]);
-    if (frames.length < 2) return null;
-    const images = await Promise.all(frames.map((frame) => loadImageForCanvas(frame.image)));
-    const cellWidth = 256;
-    const cellHeight = Math.max(1, Math.round(images[0].height * cellWidth / Math.max(images[0].width, 1)));
-    const labelHeight = 26;
-    const columns = frames.length <= 2 ? frames.length : 3;
-    const rows = Math.ceil(frames.length / columns);
+  /* Pick the most recent genuinely distinct moments, newest first, then put
+     them back in chronological order.
+
+     Selecting by motion rather than by even spacing is the whole point of the
+     timeline modes: on a moving scene it keeps the moments that differ, and on
+     a still one it collapses to a single tile instead of paying for six copies
+     of the same picture. */
+  function selectDistinctFrames(source, limit) {
+    const picked = [];
+    let reference = null;
+    for (let i = source.length - 1; i >= 0 && picked.length < limit; i--) {
+      const frame = source[i];
+      if (reference && frameDifference(frame.signature, reference.signature) < LIVE_MOTION_THRESHOLD) continue;
+      picked.push(frame);
+      reference = frame;
+    }
+    return picked.reverse();
+  }
+
+  /* Lay out `count` tiles inside a total pixel budget.
+
+     The old layout fixed the cell at 256px, so the collage grew with the frame
+     count and its cost grew with it: six tiles of a 384px capture produced a
+     768x340 image, which the Pixtral preprocessor turns into a 54x24 patch
+     grid -- 1296 patches against 448 for a single frame. Timeline mode was
+     therefore ~3x the inference cost of current-frame mode, and nothing in the
+     UI said so.
+
+     Solving for the cell width instead keeps the whole collage near the
+     budget, so adding moments trades tile detail rather than inference time.
+     With area = columns*rows*(cw^2*aspect + cw*label) this is a quadratic in
+     cw; the positive root is taken directly. Returns null when the tiles would
+     fall below MIN_CELL_WIDTH, which tells the caller to try fewer frames --
+     four legible moments beat eight unreadable ones. */
+  const MIN_CELL_WIDTH = 112;
+
+  function planCollageLayout(count, aspect, budgetPixels, sourceWidth) {
+    if (count < 1) return null;
+    const columns = count <= 3 ? count : Math.ceil(count / 2);
+    const rows = Math.ceil(count / columns);
+    // Label height scales with the tile so it stays readable without eating a
+    // fixed 26px out of every small tile.
+    const labelFor = (cw) => Math.max(11, Math.min(26, Math.round(cw * 0.1)));
+
+    // Solve with a provisional label height, then re-solve once with the
+    // height that width implies. Two passes converge well within a pixel here.
+    let cellWidth = 0;
+    for (let pass = 0; pass < 2; pass++) {
+      const label = labelFor(cellWidth || 200);
+      const a = columns * rows * aspect;
+      const b = columns * rows * label;
+      cellWidth = (-b + Math.sqrt(b * b + 4 * a * budgetPixels)) / (2 * a);
+    }
+    cellWidth = Math.min(Math.floor(cellWidth), sourceWidth);
+    if (!isFinite(cellWidth) || cellWidth < MIN_CELL_WIDTH) return null;
+    const labelHeight = labelFor(cellWidth);
+    return {
+      columns,
+      rows,
+      cellWidth,
+      labelHeight,
+      cellHeight: Math.max(1, Math.round(cellWidth * aspect))
+    };
+  }
+
+  /* Build the multi-moment image for "change" and "timeline" modes.
+
+     Returns null when there is nothing worth sending as a collage (a single
+     distinct moment), so the caller falls back to a plain current frame --
+     but now it also reports why, instead of the previous silent degradation.
+
+     Resolves to {image, frameCount, spanSeconds, dropped}. */
+  async function buildLiveTimelineCollage(signal) {
+    const limit = liveTimelineCollageLimit();
+    const windowMs = liveTimelineWindowSeconds() * 1000;
+    const withinWindow = () => {
+      const cutoff = Date.now() - windowMs;
+      return liveTimelineFrames.filter((frame) => frame.capturedAt.getTime() >= cutoff);
+    };
+
+    /* Between two browser-mode generations the buffer is typically full AND
+       entirely stale, because the 1 Hz sampler could not tick while wasm held
+       the thread. "Does it hold enough frames" is therefore the wrong
+       question; "does it hold enough RECENT frames" is the right one, and
+       when it does not, the moments are captured here and now. */
+    if (withinWindow().length < 2) await fillLiveTimelineBurst(limit, signal);
+
+    const fresh = withinWindow();
+    // Discard whatever aged out, so the buffer cannot drift into a mix of
+    // current and minutes-old frames that no longer matches the mode's label.
+    if (fresh.length !== liveTimelineFrames.length) {
+      liveTimelineFrames.length = 0;
+      for (const frame of fresh) liveTimelineFrames.push(frame);
+    }
+
+    const source = fresh.slice(-liveTimelineFrameLimit());
+    if (source.length < 2) return null;
+
+    const distinct = selectDistinctFrames(source, limit);
+    if (distinct.length < 2) {
+      // Everything in the buffer looks the same: one tile carries the same
+      // information as six, at a sixth of the vision-token cost.
+      return null;
+    }
+
+    const images = await Promise.all(distinct.map((frame) => loadImageForCanvas(frame.image)));
+    const sourceWidth = Math.max(1, images[0].width);
+    const aspect = Math.max(0.1, images[0].height / sourceWidth);
+
+    /* Budget: the collage may cost a little more than one plain frame, but
+       not a multiple of it. The reference is the current-frame area at the
+       user's own size slider, so raising that slider still raises detail
+       everywhere consistently. */
+    const frameArea = sourceWidth * sourceWidth * aspect;
+    const budgetPixels = frameArea * 1.6;
+
+    let frames = distinct;
+    let layout = null;
+    while (frames.length >= 2) {
+      layout = planCollageLayout(frames.length, aspect, budgetPixels, sourceWidth);
+      if (layout) break;
+      // Too many tiles for the budget: drop the oldest moment and retry, so
+      // what survives is always the most recent motion.
+      frames = frames.slice(1);
+    }
+    if (!layout) return null;
+    const dropped = distinct.length - frames.length;
+    const usedImages = images.slice(images.length - frames.length);
+
     const canvas = document.createElement("canvas");
-    canvas.width = columns * cellWidth;
-    canvas.height = rows * (cellHeight + labelHeight);
+    canvas.width = layout.columns * layout.cellWidth;
+    canvas.height = layout.rows * (layout.cellHeight + layout.labelHeight);
     const context = canvas.getContext("2d", { alpha: false });
     context.fillStyle = "#101818";
     context.fillRect(0, 0, canvas.width, canvas.height);
-    images.forEach((image, index) => {
-      const x = (index % columns) * cellWidth;
-      const y = Math.floor(index / columns) * (cellHeight + labelHeight);
-      context.drawImage(image, x, y, cellWidth, cellHeight);
+    const now = Date.now();
+    const fontSize = Math.max(9, Math.round(layout.labelHeight * 0.62));
+    usedImages.forEach((image, index) => {
+      const x = (index % layout.columns) * layout.cellWidth;
+      const y = Math.floor(index / layout.columns) * (layout.cellHeight + layout.labelHeight);
+      context.drawImage(image, x, y, layout.cellWidth, layout.cellHeight);
       context.fillStyle = "rgba(0, 0, 0, .72)";
-      context.fillRect(x, y + cellHeight, cellWidth, labelHeight);
+      context.fillRect(x, y + layout.cellHeight, layout.cellWidth, layout.labelHeight);
       context.fillStyle = "#fff";
-      context.font = "600 13px ui-monospace, SFMono-Regular, Menlo, monospace";
-      context.fillText(timelineTimestamp(frames[index].capturedAt), x + 8, y + cellHeight + 17);
+      context.font = "600 " + fontSize + "px ui-monospace, SFMono-Regular, Menlo, monospace";
+      context.fillText(
+        timelineAgeLabel(frames[index].capturedAt, now),
+        x + Math.round(layout.cellWidth * 0.04),
+        y + layout.cellHeight + Math.round((layout.labelHeight + fontSize) / 2) - 1
+      );
     });
-    return new Promise((resolve, reject) => {
+
+    const spanSeconds = (frames[frames.length - 1].capturedAt - frames[0].capturedAt) / 1000;
+    const image = await new Promise((resolve, reject) => {
       canvas.toBlob((blob) => {
         if (!blob) { reject(new Error("Encoding the timeline collage failed.")); return; }
         const reader = new FileReader();
@@ -5686,6 +5916,7 @@ function toMarkdown(chat) {
         reader.readAsDataURL(blob);
       }, "image/jpeg", 0.82);
     });
+    return { image, frameCount: frames.length, spanSeconds, dropped };
   }
 
   // video.play() resolves once playback is requested, which can precede the
@@ -5951,7 +6182,7 @@ function toMarkdown(chat) {
     }
   }
 
-  async function completeLiveVision(chat, prompt, image, signal, onToken, hasTimeline) {
+  async function completeLiveVision(chat, prompt, image, signal, onToken, timeline) {
     // Live frames are a perception task, not an open-ended chat turn. Short,
     // low-temperature answers keep the output grounded in what is actually
     // visible instead of letting a small vision model elaborate a speculative
@@ -5960,15 +6191,27 @@ function toMarkdown(chat) {
       maxTokens: Math.min(64, boundedNumber(chat.settings.maxTokens, 64, 1, 4096, true)),
       temperature: Math.min(0.3, boundedNumber(chat.settings.temperature, 0.3, 0, 2, false))
     });
-    const frameContext = hasTimeline
-      ? "You are seeing a timestamped collage of real frames sampled one second apart from the same live feed. Compare only clearly visible changes across the panels; it is not every camera frame and it cannot establish safety or an emergency."
+    const source = liveCaptureMode === "screen" ? "screen" : "camera";
+    // The panel count and time span are measured, not assumed: the sampler
+    // runs at whatever rate the main thread allows, so a hardcoded "sampled
+    // one second apart" was frequently a false statement about the very image
+    // being shown, and a model told the spacing wrongly reads motion wrongly.
+    const frameContext = timeline
+      ? "You are seeing a collage of " + timeline.frameCount + " real frames from the same live " + source +
+        " feed, captured over the last " + timeline.spanSeconds.toFixed(1) + " seconds and arranged oldest first, " +
+        "left to right then top to bottom. Each panel is labelled with its age at capture. Panels that looked " +
+        "identical were dropped, so consecutive panels always differ. This is a sample, not every frame, and it " +
+        "cannot establish safety or an emergency."
       : "You are seeing one freshly captured current frame."
     const zoneContext = liveZoneInputEl.value.trim()
       ? "The operator labels this view: " + liveZoneInputEl.value.trim() + ". Include that label only when it helps make the response actionable."
       : "The operator has not labelled this camera view; do not invent a location."
-    const livePromptInstruction = liveCaptureMode === "screen"
-      ? "You are describing one current live screen frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly."
-      : "You are describing one current live camera frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly.";
+    const livePromptInstruction = timeline
+      ? "You are describing how one live " + source + " view changed across the panels. State only what is clearly " +
+        "visible, and say what moved or appeared or disappeared between panels rather than describing each panel " +
+        "separately. Answer in one concise sentence in the user's language. Do not invent context, image effects, " +
+        "manipulation, or hidden details; if the panels are unclear or show no change, say so plainly."
+      : "You are describing one current live " + source + " frame. State only clearly visible people, objects, colors, interface elements, and text. Answer in one concise sentence in the user's language. Do not invent context, image effects, manipulation, or hidden details; if the frame is unclear, say so plainly.";
     // Only offer the markers the user actually armed, so the model never
     // reaches for an action nothing is listening for. The trigger condition
     // itself is the user's own words, not a hardcoded "danger" -- this is
@@ -6101,9 +6344,16 @@ function toMarkdown(chat) {
         setLiveOutputStatus(liveCaptureMode === "screen" ? "Waiting for a screen frame…" : "Waiting for a camera frame…", false);
         await waitForLiveVideoFrame(requestController.signal);
         setLiveHealth("live", "capturing frame");
-        const timelineImage = liveContextMode === "current" ? null : await buildLiveTimelineCollage();
-        const image = timelineImage || await captureLiveFrame();
-        setLiveHealth("live", timelineImage ? "analysing timeline" : "analysing current frame");
+        const timeline = liveContextMode === "current" ? null : await buildLiveTimelineCollage(requestController.signal);
+        const image = timeline ? timeline.image : await captureLiveFrame();
+        // Say which of the two it actually became. The timeline modes fall
+        // back to a single frame whenever the buffer holds only one distinct
+        // moment (a still scene, or a starved sampler), and that used to be
+        // invisible -- the overlay kept claiming "analysing timeline" while a
+        // plain current frame was on its way to the model.
+        setLiveHealth("live", timeline
+          ? "analysing " + timeline.frameCount + " moments over " + timeline.spanSeconds.toFixed(1) + "s"
+          : (liveContextMode === "current" ? "analysing current frame" : "analysing current frame (no motion to compare)"));
         startLiveFrameProgress();
         const answer = await completeLiveVision(chat, prompt, image, requestController.signal, (partial) => {
           stopLiveFrameProgress();
@@ -6117,7 +6367,7 @@ function toMarkdown(chat) {
           const statusLabel = describeLiveActionStatus(frameActionsTriggered);
           setLiveOutputStatus((statusLabel ? statusLabel + " — generating response…" : "Generating response…"), false);
           setLiveOutputText(parsed.text || (statusLabel ? "Flagged…" : partial), true);
-        }, !!timelineImage);
+        }, timeline);
         stopLiveFrameProgress();
         const parsedAnswer = parseLiveActions(answer);
         parsedAnswer.actions.forEach((key) => {

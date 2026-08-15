@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"encoding/binary"
 	"math"
+	"unsafe"
 )
 
 // rawScalarWeight reports whether w is an mmap-backed, non-quantized matrix.
@@ -33,12 +34,34 @@ func scalarBytesPerElement(typ GGMLType) int {
 	}
 }
 
+// f16RowView reinterprets n little-endian f16 elements at raw[offset:] as the
+// []uint16 the SIMD f16 kernels take, without copying.
+//
+// The alias is safe for exactly the inputs this package produces: offset is
+// always row*cols*2, so it is even, and raw is either an mmap (page-aligned)
+// or a Go allocation (word-aligned), which makes the result 2-byte aligned.
+// GGUF is little-endian and every supported GOARCH is too, so the in-memory
+// uint16 and the on-disk f16 bit patterns coincide.
+func f16RowView(raw []byte, offset, n int) []uint16 {
+	return unsafe.Slice((*uint16)(unsafe.Pointer(&raw[offset])), n)
+}
+
 func rawScalarDot(raw []byte, typ GGMLType, offset int, x []float32, cols int) float32 {
 	width := scalarBytesPerElement(typ)
 	if width == 0 || offset < 0 || offset > len(raw) || cols <= 0 {
 		return 0
 	}
 	n := min(cols, len(x), (len(raw)-offset)/width)
+	// F16 has a real vector kernel on every target that has one at all —
+	// VCVTPH2PS under AVX2 on amd64, FCVTL on arm64 — and it was reachable
+	// only from the KV cache, never from weights. Raw f16 weights are not a
+	// corner case: they are what out-of-core loading keeps on purpose (see
+	// rawScalarWeight) and what a vision tower's mmproj is stored as, so this
+	// scalar loop with a software F16ToF32 per element was the whole matvec
+	// for those models.
+	if typ == GGMLTypeF16 && n > 0 {
+		return dotF32F16(x[:n], f16RowView(raw, offset, n))
+	}
 	var s0, s1, s2, s3 float32
 	i := 0
 	switch typ {

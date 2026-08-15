@@ -34,3 +34,10 @@ func axpyF32x4(out0, out1, out2, out3 *float32, a0, a1, a2, a3 float32, x *float
 	AxpyF32(unsafe.Slice(out2, n), a2, xs)
 	AxpyF32(unsafe.Slice(out3, n), a3, xs)
 }
+
+// hasFastDotF32x4 is false here: dotF32x4 above is a composition, not a kernel.
+// Measured on amd64, routing matvecBatch's token loop through it cost roughly
+// 1.4x on the vision tower versus calling DotF32 per token directly — the
+// shared-row reuse that makes it worthwhile on arm64 needs the row to stay in
+// registers, which only the hand-written kernel achieves.
+const hasFastDotF32x4 = false
