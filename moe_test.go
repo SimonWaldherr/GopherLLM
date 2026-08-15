@@ -488,7 +488,7 @@ func TestAttentionSinkChangesSoftmaxDenominator(t *testing.T) {
 	onlineAttentionF16WithSink([]float32{0}, []uint16{F32ToF16(0)}, []uint16{F32ToF16(2)}, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, true, f16With)
 	closeMoEFloat(t, "f16 zero-logit sink", f16With[0], 1)
 
-	pattern := swaPattern(&GGUFFile{}, "gpt-oss", 4)
+	pattern := swaPattern(&GGUFFile{}, "gpt-oss", "gpt-oss", 4)
 	want := []bool{true, false, true, false}
 	if len(pattern) != len(want) {
 		t.Fatalf("GPT-OSS SWA pattern len = %d, want %d", len(pattern), len(want))

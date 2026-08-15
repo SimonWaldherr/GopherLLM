@@ -326,33 +326,14 @@ func (c Config) usesFullProjectionQKNorm() bool {
 }
 
 func ConfigFromGGUF(gguf *GGUFFile) Config {
-	arch, ok := gguf.GetString("general.architecture")
-	if !ok || arch == "" {
-		arch = "llama"
-	}
-	// A few Kimi converters preserve Hugging Face's `kimi_k2` architecture
-	// label but retain llama.cpp's `deepseek2.*` hparam namespace. Keep the
-	// public architecture label (it drives loader/template selection) while
-	// reading the namespace that is actually present in the GGUF.
-	p := arch
-	// `llama2`/`llama3` are compatibility labels used by a few third-party
-	// converters. Canonical GGUF metadata still lives under `llama.*`; prefer
-	// an alias-specific namespace when it exists, otherwise read the canonical
-	// keys while preserving the public architecture label.
-	if arch == "llama2" || arch == "llama3" {
-		if _, hasAliasPrefix := gguf.Metadata[p+".embedding_length"]; !hasAliasPrefix {
-			if _, hasLlamaPrefix := gguf.Metadata["llama.embedding_length"]; hasLlamaPrefix {
-				p = "llama"
-			}
-		}
-	}
-	if arch == "kimi_k2" {
-		if _, hasKimiPrefix := gguf.Metadata[p+".embedding_length"]; !hasKimiPrefix {
-			if _, hasDeepSeekPrefix := gguf.Metadata["deepseek2.embedding_length"]; hasDeepSeekPrefix {
-				p = "deepseek2"
-			}
-		}
-	}
+	// arch is the canonical architecture label — it drives loader, graph, and
+	// template selection. p is the metadata namespace the hyperparameters
+	// actually live under. They differ for alias labels that keep their
+	// identity (kimi_k2 with deepseek2.* hparams, llama2/llama3 with llama.*)
+	// and for files whose declared label was missing or unknown and had to be
+	// detected — see ResolveArchitecture. Behavior decisions below must key on
+	// arch; metadata reads must go through p.
+	arch, p := ResolveArchitecture(gguf)
 	dim := int(gguf.GetU32(p+".embedding_length", 0))
 	nHeads := int(gguf.GetU32(p+".attention.head_count", 0))
 	nKVHeads := int(gguf.GetU32(p+".attention.head_count_kv", uint32(max(1, nHeads))))
@@ -376,7 +357,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	}
 	embeddingScale := gguf.GetF32(p+".embedding_scale", 0)
 	if embeddingScale == 0 {
-		if gemmaFamily(p) && dim > 0 {
+		if gemmaFamily(arch) && dim > 0 {
 			// Gemma scales input embeddings by sqrt(dim); reference
 			// implementations hardcode this — it is NOT in GGUF metadata
 			// (verified against llama.cpp's gemma graphs).
@@ -411,7 +392,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		}
 	}
 	normEps := gguf.GetF32(p+".attention.layer_norm_rms_epsilon", 1e-5)
-	if usesLayerNorm(p) {
+	if usesLayerNorm(arch) {
 		// LayerNorm architectures carry an explicit epsilon key of their own
 		// rather than the generic RMSNorm one.
 		normEps = gguf.GetF32(p+".attention.layer_norm_epsilon", normEps)
@@ -473,10 +454,10 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		ParallelResidual:          parallelResidual || forcesParallelResidual(arch),
 		UseGELU:                   gemmaFamily(arch) || arch == "phi2",
 		UseExactGELU:              arch == "phi2",
-		ALiBiMaxBias:              aLiBiMaxBias(gguf, p),
+		ALiBiMaxBias:              aLiBiMaxBias(gguf, arch, p),
 		AttnLogitSoftcap:          gguf.GetF32(p+".attn_logit_softcapping", 0),
 		FinalLogitSoftcap:         gguf.GetF32(p+".final_logit_softcapping", 0),
-		SWAPattern:                swaPattern(gguf, p, int(gguf.GetU32(p+".block_count", 0))),
+		SWAPattern:                swaPattern(gguf, arch, p, int(gguf.GetU32(p+".block_count", 0))),
 	}
 	// Mistral 3's temperature schedule uses the original YaRN context length
 	// as its floor (llama.cpp's n_attn_temp_floor_scale).
@@ -487,7 +468,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		// validation and returns a useful diagnostic for malformed GGUFs.
 		cfg.UsesMLA = cfg.MLAKVLoRARank > 0 && cfg.MLAKeyDim > 0 && cfg.MLAValueDim > 0
 	}
-	if p == "nemotron_h" || p == "nemotron_h_moe" || p == "mamba2" {
+	if arch == "nemotron_h" || arch == "nemotron_h_moe" || arch == "mamba2" {
 		cfg.LayerHeads = u32ArrayAsInts(gguf, p+".attention.head_count")
 		cfg.LayerKVHeads = u32ArrayAsInts(gguf, p+".attention.head_count_kv")
 		cfg.LayerFFNDim = u32ArrayAsInts(gguf, p+".feed_forward_length")
@@ -497,7 +478,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 		cfg.SSMHeads = int(gguf.GetU32(p+".ssm.time_step_rank", 0))
 		cfg.SSMGroups = int(gguf.GetU32(p+".ssm.group_count", 0))
 	}
-	if p == "qwen35" || p == "qwen35moe" {
+	if arch == "qwen35" || arch == "qwen35moe" {
 		cfg.SSMConv = int(gguf.GetU32(p+".ssm.conv_kernel", 0))
 		cfg.SSMInner = int(gguf.GetU32(p+".ssm.inner_size", 0))
 		cfg.SSMState = int(gguf.GetU32(p+".ssm.state_size", 0))
@@ -509,7 +490,7 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 			cfg.QwenRecurrentLayers, _ = v.AsBoolArray()
 		}
 	}
-	switch p {
+	switch arch {
 	case "command-r":
 		applyCommandRLogitScale(&cfg)
 	case "minicpm":
@@ -517,13 +498,13 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 	case "minicpm3":
 		applyMiniCPM3HardcodedScales(&cfg, dim)
 	}
-	if p == "exaone4" {
+	if arch == "exaone4" {
 		// EXAONE 4 rotates only its SWA blocks, so the optional SWA-specific
 		// base is the one the active RoPE table must use.
 		cfg.RopeTheta = gguf.GetF32(p+".rope.freq_base_swa", cfg.RopeTheta)
 		cfg.NextNPredictLayers = int(gguf.GetU32(p+".nextn_predict_layers", 0))
 	}
-	if p == "olmo2" && cfg.SlidingWindow > 0 {
+	if arch == "olmo2" && cfg.SlidingWindow > 0 {
 		cfg.RopeThetaSWA = gguf.GetF32(p+".rope.freq_base_swa", cfg.RopeTheta)
 	}
 	if v, ok := gguf.Metadata[p+".expert_weights_norm"]; ok {
@@ -580,11 +561,11 @@ func applyMiniCPM3HardcodedScales(cfg *Config, dim int) {
 // aLiBiMaxBias returns the ALiBi max-bias value (0 disables ALiBi). BLOOM
 // hardcodes 8.0 unconditionally (llama.cpp does not read it from any GGUF
 // key for this arch); MPT reads it from an explicit key that is 0 whenever
-// the source checkpoint had ALiBi disabled. Neither architecture has a
-// namespace alias, so the GGUF metadata prefix p is also the public
-// architecture label here.
-func aLiBiMaxBias(gguf *GGUFFile, p string) float32 {
-	switch p {
+// the source checkpoint had ALiBi disabled. The decision keys on the
+// canonical architecture label; the key read goes through the metadata
+// namespace p, which can differ when the label was resolved from an alias.
+func aLiBiMaxBias(gguf *GGUFFile, arch, p string) float32 {
+	switch arch {
 	case "bloom":
 		return 8.0
 	case "mpt":
@@ -611,8 +592,10 @@ func u32ArrayAsInts(gguf *GGUFFile, key string) []int {
 // entry per layer — the Gemma 4 convention), an explicit scalar period (the
 // EXAONE 4 convention), then known per-architecture defaults expressed as
 // "every Nth layer is global". nil means every layer uses the window (the
-// pre-Gemma behavior, correct for e.g. old Mistral).
-func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
+// pre-Gemma behavior, correct for e.g. old Mistral). The per-architecture
+// defaults key on the canonical label arch; the metadata read goes through
+// the namespace p.
+func swaPattern(gguf *GGUFFile, arch, p string, nLayers int) []bool {
 	period := 0
 	if v, ok := gguf.Metadata[p+".attention.sliding_window_pattern"]; ok {
 		if arr, ok := v.AsBoolArray(); ok && len(arr) > 0 {
@@ -623,7 +606,7 @@ func swaPattern(gguf *GGUFFile, p string, nLayers int) []bool {
 		}
 	}
 	if period == 0 {
-		switch p {
+		switch arch {
 		case "gemma2":
 			period = 2
 		case "gemma3", "gemma4":

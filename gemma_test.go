@@ -277,7 +277,7 @@ func TestSwaPatternExplicitArrayWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pattern := swaPattern(g, "gemma4", 4)
+	pattern := swaPattern(g, "gemma4", "gemma4", 4)
 	want := []bool{true, true, false, true}
 	if len(pattern) != len(want) {
 		t.Fatalf("pattern = %v", pattern)
@@ -289,7 +289,7 @@ func TestSwaPatternExplicitArrayWins(t *testing.T) {
 	}
 	// Without the array, gemma4 synthesizes the 5:1 default.
 	g2, _ := ParseGGUFQuiet(buildGGUF(3, []ggufKV{{"general.architecture", ggufStr, "gemma4"}}, nil))
-	p2 := swaPattern(g2, "gemma4", 12)
+	p2 := swaPattern(g2, "gemma4", "gemma4", 12)
 	if len(p2) != 12 || p2[5] || p2[11] || !p2[0] || !p2[4] || !p2[6] {
 		t.Fatalf("default gemma4 pattern = %v, want 5 local then 1 global", p2)
 	}

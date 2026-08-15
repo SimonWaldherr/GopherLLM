@@ -487,12 +487,20 @@ func inspectModel(root, path string) (ModelEntry, error) {
 	if err == nil {
 		id = strings.TrimSuffix(rel, ".gguf")
 	}
-	arch, _ := gguf.GetString("general.architecture")
+	declaredArch, _ := gguf.GetString("general.architecture")
+	// resolvedArch is what the loader will actually accept; hparamNS is where
+	// the hyperparameters live. The declared label (when present) stays the
+	// display identity, but support and metadata probes follow the resolution.
+	resolvedArch, hparamNS := ResolveArchitecture(gguf)
+	arch := declaredArch
+	if arch == "" {
+		arch = resolvedArch
+	}
 	modelName, _ := gguf.GetString("general.name")
 	contextLength := ConfigFromGGUF(gguf).MaxSeqLen
 	lower := strings.ToLower(fileName + " " + modelName)
 	isProjector := strings.HasPrefix(lower, "mmproj-") || strings.Contains(lower, "mmproj") || strings.EqualFold(arch, "clip")
-	_, hasPooling := gguf.Metadata[arch+".pooling_type"]
+	_, hasPooling := gguf.Metadata[hparamNS+".pooling_type"]
 	_, hasEmbedding := gguf.Metadata["general.embedding"]
 	isEmbedding := hasPooling || hasEmbedding || containsEmbeddingModelName(lower)
 	entry := ModelEntry{
@@ -506,8 +514,8 @@ func inspectModel(root, path string) (ModelEntry, error) {
 		ModelName:     modelName,
 		IsProjector:   isProjector,
 		IsEmbedding:   isEmbedding,
-		IsSupported:   ArchitectureSupported(arch),
-		Reasoning:     modelSupportsReasoning(arch, fileName, modelName, gguf),
+		IsSupported:   ArchitectureSupported(resolvedArch),
+		Reasoning:     modelSupportsReasoning(resolvedArch, fileName, modelName, gguf),
 	}
 	if isProjector {
 		entry.visionDimension, entry.visionPixtralProjector = pixtralProjectorCatalogInfo(gguf)

@@ -331,13 +331,57 @@ type Runner struct {
 	vision           *PixtralVisionWeights
 	visionConfig     PixtralVisionConfig
 	visionMappedFile *MmapFile
-	// visionImageCache memoizes EncodeImagePixtral results within one
-	// generation call (renderMessages/context_window.go may render the same
-	// message more than once before the final call actually generates),
-	// keyed by an fnv hash of the image bytes. Cleared per call, guarded by
-	// genLock like the rest of Runner's mutable state.
+	// visionCacheMu guards the three vision-cache fields below.
+	//
+	// Deliberately its own lock rather than genLock: PrepareChatContext is
+	// exported, takes no lock, and reaches this cache through
+	// renderMessages -> renderMistralInstMessages -> encodeChatImage. An
+	// application that plans a context window while a generation is running
+	// -- which is an ordinary thing to do, and what the server does -- would
+	// otherwise hit concurrent map writes, which Go turns into a hard crash
+	// rather than a mere data race.
+	//
+	// Never take genLock while holding this; nothing here needs to.
+	visionCacheMu sync.Mutex
+	// visionImageCache memoizes EncodeImagePixtral results, keyed by an fnv
+	// hash of the image bytes.
+	//
+	// It deliberately survives across generation calls. Within one call it
+	// covers the same-image-rendered-twice case; across calls it covers the
+	// far more expensive one, which is how people actually use vision: every
+	// follow-up question about an already-attached picture re-sends that
+	// picture in the history, and re-running a 24-block tower over it costs
+	// tens of seconds. Encoding it once per conversation instead of once per
+	// turn is the single largest saving available on a multi-turn image chat.
+	//
+	// Persisting is only safe because it is bounded (see visionCachePut): a
+	// live camera feeds a unique image per frame, and an unbounded map of
+	// multi-megabyte float tensors would turn that into steadily rising GC
+	// pressure. Bounding evicts those frames as fast as they arrive while
+	// still holding the handful of stills a conversation refers back to.
+	//
+	// Entries are read-only once stored: both consumers copy out of them
+	// (copy(X[t][:dim], emb) in forward_batch.go and model.go), never in
+	// place, so handing the same slices to several calls is sound.
 	visionImageCache map[uint64]visionImageCacheEntry
+	// visionImageOrder is the eviction order, least recently used first.
+	// A slice scan is the right structure at these sizes: it holds at most
+	// visionImageCacheMaxEntries keys, so a real LRU's bookkeeping would cost
+	// more than the linear walk it replaces.
+	visionImageOrder []uint64
+	// visionImageFloats is the resident float32 count across all entries,
+	// tracked incrementally so eviction never has to re-walk the map.
+	visionImageFloats int
 }
+
+const (
+	// Caps on the vision cache. Entries scale with the image's token count
+	// (mergedTokens x ProjectionDim), which for a 1024-token image at
+	// ProjectionDim 3072 is about 12 MB, so a count-only bound could still
+	// retain hundreds of megabytes. Bound both.
+	visionImageCacheMaxEntries = 8
+	visionImageCacheMaxFloats  = 16 << 20 // 64 MiB of float32
+)
 
 type visionImageCacheEntry struct {
 	embeds                 [][]float32
@@ -374,6 +418,13 @@ func (r *Runner) HasVision() bool { return r != nil && r.vision != nil }
 //   - Devstral and Mistral-Small GGUFs usually declare llama or mistral3;
 //     their [INST]/Tekken behavior is picked up from tokenizer metadata, not
 //     the arch string.
+//
+// This is an exact-label check. The loader does not call it on the raw
+// general.architecture string but on the label returned by
+// ResolveArchitecture, which first normalizes spelling variants (Hugging Face
+// class names, hyphen/underscore forms) and falls back to the hyperparameter
+// namespace actually present in the file, so a mislabeled GGUF whose contents
+// are a supported architecture still loads.
 func ArchitectureSupported(arch string) bool {
 	switch arch {
 	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
@@ -444,11 +495,26 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		logw = io.Discard
 	}
 	fmt.Fprintf(logw, "GGUF v%d - %d tensors, %d metadata entries\n", gguf.Version, len(gguf.Tensors), len(gguf.Metadata))
-	arch, ok := gguf.GetString("general.architecture")
-	if !ok || arch == "" {
-		arch = "llama"
+	declaredArch, _ := gguf.GetString("general.architecture")
+	declaredArch = strings.TrimSpace(declaredArch)
+	arch, hparamNS := ResolveArchitecture(gguf)
+	switch {
+	case declaredArch == "" && namespaceHasHParams(gguf, hparamNS):
+		fmt.Fprintf(logw, "No general.architecture in metadata; detected %q from the %s.* hyperparameter namespace\n", arch, hparamNS)
+	case declaredArch == "":
+		fmt.Fprintf(logw, "No general.architecture in metadata and no hyperparameter namespace found; assuming %q\n", arch)
+	case arch != declaredArch:
+		fmt.Fprintf(logw, "Architecture %q is not a label GopherLLM knows; loading as %q (hyperparameters under %s.*)\n", declaredArch, arch, hparamNS)
+	case hparamNS != arch:
+		fmt.Fprintf(logw, "Architecture %s: reading hyperparameters from the %s.* metadata namespace\n", arch, hparamNS)
 	}
 	if !ArchitectureSupported(arch) {
+		if isVisionProjectorGGUF(gguf, arch) {
+			return nil, fmt.Errorf("this GGUF is a CLIP/mmproj vision projector, not a text model; load it alongside a text-model GGUF via LoadOptions.VisionProjectorPath (CLI: --mmproj)")
+		}
+		if hparamNS != arch {
+			return nil, fmt.Errorf("unsupported architecture: %s (hyperparameters found under %s.*)", arch, hparamNS)
+		}
 		return nil, fmt.Errorf("unsupported architecture: %s", arch)
 	}
 	tok, err := TokenizerFromMetadata(gguf.Metadata)
@@ -640,7 +706,7 @@ func (r *Runner) Close() error {
 	r.workspaceBuf = nil
 	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
-	r.visionImageCache = nil
+	r.visionCacheReset()
 	if r.visionMappedFile != nil {
 		_ = r.visionMappedFile.Close()
 		r.visionMappedFile = nil
@@ -723,12 +789,13 @@ func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOp
 func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
-	// Vision embeddings are useful only while this one request may render the
-	// same image more than once. Keeping them after return turns a webcam into
-	// an unbounded cache of large float tensors (one unique image per frame),
-	// eventually increasing GC pressure and slowing every subsequent frame.
-	r.visionImageCache = nil
-	defer func() { r.visionImageCache = nil }()
+	// The vision cache is deliberately NOT cleared here. It used to be, on the
+	// grounds that a webcam would otherwise grow it without bound -- true of
+	// the unbounded map it was then, but it also threw away the encoding of a
+	// still image between every turn of a conversation about that image, which
+	// is the common case and costs a full tower pass each time. The cache is
+	// bounded now (visionCachePut), so live frames evict themselves while a
+	// re-sent still stays warm.
 	if r.kind == loadedBERT {
 		return GenerationResult{}, fmt.Errorf("%s is an embedding model and cannot generate chat completions", r.arch)
 	}
@@ -2004,7 +2071,7 @@ func (r *Runner) encodeChatImage(img ImageContent) (embeds [][]float32, mergedRo
 	h := fnv.New64a()
 	h.Write(img.Bytes)
 	key := h.Sum64()
-	if entry, ok := r.visionImageCache[key]; ok {
+	if entry, ok := r.visionCacheGet(key); ok {
 		return entry.embeds, entry.mergedRows, entry.mergedCols, nil
 	}
 	decoded, err := DecodeImageBytes(img.Bytes)
@@ -2023,11 +2090,80 @@ func (r *Runner) encodeChatImage(img ImageContent) (embeds [][]float32, mergedRo
 	if err != nil {
 		return nil, 0, 0, err
 	}
+	r.visionCachePut(key, visionImageCacheEntry{embeds: embeds, mergedRows: mergedRows, mergedCols: mergedCols})
+	return embeds, mergedRows, mergedCols, nil
+}
+
+// visionCacheGet returns a memoized encoding and marks it most recently used.
+func (r *Runner) visionCacheGet(key uint64) (visionImageCacheEntry, bool) {
+	r.visionCacheMu.Lock()
+	defer r.visionCacheMu.Unlock()
+	entry, ok := r.visionImageCache[key]
+	if !ok {
+		return visionImageCacheEntry{}, false
+	}
+	r.visionCacheTouch(key)
+	return entry, true
+}
+
+// visionCacheTouch moves key to the most-recently-used end of the order.
+// Callers hold visionCacheMu.
+func (r *Runner) visionCacheTouch(key uint64) {
+	for i, k := range r.visionImageOrder {
+		if k != key {
+			continue
+		}
+		r.visionImageOrder = append(append(r.visionImageOrder[:i], r.visionImageOrder[i+1:]...), key)
+		return
+	}
+	r.visionImageOrder = append(r.visionImageOrder, key)
+}
+
+// visionCachePut stores an encoding and evicts least-recently-used entries
+// until both caps hold. A single entry larger than the float cap is stored
+// anyway and simply evicts everything else: refusing to cache it would make
+// the pathological case (one very large image, asked about repeatedly) the one
+// case that gets no benefit at all.
+func (r *Runner) visionCachePut(key uint64, entry visionImageCacheEntry) {
+	r.visionCacheMu.Lock()
+	defer r.visionCacheMu.Unlock()
 	if r.visionImageCache == nil {
 		r.visionImageCache = make(map[uint64]visionImageCacheEntry)
 	}
-	r.visionImageCache[key] = visionImageCacheEntry{embeds: embeds, mergedRows: mergedRows, mergedCols: mergedCols}
-	return embeds, mergedRows, mergedCols, nil
+	if old, ok := r.visionImageCache[key]; ok {
+		r.visionImageFloats -= visionEntryFloats(old)
+	}
+	r.visionImageCache[key] = entry
+	r.visionImageFloats += visionEntryFloats(entry)
+	r.visionCacheTouch(key)
+
+	for len(r.visionImageOrder) > 1 &&
+		(len(r.visionImageOrder) > visionImageCacheMaxEntries || r.visionImageFloats > visionImageCacheMaxFloats) {
+		oldest := r.visionImageOrder[0]
+		r.visionImageOrder = r.visionImageOrder[1:]
+		if evicted, ok := r.visionImageCache[oldest]; ok {
+			r.visionImageFloats -= visionEntryFloats(evicted)
+			delete(r.visionImageCache, oldest)
+		}
+	}
+}
+
+func visionEntryFloats(entry visionImageCacheEntry) int {
+	if len(entry.embeds) == 0 {
+		return 0
+	}
+	return len(entry.embeds) * len(entry.embeds[0])
+}
+
+// visionCacheReset drops every memoized encoding. Used when the Runner is
+// closed or its vision weights are replaced, where the entries would otherwise
+// outlive the tower that produced them.
+func (r *Runner) visionCacheReset() {
+	r.visionCacheMu.Lock()
+	defer r.visionCacheMu.Unlock()
+	r.visionImageCache = nil
+	r.visionImageOrder = nil
+	r.visionImageFloats = 0
 }
 
 // mistralMarker returns literal as a single control token when the vocabulary

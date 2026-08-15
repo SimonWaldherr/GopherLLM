@@ -128,6 +128,15 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 	// For f16 the row dot is a real vector kernel (see rawScalarDot), so this
 	// reads half the bytes of an expanded F32 copy and converts in-register.
 	//
+	// Routing these through dequantRowInto instead -- decoding each row once
+	// into an f32 scratch and then doing p plain dots, as the quantized path
+	// does -- was measured on the vision tower and is 1.5x SLOWER (47s -> 70s
+	// median, interleaved, 448 patches). Amortizing the conversion is not
+	// worth it here: dotF32F16AVX2 fuses VCVTPH2PS into the FMA loop, so the
+	// conversion is nearly free in-register, while the f32 scratch doubles the
+	// bytes the token loop reads per row. Hoisting the conversion trades a
+	// free operation for real memory traffic.
+	//
 	// This is the path out-of-core models take for every scalar matrix, and
 	// the one a vision tower's f16 mmproj takes for all seven of its
 	// per-block projections.

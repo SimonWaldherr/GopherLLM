@@ -313,7 +313,7 @@ func TestExaone4LocalGlobalAndRopeSchedule(t *testing.T) {
 	gguf := &GGUFFile{Metadata: map[string]MetaValue{
 		"exaone4.attention.sliding_window_pattern": {Kind: "u32", Value: uint32(3)},
 	}}
-	got := swaPattern(gguf, "exaone4", 6)
+	got := swaPattern(gguf, "exaone4", "exaone4", 6)
 	want := []bool{true, true, false, true, true, false}
 	for il := range want {
 		if got[il] != want[il] {

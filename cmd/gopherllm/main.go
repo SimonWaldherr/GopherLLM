@@ -1184,7 +1184,15 @@ func inspectGGUF(path string, listMetadata, listTensors bool) error {
 	}
 	arch, _ := gguf.GetString("general.architecture")
 	name, _ := gguf.GetString("general.name")
-	fmt.Printf("file: %s\nname: %s\narchitecture: %s\nsupported: %v\nmetadata: %d\ntensors: %d\ndata_offset: %d\n", path, name, arch, gopherllm.ArchitectureSupported(arch), len(gguf.Metadata), len(gguf.Tensors), gguf.DataOffset)
+	resolved, _ := gopherllm.ResolveArchitecture(gguf)
+	archDisplay := arch
+	switch {
+	case arch == "":
+		archDisplay = resolved + " (auto-detected)"
+	case arch != resolved:
+		archDisplay = fmt.Sprintf("%s (loads as %s)", arch, resolved)
+	}
+	fmt.Printf("file: %s\nname: %s\narchitecture: %s\nsupported: %v\nmetadata: %d\ntensors: %d\ndata_offset: %d\n", path, name, archDisplay, gopherllm.ArchitectureSupported(resolved), len(gguf.Metadata), len(gguf.Tensors), gguf.DataOffset)
 	if listMetadata {
 		keys := make([]string, 0, len(gguf.Metadata))
 		for key := range gguf.Metadata {

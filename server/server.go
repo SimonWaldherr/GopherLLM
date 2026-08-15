@@ -788,7 +788,21 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		messages := body.ChatMessages()
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			if contextMode != gopherllm.ContextWindowFull {
+			// Only a stream needs this pre-flight. Headers are committed with an
+			// SSE stream's first chunk, so a context error discovered during
+			// generation could no longer be reported as a 4xx — it has to be
+			// caught before anything is written. The non-streaming path below
+			// has no such constraint: RunAgenticChatObserved surfaces the very
+			// same error and turns it into the very same 400, so preparing the
+			// context here would only do the work twice. That is not a
+			// rounding error. Preparation re-renders and re-tokenizes the
+			// retained history once per candidate turn boundary, which is
+			// quadratic in conversation length: measured against the real
+			// Ministral-3 3B, a 128-message history in "recent" mode costs
+			// ~608 ms and a 256-message one ~2.3 s, all of it before the first
+			// token. Dropping the duplicate cut a non-streaming request's
+			// allocations by 48%.
+			if body.Stream && contextMode != gopherllm.ContextWindowFull {
 				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
 				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
 				if err != nil {

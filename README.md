@@ -1561,7 +1561,32 @@ gpt2, gptneox, gptj, bloom, mpt, falcon, starcoder, starcoder2, chatglm, glm4, c
 
 The architecture value is only accepted when its execution graph and expected
 tensor layout are implemented; an unknown GGUF is not treated as Llama merely
-because some tensor names happen to match. The main coverage is:
+because some tensor names happen to match. Before that check, though, the
+loader resolves the label against the file itself (`ResolveArchitecture`), so
+imperfect third-party conversions of supported architectures still load:
+
+- **Spelling variants normalize.** Hugging Face class names
+  (`Qwen2ForCausalLM`, `GPT2LMHeadModel`, `CohereForCausalLM`), case, and
+  hyphen/underscore variants (`command_r`, `gpt_oss`, `deepseek-v2`) resolve to
+  the canonical label. Nothing maps across graphs: `mamba` (Mamba-1) does not
+  become `mamba2`, and OLMoE stays unsupported.
+- **A missing `general.architecture` is detected, not assumed.** The loader
+  finds the `<arch>.*` hyperparameter namespace actually present in the
+  metadata (`block_count`, `embedding_length`, ...) and uses it; the historic
+  blanket "assume llama" default only remains for files with no namespace at
+  all.
+- **A mislabeled file follows its hyperparameters.** When the declared label
+  has no metadata namespace of its own (Kimi K2 conversions carrying
+  `deepseek2.*` keys, `llama2`/`llama3` compatibility labels over `llama.*`),
+  hyperparameters are read from the namespace that exists. When the label is
+  entirely unknown but the namespace belongs to a supported architecture
+  (e.g. a fine-tune label over stock `llama.*` metadata), the file loads as
+  that architecture and the load log says so.
+- **Vision projectors are diagnosed.** Passing an `mmproj`/CLIP GGUF as a text
+  model produces an error pointing at `--mmproj` instead of a generic
+  unsupported-architecture failure.
+
+The main coverage is:
 
 | Family | Covered GGUF models / notes |
 |---|---|

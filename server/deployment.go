@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 )
@@ -134,10 +135,69 @@ func (a deploymentAccess) status(req *http.Request) map[string]any {
 	}
 }
 
+// crossSiteRequest reports whether a browser has told us that this
+// state-changing request originated on some other site.
+//
+// A loopback bind is not an authorization boundary. Any page the user happens
+// to visit can issue requests to 127.0.0.1, and a JSON body sent as
+// Content-Type: text/plain is a CORS *simple* request: no preflight is made,
+// so nothing on the server side is consulted before the request arrives. The
+// attacker cannot read the opaque response, but several endpoints here are
+// damaging write-only: POST /remote points every subsequent completion at a
+// base URL of the caller's choosing, which is enough to capture the whole
+// conversation and to choose the assistant's replies.
+//
+// Only requests that positively identify themselves as cross-site are
+// rejected. Browsers attach Sec-Fetch-Site to everything and older ones at
+// least attach Origin to cross-origin writes, while ordinary API clients —
+// curl, the OpenAI SDKs, an agent framework — attach neither and are therefore
+// untouched. That asymmetry is the whole reason this is safe to apply
+// unconditionally: it costs a non-browser caller nothing.
+//
+// Safe methods are exempt. They are not free of consequence here (a cross-site
+// GET can still make this process talk to the Hugging Face API), but that is a
+// budgeting problem rather than a forgery one, and refusing cross-site GETs
+// would break ordinary linking without closing anything.
+func crossSiteRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	}
+	// Fetch metadata is authoritative where the browser sends it. "none" means
+	// the user typed the URL or used a bookmark; "same-origin" is our own page.
+	// "same-site" is deliberately refused along with "cross-site": it means a
+	// different origin that merely shares a registrable domain, which is not a
+	// relationship this server has with anything it trusts.
+	switch strings.ToLower(strings.TrimSpace(req.Header.Get("Sec-Fetch-Site"))) {
+	case "same-origin", "none":
+		return false
+	case "cross-site", "same-site":
+		return true
+	}
+	origin := strings.TrimSpace(req.Header.Get("Origin"))
+	if origin == "" {
+		// No fetch metadata and no Origin: not a browser-initiated write.
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return true
+	}
+	return !strings.EqualFold(parsed.Host, req.Host)
+}
+
 func (a deploymentAccess) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if a.mode.browserOnly() && browserDisabledPath(req.URL.Path) {
 			http.Error(w, "server inference and model controls are disabled in browser deployment", http.StatusNotFound)
+			return
+		}
+		if crossSiteRequest(req) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "cross-site requests are not accepted for this method", http.StatusForbidden)
 			return
 		}
 		if a.mode.adminRequired() && adminOnlyRequest(req) && !a.adminAuthorized(req) {

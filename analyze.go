@@ -35,9 +35,14 @@ type TensorStat struct {
 // analyzing a multi-gigabyte file is instant.
 type Analysis struct {
 	Architecture string
-	Name         string
-	Version      uint32
-	Supported    bool
+	// LoadsAs is the canonical architecture ResolveArchitecture maps this
+	// file to. It differs from Architecture when the declared label is an
+	// alias spelling or when the label was missing/unknown and had to be
+	// detected from the hyperparameter namespace. Supported refers to LoadsAs.
+	LoadsAs   string
+	Name      string
+	Version   uint32
+	Supported bool
 
 	Params        int64 // total weight count across all tensors
 	FileBytes     int64 // sum of tensor bytes (excludes the small header)
@@ -77,13 +82,18 @@ type Analysis struct {
 func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 	cfg := ConfigFromGGUF(g)
 	arch, _ := g.GetString("general.architecture")
+	resolved, _ := ResolveArchitecture(g)
+	if arch == "" {
+		arch = resolved
+	}
 	name, _ := g.GetString("general.name")
 
 	a := &Analysis{
 		Architecture:    arch,
+		LoadsAs:         resolved,
 		Name:            name,
 		Version:         g.Version,
-		Supported:       ArchitectureSupported(arch),
+		Supported:       ArchitectureSupported(resolved),
 		Layers:          cfg.NLayers,
 		Dim:             cfg.Dim,
 		HiddenDim:       cfg.HiddenDim,
@@ -171,7 +181,11 @@ func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 // WriteText renders the analysis as a human-readable report.
 func (a *Analysis) WriteText(w io.Writer) {
 	gb := func(b int64) string { return fmt.Sprintf("%.2f GB", float64(b)/(1024*1024*1024)) }
-	fmt.Fprintf(w, "architecture:   %s (supported: %v)\n", a.Architecture, a.Supported)
+	if a.LoadsAs != "" && a.LoadsAs != a.Architecture {
+		fmt.Fprintf(w, "architecture:   %s (loads as %s, supported: %v)\n", a.Architecture, a.LoadsAs, a.Supported)
+	} else {
+		fmt.Fprintf(w, "architecture:   %s (supported: %v)\n", a.Architecture, a.Supported)
+	}
 	if a.Name != "" {
 		fmt.Fprintf(w, "name:           %s\n", a.Name)
 	}

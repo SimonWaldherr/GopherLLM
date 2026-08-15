@@ -146,6 +146,71 @@ func TestManagedDeploymentProtectsServerControlsButNotGeneration(t *testing.T) {
 	}
 }
 
+// TestCrossSiteWritesAreRejectedButAPIClientsAreNot pins both halves of the
+// same-site check, because either half failing is silently bad: too strict and
+// every non-browser API client breaks with no browser involved to explain it,
+// too lax and any page the user visits can repoint POST /remote at a server of
+// its choosing and harvest the whole conversation.
+//
+// The endpoint under test is /remote precisely because it is the worst case: it
+// is a write whose effect outlives the request, and the attacker never needs to
+// read the response.
+func TestCrossSiteWritesAreRejectedButAPIClientsAreNot(t *testing.T) {
+	h := NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()})
+	t.Cleanup(func() { _ = h.Close() })
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	do := func(method, path string, headers map[string]string) int {
+		req, err := http.NewRequest(method, srv.URL+path, strings.NewReader(`{"base_url":"https://example.test/v1"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, tc := range []struct {
+		name    string
+		method  string
+		path    string
+		headers map[string]string
+		blocked bool
+	}{
+		// curl, the OpenAI SDKs and every agent framework send neither header.
+		{"bare api client", http.MethodPost, "/remote", nil, false},
+		{"our own page", http.MethodPost, "/remote", map[string]string{"Sec-Fetch-Site": "same-origin"}, false},
+		{"typed url or bookmark", http.MethodPost, "/remote", map[string]string{"Sec-Fetch-Site": "none"}, false},
+
+		{"drive-by write", http.MethodPost, "/remote", map[string]string{"Sec-Fetch-Site": "cross-site"}, true},
+		// A sibling origin sharing a registrable domain is not a trust relationship.
+		{"sibling origin", http.MethodPost, "/remote", map[string]string{"Sec-Fetch-Site": "same-site"}, true},
+		// Browsers predating fetch metadata still label a cross-origin write.
+		{"legacy origin header", http.MethodPost, "/remote", map[string]string{"Origin": "https://evil.example"}, true},
+		// A text/plain body is a CORS simple request: no preflight is ever sent,
+		// so the Content-Type must not be what the decision rests on.
+		{"simple request smuggling json", http.MethodPost, "/remote", map[string]string{"Sec-Fetch-Site": "cross-site", "Content-Type": "text/plain"}, true},
+
+		// Safe methods stay reachable cross-site; refusing them would break
+		// ordinary linking without closing the forgery hole.
+		{"cross-site read", http.MethodGet, "/deployment", map[string]string{"Sec-Fetch-Site": "cross-site"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := do(tc.method, tc.path, tc.headers)
+			if blocked := got == http.StatusForbidden; blocked != tc.blocked {
+				t.Fatalf("status %d: blocked=%v, want blocked=%v", got, blocked, tc.blocked)
+			}
+		})
+	}
+}
+
 func TestBrowserDeploymentDisablesServerInferenceAndModelControls(t *testing.T) {
 	wasmDir := t.TempDir()
 	for _, name := range []string{"gopherllm.wasm", "wasm_exec.js"} {
