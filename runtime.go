@@ -316,13 +316,13 @@ type Runner struct {
 	workspaceBuf   *DecodeBuffer
 	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
-	mappedFile *MmapFile
+	mappedFile     *MmapFile
 	// extraMappedFiles holds the additional shard mappings of an out-of-core
 	// split GGUF. Those models have no single mappedFile: every weight is a
 	// view into one of these, so all of them must outlive the Runner and all
 	// of them are closed by Close.
 	extraMappedFiles []*MmapFile
-	outOfCore      bool
+	outOfCore        bool
 	// vision, when non-nil, is a loaded Pixtral-style vision encoder paired
 	// with this Runner's text decoder (see LoadOptions.VisionProjector*).
 	// Independent of kind/loadedKind — only chat-template renderers that

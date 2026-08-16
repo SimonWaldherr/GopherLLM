@@ -113,6 +113,72 @@ func TestMetalQ4KMatvec2MatchesCPU(t *testing.T) {
 	assertMetalMatvecClose(t, gotB, wantB)
 }
 
+func TestMetalQ5KMatvecMatchesCPU(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const rows, cols = metalQ5KDirectMinRows, 256
+	rng := rand.New(rand.NewSource(94))
+	data := make([]byte, 0, rows*176)
+	for range rows {
+		data = append(data, randomQ5KRow(rng, cols)...)
+	}
+	x := metalTestVector(cols)
+	want := []float32{}
+	MatvecQ5KInto(data, x, rows, cols, &want)
+
+	w := prepareMetalWeight(data, GGMLTypeQ5_K, rows, cols, false)
+	if w == nil {
+		t.Fatalf("prepare Q5_K Metal weight: %s", MetalError())
+	}
+	defer releaseMetalWeight(w)
+	got := []float32{}
+	if !matvecMetalQ5KInto(w, x, rows, cols, &got) {
+		t.Fatalf("Q5_K Metal matvec: %s", MetalError())
+	}
+	assertMetalMatvecClose(t, got, want)
+}
+
+func TestMetalBorrowedQ5KMatvecMatchesCPU(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const rows, cols = metalQ5KDirectMinRows, 256
+	rng := rand.New(rand.NewSource(98))
+	data := make([]byte, 0, rows*176)
+	for range rows {
+		data = append(data, randomQ5KRow(rng, cols)...)
+	}
+	image := make([]byte, 32, 32+len(data))
+	image = append(image, data...)
+	path := filepath.Join(t.TempDir(), "borrowed-q5k.bin")
+	if err := os.WriteFile(path, image, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := OpenMmap(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mapped.Close()
+	borrowed := mapped.Bytes()[32:]
+
+	x := metalTestVector(cols)
+	want := []float32{}
+	MatvecQ5KInto(data, x, rows, cols, &want)
+	w := prepareMetalWeight(borrowed, GGMLTypeQ5_K, rows, cols, true)
+	if w == nil {
+		t.Fatalf("prepare borrowed Q5_K Metal weight: %s", MetalError())
+	}
+	defer releaseMetalWeight(w)
+	got := []float32{}
+	if !matvecMetalQ5KInto(w, x, rows, cols, &got) {
+		t.Fatalf("borrowed Q5_K Metal matvec: %s", MetalError())
+	}
+	assertMetalMatvecClose(t, got, want)
+}
+
 func TestMetalQ4K2Q6KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
