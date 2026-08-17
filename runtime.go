@@ -695,6 +695,16 @@ func (r *Runner) Config() Config            { return r.config }
 func (r *Runner) ModelName() (string, bool) { return r.gguf.GetString("general.name") }
 func (r *Runner) OutOfCore() bool           { return r != nil && r.outOfCore }
 
+// VisionConfig returns the paired vision encoder's hyperparameters, if one
+// was loaded alongside this Runner's text decoder. ok is false for a
+// text-only model (see HasVision).
+func (r *Runner) VisionConfig() (cfg PixtralVisionConfig, ok bool) {
+	if r == nil || r.vision == nil {
+		return PixtralVisionConfig{}, false
+	}
+	return r.visionConfig, true
+}
+
 func (r *Runner) Close() error {
 	if r == nil {
 		return nil

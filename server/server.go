@@ -1110,6 +1110,22 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		}
 		writeJSON(w, map[string]any{"models": models})
 	})
+	mux.HandleFunc("/models/architecture", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		requested := strings.TrimSpace(req.URL.Query().Get("model"))
+		if requested == "" {
+			requested = strings.TrimSpace(req.URL.Query().Get("id"))
+		}
+		g, ok := resolveArchGraph(state, opts.ModelDir, requested)
+		if !ok {
+			http.Error(w, "model not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, g)
+	})
 	mux.HandleFunc("/models/load", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2637,6 +2653,53 @@ func resolveModelAnalysis(state *runnerState, modelDir, requested string) (*goph
 		return nil, false
 	}
 	return a, true
+}
+
+// archGraphForFile parses a GGUF file's header only (mmap'd, no weight bytes
+// touched) into a gopherllm.ArchGraph, mirroring analyzeModelFile but for the
+// architecture viewer.
+func archGraphForFile(path string) (*gopherllm.ArchGraph, error) {
+	mmap, err := gopherllm.OpenMmap(path)
+	if err != nil {
+		return nil, err
+	}
+	defer mmap.Close()
+	gguf, err := gopherllm.ParseGGUFQuiet(mmap.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	tok, _ := gopherllm.TokenizerFromMetadata(gguf.Metadata)
+	cfg := gopherllm.ConfigFromGGUF(gguf)
+	a := gopherllm.AnalyzeGGUF(gguf, tok)
+	return gopherllm.BuildArchGraph(gguf, cfg, a, nil), nil
+}
+
+// resolveArchGraph answers the architecture viewer's "which model": empty or
+// matching name means the currently loaded gopherllm.Runner (vision encoder
+// included, if paired); any other name is looked up in ModelDir (if
+// configured) and header-analyzed on demand, same resolution rule as
+// resolveModelAnalysis.
+func resolveArchGraph(state *runnerState, modelDir, requested string) (*gopherllm.ArchGraph, bool) {
+	r := state.get()
+	if r != nil && (requested == "" || requested == modelID(r)) {
+		return gopherllm.RunnerArchGraph(r), true
+	}
+	if modelDir == "" {
+		return nil, false
+	}
+	entries, err := gopherllm.DiscoverModels(modelDir, io.Discard)
+	if err != nil {
+		return nil, false
+	}
+	entry, err := gopherllm.SelectModel(entries, requested)
+	if err != nil {
+		return nil, false
+	}
+	g, err := archGraphForFile(entry.Path)
+	if err != nil {
+		return nil, false
+	}
+	return g, true
 }
 
 // ollamaTagEntries builds /api/tags' model list: every entry under ModelDir

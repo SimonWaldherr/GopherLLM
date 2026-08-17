@@ -1282,6 +1282,40 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .agentos-field-value { color: var(--ink); overflow-wrap: anywhere; }
 .agentos-result { margin-top: 10px; }
 .agentos-output { margin: 0 0 8px; padding: 8px 9px; max-height: 220px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg); color: var(--ink); font: var(--fs-xs)/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ── Architecture viewer: hfviewer-style structural graph, built from the
+   GGUF header (no weights, no network) ── */
+.archview-panel { width: min(760px, 100%); max-height: min(90vh, 900px); }
+.archview-model-picker { display: flex; flex-direction: column; gap: 4px; margin-bottom: 2px; color: var(--muted); font-size: var(--fs-xs); font-weight: 650; }
+.archview-model-picker select { padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel); color: var(--ink); font-size: var(--fs-sm); }
+.arch-stat-grid { display: grid; grid-template-columns: minmax(120px, auto) 1fr; gap: 6px 14px; margin: 0; font-size: var(--fs-xs); }
+.arch-stat-grid dt { color: var(--muted); font-weight: 650; }
+.arch-stat-grid dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.arch-flow { display: flex; flex-direction: column; align-items: stretch; gap: 0; }
+.arch-connector { align-self: center; margin: 1px 0; color: var(--muted); font-size: var(--fs-md); line-height: 1; }
+.arch-node { padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); }
+.arch-node-vision { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 6%, var(--panel-2)); }
+.arch-node-block { border-style: dashed; }
+.arch-node-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.arch-node-label { font-weight: 700; font-size: var(--fs-sm); color: var(--ink); }
+.arch-node-repeat { flex: none; color: var(--accent); font: 700 var(--fs-xs)/1 var(--mono); }
+.arch-node-detail { margin: 3px 0 0; color: var(--muted); font-size: var(--fs-2xs); }
+.arch-node-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
+.arch-badge { display: inline-flex; align-items: center; min-height: 19px; padding: 1px 7px; border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line)); border-radius: var(--r-pill); background: var(--panel); color: var(--accent); font: 700 var(--fs-3xs)/1.2 var(--mono); white-space: nowrap; cursor: help; }
+.arch-node-expand { margin-top: 8px; }
+.arch-node-children { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.arch-node-children .arch-node { background: var(--panel); }
+.arch-layer-strip { display: flex; flex-wrap: wrap; gap: 2px; }
+.arch-layer-cell { width: 10px; height: 18px; border-radius: 2px; background: var(--line); cursor: help; }
+.arch-layer-cell.arch-layer-attn { background: color-mix(in srgb, var(--accent) 55%, var(--panel-2)); }
+.arch-layer-cell.arch-layer-mamba { background: color-mix(in srgb, var(--ok) 55%, var(--panel-2)); }
+.arch-layer-cell.arch-layer-deltanet { background: color-mix(in srgb, var(--stop) 55%, var(--panel-2)); }
+.arch-layer-cell.arch-layer-swa { outline: 2px solid var(--ink); outline-offset: -2px; }
+.arch-layer-cell.arch-layer-qknorm { border-bottom: 3px solid var(--ok); }
+.arch-glossary { display: grid; gap: 8px; margin: 10px 0 0; font-size: var(--fs-2xs); }
+.arch-glossary dt { font-weight: 700; color: var(--ink); }
+.arch-glossary dd { margin: 1px 0 0; color: var(--muted); line-height: 1.4; }
+
 .settings-note { margin: 10px 0 0; color: var(--muted); font-size: var(--fs-2xs); }
 .toast { position: fixed; z-index: 40; bottom: 20px; left: 50%; max-width: min(420px, calc(100vw - 32px)); padding: 8px 12px 8px 14px; transform: translateX(-50%); border: 1px solid var(--line-strong); border-left: 3px solid var(--line-strong); border-radius: var(--r-md); background: var(--ink); color: var(--panel); box-shadow: var(--shadow-pop); font-size: var(--fs-sm); }
 .toast-success { border-left-color: var(--ok); }

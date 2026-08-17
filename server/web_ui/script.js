@@ -1307,6 +1307,17 @@ function toMarkdown(chat) {
   const captureConfirmButtonEl = $("captureConfirmButton");
   const captureLiveButtonEl = $("captureLiveButton");
   const captureFootEl = $("captureFoot");
+  const archToggleEl = $("archToggle");
+  const archViewerEl = $("archViewer");
+  const archViewerCloseEl = $("archViewerClose");
+  const archModelSelectEl = $("archModelSelect");
+  const archStatusEl = $("archStatus");
+  const archContentEl = $("archContent");
+  const archStatsEl = $("archStats");
+  const archFlowEl = $("archFlow");
+  const archLayerSectionEl = $("archLayerSection");
+  const archLayerStripEl = $("archLayerStrip");
+  const archGlossaryEl = $("archGlossary");
   const liveOverlayEl = $("liveOverlay");
   const liveStatusBadgeEl = $("liveStatusBadge");
   const liveStatusLabelEl = $("liveStatusLabel");
@@ -1622,6 +1633,7 @@ function toMarkdown(chat) {
     else if (activeDialog.root === batchEl) closeBatch();
     else if (activeDialog.root === agentosEl) closeAgentOS();
     else if (activeDialog.root === captureModalEl) closeCaptureModal();
+    else if (activeDialog.root === archViewerEl) closeArchViewer();
   }
 
   function setStatus(text) {
@@ -4279,6 +4291,230 @@ function toMarkdown(chat) {
     }
   }
 
+  /* ── Architecture viewer: hfviewer-style structural graph, built entirely
+     from the GGUF header (no weights loaded, nothing sent anywhere) ── */
+  const ARCH_BADGE_LABELS = {
+    mha: "MHA", gqa: "GQA", mqa: "MQA", mla: "MLA",
+    rope: "RoPE", alibi: "ALiBi", "absolute-position": "Absolute position",
+    "qk-norm": "QK-Norm", "sliding-window": "Sliding window",
+    swiglu: "SwiGLU", "gelu-mlp": "GELU MLP", "plain-mlp": "Plain MLP",
+    moe: "MoE", "shared-expert": "Shared expert", "leading-dense": "Leading dense",
+    mamba: "Mamba-2", deltanet: "Gated DeltaNet",
+    rmsnorm: "RMSNorm", layernorm: "LayerNorm",
+    "weight-tying": "Weight tying", "parallel-residual": "Parallel residual", softcap: "Softcap",
+    "embedding-scale": "Embedding scale", "vision-tower": "Vision tower", "patch-merger": "Patch merger"
+  };
+  let archGlossaryTerms = {};
+
+  function archBadgeLabel(key) {
+    return ARCH_BADGE_LABELS[key] || key;
+  }
+
+  function archNumber(n) {
+    return typeof n === "number" ? n.toLocaleString("en-US") : String(n);
+  }
+
+  function archBytes(n) {
+    if (typeof n !== "number" || !n) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let value = n, i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+    return (i === 0 ? value : value.toFixed(value < 10 ? 2 : 1)) + " " + units[i];
+  }
+
+  function archParams(n) {
+    if (typeof n !== "number" || !n) return "0";
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    return archNumber(n);
+  }
+
+  function archBadgeRow(keys) {
+    const row = document.createElement("div");
+    row.className = "arch-node-badges";
+    (keys || []).forEach((key) => {
+      const pill = document.createElement("span");
+      pill.className = "arch-badge";
+      pill.textContent = archBadgeLabel(key);
+      pill.title = archGlossaryTerms[key] || "";
+      row.appendChild(pill);
+    });
+    return row;
+  }
+
+  function renderArchNode(node) {
+    const card = document.createElement("div");
+    card.className = "arch-node arch-node-" + node.kind;
+    const head = document.createElement("div");
+    head.className = "arch-node-head";
+    const label = document.createElement("span");
+    label.className = "arch-node-label";
+    label.textContent = node.label;
+    head.appendChild(label);
+    if (node.repeat) {
+      const rep = document.createElement("span");
+      rep.className = "arch-node-repeat";
+      rep.textContent = "×" + node.repeat;
+      head.appendChild(rep);
+    }
+    card.appendChild(head);
+    if (node.detail) {
+      const detail = document.createElement("p");
+      detail.className = "arch-node-detail";
+      detail.textContent = node.detail;
+      card.appendChild(detail);
+    }
+    if (node.badges && node.badges.length) card.appendChild(archBadgeRow(node.badges));
+    if (node.children && node.children.length) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "text-button arch-node-expand";
+      toggle.textContent = "Show block internals";
+      const childWrap = document.createElement("div");
+      childWrap.className = "arch-node-children";
+      childWrap.hidden = true;
+      node.children.forEach((child) => childWrap.appendChild(renderArchNode(child)));
+      toggle.addEventListener("click", () => {
+        childWrap.hidden = !childWrap.hidden;
+        toggle.textContent = childWrap.hidden ? "Show block internals" : "Hide block internals";
+      });
+      card.appendChild(toggle);
+      card.appendChild(childWrap);
+    }
+    return card;
+  }
+
+  function renderArchStats(summary) {
+    archStatsEl.replaceChildren();
+    const rows = [
+      ["Architecture", summary.architecture + (summary.loadsAs && summary.loadsAs !== summary.architecture ? " (loads as " + summary.loadsAs + ")" : "") + (summary.supported ? "" : " — unsupported")],
+      ["Parameters", archParams(summary.params) + (summary.bitsPerWeight ? " · " + summary.bitsPerWeight.toFixed(2) + " bits/weight" : "")],
+      ["Layers", archNumber(summary.layers)],
+      ["Hidden size", archNumber(summary.hiddenSize)],
+      ["Feed-forward size", archNumber(summary.ffnSize)],
+      ["Attention", summary.attentionType + " — " + summary.heads + "Q / " + summary.kvHeads + "KV heads, head dim " + summary.headDim],
+    ];
+    if (summary.moeExperts) rows.push(["Experts", summary.moeExperts + " total, top-" + summary.moeUsed + " routed" + (summary.moeSharedExperts ? " + " + summary.moeSharedExperts + " shared" : "")]);
+    rows.push(["Context length", archNumber(summary.contextLength) + (summary.slidingWindow ? " (sliding window " + summary.slidingWindow + ")" : "")]);
+    rows.push(["Vocabulary", archNumber(summary.vocabSize) + " tokens"]);
+    rows.push(["Position scheme", summary.positionScheme + (summary.ropeScalingType ? " (" + summary.ropeScalingType + " scaling)" : "")]);
+    if (summary.dtypes && summary.dtypes.length) rows.push(["Precision mix", summary.dtypes.map((d) => d.type + " " + d.percent.toFixed(0) + "%").join(", ")]);
+    rows.push(["KV cache @ 4K ctx", archBytes(summary.kvCacheBytesAt4k)]);
+    rows.push(["KV cache @ full ctx", archBytes(summary.kvCacheBytesAtFullContext)]);
+    rows.forEach(([label, value]) => {
+      const dt = document.createElement("dt");
+      dt.textContent = label;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      archStatsEl.append(dt, dd);
+    });
+  }
+
+  function renderArchLayerStrip(layers) {
+    archLayerStripEl.replaceChildren();
+    layers.forEach((layer) => {
+      const cell = document.createElement("span");
+      cell.className = "arch-layer-cell arch-layer-" + layer.attention;
+      if (layer.swa) cell.classList.add("arch-layer-swa");
+      if (layer.qkNorm) cell.classList.add("arch-layer-qknorm");
+      cell.title = "Layer " + layer.index + ": " + layer.attention + " attention, " + layer.ffn + " FFN" +
+        (layer.swa ? ", sliding window" : "") + (layer.qkNorm ? ", QK-norm" : "");
+      archLayerStripEl.appendChild(cell);
+    });
+  }
+
+  function renderArchGlossary(glossary) {
+    archGlossaryEl.replaceChildren();
+    Object.keys(glossary || {}).sort().forEach((key) => {
+      const dt = document.createElement("dt");
+      dt.textContent = archBadgeLabel(key);
+      const dd = document.createElement("dd");
+      dd.textContent = glossary[key];
+      archGlossaryEl.append(dt, dd);
+    });
+  }
+
+  function renderArchGraph(graph) {
+    archGlossaryTerms = graph.glossary || {};
+    renderArchStats(graph.summary || {});
+    archFlowEl.replaceChildren();
+    (graph.nodes || []).forEach((node, i) => {
+      if (i > 0) {
+        const connector = document.createElement("div");
+        connector.className = "arch-connector";
+        connector.setAttribute("aria-hidden", "true");
+        connector.textContent = "↓";
+        archFlowEl.appendChild(connector);
+      }
+      archFlowEl.appendChild(renderArchNode(node));
+    });
+    const layers = graph.layers || [];
+    if (graph.uniform || layers.length < 2) {
+      archLayerSectionEl.hidden = true;
+    } else {
+      archLayerSectionEl.hidden = false;
+      renderArchLayerStrip(layers);
+    }
+    renderArchGlossary(graph.glossary);
+  }
+
+  function populateArchModelSelect() {
+    const previous = archModelSelectEl.value;
+    archModelSelectEl.replaceChildren();
+    const current = document.createElement("option");
+    current.value = "";
+    current.textContent = "Currently loaded model";
+    archModelSelectEl.appendChild(current);
+    modelCatalog.forEach((model) => {
+      if (model.embedding) return;
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent = (model.name || model.id) + (model.loaded ? " (loaded)" : "");
+      archModelSelectEl.appendChild(option);
+    });
+    if (previous && Array.from(archModelSelectEl.options).some((o) => o.value === previous)) archModelSelectEl.value = previous;
+  }
+
+  async function loadArchGraph(modelID) {
+    archContentEl.setAttribute("aria-busy", "true");
+    archStatusEl.hidden = false;
+    archStatusEl.textContent = "Reading model header…";
+    try {
+      const url = "/models/architecture" + (modelID ? "?model=" + encodeURIComponent(modelID) : "");
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(response.status === 404 ? "No model loaded yet. Load a model or pick one above." : "HTTP " + response.status);
+      const graph = await response.json();
+      renderArchGraph(graph);
+      archStatusEl.hidden = true;
+    } catch (err) {
+      archStatsEl.replaceChildren();
+      archFlowEl.replaceChildren();
+      archLayerSectionEl.hidden = true;
+      archGlossaryEl.replaceChildren();
+      archStatusEl.hidden = false;
+      archStatusEl.textContent = "Could not load architecture: " + err.message;
+    } finally {
+      archContentEl.setAttribute("aria-busy", "false");
+    }
+  }
+
+  function openArchViewer() {
+    archToggleEl.setAttribute("aria-expanded", "true");
+    populateArchModelSelect();
+    openDialog(archViewerEl, archToggleEl, archViewerCloseEl);
+    loadArchGraph(archModelSelectEl.value);
+  }
+  function closeArchViewer() {
+    if (archViewerEl.hidden) return;
+    archToggleEl.setAttribute("aria-expanded", "false");
+    closeDialog(archViewerEl);
+  }
+  archToggleEl.addEventListener("click", () => {
+    if (archViewerEl.hidden) openArchViewer(); else closeArchViewer();
+  });
+  archViewerCloseEl.addEventListener("click", closeArchViewer);
+  archModelSelectEl.addEventListener("change", () => loadArchGraph(archModelSelectEl.value));
+
   /* ── /batch: one prompt, many items ── */
   function openBatch() {
     refreshBatchDataset();
@@ -5389,6 +5625,7 @@ function toMarkdown(chat) {
     serverModelSectionEl.hidden = browser || (adminRequiredDeployment && !adminAuthorized);
     modelDownloadSectionEl.hidden = browser || (adminRequiredDeployment && !adminAuthorized);
     browserModelUnloadEl.hidden = browserOnlyDeployment;
+    archToggleEl.hidden = browserOnlyDeployment;
     inferenceModeStatusEl.textContent = browser
       ? (browserOnlyDeployment
         ? "This deployment runs only in this browser. Choose a GGUF from this device; it is not uploaded to the server. WebGPU is used when available."
