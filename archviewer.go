@@ -55,8 +55,13 @@ type ArchGraphSummary struct {
 	LeadingDense     int  `json:"leadingDenseBlocks,omitempty"`
 	TiedEmbedding    bool `json:"tiedEmbedding"`
 
-	KVCacheBytesAtFullContext int64 `json:"kvCacheBytesAtFullContext"`
-	KVCacheBytesAt4K          int64 `json:"kvCacheBytesAt4k"`
+	KVCacheBytesAtFullContext    int64 `json:"kvCacheBytesAtFullContext"`
+	KVCacheBytesAt4K             int64 `json:"kvCacheBytesAt4k"`
+	KVCacheBytesAtFullContextF16 int64 `json:"kvCacheBytesAtFullContextF16"`
+	KVCacheBytesAt4KF16          int64 `json:"kvCacheBytesAt4kF16"`
+	KVCacheBytesAtFullContextI8  int64 `json:"kvCacheBytesAtFullContextI8,omitempty"`
+	KVCacheBytesAt4KI8           int64 `json:"kvCacheBytesAt4kI8,omitempty"`
+	KVCacheLayers                int   `json:"kvCacheLayers"`
 
 	TokenizerModel string `json:"tokenizerModel,omitempty"`
 	ChatTemplate   bool   `json:"chatTemplate"`
@@ -101,16 +106,30 @@ type ArchGraphLayer struct {
 	QKNorm    bool   `json:"qkNorm"`
 }
 
+// ArchGraphLayerGroup is a consecutive run of layers with the same
+// mechanisms. It makes a hybrid schedule readable without having to inspect
+// every cell in the layer strip.
+type ArchGraphLayerGroup struct {
+	Start     int    `json:"start"`
+	End       int    `json:"end"`
+	Attention string `json:"attention"`
+	FFN       string `json:"ffn"`
+	RoPE      bool   `json:"rope"`
+	SWA       bool   `json:"swa"`
+	QKNorm    bool   `json:"qkNorm"`
+}
+
 // ArchGraph is the full response for the architecture viewer: stats, an
 // optional vision tower, the node graph, the per-layer schedule, and a
 // glossary of the terms referenced by node badges.
 type ArchGraph struct {
-	Summary  ArchGraphSummary  `json:"summary"`
-	Vision   *ArchGraphVision  `json:"vision,omitempty"`
-	Nodes    []ArchGraphNode   `json:"nodes"`
-	Layers   []ArchGraphLayer  `json:"layers"`
-	Uniform  bool              `json:"uniform"`
-	Glossary map[string]string `json:"glossary"`
+	Summary  ArchGraphSummary      `json:"summary"`
+	Vision   *ArchGraphVision      `json:"vision,omitempty"`
+	Nodes    []ArchGraphNode       `json:"nodes"`
+	Layers   []ArchGraphLayer      `json:"layers"`
+	Groups   []ArchGraphLayerGroup `json:"groups,omitempty"`
+	Uniform  bool                  `json:"uniform"`
+	Glossary map[string]string     `json:"glossary"`
 }
 
 // archGlossary is static, self-contained documentation for every badge key
@@ -242,6 +261,9 @@ func BuildArchGraph(g *GGUFFile, cfg Config, a *Analysis, vision *ArchVisionInpu
 		MoEExperts: cfg.ExpertCount, MoEUsed: cfg.ExpertUsedCount, MoESharedExperts: cfg.ExpertSharedCount,
 		LeadingDense: cfg.LeadingDenseBlockCount, TiedEmbedding: tied,
 		KVCacheBytesAtFullContext: a.KVCacheBytesAtFullContext, KVCacheBytesAt4K: a.KVCacheBytesAt4K,
+		KVCacheBytesAtFullContextF16: a.KVCacheBytesAtFullContextF16, KVCacheBytesAt4KF16: a.KVCacheBytesAt4KF16,
+		KVCacheBytesAtFullContextI8: a.KVCacheBytesAtFullContextI8, KVCacheBytesAt4KI8: a.KVCacheBytesAt4KI8,
+		KVCacheLayers:  a.KVCacheLayers,
 		TokenizerModel: a.TokenizerModel, ChatTemplate: a.ChatTemplate,
 	}
 
@@ -323,7 +345,7 @@ func BuildArchGraph(g *GGUFFile, cfg Config, a *Analysis, vision *ArchVisionInpu
 
 	blockLabel := fmt.Sprintf("Transformer block x%d", cfg.NLayers)
 	if !uniform {
-		blockLabel = fmt.Sprintf("Transformer blocks x%d (heterogeneous, see layer schedule)", cfg.NLayers)
+		blockLabel = fmt.Sprintf("Decoder blocks x%d (heterogeneous, see layer schedule)", cfg.NLayers)
 	}
 	blockBadges := []string{}
 	if cfg.ParallelResidual {
@@ -367,9 +389,29 @@ func BuildArchGraph(g *GGUFFile, cfg Config, a *Analysis, vision *ArchVisionInpu
 	}
 
 	return &ArchGraph{
-		Summary: summary, Vision: visionOut, Nodes: nodes, Layers: layers, Uniform: uniform,
+		Summary: summary, Vision: visionOut, Nodes: nodes, Layers: layers, Groups: groupArchLayers(layers), Uniform: uniform,
 		Glossary: usedGlossary,
 	}
+}
+
+func groupArchLayers(layers []ArchGraphLayer) []ArchGraphLayerGroup {
+	if len(layers) == 0 {
+		return nil
+	}
+	groups := make([]ArchGraphLayerGroup, 0, len(layers))
+	start := 0
+	same := func(a, b ArchGraphLayer) bool {
+		return a.Attention == b.Attention && a.FFN == b.FFN && a.RoPE == b.RoPE && a.SWA == b.SWA && a.QKNorm == b.QKNorm
+	}
+	for i := 1; i <= len(layers); i++ {
+		if i != len(layers) && same(layers[start], layers[i]) {
+			continue
+		}
+		l := layers[start]
+		groups = append(groups, ArchGraphLayerGroup{Start: l.Index, End: layers[i-1].Index, Attention: l.Attention, FFN: l.FFN, RoPE: l.RoPE, SWA: l.SWA, QKNorm: l.QKNorm})
+		start = i
+	}
+	return groups
 }
 
 // attentionTypeLabel classifies the attention mechanism from Config alone.

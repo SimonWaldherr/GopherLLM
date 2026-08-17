@@ -1317,6 +1317,7 @@ function toMarkdown(chat) {
   const archFlowEl = $("archFlow");
   const archLayerSectionEl = $("archLayerSection");
   const archLayerStripEl = $("archLayerStrip");
+  const archLayerGroupsEl = $("archLayerGroups");
   const archGlossaryEl = $("archGlossary");
   const liveOverlayEl = $("liveOverlay");
   const liveStatusBadgeEl = $("liveStatusBadge");
@@ -4399,8 +4400,11 @@ function toMarkdown(chat) {
     rows.push(["Vocabulary", archNumber(summary.vocabSize) + " tokens"]);
     rows.push(["Position scheme", summary.positionScheme + (summary.ropeScalingType ? " (" + summary.ropeScalingType + " scaling)" : "")]);
     if (summary.dtypes && summary.dtypes.length) rows.push(["Precision mix", summary.dtypes.map((d) => d.type + " " + d.percent.toFixed(0) + "%").join(", ")]);
-    rows.push(["KV cache @ 4K ctx", archBytes(summary.kvCacheBytesAt4k)]);
-    rows.push(["KV cache @ full ctx", archBytes(summary.kvCacheBytesAtFullContext)]);
+    const cacheLayers = summary.kvCacheLayers ? " across " + summary.kvCacheLayers + " K/V layer" + (summary.kvCacheLayers === 1 ? "" : "s") : "";
+    rows.push(["KV cache @ 4K ctx", "f32 " + archBytes(summary.kvCacheBytesAt4k) + " · f16 " + archBytes(summary.kvCacheBytesAt4kF16) + cacheLayers]);
+    rows.push(["KV cache @ full ctx", "f32 " + archBytes(summary.kvCacheBytesAtFullContext) + " · f16 " + archBytes(summary.kvCacheBytesAtFullContextF16) + cacheLayers]);
+    if (summary.kvCacheBytesAt4kI8) rows.push(["KV cache @ 4K ctx (I8)", archBytes(summary.kvCacheBytesAt4kI8)]);
+    if (summary.kvCacheBytesAtFullContextI8) rows.push(["KV cache @ full ctx (I8)", archBytes(summary.kvCacheBytesAtFullContextI8)]);
     rows.forEach(([label, value]) => {
       const dt = document.createElement("dt");
       dt.textContent = label;
@@ -4420,6 +4424,20 @@ function toMarkdown(chat) {
       cell.title = "Layer " + layer.index + ": " + layer.attention + " attention, " + layer.ffn + " FFN" +
         (layer.swa ? ", sliding window" : "") + (layer.qkNorm ? ", QK-norm" : "");
       archLayerStripEl.appendChild(cell);
+    });
+  }
+
+  function renderArchLayerGroups(groups) {
+    archLayerGroupsEl.replaceChildren();
+    (groups || []).forEach((group) => {
+      const item = document.createElement("li");
+      const range = group.start === group.end ? "Layer " + group.start : "Layers " + group.start + "–" + group.end;
+      const traits = [group.attention, group.ffn + " FFN"];
+      if (group.rope) traits.push("RoPE");
+      if (group.swa) traits.push("sliding window");
+      if (group.qkNorm) traits.push("QK-norm");
+      item.textContent = range + ": " + traits.join(" · ");
+      archLayerGroupsEl.appendChild(item);
     });
   }
 
@@ -4454,6 +4472,7 @@ function toMarkdown(chat) {
     } else {
       archLayerSectionEl.hidden = false;
       renderArchLayerStrip(layers);
+      renderArchLayerGroups(graph.groups);
     }
     renderArchGlossary(graph.glossary);
   }
@@ -4490,6 +4509,7 @@ function toMarkdown(chat) {
       archStatsEl.replaceChildren();
       archFlowEl.replaceChildren();
       archLayerSectionEl.hidden = true;
+      archLayerGroupsEl.replaceChildren();
       archGlossaryEl.replaceChildren();
       archStatusEl.hidden = false;
       archStatusEl.textContent = "Could not load architecture: " + err.message;

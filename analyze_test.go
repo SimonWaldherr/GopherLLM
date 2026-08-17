@@ -91,3 +91,37 @@ func TestNearestTokensTinyModel(t *testing.T) {
 		t.Fatal("expected error for out-of-range id")
 	}
 }
+
+func TestAnalyzeKVCacheUsesHybridPhysicalDepth(t *testing.T) {
+	g, err := ParseGGUFQuiet(buildTinyQwen35MoEGGUF(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := AnalyzeGGUF(g, nil)
+	// The tiny fixture has one DeltaNet block and one full-attention block.
+	// Only the latter reserves K/V rows; treating both as attention doubles
+	// the reported footprint.
+	if a.KVCacheLayers != 1 {
+		t.Fatalf("KV cache layers = %d, want 1", a.KVCacheLayers)
+	}
+	if want := int64(1 * (4 + 4) * 32 * 4); a.KVCacheBytesAtFullContext != want {
+		t.Fatalf("f32 KV cache = %d, want %d", a.KVCacheBytesAtFullContext, want)
+	}
+	if want := int64(1 * (4 + 4) * 32 * 2); a.KVCacheBytesAtFullContextF16 != want {
+		t.Fatalf("f16 KV cache = %d, want %d", a.KVCacheBytesAtFullContextF16, want)
+	}
+	if a.KVCacheBytesAtFullContextI8 != 0 {
+		t.Fatalf("unaligned K/V dimensions must not report an I8 cache: %d", a.KVCacheBytesAtFullContextI8)
+	}
+}
+
+func TestAnalyzeMambaReportsNoKVCache(t *testing.T) {
+	g, err := ParseGGUFQuiet(buildTinyMamba2GGUF(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := AnalyzeGGUF(g, nil)
+	if a.KVCacheLayers != 0 || a.KVCacheBytesAtFullContext != 0 || a.KVCacheBytesAtFullContextF16 != 0 {
+		t.Fatalf("Mamba2 should not report a K/V cache: %+v", a)
+	}
+}

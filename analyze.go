@@ -74,6 +74,17 @@ type Analysis struct {
 	// KVCacheBytesAtFullContext / At4K estimate the f32 KV cache footprint.
 	KVCacheBytesAtFullContext int64
 	KVCacheBytesAt4K          int64
+	// KVCacheLayers is the number of physical K/V rows reserved by the
+	// runtime. It can be smaller than Layers for hybrid Qwen 3.5/3.6 models,
+	// whose DeltaNet blocks have recurrent state instead of a K/V cache.
+	KVCacheLayers int
+	// The same cache capacity in the optional storage formats. F16 is always
+	// exactly half of f32; I8 is reported only when the model's K/V geometry is
+	// Q8_0-block aligned and therefore usable by the runtime.
+	KVCacheBytesAtFullContextF16 int64
+	KVCacheBytesAt4KF16          int64
+	KVCacheBytesAtFullContextI8  int64
+	KVCacheBytesAt4KI8           int64
 }
 
 // AnalyzeGGUF builds an Analysis from a parsed GGUF. tok may be nil (tokenizer
@@ -155,14 +166,32 @@ func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 	// has a query-only shared-KV tail, so its physical cache depth is smaller
 	// than the decoder depth (35-20=15 in the local E2B GGUF).
 	kvLayers := cfg.NLayers
+	// Qwen 3.5/3.6 compacts the cache to only its full-attention blocks; its
+	// remaining blocks use DeltaNet recurrent state. A pure Mamba2 graph has
+	// no K/V cache at all. Matching these runtime allocations keeps a model
+	// inspector from overstating memory by up to 4x.
+	switch cfg.Arch {
+	case "qwen35", "qwen35moe":
+		kvLayers = qwen35KVCacheLayerCount(g, cfg.NLayers)
+	case "mamba2":
+		kvLayers = 0
+	}
 	if cfg.Arch == "gemma4" {
 		if shared := int(g.GetU32("gemma4.attention.shared_kv_layers", 0)); shared > 0 && shared < kvLayers {
 			kvLayers -= shared
 		}
 	}
-	perPos := int64(kvLayers) * int64(cfg.NKVHeads) * int64(cfg.HeadDim+cfg.ValueDim) * 4
-	a.KVCacheBytesAtFullContext = perPos * int64(cfg.MaxSeqLen)
-	a.KVCacheBytesAt4K = perPos * int64(min(4096, cfg.MaxSeqLen))
+	a.KVCacheLayers = kvLayers
+	kDim, vDim := cfg.NKVHeads*cfg.HeadDim, cfg.KVDim
+	fullContext, at4K := cfg.MaxSeqLen, min(4096, cfg.MaxSeqLen)
+	a.KVCacheBytesAtFullContext = kvCacheBytes(kvLayers, kDim, vDim, fullContext, kvF32)
+	a.KVCacheBytesAt4K = kvCacheBytes(kvLayers, kDim, vDim, at4K, kvF32)
+	a.KVCacheBytesAtFullContextF16 = kvCacheBytes(kvLayers, kDim, vDim, fullContext, kvF16)
+	a.KVCacheBytesAt4KF16 = kvCacheBytes(kvLayers, kDim, vDim, at4K, kvF16)
+	if kvI8Eligible(kDim, vDim, cfg.HeadDim, cfg.ValueDim) {
+		a.KVCacheBytesAtFullContextI8 = kvCacheBytes(kvLayers, kDim, vDim, fullContext, kvI8)
+		a.KVCacheBytesAt4KI8 = kvCacheBytes(kvLayers, kDim, vDim, at4K, kvI8)
+	}
 
 	if v, ok := g.Metadata["tokenizer.ggml.model"]; ok {
 		a.TokenizerModel, _ = v.AsString()
@@ -215,7 +244,10 @@ func (a *Analysis) WriteText(w io.Writer) {
 		kind = "plain fallback"
 	}
 	fmt.Fprintf(w, "chat template:  embedded=%v, detected=%s\n", a.ChatTemplate, kind)
-	fmt.Fprintf(w, "kv cache (f32): %s at full context, %s at 4K\n", gb(a.KVCacheBytesAtFullContext), gb(a.KVCacheBytesAt4K))
+	fmt.Fprintf(w, "kv cache (%d layers): f32 %s at full context, %s at 4K; f16 %s, %s\n", a.KVCacheLayers, gb(a.KVCacheBytesAtFullContext), gb(a.KVCacheBytesAt4K), gb(a.KVCacheBytesAtFullContextF16), gb(a.KVCacheBytesAt4KF16))
+	if a.KVCacheBytesAtFullContextI8 > 0 {
+		fmt.Fprintf(w, "kv cache (i8):  %s at full context, %s at 4K\n", gb(a.KVCacheBytesAtFullContextI8), gb(a.KVCacheBytesAt4KI8))
+	}
 	fmt.Fprintln(w, "tensor types:")
 	for _, st := range a.DTypes {
 		share := float64(0)
@@ -228,6 +260,24 @@ func (a *Analysis) WriteText(w io.Writer) {
 	for _, t := range a.LargestTensors {
 		fmt.Fprintf(w, "  %-40s %-6s %8s\n", t.Name, t.Type, gb(t.Bytes))
 	}
+}
+
+// qwen35KVCacheLayerCount returns the physical cache depth for the hybrid
+// Qwen 3.5/3.6 graph without loading weights. DeltaNet blocks also carry an
+// attn_qkv tensor, so the separate attn_q projection is the reliable marker
+// for a full-attention block.
+func qwen35KVCacheLayerCount(g *GGUFFile, layers int) int {
+	names := make(map[string]struct{}, len(g.Tensors))
+	for _, t := range g.Tensors {
+		names[t.Name] = struct{}{}
+	}
+	count := 0
+	for i := 0; i < layers; i++ {
+		if _, ok := names[fmt.Sprintf("blk.%d.attn_q.weight", i)]; ok {
+			count++
+		}
+	}
+	return count
 }
 
 // TokenMatch is one vocabulary entry, with Score meaning depending on the

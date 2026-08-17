@@ -1312,6 +1312,8 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .arch-layer-cell.arch-layer-deltanet { background: color-mix(in srgb, var(--stop) 55%, var(--panel-2)); }
 .arch-layer-cell.arch-layer-swa { outline: 2px solid var(--ink); outline-offset: -2px; }
 .arch-layer-cell.arch-layer-qknorm { border-bottom: 3px solid var(--ok); }
+.arch-layer-groups { display: grid; gap: 4px; margin: 9px 0 0; padding-left: 18px; color: var(--muted); font-size: var(--fs-2xs); line-height: 1.45; }
+.arch-layer-groups li::marker { color: var(--accent); }
 .arch-glossary { display: grid; gap: 8px; margin: 10px 0 0; font-size: var(--fs-2xs); }
 .arch-glossary dt { font-weight: 700; color: var(--ink); }
 .arch-glossary dd { margin: 1px 0 0; color: var(--muted); line-height: 1.4; }
