@@ -95,7 +95,7 @@ type ArchGraphNode struct {
 
 // ArchGraphLayer records one decoder layer's mechanism, detected from tensor
 // name presence rather than assumed from the architecture label -- so hybrid
-// schedules (Nemotron-H's attention/Mamba mix, Qwen3.5/3.6's attention/Gated
+// schedules (Nemotron-H's attention/Mamba mix, Qwen3.5/3.6/3.8's attention/Gated
 // DeltaNet mix, leading dense blocks before MoE starts) show up accurately.
 type ArchGraphLayer struct {
 	Index     int    `json:"index"`

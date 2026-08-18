@@ -218,3 +218,107 @@ func TestQwen35UsesExplicitRecurrentScheduleWithoutInterval(t *testing.T) {
 		t.Fatalf("compact cache layers K/V=%d recurrent=%d, want 1/1", cache.layerCount(), cache.Qwen35.Layers)
 	}
 }
+
+func TestQwen35PrefixReuseRestoresDeltaNetState(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, buf := r.generationWorkspace(6)
+	if !r.prefixCacheSupported(cache) {
+		t.Fatal("small Qwen35 cache should be eligible for a recurrent prefix snapshot")
+	}
+	prefix := []uint32{1, 3, 4}
+	var ignored []float32
+	for pos, token := range prefix {
+		r.forwardTokenInto(cache, buf, token, pos, &ignored)
+	}
+	snapshot := cache.Qwen35.snapshot()
+	r.prefixCache = prefixCacheState{
+		cache:        cache,
+		tokens:       append([]uint32(nil), prefix...),
+		promptTokens: len(prefix),
+		qwen35:       snapshot,
+	}
+
+	// A real follow-up normally needs a slightly larger cache. Growing it must
+	// copy the attention rows and retain the separate recurrent snapshot.
+	previousCache := cache
+	cache, buf = r.generationWorkspace(7)
+	if cache == previousCache {
+		t.Fatal("follow-up cache should have grown")
+	}
+	if r.prefixCache.cache != cache {
+		t.Fatal("grown cache did not retain Qwen prefix metadata")
+	}
+
+	// A subsequent user turn starts after the whole resident prefix. The
+	// snapshot must restore DeltaNet state before the one-token suffix runs.
+	all := append(append([]uint32(nil), prefix...), 5)
+	if got := r.prefixReuse(cache, all); got != len(prefix) {
+		t.Fatalf("reused tokens = %d, want %d", got, len(prefix))
+	}
+	var resumed []float32
+	r.forwardTokenInto(cache, buf, all[len(prefix)], len(prefix), &resumed)
+
+	cold, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coldCache, coldBuf := cold.generationWorkspace(6)
+	var want []float32
+	for pos, token := range all {
+		cold.forwardTokenInto(coldCache, coldBuf, token, pos, &want)
+	}
+	if len(resumed) != len(want) {
+		t.Fatalf("logit length = %d, want %d", len(resumed), len(want))
+	}
+	for i := range want {
+		if delta := math.Abs(float64(resumed[i] - want[i])); delta > 1e-5 {
+			t.Fatalf("logit %d after restored prefix = %v, cold = %v", i, resumed[i], want[i])
+		}
+	}
+}
+
+func TestGenerateChatReusesQwen35PrefixForFollowup(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 1
+	opts.Seed = 7
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	initial := []ChatMessage{UserMessage("a")}
+	first, err := r.GenerateChat(initial, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PromptCache == nil || first.PromptCache.Mode != "prefix" || first.PromptCache.Hit {
+		t.Fatalf("first prompt cache = %+v, want a cold Qwen prefix cache", first.PromptCache)
+	}
+
+	followup := []ChatMessage{initial[0], AssistantMessage(first.Text), UserMessage("b")}
+	cached, err := r.GenerateChat(followup, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.PromptCache == nil || !cached.PromptCache.Hit || cached.PromptCache.ReusedTokens <= 0 {
+		t.Fatalf("follow-up prompt cache = %+v, want recurrent prefix reuse", cached.PromptCache)
+	}
+
+	cold, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := cold.GenerateChat(followup, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Text != want.Text {
+		t.Fatalf("cached follow-up = %q, cold = %q", cached.Text, want.Text)
+	}
+}

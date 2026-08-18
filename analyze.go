@@ -75,7 +75,7 @@ type Analysis struct {
 	KVCacheBytesAtFullContext int64
 	KVCacheBytesAt4K          int64
 	// KVCacheLayers is the number of physical K/V rows reserved by the
-	// runtime. It can be smaller than Layers for hybrid Qwen 3.5/3.6 models,
+	// runtime. It can be smaller than Layers for hybrid Qwen 3.5/3.6/3.8 models,
 	// whose DeltaNet blocks have recurrent state instead of a K/V cache.
 	KVCacheLayers int
 	// The same cache capacity in the optional storage formats. F16 is always
@@ -166,7 +166,7 @@ func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 	// has a query-only shared-KV tail, so its physical cache depth is smaller
 	// than the decoder depth (35-20=15 in the local E2B GGUF).
 	kvLayers := cfg.NLayers
-	// Qwen 3.5/3.6 compacts the cache to only its full-attention blocks; its
+	// Qwen 3.5/3.6/3.8 compacts the cache to only its full-attention blocks; its
 	// remaining blocks use DeltaNet recurrent state. A pure Mamba2 graph has
 	// no K/V cache at all. Matching these runtime allocations keeps a model
 	// inspector from overstating memory by up to 4x.
@@ -263,7 +263,7 @@ func (a *Analysis) WriteText(w io.Writer) {
 }
 
 // qwen35KVCacheLayerCount returns the physical cache depth for the hybrid
-// Qwen 3.5/3.6 graph without loading weights. DeltaNet blocks also carry an
+// Qwen 3.5/3.6/3.8 graph without loading weights. DeltaNet blocks also carry an
 // attn_qkv tensor, so the separate attn_q projection is the reliable marker
 // for a full-attention block.
 func qwen35KVCacheLayerCount(g *GGUFFile, layers int) int {

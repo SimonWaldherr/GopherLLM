@@ -489,7 +489,7 @@ func extractToolCallsLlama31(text string) (content string, calls []ToolCall) {
 	}}
 }
 
-// extractToolCallsQwen35 parses Qwen3.5/3.6's native XML-like convention:
+// extractToolCallsQwen35 parses Qwen3.5/3.6/3.8's native XML-like convention:
 //
 //	<tool_call>
 //	<function=name>

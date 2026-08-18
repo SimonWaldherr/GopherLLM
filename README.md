@@ -1592,7 +1592,7 @@ The main coverage is:
 |---|---|
 | Llama-style | Llama 2/3 text models, compatible `llama` exports, SmolLM3 3B (including its every-fourth-layer no-RoPE schedule) |
 | Mistral | Mistral, Mistral Small/Devstral exports, Mistral 3, Ministral, and Mixtral |
-| Qwen | Qwen2/2.5, QwQ, dense/sparse Qwen3 and Qwen3 Coder, plus experimental text-only Qwen3.5/3.6 hybrid exports |
+| Qwen | Qwen2/2.5, QwQ, dense/sparse Qwen3 and Qwen3 Coder, plus experimental text-only Qwen3.5/3.6/3.8 hybrid exports |
 | DeepSeek / Kimi | Modern DeepSeek-V2/V3 and Kimi K2 MLA layouts |
 | Gemma | Gemma 1–3 and native dense/MoE/E2B Gemma 4 text graphs |
 | Other decoders | Phi-2, Phi-3/3.5, dense/sparse Granite (GraniteMoE), EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
@@ -1644,7 +1644,7 @@ focused scalar-reference tests and text-only local-GGUF smoke coverage; full
 cross-runtime logit parity remains pending, so the runtime emits an explicit
 experimental warning. Vision families that require visual-feature injection
 or multimodal MRoPE remain outside this text-generation scope: `qwen2vl`,
-`qwen3vl`, `qwen3vlmoe`, and `qwen3next`. Qwen3.6 GGUFs with trailing MTP
+`qwen3vl`, `qwen3vlmoe`, and `qwen3next`. Qwen3.6/3.8 GGUFs with trailing MTP
 draft layers load for ordinary generation; the draft layer is intentionally
 skipped until speculative decoding is implemented.
 

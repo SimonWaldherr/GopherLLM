@@ -283,13 +283,15 @@ const (
 // prefixCacheState points at the retained generation workspace. tokens are
 // exactly the positions resident in it. promptLogits is a bounded,
 // vocab-sized snapshot taken before sampling mutates the live logits; it lets
-// an identical request skip even the final prompt-token forward pass.
+// an identical request skip even the final prompt-token forward pass. Qwen35
+// additionally needs its independent DeltaNet state to resume the prefix.
 // Runner.genLock protects the whole structure.
 type prefixCacheState struct {
 	cache        *KVCache
 	tokens       []uint32
 	promptTokens int
 	promptLogits []float32
+	qwen35       *Qwen35Cache
 }
 
 // Runner is a fully loaded model ready to generate: parsed GGUF header,
@@ -547,7 +549,7 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 	case "qwen35", "qwen35moe":
 		// Text-only decode is implemented and covered by focused graph tests and
 		// local GGUF smoke tests. Keep the remaining unsupported capabilities
-		// explicit instead of claiming general Qwen3.6 feature parity.
+		// explicit instead of claiming general Qwen3.5/3.6/3.8 feature parity.
 		fmt.Fprintln(logw, "Warning: qwen35 support is experimental: text-only decode is implemented; vision, MTP speculative decoding, and cross-runtime logit-parity validation are pending (see qwen35.go)")
 		config, weights, err := LoadQwen35Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
@@ -860,6 +862,13 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// prefill already dominates a multimodal turn's cost far more than
 	// prefix-cache reuse would save.
 	cacheEligible := len(imageEmbeds) == 0 && r.prefixCacheSupported(cache)
+	// A grown Qwen workspace can still be retained for the current request
+	// while exceeding the stricter K/V-plus-snapshot prefix budget. Drop an
+	// old snapshot attached to that workspace immediately rather than keeping
+	// memory that can no longer be reused.
+	if !cacheEligible && r.kind == loadedQwen35 && r.prefixCache.cache == cache {
+		r.clearPrefixCache()
+	}
 	// A multimodal request overwrites the reusable workspace with image-derived
 	// KV rows. It cannot reuse a text prefix itself, but must also invalidate a
 	// previously retained text prefix so the next text-only request cannot match
@@ -914,11 +923,20 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			r.clearPrefixCache()
 			return
 		}
+		var qwen35Snapshot *Qwen35Cache
+		if r.kind == loadedQwen35 {
+			qwen35Snapshot = cache.Qwen35.snapshot()
+			if qwen35Snapshot == nil {
+				r.clearPrefixCache()
+				return
+			}
+		}
 		state := prefixCacheState{
 			cache:        cache,
 			tokens:       residentTokens,
 			promptTokens: len(tokens),
 			promptLogits: promptLogits,
+			qwen35:       qwen35Snapshot,
 		}
 		r.prefixCache = state
 	}()
@@ -1136,7 +1154,7 @@ func (r *Runner) cacheDims() (int, int, int, int, int) {
 	return r.config.NKVHeads * r.config.HeadDim, r.config.KVDim, r.config.HeadDim, r.config.NKVHeads, r.config.ValueDim
 }
 
-// kvCacheLayerCount is normally the model's decoder depth. Qwen3.5/3.6 is a
+// kvCacheLayerCount is normally the model's decoder depth. Qwen3.5/3.6/3.8 is a
 // hybrid graph, though: only its periodic full-attention layers ever access
 // K/V rows. DeltaNet layers keep their separate recurrent state, so reserving
 // K/V for every decoder layer wastes three quarters of the cache for the
@@ -1166,6 +1184,13 @@ func kvCacheBytes(layers, kDim, vDim, cacheLen int, format kvFormat) int64 {
 		elemBytes = 2
 	}
 	return int64(layers) * int64(kDim+vDim) * int64(cacheLen) * elemBytes
+}
+
+func kvCacheStorageBytes(cache *KVCache) int64 {
+	if cache == nil {
+		return 0
+	}
+	return kvCacheBytes(cache.layerCount(), cache.PerPosKDim, cache.PerPosVDim, cache.MaxLen, cache.kvFormat())
 }
 
 func grownKVCacheLen(current, required, limit int, config Config) int {
@@ -1235,10 +1260,19 @@ func (r *Runner) clearPrefixCache() {
 }
 
 func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
-	// Recurrent Mamba/DeltaNet state must be replayed from the beginning.
-	// Reusing only the attention K/V rows (or none at all for pure Mamba2)
-	// would be wrong.
-	return r.kind != loadedNemotronH && r.kind != loadedMamba2 && r.kind != loadedQwen35 && cache != nil && cache == r.workspaceCache
+	if cache == nil || cache != r.workspaceCache {
+		return false
+	}
+	if r.kind == loadedQwen35 {
+		// Qwen3.8's DeltaNet cache is needed in addition to K/V rows. Bound the
+		// combined retained footprint to the same budget that guards normal
+		// prefix caching; a 27B Qwen3.8 snapshot is about 150 MiB and fits with
+		// the common short-context f16 or i8 K/V cache.
+		return cache.Qwen35 != nil && kvCacheStorageBytes(cache)+cache.Qwen35.bytes() <= maxReusableKVCacheBytes
+	}
+	// Nemotron-H's recurrent state has no prefix snapshot yet. Reusing only
+	// its attention K/V rows (or none at all for pure Mamba2) would be wrong.
+	return r.kind != loadedNemotronH && r.kind != loadedMamba2
 }
 
 // prefixReuse returns the exact number of resident KV positions that match.
@@ -1252,6 +1286,18 @@ func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
 	matched := min(sharedTokenPrefix(tokens, state.tokens), cache.MaxLen)
 	if matched == 0 {
 		return 0
+	}
+	if r.kind == loadedQwen35 {
+		// A single snapshot represents the state after the complete resident
+		// token sequence, unlike ordinary K/V rows reusable at arbitrary prefixes.
+		// It is therefore valid only when the complete snapshot prefix matches.
+		// If the new prompt ends exactly there without matching prompt logits,
+		// the generic one-token re-forward fallback would update DeltaNet state
+		// twice, so leave it cold instead.
+		if matched != len(state.tokens) || (matched == len(tokens) && state.promptTokens != len(tokens)) ||
+			!cache.Qwen35.restore(state.qwen35) {
+			return 0
+		}
 	}
 	return matched
 }
@@ -1291,9 +1337,17 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.kvFormat())
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
-			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 && r.kind != loadedQwen35 {
+			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 {
 				if copied := copyKVPrefix(cache, old, len(r.prefixCache.tokens)); copied == len(r.prefixCache.tokens) {
-					r.prefixCache.cache = cache
+					// Qwen's recurrent snapshot is independent from its K/V rows,
+					// so a geometrically grown cache can retain both. Keep their
+					// combined footprint within the normal prefix-cache budget.
+					if r.kind != loadedQwen35 || (r.prefixCache.qwen35 != nil &&
+						kvCacheStorageBytes(cache)+r.prefixCache.qwen35.bytes() <= maxReusableKVCacheBytes) {
+						r.prefixCache.cache = cache
+					} else {
+						r.clearPrefixCache()
+					}
 				} else {
 					r.clearPrefixCache()
 				}
@@ -1604,7 +1658,7 @@ func (r *Runner) isStopToken(token uint32) bool {
 		}
 	}
 	if qwen35Family(r.arch) {
-		// Qwen3.5/3.6 opens assistant turns with ChatML and terminates them
+		// Qwen3.5/3.6/3.8 opens assistant turns with ChatML and terminates them
 		// with <|im_end|>. Its tokenizer EOS is not consistently configured to
 		// that turn marker across converted GGUFs.
 		if id, ok := r.tok.SpecialID("<|im_end|>"); ok && token == id {
@@ -2815,7 +2869,7 @@ func (r *Runner) chatMLOpensThinkTagByDefault() bool {
 		strings.Contains(s, `enable_thinking = enable_thinking if enable_thinking is defined else True`)
 }
 
-// renderQwen35Messages mirrors the text-only parts of Qwen3.5/3.6's embedded
+// renderQwen35Messages mirrors the text-only parts of Qwen3.5/3.6/3.8's embedded
 // ChatML template. In addition to its thinking prompt it uses Qwen's native
 // XML-like tool protocol; generic JSON tool blocks noticeably degrade tool
 // calling because the model was trained on <function=...>/<parameter=...>.
@@ -2915,7 +2969,7 @@ func qwen35ToolSystemPrompt(tools []ToolDefinition) string {
 		}
 	}
 	sb.WriteString("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n")
-	// Keep the native text portion byte-for-byte aligned with Qwen3.5/3.6's
+	// Keep the native text portion byte-for-byte aligned with Qwen3.5/3.6/3.8's
 	// embedded chat template. These models are sensitive to the exact native
 	// XML example and its explicit instruction block.
 	sb.WriteString("<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")

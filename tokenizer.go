@@ -477,7 +477,7 @@ func (t *Tokenizer) pretokenize(text string) []string {
 	return pretokenizeGPT2(text)
 }
 
-// pretokenizeQwen35 implements Qwen3.5/3.6's tokenizer.json pattern:
+// pretokenizeQwen35 implements Qwen3.5/3.6/3.8's tokenizer.json pattern:
 //
 //	(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
 //

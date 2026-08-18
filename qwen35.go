@@ -1,9 +1,9 @@
 package gopherllm
 
-// Native Qwen3.5 / Qwen3.6 ("qwen35") inference.
+// Native Qwen3.5 / Qwen3.6 / Qwen3.8 ("qwen35") inference.
 //
 // EXPERIMENTAL: this is a native, text-only single-token decode path for the
-// Qwen3.5/3.6 hybrid architecture. Its DeltaNet and gated-attention math
+// Qwen3.5/3.6/3.8 hybrid architecture. Its DeltaNet and gated-attention math
 // follows the Qwen reference graph and the llama.cpp GGUF conversion layout:
 // QKV is [Q|K|V], Q/K use L2 normalization, and full attention uses a sigmoid
 // gate. The implementation has focused unit coverage, but does not yet offer
@@ -156,6 +156,47 @@ func (c *Qwen35Cache) reset() {
 	clear(c.State)
 }
 
+// bytes reports the resident recurrent-state footprint. It deliberately
+// excludes the small struct header so callers can budget snapshots alongside
+// the ordinary K/V cache without depending on Go's object layout.
+func (c *Qwen35Cache) bytes() int64 {
+	if c == nil {
+		return 0
+	}
+	return int64(len(c.Conv)+len(c.State)) * 4
+}
+
+// snapshot returns an independent copy of a fully initialized recurrent
+// cache. Qwen's DeltaNet state is updated in place for every token, so K/V
+// rows alone are insufficient to resume a cached chat prefix safely.
+func (c *Qwen35Cache) snapshot() *Qwen35Cache {
+	if c == nil {
+		return nil
+	}
+	snap := &Qwen35Cache{
+		Layers: c.Layers, Channels: c.Channels, ConvLen: c.ConvLen,
+		Heads: c.Heads, HeadDim: c.HeadDim,
+	}
+	snap.Conv = append(snap.Conv, c.Conv...)
+	snap.State = append(snap.State, c.State...)
+	return snap
+}
+
+// restore replaces this cache's mutable recurrent state from a snapshot.
+// Shapes and backing lengths must agree exactly: accepting a partial state
+// would silently corrupt a later DeltaNet update.
+func (c *Qwen35Cache) restore(snapshot *Qwen35Cache) bool {
+	if c == nil || snapshot == nil ||
+		c.Layers != snapshot.Layers || c.Channels != snapshot.Channels || c.ConvLen != snapshot.ConvLen ||
+		c.Heads != snapshot.Heads || c.HeadDim != snapshot.HeadDim ||
+		len(c.Conv) != len(snapshot.Conv) || len(c.State) != len(snapshot.State) {
+		return false
+	}
+	copy(c.Conv, snapshot.Conv)
+	copy(c.State, snapshot.State)
+	return true
+}
+
 func (c *Qwen35Cache) convOffset(layer, channel int) int {
 	return (layer*c.Channels + channel) * c.ConvLen
 }
@@ -174,10 +215,10 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 	}
 	cfg := ConfigFromGGUF(gguf)
 	if cfg.Arch != "qwen35" && cfg.Arch != "qwen35moe" {
-		return cfg, Qwen35Weights{}, fmt.Errorf("not a Qwen3.5 GGUF: %s", cfg.Arch)
+		return cfg, Qwen35Weights{}, fmt.Errorf("not a Qwen hybrid GGUF: %s", cfg.Arch)
 	}
 	tensors := indexTensors(gguf)
-	// Some Qwen3.6 exports append MTP (multi-token prediction) draft blocks
+	// Some Qwen3.6/3.8 exports append MTP (multi-token prediction) draft blocks
 	// to the decoder stack. Prefer the explicit metadata count, then retain a
 	// tensor-marker fallback for older converters. The draft blocks are useful
 	// only to speculative decoding; normal autoregressive inference stops at
@@ -237,7 +278,7 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 	}
 	// The depthwise DeltaNet convolution is tiny relative to the checkpoint but
 	// runs once per channel for every recurrent layer and generated token. Keep
-	// scalar kernels hot even for an out-of-core model: a Qwen3.6-27B kernel
+	// scalar kernels hot even for an out-of-core model: a Qwen3.8-27B kernel
 	// bank is only a few MiB, while repeatedly decoding it from the mmap would
 	// otherwise add hundreds of thousands of row conversions per token.
 	loadHotScalar := func(name string) (Weight, error) {
@@ -400,7 +441,7 @@ func ForwardQwen35Into(cfg Config, weights Qwen35Weights, cache *KVCache, buf *D
 
 func ForwardQwen35BodyInto(cfg Config, weights Qwen35Weights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {
 	if cache == nil || cache.Qwen35 == nil {
-		panic("Qwen3.5 forward requires a recurrent cache")
+		panic("Qwen hybrid forward requires a recurrent cache")
 	}
 	weights.TokenEmbd.RowInto(int(token), cfg.Dim, &buf.X)
 	// RoPE only depends on position, not layer, for this architecture: safe
@@ -434,15 +475,14 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 	headDim := cfg.HeadDim
 	nHeads := cfg.NHeads
 	kvMul := max(1, cfg.KVMul)
-	// Q and K share their input and are commonly the same quantization in
-	// Qwen3.6 GGUFs (including the local IQ variants). Fuse their row work
-	// when possible; V remains separate because its format often differs.
-	if !tryMatvec2Into(w.Q, w.K, x, &buf.Q4KXSums, &buf.QGate, &buf.K) {
-		w.Q.MatvecInto(x, &buf.QGate)
-		w.K.MatvecInto(x, &buf.K)
-	}
+	// Qwen3.8's Q4_K_M export uses Q4_K/Q4_K/Q6_K for Q/K/V.  The mixed
+	// kernel shares the Q4 activation sums and one worker-pool dispatch across
+	// all three projections (and uses the matching fused Metal path for
+	// compatible shapes). It also retains the ordinary per-weight fallback for other
+	// Qwen3.5/3.6/3.8 quantizations.
+	tryMatvecAttentionInto(w.Q, w.K, w.V, x, &buf.Q4KXSums, &buf.QGate, &buf.K, &buf.V)
 	if len(buf.QGate) < nHeads*2*headDim {
-		panic("Qwen3.5 attention: attn_q projection has an invalid shape")
+		panic("Qwen hybrid attention: attn_q projection has an invalid shape")
 	}
 	ensureLenNoClear(&buf.Q, nHeads*headDim)
 	ensureLenNoClear(&buf.AttnGate, nHeads*headDim)
@@ -451,7 +491,6 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 		copy(buf.Q[h*headDim:(h+1)*headDim], src[:headDim])
 		copy(buf.AttnGate[h*headDim:(h+1)*headDim], src[headDim:2*headDim])
 	}
-	w.V.MatvecInto(x, &buf.V)
 	perHeadRMSNormInPlace(buf.Q, headDim, nHeads, w.QNorm, cfg.RMSNormEps)
 	perHeadRMSNormInPlace(buf.K, headDim, cfg.NKVHeads, w.KNorm, cfg.RMSNormEps)
 	applyPreparedRope(buf.Q, headDim, nHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, false)
@@ -468,7 +507,7 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 		gate := buf.AttnGate[h*headDim : h*headDim+cfg.ValueDim]
 		out := buf.AttnOut[outOff : outOff+cfg.ValueDim]
 		for d, g := range gate {
-			out[d] *= 1 / (1 + float32(math.Exp(float64(-g))))
+			out[d] *= fastSigmoidF32(g)
 		}
 	}
 	w.O.MatvecInto(buf.AttnOut[:nHeads*cfg.ValueDim], &buf.Proj)
@@ -485,7 +524,7 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 
 	w.QKVConv.MatvecInto(x, &buf.MambaIn)
 	if len(buf.MambaIn) < channels {
-		panic("Qwen3.5 Gated DeltaNet qkv projection has an invalid shape")
+		panic("Qwen hybrid Gated DeltaNet qkv projection has an invalid shape")
 	}
 	ensureLenNoClear(&buf.MambaConv, channels)
 	copy(buf.MambaConv, buf.MambaIn[:channels])
@@ -514,7 +553,7 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 			copy(state.Conv[off:off+state.ConvLen-1], state.Conv[off+1:off+state.ConvLen])
 			state.Conv[off+state.ConvLen-1] = buf.MambaConv[ch]
 		}
-		buf.MambaConv[ch] = v / (1 + float32(math.Exp(float64(-v))))
+		buf.MambaConv[ch] = v * fastSigmoidF32(v)
 	}
 
 	ensureLenNoClear(&buf.MambaX, dInner)         // V, one vector per value head.
@@ -545,7 +584,7 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 	for h := range nHeads {
 		alpha := nemotronSoftplus(buf.MambaDT[h] + w.DTBias[h])
 		decay := float32(math.Exp(float64(alpha * w.A[h])))
-		beta := nemotronSigmoid(buf.MambaBeta[h])
+		beta := fastSigmoidF32(buf.MambaBeta[h])
 		group := h % nGroups
 		q := buf.MambaB[group*dState : group*dState+dState]
 		k := buf.MambaC[group*dState : group*dState+dState]
@@ -577,7 +616,7 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 	ensureLenNoClear(&buf.MambaZ, dInner)
 	w.Gate.MatvecInto(x, &buf.MambaZ)
 	for i, g := range buf.MambaZ[:dInner] {
-		buf.MambaY[i] *= g / (1 + float32(math.Exp(float64(-g))))
+		buf.MambaY[i] *= g * fastSigmoidF32(g)
 	}
 	w.Out.MatvecInto(buf.MambaY, &buf.Proj)
 }
@@ -594,6 +633,13 @@ func qwen35L2NormalizeInPlace(v []float32, eps, postScale float32) {
 }
 
 func qwen35FFNForward(w Qwen35FFNWeights, x []float32, buf *DecodeBuffer) {
+	// Qwen3.8-27B-Q4_K_M stores every dense FFN as Q4_K gate/up and Q6_K
+	// down. Keep those three stages inside the existing Metal command buffer
+	// when it is available; otherwise the fused CPU gate/up kernel below is
+	// still used. This is intentionally checked before allocating Hidden.
+	if matvecMetalSwiGLUInto(w.Gate.Metal, w.Up.Metal, w.Down.Metal, x, &buf.Proj) {
+		return
+	}
 	if !tryMatvec2Into(w.Gate, w.Up, x, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
 		w.Gate.MatvecInto(x, &buf.Gate)
 		w.Up.MatvecInto(x, &buf.Up)
