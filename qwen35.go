@@ -501,9 +501,21 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 	if scale == 0 {
 		scale = float32(1 / math.Sqrt(float64(headDim)))
 	}
+	// Qwen3.8-27B has 24 query heads but only four KV heads: each six-head
+	// group reads the same K/V history. At a long context, stream that history
+	// once per group and give the independent groups to the worker pool. The
+	// short-context scalar path avoids scheduling overhead, while the grouped
+	// kernel retains the exact Qwen attention parameters (notably softcap=0).
+	if useGroupedGQAAttention && kvMul > 1 && cfg.NKVHeads > 1 && pos+1 >= groupedGQADecodeMinContext {
+		qwen35ParallelAttendHeadGroups(cfg, cache, buf, layer, pos, scale, kvMul)
+	} else {
+		for h := range nHeads {
+			qOff, outOff := h*headDim, h*cfg.ValueDim
+			cache.attendHead(layer, h/kvMul, buf.Q[qOff:qOff+headDim], headDim, cfg.ValueDim, 0, pos, scale, 0, buf.AttnOut[outOff:outOff+cfg.ValueDim])
+		}
+	}
 	for h := range nHeads {
-		qOff, outOff := h*headDim, h*cfg.ValueDim
-		cache.attendHead(layer, h/kvMul, buf.Q[qOff:qOff+headDim], headDim, cfg.ValueDim, 0, pos, scale, 0, buf.AttnOut[outOff:outOff+cfg.ValueDim])
+		outOff := h * cfg.ValueDim
 		gate := buf.AttnGate[h*headDim : h*headDim+cfg.ValueDim]
 		out := buf.AttnOut[outOff : outOff+cfg.ValueDim]
 		for d, g := range gate {
@@ -511,6 +523,40 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 		}
 	}
 	w.O.MatvecInto(buf.AttnOut[:nHeads*cfg.ValueDim], &buf.Proj)
+}
+
+// qwen35ParallelAttendHeadGroups is the Qwen-specific long-context GQA path.
+// Unlike the standard decoder it deliberately passes a zero softcap: Qwen's
+// hybrid full-attention graph has no attention-logit softcap tensor, and its
+// scalar fallback above has always used zero. Keep that semantic detail local
+// instead of relying on Config.AttnLogitSoftcap remaining unset.
+func qwen35ParallelAttendHeadGroups(cfg Config, cache *KVCache, buf *DecodeBuffer, layer, pos int, scale float32, kvMul int) {
+	// Use the shared worker-pool scheduling policy from ordinary GQA. Keeping
+	// the configured workers active also avoids a wake-up gap before Qwen's
+	// comparatively large output projection.
+	workItems := max(cfg.NKVHeads, min(numThreads(), cfg.NHeads))
+	parallelChunks(workItems, func(kvStart, kvEnd int) {
+		if kvStart >= cfg.NKVHeads {
+			return
+		}
+		qwen35AttendHeadGroupsRange(&cfg, cache, buf, layer, pos, scale, kvMul, kvStart, min(kvEnd, cfg.NKVHeads))
+	})
+}
+
+func qwen35AttendHeadGroupsRange(cfg *Config, cache *KVCache, buf *DecodeBuffer, layer, pos int, scale float32, kvMul, kvStart, kvEnd int) {
+	headDim := cfg.HeadDim
+	valueDim := cfg.ValueDim
+	for kvH := kvStart; kvH < kvEnd; kvH++ {
+		hStart := kvH * kvMul
+		hEnd := min(hStart+kvMul, cfg.NHeads)
+		if hStart >= hEnd {
+			break
+		}
+		cache.attendHeadGroup(layer, kvH,
+			buf.Q[hStart*headDim:hEnd*headDim], hEnd-hStart, headDim, valueDim,
+			0, pos, scale, 0,
+			buf.AttnOut[hStart*valueDim:hEnd*valueDim])
+	}
 }
 
 // qwen35DeltaNetForward runs one Gated DeltaNet layer. It performs the

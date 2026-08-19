@@ -3364,6 +3364,14 @@ func onlineAttentionGroup(queries, keys, values []float32, queryHeads, keyStride
 			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
 		return
 	}
+	if queryHeads == 6 {
+		// Qwen3.8's 24 query heads and four KV heads form six-way groups.
+		// Process the first four through the shared-row SIMD primitive and
+		// retain two ordinary heads, keeping every K/V row live across all six.
+		onlineAttentionGroup6(queries, keys, values, keyStride, valueStride,
+			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+		return
+	}
 	onlineAttentionGroupEither(queries, keys, nil, nil, values, nil, nil, queryHeads,
 		keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
 }
@@ -3425,9 +3433,79 @@ func onlineAttentionGroup4(queries, keys, values []float32, keyStride, valueStri
 	attnScoresPool.Put(scratch)
 }
 
+// onlineAttentionGroup6 is Qwen3.8's six-query-head GQA specialization. Four
+// heads use the existing shared-row SIMD instructions while the remaining two
+// finish against the same cacheline. This avoids falling back to six unrelated
+// dot/AXPY calls for Qwen's 24:4 attention layout.
+func onlineAttentionGroup6(queries, keys, values []float32, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	const queryHeads = 6
+	span := endT - startT + 1
+	if span <= 0 || keyHeadDim <= 0 || valueHeadDim <= 0 || len(queries) < queryHeads*keyHeadDim || len(out) < queryHeads*valueHeadDim {
+		return
+	}
+	scratch := attnScoresPool.Get().(*[]float32)
+	scoreLen := queryHeads * span
+	ensureLenNoClear(scratch, scoreLen+queryHeads)
+	scores := (*scratch)[:scoreLen]
+	denoms := (*scratch)[scoreLen : scoreLen+queryHeads]
+
+	n := 0
+	for t := startT; t <= endT; t++ {
+		kOff := t * keyStride
+		if kOff+keyHeadDim > len(keys) {
+			break
+		}
+		s0, s1, s2, s3 := dotF32x4(
+			&queries[0], &queries[keyHeadDim], &queries[2*keyHeadDim], &queries[3*keyHeadDim],
+			&keys[kOff], keyHeadDim)
+		scores[n] = s0 * scale
+		scores[span+n] = s1 * scale
+		scores[2*span+n] = s2 * scale
+		scores[3*span+n] = s3 * scale
+		scores[4*span+n] = DotF32(queries[4*keyHeadDim:5*keyHeadDim], keys[kOff:kOff+keyHeadDim]) * scale
+		scores[5*span+n] = DotF32(queries[5*keyHeadDim:6*keyHeadDim], keys[kOff:kOff+keyHeadDim]) * scale
+		n++
+	}
+	if n == 0 {
+		attnScoresPool.Put(scratch)
+		return
+	}
+	for h := 0; h < queryHeads; h++ {
+		denoms[h] = attentionWeightsInPlace(scores[h*span:h*span+n], softcap)
+	}
+
+	out0 := out[:valueHeadDim]
+	out1 := out[valueHeadDim : 2*valueHeadDim]
+	out2 := out[2*valueHeadDim : 3*valueHeadDim]
+	out3 := out[3*valueHeadDim : 4*valueHeadDim]
+	out4 := out[4*valueHeadDim : 5*valueHeadDim]
+	out5 := out[5*valueHeadDim : 6*valueHeadDim]
+	for i := 0; i < n; i++ {
+		vOff := (startT + i) * valueStride
+		if vOff+valueHeadDim > len(values) {
+			break
+		}
+		value := values[vOff : vOff+valueHeadDim]
+		axpyF32x4(&out0[0], &out1[0], &out2[0], &out3[0],
+			scores[i], scores[span+i], scores[2*span+i], scores[3*span+i],
+			&value[0], valueHeadDim)
+		AxpyF32(out4, scores[4*span+i], value)
+		AxpyF32(out5, scores[5*span+i], value)
+	}
+	for h := 0; h < queryHeads; h++ {
+		ScaleF32(out[h*valueHeadDim:(h+1)*valueHeadDim], 1/denoms[h])
+	}
+	attnScoresPool.Put(scratch)
+}
+
 func onlineAttentionGroupF16(queries []float32, keys, values []uint16, queryHeads, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
 	if queryHeads == 4 {
 		onlineAttentionGroup4F16(queries, keys, values, keyStride, valueStride,
+			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
+		return
+	}
+	if queryHeads == 6 {
+		onlineAttentionGroup6F16(queries, keys, values, keyStride, valueStride,
 			keyHeadDim, valueHeadDim, startT, endT, scale, softcap, out)
 		return
 	}
@@ -3491,6 +3569,71 @@ func onlineAttentionGroup4F16(queries []float32, keys, values []uint16, keyStrid
 	ScaleF32(out1, 1/denoms[1])
 	ScaleF32(out2, 1/denoms[2])
 	ScaleF32(out3, 1/denoms[3])
+	attnScoresPool.Put(scratch)
+}
+
+// onlineAttentionGroup6F16 is the compact-KV counterpart to
+// onlineAttentionGroup6. Qwen3.8's six-head groups take the four-wide NEON
+// fast path for most heads and reuse the already-hot f16 K/V row for the last
+// two, instead of converting it independently six times.
+func onlineAttentionGroup6F16(queries []float32, keys, values []uint16, keyStride, valueStride, keyHeadDim, valueHeadDim, startT, endT int, scale, softcap float32, out []float32) {
+	const queryHeads = 6
+	span := endT - startT + 1
+	if span <= 0 || keyHeadDim <= 0 || valueHeadDim <= 0 || len(queries) < queryHeads*keyHeadDim || len(out) < queryHeads*valueHeadDim {
+		return
+	}
+	scratch := attnScoresPool.Get().(*[]float32)
+	scoreLen := queryHeads * span
+	ensureLenNoClear(scratch, scoreLen+queryHeads)
+	scores := (*scratch)[:scoreLen]
+	denoms := (*scratch)[scoreLen : scoreLen+queryHeads]
+
+	n := 0
+	for t := startT; t <= endT; t++ {
+		kOff := t * keyStride
+		if kOff+keyHeadDim > len(keys) {
+			break
+		}
+		s0, s1, s2, s3 := dotF32F16x4(
+			&queries[0], &queries[keyHeadDim], &queries[2*keyHeadDim], &queries[3*keyHeadDim],
+			&keys[kOff], keyHeadDim)
+		scores[n] = s0 * scale
+		scores[span+n] = s1 * scale
+		scores[2*span+n] = s2 * scale
+		scores[3*span+n] = s3 * scale
+		scores[4*span+n] = dotF32F16(queries[4*keyHeadDim:5*keyHeadDim], keys[kOff:kOff+keyHeadDim]) * scale
+		scores[5*span+n] = dotF32F16(queries[5*keyHeadDim:6*keyHeadDim], keys[kOff:kOff+keyHeadDim]) * scale
+		n++
+	}
+	if n == 0 {
+		attnScoresPool.Put(scratch)
+		return
+	}
+	for h := 0; h < queryHeads; h++ {
+		denoms[h] = attentionWeightsInPlace(scores[h*span:h*span+n], softcap)
+	}
+
+	out0 := out[:valueHeadDim]
+	out1 := out[valueHeadDim : 2*valueHeadDim]
+	out2 := out[2*valueHeadDim : 3*valueHeadDim]
+	out3 := out[3*valueHeadDim : 4*valueHeadDim]
+	out4 := out[4*valueHeadDim : 5*valueHeadDim]
+	out5 := out[5*valueHeadDim : 6*valueHeadDim]
+	for i := 0; i < n; i++ {
+		vOff := (startT + i) * valueStride
+		if vOff+valueHeadDim > len(values) {
+			break
+		}
+		value := values[vOff : vOff+valueHeadDim]
+		axpyF32F16x4(&out0[0], &out1[0], &out2[0], &out3[0],
+			scores[i], scores[span+i], scores[2*span+i], scores[3*span+i],
+			&value[0], valueHeadDim)
+		axpyF16(out4, scores[4*span+i], value)
+		axpyF16(out5, scores[5*span+i], value)
+	}
+	for h := 0; h < queryHeads; h++ {
+		ScaleF32(out[h*valueHeadDim:(h+1)*valueHeadDim], 1/denoms[h])
+	}
 	attnScoresPool.Put(scratch)
 }
 

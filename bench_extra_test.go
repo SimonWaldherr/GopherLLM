@@ -156,6 +156,78 @@ func BenchmarkGQAAttentionF16_ctx32768(b *testing.B) {
 	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttentionF16(b, 32768, "grouped") })
 }
 
+// benchmarkQwen35GQAAttentionF16 covers Qwen3.8-27B's actual full-attention
+// layout: 24 query heads, four KV heads, six queries per shared KV stream, and
+// 256-wide heads. The old hybrid path ran all 24 heads separately; the grouped
+// path is the long-context dispatch used by qwen35AttentionForward.
+func benchmarkQwen35GQAAttentionF16(b *testing.B, ctx int, grouped bool) {
+	const nHeads, nKVHeads, headDim = 24, 4, 256
+	config := Config{NHeads: nHeads, NKVHeads: nKVHeads, HeadDim: headDim, ValueDim: headDim}
+	cache := NewKVCacheF16(1, nKVHeads*headDim, nKVHeads*headDim, ctx)
+	for i := range cache.K16[0] {
+		cache.K16[0][i] = F32ToF16(float32(i%29-14) / 16)
+		cache.V16[0][i] = F32ToF16(float32(i%31-15) / 16)
+	}
+	buf := &DecodeBuffer{
+		Q:       benchFloatSlice(nHeads * headDim),
+		AttnOut: make([]float32, nHeads*headDim),
+	}
+	scale := float32(1 / 16) // 1/sqrt(256), Qwen3.8's default attention scale.
+	b.ReportAllocs()
+	// Unique K/V bytes. The scalar baseline must logically reread this cache
+	// six times per KV head; grouping keeps it hot while all six queries run.
+	b.SetBytes(int64(2 * ctx * nKVHeads * headDim * 2))
+	for b.Loop() {
+		clear(buf.AttnOut)
+		if grouped {
+			qwen35ParallelAttendHeadGroups(config, cache, buf, 0, ctx-1, scale, nHeads/nKVHeads)
+			continue
+		}
+		for h := 0; h < nHeads; h++ {
+			qOff := h * headDim
+			cache.attendHead(0, h/(nHeads/nKVHeads), buf.Q[qOff:qOff+headDim], headDim, headDim,
+				0, ctx-1, scale, 0, buf.AttnOut[qOff:qOff+headDim])
+		}
+	}
+}
+
+func BenchmarkQwen35GQAAttentionF16_ctx4096(b *testing.B) {
+	b.Run("separate", func(b *testing.B) { benchmarkQwen35GQAAttentionF16(b, 4096, false) })
+	b.Run("grouped", func(b *testing.B) { benchmarkQwen35GQAAttentionF16(b, 4096, true) })
+}
+
+func benchmarkQwen35GQAAttention(b *testing.B, ctx int, grouped bool) {
+	const nHeads, nKVHeads, headDim = 24, 4, 256
+	config := Config{NHeads: nHeads, NKVHeads: nKVHeads, HeadDim: headDim, ValueDim: headDim}
+	cache := NewKVCache(1, nKVHeads*headDim, nKVHeads*headDim, ctx)
+	cache.K[0] = benchFloatSlice(len(cache.K[0]))
+	cache.V[0] = benchFloatSlice(len(cache.V[0]))
+	buf := &DecodeBuffer{
+		Q:       benchFloatSlice(nHeads * headDim),
+		AttnOut: make([]float32, nHeads*headDim),
+	}
+	scale := float32(1 / 16) // 1/sqrt(256), Qwen3.8's default attention scale.
+	b.ReportAllocs()
+	b.SetBytes(int64(2 * ctx * nKVHeads * headDim * 4))
+	for b.Loop() {
+		clear(buf.AttnOut)
+		if grouped {
+			qwen35ParallelAttendHeadGroups(config, cache, buf, 0, ctx-1, scale, nHeads/nKVHeads)
+			continue
+		}
+		for h := 0; h < nHeads; h++ {
+			qOff := h * headDim
+			cache.attendHead(0, h/(nHeads/nKVHeads), buf.Q[qOff:qOff+headDim], headDim, headDim,
+				0, ctx-1, scale, 0, buf.AttnOut[qOff:qOff+headDim])
+		}
+	}
+}
+
+func BenchmarkQwen35GQAAttention_ctx4096(b *testing.B) {
+	b.Run("separate", func(b *testing.B) { benchmarkQwen35GQAAttention(b, 4096, false) })
+	b.Run("grouped", func(b *testing.B) { benchmarkQwen35GQAAttention(b, 4096, true) })
+}
+
 func BenchmarkGQAAttention_ctx32768(b *testing.B) {
 	b.Run("separate", func(b *testing.B) { benchmarkGQAAttention(b, 32768, false) })
 	b.Run("grouped", func(b *testing.B) { benchmarkGQAAttention(b, 32768, true) })

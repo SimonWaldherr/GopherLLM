@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -36,6 +37,65 @@ func TestQwen35AttentionUsesSigmoidGate(t *testing.T) {
 	qwen35AttentionForward(cfg, w, cache, []float32{2, 1}, 0, 0, 0, 0, buf)
 	requireQwen35Close(t, buf.Proj[0], 1)
 	requireQwen35Close(t, buf.Proj[1], .5)
+}
+
+// TestQwen35LongContextGroupedGQAMatchesScalar locks the specialized Qwen
+// dispatch to the former per-head result. Qwen3.8-27B uses this exact 24:4
+// GQA ratio (six queries share each KV head); F16 is the normal compact cache
+// on Apple Silicon and exercises the grouped F16 kernel used in production.
+func TestQwen35LongContextGroupedGQAMatchesScalar(t *testing.T) {
+	const (
+		nHeads   = 24
+		nKVHeads = 4
+		headDim  = 2
+		dim      = 4
+		ctx      = groupedGQADecodeMinContext + 1
+	)
+	cfg := Config{
+		Dim: dim, NHeads: nHeads, NKVHeads: nKVHeads, HeadDim: headDim, ValueDim: headDim,
+		KVMul: nHeads / nKVHeads, RMSNormEps: 1e-5, RopeDimensionCount: headDim,
+		RopeTheta: 10000,
+	}
+	rng := rand.New(rand.NewSource(38))
+	w := Qwen35AttentionWeights{
+		Q:     qwen35TestWeight(nHeads*2*headDim, dim, randomVec(rng, nHeads*2*headDim*dim)),
+		K:     qwen35TestWeight(nKVHeads*headDim, dim, randomVec(rng, nKVHeads*headDim*dim)),
+		V:     qwen35TestWeight(nKVHeads*headDim, dim, randomVec(rng, nKVHeads*headDim*dim)),
+		O:     qwen35TestWeight(dim, nHeads*headDim, randomVec(rng, dim*nHeads*headDim)),
+		QNorm: []float32{1, 1},
+		KNorm: []float32{1, 1},
+	}
+	input := randomVec(rng, dim)
+	newCache := func() *KVCache {
+		return NewKVCacheF16(1, nKVHeads*headDim, nKVHeads*headDim, ctx)
+	}
+	scalarCache, groupedCache := newCache(), newCache()
+	for pos := 0; pos < ctx-1; pos++ {
+		k := randomVec(rng, nKVHeads*headDim)
+		v := randomVec(rng, nKVHeads*headDim)
+		scalarCache.storeKV(0, pos, k, v)
+		groupedCache.storeKV(0, pos, k, v)
+	}
+
+	run := func(cache *KVCache) (attnOut, proj []float32) {
+		buf := NewDecodeBuffer(cfg, headDim, nKVHeads, headDim)
+		ropeHalf, ropePairs := prepareRopeScratch(ctx-1, headDim, cfg.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
+		qwen35AttentionForward(cfg, w, cache, input, 0, ctx-1, ropeHalf, ropePairs, buf)
+		return append([]float32(nil), buf.AttnOut...), append([]float32(nil), buf.Proj...)
+	}
+
+	oldGrouped := useGroupedGQAAttention
+	defer func() { useGroupedGQAAttention = oldGrouped }()
+	useGroupedGQAAttention = false
+	wantAttn, wantProj := run(scalarCache)
+	useGroupedGQAAttention = true
+	gotAttn, gotProj := run(groupedCache)
+	for i := range gotAttn {
+		requireQwen35Close(t, gotAttn[i], wantAttn[i])
+	}
+	for i := range gotProj {
+		requireQwen35Close(t, gotProj[i], wantProj[i])
+	}
 }
 
 // qwen35DeltaReferenceStep is a deliberately small, scalar reference for
