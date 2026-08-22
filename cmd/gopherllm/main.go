@@ -54,6 +54,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "                           local-browser-inference mode (default: auto-detect ./bin)")
 	fmt.Fprintln(os.Stderr, "  --max-connections <N>     Max concurrent server connections")
 	fmt.Fprintln(os.Stderr, "  --max-tokens <N>          Max tokens to generate (default: 256)")
+	fmt.Fprintln(os.Stderr, "  --mtp-draft-tokens <N>    Exact greedy Qwen MTP draft candidates (default: 0, disabled)")
 	fmt.Fprintln(os.Stderr, "  --temp <F>                Temperature (default: 0.7, 0=greedy)")
 	fmt.Fprintln(os.Stderr, "  --top-p <F>               Nucleus sampling threshold (default: 0.9)")
 	fmt.Fprintln(os.Stderr, "  --top-k <N>               Top-K filtering (default: 40)")
@@ -841,6 +842,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.options.MaxTokens = v
+		case "--mtp-draft-tokens":
+			v, err := parseNextInt(next, arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.options.MTPDraftTokens = v
 		case "--temp", "-t":
 			v, err := parseNextFloat(next, arg)
 			if err != nil {

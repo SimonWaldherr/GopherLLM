@@ -131,9 +131,27 @@ func buildTinyQwen35MoEGGUFWithSchedule(withMTP bool, recurrentSchedule []bool, 
 		}
 	}
 	if withMTP {
-		// A marker is sufficient: the loader must recognize the draft layer
-		// before attempting to load its non-base transformer tensors.
-		tensors = append(tensors, f32t("blk.2.nextn.eh_proj.weight", dim*2, dim, 130))
+		// The MTP head is a full-attention dense draft block stored immediately
+		// after the sparse-MoE trunk. Its normal layer tensors are deliberately
+		// not prefixed nextn.*; only the input-pair and shared-head tensors are.
+		prefix := "blk.2."
+		tensors = append(tensors,
+			vec(prefix+"nextn.enorm.weight", dim, 130),
+			vec(prefix+"nextn.hnorm.weight", dim, 131),
+			f32t(prefix+"nextn.eh_proj.weight", dim, dim*2, 132),
+			vec(prefix+"nextn.shared_head_norm.weight", dim, 133),
+			vec(prefix+"attn_norm.weight", dim, 134),
+			vec(prefix+"post_attention_norm.weight", dim, 135),
+			f32t(prefix+"attn_q.weight", heads*2*headDim, dim, 136),
+			f32t(prefix+"attn_k.weight", kvHeads*headDim, dim, 137),
+			f32t(prefix+"attn_v.weight", kvHeads*headDim, dim, 138),
+			f32t(prefix+"attn_output.weight", dim, heads*headDim, 139),
+			vec(prefix+"attn_q_norm.weight", headDim, 140),
+			vec(prefix+"attn_k_norm.weight", headDim, 141),
+			f32t(prefix+"ffn_gate.weight", expertHidden, dim, 142),
+			f32t(prefix+"ffn_up.weight", expertHidden, dim, 143),
+			f32t(prefix+"ffn_down.weight", dim, expertHidden, 144),
+		)
 	}
 	return buildGGUF(3, kvs, tensors)
 }
@@ -189,13 +207,67 @@ func TestQwen35MoELoadsAndRunsHybridGraph(t *testing.T) {
 	}
 }
 
-func TestQwen35SkipsTrailingMTPDraftLayer(t *testing.T) {
+func TestQwen35LoadsTrailingMTPDraftLayer(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if r.config.NLayers != 2 || len(r.qwen35.Layers) != 2 {
 		t.Fatalf("MTP-adjusted layers = %d/%d, want 2/2", r.config.NLayers, len(r.qwen35.Layers))
+	}
+	if r.qwen35.MTP == nil {
+		t.Fatal("trailing Qwen MTP draft layer was not loaded")
+	}
+	cache, _ := r.generationWorkspace(4, true)
+	if cache.Qwen35MTP == nil || cache.Qwen35MTP.KV.layerCount() != 1 {
+		t.Fatalf("MTP cache = %+v, want one independent attention layer", cache.Qwen35MTP)
+	}
+}
+
+func TestQwen35MTPGreedySpeculationMatchesTarget(t *testing.T) {
+	baseline, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mtp, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 4
+	opts.Seed = 17
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	want, err := baseline.GenerateChat([]ChatMessage{UserMessage("a")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts.MTPDraftTokens = 3
+	got, err := mtp.GenerateChat([]ChatMessage{UserMessage("a")}, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != want.Text || got.FinishReason != want.FinishReason || got.Stats.GeneratedTokens != want.Stats.GeneratedTokens {
+		t.Fatalf("MTP result = %#v, target result = %#v", got, want)
+	}
+	if mtp.workspaceCache == nil || mtp.workspaceCache.Qwen35MTP == nil {
+		t.Fatal("MTP generation did not allocate its independent cache")
+	}
+}
+
+func TestQwen35MTPRejectsStochasticSampling(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 2
+	opts.MTPDraftTokens = 2
+	if _, err := r.GenerateChat([]ChatMessage{UserMessage("a")}, opts); err == nil {
+		t.Fatal("stochastic MTP generation unexpectedly succeeded")
 	}
 }
 
@@ -320,5 +392,90 @@ func TestGenerateChatReusesQwen35PrefixForFollowup(t *testing.T) {
 	}
 	if cached.Text != want.Text {
 		t.Fatalf("cached follow-up = %q, cold = %q", cached.Text, want.Text)
+	}
+}
+
+func TestGenerateChatReusesQwen35MTPPrefixForFollowup(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 2
+	opts.MTPDraftTokens = 2
+	opts.Seed = 11
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	initial := []ChatMessage{UserMessage("a")}
+	first, err := r.GenerateChat(initial, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.PromptCache == nil || first.PromptCache.Mode != "prefix" || first.PromptCache.Hit {
+		t.Fatalf("first MTP prompt cache = %+v, want a cold prefix cache", first.PromptCache)
+	}
+
+	followup := []ChatMessage{initial[0], AssistantMessage(first.Text), UserMessage("b")}
+	cached, err := r.GenerateChat(followup, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.PromptCache == nil || !cached.PromptCache.Hit || cached.PromptCache.ReusedTokens <= 0 {
+		t.Fatalf("MTP follow-up prompt cache = %+v, want a warm prefix cache", cached.PromptCache)
+	}
+
+	cold, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := cold.GenerateChat(followup, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Text != want.Text || cached.FinishReason != want.FinishReason {
+		t.Fatalf("cached MTP follow-up = %#v, cold = %#v", cached, want)
+	}
+}
+
+func TestQwen35MTPColdPrefillAfterNonMTPPrefix(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := DefaultGenerationOptions()
+	base.SystemPrompt = ""
+	base.MaxTokens = 2
+	base.Seed = 19
+	base.Sampler.Temperature = 0
+	base.Sampler.TopK = 1
+
+	initial := []ChatMessage{UserMessage("a")}
+	first, err := r.GenerateChat(initial, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	followup := []ChatMessage{initial[0], AssistantMessage(first.Text), UserMessage("b")}
+	mtp := base
+	mtp.MTPDraftTokens = 2
+	got, err := r.GenerateChat(followup, mtp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.PromptCache == nil || got.PromptCache.Hit {
+		t.Fatalf("MTP after non-MTP prompt cache = %+v, want a deliberate cold prefill", got.PromptCache)
+	}
+
+	cold, err := RunnerFromGGUFBytes(buildTinyQwen35MoEGGUF(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := cold.GenerateChat(followup, mtp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Text != want.Text || got.FinishReason != want.FinishReason || got.Stats.GeneratedTokens != want.Stats.GeneratedTokens {
+		t.Fatalf("MTP cold refill after non-MTP = %#v, cold = %#v", got, want)
 	}
 }

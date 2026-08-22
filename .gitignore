@@ -10,3 +10,4 @@ scratch/p.prof
 /archive-web
 *.pprof
 /pool-lifeguard-assist
+GopherLLM.test

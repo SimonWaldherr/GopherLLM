@@ -44,6 +44,29 @@ type bertEmbeddingScratch struct {
 	XFlat, QFlat, KFlat, VFlat, QKVFlat, HiddenFlat, GateFlat []float32
 	X, Q, K, V, QKV, Hidden, Gate                             [][]float32
 	Position, RopeSin, RopeCos, Scores                        []float32
+	// The FFN activation callback is initialized once per reusable scratch.
+	// Reusing it avoids one escaping closure (which otherwise captures a large
+	// BERT layer value) per layer and embedding request.
+	activationHidden [][]float32
+	activationGate   [][]float32
+	activationBias   []float32
+	activationGated  bool
+	activationFn     func(start, end int)
+}
+
+func (s *bertEmbeddingScratch) activateFFNRange(start, end int) {
+	for i := start; i < end; i++ {
+		addInPlace(s.activationHidden[i], s.activationBias)
+		if s.activationGated {
+			for j := range s.activationHidden[i] {
+				s.activationHidden[i][j] *= s.activationGate[i][j] / (1 + float32(math.Exp(float64(-s.activationGate[i][j]))))
+			}
+			continue
+		}
+		for j := range s.activationHidden[i] {
+			s.activationHidden[i][j] = geluExact(s.activationHidden[i][j])
+		}
+	}
 }
 
 const maxReusableBERTScratchBytes int64 = 128 << 20
@@ -394,17 +417,22 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 		if weights.UseRoPE {
 			matvec(layer.FFNGate, x, gate)
 		}
-		for i := range n {
-			addInPlace(hidden[i], layer.FFNUpB)
-			if weights.UseRoPE {
-				for j := range hidden[i] {
-					hidden[i][j] *= gate[i][j] / (1 + float32(math.Exp(float64(-gate[i][j]))))
-				}
-			} else {
-				for j := range hidden[i] {
-					hidden[i][j] = geluExact(hidden[i][j])
-				}
-			}
+		// FFN rows are independent once their batched projections have
+		// completed. The large embedding models spend a visible serial slice
+		// here in exact GELU (or Nomic's gated activation) while the surrounding
+		// matvecs already use all cores. Split by token only when a chunk carries
+		// enough substantial rows to amortize the persistent worker-pool dispatch.
+		scratch.activationHidden = hidden
+		scratch.activationGate = gate
+		scratch.activationBias = layer.FFNUpB
+		scratch.activationGated = weights.UseRoPE
+		if scratch.activationFn == nil {
+			scratch.activationFn = scratch.activateFFNRange
+		}
+		if n >= 8 && config.HiddenDim >= 256 {
+			parallelChunks(n, scratch.activationFn)
+		} else {
+			scratch.activateFFNRange(0, n)
 		}
 		matvec(layer.FFNDown, hidden, v)
 		for i := range n {

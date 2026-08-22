@@ -1346,10 +1346,14 @@ type KVCache struct {
 	// hybrid graph. Its periodic full-attention layers use the K/V rows above,
 	// same dual-cache pattern as Nemotron-H.
 	Qwen35 *Qwen35Cache
-	K16    [][]uint16
-	V16    [][]uint16
-	K8     [][]byte
-	V8     [][]byte
+	// Qwen35MTP is the optional one-layer NextN draft head's independent KV
+	// cache and staging scratch. It is allocated only for a generation request
+	// that explicitly enables MTP speculation.
+	Qwen35MTP *Qwen35MTPState
+	K16       [][]uint16
+	V16       [][]uint16
+	K8        [][]byte
+	V8        [][]byte
 }
 
 // kvFormat is the tri-state storage format a KVCache actually holds. Every
@@ -1602,9 +1606,10 @@ type DecodeBuffer struct {
 	// MambaBeta/MambaRecall are Qwen3.5 Gated DeltaNet scratch: MambaBeta is
 	// the per-head delta-rule mixing gate (reuses the Mamba naming scheme
 	// rather than adding a parallel "DeltaNet*" set, since they play the same
-	// per-head-scratch role as MambaDT etc.), MambaRecall is the single head's
-	// worth of scratch for what the state currently predicts for this token's
-	// key, before the delta correction.
+	// per-head-scratch role as MambaDT etc.), MambaRecall holds one distinct
+	// head-width span per head for what the state predicts for this token's key
+	// before the delta correction. This permits the independent head updates to
+	// run in parallel without per-token allocations.
 	MambaBeta   []float32
 	MambaRecall []float32
 	// QGate/AttnGate are Qwen3.5's gated-attention scratch: attn_q projects
@@ -1612,8 +1617,13 @@ type DecodeBuffer struct {
 	// headDim, so QGate holds the raw strided projection and AttnGate the
 	// extracted, compactly-packed gate half (the query half is copied into
 	// the ordinary Q buffer so every existing per-head helper still applies).
-	QGate        []float32
-	AttnGate     []float32
+	QGate    []float32
+	AttnGate []float32
+	// MTPInput is Qwen's NextN [normalized token embedding | normalized
+	// previous target hidden] pair. It is only touched by the optional Qwen
+	// draft head, but keeping it in DecodeBuffer makes the draft loop
+	// allocation-free once its separate workspace has been created.
+	MTPInput     []float32
 	ExpertRow    []float32
 	ExpertHidden []float32
 	// Gemma4PLE and Gemma4PLEInput retain a token's prepared E2B per-layer
@@ -1687,6 +1697,7 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		GeneratedTokens:         make([]uint32, 0, 64),
 		StreamBytes:             make([]byte, 0, 256),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
+		MTPInput:                make([]float32, 2*config.Dim),
 		RopeInvFreq:             inv,
 		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeCos:                 make([]float32, max(1, maxHeadDim/2)),

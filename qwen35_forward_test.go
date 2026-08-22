@@ -217,3 +217,68 @@ func TestQwen35DeltaNetMatchesScalarReferenceAcrossSteps(t *testing.T) {
 		}
 	}
 }
+
+// The production Qwen3.8 geometry updates large independent DeltaNet state
+// matrices per head concurrently. Keep that path locked to the scalar graph,
+// not only the small serial fixture above.
+func TestQwen35DeltaNetParallelHeadsMatchesScalarReference(t *testing.T) {
+	const (
+		heads   = 8
+		headDim = 64
+	)
+	cfg := Config{
+		Dim: 1, SSMConv: 1, SSMInner: heads * headDim, SSMState: headDim,
+		SSMHeads: heads, SSMGroups: 1, RMSNormEps: 1e-5,
+	}
+	rng := rand.New(rand.NewSource(81))
+	channels := cfg.SSMInner + 2*cfg.SSMGroups*cfg.SSMState
+	qkv := randomVec(rng, channels)
+	gate := randomVec(rng, cfg.SSMInner)
+	alpha := randomVec(rng, heads)
+	beta := randomVec(rng, heads)
+	a := make([]float32, heads)
+	dt := randomVec(rng, heads)
+	for h := range heads {
+		a[h] = -.2 - float32(h)*.03
+		dt[h] *= .1
+	}
+	norm := make([]float32, headDim)
+	for i := range norm {
+		norm[i] = .8 + float32(i%7)*.04
+	}
+	identity := make([]float32, cfg.SSMInner*cfg.SSMInner)
+	for i := range cfg.SSMInner {
+		identity[i*cfg.SSMInner+i] = 1
+	}
+	w := Qwen35DeltaNetWeights{
+		QKVConv:    qwen35TestWeight(channels, 1, qkv),
+		ConvKernel: qwen35TestWeight(channels, 1, make([]float32, channels)),
+		Gate:       qwen35TestWeight(cfg.SSMInner, 1, gate),
+		AlphaProj:  qwen35TestWeight(heads, 1, alpha),
+		BetaProj:   qwen35TestWeight(heads, 1, beta),
+		A:          a,
+		DTBias:     dt,
+		Norm:       norm,
+		Out:        qwen35TestWeight(cfg.SSMInner, cfg.SSMInner, identity),
+	}
+	for i := range w.ConvKernel.F32 {
+		w.ConvKernel.F32[i] = 1
+	}
+
+	refState := make([][][]float32, heads)
+	for h := range refState {
+		refState[h] = make([][]float32, headDim)
+		for d := range refState[h] {
+			refState[h][d] = make([]float32, headDim)
+		}
+	}
+	cache := newQwen35Cache(cfg, 1)
+	buf := NewDecodeBuffer(cfg, headDim, 1, headDim)
+	for _, input := range []float32{.35, -.2} {
+		want := qwen35DeltaReferenceStep(cfg, qkv, gate, alpha, beta, a, dt, norm, input, refState)
+		qwen35DeltaNetForward(cfg, w, cache, []float32{input}, 0, buf)
+		for i, value := range want {
+			requireQwen35Close(t, buf.Proj[i], value)
+		}
+	}
+}

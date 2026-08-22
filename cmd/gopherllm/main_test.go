@@ -13,7 +13,7 @@ func TestParseCLISamplerFlags(t *testing.T) {
 	cfg, err := parseCLI([]string{
 		"model.gguf",
 		"--temp", "0.5", "--top-p", "0.85", "--top-k", "10", "--min-p", "0.1",
-		"--repeat-penalty", "1.2", "--max-tokens", "64", "--seed", "42", "--prompt", "hi",
+		"--repeat-penalty", "1.2", "--max-tokens", "64", "--mtp-draft-tokens", "3", "--seed", "42", "--prompt", "hi",
 	})
 	if err != nil {
 		t.Fatalf("parseCLI: %v", err)
@@ -25,8 +25,8 @@ func TestParseCLISamplerFlags(t *testing.T) {
 	if s.Temperature != 0.5 || s.TopP != 0.85 || s.TopK != 10 || s.MinP != 0.1 || s.RepeatPenalty != 1.2 {
 		t.Fatalf("sampler = %+v", s)
 	}
-	if cfg.options.MaxTokens != 64 || cfg.options.Seed != 42 || cfg.prompt != "hi" {
-		t.Fatalf("maxtok=%d seed=%d prompt=%q", cfg.options.MaxTokens, cfg.options.Seed, cfg.prompt)
+	if cfg.options.MaxTokens != 64 || cfg.options.MTPDraftTokens != 3 || cfg.options.Seed != 42 || cfg.prompt != "hi" {
+		t.Fatalf("maxtok=%d mtp=%d seed=%d prompt=%q", cfg.options.MaxTokens, cfg.options.MTPDraftTokens, cfg.options.Seed, cfg.prompt)
 	}
 }
 

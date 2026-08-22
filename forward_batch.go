@@ -187,6 +187,27 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 	})
 }
 
+// matvecBatch2/3 keep projections with a shared activation batch together.
+// On targets with the Q8K batch path this avoids re-quantizing every token and
+// collapsing the worker pool between Q/K/V or gate/up projections. Unsupported
+// formats retain the ordinary independently-dispatched batch implementation.
+func matvecBatch2(a, b Weight, xs, aOut, bOut [][]float32) {
+	if matvecBatchQ8Fused2(a, b, xs, aOut, bOut) {
+		return
+	}
+	matvecBatch(a, xs, aOut)
+	matvecBatch(b, xs, bOut)
+}
+
+func matvecBatch3(a, b, c Weight, xs, aOut, bOut, cOut [][]float32) {
+	if matvecBatchQ8Fused3(a, b, c, xs, aOut, bOut, cOut) {
+		return
+	}
+	matvecBatch(a, xs, aOut)
+	matvecBatch(b, xs, bOut)
+	matvecBatch(c, xs, cOut)
+}
+
 // dequantRowInto returns the row-dequant function for a quantized weight, or nil
 // if cols is incompatible or the type has no dequantizer.
 func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32) {
@@ -392,9 +413,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				copy(V[t], QKV[t][qLen+kLen:qLen+kLen+vLen])
 			}
 		} else {
-			matvecBatch(layer.WQ, XN, Q)
-			matvecBatch(layer.WK, XN, K)
-			matvecBatch(layer.WV, XN, V)
+			matvecBatch3(layer.WQ, layer.WK, layer.WV, XN, Q, K, V)
 		}
 
 		// RoPE + KV cache write are sequential: RoPE reuses shared sin/cos
@@ -505,8 +524,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				copy(Up[t], GateUp[t][hDim:gateUpLen])
 			}
 		} else {
-			matvecBatch(layer.W1, XN, Gate)
-			matvecBatch(layer.W3, XN, Up)
+			matvecBatch2(layer.W1, layer.W3, XN, Gate, Up)
 		}
 		activateFFN := func(ts, te int) {
 			for t := ts; t < te; t++ {

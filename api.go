@@ -181,6 +181,13 @@ type GenOption func(*GenerationOptions)
 // WithMaxTokens caps the number of generated tokens (default 256).
 func WithMaxTokens(n int) GenOption { return func(o *GenerationOptions) { o.MaxTokens = n } }
 
+// WithMTPDraftTokens enables Qwen3.5/3.6/3.8's exact greedy MTP draft head.
+// The model must contain a NextN block and generation must be deterministic
+// (temperature 0 or top-k 1); zero leaves MTP disabled.
+func WithMTPDraftTokens(n int) GenOption {
+	return func(o *GenerationOptions) { o.MTPDraftTokens = n }
+}
+
 // WithTemperature sets the sampling temperature; 0 selects greedy decoding.
 func WithTemperature(t float32) GenOption {
 	return func(o *GenerationOptions) { o.Sampler.Temperature = t }

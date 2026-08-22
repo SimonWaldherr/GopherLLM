@@ -93,6 +93,12 @@ type GenerationOptions struct {
 	Seed          uint64
 	SystemPrompt  string
 	StopSequences []string
+	// MTPDraftTokens enables Qwen3.5/3.6/3.8's on-model NextN draft head for
+	// exact greedy speculation. Zero (the default) leaves MTP inactive in the
+	// decode path. The target remains the authority for every emitted
+	// token; non-greedy sampling is rejected rather than silently changing its
+	// distribution.
+	MTPDraftTokens int
 	// ContextWindowMode controls whether an oversized chat history fails as it
 	// historically did (full, the zero-value behavior), is reduced to the
 	// newest complete turns before rendering (recent), or lexically condensed
@@ -178,6 +184,9 @@ func (o GenerationOptions) Validate() error {
 	}
 	if !finite32(o.Sampler.RepeatPenalty) || o.Sampler.RepeatPenalty <= 0 {
 		return fmt.Errorf("repeat_penalty must be a finite number > 0")
+	}
+	if o.MTPDraftTokens < 0 || o.MTPDraftTokens > 32 {
+		return fmt.Errorf("mtp_draft_tokens must be in the range [0, 32]")
 	}
 	return nil
 }
@@ -292,6 +301,10 @@ type prefixCacheState struct {
 	promptTokens int
 	promptLogits []float32
 	qwen35       *Qwen35Cache
+	// qwen35MTP is only present for a request that opted into MTP. Its KV rows
+	// remain in the shared workspace alongside ordinary Qwen K/V; this tiny
+	// snapshot carries the one recurrent boundary value that those rows need.
+	qwen35MTP []float32
 }
 
 // Runner is a fully loaded model ready to generate: parsed GGUF header,
@@ -403,10 +416,10 @@ func (r *Runner) HasVision() bool { return r != nil && r.vision != nil }
 //     sparse experts when their router tensors are present. deepseek2 uses a
 //     dedicated MLA attention path and its sigmoid/noaux shared-expert router.
 //   - qwen35/qwen35moe use the experimental native Gated-DeltaNet hybrid
-//     loader. It has focused graph and local-GGUF smoke coverage, while
-//     cross-runtime logit parity, vision, and MTP speculation remain out of
-//     scope. qwen35moe shares the sparse-expert tensor path; a trailing
-//     Qwen MTP draft layer is skipped for ordinary generation.
+//     loader. It has focused graph and local-GGUF smoke coverage; a trailing
+//     one-layer Qwen MTP draft head can be enabled for exact greedy
+//     speculation. Cross-runtime logit parity and vision remain out of scope;
+//     qwen35moe shares the sparse-expert trunk tensor path.
 //   - Phi-3, dense Granite, EXAONE, and InternLM2 use the same pre-norm, RoPE, GQA and
 //     SwiGLU graph as the standard loader. Their architecture-specific scales
 //     are read from GGUF metadata by ConfigFromGGUF.
@@ -547,10 +560,11 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		}
 		r.config, r.mamba2, r.kind = config, weights, loadedMamba2
 	case "qwen35", "qwen35moe":
-		// Text-only decode is implemented and covered by focused graph tests and
-		// local GGUF smoke tests. Keep the remaining unsupported capabilities
-		// explicit instead of claiming general Qwen3.5/3.6/3.8 feature parity.
-		fmt.Fprintln(logw, "Warning: qwen35 support is experimental: text-only decode is implemented; vision, MTP speculative decoding, and cross-runtime logit-parity validation are pending (see qwen35.go)")
+		// Text-only decode and the optional exact-greedy MTP draft head are
+		// implemented and covered by focused graph tests. Keep the remaining
+		// unsupported capabilities explicit instead of claiming general Qwen
+		// feature parity.
+		fmt.Fprintln(logw, "Warning: qwen35 support is experimental: text-only decode and greedy MTP speculation are implemented; vision and cross-runtime logit-parity validation are pending (see qwen35.go)")
 		config, weights, err := LoadQwen35Model(data, gguf, borrowQuantized, options.PrepareQuantized, options.UseMetal, logw, options.OutOfCore)
 		if err != nil {
 			return nil, err
@@ -814,6 +828,10 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if err := options.Validate(); err != nil {
 		return GenerationResult{}, err
 	}
+	mtpDraftTokens, err := r.mtpDraftTokenCount(options)
+	if err != nil {
+		return GenerationResult{}, err
+	}
 	if len(messages) == 0 {
 		return GenerationResult{}, fmt.Errorf("no prompt provided")
 	}
@@ -849,7 +867,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return GenerationResult{}, fmt.Errorf("prompt (%d tokens) leaves no room to generate within the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
-	cache, buf := r.generationWorkspace(cacheLen)
+	cache, buf := r.generationWorkspace(cacheLen, mtpDraftTokens > 0)
 	buf.ImageEmbeds = imageEmbeds
 	defer func() { buf.ImageEmbeds = nil }()
 	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
@@ -861,7 +879,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// out of prefix-cache reuse entirely rather than risk that — image
 	// prefill already dominates a multimodal turn's cost far more than
 	// prefix-cache reuse would save.
-	cacheEligible := len(imageEmbeds) == 0 && r.prefixCacheSupported(cache)
+	cacheEligible := len(imageEmbeds) == 0 && r.prefixCacheSupportedWithMTP(cache, mtpDraftTokens > 0)
 	// A grown Qwen workspace can still be retained for the current request
 	// while exceeding the stricter K/V-plus-snapshot prefix budget. Drop an
 	// old snapshot attached to that workspace immediately rather than keeping
@@ -881,7 +899,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	cachedPromptLogits := r.prefixCache.promptLogits
 	if cacheEligible {
 		cacheInfo.Mode = "prefix"
-		reusedTokens = r.prefixReuse(cache, tokens)
+		reusedTokens = r.prefixReuseWithMTP(cache, tokens, mtpDraftTokens > 0)
 		cacheInfo.Hit = reusedTokens > 0
 		cacheInfo.ReusedTokens = reusedTokens
 	}
@@ -924,11 +942,19 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			return
 		}
 		var qwen35Snapshot *Qwen35Cache
+		var qwen35MTP []float32
 		if r.kind == loadedQwen35 {
 			qwen35Snapshot = cache.Qwen35.snapshot()
 			if qwen35Snapshot == nil {
 				r.clearPrefixCache()
 				return
+			}
+			if mtpDraftTokens > 0 {
+				qwen35MTP = cache.Qwen35MTP.pendingSnapshot()
+				if qwen35MTP == nil {
+					r.clearPrefixCache()
+					return
+				}
 			}
 		}
 		state := prefixCacheState{
@@ -937,6 +963,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			promptTokens: len(tokens),
 			promptLogits: promptLogits,
 			qwen35:       qwen35Snapshot,
+			qwen35MTP:    qwen35MTP,
 		}
 		r.prefixCache = state
 	}()
@@ -954,6 +981,9 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 					r.forwardTokenInto(cache, buf, tokens[pos], pos, &logits)
 				} else {
 					r.forwardPrefillToken(cache, buf, tokens[pos], pos)
+				}
+				if mtpDraftTokens > 0 {
+					qwen35MTPProcess(r.config, r.qwen35.MTP, cache.Qwen35MTP, tokens[pos], buf.XN, pos)
 				}
 			}
 		}
@@ -1022,20 +1052,14 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		}
 		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats, ContextWindow: contextWindow, PromptCache: &cacheInfo}
 	}
-decode:
-	for range options.MaxTokens {
-		if err := ctx.Err(); err != nil {
-			return buildResult(), err
-		}
-		token := nextToken
-		if haveNextToken {
-			haveNextToken = false
-		} else {
-			token = SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
-		}
+	// emitToken owns every user-visible side effect of accepting a token. MTP
+	// verification can accept several candidates in one outer decode pass, so
+	// keeping this logic in one closure preserves stop-string, UTF-8 streaming,
+	// cancellation, repetition-window, and accounting semantics exactly.
+	emitToken := func(token uint32) (keepDecoding, canceled bool) {
 		if r.isStopToken(token) {
 			finishReason = "stop"
-			break
+			return false, false
 		}
 		if ttft == 0 {
 			ttft = time.Since(totalStart)
@@ -1053,13 +1077,13 @@ decode:
 					output.WriteString(current)
 					streamBuf = streamBuf[:0]
 					finishReason = "stop"
-					break decode
+					return false, false
 				}
 			}
 		}
 		streamBuf = append(streamBuf, text...)
 		if !flushStream(false) {
-			return buildResult(), ErrGenerationCanceled
+			return false, true
 		}
 		generated = append(generated, token)
 		recent = append(recent, token)
@@ -1067,23 +1091,118 @@ decode:
 			copy(recent, recent[len(recent)-repeatPenaltyWindow:])
 			recent = recent[:repeatPenaltyWindow]
 		}
-		if len(generated) >= options.MaxTokens || pos >= cacheLen {
-			break
-		}
+		return true, false
+	}
+	// verifyToken advances the target by an already-emitted token and returns
+	// its deterministic next choice. Its MTP catch-up happens only after the
+	// target body has produced the real hidden state, which overwrites any
+	// speculative MTP row at this position with the authoritative pair.
+	verifyToken := func(token uint32, mtpPrepared bool) uint32 {
+		var targetNext uint32
 		if greedyFastPath {
 			var ok bool
-			nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, recent, options.Sampler.RepeatPenalty, &logits)
-			haveNextToken = ok
-			if cacheEligible {
-				residentTokens = append(residentTokens, token)
+			targetNext, ok = r.forwardGreedyToken(cache, buf, token, pos, recent, options.Sampler.RepeatPenalty, &logits)
+			if !ok {
+				targetNext = SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
 			}
 		} else {
 			r.forwardTokenInto(cache, buf, token, pos, &logits)
-			if cacheEligible {
-				residentTokens = append(residentTokens, token)
+			targetNext = SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
+		}
+		if mtpDraftTokens > 0 {
+			if mtpPrepared {
+				// The seed MTP row was just computed from this exact token and
+				// the same pending target hidden state. Reuse its KV rather than
+				// evaluating the full draft block a second time; only the real
+				// target boundary needs updating after verification.
+				copy(cache.Qwen35MTP.PendingHidden, buf.XN[:r.config.Dim])
+			} else {
+				qwen35MTPProcess(r.config, r.qwen35.MTP, cache.Qwen35MTP, token, buf.XN, pos)
 			}
 		}
+		if cacheEligible {
+			residentTokens = append(residentTokens, token)
+		}
 		pos++
+		return targetNext
+	}
+decode:
+	for range options.MaxTokens {
+		if err := ctx.Err(); err != nil {
+			return buildResult(), err
+		}
+		token := nextToken
+		if haveNextToken {
+			haveNextToken = false
+		} else {
+			token = SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
+		}
+		keepDecoding, canceled := emitToken(token)
+		if canceled {
+			return buildResult(), ErrGenerationCanceled
+		}
+		if !keepDecoding {
+			break
+		}
+		if len(generated) >= options.MaxTokens || pos >= cacheLen {
+			break
+		}
+		if mtpDraftTokens == 0 {
+			if greedyFastPath {
+				var ok bool
+				nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, recent, options.Sampler.RepeatPenalty, &logits)
+				haveNextToken = ok
+				if cacheEligible {
+					residentTokens = append(residentTokens, token)
+				}
+			} else {
+				r.forwardTokenInto(cache, buf, token, pos, &logits)
+				if cacheEligible {
+					residentTokens = append(residentTokens, token)
+				}
+			}
+			pos++
+			continue
+		}
+
+		// Seed MTP with the just-emitted target token, then verify candidates
+		// one by one. Qwen's hybrid target currently has a serial DeltaNet
+		// recurrence, so verification remains sequential; keeping it exact here
+		// makes the MTP head safe today and lets a future chunked verifier reuse
+		// the synchronized cache without changing generation semantics.
+		// Never score draft positions that cannot be emitted in this request.
+		// Besides avoiding wasted MTP work near max_tokens, this keeps a
+		// one-token completion to exactly one draft-head evaluation.
+		draftLimit := min(mtpDraftTokens, min(cacheLen-pos, options.MaxTokens-len(generated)))
+		drafts := qwen35MTPDraftGreedy(r.config, r.qwen35.MTP, cache.Qwen35MTP, token, pos,
+			draftLimit, recent, options.Sampler.RepeatPenalty)
+		currentToken := token
+		seedPrepared := len(drafts) > 0
+		for {
+			if err := ctx.Err(); err != nil {
+				return buildResult(), err
+			}
+			targetNext := verifyToken(currentToken, seedPrepared)
+			seedPrepared = false
+			if len(drafts) == 0 {
+				nextToken, haveNextToken = targetNext, true
+				break
+			}
+			candidate := drafts[0]
+			drafts = drafts[1:]
+			if targetNext != candidate {
+				nextToken, haveNextToken = targetNext, true
+				break
+			}
+			keepDecoding, canceled = emitToken(candidate)
+			if canceled {
+				return buildResult(), ErrGenerationCanceled
+			}
+			if !keepDecoding || len(generated) >= options.MaxTokens || pos >= cacheLen {
+				break decode
+			}
+			currentToken = candidate
+		}
 	}
 	if !flushStream(true) {
 		return buildResult(), ErrGenerationCanceled
@@ -1260,6 +1379,10 @@ func (r *Runner) clearPrefixCache() {
 }
 
 func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
+	return r.prefixCacheSupportedWithMTP(cache, false)
+}
+
+func (r *Runner) prefixCacheSupportedWithMTP(cache *KVCache, useMTP bool) bool {
 	if cache == nil || cache != r.workspaceCache {
 		return false
 	}
@@ -1268,7 +1391,17 @@ func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
 		// combined retained footprint to the same budget that guards normal
 		// prefix caching; a 27B Qwen3.8 snapshot is about 150 MiB and fits with
 		// the common short-context f16 or i8 K/V cache.
-		return cache.Qwen35 != nil && kvCacheStorageBytes(cache)+cache.Qwen35.bytes() <= maxReusableKVCacheBytes
+		if cache.Qwen35 == nil {
+			return false
+		}
+		bytes := kvCacheStorageBytes(cache) + cache.Qwen35.bytes()
+		if useMTP {
+			if cache.Qwen35MTP == nil || cache.Qwen35MTP.KV == nil {
+				return false
+			}
+			bytes += kvCacheStorageBytes(cache.Qwen35MTP.KV)
+		}
+		return bytes <= maxReusableKVCacheBytes
 	}
 	// Nemotron-H's recurrent state has no prefix snapshot yet. Reusing only
 	// its attention K/V rows (or none at all for pure Mamba2) would be wrong.
@@ -1279,6 +1412,10 @@ func (r *Runner) prefixCacheSupported(cache *KVCache) bool {
 // GenerateChatStreamUntil may skip an identical prompt completely when the
 // corresponding immutable pre-sampling logits snapshot is also resident.
 func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
+	return r.prefixReuseWithMTP(cache, tokens, false)
+}
+
+func (r *Runner) prefixReuseWithMTP(cache *KVCache, tokens []uint32, useMTP bool) int {
 	state := r.prefixCache
 	if state.cache != cache || len(state.tokens) == 0 || cache == nil {
 		return 0
@@ -1294,8 +1431,21 @@ func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
 		// If the new prompt ends exactly there without matching prompt logits,
 		// the generic one-token re-forward fallback would update DeltaNet state
 		// twice, so leave it cold instead.
-		if matched != len(state.tokens) || (matched == len(tokens) && state.promptTokens != len(tokens)) ||
-			!cache.Qwen35.restore(state.qwen35) {
+		if matched != len(state.tokens) || (matched == len(tokens) && state.promptTokens != len(tokens)) {
+			return 0
+		}
+		// Preflight the independent MTP boundary before restoring the target
+		// recurrence. A missing MTP snapshot is normal when the immediately
+		// preceding request ran without MTP; returning cold after mutating only
+		// Qwen35 would otherwise make its next prefill start from an unrelated
+		// recurrent state.
+		if useMTP && (cache.Qwen35MTP == nil || len(state.qwen35MTP) != len(cache.Qwen35MTP.PendingHidden)) {
+			return 0
+		}
+		if !cache.Qwen35.restore(state.qwen35) {
+			return 0
+		}
+		if useMTP && !cache.Qwen35MTP.restorePending(state.qwen35MTP) {
 			return 0
 		}
 	}
@@ -1307,7 +1457,8 @@ func (r *Runner) prefixReuse(cache *KVCache, tokens []uint32) int {
 // most recent conversation. When it grows, copy known K/V rows geometrically
 // rather than re-prefilling prior turns. Retaining at most 512 MiB avoids
 // turning one unusually large context into a permanent memory commitment.
-func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
+func (r *Runner) generationWorkspace(cacheLen int, enableMTP ...bool) (*KVCache, *DecodeBuffer) {
+	useMTP := len(enableMTP) > 0 && enableMTP[0] && r.kind == loadedQwen35 && r.qwen35.MTP != nil
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	layers := r.kvCacheLayerCount()
 	old := r.workspaceCache
@@ -1318,6 +1469,12 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 	// one erroring, which is exactly the failure mode worth avoiding.
 	allowI8 := kvI8Eligible(kDim, vDim, maxHead, maxVal)
 	desiredFormat := desiredKVFormat(allowI8)
+	mtpKVBytes := func(length int, format kvFormat) int64 {
+		if !useMTP {
+			return 0
+		}
+		return kvCacheBytes(1, kDim, vDim, length, format)
+	}
 	shapeCompatible := old != nil && old.layerCount() == layers && old.kvFormat() == desiredFormat &&
 		old.PerPosKDim == kDim && old.PerPosVDim == vDim
 	cache := old
@@ -1330,11 +1487,11 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 		// Geometric headroom is useful only while it stays within the same
 		// retention budget. Never make a one-off request allocate a larger
 		// temporary cache merely because the next growth step crossed 512 MiB.
-		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, desiredFormat) > maxReusableKVCacheBytes {
+		if targetLen > cacheLen && kvCacheBytes(layers, kDim, vDim, targetLen, desiredFormat)+mtpKVBytes(targetLen, desiredFormat) > maxReusableKVCacheBytes {
 			targetLen = cacheLen
 		}
 		cache = newKVCacheAuto(layers, kDim, vDim, targetLen, allowI8)
-		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.kvFormat())
+		bytes := kvCacheBytes(layers, kDim, vDim, targetLen, cache.kvFormat()) + mtpKVBytes(targetLen, cache.kvFormat())
 		if bytes <= maxReusableKVCacheBytes {
 			r.workspaceCache = cache
 			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 {
@@ -1358,6 +1515,14 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 			r.clearPrefixCache()
 		}
 	}
+	// A cache growth during a non-MTP request copies only the target's K/V
+	// rows. Preserve that useful target prefix, but invalidate the independent
+	// MTP boundary snapshot: its one-layer K/V rows were intentionally not
+	// allocated/copied for this request and restoring just PendingHidden later
+	// would make an apparently warm MTP prefix incorrect.
+	if !useMTP && cache != old && r.kind == loadedQwen35 && r.prefixCache.cache == cache {
+		r.prefixCache.qwen35MTP = nil
+	}
 	if r.kind == loadedNemotronH || r.kind == loadedMamba2 {
 		if !cache.Nemotron.compatible(r.config) {
 			cache.Nemotron = newNemotronHCache(r.config)
@@ -1372,6 +1537,25 @@ func (r *Runner) generationWorkspace(cacheLen int) (*KVCache, *DecodeBuffer) {
 			cache.Qwen35 = newQwen35Cache(r.config, recurrentLayers)
 		}
 		cache.Qwen35.reset()
+		if useMTP {
+			oldMTP := (*Qwen35MTPState)(nil)
+			if old != nil {
+				oldMTP = old.Qwen35MTP
+			}
+			if !cache.Qwen35MTP.compatible(r.config, cache.MaxLen, cache.kvFormat()) {
+				cache.Qwen35MTP = newQwen35MTPState(r.config, cache.MaxLen, cache.kvFormat())
+				// A geometrically grown target cache can retain a matching MTP
+				// prefix too. The base prefix remains useful even if this copy
+				// cannot happen, so leave its metadata intact; the MTP-specific
+				// restore will simply cold-prefill on the next request.
+				if oldMTP != nil && r.prefixCache.cache == cache && len(r.prefixCache.tokens) > 0 {
+					if copyQwen35MTPPrefix(cache.Qwen35MTP, oldMTP, len(r.prefixCache.tokens)) != len(r.prefixCache.tokens) {
+						r.prefixCache.qwen35MTP = nil
+					}
+				}
+			}
+			cache.Qwen35MTP.reset()
+		}
 	}
 	if r.workspaceBuf == nil {
 		r.workspaceBuf = NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
@@ -1400,6 +1584,24 @@ func (r *Runner) canGreedyOutputFastPath(options GenerationOptions) bool {
 	s := options.Sampler
 	return os.Getenv("GOPHERLLM_NO_GREEDY_ARGMAX") != "1" &&
 		(s.Temperature < 1e-6 || s.TopK == 1)
+}
+
+// mtpDraftTokenCount validates the opt-in MTP path at the point where both
+// the loaded architecture and the sampler are known. MTP candidates are
+// accepted only when they equal the target's deterministic choice, which is
+// exact for greedy decoding; using that shortcut for stochastic sampling would
+// bias the output distribution, so it is deliberately refused.
+func (r *Runner) mtpDraftTokenCount(options GenerationOptions) (int, error) {
+	if options.MTPDraftTokens == 0 {
+		return 0, nil
+	}
+	if r.kind != loadedQwen35 || r.qwen35.MTP == nil {
+		return 0, fmt.Errorf("mtp_draft_tokens requires a Qwen3.5/3.6/3.8 GGUF with a loaded NextN/MTP draft layer")
+	}
+	if options.Sampler.Temperature >= 1e-6 && options.Sampler.TopK != 1 {
+		return 0, fmt.Errorf("mtp_draft_tokens requires greedy sampling (temperature 0 or top_k 1) to preserve exact output")
+	}
+	return options.MTPDraftTokens, nil
 }
 
 func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {

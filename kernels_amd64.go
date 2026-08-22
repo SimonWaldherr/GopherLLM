@@ -446,6 +446,18 @@ type batchQ8Scratch struct {
 	xsums []float32
 }
 
+// Apple Silicon currently has the fused batch implementation below in its
+// portable-Q8 path. Keep amd64 on its independently tuned AVX2 dispatch until
+// it has a matching fused kernel; the shared caller falls back without any
+// behavioural change.
+func matvecBatchQ8Fused2(_ Weight, _ Weight, _ [][]float32, _ [][]float32, _ [][]float32) bool {
+	return false
+}
+
+func matvecBatchQ8Fused3(_ Weight, _ Weight, _ Weight, _ [][]float32, _ [][]float32, _ [][]float32, _ [][]float32) bool {
+	return false
+}
+
 var batchQ8Pool = sync.Pool{New: func() any { return &batchQ8Scratch{} }}
 
 // matvecBatchQ8 is the batched-prefill analogue of the int8-activation

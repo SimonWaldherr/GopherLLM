@@ -34,16 +34,17 @@ type fileConfig struct {
 }
 
 type fileGenerationConfig struct {
-	MaxTokens     *int     `json:"max_tokens,omitempty"`
-	Temperature   *float32 `json:"temperature,omitempty"`
-	TopP          *float32 `json:"top_p,omitempty"`
-	TopK          *int     `json:"top_k,omitempty"`
-	MinP          *float32 `json:"min_p,omitempty"`
-	RepeatPenalty *float32 `json:"repeat_penalty,omitempty"`
-	Seed          *uint64  `json:"seed,omitempty"`
-	SystemPrompt  *string  `json:"system_prompt,omitempty"`
-	Stop          []string `json:"stop,omitempty"`
-	ContextWindow *string  `json:"context_window_mode,omitempty"`
+	MaxTokens      *int     `json:"max_tokens,omitempty"`
+	MTPDraftTokens *int     `json:"mtp_draft_tokens,omitempty"`
+	Temperature    *float32 `json:"temperature,omitempty"`
+	TopP           *float32 `json:"top_p,omitempty"`
+	TopK           *int     `json:"top_k,omitempty"`
+	MinP           *float32 `json:"min_p,omitempty"`
+	RepeatPenalty  *float32 `json:"repeat_penalty,omitempty"`
+	Seed           *uint64  `json:"seed,omitempty"`
+	SystemPrompt   *string  `json:"system_prompt,omitempty"`
+	Stop           []string `json:"stop,omitempty"`
+	ContextWindow  *string  `json:"context_window_mode,omitempty"`
 }
 
 type fileRuntimeConfig struct {
@@ -98,6 +99,7 @@ var cliValueOptions = map[string]bool{
 	"--max-connections":    true,
 	"--max-tokens":         true,
 	"-n":                   true,
+	"--mtp-draft-tokens":   true,
 	"--temp":               true,
 	"-t":                   true,
 	"--top-p":              true,
@@ -201,6 +203,9 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 	if g := raw.Generation; g != nil {
 		if g.MaxTokens != nil {
 			cfg.options.MaxTokens = *g.MaxTokens
+		}
+		if g.MTPDraftTokens != nil {
+			cfg.options.MTPDraftTokens = *g.MTPDraftTokens
 		}
 		if g.Temperature != nil {
 			cfg.options.Sampler.Temperature = *g.Temperature
@@ -363,16 +368,17 @@ func effectiveContextWindowMode(mode gopherllm.ContextWindowMode) string {
 // HF_TOKEN and transient user prompts are intentionally not part of the schema.
 func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	type effectiveGenerationConfig struct {
-		MaxTokens     int      `json:"max_tokens"`
-		Temperature   float32  `json:"temperature"`
-		TopP          float32  `json:"top_p"`
-		TopK          int      `json:"top_k"`
-		MinP          float32  `json:"min_p"`
-		RepeatPenalty float32  `json:"repeat_penalty"`
-		Seed          uint64   `json:"seed"`
-		SystemPrompt  string   `json:"system_prompt"`
-		Stop          []string `json:"stop,omitempty"`
-		ContextWindow string   `json:"context_window_mode"`
+		MaxTokens      int      `json:"max_tokens"`
+		MTPDraftTokens int      `json:"mtp_draft_tokens"`
+		Temperature    float32  `json:"temperature"`
+		TopP           float32  `json:"top_p"`
+		TopK           int      `json:"top_k"`
+		MinP           float32  `json:"min_p"`
+		RepeatPenalty  float32  `json:"repeat_penalty"`
+		Seed           uint64   `json:"seed"`
+		SystemPrompt   string   `json:"system_prompt"`
+		Stop           []string `json:"stop,omitempty"`
+		ContextWindow  string   `json:"context_window_mode"`
 	}
 	type effectiveRuntimeConfig struct {
 		Threads      int    `json:"threads,omitempty"`
@@ -410,16 +416,17 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		Preset:   cfg.preset,
 		ModelDir: cfg.modelDir,
 		Generation: effectiveGenerationConfig{
-			MaxTokens:     cfg.options.MaxTokens,
-			Temperature:   cfg.options.Sampler.Temperature,
-			TopP:          cfg.options.Sampler.TopP,
-			TopK:          cfg.options.Sampler.TopK,
-			MinP:          cfg.options.Sampler.MinP,
-			RepeatPenalty: cfg.options.Sampler.RepeatPenalty,
-			Seed:          cfg.options.Seed,
-			SystemPrompt:  cfg.options.SystemPrompt,
-			Stop:          append([]string(nil), cfg.options.StopSequences...),
-			ContextWindow: effectiveContextWindowMode(cfg.options.ContextWindowMode),
+			MaxTokens:      cfg.options.MaxTokens,
+			MTPDraftTokens: cfg.options.MTPDraftTokens,
+			Temperature:    cfg.options.Sampler.Temperature,
+			TopP:           cfg.options.Sampler.TopP,
+			TopK:           cfg.options.Sampler.TopK,
+			MinP:           cfg.options.Sampler.MinP,
+			RepeatPenalty:  cfg.options.Sampler.RepeatPenalty,
+			Seed:           cfg.options.Seed,
+			SystemPrompt:   cfg.options.SystemPrompt,
+			Stop:           append([]string(nil), cfg.options.StopSequences...),
+			ContextWindow:  effectiveContextWindowMode(cfg.options.ContextWindowMode),
 		},
 		Runtime: effectiveRuntimeConfig{
 			PrepareQuant: cfg.prepareQuant,

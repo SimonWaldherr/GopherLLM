@@ -204,9 +204,9 @@ func fillQ8KXSums(t GGMLType, x []float32, cols int, sub *[]float32) {
 }
 
 type batchQ8Scratch struct {
-	q8    []int8
-	xsc   []float32
-	xsums []float32
+	q8                    []int8
+	xsc                   []float32
+	xsums, xsums2, xsums3 []float32
 }
 
 var batchQ8Pool = sync.Pool{New: func() any { return &batchQ8Scratch{} }}
@@ -271,6 +271,128 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 				out := outs[t]
 				for r := tileStart; r < tileEnd; r++ {
 					out[r] = layout.dot(w.Raw[r*layout.rowBytes:], q8, xsc, xsum, blocks)
+				}
+			}
+		}
+	})
+	batchQ8Pool.Put(scratch)
+	return true
+}
+
+// matvecBatchQ8Fused{2,3} execute independent Q8K batch projections that
+// share their activation rows. Standard transformer prefill invokes this for
+// Q/K/V and SwiGLU gate/up. Quantizing the same p inputs for every projection
+// was pure duplicated work, and each separate projection also introduced a
+// worker-pool barrier. Dot arithmetic and the per-weight row order below are
+// identical to matvecBatchQ8, so this is a scheduling/data-reuse optimization
+// rather than a numerics change.
+func matvecBatchQ8Fused2(a, b Weight, xs, aOut, bOut [][]float32) bool {
+	weights := [2]Weight{a, b}
+	outs := [2][][]float32{aOut, bOut}
+	return matvecBatchQ8Fused(weights[:], xs, outs[:])
+}
+
+func matvecBatchQ8Fused3(a, b, c Weight, xs, aOut, bOut, cOut [][]float32) bool {
+	weights := [3]Weight{a, b, c}
+	outs := [3][][]float32{aOut, bOut, cOut}
+	return matvecBatchQ8Fused(weights[:], xs, outs[:])
+}
+
+func matvecBatchQ8Fused(weights []Weight, xs [][]float32, outs [][][]float32) bool {
+	if !useQ8Activations.Load() || len(weights) < 2 || len(weights) > 3 || len(weights) != len(outs) {
+		return false
+	}
+	p := len(xs)
+	// The saved activation preparation and worker barrier become measurable
+	// only once a prompt chunk has enough token rows. Small chat prompts keep
+	// the established per-projection dispatch, which avoids trading their low
+	// latency for a larger combined work queue.
+	if p < 32 {
+		return false
+	}
+	cols := len(xs[0])
+	if cols <= 0 || cols%256 != 0 {
+		return false
+	}
+	blocks := cols / 256
+	var layouts [3]q8kRowLayout
+	var offsets [4]int
+	for wi := range weights {
+		w := weights[wi]
+		if w.Rows <= 0 || w.Cols != cols || len(outs[wi]) != p {
+			return false
+		}
+		layout, ok := q8kLayoutFor(w.Type, blocks)
+		if !ok || len(w.Raw) < w.Rows*layout.rowBytes {
+			return false
+		}
+		for t := range p {
+			if len(xs[t]) < cols || len(outs[wi][t]) < w.Rows {
+				return false
+			}
+		}
+		layouts[wi] = layout
+		offsets[wi+1] = offsets[wi] + w.Rows
+	}
+
+	scratch := batchQ8Pool.Get().(*batchQ8Scratch)
+	ensureLenNoClear(&scratch.q8, p*cols)
+	ensureLenNoClear(&scratch.xsc, p*blocks)
+	q8All, xscAll := scratch.q8, scratch.xsc
+	sumStorage := [3]*[]float32{&scratch.xsums, &scratch.xsums2, &scratch.xsums3}
+	var sums [3][]float32
+	var owner [3]int
+	uniqueSums := 0
+	for wi := range weights {
+		owner[wi] = wi
+		for prior := 0; prior < wi; prior++ {
+			if weights[prior].Type == weights[wi].Type {
+				owner[wi] = owner[prior]
+				sums[wi] = sums[prior]
+				break
+			}
+		}
+		if owner[wi] != wi {
+			continue
+		}
+		ensureLenNoClear(sumStorage[uniqueSums], p*layouts[wi].sumsPerTok)
+		sums[wi] = *sumStorage[uniqueSums]
+		uniqueSums++
+	}
+	for t := range p {
+		q8kQuantize(xs[t], q8All[t*cols:], xscAll[t*blocks:], blocks)
+		for wi := range weights {
+			if owner[wi] != wi {
+				continue
+			}
+			sumsPerTok := layouts[wi].sumsPerTok
+			sub := sums[wi][t*sumsPerTok : (t+1)*sumsPerTok : (t+1)*sumsPerTok]
+			fillQ8KXSums(weights[wi].Type, xs[t], cols, &sub)
+		}
+	}
+
+	// Keep the same small row tile as matvecBatchQ8. A single worker dispatch
+	// covers all projections; rows from each weight remain contiguous inside a
+	// worker range, preserving cache-friendly streaming of every raw matrix.
+	const rowTile = 16
+	parallelRows(offsets[len(weights)], func(start, end int) {
+		for wi, w := range weights {
+			localStart := max(start, offsets[wi]) - offsets[wi]
+			localEnd := min(end, offsets[wi+1]) - offsets[wi]
+			if localStart >= localEnd {
+				continue
+			}
+			layout := layouts[wi]
+			for tileStart := localStart; tileStart < localEnd; tileStart += rowTile {
+				tileEnd := min(tileStart+rowTile, localEnd)
+				for t := range p {
+					q8 := q8All[t*cols:]
+					xsc := xscAll[t*blocks:]
+					xsum := sums[wi][t*layout.sumsPerTok:]
+					out := outs[wi][t]
+					for row := tileStart; row < tileEnd; row++ {
+						out[row] = layout.dot(w.Raw[row*layout.rowBytes:], q8, xsc, xsum, blocks)
+					}
 				}
 			}
 		}

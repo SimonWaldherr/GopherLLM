@@ -349,6 +349,68 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 	}
 }
 
+// Q/K/V and gate/up prefill fusion must preserve the exact Q8-activation row
+// results of issuing the same batch projections separately. The three weights
+// intentionally use Q4_K, Q4_K, and Q6_K — the mixed layout used by real
+// Ministral and Granite checkpoints.
+func TestMatvecBatchQ8FusedProjectionsMatchSeparate(t *testing.T) {
+	rng := rand.New(rand.NewSource(58))
+	const (
+		cols = 512
+		p    = 32
+	)
+	makeWeight := func(typ GGMLType, rows int) Weight {
+		var raw []byte
+		for range rows {
+			switch typ {
+			case GGMLTypeQ4_K:
+				raw = append(raw, randomQ4KRow(rng, cols)...)
+			case GGMLTypeQ6_K:
+				raw = append(raw, randomQ6KRow(rng, cols)...)
+			default:
+				t.Fatalf("unsupported fixture type %s", typ)
+			}
+		}
+		return Weight{Raw: raw, Type: typ, Rows: rows, Cols: cols}
+	}
+	newOutputs := func(rows int) [][]float32 {
+		out := make([][]float32, p)
+		for i := range out {
+			out[i] = make([]float32, rows)
+		}
+		return out
+	}
+	xs := make([][]float32, p)
+	for i := range xs {
+		xs[i] = randomVec(rng, cols)
+	}
+	a := makeWeight(GGMLTypeQ4_K, 72)
+	b := makeWeight(GGMLTypeQ4_K, 48)
+	c := makeWeight(GGMLTypeQ6_K, 40)
+	wantA, wantB, wantC := newOutputs(a.Rows), newOutputs(b.Rows), newOutputs(c.Rows)
+	gotA, gotB, gotC := newOutputs(a.Rows), newOutputs(b.Rows), newOutputs(c.Rows)
+
+	withQ8Activations(true, func() {
+		matvecBatch(a, xs, wantA)
+		matvecBatch(b, xs, wantB)
+		matvecBatch(c, xs, wantC)
+		matvecBatch3(a, b, c, xs, gotA, gotB, gotC)
+	})
+	for label, pair := range map[string]struct{ got, want [][]float32 }{
+		"q": {gotA, wantA},
+		"k": {gotB, wantB},
+		"v": {gotC, wantC},
+	} {
+		for token := range p {
+			for row := range pair.want[token] {
+				if got, want := pair.got[token][row], pair.want[token][row]; got != want {
+					t.Fatalf("%s token %d row %d: fused=%v separate=%v", label, token, row, got, want)
+				}
+			}
+		}
+	}
+}
+
 func TestSameTypeQ4_0FusionMatchesSeparateMatvecs(t *testing.T) {
 	rng := rand.New(rand.NewSource(41))
 	const cols = 64

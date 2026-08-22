@@ -1644,9 +1644,13 @@ focused scalar-reference tests and text-only local-GGUF smoke coverage; full
 cross-runtime logit parity remains pending, so the runtime emits an explicit
 experimental warning. Vision families that require visual-feature injection
 or multimodal MRoPE remain outside this text-generation scope: `qwen2vl`,
-`qwen3vl`, `qwen3vlmoe`, and `qwen3next`. Qwen3.6/3.8 GGUFs with trailing MTP
-draft layers load for ordinary generation; the draft layer is intentionally
-skipped until speculative decoding is implemented.
+`qwen3vl`, `qwen3vlmoe`, and `qwen3next`. Qwen3.6/3.8 GGUFs with one trailing
+MTP/NextN draft layer load that layer into its own KV cache. It is opt-in via
+`--mtp-draft-tokens N` (or `WithMTPDraftTokens(N)`) and requires deterministic
+generation (`--temp 0` or `--top-k 1`): every candidate is verified by the
+target before it is emitted, so the result stays exact. The current hybrid
+DeltaNet verifier is serial, so MTP is disabled by default and should be
+benchmarked per machine rather than assumed to increase tokens/s.
 
 `deepseek2` and `kimi_k2` provide a dedicated Multi-head Latent Attention
 (MLA) path for Kimi K2 and compatible modern DeepSeek-V2/V3 GGUFs. It uses a
