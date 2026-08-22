@@ -3,6 +3,9 @@
 
   const root = document.documentElement;
   const themeToggle = document.getElementById("themeToggle");
+  const themeToggleLabel = themeToggle.querySelector(".theme-toggle-label");
+  const navToggle = document.getElementById("navToggle");
+  const primaryNav = document.getElementById("primaryNav");
   const copyStatus = document.getElementById("copyStatus");
   const tabs = Array.from(document.querySelectorAll("[data-api-tab]"));
   const panels = Array.from(document.querySelectorAll("[data-api-panel]"));
@@ -16,12 +19,26 @@
 
   function setTheme(theme) {
     root.dataset.theme = theme;
-    themeToggle.textContent = theme === "dark" ? "Light theme" : "Dark theme";
+    themeToggleLabel.textContent = theme === "dark" ? "Light theme" : "Dark theme";
     themeToggle.setAttribute("aria-label", "Switch to " + (theme === "dark" ? "light" : "dark") + " theme");
   }
 
-  function showCopyStatus() {
+  function setNavigation(open, restoreFocus) {
+    if (!navToggle || !primaryNav) return;
+    primaryNav.classList.toggle("is-open", open);
+    navToggle.setAttribute("aria-expanded", String(open));
+    navToggle.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    navToggle.textContent = open ? "Close" : "Menu";
+    if (open) {
+      primaryNav.querySelector("a").focus();
+    } else if (restoreFocus) {
+      navToggle.focus();
+    }
+  }
+
+  function showCopyStatus(message) {
     window.clearTimeout(toastTimer);
+    copyStatus.textContent = message || "Copied to clipboard";
     copyStatus.hidden = false;
     toastTimer = window.setTimeout(() => {
       copyStatus.hidden = true;
@@ -45,6 +62,7 @@
       range.selectNodeContents(target);
       selection.removeAllRanges();
       selection.addRange(range);
+      showCopyStatus("Code selected — copy it");
     }
   }
 
@@ -71,6 +89,34 @@
     setTheme(next);
   });
 
+  if (navToggle && primaryNav) {
+    navToggle.addEventListener("click", () => {
+      const opening = !primaryNav.classList.contains("is-open");
+      setNavigation(opening, !opening);
+    });
+
+    primaryNav.querySelectorAll("a").forEach((link) => {
+      link.addEventListener("click", () => setNavigation(false));
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && primaryNav.classList.contains("is-open")) {
+        setNavigation(false, true);
+      }
+    });
+
+    document.addEventListener("click", (event) => {
+      if (!primaryNav.classList.contains("is-open")) return;
+      if (primaryNav.contains(event.target) || navToggle.contains(event.target)) return;
+      setNavigation(false);
+    });
+
+    const desktopNavigation = window.matchMedia("(min-width: 981px)");
+    desktopNavigation.addEventListener("change", (event) => {
+      if (event.matches) setNavigation(false);
+    });
+  }
+
   document.querySelectorAll("[data-copy-target]").forEach((button) => {
     button.addEventListener("click", () => copyText(button.dataset.copyTarget, button));
   });
@@ -78,10 +124,13 @@
   tabs.forEach((tab, index) => {
     tab.addEventListener("click", () => setAPITab(tab.dataset.apiTab, false));
     tab.addEventListener("keydown", (event) => {
-      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
-      const direction = event.key === "ArrowRight" ? 1 : -1;
-      const next = (index + direction + tabs.length) % tabs.length;
+      let next = index;
+      if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+      if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+      if (event.key === "Home") next = 0;
+      if (event.key === "End") next = tabs.length - 1;
       setAPITab(tabs[next].dataset.apiTab, true);
     });
   });
