@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"sync/atomic"
 )
 
 // BERTWeights is the encoder-only transformer graph used by GGUF BERT
@@ -43,7 +45,9 @@ type BERTLayerWeights struct {
 type bertEmbeddingScratch struct {
 	XFlat, QFlat, KFlat, VFlat, QKVFlat, HiddenFlat, GateFlat []float32
 	X, Q, K, V, QKV, Hidden, Gate                             [][]float32
-	Position, RopeSin, RopeCos, Scores                        []float32
+	Position, RopeSinFlat, RopeCosFlat, Scores                []float32
+	AttentionScoresFlat                                       []float32
+	attentionScoreNext                                        int64
 	// The FFN activation callback is initialized once per reusable scratch.
 	// Reusing it avoids one escaping closure (which otherwise captures a large
 	// BERT layer value) per layer and embedding request.
@@ -71,12 +75,24 @@ func (s *bertEmbeddingScratch) activateFFNRange(start, end int) {
 
 const maxReusableBERTScratchBytes int64 = 128 << 20
 
-func reusableBERTScratch(n, dim, hidden int, useGate, useFusedQKV bool) bool {
+func bertAttentionScoreWidth() int {
+	if hasFastDotF32x4 {
+		return 4
+	}
+	return 1
+}
+
+func reusableBERTScratch(n, dim, hidden int, useGate, hasFusedQKV, allFusedQKV bool) bool {
 	if n <= 0 || dim <= 0 || hidden < 0 {
 		return false
 	}
-	values := int64(n) * (int64(dim)*4 + int64(hidden))
-	if useFusedQKV {
+	// X and the FFN output are always needed. Separate Q/K/V slabs are only
+	// needed when at least one layer does not use the fused Nomic projection.
+	values := int64(n) * (int64(dim) + int64(hidden))
+	if !allFusedQKV {
+		values += int64(n) * int64(dim) * 3
+	}
+	if hasFusedQKV {
 		// The combined projection is transient (it is split into Q/K/V before
 		// attention), but retaining it in Runner scratch avoids a large
 		// per-request allocation for Nomic's fused QKV tensor.
@@ -85,6 +101,14 @@ func reusableBERTScratch(n, dim, hidden int, useGate, useFusedQKV bool) bool {
 	if useGate {
 		values += int64(n) * int64(hidden)
 	}
+	// Parallel attention needs one independent score row per dispatched chunk.
+	// On Apple Silicon the worker pool may over-dispatch up to 8x to balance
+	// performance and efficiency cores.
+	scoreSlots := min(numThreads(), n)
+	if oversubscribeDispatch && n >= scoreSlots*128 {
+		scoreSlots *= 8
+	}
+	values += int64(scoreSlots) * int64(n) * int64(bertAttentionScoreWidth())
 	return values*4 <= maxReusableBERTScratchBytes
 }
 
@@ -223,17 +247,58 @@ func (r *Runner) embedBERT(text string) (EmbeddingResult, error) {
 		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	var scratch *bertEmbeddingScratch
-	if reusableBERTScratch(len(tokens), r.config.Dim, r.config.HiddenDim, r.bert.UseRoPE, bertHasFusedQKV(r.bert)) {
+	hasFusedQKV := bertHasFusedQKV(r.bert)
+	if reusableBERTScratch(len(tokens), r.config.Dim, r.config.HiddenDim, r.bert.UseRoPE, hasFusedQKV, bertAllLayersHaveFusedQKV(r.bert)) {
 		scratch = &r.bertScratch
 	}
 	matvec := bertBatchMatvec(matvecBERTBatch)
+	matvec2 := bertBatchMatvec2(matvecBERTBatch2)
+	if bertPreferFloatBatch(r.config, r.bert, len(tokens)) {
+		// On Apple Silicon, the selected embedding geometry and long Nomic
+		// prompts run their row-stationary projections faster after dequantization:
+		// NEON's four-token float dot reuses every decoded row effectively,
+		// while Q8K pays activation quantization plus per-token scale/min work.
+		// This is intentionally a per-Runner choice, never a write to the
+		// process-wide useQ8Activations flag.
+		matvec = matvecBERTBatchNoQ8
+		matvec2 = matvecBERTBatch2NoQ8
+	}
 	if r.outOfCore {
 		// Batching trades more pages held concurrently for speed. The OOC path
 		// intentionally streams one activation at a time so the VM can evict
 		// cold model pages between projections.
 		matvec = matvecBERTSequential
+		matvec2 = nil
 	}
-	return embedBERTWithScratch(r.config, r.bert, tokens, matvec, scratch)
+	return embedBERTWithScratchWithPair(r.config, r.bert, tokens, matvec, matvec2, scratch)
+}
+
+// bertPreferFloatBatch selects the faster local BERT projection backend on
+// arm64. Granite Embedding 278m's Q6_K-heavy encoder benefits at every batch
+// length; Nomic crosses over at a measured long-prompt threshold. BGE-M3 stays
+// on Q8 because its relative result is model- and load-dependent. Explicit user
+// configuration remains authoritative, including
+// GOPHERLLM_Q8_ACTIVATIONS=0 for all models.
+func bertPreferFloatBatch(config Config, weights BERTWeights, tokens int) bool {
+	switch os.Getenv("GOPHERLLM_Q8_ACTIVATIONS") {
+	case "0", "1":
+		return false
+	}
+	if !hasFastDotF32x4 || tokens < 2 {
+		return false
+	}
+	// Nomic's Q8/SDOT path wins on short prompts, but its float/NEON path
+	// overtakes it once the batched traversal reaches roughly 128 tokens.
+	// Keep the threshold deliberately conservative so chat-sized retrieval
+	// queries retain their lower Q8 latency.
+	if weights.UseRoPE {
+		return tokens >= 128
+	}
+	// GGUF "bert" covers both Granite and BGE, so architecture alone is too
+	// broad. This is Granite Embedding's stable published tensor geometry; the
+	// context cap distinguishes it from unrelated 768-wide encoders.
+	return config.Dim == 768 && config.HiddenDim == 3072 && config.NLayers == 12 &&
+		config.NHeads == 12 && config.MaxSeqLen > 0 && config.MaxSeqLen <= 512
 }
 
 func bertHasFusedQKV(weights BERTWeights) bool {
@@ -245,10 +310,186 @@ func bertHasFusedQKV(weights BERTWeights) bool {
 	return false
 }
 
+// bertAllLayersHaveFusedQKV identifies Nomic-style models where every layer
+// writes Q, K, and V into one [Q;K;V] activation. Such a model does not need
+// separate Q/K/V backing slabs: the views can point at that combined output.
+func bertAllLayersHaveFusedQKV(weights BERTWeights) bool {
+	if len(weights.Layers) == 0 {
+		return false
+	}
+	for i := range weights.Layers {
+		if !weights.Layers[i].HasQKV {
+			return false
+		}
+	}
+	return true
+}
+
+func reuseBERTViews(views *[][]float32, n int) [][]float32 {
+	if cap(*views) < n {
+		*views = make([][]float32, n)
+	} else {
+		*views = (*views)[:n]
+	}
+	return *views
+}
+
+func (s *bertEmbeddingScratch) prepareParallelAttentionScores(n int) {
+	slots := min(numThreads(), n)
+	if oversubscribeDispatch && n >= slots*128 {
+		slots *= 8
+	}
+	ensureLenNoClear(&s.AttentionScoresFlat, slots*n*bertAttentionScoreWidth())
+	atomic.StoreInt64(&s.attentionScoreNext, 0)
+}
+
+func (s *bertEmbeddingScratch) nextParallelAttentionScores(n int) []float32 {
+	slot := int(atomic.AddInt64(&s.attentionScoreNext, 1) - 1)
+	width := n * bertAttentionScoreWidth()
+	return s.AttentionScoresFlat[slot*width : (slot+1)*width]
+}
+
+// precomputeBERTRopeTables materializes Nomic-BERT's position-only RoPE
+// coefficients once for the complete embedding sequence. RoPE is identical in
+// every transformer layer; recomputing the same Sincos values inside each
+// layer was needless work for long inputs. The arithmetic deliberately matches
+// prepareRopeScratch bit-for-bit.
+func precomputeBERTRopeTables(config Config, headDim, n int, invFreq []float32, mscale float32, scratch *bertEmbeddingScratch) (int, int) {
+	ropeDim := config.RopeDimensionCount
+	if ropeDim <= 0 || ropeDim > headDim {
+		ropeDim = headDim
+	}
+	ropeDim -= ropeDim % 2
+	half := ropeDim / 2
+	if half <= 0 {
+		return 0, 0
+	}
+	pairs := min(half, len(invFreq))
+	if pairs <= 0 || n <= 0 {
+		return half, 0
+	}
+	ensureLenNoClear(&scratch.RopeSinFlat, n*pairs)
+	ensureLenNoClear(&scratch.RopeCosFlat, n*pairs)
+	if mscale == 0 {
+		mscale = 1
+	}
+	for pos := range n {
+		sin := scratch.RopeSinFlat[pos*pairs : (pos+1)*pairs]
+		cos := scratch.RopeCosFlat[pos*pairs : (pos+1)*pairs]
+		for i := range pairs {
+			angle := float64(float32(pos) * invFreq[i])
+			s, c := math.Sincos(angle)
+			sin[i] = float32(s) * mscale
+			cos[i] = float32(c) * mscale
+		}
+	}
+	return half, pairs
+}
+
+func attendBERTOne(q, k, v [][]float32, i, n, nHeads, headDim int, scale float32, scores []float32) {
+	scores = scores[:n]
+	for h := range nHeads {
+		off := h * headDim
+		query := q[i][off : off+headDim]
+		maxScore := float32(-math.MaxFloat32)
+		for j := range n {
+			scores[j] = DotF32(query, k[j][off:off+headDim]) * scale
+			maxScore = max(maxScore, scores[j])
+		}
+		denom := float32(0)
+		for j := range n {
+			scores[j] = float32(math.Exp(float64(scores[j] - maxScore)))
+			denom += scores[j]
+		}
+		// The old implementation started each attention output at zero. Clear
+		// only after the query has been fully consumed so the same
+		// zero-output behavior is retained for non-finite/degenerate rows.
+		clear(query)
+		if denom > 0 {
+			for j := range n {
+				AxpyF32(query, scores[j]/denom, v[j][off:off+headDim])
+			}
+		}
+	}
+}
+
+// attendBERTQuad keeps all score arithmetic query-local and identical to four
+// calls to attendBERTOne. It only shares a V row during the final weighted sum,
+// where ARM's axpyF32x4 loads it once for four independent outputs.
+func attendBERTQuad(q, k, v [][]float32, i0, n, nHeads, headDim int, scale float32, scores []float32) {
+	s0 := scores[0*n : 1*n]
+	s1 := scores[1*n : 2*n]
+	s2 := scores[2*n : 3*n]
+	s3 := scores[3*n : 4*n]
+	for h := range nHeads {
+		off := h * headDim
+		q0 := q[i0][off : off+headDim]
+		q1 := q[i0+1][off : off+headDim]
+		q2 := q[i0+2][off : off+headDim]
+		q3 := q[i0+3][off : off+headDim]
+		m0, m1, m2, m3 := float32(-math.MaxFloat32), float32(-math.MaxFloat32), float32(-math.MaxFloat32), float32(-math.MaxFloat32)
+		for j := range n {
+			key := k[j][off : off+headDim]
+			// arm64's four-way NEON dot keeps this shared key row in registers.
+			// It has the same per-query reduction order as DotF32, so only the
+			// K-row loads and call overhead change; scores and softmax remain
+			// byte-identical to four individual attention calls.
+			a, b, c, d := dotF32x4(&q0[0], &q1[0], &q2[0], &q3[0], &key[0], headDim)
+			a, b, c, d = a*scale, b*scale, c*scale, d*scale
+			s0[j], s1[j], s2[j], s3[j] = a, b, c, d
+			m0, m1, m2, m3 = max(m0, a), max(m1, b), max(m2, c), max(m3, d)
+		}
+		var d0, d1, d2, d3 float32
+		for j := range n {
+			s0[j] = float32(math.Exp(float64(s0[j] - m0)))
+			s1[j] = float32(math.Exp(float64(s1[j] - m1)))
+			s2[j] = float32(math.Exp(float64(s2[j] - m2)))
+			s3[j] = float32(math.Exp(float64(s3[j] - m3)))
+			d0, d1, d2, d3 = d0+s0[j], d1+s1[j], d2+s2[j], d3+s3[j]
+		}
+		clear(q0)
+		clear(q1)
+		clear(q2)
+		clear(q3)
+		if d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0 {
+			for j := range n {
+				value := v[j][off : off+headDim]
+				axpyF32x4(&q0[0], &q1[0], &q2[0], &q3[0], s0[j]/d0, s1[j]/d1, s2[j]/d2, s3[j]/d3, &value[0], headDim)
+			}
+			continue
+		}
+		if d0 > 0 {
+			for j := range n {
+				AxpyF32(q0, s0[j]/d0, v[j][off:off+headDim])
+			}
+		}
+		if d1 > 0 {
+			for j := range n {
+				AxpyF32(q1, s1[j]/d1, v[j][off:off+headDim])
+			}
+		}
+		if d2 > 0 {
+			for j := range n {
+				AxpyF32(q2, s2[j]/d2, v[j][off:off+headDim])
+			}
+		}
+		if d3 > 0 {
+			for j := range n {
+				AxpyF32(q3, s3[j]/d3, v[j][off:off+headDim])
+			}
+		}
+	}
+}
+
 // bertBatchMatvec lets the BERT graph use one batched matrix traversal per
 // projection while retaining a serial reference implementation for numerical
 // regression tests and Metal-only fallbacks.
 type bertBatchMatvec func(Weight, [][]float32, [][]float32)
+
+// bertBatchMatvec2 handles two independent projections sharing the same input
+// batch. Nomic's gated FFN uses it to quantize X once and execute one combined
+// worker dispatch on supported CPU weights.
+type bertBatchMatvec2 func(Weight, Weight, [][]float32, [][]float32, [][]float32)
 
 func matvecBERTSequential(w Weight, xs, outs [][]float32) {
 	for i := range xs {
@@ -268,11 +509,45 @@ func matvecBERTBatch(w Weight, xs, outs [][]float32) {
 	matvecBatch(w, xs, outs)
 }
 
+// matvecBERTBatchNoQ8 has the same batched traversal as matvecBERTBatch but
+// keeps quantized rows in the float/NEON path selected by bertPreferFloatBatch.
+func matvecBERTBatchNoQ8(w Weight, xs, outs [][]float32) {
+	if len(xs) < 2 || metalWeightUsesDirect(w.Metal) {
+		matvecBERTSequential(w, xs, outs)
+		return
+	}
+	matvecBatchNoQ8(w, xs, outs)
+}
+
+func matvecBERTBatch2(a, b Weight, xs, aOut, bOut [][]float32) {
+	if len(xs) < 2 || metalWeightUsesDirect(a.Metal) || metalWeightUsesDirect(b.Metal) {
+		matvecBERTSequential(a, xs, aOut)
+		matvecBERTSequential(b, xs, bOut)
+		return
+	}
+	matvecBatch2(a, b, xs, aOut, bOut)
+}
+
+func matvecBERTBatch2NoQ8(a, b Weight, xs, aOut, bOut [][]float32) {
+	if len(xs) < 2 || metalWeightUsesDirect(a.Metal) || metalWeightUsesDirect(b.Metal) {
+		matvecBERTSequential(a, xs, aOut)
+		matvecBERTSequential(b, xs, bOut)
+		return
+	}
+	matvecBatch2NoQ8(a, b, xs, aOut, bOut)
+}
+
 // EmbedBERT executes one full bidirectional BERT encoder pass and applies the
 // GGUF pooling mode (mean=1, CLS=2). It intentionally has no KV cache: every
 // token needs to see all other tokens in the input.
 func EmbedBERT(config Config, weights BERTWeights, tokens []uint32) (EmbeddingResult, error) {
-	return embedBERTWithScratch(config, weights, tokens, matvecBERTBatch, nil)
+	matvec := bertBatchMatvec(matvecBERTBatch)
+	matvec2 := bertBatchMatvec2(matvecBERTBatch2)
+	if bertPreferFloatBatch(config, weights, len(tokens)) {
+		matvec = matvecBERTBatchNoQ8
+		matvec2 = matvecBERTBatch2NoQ8
+	}
+	return embedBERTWithScratchWithPair(config, weights, tokens, matvec, matvec2, nil)
 }
 
 // embedBERTWithMatvec keeps the encoder graph independent from its projection
@@ -283,6 +558,10 @@ func embedBERTWithMatvec(config Config, weights BERTWeights, tokens []uint32, ma
 }
 
 func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, matvec bertBatchMatvec, scratch *bertEmbeddingScratch) (EmbeddingResult, error) {
+	return embedBERTWithScratchWithPair(config, weights, tokens, matvec, nil, scratch)
+}
+
+func embedBERTWithScratchWithPair(config Config, weights BERTWeights, tokens []uint32, matvec bertBatchMatvec, matvec2 bertBatchMatvec2, scratch *bertEmbeddingScratch) (EmbeddingResult, error) {
 	n := len(tokens)
 	if n == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: no tokens")
@@ -319,14 +598,25 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 	var ropeInv []float32
 	ropeMscale := float32(1)
+	ropeHalf, ropePairs := 0, 0
 	if weights.UseRoPE {
 		ropeInv, ropeMscale = buildRopeInvFreq(config, headDim)
+		ropeHalf, ropePairs = precomputeBERTRopeTables(config, headDim, n, ropeInv, ropeMscale, scratch)
 	}
-	q := reuseBatchViews(&scratch.QFlat, &scratch.Q, n, dim)
-	k := reuseBatchViews(&scratch.KFlat, &scratch.K, n, dim)
-	v := reuseBatchViews(&scratch.VFlat, &scratch.V, n, dim)
+	hasFusedQKV := bertHasFusedQKV(weights)
+	allFusedQKV := bertAllLayersHaveFusedQKV(weights)
+	var q, k, v [][]float32
+	if allFusedQKV {
+		q = reuseBERTViews(&scratch.Q, n)
+		k = reuseBERTViews(&scratch.K, n)
+		v = reuseBERTViews(&scratch.V, n)
+	} else {
+		q = reuseBatchViews(&scratch.QFlat, &scratch.Q, n, dim)
+		k = reuseBatchViews(&scratch.KFlat, &scratch.K, n, dim)
+		v = reuseBatchViews(&scratch.VFlat, &scratch.V, n, dim)
+	}
 	var qkv [][]float32
-	if bertHasFusedQKV(weights) {
+	if hasFusedQKV {
 		qkv = reuseBatchViews(&scratch.QKVFlat, &scratch.QKV, n, 3*dim)
 	}
 	hidden := reuseBatchViews(&scratch.HiddenFlat, &scratch.Hidden, n, config.HiddenDim)
@@ -338,9 +628,12 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 		if layer.HasQKV {
 			matvec(layer.QKV, x, qkv)
 			for i := range n {
-				copy(q[i], qkv[i][:dim])
-				copy(k[i], qkv[i][dim:2*dim])
-				copy(v[i], qkv[i][2*dim:])
+				// Q/K/V are consumed in-place below. Reusing the three contiguous
+				// QKV output regions avoids copying 3*Dim values per token and
+				// layer for Nomic's fused attention projection.
+				q[i] = qkv[i][:dim:dim]
+				k[i] = qkv[i][dim : 2*dim : 2*dim]
+				v[i] = qkv[i][2*dim : 3*dim : 3*dim]
 			}
 		} else {
 			matvec(layer.Q, x, q)
@@ -360,48 +653,32 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 				addInPlace(v[i], layer.VB)
 			}
 			if weights.UseRoPE {
-				half, cached := prepareRopeScratch(i, headDim, config.RopeDimensionCount, ropeInv, ropeMscale, &scratch.RopeSin, &scratch.RopeCos)
-				applyPreparedRope(q[i], headDim, config.NHeads, half, cached, scratch.RopeSin, scratch.RopeCos, false)
-				applyPreparedRope(k[i], headDim, config.NHeads, half, cached, scratch.RopeSin, scratch.RopeCos, false)
-			}
-		}
-		attendOne := func(i int, scores []float32) {
-			for h := range config.NHeads {
-				off := h * headDim
-				query := q[i][off : off+headDim]
-				maxScore := float32(-math.MaxFloat32)
-				for j := range n {
-					scores[j] = DotF32(query, k[j][off:off+headDim]) * scale
-					maxScore = max(maxScore, scores[j])
-				}
-				denom := float32(0)
-				for j := range n {
-					scores[j] = float32(math.Exp(float64(scores[j] - maxScore)))
-					denom += scores[j]
-				}
-				// The old implementation started each attention output at zero.
-				// Clear only after the query has been fully consumed so the same
-				// zero-output behavior is retained for non-finite/degenerate rows.
-				clear(query)
-				if denom > 0 {
-					for j := range n {
-						AxpyF32(query, scores[j]/denom, v[j][off:off+headDim])
-					}
-				}
+				start := i * ropePairs
+				sin := scratch.RopeSinFlat[start : start+ropePairs]
+				cos := scratch.RopeCosFlat[start : start+ropePairs]
+				applyPreparedRope(q[i], headDim, config.NHeads, ropeHalf, ropePairs, sin, cos, false)
+				applyPreparedRope(k[i], headDim, config.NHeads, ropeHalf, ropePairs, sin, cos, false)
 			}
 		}
 		attend := func(start, end int) {
-			scores := make([]float32, n)
-			for i := start; i < end; i++ {
-				attendOne(i, scores)
+			scores := scratch.nextParallelAttentionScores(n)
+			for i := start; i < end; {
+				if hasFastDotF32x4 && i+4 <= end {
+					attendBERTQuad(q, k, v, i, n, config.NHeads, headDim, scale, scores)
+					i += 4
+					continue
+				}
+				attendBERTOne(q, k, v, i, n, config.NHeads, headDim, scale, scores)
+				i++
 			}
 		}
 		if n >= 64 && config.NHeads > 1 {
+			scratch.prepareParallelAttentionScores(n)
 			parallelChunks(n, attend)
 		} else {
 			ensureLenNoClear(&scratch.Scores, n)
 			for i := range n {
-				attendOne(i, scratch.Scores)
+				attendBERTOne(q, k, v, i, n, config.NHeads, headDim, scale, scratch.Scores)
 			}
 		}
 		// q now holds attention output. k is no longer needed, and v can
@@ -413,9 +690,16 @@ func embedBERTWithScratch(config Config, weights BERTWeights, tokens []uint32, m
 			addInPlace(v[i], x[i])
 			layerNormInto(v[i], layer.AttentionNorm, layer.AttentionBias, weights.Epsilon, &x[i])
 		}
-		matvec(layer.FFNUp, x, hidden)
-		if weights.UseRoPE {
-			matvec(layer.FFNGate, x, gate)
+		if weights.UseRoPE && matvec2 != nil {
+			// Nomic's gate and up projections share the same X. The fused Q8
+			// batch route quantizes it once and dispatches both matrices together;
+			// unsupported formats retain the two established projections.
+			matvec2(layer.FFNUp, layer.FFNGate, x, hidden, gate)
+		} else {
+			matvec(layer.FFNUp, x, hidden)
+			if weights.UseRoPE {
+				matvec(layer.FFNGate, x, gate)
+			}
 		}
 		// FFN rows are independent once their batched projections have
 		// completed. The large embedding models spend a visible serial slice

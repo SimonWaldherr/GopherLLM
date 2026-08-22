@@ -261,7 +261,10 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 	// Row tile sized so a tile of raw rows stays L2-resident while each token's
 	// int8 activations run through L1.
 	const rowTile = 16
-	parallelRows(w.Rows, func(start, end int) {
+	// Each row performs the complete prompt batch. Keep one coarse range per
+	// worker: ARM's decode-oriented over-dispatch creates many wakeups here
+	// without exposing additional independent work.
+	parallelRowsBatched(w.Rows, func(start, end int) {
 		for tileStart := start; tileStart < end; tileStart += rowTile {
 			tileEnd := min(tileStart+rowTile, end)
 			for t := range p {
@@ -375,7 +378,10 @@ func matvecBatchQ8Fused(weights []Weight, xs [][]float32, outs [][][]float32) bo
 	// covers all projections; rows from each weight remain contiguous inside a
 	// worker range, preserving cache-friendly streaming of every raw matrix.
 	const rowTile = 16
-	parallelRows(offsets[len(weights)], func(start, end int) {
+	// The fused projection has the same long, weight-stationary row work as
+	// matvecBatchQ8 above. One chunk per worker avoids dispatch overhead on
+	// heterogeneous ARM CPUs while retaining the shared activation preparation.
+	parallelRowsBatched(offsets[len(weights)], func(start, end int) {
 		for wi, w := range weights {
 			localStart := max(start, offsets[wi]) - offsets[wi]
 			localEnd := min(end, offsets[wi+1]) - offsets[wi]

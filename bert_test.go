@@ -146,6 +146,34 @@ func TestLoadAndEmbedTinyBERTModel(t *testing.T) {
 	}
 }
 
+func TestBERTFloatBatchPreferenceHonorsArchitectureAndOverride(t *testing.T) {
+	t.Setenv("GOPHERLLM_Q8_ACTIVATIONS", "")
+	granite := Config{Dim: 768, HiddenDim: 3072, NLayers: 12, NHeads: 12, MaxSeqLen: 512}
+	if got, want := bertPreferFloatBatch(granite, BERTWeights{}, 2), hasFastDotF32x4; got != want {
+		t.Fatalf("Granite float-batch preference = %v, want %v", got, want)
+	}
+	if bertPreferFloatBatch(granite, BERTWeights{}, 1) {
+		t.Fatal("single-token BERT must retain its established sequential path")
+	}
+	if got, want := bertPreferFloatBatch(granite, BERTWeights{UseRoPE: true}, 127), false; got != want {
+		t.Fatalf("short Nomic float-batch preference = %v, want %v", got, want)
+	}
+	if got, want := bertPreferFloatBatch(granite, BERTWeights{UseRoPE: true}, 128), hasFastDotF32x4; got != want {
+		t.Fatalf("long Nomic float-batch preference = %v, want %v", got, want)
+	}
+	if bertPreferFloatBatch(Config{Dim: 1024, HiddenDim: 4096, NLayers: 24, NHeads: 16, MaxSeqLen: 8192}, BERTWeights{}, 512) {
+		t.Fatal("BGE-style BERT must retain its Q8 batch preference")
+	}
+	t.Setenv("GOPHERLLM_Q8_ACTIVATIONS", "1")
+	if bertPreferFloatBatch(granite, BERTWeights{}, 128) {
+		t.Fatal("explicit Q8 activation setting must disable BERT auto-selection")
+	}
+	t.Setenv("GOPHERLLM_Q8_ACTIVATIONS", "0")
+	if bertPreferFloatBatch(granite, BERTWeights{}, 128) {
+		t.Fatal("explicit float activation setting must disable BERT auto-selection")
+	}
+}
+
 func TestLoadAndEmbedTinyNomicBERTModel(t *testing.T) {
 	if !ArchitectureSupported("nomic-bert") {
 		t.Fatal("nomic-bert must be supported")
@@ -225,6 +253,9 @@ func TestRunnerFusedBERTQKVScratchIsReused(t *testing.T) {
 	if len(r.bertScratch.QKVFlat) == 0 {
 		t.Fatal("fused BERT QKV scratch was not retained by Runner")
 	}
+	if len(r.bertScratch.QFlat) != 0 || len(r.bertScratch.KFlat) != 0 || len(r.bertScratch.VFlat) != 0 {
+		t.Fatal("fully fused BERT retained separate Q/K/V activation slabs")
+	}
 	first := &r.bertScratch.QKVFlat[0]
 	if _, err := r.Embed("nomic"); err != nil {
 		t.Fatal(err)
@@ -287,6 +318,68 @@ func TestRunnerBERTEmbeddingScratchIsReused(t *testing.T) {
 	}
 }
 
+func TestPrecomputeBERTRopeTablesMatchesPerPositionScratch(t *testing.T) {
+	config := Config{HeadDim: 8, RopeDimensionCount: 8}
+	invFreq := []float32{1, 0.1, 0.01, 0.001}
+	var scratch bertEmbeddingScratch
+	half, pairs := precomputeBERTRopeTables(config, config.HeadDim, 9, invFreq, 0.75, &scratch)
+	if half != 4 || pairs != 4 {
+		t.Fatalf("geometry = half %d pairs %d, want 4/4", half, pairs)
+	}
+	for pos := 0; pos < 9; pos++ {
+		var wantSin, wantCos []float32
+		wantHalf, wantPairs := prepareRopeScratch(pos, config.HeadDim, config.RopeDimensionCount, invFreq, 0.75, &wantSin, &wantCos)
+		if half != wantHalf || pairs != wantPairs {
+			t.Fatalf("pos %d geometry = %d/%d, want %d/%d", pos, half, pairs, wantHalf, wantPairs)
+		}
+		gotSin := scratch.RopeSinFlat[pos*pairs : (pos+1)*pairs]
+		gotCos := scratch.RopeCosFlat[pos*pairs : (pos+1)*pairs]
+		for i := range pairs {
+			if gotSin[i] != wantSin[i] || gotCos[i] != wantCos[i] {
+				t.Fatalf("pos %d pair %d = sin/cos %g/%g, want %g/%g", pos, i, gotSin[i], gotCos[i], wantSin[i], wantCos[i])
+			}
+		}
+	}
+}
+
+func TestBERTAttentionQuadMatchesIndividual(t *testing.T) {
+	const (
+		n       = 7
+		heads   = 2
+		headDim = 8
+	)
+	q := make([][]float32, n)
+	k := make([][]float32, n)
+	v := make([][]float32, n)
+	for i := range n {
+		q[i] = make([]float32, heads*headDim)
+		k[i] = make([]float32, heads*headDim)
+		v[i] = make([]float32, heads*headDim)
+		for j := range q[i] {
+			q[i][j] = float32((i+1)*(j%5+1)) / 37
+			k[i][j] = float32((i+3)*(j%7-3)) / 41
+			v[i][j] = float32((i+5)*(j%11-5)) / 43
+		}
+	}
+	individual := make([][]float32, 4)
+	quad := make([][]float32, 4)
+	for i := range 4 {
+		individual[i] = append([]float32(nil), q[i]...)
+		quad[i] = append([]float32(nil), q[i]...)
+	}
+	for i := range 4 {
+		attendBERTOne(individual, k, v, i, n, heads, headDim, 0.125, make([]float32, n))
+	}
+	attendBERTQuad(quad, k, v, 0, n, heads, headDim, 0.125, make([]float32, 4*n))
+	for i := range 4 {
+		for j := range individual[i] {
+			if quad[i][j] != individual[i][j] {
+				t.Fatalf("query %d dim %d = %g, want %g", i, j, quad[i][j], individual[i][j])
+			}
+		}
+	}
+}
+
 func TestEmbedBERTParallelAttentionMatchesSequential(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyBERTGGUFWithArch("nomic-bert"))
 	if err != nil {
@@ -303,9 +396,20 @@ func TestEmbedBERTParallelAttentionMatchesSequential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := EmbedBERT(r.config, r.bert, tokens)
+	var scratch bertEmbeddingScratch
+	got, err := embedBERTWithScratch(r.config, r.bert, tokens, matvecBERTBatch, &scratch)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(scratch.AttentionScoresFlat) == 0 {
+		t.Fatal("parallel BERT attention did not retain score scratch")
+	}
+	firstScores := &scratch.AttentionScoresFlat[0]
+	if _, err := embedBERTWithScratch(r.config, r.bert, tokens, matvecBERTBatch, &scratch); err != nil {
+		t.Fatal(err)
+	}
+	if &scratch.AttentionScoresFlat[0] != firstScores {
+		t.Fatal("same-shape BERT attention reallocated score scratch")
 	}
 	for i := range want.Embedding {
 		if d := math.Abs(float64(got.Embedding[i] - want.Embedding[i])); d > 1e-5 {

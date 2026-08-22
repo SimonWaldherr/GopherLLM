@@ -327,16 +327,22 @@ func TestMatvecBatchMatchesPerToken(t *testing.T) {
 		// dequantize-once bookkeeping against the per-token matvec exactly,
 		// which the int8-activation default would blur with quantization error
 		// (covered separately by TestMatvecBatchQ8CloseToFloat).
+		var want [][]float32
 		withQ8Activations(false, func() {
-			want := make([][]float32, P)
+			want = make([][]float32, P)
 			for p := range want {
 				want[p] = w.Matvec(xs[p])
 			}
+		})
+		// The BERT backend can opt out of Q8 locally while other runners in
+		// the process keep it enabled. Verify that this route does not rely on
+		// mutating the package-level toggle.
+		withQ8Activations(true, func() {
 			got := make([][]float32, P)
 			for p := range got {
 				got[p] = make([]float32, rows)
 			}
-			matvecBatch(w, xs, got)
+			matvecBatchNoQ8(w, xs, got)
 			for p := 0; p < P; p++ {
 				for r := 0; r < rows; r++ {
 					d := math.Abs(float64(got[p][r] - want[p][r]))

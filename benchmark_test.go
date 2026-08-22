@@ -3,6 +3,8 @@ package gopherllm
 import (
 	"math/rand"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -439,6 +441,19 @@ func BenchmarkEmbeddingConfiguredModel(b *testing.B) {
 	if modelPath == "" {
 		b.Skip("set GOPHERLLM_BENCH_EMBED_MODEL=/path/to/embedding-model.gguf to benchmark embeddings")
 	}
+	if raw := os.Getenv("GOPHERLLM_BENCH_THREADS"); raw != "" {
+		threads, err := strconv.Atoi(raw)
+		if err != nil || threads < 1 {
+			b.Fatalf("GOPHERLLM_BENCH_THREADS must be a positive integer, got %q", raw)
+		}
+		previousThreads := configuredThreads.Load()
+		previousProcs := runtime.GOMAXPROCS(threads)
+		SetNumThreads(threads)
+		b.Cleanup(func() {
+			configuredThreads.Store(previousThreads)
+			runtime.GOMAXPROCS(previousProcs)
+		})
+	}
 	runner, _, err := RunnerFromPath(modelPath)
 	if err != nil {
 		b.Fatal(err)
@@ -448,6 +463,13 @@ func BenchmarkEmbeddingConfiguredModel(b *testing.B) {
 	// Trim the sample for small-context embedding models rather than failing
 	// an otherwise useful local benchmark.
 	units := 16
+	if raw := os.Getenv("GOPHERLLM_BENCH_EMBED_UNITS"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 {
+			b.Fatalf("GOPHERLLM_BENCH_EMBED_UNITS must be a positive integer, got %q", raw)
+		}
+		units = parsed
+	}
 	prompt := ""
 	var tokens []uint32
 	for units >= 1 {
@@ -461,6 +483,7 @@ func BenchmarkEmbeddingConfiguredModel(b *testing.B) {
 	if runner.config.MaxSeqLen > 0 && len(tokens) > runner.config.MaxSeqLen {
 		b.Skip("benchmark prompt exceeds this model's context length")
 	}
+	b.Logf("embedding benchmark prompt: %d tokens (%d repeated units)", len(tokens), units)
 
 	b.Run("production", func(b *testing.B) {
 		if _, err := runner.Embed(prompt); err != nil {
@@ -476,6 +499,37 @@ func BenchmarkEmbeddingConfiguredModel(b *testing.B) {
 	})
 	if runner.kind != loadedBERT {
 		return
+	}
+	if runner.bert.UseRoPE {
+		b.Run("bert_paired_ffn", func(b *testing.B) {
+			var scratch bertEmbeddingScratch
+			if _, err := embedBERTWithScratchWithPair(runner.config, runner.bert, tokens, matvecBERTBatch, matvecBERTBatch2, &scratch); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := embedBERTWithScratchWithPair(runner.config, runner.bert, tokens, matvecBERTBatch, matvecBERTBatch2, &scratch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		// Keep Nomic's paired gate/up projection separately measurable. This
+		// route is otherwise identical to production, but deliberately omits
+		// the batch-pair hook as a stable A/B baseline for the optimization.
+		b.Run("bert_unpaired_ffn", func(b *testing.B) {
+			var scratch bertEmbeddingScratch
+			if _, err := embedBERTWithScratch(runner.config, runner.bert, tokens, matvecBERTBatch, &scratch); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if _, err := embedBERTWithScratch(runner.config, runner.bert, tokens, matvecBERTBatch, &scratch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 	b.Run("bert_serial_projections", func(b *testing.B) {
 		var scratch bertEmbeddingScratch

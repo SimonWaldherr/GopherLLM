@@ -90,6 +90,22 @@ func dotRowIntoBatch(row []float32, xs, outs [][]float32, r, p, cols int, tiled 
 // dequantization across the whole prompt chunk is the win. outs[p] must be
 // pre-sized to the weight's row count.
 func matvecBatch(w Weight, xs, outs [][]float32) {
+	matvecBatchWithQ8(w, xs, outs, useQ8Activations.Load())
+}
+
+// matvecBatchNoQ8 retains the weight-stationary batched traversal while
+// deliberately using the dequantize-once + float/NEON dot path for quantized
+// rows. Embedding models can select it per Runner without flipping the
+// process-wide Q8 activation setting used by simultaneously active decoders.
+func matvecBatchNoQ8(w Weight, xs, outs [][]float32) {
+	matvecBatchWithQ8(w, xs, outs, false)
+}
+
+// matvecBatchWithQ8 is matvecBatch with an explicit choice for the optional
+// Q8-activation kernel. Keeping the choice as an argument is important for
+// embedding runners: useQ8Activations is process-global and cannot safely be
+// toggled around one model invocation.
+func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
 	p := len(xs)
 	if p == 0 {
 		return
@@ -157,7 +173,7 @@ func matvecBatch(w Weight, xs, outs [][]float32) {
 		}
 	}
 
-	if useQ8Activations.Load() && matvecBatchQ8(w, xs, outs) {
+	if useQ8 && matvecBatchQ8(w, xs, outs) {
 		return
 	}
 
@@ -197,6 +213,14 @@ func matvecBatch2(a, b Weight, xs, aOut, bOut [][]float32) {
 	}
 	matvecBatch(a, xs, aOut)
 	matvecBatch(b, xs, bOut)
+}
+
+// matvecBatch2NoQ8 is the per-Runner float counterpart to matvecBatch2. It
+// intentionally does not enter the fused Q8 route: both projections keep the
+// same batched row traversal, just without quantizing their shared activations.
+func matvecBatch2NoQ8(a, b Weight, xs, aOut, bOut [][]float32) {
+	matvecBatchNoQ8(a, xs, aOut)
+	matvecBatchNoQ8(b, xs, bOut)
 }
 
 func matvecBatch3(a, b, c Weight, xs, aOut, bOut, cOut [][]float32) {

@@ -390,20 +390,47 @@ func validateMXFP4Q8Dots8Asm() bool {
 // unpack kernel; this arithmetic is identical, so it lives once. xsums must
 // start at this block's 8 per-32-element activation sums.
 //
-// It does NOT inline: `go build -gcflags=-m` reports cost 102 against the budget
-// of 80, because the eight getScaleMinK4 calls inside it do inline and their
-// bodies are what blow the budget. That leaves exactly one extra static call per
-// 256-element block compared to open-coding this loop in both row kernels —
-// against the 64 SDOTs that block also runs, which is why sharing it is the
-// right trade and why this is a static call rather than a closure.
+// The eight scale/min pairs are deliberately unpacked inline. This is reached
+// for every Q4_K/Q5_K row and the generic getScaleMinK4 helper's loop/branch
+// showed up prominently in real embedding profiles. Keeping the arithmetic
+// spelled out preserves the exact j=0..7 accumulation order while removing
+// eight repeated packed-field decodes per 256-element superblock.
 func combineQ4KStyle(scales []byte, qdots *[8]int32, xsums []float32, d, dmin, xscale float32) float32 {
+	_ = scales[11]
+	_ = qdots[7]
+	_ = xsums[7]
+
+	s0, m0 := int32(scales[0]&63), int32(scales[4]&63)
+	s1, m1 := int32(scales[1]&63), int32(scales[5]&63)
+	s2, m2 := int32(scales[2]&63), int32(scales[6]&63)
+	s3, m3 := int32(scales[3]&63), int32(scales[7]&63)
+	s4 := int32((scales[8] & 0x0f) | ((scales[0] >> 6) << 4))
+	m4 := int32((scales[8] >> 4) | ((scales[4] >> 6) << 4))
+	s5 := int32((scales[9] & 0x0f) | ((scales[1] >> 6) << 4))
+	m5 := int32((scales[9] >> 4) | ((scales[5] >> 6) << 4))
+	s6 := int32((scales[10] & 0x0f) | ((scales[2] >> 6) << 4))
+	m6 := int32((scales[10] >> 4) | ((scales[6] >> 6) << 4))
+	s7 := int32((scales[11] & 0x0f) | ((scales[3] >> 6) << 4))
+	m7 := int32((scales[11] >> 4) | ((scales[7] >> 6) << 4))
+
 	var blockInt int32
+	blockInt += s0 * qdots[0]
+	blockInt += s1 * qdots[1]
+	blockInt += s2 * qdots[2]
+	blockInt += s3 * qdots[3]
+	blockInt += s4 * qdots[4]
+	blockInt += s5 * qdots[5]
+	blockInt += s6 * qdots[6]
+	blockInt += s7 * qdots[7]
 	var minTerm float32
-	for j := range 8 {
-		sc, m := getScaleMinK4(j, scales)
-		blockInt += int32(sc) * qdots[j]
-		minTerm += float32(m) * xsums[j]
-	}
+	minTerm += float32(m0) * xsums[0]
+	minTerm += float32(m1) * xsums[1]
+	minTerm += float32(m2) * xsums[2]
+	minTerm += float32(m3) * xsums[3]
+	minTerm += float32(m4) * xsums[4]
+	minTerm += float32(m5) * xsums[5]
+	minTerm += float32(m6) * xsums[6]
+	minTerm += float32(m7) * xsums[7]
 	return d*xscale*float32(blockInt) - dmin*minTerm
 }
 
