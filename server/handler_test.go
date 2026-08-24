@@ -251,7 +251,8 @@ func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runner.Close()
-	srv := newManagedTestServer(t, NewHandler(runner, HandlerOptions{ModelDir: modelDir, ModelPath: chatPath}))
+	handler := NewHandler(runner, HandlerOptions{ModelDir: modelDir, ModelPath: chatPath})
+	srv := newManagedTestServer(t, handler)
 
 	body, err := json.Marshal(map[string]string{"model": filepath.Join("catalog", "tiny-embedding")})
 	if err != nil {
@@ -282,6 +283,42 @@ func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {
 	}
 	if len(got.Embeddings) != 1 || len(got.Embeddings[0]) != runner.Config().Dim {
 		t.Fatalf("embeddings = %#v", got.Embeddings)
+	}
+
+	// The public OpenAI-compatible endpoint must select the same dedicated
+	// runner as browser RAG, rather than quietly falling back to the chat
+	// model after a successful /models/embed/load.
+	resp, err = http.Post(srv.URL+"/v1/embeddings", "application/json", strings.NewReader(`{"input":"semantic search text"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("OpenAI embedding status = %d body=%s", resp.StatusCode, readAll(t, resp))
+	}
+	var openAI struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&openAI); err != nil {
+		t.Fatal(err)
+	}
+	var want []float32
+	handler.embedder.withRunner(func(embedder *gopherllm.Runner) {
+		result, err := embedder.Embed("semantic search text")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = result.Embedding
+	})
+	if len(openAI.Data) != 1 || len(openAI.Data[0].Embedding) != len(want) {
+		t.Fatalf("OpenAI embeddings = %#v, want %d dimensions", openAI, len(want))
+	}
+	for i := range want {
+		if got := openAI.Data[0].Embedding[i]; got != want[i] {
+			t.Fatalf("OpenAI embedding[%d] = %v, want dedicated model value %v", i, got, want[i])
+		}
 	}
 }
 

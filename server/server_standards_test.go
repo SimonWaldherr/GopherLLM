@@ -117,6 +117,20 @@ func TestOllamaEmbedBatches(t *testing.T) {
 	}
 }
 
+func TestEmbeddingEndpointsRejectEmptyInput(t *testing.T) {
+	srv := newTestServer(t, HandlerOptions{})
+	for _, endpoint := range []string{"/v1/embeddings", "/api/embed"} {
+		resp, err := http.Post(srv.URL+endpoint, "application/json", strings.NewReader(`{"input":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, want %d", endpoint, resp.StatusCode, http.StatusBadRequest)
+		}
+		resp.Body.Close()
+	}
+}
+
 func TestOllamaGenerateStreamsNDJSONByDefault(t *testing.T) {
 	srv := newTestServer(t, HandlerOptions{})
 

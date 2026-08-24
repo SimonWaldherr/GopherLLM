@@ -897,15 +897,15 @@ Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
 | POST | `/generate` | Native generation API (prompt or messages; accepts tools) |
 | POST | `/v1/chat/completions` | OpenAI-compatible chat (streaming, tools, reasoning) |
 | POST | `/v1/completions` | OpenAI-compatible text completion |
-| POST | `/v1/embeddings` | OpenAI-compatible embeddings |
+| POST | `/v1/embeddings` | OpenAI-compatible embeddings (uses the dedicated embedding model when loaded) |
 | GET | `/v1/models` | OpenAI-compatible model listing (the loaded model) |
 | GET | `/v1/skills` | Names + descriptions of configured skills |
 | POST | `/api/generate` | Ollama-compatible generation |
 | POST | `/api/chat` | Ollama-compatible chat (accepts tools) |
-| POST | `/api/embeddings` | Ollama-compatible embeddings |
+| POST | `/api/embeddings` | Ollama-compatible embeddings (uses the dedicated embedding model when loaded) |
 | GET | `/models` | Scan `--model-dir` and list discovered GGUFs, including each model's context length |
 | POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; response includes the loaded context length) |
-| POST | `/models/embed/load` | Load a compatible embedding GGUF for history RAG (`{"model": "<catalog-id>"}`); BERT, Nomic-BERT, and Granite Embedding models are supported |
+| POST | `/models/embed/load` | Load a compatible embedding GGUF for history RAG and all embedding APIs (`{"model": "<catalog-id>"}`); BERT, Nomic-BERT, and Granite Embedding models are supported |
 | GET / POST / DELETE | `/remote` | Inspect, configure, or clear an OpenAI-compatible chat proxy (the API key is write-only) |
 | GET | `/remote/models` | List models advertised by the configured remote API |
 | GET | `/autotune` | Report Auto Mode status: whether a tuning is active this session, whether one is cached on disk for this model+machine, and the result either way |

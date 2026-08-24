@@ -108,6 +108,21 @@ func (s *embeddingState) withRunner(fn func(*gopherllm.Runner)) {
 	fn(s.r)
 }
 
+// withEmbeddingRunner selects the dedicated embedding runner when one has
+// been loaded, falling back to the chat runner for the useful single-model
+// setup. Keeping the read lock for the entire callback also prevents a model
+// swap from closing weights while an embedding pass is in progress.
+func withEmbeddingRunner(chat *runnerState, embedder *embeddingState, fn func(*gopherllm.Runner)) {
+	embedder.mu.RLock()
+	if embedder.r != nil {
+		defer embedder.mu.RUnlock()
+		fn(embedder.r)
+		return
+	}
+	embedder.mu.RUnlock()
+	chat.withRunner(fn)
+}
+
 func (s *embeddingState) swap(r *gopherllm.Runner) {
 	s.mu.Lock()
 	old := s.r
@@ -860,21 +875,23 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			return
 		}
 		inputs := body.Inputs()
-		data := []any{}
-		total := 0
-		state.withRunner(func(r *gopherllm.Runner) {
-			model := modelID(r)
-			for i, input := range inputs {
-				emb, err := r.Embed(input)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-				total += emb.TokenCount
-				data = append(data, map[string]any{"object": "embedding", "index": i, "embedding": emb.Embedding})
-			}
-			writeJSON(w, map[string]any{"object": "list", "model": model, "data": data, "usage": map[string]int{"prompt_tokens": total, "total_tokens": total}})
+		var vectors [][]float32
+		var total int
+		var embedErr error
+		var model string
+		withEmbeddingRunner(state, embedder, func(r *gopherllm.Runner) {
+			model = modelID(r)
+			vectors, total, embedErr = embedTexts(r, inputs)
 		})
+		if embedErr != nil {
+			http.Error(w, embedErr.Error(), http.StatusBadRequest)
+			return
+		}
+		data := make([]any, len(vectors))
+		for i, vector := range vectors {
+			data[i] = map[string]any{"object": "embedding", "index": i, "embedding": vector}
+		}
+		writeJSON(w, map[string]any{"object": "list", "model": model, "data": data, "usage": map[string]int{"prompt_tokens": total, "total_tokens": total}})
 	}))
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
 		model := modelID(state.get())
@@ -967,14 +984,16 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 				text = inputs[0]
 			}
 		}
-		state.withRunner(func(r *gopherllm.Runner) {
-			emb, err := r.Embed(text)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadRequest)
-				return
-			}
-			writeJSON(w, map[string]any{"embedding": emb.Embedding})
+		var vectors [][]float32
+		var embedErr error
+		withEmbeddingRunner(state, embedder, func(r *gopherllm.Runner) {
+			vectors, _, embedErr = embedTexts(r, []string{text})
 		})
+		if embedErr != nil {
+			http.Error(w, embedErr.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"embedding": vectors[0]})
 	}))
 	mux.HandleFunc("/api/embed", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		var body OllamaEmbedRequest
@@ -983,21 +1002,19 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 			return
 		}
 		inputs := body.Inputs()
-		embeddings := make([][]float32, 0, len(inputs))
-		state.withRunner(func(r *gopherllm.Runner) {
-			model := modelID(r)
-			promptTokens := 0
-			for _, input := range inputs {
-				emb, err := r.Embed(input)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
-				}
-				promptTokens += emb.TokenCount
-				embeddings = append(embeddings, emb.Embedding)
-			}
-			writeJSON(w, map[string]any{"model": model, "embeddings": embeddings, "prompt_eval_count": promptTokens})
+		var embeddings [][]float32
+		var promptTokens int
+		var embedErr error
+		var model string
+		withEmbeddingRunner(state, embedder, func(r *gopherllm.Runner) {
+			model = modelID(r)
+			embeddings, promptTokens, embedErr = embedTexts(r, inputs)
 		})
+		if embedErr != nil {
+			http.Error(w, embedErr.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"model": model, "embeddings": embeddings, "prompt_eval_count": promptTokens})
 	}))
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]any{"models": ollamaTagEntries(state, opts.ModelDir)})
@@ -1230,24 +1247,8 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		var model string
 		var embedErr error
 		embedder.withRunner(func(runner *gopherllm.Runner) {
-			if runner == nil {
-				embedErr = errors.New("no embedding model is loaded")
-				return
-			}
 			model = modelID(runner)
-			vectors = make([][]float32, 0, len(body.Input))
-			for _, input := range body.Input {
-				if strings.TrimSpace(input) == "" {
-					embedErr = errors.New("embedding input must not be empty")
-					return
-				}
-				result, err := runner.Embed(input)
-				if err != nil {
-					embedErr = err
-					return
-				}
-				vectors = append(vectors, result.Embedding)
-			}
+			vectors, _, embedErr = embedTexts(runner, body.Input)
 		})
 		if embedErr != nil {
 			status := http.StatusBadRequest
@@ -2013,9 +2014,38 @@ func (e EmbeddingsRequest) Inputs() []string {
 			}
 		}
 		return out
+	case nil:
+		return nil
 	default:
 		return []string{fmt.Sprint(x)}
 	}
+}
+
+// embedTexts is the shared compatibility-layer implementation for OpenAI,
+// Ollama, and the browser RAG endpoint. In particular, it makes their empty
+// input behaviour consistent instead of silently returning an empty success
+// response from one endpoint and rejecting the same request from another.
+func embedTexts(r *gopherllm.Runner, inputs []string) ([][]float32, int, error) {
+	if r == nil {
+		return nil, 0, errors.New("no embedding model is loaded")
+	}
+	if len(inputs) == 0 {
+		return nil, 0, errors.New("embedding input must contain at least one text")
+	}
+	vectors := make([][]float32, 0, len(inputs))
+	tokens := 0
+	for _, input := range inputs {
+		if strings.TrimSpace(input) == "" {
+			return nil, 0, errors.New("embedding input must not be empty")
+		}
+		result, err := r.Embed(input)
+		if err != nil {
+			return nil, 0, err
+		}
+		vectors = append(vectors, result.Embedding)
+		tokens += result.TokenCount
+	}
+	return vectors, tokens, nil
 }
 
 type OllamaGenerateRequest struct {
