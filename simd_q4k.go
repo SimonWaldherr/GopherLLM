@@ -1,5 +1,22 @@
 package gopherllm
 
+import "sync"
+
+type q4KQ8RowsTask struct {
+	data               []byte
+	q8                 []int8
+	xscale, xsums, out []float32
+	blocks, rowBytes   int
+}
+
+func (t *q4KQ8RowsTask) runRows(start, end int) {
+	for r := start; r < end; r++ {
+		t.out[r] = q4kDotQ8KRow(t.data[r*t.rowBytes:], t.q8, t.xscale, t.xsums, t.blocks)
+	}
+}
+
+var q4KQ8RowsTaskPool = sync.Pool{New: func() any { return new(q4KQ8RowsTask) }}
+
 func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 256) * 144
 	ensureLenNoClear(out, rows)
@@ -8,9 +25,12 @@ func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 		xs := fillQ4KXSums(x, cols, scratch)
 		if useQ8Activations.Load() {
 			q8, xsc, lease := acquireQ8(x, cols)
-			parallelRows(rows, func(start, end int) {
-				dotQ4KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
-			})
+			task := q4KQ8RowsTaskPool.Get().(*q4KQ8RowsTask)
+			task.data, task.q8, task.xscale, task.xsums, task.out = data, q8, xsc, xs, *out
+			task.blocks, task.rowBytes = cols/256, rowBytes
+			parallelRowsTask(rows, task)
+			*task = q4KQ8RowsTask{}
+			q4KQ8RowsTaskPool.Put(task)
 			releaseQ8(q8, xsc, lease)
 		} else {
 			parallelRows(rows, func(start, end int) {

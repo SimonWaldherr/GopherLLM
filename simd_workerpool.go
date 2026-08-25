@@ -15,6 +15,23 @@ func parallelRows(rows int, fn func(start, end int)) {
 	dispatchParallel(threads, rows, fn)
 }
 
+// rowTask is the allocation-free counterpart of the callback accepted by
+// parallelRows. Hot matvec paths keep their per-call state in a pooled task;
+// sending that task through the worker pool avoids allocating an escaping
+// closure for every projection.
+type rowTask interface {
+	runRows(start, end int)
+}
+
+func parallelRowsTask(rows int, task rowTask) {
+	threads := min(numThreads(), rows)
+	if threads <= 1 || rows < threads*8 {
+		task.runRows(0, rows)
+		return
+	}
+	dispatchParallelTask(threads, rows, task)
+}
+
 // parallelRowsBatched keeps one coarse range per worker. A batch row already
 // performs many dot products, so the ARM overdispatch used to balance short
 // decode rows adds scheduling overhead instead. The regular parallelRows path
@@ -42,6 +59,24 @@ func parallelChunks(n int, fn func(start, end int)) {
 
 func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	dispatchParallelMode(threads, rows, true, fn)
+}
+
+func dispatchParallelTask(threads, rows int, task rowTask) {
+	pool := getRowWorkerPool(numThreads())
+	chunks := threads
+	if oversubscribeDispatch && rows >= threads*128 {
+		chunks = min(threads*8, cap(pool.jobs))
+	}
+	wg := wgPool.Get().(*sync.WaitGroup)
+	wg.Add(chunks - 1)
+	for w := 1; w < chunks; w++ {
+		start := rows * w / chunks
+		end := rows * (w + 1) / chunks
+		pool.jobs <- rowJob{start: start, end: end, task: task, wg: wg}
+	}
+	task.runRows(0, rows/chunks)
+	wg.Wait()
+	wgPool.Put(wg)
 }
 
 func dispatchParallelMode(threads, rows int, allowOversubscribe bool, fn func(start, end int)) {
@@ -88,6 +123,7 @@ type rowJob struct {
 	start int
 	end   int
 	fn    func(start, end int)
+	task  rowTask
 	wg    *sync.WaitGroup
 }
 
@@ -132,7 +168,11 @@ func rowWorker(jobs <-chan rowJob, stop <-chan struct{}) {
 	for {
 		select {
 		case job := <-jobs:
-			job.fn(job.start, job.end)
+			if job.task != nil {
+				job.task.runRows(job.start, job.end)
+			} else {
+				job.fn(job.start, job.end)
+			}
 			job.wg.Done()
 		case <-stop:
 			return
