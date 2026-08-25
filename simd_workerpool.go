@@ -57,6 +57,17 @@ func parallelChunks(n int, fn func(start, end int)) {
 	dispatchParallel(threads, n, fn)
 }
 
+// parallelChunksTask is parallelChunks without an escaping callback. It is
+// used by attention, where even one head is enough work to justify a worker.
+func parallelChunksTask(n int, task rowTask) {
+	threads := min(numThreads(), n)
+	if threads <= 1 {
+		task.runRows(0, n)
+		return
+	}
+	dispatchParallelTask(threads, n, task)
+}
+
 func dispatchParallel(threads, rows int, fn func(start, end int)) {
 	dispatchParallelMode(threads, rows, true, fn)
 }

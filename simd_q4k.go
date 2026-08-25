@@ -6,13 +6,13 @@ type q4KQ8RowsTask struct {
 	data               []byte
 	q8                 []int8
 	xscale, xsums, out []float32
-	blocks, rowBytes   int
+	cols, rowBytes     int
 }
 
 func (t *q4KQ8RowsTask) runRows(start, end int) {
-	for r := start; r < end; r++ {
-		t.out[r] = q4kDotQ8KRow(t.data[r*t.rowBytes:], t.q8, t.xscale, t.xsums, t.blocks)
-	}
+	// Keep the architecture-specific kernel ABI behind dotQ4KRowsQ8: amd64
+	// uses noescape pointers while arm64 uses slices.
+	dotQ4KRowsQ8(t.data, t.q8, t.xscale, t.xsums, t.cols, t.rowBytes, start, end, t.out)
 }
 
 var q4KQ8RowsTaskPool = sync.Pool{New: func() any { return new(q4KQ8RowsTask) }}
@@ -27,7 +27,7 @@ func MatvecQ4KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 			q8, xsc, lease := acquireQ8(x, cols)
 			task := q4KQ8RowsTaskPool.Get().(*q4KQ8RowsTask)
 			task.data, task.q8, task.xscale, task.xsums, task.out = data, q8, xsc, xs, *out
-			task.blocks, task.rowBytes = cols/256, rowBytes
+			task.cols, task.rowBytes = cols, rowBytes
 			parallelRowsTask(rows, task)
 			*task = q4KQ8RowsTask{}
 			q4KQ8RowsTaskPool.Put(task)

@@ -1,5 +1,45 @@
 package gopherllm
 
+import "sync"
+
+type q4K2Q6KRowsTask struct {
+	aData, bData, cData      []byte
+	x                        []float32
+	q8                       []int8
+	xscale, q4xs, q6xs       []float32
+	aOut, bOut, cOut         []float32
+	aRows, abRows, totalRows int
+	cols, q4RowBytes         int
+	q6RowBytes               int
+	useQ8                    bool
+}
+
+func (t *q4K2Q6KRowsTask) runRows(start, end int) {
+	if as, ae := clippedRange(start, end, 0, t.aRows); as < ae {
+		if t.useQ8 {
+			dotQ4KRowsQ8(t.aData, t.q8, t.xscale, t.q4xs, t.cols, t.q4RowBytes, as, ae, t.aOut)
+		} else {
+			dotQ4KRowsWithXSums(t.aData, t.x, t.q4xs, t.cols, t.q4RowBytes, as, ae, t.aOut)
+		}
+	}
+	if bs, be := clippedRange(start, end, t.aRows, t.abRows); bs < be {
+		if t.useQ8 {
+			dotQ4KRowsQ8(t.bData, t.q8, t.xscale, t.q4xs, t.cols, t.q4RowBytes, bs-t.aRows, be-t.aRows, t.bOut)
+		} else {
+			dotQ4KRowsWithXSums(t.bData, t.x, t.q4xs, t.cols, t.q4RowBytes, bs-t.aRows, be-t.aRows, t.bOut)
+		}
+	}
+	if cs, ce := clippedRange(start, end, t.abRows, t.totalRows); cs < ce {
+		if t.useQ8 {
+			dotQ6KRowsQ8(t.cData, t.q8, t.xscale, t.q6xs, t.cols, t.q6RowBytes, cs-t.abRows, ce-t.abRows, t.cOut)
+		} else {
+			dotQ6KRowsWithXSums(t.cData, t.x, t.q6xs, t.cols, t.q6RowBytes, cs-t.abRows, ce-t.abRows, t.cOut)
+		}
+	}
+}
+
+var q4K2Q6KRowsTaskPool = sync.Pool{New: func() any { return new(q4K2Q6KRowsTask) }}
+
 func MatvecQ4K2Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols int, x []float32, aOut, bOut *[]float32) bool {
 	scratch := []float32{}
 	return MatvecQ4K2IntoWithXSums(aData, aRows, aCols, bData, bRows, bCols, x, &scratch, aOut, bOut)
@@ -59,33 +99,22 @@ func MatvecQ4K2Q6KIntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bR
 	ScaleF32(q6xs, 32)
 	abRows := aRows + bRows
 	totalRows := abRows + cRows
+	task := q4K2Q6KRowsTaskPool.Get().(*q4K2Q6KRowsTask)
+	task.aData, task.bData, task.cData, task.x = aData, bData, cData, x
+	task.q4xs, task.q6xs = q4xs, q6xs
+	task.aOut, task.bOut, task.cOut = *aOut, *bOut, *cOut
+	task.aRows, task.abRows, task.totalRows = aRows, abRows, totalRows
+	task.cols, task.q4RowBytes, task.q6RowBytes = aCols, q4RowBytes, q6RowBytes
 	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, aCols)
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ4KRowsQ8(aData, q8, xsc, q4xs, aCols, q4RowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-				dotQ4KRowsQ8(bData, q8, xsc, q4xs, bCols, q4RowBytes, bs-aRows, be-aRows, *bOut)
-			}
-			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-				dotQ6KRowsQ8(cData, q8, xsc, q6xs, cCols, q6RowBytes, cs-abRows, ce-abRows, *cOut)
-			}
-		})
+		task.q8, task.xscale, task.useQ8 = q8, xsc, true
+		parallelRowsTask(totalRows, task)
 		releaseQ8(q8, xsc, lease)
 	} else {
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ4KRowsWithXSums(aData, x, q4xs, aCols, q4RowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-				dotQ4KRowsWithXSums(bData, x, q4xs, bCols, q4RowBytes, bs-aRows, be-aRows, *bOut)
-			}
-			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-				dotQ6KRowsWithXSums(cData, x, q6xs, cCols, q6RowBytes, cs-abRows, ce-abRows, *cOut)
-			}
-		})
+		parallelRowsTask(totalRows, task)
 	}
+	*task = q4K2Q6KRowsTask{}
+	q4K2Q6KRowsTaskPool.Put(task)
 	*q6Scratch = q6xs
 	xsumsScratchPool.Put(q6Scratch)
 	return true

@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"math"
 	"os"
+	"sync"
 )
 
 // Forward runs one token through the transformer and returns its
@@ -309,10 +310,29 @@ func attendHeadsRange(config *Config, layer *LayerWeights, cache *KVCache, buf *
 	}
 }
 
+type attendHeadsTask struct {
+	config            Config
+	layer             LayerWeights
+	cache             *KVCache
+	buf               *DecodeBuffer
+	l, pos, attnStart int
+	scale             float32
+	kvMul             int
+}
+
+func (t *attendHeadsTask) runRows(start, end int) {
+	attendHeadsRange(&t.config, &t.layer, t.cache, t.buf, t.l, t.pos, t.attnStart, t.scale, t.kvMul, start, end)
+}
+
+var attendHeadsTaskPool = sync.Pool{New: func() any { return new(attendHeadsTask) }}
+
 func parallelAttendHeads(config Config, layer LayerWeights, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul int) {
-	parallelChunks(config.NHeads, func(hStart, hEnd int) {
-		attendHeadsRange(&config, &layer, cache, buf, l, pos, attnStart, scale, kvMul, hStart, hEnd)
-	})
+	task := attendHeadsTaskPool.Get().(*attendHeadsTask)
+	task.config, task.layer, task.cache, task.buf = config, layer, cache, buf
+	task.l, task.pos, task.attnStart, task.scale, task.kvMul = l, pos, attnStart, scale, kvMul
+	parallelChunksTask(config.NHeads, task)
+	*task = attendHeadsTask{}
+	attendHeadsTaskPool.Put(task)
 }
 
 func attendHeadGroupsRange(config *Config, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul, kvStart, kvEnd int) {
@@ -331,18 +351,37 @@ func attendHeadGroupsRange(config *Config, cache *KVCache, buf *DecodeBuffer, l,
 	}
 }
 
+type attendHeadGroupsTask struct {
+	config            Config
+	cache             *KVCache
+	buf               *DecodeBuffer
+	l, pos, attnStart int
+	scale             float32
+	kvMul, nKVHeads   int
+}
+
+func (t *attendHeadGroupsTask) runRows(start, end int) {
+	if start >= t.nKVHeads {
+		return
+	}
+	attendHeadGroupsRange(&t.config, t.cache, t.buf, t.l, t.pos, t.attnStart, t.scale, t.kvMul, start, min(end, t.nKVHeads))
+}
+
+var attendHeadGroupsTaskPool = sync.Pool{New: func() any { return new(attendHeadGroupsTask) }}
+
 func parallelAttendHeadGroups(config Config, cache *KVCache, buf *DecodeBuffer, l, pos, attnStart int, scale float32, kvMul int) {
 	// Keep the configured worker set awake for the projection matvec that
 	// immediately follows attention. GQA often exposes only eight groups on a
 	// 12-core Apple SoC; dispatching exactly eight jobs made four workers sleep
 	// and added a repeated wake-up penalty at every layer boundary.
 	workItems := max(config.NKVHeads, min(numThreads(), config.NHeads))
-	parallelChunks(workItems, func(kvStart, kvEnd int) {
-		if kvStart >= config.NKVHeads {
-			return
-		}
-		attendHeadGroupsRange(&config, cache, buf, l, pos, attnStart, scale, kvMul, kvStart, min(kvEnd, config.NKVHeads))
-	})
+	task := attendHeadGroupsTaskPool.Get().(*attendHeadGroupsTask)
+	task.config, task.cache, task.buf = config, cache, buf
+	task.l, task.pos, task.attnStart, task.scale = l, pos, attnStart, scale
+	task.kvMul, task.nKVHeads = kvMul, config.NKVHeads
+	parallelChunksTask(workItems, task)
+	*task = attendHeadGroupsTask{}
+	attendHeadGroupsTaskPool.Put(task)
 }
 
 func ForwardHidden(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {
