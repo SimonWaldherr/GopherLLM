@@ -1538,7 +1538,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on all of arm64) to halve KV memory |
 | `GOPHERLLM_KV_I8` | `1` opts into the Q8_0-block KV cache tier (off by default everywhere) — a memory-capacity option, not a speed one; see the KV cache section above |
-| `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`) |
+| `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`, adaptively `6` for the fused Ministral-3B-sized FFN) |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
 

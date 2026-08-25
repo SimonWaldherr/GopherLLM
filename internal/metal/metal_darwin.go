@@ -273,7 +273,7 @@ static const char* gllm_q6k_source =
 "  }\n"
 "}\n";
 
-static int gllm_metal_rows_per_group(int rows) {
+static int gllm_metal_rows_per_group(int rows, int fallback) {
 	const char* value = getenv("GOPHERLLM_METAL_ROWS_PER_GROUP");
 	if (value == NULL || value[0] == '\0') {
 		value = getenv("GOPHERLLM_METAL_Q6K_ROWS_PER_GROUP");
@@ -286,7 +286,7 @@ static int gllm_metal_rows_per_group(int rows) {
 		}
 	}
 	(void)rows;
-	return 4;
+	return fallback;
 }
 
 static bool gllm_metal_init(void) {
@@ -651,12 +651,12 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 	}
 }
 
-static void gllm_metal_encode_q4k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer) {
+static void gllm_metal_encode_q4k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
 	[enc setComputePipelineState:gllm_q4k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
 	[enc setBuffer:w->out offset:0 atIndex:2];
-	int rows_per_group = gllm_metal_rows_per_group(w->rows);
+	int rows_per_group = gllm_metal_rows_per_group(w->rows, default_rows_per_group);
 	GLLMMetalParams params = {
 		.rows = (uint32_t)w->rows,
 		.cols = (uint32_t)w->cols,
@@ -675,7 +675,7 @@ static void gllm_metal_encode_q5k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
 	[enc setBuffer:w->out offset:0 atIndex:2];
-	int rows_per_group = gllm_metal_rows_per_group(w->rows);
+	int rows_per_group = gllm_metal_rows_per_group(w->rows, 4);
 	GLLMMetalParams params = {
 		.rows = (uint32_t)w->rows,
 		.cols = (uint32_t)w->cols,
@@ -689,12 +689,12 @@ static void gllm_metal_encode_q5k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 }
 
-static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer) {
+static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
 	[enc setComputePipelineState:gllm_q6k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
 	[enc setBuffer:w->out offset:0 atIndex:2];
-	int rows_per_group = gllm_metal_rows_per_group(w->rows);
+	int rows_per_group = gllm_metal_rows_per_group(w->rows, default_rows_per_group);
 	GLLMMetalParams params = {
 		.rows = (uint32_t)w->rows,
 		.cols = (uint32_t)w->cols,
@@ -753,7 +753,7 @@ static int gllm_metal_q4k_matvec(void* handle, const float* x, float* out) {
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-		gllm_metal_encode_q4k(enc, w, w->x);
+		gllm_metal_encode_q4k(enc, w, w->x, 4);
 		[enc endEncoding];
 		[cb commit];
 		[cb waitUntilCompleted];
@@ -783,8 +783,8 @@ static int gllm_metal_q4k_matvec2(void* a_handle, void* b_handle, const float* x
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-		gllm_metal_encode_q4k(enc, a, a->x);
-		gllm_metal_encode_q4k(enc, b, a->x);
+		gllm_metal_encode_q4k(enc, a, a->x, 4);
+		gllm_metal_encode_q4k(enc, b, a->x, 4);
 		[enc endEncoding];
 		[cb commit];
 		[cb waitUntilCompleted];
@@ -828,9 +828,9 @@ static int gllm_metal_q4k2_q6k_matvec3(
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-		gllm_metal_encode_q4k(enc, q, q->x);
-		gllm_metal_encode_q4k(enc, k, q->x);
-		gllm_metal_encode_q6k(enc, v, q->x);
+		gllm_metal_encode_q4k(enc, q, q->x, 4);
+		gllm_metal_encode_q4k(enc, k, q->x, 4);
+		gllm_metal_encode_q6k(enc, v, q->x, 4);
 		[enc endEncoding];
 		[cb commit];
 		[cb waitUntilCompleted];
@@ -874,8 +874,14 @@ static int gllm_metal_q4k2_silu_q6k(
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-		gllm_metal_encode_q4k(enc, gate, gate->x);
-		gllm_metal_encode_q4k(enc, up, gate->x);
+		// The 3B Ministral FFN (3072 -> 9216 -> 3072) is ~3% faster with
+		// three two-row SIMD groups per threadgroup. Larger 14B shapes lose
+		// about 1-2% at that occupancy, so retain four rows there. An explicit
+		// GOPHERLLM_METAL_ROWS_PER_GROUP value still overrides this default.
+		int ffn_rows_per_group =
+			gate->cols <= 3072 && gate->rows <= 9216 && down->rows <= 3072 ? 6 : 4;
+		gllm_metal_encode_q4k(enc, gate, gate->x, ffn_rows_per_group);
+		gllm_metal_encode_q4k(enc, up, gate->x, ffn_rows_per_group);
 		// These dispatches have explicit buffer dependencies, so Metal executes
 		// them in order within one compute encoder. Keeping the complete SwiGLU
 		// path in that encoder avoids two encoder-finalization/scheduling points
@@ -883,7 +889,7 @@ static int gllm_metal_q4k2_silu_q6k(
 		// Devstral, whose 26+ FFNs dominate decode once narrow GQA projections
 		// correctly stay on the CPU path.
 		gllm_metal_encode_silu(enc, gate->out, up->out, down->x, (uint32_t)gate->rows);
-		gllm_metal_encode_q6k(enc, down, down->x);
+		gllm_metal_encode_q6k(enc, down, down->x, ffn_rows_per_group);
 		[enc endEncoding];
 		[cb commit];
 		[cb waitUntilCompleted];
@@ -943,7 +949,7 @@ static int gllm_metal_q6k_matvec(void* handle, const float* x, float* out) {
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-		gllm_metal_encode_q6k(enc, w, w->x);
+		gllm_metal_encode_q6k(enc, w, w->x, 4);
 		[enc endEncoding];
 		[cb commit];
 		[cb waitUntilCompleted];
@@ -975,7 +981,7 @@ static int gllm_metal_q6k_argmax(void* handle, const float* x, const uint32_t* r
 
 		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-		gllm_metal_encode_q6k(enc, w, w->x);
+		gllm_metal_encode_q6k(enc, w, w->x, 4);
 		// The reduction consumes w->out written by the preceding dispatch.
 		// A compute encoder preserves that ordering, and avoiding a second
 		// encoder matters on every greedy decode token for large vocabularies.

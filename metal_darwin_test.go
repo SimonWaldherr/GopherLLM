@@ -272,6 +272,93 @@ func TestMetalQ4K2SwiGLUQ6KMatchesCPU(t *testing.T) {
 	assertMetalMatvecClose(t, got, want)
 }
 
+// BenchmarkMetalMinistral3BFFN covers the dominant dense block in the
+// Ministral-3 3B decode path: Q4_K gate/up projections, SwiGLU, then a Q6_K
+// down projection. Keeping the production shape here makes Metal scheduling
+// changes measurable without requiring a multi-gigabyte model fixture.
+func BenchmarkMetalMinistral3BFFN(b *testing.B) {
+	benchmarkMetalMinistralFFN(b, 3072, 9216, 3072)
+}
+
+func BenchmarkMetalMinistral14BFFN(b *testing.B) {
+	benchmarkMetalMinistralFFN(b, 5120, 16384, 5120)
+}
+
+func benchmarkMetalMinistralFFN(b *testing.B, inputCols, hiddenRows, outputRows int) {
+	if !MetalAvailable() {
+		b.Skip(MetalError())
+	}
+	rng := rand.New(rand.NewSource(196))
+	gateRow := randomQ4KRow(rng, inputCols)
+	upRow := randomQ4KRow(rng, inputCols)
+	downRow := randomQ6KRow(rng, hiddenRows)
+	gateData := make([]byte, hiddenRows*len(gateRow))
+	upData := make([]byte, hiddenRows*len(upRow))
+	downData := make([]byte, outputRows*len(downRow))
+	for r := range hiddenRows {
+		copy(gateData[r*len(gateRow):], gateRow)
+		copy(upData[r*len(upRow):], upRow)
+	}
+	for r := range outputRows {
+		copy(downData[r*len(downRow):], downRow)
+	}
+	x := metalTestVector(inputCols)
+
+	b.Run("CPU", func(b *testing.B) {
+		gate, up := make([]float32, hiddenRows), make([]float32, hiddenRows)
+		hidden := make([]float32, hiddenRows)
+		out := make([]float32, outputRows)
+		b.ReportAllocs()
+		for b.Loop() {
+			MatvecQ4K2Into(gateData, hiddenRows, inputCols, upData, hiddenRows, inputCols, x, &gate, &up)
+			siluMulF32(gate, up, hidden)
+			MatvecQ6KInto(downData, hidden, outputRows, hiddenRows, &out)
+		}
+	})
+
+	gateWeight := metalbackend.PrepareQ4K(gateData, hiddenRows, inputCols, false)
+	upWeight := metalbackend.PrepareQ4K(upData, hiddenRows, inputCols, false)
+	downWeight := metalbackend.PrepareQ6K(downData, outputRows, hiddenRows, false)
+	if gateWeight == nil || upWeight == nil || downWeight == nil {
+		metalbackend.Release(gateWeight)
+		metalbackend.Release(upWeight)
+		metalbackend.Release(downWeight)
+		b.Fatalf("prepare fused FFN Metal weights: %s", MetalError())
+	}
+	b.Cleanup(func() {
+		metalbackend.Release(gateWeight)
+		metalbackend.Release(upWeight)
+		metalbackend.Release(downWeight)
+	})
+	gateOut, upOut := make([]float32, hiddenRows), make([]float32, hiddenRows)
+	b.Run("MetalQ4K2", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if !metalbackend.MatvecQ4K2(gateWeight, upWeight, x, gateOut, upOut) {
+				b.Fatal(MetalError())
+			}
+		}
+	})
+	downX := metalTestVector(hiddenRows)
+	out := make([]float32, outputRows)
+	b.Run("MetalQ6K", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if !metalbackend.MatvecQ6K(downWeight, downX, out) {
+				b.Fatal(MetalError())
+			}
+		}
+	})
+	b.Run("Metal", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			if !metalbackend.MatvecQ4K2SwiGLUQ6K(gateWeight, upWeight, downWeight, x, out) {
+				b.Fatal(MetalError())
+			}
+		}
+	})
+}
+
 func TestMetalQ6KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())
