@@ -632,22 +632,41 @@ func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 	}
 	ensureLenNoClear(&buf.Proj, w.Down.Output)
 	clear(buf.Proj[:w.Down.Output])
+	out := w.Gate.Output
+	// Every selected expert's gate/up projection reads the same x (unlike the
+	// down projection below, whose input is that expert's own SiLU(gate,up)
+	// output and therefore differs per expert). That shared input lets all K
+	// selected experts' gate+up rows be coalesced into one worker-pool
+	// dispatch instead of paying the fixed dispatch/synchronization cost once
+	// per expert; see expertMatvecGateUpBatchInto. batchedGateUp is decided
+	// once for the whole call (it depends only on weight layout/type, not on
+	// which experts were selected), and on any layout it declines, every
+	// expert falls back to the original per-expert path unchanged.
+	batchedGateUp := expertMatvecGateUpBatchInto(w.Gate, w.Up, selected, x, &buf.Q4KXSums, &buf.Gate, &buf.Up)
 	for i, choice := range selected {
-		if !expertMatvec2Into(w.Gate, w.Up, choice.Index, x, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
-			expertMatvecInto(w.Gate, choice.Index, x, &buf.Gate, &buf.ExpertRow)
-			expertMatvecInto(w.Up, choice.Index, x, &buf.Up, &buf.ExpertRow)
+		var gateVals, upVals []float32
+		if batchedGateUp {
+			gateVals = buf.Gate[i*out : (i+1)*out]
+			upVals = buf.Up[i*out : (i+1)*out]
+		} else {
+			if !expertMatvec2Into(w.Gate, w.Up, choice.Index, x, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+				expertMatvecInto(w.Gate, choice.Index, x, &buf.Gate, &buf.ExpertRow)
+				expertMatvecInto(w.Up, choice.Index, x, &buf.Up, &buf.ExpertRow)
+			}
+			gateVals = buf.Gate
+			upVals = buf.Up
 		}
-		w.GateBias.addTo(choice.Index, buf.Gate)
-		w.UpBias.addTo(choice.Index, buf.Up)
-		ensureLenNoClear(&buf.Hidden, w.Gate.Output)
+		w.GateBias.addTo(choice.Index, gateVals)
+		w.UpBias.addTo(choice.Index, upVals)
+		ensureLenNoClear(&buf.Hidden, out)
 		if w.OAIActivation {
-			for j := range w.Gate.Output {
-				gate := min(buf.Gate[j], float32(7))
-				up := clamp(buf.Up[j], -7, 7)
+			for j := range out {
+				gate := min(gateVals[j], float32(7))
+				up := clamp(upVals[j], -7, 7)
 				buf.Hidden[j] = gate * nemotronSigmoid(1.702*gate) * (up + 1)
 			}
 		} else {
-			siluMulF32(buf.Gate, buf.Up, buf.Hidden)
+			siluMulF32(gateVals, upVals, buf.Hidden)
 		}
 		expertMatvecInto(w.Down, choice.Index, buf.Hidden, &buf.MOE, &buf.ExpertRow)
 		w.DownBias.addTo(choice.Index, buf.MOE)
@@ -729,6 +748,215 @@ func expertMatvec2Into(a, b ExpertWeight, expert int, x []float32, q4Sums *[]flo
 	default:
 		return false
 	}
+}
+
+// expertMatvecGateUpBatchInto computes every selected expert's gate and up
+// projections in a single worker-pool dispatch instead of one dispatch per
+// expert (or two, when expertMatvec2Into's own fused fast path is
+// unavailable). This is safe specifically because gate and up always read
+// the same x for every selected expert -- unlike the down projection, whose
+// input is that expert's own SiLU(gate,up) output and therefore differs per
+// expert, so it is deliberately left out of this batching and still
+// dispatched per expert by the caller.
+//
+// Output for selected[j] lands at (*gateOut)[j*Output:(j+1)*Output], and the
+// same layout for upOut. Only row-range bookkeeping changes here: every row
+// is still computed by the exact same per-row dot-product routine the
+// unbatched path already uses (DotF32 / dotQ4KRows* / dotQ6KRows*), against
+// the same weight bytes and the same x, so results are bit-identical to
+// calling expertMatvec2Into once per expert -- only which goroutine performs
+// a given row's arithmetic changes, and IEEE754 float ops do not depend on
+// that.
+//
+// Returns false for any layout expertMatvec2Into itself would decline (mixed
+// gate/up types, a quant type outside Q4_K/Q6_K, or an unaddressable expert
+// plane); callers must then fall back to the original per-expert path. This
+// mirrors expertMatvec2Into's own fallback contract, and validates every
+// selected expert's plane before writing anything, so a false return never
+// leaves gateOut/upOut partially overwritten.
+// disableExpertGateUpBatchForTest is a test-only escape hatch that forces
+// expertMatvecGateUpBatchInto to always decline, so tests can run
+// sparseMoEForward through the original per-expert path for a direct,
+// otherwise-identical reference comparison. Production code must never set
+// this; it always defaults to false (batching enabled).
+var disableExpertGateUpBatchForTest = newAtomicBool(false)
+
+func expertMatvecGateUpBatchInto(gate, up ExpertWeight, selected []ExpertScore, x []float32, q4Sums *[]float32, gateOut, upOut *[]float32) bool {
+	if disableExpertGateUpBatchForTest.Load() {
+		return false
+	}
+	n := len(selected)
+	if n == 0 || len(x) != gate.Input || gate.Input != up.Input || gate.Output != up.Output || gate.Output <= 0 {
+		return false
+	}
+	out := gate.Output
+	if gate.Weight.F32 != nil && up.Weight.F32 != nil {
+		for _, choice := range selected {
+			if _, ok := gate.f32Plane(choice.Index); !ok {
+				return false
+			}
+			if _, ok := up.f32Plane(choice.Index); !ok {
+				return false
+			}
+		}
+		ensureLenNoClear(gateOut, n*out)
+		ensureLenNoClear(upOut, n*out)
+		gOut, uOut := *gateOut, *upOut
+		totalRows := n * 2 * out
+		parallelRows(totalRows, func(start, end int) {
+			for j := 0; j < n; j++ {
+				segBase := j * 2 * out
+				if as, ae := clippedRange(start, end, segBase, segBase+out); as < ae {
+					plane, _ := gate.f32Plane(selected[j].Index)
+					dst := gOut[j*out : (j+1)*out]
+					for r := as - segBase; r < ae-segBase; r++ {
+						dst[r] = DotF32(plane[r*gate.Input:(r+1)*gate.Input], x)
+					}
+				}
+				if bs, be := clippedRange(start, end, segBase+out, segBase+2*out); bs < be {
+					plane, _ := up.f32Plane(selected[j].Index)
+					dst := uOut[j*out : (j+1)*out]
+					for r := bs - segBase - out; r < be-segBase-out; r++ {
+						dst[r] = DotF32(plane[r*up.Input:(r+1)*up.Input], x)
+					}
+				}
+			}
+		})
+		return true
+	}
+	if gate.Weight.F32 != nil || up.Weight.F32 != nil || gate.Weight.Type != up.Weight.Type {
+		return false
+	}
+	cols := gate.Input
+	if cols <= 0 || cols%256 != 0 {
+		return false
+	}
+	switch gate.Weight.Type {
+	case GGMLTypeQ4_K:
+		return expertMatvecGateUpBatchQ4KInto(gate, up, selected, x, cols, q4Sums, gateOut, upOut)
+	case GGMLTypeQ6_K:
+		return expertMatvecGateUpBatchQ6KInto(gate, up, selected, x, cols, gateOut, upOut)
+	default:
+		return false
+	}
+}
+
+func expertMatvecGateUpBatchQ4KInto(gate, up ExpertWeight, selected []ExpertScore, x []float32, cols int, q4Sums *[]float32, gateOut, upOut *[]float32) bool {
+	n := len(selected)
+	out := gate.Output
+	rowBytes := (cols / 256) * 144
+	for _, choice := range selected {
+		gp, ok := expertPlaneWeight(gate, choice.Index)
+		if !ok || len(gp.Raw) < out*rowBytes {
+			return false
+		}
+		up_, ok := expertPlaneWeight(up, choice.Index)
+		if !ok || len(up_.Raw) < out*rowBytes {
+			return false
+		}
+	}
+	ensureLenNoClear(gateOut, n*out)
+	ensureLenNoClear(upOut, n*out)
+	gOut, uOut := *gateOut, *upOut
+	if q4Sums == nil {
+		scratch := []float32{}
+		q4Sums = &scratch
+	}
+	// x is shared by every selected expert's gate and up projection, so its
+	// per-32-element activation sums (and, on the int8-activation path, its
+	// quantized form) need computing only once for the whole batch rather
+	// than once per expert as the unbatched loop did.
+	xs := fillQ4KXSums(x, cols, q4Sums)
+	totalRows := n * 2 * out
+	if useQ8Activations.Load() {
+		q8, xsc, lease := acquireQ8(x, cols)
+		parallelRows(totalRows, func(start, end int) {
+			for j := 0; j < n; j++ {
+				segBase := j * 2 * out
+				if as, ae := clippedRange(start, end, segBase, segBase+out); as < ae {
+					gp, _ := expertPlaneWeight(gate, selected[j].Index)
+					dotQ4KRowsQ8(gp.Raw, q8, xsc, xs, cols, rowBytes, as-segBase, ae-segBase, gOut[j*out:(j+1)*out])
+				}
+				if bs, be := clippedRange(start, end, segBase+out, segBase+2*out); bs < be {
+					up_, _ := expertPlaneWeight(up, selected[j].Index)
+					dotQ4KRowsQ8(up_.Raw, q8, xsc, xs, cols, rowBytes, bs-segBase-out, be-segBase-out, uOut[j*out:(j+1)*out])
+				}
+			}
+		})
+		releaseQ8(q8, xsc, lease)
+		return true
+	}
+	parallelRows(totalRows, func(start, end int) {
+		for j := 0; j < n; j++ {
+			segBase := j * 2 * out
+			if as, ae := clippedRange(start, end, segBase, segBase+out); as < ae {
+				gp, _ := expertPlaneWeight(gate, selected[j].Index)
+				dotQ4KRowsWithXSums(gp.Raw, x, xs, cols, rowBytes, as-segBase, ae-segBase, gOut[j*out:(j+1)*out])
+			}
+			if bs, be := clippedRange(start, end, segBase+out, segBase+2*out); bs < be {
+				up_, _ := expertPlaneWeight(up, selected[j].Index)
+				dotQ4KRowsWithXSums(up_.Raw, x, xs, cols, rowBytes, bs-segBase-out, be-segBase-out, uOut[j*out:(j+1)*out])
+			}
+		}
+	})
+	return true
+}
+
+func expertMatvecGateUpBatchQ6KInto(gate, up ExpertWeight, selected []ExpertScore, x []float32, cols int, gateOut, upOut *[]float32) bool {
+	n := len(selected)
+	out := gate.Output
+	rowBytes := (cols / 256) * 210
+	for _, choice := range selected {
+		gp, ok := expertPlaneWeight(gate, choice.Index)
+		if !ok || len(gp.Raw) < out*rowBytes {
+			return false
+		}
+		up_, ok := expertPlaneWeight(up, choice.Index)
+		if !ok || len(up_.Raw) < out*rowBytes {
+			return false
+		}
+	}
+	ensureLenNoClear(gateOut, n*out)
+	ensureLenNoClear(upOut, n*out)
+	gOut, uOut := *gateOut, *upOut
+	scratch := xsumsScratchPool.Get().(*[]float32)
+	xs := fillQ6KXSums16(x, cols, scratch)
+	ScaleF32(xs, 32)
+	totalRows := n * 2 * out
+	if useQ8Activations.Load() {
+		q8, xsc, lease := acquireQ8(x, cols)
+		parallelRows(totalRows, func(start, end int) {
+			for j := 0; j < n; j++ {
+				segBase := j * 2 * out
+				if as, ae := clippedRange(start, end, segBase, segBase+out); as < ae {
+					gp, _ := expertPlaneWeight(gate, selected[j].Index)
+					dotQ6KRowsQ8(gp.Raw, q8, xsc, xs, cols, rowBytes, as-segBase, ae-segBase, gOut[j*out:(j+1)*out])
+				}
+				if bs, be := clippedRange(start, end, segBase+out, segBase+2*out); bs < be {
+					up_, _ := expertPlaneWeight(up, selected[j].Index)
+					dotQ6KRowsQ8(up_.Raw, q8, xsc, xs, cols, rowBytes, bs-segBase-out, be-segBase-out, uOut[j*out:(j+1)*out])
+				}
+			}
+		})
+		releaseQ8(q8, xsc, lease)
+	} else {
+		parallelRows(totalRows, func(start, end int) {
+			for j := 0; j < n; j++ {
+				segBase := j * 2 * out
+				if as, ae := clippedRange(start, end, segBase, segBase+out); as < ae {
+					gp, _ := expertPlaneWeight(gate, selected[j].Index)
+					dotQ6KRowsWithXSums(gp.Raw, x, xs, cols, rowBytes, as-segBase, ae-segBase, gOut[j*out:(j+1)*out])
+				}
+				if bs, be := clippedRange(start, end, segBase+out, segBase+2*out); bs < be {
+					up_, _ := expertPlaneWeight(up, selected[j].Index)
+					dotQ6KRowsWithXSums(up_.Raw, x, xs, cols, rowBytes, bs-segBase-out, be-segBase-out, uOut[j*out:(j+1)*out])
+				}
+			}
+		})
+	}
+	*scratch = xs
+	xsumsScratchPool.Put(scratch)
+	return true
 }
 
 func expertPlaneWeight(w ExpertWeight, expert int) (Weight, bool) {

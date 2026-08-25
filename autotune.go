@@ -558,6 +558,11 @@ func (t *autoTuner) prefillProbe(chunk int) float64 {
 	}
 	cache, buf := t.workspace()
 	toks := t.tokens[:chunk]
+	// Callers only reach prefillProbe behind r.canBatchPrefill(), which now
+	// also admits non-native Gemma/Gemma2/Gemma3 models (see
+	// Runner.batchPrefillWeights); r.standard is unpopulated for those, so the
+	// probe must stream whichever weights canBatchPrefill actually validated.
+	weights, _ := r.batchPrefillWeights()
 	// No per-sample warm-up here: at seconds per batch it would double the cost
 	// of the tuner's most expensive probe. tunePrefillChunk warms up once, with
 	// the largest candidate, which sizes every batch buffer the smaller
@@ -565,7 +570,7 @@ func (t *autoTuner) prefillProbe(chunk int) float64 {
 	start := time.Now()
 	reps := 0
 	for {
-		ForwardBatchInto(r.config, r.standard, cache, buf, toks, 0, true, &t.logits)
+		ForwardBatchInto(r.config, weights, cache, buf, toks, 0, true, &t.logits)
 		reps++
 		el := time.Since(start).Seconds()
 		if reps >= maxProbeSteps || el >= minProbeSeconds {

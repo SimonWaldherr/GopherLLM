@@ -46,7 +46,13 @@ func TestEmbedBatchedMatchesSequentialMultiChunk(t *testing.T) {
 	defer SetPrefillChunk(oldChunk)
 
 	prompt := strings.Repeat("a b c ", 30)
-	for _, arch := range []string{"llama", "stablelm"} {
+	// gemma2/gemma3 load through LoadGemma4Model, but for these non-"gemma4"
+	// archs that loader does nothing gemma4-specific: it calls the same
+	// LoadModel as loadedStandard and keeps the result in
+	// Gemma4Weights.Standard (see LoadGemma4Model). canBatchPrefill widening
+	// to loadedGemma4-non-native relies on that equivalence, so it belongs in
+	// this same batched-vs-sequential parity check.
+	for _, arch := range []string{"llama", "stablelm", "gemma2", "gemma3"} {
 		t.Run(arch, func(t *testing.T) {
 			r, err := RunnerFromGGUFBytes(buildTinyStandardGGUF(arch))
 			if err != nil {

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -87,10 +89,16 @@ func postJSON(t *testing.T, handler http.Handler, path string, body any) *httpte
 // Deny mode must refuse a command it rates safe:2 exactly as it refuses one
 // rated safe:0, until a human sets approved:true out of band.
 func TestExecuteUnderDenyIgnoresTheModelsSafeClaimAndNeedsApproval(t *testing.T) {
+	// A real "echo" binary does not exist standalone on Windows outside a
+	// Git-Bash-flavored PATH, so this re-execs the test binary itself (see
+	// TestAgentOSHelperProcess) instead of relying on an external program.
+	t.Setenv("GO_WANT_SERVER_AGENTOS_HELPER_PROCESS", "1")
+	helper := `"` + os.Args[0] + `" -test.run=^TestAgentOSHelperProcess$ -- echo:hi`
+
 	handler := agentOSTestHandler(t, &agentos.Runner{Policy: agentos.PolicyDeny})
 
 	for _, safe := range []int{0, 1, 2} {
-		proposal := map[string]any{"cmd": "echo hi", "dsc": "prints hi", "safe": safe}
+		proposal := map[string]any{"cmd": helper, "dsc": "prints hi", "safe": safe}
 		rec := postJSON(t, handler, "/agentos/execute", map[string]any{"proposal": proposal, "approved": false})
 		if rec.Code == http.StatusOK {
 			t.Fatalf("safe=%d: deny mode ran an unapproved command: %s", safe, rec.Body.String())
@@ -98,7 +106,7 @@ func TestExecuteUnderDenyIgnoresTheModelsSafeClaimAndNeedsApproval(t *testing.T)
 	}
 
 	// The same proposal, only a human approval flips it to true, now runs.
-	proposal := map[string]any{"cmd": "echo hi", "dsc": "prints hi", "safe": 0}
+	proposal := map[string]any{"cmd": helper, "dsc": "prints hi", "safe": 0}
 	rec := postJSON(t, handler, "/agentos/execute", map[string]any{"proposal": proposal, "approved": true})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("approved command was refused: %s", rec.Body.String())
@@ -130,13 +138,37 @@ func TestExecuteUnderWhitelistBlocksMetacharactersEvenWhenApproved(t *testing.T)
 // A whitelisted program with no approval step needed still requires the
 // handler to actually run it (AutoRun), proving the wiring reaches
 // Runner.Execute and not just Runner.Evaluate.
+//
+// This must be a bare program name found via PATH lookup (Runner.Evaluate
+// requires args[0] to have no path separators at all before it will
+// AutoRun a whitelisted entry), which rules out the self-exec helper trick
+// used by the deny-mode test above — an absolute re-exec path can never
+// satisfy that check. "go" is used instead of "echo" because Windows has
+// no standalone echo.exe, while a `go` binary is guaranteed to be on PATH
+// in any environment that can run `go test` in the first place.
 func TestExecuteUnderWhitelistAutoRunsAnAllowedProgram(t *testing.T) {
-	handler := agentOSTestHandler(t, &agentos.Runner{Policy: agentos.PolicyWhitelist, Allowed: []string{"echo"}})
-	proposal := map[string]any{"cmd": "echo hi", "dsc": "prints hi", "safe": 0}
+	handler := agentOSTestHandler(t, &agentos.Runner{Policy: agentos.PolicyWhitelist, Allowed: []string{"go"}})
+	proposal := map[string]any{"cmd": "go version", "dsc": "prints the go toolchain version", "safe": 0}
 	rec := postJSON(t, handler, "/agentos/execute", map[string]any{"proposal": proposal, "approved": false})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("allow-listed program was refused: %s", rec.Body.String())
 	}
+}
+
+// TestAgentOSHelperProcess is not a real test; it is re-exec'd as a child
+// process (see TestExecuteUnderDenyIgnoresTheModelsSafeClaimAndNeedsApproval)
+// so agentos tests can stand in for a real "echo" without depending on one
+// being on PATH.
+func TestAgentOSHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_SERVER_AGENTOS_HELPER_PROCESS") != "1" {
+		return
+	}
+	arg := os.Args[len(os.Args)-1]
+	if strings.HasPrefix(arg, "echo:") {
+		fmt.Print(strings.TrimPrefix(arg, "echo:"))
+		os.Exit(0)
+	}
+	os.Exit(2)
 }
 
 func TestProposeRejectsAnEmptyInstruction(t *testing.T) {

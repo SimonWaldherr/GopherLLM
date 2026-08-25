@@ -471,6 +471,49 @@ func TestAutoTuneEndToEnd(t *testing.T) {
 	}
 }
 
+// TestAutoTuneEndToEndGemma exercises prefill-chunk tuning on a non-native
+// Gemma model. canBatchPrefill() now admits loadedGemma4 (see
+// Runner.batchPrefillWeights), so TunePrefill's probe reaches
+// autoTuner.prefillProbe -- which must stream r.gemma4.Standard rather than
+// the always-empty r.standard for this kind, or ForwardBatchInto would run
+// against a zero-value ModelWeights.
+func TestAutoTuneEndToEndGemma(t *testing.T) {
+	before := captureTunerConfig(Config{})
+	defer before.apply()
+
+	r, err := RunnerFromGGUFBytes(buildTinyGemmaGGUF())
+	if err != nil {
+		t.Fatalf("load synthetic model: %v", err)
+	}
+	defer r.Close()
+	if !r.canBatchPrefill() {
+		t.Fatal("expected non-native gemma model to be batch-prefill eligible")
+	}
+
+	var log strings.Builder
+	res, err := r.AutoTune(AutoTuneOptions{
+		Rounds: 2, DecodeSteps: 1, Context: 8, MinGain: 0.05,
+		TunePrefill: true, LogWriter: &log,
+	})
+	if err != nil {
+		t.Fatalf("AutoTune: %v", err)
+	}
+	if res.PrefillChunk < 1 {
+		t.Fatalf("prefill chunk must be positive, got %d", res.PrefillChunk)
+	}
+	if res.TunedPrefillTps <= 0 {
+		t.Fatalf("prefill was not measured: %+v", res)
+	}
+
+	out, err := r.Generate("a b c", GenerationOptions{MaxTokens: 4, Sampler: DefaultSamplerConfig(), Seed: 1})
+	if err != nil {
+		t.Fatalf("generate after tuning: %v", err)
+	}
+	if out.Stats.GeneratedTokens == 0 {
+		t.Fatal("no tokens generated after tuning")
+	}
+}
+
 func TestHostFingerprintIsStable(t *testing.T) {
 	a, b := hostFingerprint(), hostFingerprint()
 	if a != b {

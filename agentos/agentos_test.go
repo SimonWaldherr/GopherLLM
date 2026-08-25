@@ -128,11 +128,17 @@ func TestParseProposalToleratesFencesAndProse(t *testing.T) {
 }
 
 func TestExecuteRequiresApprovalUnderDeny(t *testing.T) {
+	// A real "echo" binary does not exist standalone on Windows outside a
+	// Git-Bash-flavored PATH, so this re-execs the test binary itself (see
+	// TestExecuteHelperProcess) instead of relying on an external program.
+	t.Setenv("GO_WANT_AGENTOS_HELPER_PROCESS", "1")
+	helper := `"` + os.Args[0] + `" -test.run=^TestExecuteHelperProcess$ -- `
+
 	r := Runner{Policy: PolicyDeny}
-	if _, _, err := r.Execute(context.Background(), Proposal{Cmd: "echo hi", Safe: 2}, false); err == nil {
+	if _, _, err := r.Execute(context.Background(), Proposal{Cmd: helper + "echo:hi", Safe: 2}, false); err == nil {
 		t.Fatal("deny mode ran a command without approval")
 	}
-	res, _, err := r.Execute(context.Background(), Proposal{Cmd: "echo hi"}, true)
+	res, _, err := r.Execute(context.Background(), Proposal{Cmd: helper + "echo:hi"}, true)
 	if err != nil {
 		t.Fatalf("approved command failed: %v", err)
 	}
@@ -152,8 +158,13 @@ func TestApprovalCannotUnblockAChainedCommand(t *testing.T) {
 
 // Without a shell, metacharacters are inert text rather than syntax.
 func TestNonAllowPolicyDoesNotUseAShell(t *testing.T) {
+	// See TestExecuteRequiresApprovalUnderDeny: re-exec the test binary
+	// rather than depend on an external "echo" that Windows doesn't ship.
+	t.Setenv("GO_WANT_AGENTOS_HELPER_PROCESS", "1")
+	helper := `"` + os.Args[0] + `" -test.run=^TestExecuteHelperProcess$ -- `
+
 	r := Runner{Policy: PolicyDeny}
-	res, _, err := r.Execute(context.Background(), Proposal{Cmd: `echo $HOME`}, true)
+	res, _, err := r.Execute(context.Background(), Proposal{Cmd: helper + `echo:$HOME`}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,11 +228,16 @@ func TestExecuteHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_AGENTOS_HELPER_PROCESS") != "1" {
 		return
 	}
-	switch os.Args[len(os.Args)-1] {
-	case "sleep":
+	arg := os.Args[len(os.Args)-1]
+	switch {
+	case arg == "sleep":
 		time.Sleep(5 * time.Second)
-	case "output":
+	case arg == "output":
 		fmt.Print(strings.Repeat("x", 500))
+	case strings.HasPrefix(arg, "echo:"):
+		// Prints its payload verbatim (no shell involved), letting tests
+		// stand in for a real "echo" without depending on one being on PATH.
+		fmt.Print(strings.TrimPrefix(arg, "echo:"))
 	default:
 		os.Exit(2)
 	}

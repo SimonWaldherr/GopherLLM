@@ -166,6 +166,47 @@ func TestGemmaLoadsOptionalNormsAndGenerates(t *testing.T) {
 	}
 }
 
+// TestGemmaBatchedPrefillMatchesPerToken locks in the canBatchPrefill widening
+// to non-native Gemma4Weights: gemma2/gemma3 (and dense-layout gemma4) now
+// take ForwardBatchInto's chunked prefill instead of the forwardPrefillToken
+// per-position loop. Both paths must produce byte-identical greedy output --
+// GOPHERLLM_NO_BATCH_PREFILL=1 forces the old per-token loop for direct A/B
+// comparison against the same weights within one process.
+func TestGemmaBatchedPrefillMatchesPerToken(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyGemmaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.canBatchPrefill() {
+		t.Fatal("non-native gemma2 model should now be eligible for batched prefill")
+	}
+
+	opts := DefaultGenerationOptions()
+	opts.MaxTokens = 8
+	opts.SystemPrompt = ""
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+	prompt := "a b c d e"
+
+	batched, err := r.Generate(prompt, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GOPHERLLM_NO_BATCH_PREFILL", "1")
+	if r.canBatchPrefill() {
+		t.Fatal("GOPHERLLM_NO_BATCH_PREFILL=1 should disable batched prefill")
+	}
+	perToken, err := r.Generate(prompt, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if batched.Text != perToken.Text {
+		t.Fatalf("batched prefill changed gemma output: batched=%q per-token=%q", batched.Text, perToken.Text)
+	}
+}
+
 func TestGemma3LoadsDenseGraph(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyGemmaGGUFWithArch("gemma3"))
 	if err != nil {

@@ -2,9 +2,19 @@ package gopherllm
 
 import (
 	"math"
+	"math/rand"
 	"strings"
 	"testing"
 )
+
+// forceExpertGateUpBatchDisabledForTest routes sparseMoEForward through the
+// original per-expert gate/up path for the duration of the calling test,
+// restoring the batched fast path afterward.
+func forceExpertGateUpBatchDisabledForTest(t *testing.T) func() {
+	t.Helper()
+	disableExpertGateUpBatchForTest.Store(true)
+	return func() { disableExpertGateUpBatchForTest.Store(false) }
+}
 
 func closeMoEFloat(t *testing.T, name string, got, want float32) {
 	t.Helper()
@@ -457,6 +467,109 @@ func TestFusedExpertWeightQuantizedViewsAddressEachExpertPlane(t *testing.T) {
 						t.Fatalf("%s fused %s row %d = %v, want %v (diff %g, limit %g)", typ, tc.name, i, tc.got[i], tc.want[i], diff, limit)
 					}
 				}
+			}
+		})
+	}
+}
+
+// TestExpertMatvecGateUpBatchMatchesPerExpert checks that coalescing every
+// selected expert's gate/up projection into one dispatch
+// (expertMatvecGateUpBatchInto) produces bit-identical results to calling
+// expertMatvec2Into once per expert, for both the float and int8-activation
+// quantized paths. Rows/experts are sized well past the parallelRows
+// oversubscription threshold so chunk boundaries actually land inside and
+// across per-expert segments, not just at their edges.
+func TestExpertMatvecGateUpBatchMatchesPerExpert(t *testing.T) {
+	const (
+		input, output, experts = 512, 96, 8
+	)
+	selected := []ExpertScore{{Index: 0}, {Index: experts - 1}, {Index: 3}, {Index: 1}, {Index: 5}}
+	for _, typ := range []GGMLType{GGMLTypeQ4_K, GGMLTypeQ6_K} {
+		t.Run(typ.String(), func(t *testing.T) {
+			gate := quantExpertWeightForTest(typ, input, output, experts, int64(5000+typ))
+			up := quantExpertWeightForTest(typ, input, output, experts, int64(6000+typ))
+			x := randomExpertInput(input, int64(7000+typ))
+			for _, q8 := range []bool{false, true} {
+				t.Run(map[bool]string{true: "q8activations", false: "float"}[q8], func(t *testing.T) {
+					withQ8Activations(q8, func() {
+						var gotGate, gotUp, sums []float32
+						if !expertMatvecGateUpBatchInto(gate, up, selected, x, &sums, &gotGate, &gotUp) {
+							t.Fatalf("batched gate/up path declined %s", typ)
+						}
+						for j, choice := range selected {
+							var wantGate, wantUp, refSums []float32
+							if !expertMatvec2Into(gate, up, choice.Index, x, &refSums, &wantGate, &wantUp) {
+								t.Fatalf("reference per-expert path declined %s", typ)
+							}
+							for i := range wantGate {
+								if got, want := gotGate[j*output+i], wantGate[i]; got != want {
+									t.Fatalf("expert %d gate row %d = %v, want %v (exact)", choice.Index, i, got, want)
+								}
+							}
+							for i := range wantUp {
+								if got, want := gotUp[j*output+i], wantUp[i]; got != want {
+									t.Fatalf("expert %d up row %d = %v, want %v (exact)", choice.Index, i, got, want)
+								}
+							}
+						}
+					})
+				})
+			}
+		})
+	}
+}
+
+// TestSparseMoEForwardBatchedGateUpMatchesUnbatched drives the full
+// sparseMoEForward path (router, top-k, SwiGLU, down projection, weighted
+// sum) end to end on quantized Q4_K/Q6_K expert weights, comparing the
+// batched-gate/up code path against a reference run that forces the original
+// per-expert path. Confirms the optimization is invisible from the forward
+// function's actual output, not just from the isolated matvec it changes.
+func TestSparseMoEForwardBatchedGateUpMatchesUnbatched(t *testing.T) {
+	const (
+		dim, hidden, experts, used = 128, 96, 8, 4
+	)
+	rng := rand.New(rand.NewSource(4242))
+	fillF32 := func(n int) []float32 {
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = (rng.Float32()*2 - 1) * 0.05
+		}
+		return v
+	}
+	for _, typ := range []GGMLType{GGMLTypeQ4_K, GGMLTypeQ6_K} {
+		t.Run(typ.String(), func(t *testing.T) {
+			w := &SparseMoEWeights{
+				Router:        Weight{F32: fillF32(experts * dim)},
+				Gate:          quantExpertWeightForTest(typ, dim, hidden, experts, int64(8000+typ)),
+				Up:            quantExpertWeightForTest(typ, dim, hidden, experts, int64(9000+typ)),
+				Down:          quantExpertWeightForTest(typ, hidden, dim, experts, int64(10000+typ)),
+				NormalizeTopK: true,
+				Scale:         1,
+				ExpertUsed:    used,
+			}
+			x := randomExpertInput(dim, int64(11000+typ))
+			for _, q8 := range []bool{false, true} {
+				t.Run(map[bool]string{true: "q8activations", false: "float"}[q8], func(t *testing.T) {
+					withQ8Activations(q8, func() {
+						batchedBuf := &DecodeBuffer{}
+						sparseMoEForward(w, x, batchedBuf)
+
+						refBuf := &DecodeBuffer{}
+						restore := forceExpertGateUpBatchDisabledForTest(t)
+						defer restore()
+						sparseMoEForward(w, x, refBuf)
+
+						if len(batchedBuf.Proj) != len(refBuf.Proj) {
+							t.Fatalf("Proj length = %d, want %d", len(batchedBuf.Proj), len(refBuf.Proj))
+						}
+						for i := range refBuf.Proj {
+							if got, want := batchedBuf.Proj[i], refBuf.Proj[i]; got != want {
+								t.Fatalf("Proj[%d] = %v, want %v (exact)", i, got, want)
+							}
+						}
+					})
+				})
 			}
 		})
 	}
