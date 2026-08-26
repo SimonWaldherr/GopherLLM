@@ -2,26 +2,18 @@
 
 [![DOI](https://zenodo.org/badge/1264366305.svg)](https://doi.org/10.5281/zenodo.21197831)
 
-GopherLLM is a local GGUF inference engine written in Go. It runs models directly
-in-process and can be used on its own through the Go package or CLI: no Ollama,
-llama.cpp, LM Studio, RustyLLM, HTTP server, or browser UI is required. One-shot
-prompts, interactive REPL sessions, embeddings, model inspection, and benchmark runs
-all use that engine.
-
-The bundled HTTP server and browser chat are optional ways to expose the engine. They
-also integrate with an existing OpenAI-compatible inference server, so GopherLLM can
-be used beside Ollama, llama.cpp, LM Studio, RustyLLM, or a hosted provider when that
-server exposes the compatible chat API.
+GopherLLM is a local GGUF inference engine written in Go. It loads and runs models
+directly in the calling process, with no external runtime or child process
+required. The Go package and CLI cover generation, streaming chat, embeddings,
+tokenization, model inspection, compression, and benchmarks.
 
 **[Project website](https://simonwaldherr.github.io/GopherLLM/)** ·
-**[Go package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM)**
+**[Go package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM)** ·
+**[Demo application documentation](server/README.md)**
 
 ## Contents
 
 - [Features](#features)
-- [Engine first: standalone or connected](#engine-first-standalone-or-connected)
-- [Use cases](#use-cases)
-- [Example AI integrations](#example-ai-integrations)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
@@ -30,8 +22,6 @@ server exposes the compatible chat API.
 - [CLI Usage](#cli-usage)
 - [GGUF Analyzer](#gguf-analyzer)
 - [Model Compression](#model-compression)
-- [Server](#server)
-- [Tool Use / Agentic](#tool-use--agentic)
 - [Auto Mode (hardware autotuning)](#auto-mode-hardware-autotuning)
 - [Benchmarking and Profiling](#benchmarking-and-profiling)
 - [Make Targets](#make-targets)
@@ -56,122 +46,15 @@ server exposes the compatible chat API.
 - Temperature, top-k, top-p, and min-p sampling with a repetition penalty.
 - OpenAI-compatible tool/function calling, with a native prompt format for
   Mistral-family models and a generic convention for everything else.
-- Optional Wikipedia and Wikidata research tools, including bounded read-only
-  SPARQL queries, resolved server-side into the model's answer.
 - Chain-of-thought extraction (`<think>` blocks, gpt-oss channels) into a
   separate `reasoning_content` field instead of leaving it in the answer text.
-- Skills: point `--skills-dir` at a folder of `SKILL.md` files and the server
-  resolves the model's `load_skill` calls itself, agentically, before replying.
 - CLI generation, REPL mode, embeddings, metadata inspection, and tensor listing.
-- HTTP API with `/generate`, `/v1/chat/completions`, `/v1/completions`,
-  `/v1/embeddings`, `/v1/skills`, `/api/generate`, `/api/chat`, and `/api/embeddings`.
-- Optional browser chat UI served from the embedded `web_ui` assets, with
-  persistent local conversations and a template-aware smart context window.
 - Model discovery across the complete local LM Studio model library.
 - Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
   private/gated-model tokens, and revision selection.
 - `--compress`: requantize any GGUF to Q8_0/Q4_0/Q4_K/Q5_K/Q6_K in place, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
-
-## Engine first: standalone or connected
-
-GopherLLM is an inference engine first, not a web-UI wrapper around another
-runtime. The module-root `gopherllm` package loads and executes GGUF models in
-the calling process. The CLI uses that same engine, and applications can embed
-it without starting a local service or spawning a child process.
-
-| If you want to… | Use GopherLLM as… | What is optional |
-| --- | --- | --- |
-| Run a local GGUF directly | a Go library or CLI | UI, HTTP server, Ollama, llama.cpp, LM Studio, RustyLLM, and any other runtime |
-| Add local inference to an application | the importable `gopherllm` package | GopherLLM's bundled server and chat UI |
-| Expose a loaded GopherLLM model to clients | the optional `server` package / CLI server | a separate inference server; GopherLLM provides OpenAI- and Ollama-compatible endpoints itself |
-| Keep the GopherLLM chat workspace while using an existing runtime | the optional OpenAI-compatible remote-chat proxy | a local GGUF in GopherLLM; configure Ollama, llama.cpp, LM Studio, RustyLLM, or another compatible upstream instead |
-
-An external runtime is therefore an integration choice, not a prerequisite or
-replacement for the core engine. See [Use as a Go Library](#use-as-a-go-library)
-for direct embedding and [OpenAI-compatible remote APIs](#openai-compatible-remote-apis)
-for the optional upstream path.
-
-## Use cases
-
-GopherLLM is useful wherever a model should run close to the data and remain
-under the operator's control:
-
-- **Private everyday assistant:** run chat, drafting, summarization, and
-  translation locally; browser conversations remain in the browser unless
-  server history is explicitly enabled.
-- **Developer copilot:** use the coding workflow for review, debugging,
-  implementation plans, and repository-aware skills. The optional AgentOS
-  panel keeps command execution behind the server policy and an approval step.
-- **Research and fact checking:** enable the research workflow to combine the
-  local model with bounded Wikipedia/Wikidata/OpenStreetMap lookups and, when
-  configured, semantic search over saved conversations. Retrieved evidence is
-  kept separate from model inference so uncertainty remains visible.
-- **Documents and operations:** batch-process CSV/TSV, JSONL, Markdown,
-  XLSX/ODS, and text files with one prompt, then export JSON, CSV, or Markdown
-  results. The structured-extraction workflow is tuned for consistent output.
-- **Vision and live assistance:** compatible Pixtral/Ministral models can
-  describe uploaded images, webcam frames, or a shared screen. Camera and
-  screen sources both support continuous live analysis; the vision workflow
-  keeps prompts short and grounded, while the live panel exposes frame size,
-  pause, latest-answer, and history controls for latency-sensitive use. An
-  explicitly armed local sound alert can emit a short browser beep when the
-  model marks a clearly visible danger with `[ALERT]`.
-- **Operational intake and triage:** use the extraction workflow for
-  ticket classification, warranty checks, complaint handling, and other
-  structured workflows where the model should ask for missing fields, keep
-  the conversation on task, and produce a consistent next step.
-- **Local service or embedded app:** use the OpenAI- and Ollama-compatible
-  endpoints from an existing client, or import the Go package directly. The
-  same model can be tuned once and served without a cloud dependency.
-
-In the browser chat, **Settings → Model & chat → Use-case workflow** applies a
-task-focused starting point for sampling, context handling, tools, and persona.
-It never prevents manual adjustment; selecting **Custom / current settings**
-keeps the current values.
-
-## Example AI integrations
-
-For the local pool/spa operator-assistance proof of concept—including its
-safety limits, research notes, and the substantial work still required for a
-product—see [Pool Lifeguard Assist](examples/pool-lifeguard-assist/README.md).
-For a fictional local customer-support workflow with human review, see
-[Complaints Assistant](examples/complaints-assistant/README.md).
-Further direct-package examples are available for
-[local image inspection](examples/vision-inspector/README.md),
-[JSONL ticket triage](examples/ticket-triage/README.md), an
-[application-owned reply service](examples/embedded-reply-service/README.md),
-and [every model source at once](examples/model-sources/README.md) — a model
-directory, an existing Ollama store, and the Hugging Face Hub, all converging
-on the same local `.gguf` path.
-
-The examples below are demo patterns, not production safety systems. They are
-useful for prototyping, operator assistance, and product exploration, but they
-still need policy, human review, logging, escalation rules, and domain-specific
-validation before you rely on them in a real deployment.
-
-GopherLLM works well when the model sits inside a real workflow rather than a
-generic chat box. A few examples are already well matched to the built-in
-vision and extraction paths:
-
-- **Safety camera / live triage:** ask the model to watch a webcam or screen
-  feed for emergency signals such as drowning, crowding, smoke, fire, collapse,
-  or obvious distress. Keep the prompt short, insist on visible evidence only,
-  and let the model return a one-line status plus an escalation flag.
-- **Support and complaints:** present the customer with their recent orders,
-  ask for the affected product, purchase date, price, and a short free-text
-  description, then have the model classify the case, draft the reply, and
-  suggest first-line troubleshooting steps such as restart, another cable, or
-  checking power and charging behavior. If the device smells burnt or gets
-  unusually hot while charging, the model should escalate immediately and
-  warn not to keep charging it.
-- **Image context strategy:** the Live vision **Context** control offers a
-  low-latency current frame or a timestamped five-frame timeline. The timeline
-  samples the real camera or screen stream once per second and keeps only its
-  five newest samples; it is not five 25-fps frames and it is not a history of
-  earlier AI requests. The collage gives a prototype model limited temporal
-  context for visible motion and state changes, not reliable event detection.
 
 ## Requirements
 
@@ -194,24 +77,20 @@ variable (see [Make Targets](#make-targets)) that `make` targets use to fill in
 
 The checked-in Go module intentionally has no third-party dependencies: its
 `go.mod` contains only this module and the Go version, and `make deps-check`
-enforces that policy. The embedded chat UI is self-contained as well: by default
-it loads no packages, fonts, or scripts, and its `script-src` stays `'self'`.
-The single exception is opt-in per request — `?mermaid=jsdelivr` (or `unpkg`,
-`cdnjs`) on the chat page loads a diagram renderer from that one operator-chosen
-origin, and widens the CSP by exactly that origin. It is a query parameter
-rather than the default because embedding ~2.8 MB of Mermaid in every binary,
-for a feature most sessions never use, is the worse trade.
+enforces that policy.
 
 The module-root Go files form the public `gopherllm` package, so core package
 sources remain there to preserve the stable import path
 `github.com/SimonWaldherr/GopherLLM`. Architecture-specific kernel dispatch and
 assembly are consolidated into `kernels_<arch>.go` / `kernels_<arch>.s`
 instead of being spread across one file per operation. Executable entry points
-live in `cmd/`, HTTP code and UI assets in `server/`, generated tables and
-other implementation details in `internal/`, and test-only fixtures—including
-preserved profiling captures—in `testdata/`. Public-boundary and opt-in local
-model tests live in `integration/`. Build output and local model/RAG data are
-ignored and are not part of the repository.
+live in `cmd/`, generated tables and other implementation details in `internal/`,
+and test-only fixtures—including preserved profiling captures—in `testdata/`.
+Public-boundary and opt-in local model tests live in `integration/`. Build output
+and local model/RAG data are ignored and are not part of the repository.
+
+The optional demo application is documented separately in
+[server/README.md](server/README.md).
 
 ## Quickstart
 
@@ -264,11 +143,6 @@ automatically, and it contains no access tokens.
     "prepare_quant": true,
     "timeout": "2m"
   },
-  "server": {
-    "address": "127.0.0.1:8080",
-    "chat": true,
-    "max_connections": 16
-  },
   "huggingface": {"offline": true}
 }
 ```
@@ -298,7 +172,8 @@ branch, tag, or commit after `@`:
 
 ```sh
 bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M --repl
-bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main --serve 127.0.0.1:8080 --chat
+bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main \
+  --prompt "Explain local inference." --max-tokens 128
 ```
 
 Explore a repository first when you do not know its available quantizations:
@@ -363,17 +238,15 @@ gopherllm.AnalyzeGGUF(model.GGUF(), model.Tokenizer()).WriteText(os.Stdout)
 
 ### Package layout
 
-The root package is inference only. HTTP serving and the embedded web UI live
-in the `server` subpackage, so importing GopherLLM to run a model does not pull
-in `net/http`, `html/template`, or the web assets:
+The root package is inference only. Its import closure excludes the optional
+demo application and its UI assets:
 
 | Import | You get | Transitive deps |
 |---|---|---|
 | `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 90 |
 | `github.com/SimonWaldherr/GopherLLM/huggingface` | Hub search, variant listing, and `owner/repo` → local GGUF resolution | 192 |
-| `github.com/SimonWaldherr/GopherLLM/server` | the above **plus** the OpenAI-/Ollama-compatible HTTP API and the `/chat` web UI | 213 |
 
-`TestInferencePackageStaysFreeOfServerDependencies` enforces the boundary
+`TestInferencePackageStaysFreeOfServerDependencies` enforces that boundary
 against the real dependency graph, so it cannot regress silently.
 
 Those counts are all standard library — the module has no `require` block, no
@@ -421,58 +294,15 @@ entries, err := gopherllm.DiscoverOllamaModelsDefault(os.Stderr)
 ```
 
 `--list-models` includes them automatically. Set `OLLAMA_MODELS` when the store
-is not at `~/.ollama/models`. This is the third side of the Ollama integration:
-GopherLLM already serves Ollama-compatible endpoints and can proxy to an Ollama
-server, and now reuses its local models too.
-
-For applications that expose the model over HTTP themselves, the entire
-OpenAI-/Ollama-compatible API mounts as a plain `http.Handler` — under any
-router, prefix, or middleware stack:
-
-```go
-import "github.com/SimonWaldherr/GopherLLM/server"
-
-mux.Handle("/llm/", http.StripPrefix("/llm",
-    server.HandlerForModel(model, server.HandlerOptions{Defaults: gopherllm.DefaultGenerationOptions()})))
-```
-
-`server.NewHandler` returns a closeable `*server.Handler`. Hosts that enable
-model hot-swapping should stop their HTTP server and then call
-`handler.Close()` so the current chat and embedding GGUF mappings are released;
-`server.Serve` does this automatically when it returns.
-
-> **Moved in this release.** `gopherllm.Serve`, `gopherllm.NewHandler`,
-> `gopherllm.HandlerOptions`/`ServeOptions` and the request/response types are
-> now `server.*`, and `model.HTTPHandler(opts)` is now
-> `server.HandlerForModel(model, opts)`. Inference APIs are unchanged.
+is not at `~/.ollama/models`. This lets an embedder reuse existing local model
+files without another download.
 
 The library never writes to stdout/stderr on its own; pass
-`gopherllm.WithLogWriter(os.Stderr)` (or `HandlerOptions.LogWriter`) to opt
-into diagnostics. Tool calling, reasoning extraction, and skills are available
-via `WithTools`, `Result.ReasoningText`, and `RunAgenticChat` — see the godoc
-and the runnable examples in `example_test.go`; `testdata/consumer` is a
-complete external application using the API.
-
-### Native Go research tools
-
-Go hosts can choose the same bounded factual source tools without running a
-separate process or exposing an HTTP endpoint. No source is enabled by default:
-
-```go
-tools := server.NewResearchTools(server.ResearchOptions{
-    Wikimedia:     true,
-    OpenStreetMap: true,
-})
-result, err := gopherllm.RunAgenticChatWithTools(
-    model.Runner(), []gopherllm.ChatMessage{gopherllm.UserMessage("Where is the Brandenburg Gate?")},
-    gopherllm.DefaultGenerationOptions(), nil, tools, nil,
-)
-```
-
-`ResearchOptions` can enable Wikipedia/Wikidata and a bounded OpenStreetMap
-place lookup independently. Every result carries a source URL and attribution.
-For a self-hosted Nominatim-compatible service, set `OSMSearchURL` instead of
-using the public endpoint.
+`gopherllm.WithLogWriter(os.Stderr)` to opt into diagnostics. Tool calling,
+reasoning extraction, and agentic runs are available via `WithTools`,
+`Result.ReasoningText`, and `RunAgenticChat`; see the godoc and runnable
+examples in `example_test.go`. `testdata/consumer` is a complete external
+application using the API.
 
 ## Build
 
@@ -536,7 +366,7 @@ bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --repl
 ```
 
-Run with a [skill](#tool-use--agentic) available (one-shot or REPL alike):
+Run with a local skill available (one-shot or REPL alike):
 
 ```sh
 bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
@@ -644,413 +474,6 @@ landed yet.
 The same feature is available in the library as `gopherllm.CompressModel`
 and `gopherllm.ParseCompressFormat`.
 
-## Server
-
-Start the API server with the embedded chat UI:
-
-```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
-  --model "model-name-or-file-fragment" \
-  --serve 127.0.0.1:8080 \
-  --chat
-```
-
-Open `http://127.0.0.1:8080/chat` for the browser UI.
-
-### Deployment profiles
-
-Choose an explicit server profile when starting the chat UI. The profile is
-enforced by the HTTP server; hiding a control in the browser is never the only
-protection.
-
-| Profile | Intended use | Inference and control boundary |
-| --- | --- | --- |
-| `local` (default) | One person on one laptop | The listener must use a loopback address. The owner can select models, download, tune, and change settings. |
-| `managed` | Shared server | Users can generate replies. Model changes, downloads, embedding-model loads, tuning, remote credentials, and agentic OS actions require the administrator token. |
-| `browser` | Server-hosted web app with on-device inference | The server serves the UI and WASM runtime only. Each browser tab picks and runs its own GGUF with WASM/WebGPU; server inference and its model controls are disabled. |
-
-Personal/local setup:
-
-```sh
-bin/gopherllm --model-dir /path/to/models --serve 127.0.0.1:8080 --chat \
-  --deployment local
-```
-
-Managed server setup (put the token file under the service account with
-restricted permissions):
-
-```sh
-bin/gopherllm --model-dir /srv/gopherllm/models --model my-model \
-  --serve 0.0.0.0:8080 --chat --deployment managed \
-  --admin-token-file /etc/gopherllm/admin-token
-```
-
-The administrator can paste that token into the **Server administration**
-section of the chat UI for the current tab, or send it as
-`X-GopherLLM-Admin-Token` / `Authorization: Bearer ...` to the API. The token
-is not written into browser storage, URLs, logs, or `--print-config` output.
-Use HTTPS and normal user authentication at a reverse proxy before exposing a
-managed server to a network: the built-in token protects operational controls,
-not end-user identity or transport security.
-
-Browser-only setup:
-
-```sh
-make wasm-build
-bin/gopherllm --serve 0.0.0.0:8080 --deployment browser --wasm-dir ./bin
-```
-
-This profile deliberately rejects a server-side `--model`: the browser opens a
-GGUF selected from the user's device and runs it there. Prompts, images, and
-model bytes are not sent to GopherLLM's inference API. WebGPU, camera, and
-screen capture require HTTPS outside `localhost`.
-
-The CLI remembers every successfully loaded **local** GGUF, whether it was
-used for a one-shot prompt, REPL, benchmark, server startup, or selected
-through the browser/API model picker. Later commands can omit the model
-selector entirely; an explicit selector always wins. For example, restart a
-server with:
-
-```sh
-bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
-  --serve 127.0.0.1:8080 --chat
-```
-
-The remembered absolute path is stored as `last-model.json` below the
-platform's per-user configuration directory (override with
-`GOPHERLLM_MODEL_STATE_PATH`). Only the first run, a removed model, or an
-unreadable state file can therefore start a server without weights. In that
-case, choose a discovered GGUF in the browser's model picker or with
-`POST /models/load`; the successful load immediately repairs the remembered
-selection.
-
-### OpenAI-compatible remote APIs
-
-GopherLLM never needs a separate inference server to run its own GGUF engine.
-When an existing runtime is already part of a deployment, its optional server
-can instead proxy `/v1/chat/completions` to an OpenAI-compatible upstream. This
-lets the GopherLLM chat UI and API sit alongside OpenAI or local servers such
-as Ollama, llama.cpp, LM Studio, and RustyLLM, provided the selected upstream
-offers that API shape. This proxy is intentionally a chat route; local GGUF
-generation, embeddings, and the other engine features remain available without
-an upstream.
-
-Configure it on the trusted local server; the key is kept only in server memory
-and is never returned by the configuration endpoint:
-
-```sh
-curl http://127.0.0.1:8080/remote \
-  -H 'Content-Type: application/json' \
-  -d '{"base_url":"http://127.0.0.1:11434","model":"llama3.2"}'
-```
-
-For OpenAI, use `{"base_url":"https://api.openai.com/v1","api_key":"…","model":"…"}`.
-The configured remote becomes the target for `/v1/chat/completions`; use
-`DELETE /remote` to switch back to the local model. `GET /remote/models`
-lists models advertised by the remote service.
-
-The chat UI is a local workspace rather than a thin request form: conversations,
-drafts, per-chat instructions, sampling settings, and the selected appearance
-are saved in the browser's IndexedDB. It supports chat search, rename/delete,
-non-destructive edit and retry branches, local text-file insertion, and
-JSON/Markdown export. Editing an earlier prompt or retrying an answer opens a
-new local branch while retaining the original conversation for comparison.
-Every assistant answer also has an under-text **Copy message** action and a
-**Change model** action; changing the model creates a comparison branch and
-automatically asks the same question again while preserving the original. The
-**Model & chat** settings page presents discovered GGUFs as a searchable
-two-column library with architecture, file size, context length, compatibility,
-load progress, and the currently active model visible at a glance. Unsupported
-or auxiliary GGUFs stay hidden unless requested, and the model name in the chat
-header opens this picker directly.
-Nothing is synced to a third party; exported archives are the portable backup
-format. The UI assets use no-store and same-origin security headers, so start
-the server on a trusted local address unless you add your own network security
-in front of it.
-
-Important conversations can be pinned with the star button in the local
-sidebar. Pinned chats stay above normal history and are preferred when the
-bounded history cleanup removes old chats; they remain part of the same
-browser-local export/import workspace.
-
-Browser storage is the default and remains private to that browser profile.
-For a shared device workspace, start the server with
-`--chat-history ./gopherllm-chats.json.gz` (or set
-`server.chat_history_path` in the JSON config), then select **GopherLLM server**
-under Settings → Workspace → Chat data. The server stores a compact gzip file,
-writes it atomically with mode `0600`, limits the uncompressed workspace to
-64 MiB, and uses ETags to reject stale writes from another tab. The server
-store is intentionally opt-in and has no authentication; bind it to a trusted
-local address or put authentication/TLS in front of it before sharing it.
-
-The composer keeps the default path deliberately small: write a message,
-attach files, and send. **Pro tools** reveals quick controls for context mode,
-output length, and slash commands; the complete configuration remains in
-Settings. The Settings dialog separates **Model & chat**, **Capabilities**,
-**Generation**, and **Workspace** into keyboard-accessible tabs so common model
-switching stays close while advanced sampling and storage controls do not
-compete for attention. The model library and tab bar collapse cleanly on narrow
-screens, and the mobile header wraps its actions below the chat title instead
-of clipping them. Any file type can be attached. Text files up to 500 KB are
-included as text in the model request; `.xlsx` and `.ods` attachments are
-parsed by the local server and included as bounded tabular text. Other
-non-text files (images, audio, video, PDFs, archives, and other binaries) stay
-local to the browser and are shown as attachment cards. With the built-in
-text-only server, their filename, type, and size are sent as metadata rather
-than pretending that binary content was analysed.
-
-With **Power commands** enabled, `/goal` supports `--rounds 2..8` and an
-optional `--focus "…"` rubric. `/review` audits the current conversation for
-gaps, security/privacy risks, and prioritized fixes; `/plan` turns it into an
-ordered, testable implementation plan. Their intermediate prompts are stored
-as normal local/server history, while the model receives an explicit
-untrusted-reference boundary.
-
-Batch mode accepts JSON arrays/JSONL, CSV/TSV, Markdown chapters, plain text,
-and spreadsheet files. `.xlsx` and `.ods` are parsed by the local Go server
-with bounded XML/ZIP expansion; legacy binary `.xls` files should be converted
-to `.xlsx` first. No spreadsheet content is sent to a third party.
-
-### Smart context for long chats
-
-The browser UI defaults to **Smart — recent complete turns**. It retains the
-entire conversation in IndexedDB, but when sending a reply it asks the server
-to select the newest complete turns that fit the loaded model's *actual* chat
-template and token budget. Leading system instructions stay pinned; an
-assistant tool call and its tool results stay with the user turn that caused
-them. The latest turn is never cut mid-message: if it alone cannot fit after
-reserving `max_tokens`, the request returns a clear error instead.
-
-The Settings panel reports the exact prompt token count and how many earlier
-messages remain saved locally. **Auto-compress — dense technical context**
-first condenses ordinary user, system, and assistant text with conservative
-terminology/abbreviation substitutions (for example, `application programming
-interface` → `API` and `zum Beispiel` → `z. B.`). It uses the condensed form
-only when the active model's tokenizer confirms that it is shorter, preserves
-tool payloads and fenced code unchanged, then applies the same complete-turn
-selection as Smart context. Choose **Full history — stop when full** for a
-strict, untrimmed transcript. This is also the default for normal API clients;
-the local extension is opt-in on `/v1/chat/completions`:
-
-```json
-{
-  "gopherllm_context_mode": "autoCompress"
-}
-```
-
-For a non-streaming recent-context request, the response includes
-`X-GopherLLM-Context-*` headers (`Mode`, `Budget`, `Prompt-Tokens`,
-input/retained/dropped message counts) and a `gopherllm_context` object. For
-streaming requests, that object is carried by the terminal SSE choice instead,
-so it always describes the final model call even after an internal skill/tool
-loop. Allowed values are `recent`, `autoCompress`, and `full`.
-
-### Model context cache
-
-While a local server stays running, it retains one bounded **KV prefix cache**
-for the most recently used rendered prompt. The browser still sends its normal
-chat history, preserving the stateless OpenAI-compatible API, but the runner
-compares the exact rendered token IDs and forwards only the changed suffix to
-the model. Consecutive long-chat turns therefore avoid reprocessing their
-unchanged context; edits and branches safely reuse only the unchanged prefix.
-
-The cache reuses the normal generation workspace, grows geometrically for
-follow-up turns, and is capped at 512 MiB rather than allocating one KV cache
-per saved chat. It is memory-only and naturally cold after a server/model
-restart (or when a context is too large to retain). Responses expose the
-measured result as `gopherllm_cache` with `mode`, `hit`, `reused_tokens`, and
-`prompt_tokens`; streaming responses carry it in the terminal SSE choice. The
-browser UI shows the same information as cache warming or reuse, separately
-from Smart Context's message-selection status.
-
-The runner also retains an immutable, vocabulary-sized snapshot of the prompt
-logits before sampling. An exactly repeated prompt can therefore reuse every
-input token without re-running the final prompt token through the transformer.
-Logit, generated-token, repeat-window, and streaming buffers are retained in
-the bounded runner workspace to reduce allocation and garbage-collection work
-across requests.
-
-OpenAI-compatible completion responses also report the reused portion as
-`usage.prompt_tokens_details.cached_tokens` (zero on a cold request).
-When `stream_options.include_usage` is enabled, streaming chat completions emit
-the standard final usage chunk with an empty `choices` array.
-
-Minimal OpenAI-compatible chat request:
-
-```sh
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [{"role": "user", "content": "Write a haiku about Go."}],
-    "max_tokens": 64,
-    "temperature": 0.7
-  }'
-```
-
-Streaming is supported on `/v1/chat/completions` by setting `"stream": true`.
-
-### Endpoints
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET | `/health` | Liveness + loaded model id |
-| POST | `/generate` | Native generation API (prompt or messages; accepts tools) |
-| POST | `/v1/chat/completions` | OpenAI-compatible chat (streaming, tools, reasoning) |
-| POST | `/v1/completions` | OpenAI-compatible text completion |
-| POST | `/v1/embeddings` | OpenAI-compatible embeddings (uses the dedicated embedding model when loaded) |
-| GET | `/v1/models` | OpenAI-compatible model listing (the loaded model) |
-| GET | `/v1/skills` | Names + descriptions of configured skills |
-| POST | `/api/generate` | Ollama-compatible generation |
-| POST | `/api/chat` | Ollama-compatible chat (accepts tools) |
-| POST | `/api/embeddings` | Ollama-compatible embeddings (uses the dedicated embedding model when loaded) |
-| GET | `/models` | Scan `--model-dir` and list discovered GGUFs, including each model's context length |
-| POST | `/models/load` | Hot-swap to a supported GGUF discovered under `--model-dir` (`{"model": "<catalog-id>"}`; response includes the loaded context length) |
-| POST | `/models/embed/load` | Load a compatible embedding GGUF for history RAG and all embedding APIs (`{"model": "<catalog-id>"}`); BERT, Nomic-BERT, and Granite Embedding models are supported |
-| GET / POST / DELETE | `/remote` | Inspect, configure, or clear an OpenAI-compatible chat proxy (the API key is write-only) |
-| GET | `/remote/models` | List models advertised by the configured remote API |
-| GET | `/autotune` | Report Auto Mode status: whether a tuning is active this session, whether one is cached on disk for this model+machine, and the result either way |
-| POST | `/autotune/run` | Run (or apply a cached) tuning for the loaded model, same effort levels as `--auto-effort` (`{"effort": "quick\|balanced\|thorough", "refresh": false}`) |
-| GET | `/chat`, `/style.css`, `/script.js` | Embedded browser chat UI (with `--chat`) |
-| GET | `/chat/storage` | Report whether opt-in server history is configured |
-| GET / PUT / DELETE | `/chat/workspace` | Read, atomically replace, or clear the configured server workspace |
-| POST | `/batch/parse` | Parse a local `.xlsx` or `.ods` upload into bounded batch rows (no model required) |
-
-## Tool Use / Agentic
-
-`/v1/chat/completions` (and the native `/generate` and Ollama-compatible
-`/api/chat` endpoints) accept an OpenAI-shaped `tools` array. `/api/generate`
-and `/v1/completions` don't (matching the real OpenAI/Ollama APIs, where tools
-are chat-only), but skills (below) still apply there since those are a
-server-side capability independent of any client-supplied `tools`:
-
-```sh
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [{"role": "user", "content": "What is the weather in Berlin?"}],
-    "tools": [{"type": "function", "function": {
-      "name": "get_weather",
-      "description": "Get the current weather for a city",
-      "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
-    }}]
-  }'
-```
-
-A model that decides to call the tool returns `finish_reason: "tool_calls"` and
-a `message.tool_calls` array (`content` is `null` when the turn is only a tool
-call). Continue the conversation by appending the assistant's tool-call
-message and a `role: "tool"` message with the result:
-
-```json
-{"role": "assistant", "tool_calls": [{"id": "…", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Berlin\"}"}}]},
-{"role": "tool", "tool_call_id": "…", "content": "{\"temperature_c\": 18, \"conditions\": \"sunny\"}"}
-```
-
-Rendering is native (`[AVAILABLE_TOOLS]`/`[TOOL_CALLS]`/`[TOOL_RESULTS]`,
-verified directly against a real Ministral GGUF's `chat_template`) for
-Mistral-family models, and a generic `<tool_call>{"name":...,"arguments":...}</tool_call>`
-JSON convention for every other supported chat template. gpt-oss tool calling
-is not yet implemented (only its reasoning channels are, see below).
-
-Set `"tool_choice": "none"` to suppress tool offering (and skills, see below)
-for a single request.
-
-### Reasoning
-
-Models that emit `<think>...</think>` chain-of-thought (DeepSeek-R1, QwQ,
-etc.) have it split out of the answer and returned separately as
-`reasoning_content` on the message (and as `delta.reasoning_content` when
-streaming), rather than left mixed into the visible text. gpt-oss's
-analysis/final channels are parsed the same way, though gpt-oss generation
-currently still forces the final channel directly in the prompt — see the
-comment on `renderGptOssMessages` for how to unlock full channel-based
-reasoning once validated against a real gpt-oss GGUF.
-
-### Skills
-
-Point `--skills-dir` at a directory of skills, Claude-Agent-Skills style —
-a name and one-line description are always visible to the model (via a
-`load_skill` tool), and the full body is only loaded into context once the
-model actually asks for it:
-
-```text
-skills/
-  pdf-fill/SKILL.md
-  git-review/SKILL.md
-```
-
-```markdown
----
-name: pdf-fill
-description: Fill out a PDF form given field values.
----
-Full instructions the model receives once it loads this skill...
-```
-
-When skills are configured, every generation endpoint runs an agentic loop
-server-side: if the model calls `load_skill`, the server resolves it
-internally (feeding the skill body back as a tool result and letting the
-model continue) before ever returning a response — the client never sees the
-internal `load_skill` call. A `GET /v1/skills` endpoint lists the configured
-skills' names and descriptions. Tool calls for anything else (i.e. tools the
-*caller* supplied) are returned to the caller as usual, even with skills
-configured. `--skills-dir` works the same way in one-shot/`--repl` CLI mode.
-
-### Wikipedia and Wikidata research
-
-The browser chat can opt into **Wikipedia & Wikidata research** from
-**Options** (or the chat settings). The setting is saved per chat and defaults
-to off: when enabled, only a search term, article title, Wikidata Q-ID, or
-read-only SPARQL query requested by the model is sent to Wikimedia. The full
-chat transcript is never sent to Wikimedia.
-
-The server executes four bounded tools and feeds their JSON results back into
-the same agentic turn, so the model can use the data in its final response:
-
-- `wikipedia_search` uses Wikipedia's REST search endpoint.
-- `wikipedia_summary` retrieves a concise article summary and canonical URL.
-- `wikidata_entity` retrieves labels, descriptions, and a small set of claims
-  for one Q-ID through the Wikidata Action API.
-- `wikidata_sparql` runs read-only `SELECT`/`ASK` queries against the Wikidata
-  Query Service; updates and `SERVICE` calls are rejected, responses are
-  capped at 25 rows.
-
-API clients enable the same integration per request with
-`"gopherllm_wikimedia": true` on `/v1/chat/completions`, `/generate`,
-`/api/chat`, or `/api/generate`. Set `tool_choice` to `none` to suppress it.
-Results include their Wikimedia source URL or query endpoint; answers should
-attribute factual claims to those results.
-
-### OpenStreetMap place research
-
-The browser chat can separately enable **OpenStreetMap place research** in
-**Options → Tools & agents**. API clients use
-`"gopherllm_openstreetmap": true` on the same chat and generation endpoints.
-It is off by default. Only the bounded place query selected by the model is
-sent to the configured Nominatim endpoint; the chat transcript is not sent.
-Results include OpenStreetMap attribution and an object URL.
-
-The default public Nominatim service is intentionally restricted to direct,
-low-volume place lookups: GopherLLM enforces at most one request per second and
-does not offer autocomplete or bulk geocoding. Do not send personal or
-confidential data. Operators with a larger workload should configure their own
-compatible endpoint with `server.HandlerOptions{OSMSearchURL: "..."}`. See the
-[Nominatim usage policy](https://operations.osmfoundation.org/policies/nominatim/).
-
-### Privacy report
-
-Local model inference does not make network requests and GopherLLM has no
-telemetry. Inspect the complete contract with:
-
-```sh
-gopherllm --privacy
-curl http://127.0.0.1:8080/privacy
-```
-
-The report names every feature that can send data externally, its destination,
-and the limited data it may send. Hugging Face imports, remote model proxies,
-and factual research sources remain opt-in.
-
 ## Auto Mode (hardware autotuning)
 
 `--auto` measures **this model on this machine** at startup and runs it with the
@@ -1074,8 +497,8 @@ Auto: calibrated in 7.9s
 ```
 
 The result is **cached per model + hardware** under the user cache directory, so
-only the first run pays for calibration. It applies to every mode — one-shot,
-`--repl`, `--serve`, and `--bench`.
+only the first run pays for calibration. It applies to one-shot generation,
+`--repl`, and `--bench`.
 
 | Flag | Effect |
 | --- | --- |
@@ -1086,30 +509,14 @@ only the first run pays for calibration. It applies to every mode — one-shot,
 | `--auto-refresh` | Re-measure and overwrite the cached result |
 | `--auto-json` | Print the full result — including every candidate's median — and exit |
 
-### From the web UI
-
-Auto Mode isn't just a startup flag: the embedded chat UI (`--chat`) has a
-"Performance" panel in Settings with an effort selector and a **Tune now**
-button, backed by `GET /autotune` and `POST /autotune/run` (see the endpoint
-table above). It reports whether a tuning is *active* this session versus
-merely *cached* on disk from an earlier run — useful when the server was
-started without `--auto` but a previous `--auto` run (or an earlier click of
-Tune now) already measured this model on this machine. Triggering a tune
-pauses generation until it finishes, same as the CLI: measurement and
-generation share the same runner lock.
-
 ### Makefile workflow
 
-The generation, REPL, server, and model-benchmark targets accept `AUTO=1`, so
-the same cached tuning is used regardless of how the model is started:
+The generation, REPL, and model-benchmark targets accept `AUTO=1`, so the same
+cached tuning is used regardless of how the model is started:
 
 ```sh
 # Fast first-pass calibration, then generate.
 make run MODEL="my-model.gguf" AUTO=1 AUTO_EFFORT=quick
-
-# Calibrate before exposing the local chat UI.
-make serve MODEL="my-model.gguf" CHAT=1 AUTO=1
-make serve-metal MODEL="my-model.gguf" CHAT=1 AUTO=1
 
 # Inspect the cached result (or force a fresh calibration) as JSON and exit.
 make autotune MODEL="my-model.gguf"
@@ -1118,10 +525,9 @@ make autotune MODEL="my-model.gguf" AUTO_REFRESH=1
 
 `AUTO_EFFORT` accepts `quick`, `balanced` (the default), or `thorough`.
 `AUTO_REFRESH=1` bypasses the cache. `AUTO_JSON=1` can be used with any of
-those Make targets, but it prints the tuning report and exits before generation
-or serving; `make autotune` is the convenient report-only target. The
-`run-auto`, `run-auto-metal`, `serve-auto`, and `serve-auto-metal` targets are
-shortcuts for their corresponding command with `AUTO=1`.
+those Make targets, but it prints the tuning report and exits before generation;
+`make autotune` is the convenient report-only target. `run-auto` and
+`run-auto-metal` are shortcuts for their corresponding command with `AUTO=1`.
 
 What it tunes: thread count, the int8-activation matvec kernels, the f16 KV
 cache, worker-dispatch oversubscription, and the prefill chunk size. Load-time
@@ -1211,7 +617,7 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 
 ## Make Targets
 
-- `make build`, `make run`, `make repl`, and `make serve` auto-detect Metal:
+- `make build`, `make run`, and `make repl` auto-detect Metal:
   on macOS with Xcode Command Line Tools installed, they build with
   `CGO_ENABLED=1 -tags metal` and pass `--metal` for you (a real ~1.5-2x
   decode speedup and ~10x faster load from measurements on an M2 Max).
@@ -1234,13 +640,6 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - `make run ARGS='...'` runs the CLI with a fully custom argument list instead
   (bypasses `MODEL`/`PROMPT`/sampler variables entirely).
 - `make repl MODEL=...` starts the REPL.
-- `make serve MODEL=... CHAT=1` starts the HTTP server and chat UI.
-- `make serve-metal MODEL=... CHAT=1 THREADS=8` starts the Metal server with
-  prepared CPU fallback kernels enabled by default (`PREPARE_QUANT=0` disables
-  preparation).
-- `make serve-auto MODEL=... CHAT=1` and `make serve-auto-metal MODEL=...`
-  perform startup tuning before accepting requests. Equivalently, add `AUTO=1`
-  to `run`, `repl`, `serve`, or any model benchmark target.
 - `make autotune MODEL=...` prints the cached or newly measured tuning result
   as JSON and exits; add `AUTO_REFRESH=1` to force a fresh measurement. Use
   `make autotune-metal MODEL=...` to report a Metal-enabled load.
@@ -1264,8 +663,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   coverage-html` does the same and opens an HTML report.
 - `make cross-build` compiles release binaries for macOS, Linux, and Windows on
   `amd64` and `arm64`.
-- `run`, `repl`, and `serve` all accept `SKILLS_DIR=path/to/skills` to enable
-  [skills](#tool-use--agentic); `run` and `repl` also accept `MIN_P`,
+- `run` and `repl` accept `SKILLS_DIR=path/to/skills` to enable skills; they
+  also accept `MIN_P`,
   `REPEAT_PENALTY`, and `SEED` alongside the existing `TEMP`/`TOP_P`/`TOP_K`.
 - Run `make help` for the full target and variable list.
 
@@ -1338,7 +737,7 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - `--bench-json` and `--kernel-bench-json` are intended for repeatable performance
   comparisons.
 - Metal requires a build with `CGO_ENABLED=1 -tags metal` (the plain `make
-  build`/`run`/`serve` targets do this automatically on macOS when Xcode
+  build`/`run` targets do this automatically on macOS when Xcode
   Command Line Tools are present; `make build-metal` does it explicitly
   regardless of platform detection) and must be enabled with `--metal` at
   runtime (also automatic from the `make` targets above; pass it yourself for
@@ -1517,10 +916,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   request after startup silently inherited that page-in cost (disk I/O, or on
   Windows, real-time antivirus scanning of each mapped page) inside its own
   TTFT instead of load time. For a one-shot CLI run this doesn't change total
-  wall-clock; for the HTTP server and REPL cases it means every request,
-  including the first, sees consistent latency instead of one random request
-  eating a multi-second page-in tax. Set `GOPHERLLM_NO_PREFAULT=1` to restore
-  pure lazy paging.
+  wall-clock; for a REPL or another long-running inference process it makes
+  first-use latency predictable instead of leaving one request to absorb a
+  multi-second page-in tax. Set `GOPHERLLM_NO_PREFAULT=1` to restore pure lazy
+  paging.
 
 ### Environment variables
 
@@ -1598,7 +997,7 @@ The main coverage is:
 | Other decoders | Phi-2, Phi-3/3.5, dense/sparse Granite (GraniteMoE), EXAONE 3, EXAONE 4 1.2B/32B, OLMo 2/3, InternLM2, StableLM, GPT-OSS |
 | Classic / vendor decoders | GPT-2, GPT-NeoX, GPT-J, BLOOM (ALiBi), MPT (ALiBi), Falcon, StarCoder/StarCoder2, ChatGLM, GLM4 (dense), Command-R, MiniCPM |
 | Recurrent / hybrid | Mamba2 and Nemotron-H / Nemotron-H-MoE |
-| Embeddings | BERT and Nomic-BERT (`/v1/embeddings`, not chat generation) |
+| Embeddings | BERT and Nomic-BERT (embedding generation only; not chat generation) |
 
 Important upstream GGUF families that are **not implemented yet**:
 
@@ -1754,10 +1153,10 @@ available. A sensible Gemma sampling starting point is `--temp 1.0 --top-p
 Projector files such as `mmproj-*` are detected and excluded from text-model
 selection.
 
-`bert` and `nomic-bert` are encoder-only architectures: they are available as
-embedding models for `/v1/embeddings` and history RAG, but intentionally cannot
-be selected for chat generation. This covers BERT-format Granite Embedding
-GGUFs as well as Nomic Embed GGUFs carrying `general.architecture = nomic-bert`.
+`bert` and `nomic-bert` are encoder-only architectures: they are available for
+embedding generation but intentionally cannot be selected for chat generation.
+This covers BERT-format Granite Embedding GGUFs as well as Nomic Embed GGUFs
+carrying `general.architecture = nomic-bert`.
 GGUF tokenizers declaring `tokenizer.ggml.model = bert` use native WordPiece
 normalization and greedy segmentation, including CLS/SEP boundaries and both
 llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
@@ -1778,11 +1177,10 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 | Generation orchestration + chat templates | `runtime.go` |
 | Tool calling / reasoning / skills | `agent.go`, `extract.go`, `skills.go`; wire types and helpers in `internal/tooling/` |
 | Model discovery + selection | `catalog.go` |
-| HTTP server | `server/server.go`, `server/web_ui/` |
 | CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
 
 A full architecture walkthrough — load path, inference data flow, kernel
-dispatch tiers, and how to add a quant kernel / architecture / endpoint — is
+dispatch tiers, and how to add a quant kernel or architecture — is
 in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 For a concise directory map and guidance on where new code belongs, see
@@ -1815,7 +1213,7 @@ GOPHERLLM_MODEL_SMOKE_DIR="$HOME/.cache/lm-studio/models" \
 For a slower end-to-end answer check of every supported text model below 5 GB,
 first build the CLI and then run the opt-in sweep. Embedding GGUFs are
 deliberately excluded from chat generation and remain covered by the loader
-test plus `/v1/embeddings` tests.
+test plus embedding tests.
 
 ```sh
 go build -o /tmp/gopherllm-model-sweep ./cmd/gopherllm
