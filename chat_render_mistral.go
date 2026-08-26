@@ -45,24 +45,33 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 	resultsEnd := r.mistralMarker("[/TOOL_RESULTS]")
 
 	system := strings.TrimSpace(systemPrompt)
-	loop := make([]ChatMessage, 0, len(messages))
-	for _, m := range messages {
+	lastUser := -1
+	lastNonSystem := -1
+	for i, m := range messages {
 		if m.Role == ChatRoleSystem {
 			if s := strings.TrimSpace(m.Content); s != "" {
 				system = s
 			}
 			continue
 		}
-		loop = append(loop, m)
-	}
-	lastUser := -1
-	for i, m := range loop {
+		lastNonSystem = i
 		if m.Role == ChatRoleUser {
 			lastUser = i
 		}
 	}
 
-	tokens := []uint32{}
+	tokenCap := 128 + len(messages)*16
+	if hasSysTokens {
+		tokenCap += 12
+	}
+	if len(system) > 0 {
+		tokenCap += len(system) / 4
+	}
+	if len(tools) > 0 {
+		tokenCap += 32 + len(tools)*16
+	}
+	tokens := make([]uint32, 0, tokenCap)
+
 	if r.tok.AddBOS {
 		tokens = append(tokens, r.tok.BOSID)
 	}
@@ -78,9 +87,12 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			tokens = append(tokens, r.mistralMarker("[/AVAILABLE_TOOLS]")...)
 		}
 	}
+
 	var imageEmbeds map[int][]float32
-	for i, m := range loop {
+	for idx, m := range messages {
 		switch m.Role {
+		case ChatRoleSystem:
+			continue
 		case ChatRoleAssistant:
 			if content := strings.TrimSpace(m.Content); content != "" {
 				tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
@@ -98,7 +110,7 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			// A trailing assistant message is a prefill continuation: leave
 			// the turn open (no EOS) so generation extends it — the standard
 			// way to seed a reply prefix with Mistral/Devstral models.
-			if i == len(loop)-1 && len(m.ToolCalls) == 0 {
+			if idx == lastNonSystem && len(m.ToolCalls) == 0 {
 				break
 			}
 			tokens = append(tokens, r.tok.EOSID)
@@ -108,29 +120,29 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			tokens = append(tokens, resultsEnd...)
 		default:
 			content := strings.TrimSpace(m.Content)
-			if i == lastUser && system != "" && !hasSysTokens {
+			if idx == lastUser && system != "" && !hasSysTokens {
 				content = system + "\n\n" + content
 			}
 			tokens = append(tokens, instTok)
 			if len(m.Images) > 0 {
 				if len(m.Images) > 1 {
-					return nil, nil, true, fmt.Errorf("rendering message %d: only one image per message is supported, got %d", i, len(m.Images))
+					return nil, nil, true, fmt.Errorf("rendering message %d: only one image per message is supported, got %d", idx, len(m.Images))
 				}
 				// We already hold visionMu; calling HasVision here would take a
 				// recursive RLock and can deadlock when Close is waiting for its
 				// exclusive lease.
 				if r.vision == nil {
-					return nil, nil, true, fmt.Errorf("rendering message %d: message includes an image but no vision projector is loaded for this model", i)
+					return nil, nil, true, fmt.Errorf("rendering message %d: message includes an image but no vision projector is loaded for this model", idx)
 				}
 				imgTok, ok1 := r.tok.SpecialID("[IMG]")
 				breakTok, ok2 := r.tok.SpecialID("[IMG_BREAK]")
 				endTok, ok3 := r.tok.SpecialID("[IMG_END]")
 				if !(ok1 && ok2 && ok3) {
-					return nil, nil, true, fmt.Errorf("rendering message %d: this model's vocabulary is missing the [IMG]/[IMG_BREAK]/[IMG_END] special tokens image content requires", i)
+					return nil, nil, true, fmt.Errorf("rendering message %d: this model's vocabulary is missing the [IMG]/[IMG_BREAK]/[IMG_END] special tokens image content requires", idx)
 				}
 				embeds, mergedRows, mergedCols, err := r.encodeChatImage(m.Images[0])
 				if err != nil {
-					return nil, nil, true, fmt.Errorf("rendering message %d: %w", i, err)
+					return nil, nil, true, fmt.Errorf("rendering message %d: %w", idx, err)
 				}
 				if imageEmbeds == nil {
 					imageEmbeds = make(map[int][]float32, len(embeds)+mergedRows)
