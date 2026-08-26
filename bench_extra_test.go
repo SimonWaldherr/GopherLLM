@@ -2,6 +2,7 @@ package gopherllm
 
 import (
 	"math/rand"
+	"strconv"
 	"testing"
 )
 
@@ -256,6 +257,43 @@ func BenchmarkParallelMinistralAttention_ctx1667(b *testing.B) {
 			parallelAttendHeadGroups(config, cache, buf, 0, ctx-1, 0, scale, nHeads/nKVHeads)
 		}
 	})
+}
+
+// BenchmarkParallelMinistralAttentionF16 measures the dispatch choice made by
+// ForwardBodyInto for Ministral's 32:8 GQA geometry.  The four-way f16
+// kernels reduce the per-group work substantially, so their crossover with
+// the 32 independent-head schedule is intentionally tracked separately from
+// the f32-only benchmark above.
+func BenchmarkParallelMinistralAttentionF16(b *testing.B) {
+	for _, ctx := range []int{128, 512, 1024, 1667, 2048, 4096} {
+		b.Run("ctx"+strconv.Itoa(ctx), func(b *testing.B) {
+			const nHeads, nKVHeads, headDim = 32, 8, 128
+			config := Config{NHeads: nHeads, NKVHeads: nKVHeads, HeadDim: headDim, ValueDim: headDim}
+			cache := NewKVCacheF16(1, nKVHeads*headDim, nKVHeads*headDim, ctx)
+			for i := range cache.K16[0] {
+				cache.K16[0][i] = F32ToF16(float32(i%29-14) / 16)
+				cache.V16[0][i] = F32ToF16(float32(i%31-15) / 16)
+			}
+			buf := &DecodeBuffer{Q: benchFloatSlice(nHeads * headDim), AttnOut: make([]float32, nHeads*headDim)}
+			scale := float32(0.0883883476)
+			layer := LayerWeights{}
+			b.SetBytes(int64(2 * ctx * nKVHeads * headDim * 2))
+			b.Run("separate", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					clear(buf.AttnOut)
+					parallelAttendHeads(config, layer, cache, buf, 0, ctx-1, 0, scale, nHeads/nKVHeads)
+				}
+			})
+			b.Run("grouped", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					clear(buf.AttnOut)
+					parallelAttendHeadGroups(config, cache, buf, 0, ctx-1, 0, scale, nHeads/nKVHeads)
+				}
+			})
+		})
+	}
 }
 
 // The ctx32768 pair is larger than Apple Silicon's shared performance-core
@@ -807,4 +845,94 @@ func BenchmarkTinyGraniteMoEDecodeReuse(b *testing.B) {
 		}
 	}
 	_ = logits
+}
+
+// BenchmarkMinistralLowBitFusionDispatch measures the important dispatch
+// choice for a uniformly Q2_K/Q3_K-compressed Ministral-3B: generic same-type
+// fusion uses the float row dots, whereas separate MatvecInto calls reach the
+// Q8-activation SIMD kernels. The real model has 4096/1024/1024 Q/K/V rows
+// and two 9216-row SwiGLU input projections, all with a 3072-wide input.
+func BenchmarkMinistralLowBitFusionDispatch(b *testing.B) {
+	const (
+		cols    = 3072
+		qRows   = 4096
+		kvRows  = 1024
+		ffnRows = 9216
+	)
+	formats := []struct {
+		name string
+		typ  GGMLType
+		row  func(*rand.Rand, int) []byte
+	}{
+		{"Q2_K", GGMLTypeQ2_K, randomQ2KRow},
+		{"Q3_K", GGMLTypeQ3_K, randomQ3KRow},
+	}
+	for _, format := range formats {
+		b.Run(format.name, func(b *testing.B) {
+			rng := rand.New(rand.NewSource(97))
+			makeWeight := func(rows int) Weight {
+				rowBytes, ok := format.typ.DataSize(cols)
+				if !ok {
+					b.Fatal("missing row size")
+				}
+				raw := make([]byte, 0, rows*rowBytes)
+				for range rows {
+					raw = append(raw, format.row(rng, cols)...)
+				}
+				return Weight{Raw: raw, Type: format.typ, Rows: rows, Cols: cols}
+			}
+			wq, wk, wv := makeWeight(qRows), makeWeight(kvRows), makeWeight(kvRows)
+			gate, up := makeWeight(ffnRows), makeWeight(ffnRows)
+			x := benchFloatSlice(cols)
+
+			withQ8Activations(true, func() {
+				b.Run("QKV/generic_fused_float", func(b *testing.B) {
+					q, k, v := make([]float32, qRows), make([]float32, kvRows), make([]float32, kvRows)
+					_ = matvecSameType3Into(wq, wk, wv, x, &q, &k, &v)
+					b.ReportAllocs()
+					b.SetBytes(int64(len(wq.Raw) + len(wk.Raw) + len(wv.Raw)))
+					for b.Loop() {
+						if !matvecSameType3Into(wq, wk, wv, x, &q, &k, &v) {
+							b.Fatal("generic QKV fusion declined valid weights")
+						}
+					}
+				})
+				b.Run("QKV/separate_q8", func(b *testing.B) {
+					q, k, v := make([]float32, qRows), make([]float32, kvRows), make([]float32, kvRows)
+					wq.MatvecInto(x, &q)
+					wk.MatvecInto(x, &k)
+					wv.MatvecInto(x, &v)
+					b.ReportAllocs()
+					b.SetBytes(int64(len(wq.Raw) + len(wk.Raw) + len(wv.Raw)))
+					for b.Loop() {
+						wq.MatvecInto(x, &q)
+						wk.MatvecInto(x, &k)
+						wv.MatvecInto(x, &v)
+					}
+				})
+				b.Run("GateUp/generic_fused_float", func(b *testing.B) {
+					gateOut, upOut := make([]float32, ffnRows), make([]float32, ffnRows)
+					_ = matvecSameType2Into(gate, up, x, &gateOut, &upOut)
+					b.ReportAllocs()
+					b.SetBytes(int64(len(gate.Raw) + len(up.Raw)))
+					for b.Loop() {
+						if !matvecSameType2Into(gate, up, x, &gateOut, &upOut) {
+							b.Fatal("generic gate/up fusion declined valid weights")
+						}
+					}
+				})
+				b.Run("GateUp/separate_q8", func(b *testing.B) {
+					gateOut, upOut := make([]float32, ffnRows), make([]float32, ffnRows)
+					gate.MatvecInto(x, &gateOut)
+					up.MatvecInto(x, &upOut)
+					b.ReportAllocs()
+					b.SetBytes(int64(len(gate.Raw) + len(up.Raw)))
+					for b.Loop() {
+						gate.MatvecInto(x, &gateOut)
+						up.MatvecInto(x, &upOut)
+					}
+				})
+			})
+		})
+	}
 }

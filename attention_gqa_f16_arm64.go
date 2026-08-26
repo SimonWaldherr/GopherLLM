@@ -4,6 +4,12 @@ package gopherllm
 
 import "unsafe"
 
+// hasFastF16GQA4 marks that the four-head f16 grouped attention path has a
+// genuine shared-row NEON kernel.  Decode dispatch uses it to select the
+// grouped schedule earlier for Mistral/Ministral, where four query heads share
+// each KV head.
+const hasFastF16GQA4 = true
+
 // The f16 GQA primitives mirror dotF32x4/axpyF32x4, but convert the shared
 // K/V row only once. Mistral-family GQA uses four query heads for each KV head,
 // so this avoids three of the four FCVTL conversions and K/V loads in the

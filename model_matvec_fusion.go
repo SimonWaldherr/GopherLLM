@@ -37,6 +37,18 @@ func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v
 		)
 	case GGMLTypeQ6_K:
 		return MatvecQ6K3Into(wq.Raw, wq.Rows, wq.Cols, wk.Raw, wk.Rows, wk.Cols, wv.Raw, wv.Rows, wv.Cols, x, q, k, v)
+	case GGMLTypeQ2_K, GGMLTypeQ3_K:
+		// The generic same-type fusion below calls the exact float row dots.
+		// That bypasses these formats' Q8-activation SIMD kernels, which is a
+		// large regression for a uniformly low-bit Ministral: its Q/K/V and
+		// Gate/Up projections all have one of these types. Let the caller use
+		// the individual MatvecInto calls while Q8 SIMD is active; they retain
+		// the architecture-specific SDOT/AVX2 path. A scalar Q8 implementation
+		// does not justify giving up the existing one-dispatch float fusion.
+		if lowBitQ8SIMDEnabled() {
+			return false
+		}
+		return matvecSameType3Into(wq, wk, wv, x, q, k, v)
 	default:
 		return matvecSameType3Into(wq, wk, wv, x, q, k, v)
 	}
@@ -97,6 +109,14 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 		return MatvecQ4K2IntoWithXSums(a.Raw, a.Rows, a.Cols, b.Raw, b.Rows, b.Cols, x, q4kXSums, aOut, bOut)
 	case GGMLTypeQ6_K:
 		return MatvecQ6K2Into(a.Raw, a.Rows, a.Cols, b.Raw, b.Rows, b.Cols, x, aOut, bOut)
+	case GGMLTypeQ2_K, GGMLTypeQ3_K:
+		// See the matching Q/K/V case above. A future fused Q8 multi-matrix
+		// kernel can replace this fallback; until then, two Q8 SIMD matvecs are
+		// substantially faster than one generic float-fused traversal.
+		if lowBitQ8SIMDEnabled() {
+			return false
+		}
+		return matvecSameType2Into(a, b, x, aOut, bOut)
 	default:
 		return matvecSameType2Into(a, b, x, aOut, bOut)
 	}

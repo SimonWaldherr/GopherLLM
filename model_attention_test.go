@@ -220,6 +220,28 @@ func TestGroupedGQAAttentionI8MatchesSeparateHeads(t *testing.T) {
 	}
 }
 
+func TestParallelGroupedGQAAttentionF16Crossover(t *testing.T) {
+	const nKVHeads, kvMul = 8, 4 // Ministral's 32 query / 8 KV-head layout.
+	f32 := NewKVCache(1, nKVHeads*32, nKVHeads*32, 128)
+	f16 := NewKVCacheF16(1, nKVHeads*32, nKVHeads*32, 128)
+
+	if shouldParallelGroupedGQAAttention(f16, kvMul, nKVHeads, 127) {
+		t.Fatal("short f16 GQA context must stay on the serial grouped path")
+	}
+	if got, want := shouldParallelGroupedGQAAttention(f16, kvMul, nKVHeads, 128), hasFastF16GQA4; got != want {
+		t.Fatalf("f16 grouped crossover = %v, want %v", got, want)
+	}
+	if shouldParallelGroupedGQAAttention(f32, kvMul, nKVHeads, 128) {
+		t.Fatal("f32 GQA must retain the conservative long-context crossover")
+	}
+	if !shouldParallelGroupedGQAAttention(f32, kvMul, nKVHeads, groupedGQADecodeMinContext) {
+		t.Fatal("long f32 GQA context must use the grouped parallel path")
+	}
+	if shouldParallelGroupedGQAAttention(f16, kvMul, 1, groupedGQADecodeMinContext) {
+		t.Fatal("a single KV head has no independent group to parallelize")
+	}
+}
+
 // TestAttendHeadGroupsRangeMatchesPerHeadDispatch exercises attendHeadGroupsRange
 // itself — the exact function ForwardBodyInto's groupedGQA branch calls — across
 // all three KV cache formats and a kvMul that is NOT 4, so it covers both

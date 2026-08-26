@@ -180,7 +180,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 		// so the shared cacheline is fetched once, then parallelize across KV
 		// groups at contexts long enough to amortize dispatch.
 		groupedGQA := useGroupedGQAAttention && kvMul > 1 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !config.usesALiBi()
-		if attnLen := pos - attnStart + 1; groupedGQA && attnLen >= groupedGQADecodeMinContext && config.NKVHeads > 1 {
+		if attnLen := pos - attnStart + 1; groupedGQA && shouldParallelGroupedGQAAttention(cache, kvMul, config.NKVHeads, attnLen) {
 			parallelAttendHeadGroups(config, cache, buf, l, pos, attnStart, scale, kvMul)
 		} else if groupedGQA && attnLen < 128 {
 			attendHeadGroupsRange(&config, cache, buf, l, pos, attnStart, scale, kvMul, 0, config.NKVHeads)
@@ -434,6 +434,24 @@ var useGroupedGQAAttention = os.Getenv("GOPHERLLM_NO_GROUPED_GQA") == ""
 // the NEON x4 kernels dominates. Prefill has independent token-level
 // parallelism and therefore uses grouping without this decode-only threshold.
 const groupedGQADecodeMinContext = 4096
+
+// shouldParallelGroupedGQAAttention selects the long-context grouped GQA
+// schedule. The f32 crossover stays conservative: on an M2 Max, its eight
+// Ministral KV groups leave enough cores idle that independent heads win below
+// 4k context. With f16 KV rows, though, the arm64 four-way kernels load and
+// convert each shared K/V row once. The reduced group cost moves that
+// crossover down to the existing 128-token parallel-attention threshold. At
+// shorter contexts, ForwardBodyInto keeps the serial grouped path to avoid
+// worker dispatch overhead entirely.
+func shouldParallelGroupedGQAAttention(cache *KVCache, kvMul, nKVHeads, attnLen int) bool {
+	if nKVHeads <= 1 || attnLen < 128 {
+		return false
+	}
+	if attnLen >= groupedGQADecodeMinContext {
+		return true
+	}
+	return hasFastF16GQA4 && kvMul == 4 && cache != nil && cache.kvFormat() == kvF16
+}
 
 func addInPlace(dst, src []float32) {
 	AxpyF32(dst, 1.0, src)

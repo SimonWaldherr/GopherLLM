@@ -4,6 +4,11 @@ package gopherllm
 
 import "unsafe"
 
+// Non-arm64 builds compose the four f16 operations from per-head primitives,
+// so they do not have the shared-row conversion and load reuse that warrants
+// the earlier Ministral decode-dispatch crossover used on NEON.
+const hasFastF16GQA4 = false
+
 // Keep the grouped f16 attention shape available on every target. Apple
 // Silicon replaces these compositions with the NEON implementations above;
 // other targets retain their existing per-head SIMD/scalar primitives.
