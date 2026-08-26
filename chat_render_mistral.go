@@ -59,6 +59,16 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			lastUser = i
 		}
 	}
+	toolsJSON := ""
+	if len(tools) > 0 {
+		// Keep the historical behavior for a malformed tool definition: omit
+		// the unavailable-tool block rather than failing an otherwise usable
+		// chat request. The exact serialized form is also the render-cache key,
+		// so mutations to a caller-owned definition cannot return stale tokens.
+		if encoded, err := json.Marshal(tools); err == nil {
+			toolsJSON = string(encoded)
+		}
+	}
 
 	tokenCap := 128 + len(messages)*16
 	if hasSysTokens {
@@ -67,25 +77,38 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 	if len(system) > 0 {
 		tokenCap += len(system) / 4
 	}
-	if len(tools) > 0 {
-		tokenCap += 32 + len(tools)*16
+	if toolsJSON != "" {
+		tokenCap += 32 + len(toolsJSON)/4
 	}
 	tokens := make([]uint32, 0, tokenCap)
 
-	if r.tok.AddBOS {
-		tokens = append(tokens, r.tok.BOSID)
+	// This cache key covers only text emitted before every chat turn. It is
+	// therefore safe to use even when a later user message has image content:
+	// neither image placeholder positions nor image embeddings enter the cache.
+	cacheKey := mistralPromptPrefixCacheKey{toolsJSON: toolsJSON}
+	if hasSysTokens {
+		cacheKey.system = system
 	}
-	if system != "" && hasSysTokens {
-		tokens = append(tokens, sysStart)
-		tokens = append(tokens, r.tok.EncodeWithoutBOS(system)...)
-		tokens = append(tokens, sysEnd)
-	}
-	if len(tools) > 0 {
-		if toolsJSON, err := json.Marshal(tools); err == nil {
+	var cacheEpoch uint64
+	if cached, epoch, hit := r.appendMistralPromptPrefix(tokens, cacheKey); hit {
+		tokens = cached
+	} else {
+		cacheEpoch = epoch
+		prefixStart := len(tokens)
+		if r.tok.AddBOS {
+			tokens = append(tokens, r.tok.BOSID)
+		}
+		if system != "" && hasSysTokens {
+			tokens = append(tokens, sysStart)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(system)...)
+			tokens = append(tokens, sysEnd)
+		}
+		if toolsJSON != "" {
 			tokens = append(tokens, r.mistralMarker("[AVAILABLE_TOOLS]")...)
-			tokens = append(tokens, r.tok.EncodeWithoutBOS(string(toolsJSON))...)
+			tokens = append(tokens, r.tok.EncodeWithoutBOS(toolsJSON)...)
 			tokens = append(tokens, r.mistralMarker("[/AVAILABLE_TOOLS]")...)
 		}
+		r.putMistralPromptPrefix(cacheKey, tokens[prefixStart:], cacheEpoch)
 	}
 
 	var imageEmbeds map[int][]float32

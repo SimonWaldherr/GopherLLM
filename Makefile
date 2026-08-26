@@ -361,7 +361,7 @@ help:
 	@printf "  make inspect MODEL=...               Inspect GGUF metadata and compatibility\n"
 	@printf "  make list-tensors MODEL=...          Print tensor inventory\n"
 	@printf "  make compress MODEL=... COMPRESS_FORMAT=Q4_K COMPRESS_OUT=...\n"
-	@printf "                                        Requantize a GGUF via round-to-nearest (Q8_0/Q4_0/Q4_K/Q5_K/Q6_K)\n"
+	@printf "                                        Requantize a GGUF via round-to-nearest (Q8_0/Q4_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K)\n"
 	@printf "  make bench                           Run Go microbenchmarks\n"
 	@printf "  make bench-model MODEL=...           Run CLI generation benchmark JSON with per-run output\n"
 	@printf "  make bench-model-prep MODEL=...      Run generation benchmark with --prepare-quant\n"

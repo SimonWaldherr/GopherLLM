@@ -9,12 +9,9 @@ import (
 )
 
 const (
-	metalQ4KPrepareMinRows = 1024
-	metalQ5KPrepareMinRows = 1024
-	metalQ6KPrepareMinRows = 1024
-	metalQ4KDirectMinRows  = 8192
-	metalQ5KDirectMinRows  = 3072
-	metalQ6KDirectMinRows  = 3072
+	metalQ4KDirectMinRows = 8192
+	metalQ5KDirectMinRows = 3072
+	metalQ6KDirectMinRows = 3072
 )
 
 var metalFusedFFNEnabled = os.Getenv("GOPHERLLM_METAL_FUSED_FFN") != "0"
@@ -36,28 +33,45 @@ func MetalError() string {
 	return metalbackend.LastError()
 }
 
+// metalWeightMayUseDirect is deliberately shared by preparation and dispatch.
+// A Metal handle owns several shared buffers, so retaining a matrix below the
+// direct-dispatch crossover wastes load time and memory: every current Metal
+// call rejects it on the same row threshold. This matters for Ministral GQA,
+// whose narrow Q/K/V and attention-output projections stay on the CPU while
+// its large FFN and vocabulary projections still use Metal.
+func metalWeightMayUseDirect(typ GGMLType, rows int) bool {
+	switch typ {
+	case GGMLTypeQ4_K:
+		// Q4_K attention-output projections in Mistral-family GQA models are
+		// typically 3K-5K rows. On an M2 Max their CPU Q8_K/NEON path is
+		// 35-50% faster than a standalone Metal dispatch; reserve direct GPU
+		// work for the large FFN/vocabulary-shaped matrices that amortize the
+		// command-buffer boundary.
+		return rows >= metalQ4KDirectMinRows
+	case GGMLTypeQ5_K:
+		// Q5_K carries Q4_K's scale structure with an extra bitplane, so its
+		// CPU kernel is slightly slower per row than Q4_K's while the GPU cost
+		// is nearly identical — the crossover therefore sits at the Q6_K
+		// threshold rather than Q4_K's higher one.
+		return rows >= metalQ5KDirectMinRows
+	case GGMLTypeQ6_K:
+		return rows >= metalQ6KDirectMinRows
+	default:
+		return false
+	}
+}
+
 func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int, borrow bool) *MetalWeight {
-	if cols <= 0 || cols%256 != 0 {
+	if cols <= 0 || cols%256 != 0 || !metalWeightMayUseDirect(typ, rows) {
 		return nil
 	}
-	// Small Q/K/V handles are retained for the fused attention command buffer;
-	// individual dispatch still uses the higher measured direct thresholds.
 	w := &MetalWeight{typ: typ, rows: rows, cols: cols}
 	switch typ {
 	case GGMLTypeQ4_K:
-		if rows < metalQ4KPrepareMinRows {
-			return nil
-		}
 		w.q4 = metalbackend.PrepareQ4K(data, rows, cols, borrow)
 	case GGMLTypeQ5_K:
-		if rows < metalQ5KPrepareMinRows {
-			return nil
-		}
 		w.q5 = metalbackend.PrepareQ5K(data, rows, cols, borrow)
 	case GGMLTypeQ6_K:
-		if rows < metalQ6KPrepareMinRows {
-			return nil
-		}
 		w.q6 = metalbackend.PrepareQ6K(data, rows, cols, borrow)
 	default:
 		return nil
@@ -69,28 +83,7 @@ func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int, borrow bool) 
 }
 
 func metalWeightUsesDirect(w *MetalWeight) bool {
-	if w == nil {
-		return false
-	}
-	switch w.typ {
-	case GGMLTypeQ4_K:
-		// Q4_K attention-output projections in Mistral-family GQA models are
-		// typically 3K-5K rows. On an M2 Max their CPU Q8_K/NEON path is
-		// 35-50% faster than a standalone Metal dispatch; reserve direct GPU
-		// work for the large FFN/vocabulary-shaped matrices that amortize the
-		// command-buffer boundary.
-		return w.rows >= metalQ4KDirectMinRows
-	case GGMLTypeQ5_K:
-		// Q5_K carries Q4_K's scale structure with an extra bitplane, so its
-		// CPU kernel is slightly slower per row than Q4_K's while the GPU cost
-		// is nearly identical — the crossover therefore sits at the Q6_K
-		// threshold rather than Q4_K's higher one.
-		return w.rows >= metalQ5KDirectMinRows
-	case GGMLTypeQ6_K:
-		return w.rows >= metalQ6KDirectMinRows
-	default:
-		return false
-	}
+	return w != nil && metalWeightMayUseDirect(w.typ, w.rows)
 }
 
 func matvecMetalQ4KInto(w *MetalWeight, x []float32, rows, cols int, out *[]float32) bool {

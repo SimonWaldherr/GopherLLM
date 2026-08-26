@@ -56,13 +56,19 @@ func tensorToF32(dtype GGMLType, raw []byte, numel int) ([]float32, bool) {
 // ParseCompressFormat maps a CLI-facing format name to the GGMLType
 // CompressModel accepts, restricted to the formats quantize_rtn.go has
 // encoders for (the full GGMLType enum covers many more read-only formats
-// that aren't valid compression targets here).
+// that aren't valid compression targets here). Q3_K and Q2_K are deliberately
+// opt-in: they reduce the memory bandwidth consumed per generated token, at a
+// progressively larger model-quality cost.
 func ParseCompressFormat(name string) (GGMLType, bool) {
 	switch name {
 	case "Q8_0", "q8_0":
 		return GGMLTypeQ8_0, true
 	case "Q4_0", "q4_0":
 		return GGMLTypeQ4_0, true
+	case "Q2_K", "q2_k":
+		return GGMLTypeQ2_K, true
+	case "Q3_K", "q3_k":
+		return GGMLTypeQ3_K, true
 	case "Q4_K", "q4_k", "Q4_K_M", "q4_k_m":
 		return GGMLTypeQ4_K, true
 	case "Q5_K", "q5_k", "Q5_K_M", "q5_k_m":
@@ -80,16 +86,20 @@ func ParseCompressFormat(name string) (GGMLType, bool) {
 // format above the user's chosen target — never to pick the target itself.
 func compressFormatRank(t GGMLType) int {
 	switch t {
-	case GGMLTypeQ4_0:
+	case GGMLTypeQ2_K:
 		return 0
-	case GGMLTypeQ4_K:
+	case GGMLTypeQ3_K:
 		return 1
-	case GGMLTypeQ5_K:
+	case GGMLTypeQ4_0:
 		return 2
-	case GGMLTypeQ6_K:
+	case GGMLTypeQ4_K:
 		return 3
-	case GGMLTypeQ8_0:
+	case GGMLTypeQ5_K:
 		return 4
+	case GGMLTypeQ6_K:
+		return 5
+	case GGMLTypeQ8_0:
+		return 6
 	default:
 		return -1
 	}
@@ -112,8 +122,9 @@ var namedOutputTensors = map[string]bool{
 // CompressOptions configures CompressModel.
 type CompressOptions struct {
 	// TargetFormat is the GGML type every eligible weight tensor is
-	// requantized to. Only Q8_0, Q4_0, Q4_K, Q5_K, Q6_K are supported (the
-	// formats quantize_rtn.go has encoders for).
+	// requantized to. Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, and Q6_K are
+	// supported (the formats quantize_rtn.go has encoders for). Q2_K/Q3_K
+	// trade output quality for less memory traffic during decode.
 	TargetFormat GGMLType
 	// Uniform disables the output/embedding quality floor (outputFloorFormat)
 	// and applies TargetFormat everywhere without exception. Default false
@@ -142,6 +153,10 @@ func quantizeRowFor(dtype GGMLType) func(row []float32, cols int) []byte {
 		return QuantizeRowQ8_0
 	case GGMLTypeQ4_0:
 		return QuantizeRowQ4_0
+	case GGMLTypeQ2_K:
+		return QuantizeRowQ2K
+	case GGMLTypeQ3_K:
+		return QuantizeRowQ3K
 	case GGMLTypeQ4_K:
 		return QuantizeRowQ4K
 	case GGMLTypeQ5_K:
@@ -237,9 +252,8 @@ func sameFile(a, b string) bool {
 // feature (see gguf_split.go's loadSplitRunner), not something Phase A
 // attempts.
 func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
-	quantizeRow := quantizeRowFor(opts.TargetFormat)
-	if quantizeRow == nil {
-		return fmt.Errorf("compress: unsupported target format %s (supported: Q8_0, Q4_0, Q4_K, Q5_K, Q6_K)", opts.TargetFormat)
+	if quantizeRowFor(opts.TargetFormat) == nil {
+		return fmt.Errorf("compress: unsupported target format %s (supported: Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)", opts.TargetFormat)
 	}
 	if sameFile(sourcePath, outPath) {
 		return fmt.Errorf("compress: --compress-out must not be the same file as the source model (%s); compress to a different path and rename it afterward if you want to replace the original", sourcePath)
@@ -343,6 +357,15 @@ func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
 				return fmt.Errorf("compress: tensor %q: cannot dequantize source type %s for requantization", t.Name, t.DType)
 			}
 			outType := planned[i].DType
+			// The output/embedding quality floor can raise this tensor above the
+			// requested target (for example Q3_K -> Q6_K). Select the encoder
+			// from the planned tensor type rather than reusing the global target
+			// encoder, otherwise its packed bytes would be interpreted as the
+			// wrong GGML format on reload.
+			rowQuantize := quantizeRowFor(outType)
+			if rowQuantize == nil {
+				return fmt.Errorf("compress: tensor %q: unsupported planned target type %s", t.Name, outType)
+			}
 			rowSize, ok := outType.DataSize(cols)
 			if !ok {
 				return fmt.Errorf("compress: tensor %q: cannot size target type %s", t.Name, outType)
@@ -350,7 +373,7 @@ func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
 			outBytes = make([]byte, rows*rowSize)
 			parallelRows(rows, func(rstart, rend int) {
 				for r := rstart; r < rend; r++ {
-					rowBytes := quantizeRow(f32[r*cols:(r+1)*cols], cols)
+					rowBytes := rowQuantize(f32[r*cols:(r+1)*cols], cols)
 					copy(outBytes[r*rowSize:(r+1)*rowSize], rowBytes)
 				}
 			})

@@ -160,6 +160,54 @@ func TestCompressModelOutputFloor(t *testing.T) {
 		t.Errorf("blk.0.attn_q.weight = %s, want the requested Q4_K (no floor applies to attention weights)", got)
 	}
 
+	// The quality floor changes the planned format from Q4_K to Q6_K. Verify
+	// that it changes the *encoder* too: treating Q4_K-packed bytes as Q6_K
+	// is structurally valid enough to parse, but corrupts the tensor values.
+	srcMmap, err := OpenMmap(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srcMmap.Close()
+	srcGGUF, err := ParseGGUF(srcMmap.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var srcOutput, floorOutput *TensorInfo
+	for i := range srcGGUF.Tensors {
+		if srcGGUF.Tensors[i].Name == "output.weight" {
+			srcOutput = &srcGGUF.Tensors[i]
+		}
+	}
+	for i := range g.Tensors {
+		if g.Tensors[i].Name == "output.weight" {
+			floorOutput = &g.Tensors[i]
+		}
+	}
+	if srcOutput == nil || floorOutput == nil {
+		t.Fatal("output.weight missing from source or floored GGUF")
+	}
+	srcRaw := srcMmap.Bytes()[srcGGUF.DataOffset+int(srcOutput.Offset):]
+	want := make([]float32, 256)
+	for i := range want {
+		want[i] = math.Float32frombits(uint32(srcRaw[i*4]) | uint32(srcRaw[i*4+1])<<8 | uint32(srcRaw[i*4+2])<<16 | uint32(srcRaw[i*4+3])<<24)
+	}
+	floorMmap, err := OpenMmap(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer floorMmap.Close()
+	floorRaw := floorMmap.Bytes()[g.DataOffset+int(floorOutput.Offset):]
+	got := DequantRowQ6K(floorRaw, 256)
+	var maxErr float32
+	for i := range want {
+		if err := abs32(want[i] - got[i]); err > maxErr {
+			maxErr = err
+		}
+	}
+	if maxErr > 0.05 {
+		t.Fatalf("Q6_K output floor appears to use the wrong encoder: max error %v", maxErr)
+	}
+
 	uniformPath := filepath.Join(t.TempDir(), "uniform.gguf")
 	if err := CompressModel(srcPath, uniformPath, CompressOptions{TargetFormat: GGMLTypeQ4_K, Uniform: true}); err != nil {
 		t.Fatalf("CompressModel(Uniform): %v", err)
@@ -240,6 +288,58 @@ func TestCompressModelEndToEnd(t *testing.T) {
 	// tests (runtime_test.go), which only assert Generate doesn't error.
 	if _, err := runner.Generate("a b c", opts); err != nil {
 		t.Fatalf("Generate on compressed model: %v", err)
+	}
+}
+
+// TestCompressModelLowBitTargets verifies the deliberately opt-in Q3_K/Q2_K
+// targets all the way through GGUF writing, parsing, model loading, and a
+// forward pass. Their accuracy is a caller-visible trade-off; this test is
+// about ensuring the smaller artifacts remain valid and runnable.
+func TestCompressModelLowBitTargets(t *testing.T) {
+	for _, target := range []GGMLType{GGMLTypeQ3_K, GGMLTypeQ2_K} {
+		t.Run(target.String(), func(t *testing.T) {
+			srcPath := writeTempGGUF(t, buildRequantizableLlamaGGUF())
+			outPath := filepath.Join(t.TempDir(), "out.gguf")
+			if err := CompressModel(srcPath, outPath, CompressOptions{TargetFormat: target}); err != nil {
+				t.Fatalf("CompressModel(%s): %v", target, err)
+			}
+			gguf := parseGGUFFile(t, outPath)
+			if got := tensorType(gguf, "blk.0.attn_q.weight"); got != target {
+				t.Fatalf("attention target = %s, want %s", got, target)
+			}
+			if got := tensorType(gguf, "output.weight"); got != GGMLTypeQ6_K {
+				t.Fatalf("output quality floor = %s, want Q6_K", got)
+			}
+			outBytes, err := os.ReadFile(outPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner, err := RunnerFromGGUFBytes(outBytes)
+			if err != nil {
+				t.Fatalf("RunnerFromGGUFBytes(%s): %v", target, err)
+			}
+			defer runner.Close()
+			opts := DefaultGenerationOptions()
+			opts.MaxTokens = 2
+			if _, err := runner.Generate("a b c", opts); err != nil {
+				t.Fatalf("Generate(%s): %v", target, err)
+			}
+		})
+	}
+}
+
+func TestParseCompressFormatLowBitTargets(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want GGMLType
+	}{
+		{"Q2_K", GGMLTypeQ2_K},
+		{"q3_k", GGMLTypeQ3_K},
+	} {
+		got, ok := ParseCompressFormat(tc.name)
+		if !ok || got != tc.want {
+			t.Errorf("ParseCompressFormat(%q) = %s, %v; want %s, true", tc.name, got, ok, tc.want)
+		}
 	}
 }
 

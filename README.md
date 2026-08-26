@@ -52,7 +52,7 @@ tokenization, model inspection, compression, and benchmarks.
 - Model discovery across the complete local LM Studio model library.
 - Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
   private/gated-model tokens, and revision selection.
-- `--compress`: requantize any GGUF to Q8_0/Q4_0/Q4_K/Q5_K/Q6_K in place, writing
+- `--compress`: requantize any GGUF to Q8_0/Q4_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
 
@@ -235,6 +235,25 @@ emb, _ := model.Embed(ctx, "semantic search query")
 ids := model.Tokenize("hello")
 gopherllm.AnalyzeGGUF(model.GGUF(), model.Tokenizer()).WriteText(os.Stdout)
 ```
+
+### Repeated Mistral chat prefixes
+
+For a Ministral/Mistral application that repeatedly renders the same system
+prompt and tool schema (especially with `PrepareChatContext`), opt into the
+small, per-model render cache:
+
+```go
+runner := model.Runner()
+runner.EnableMistralPromptPrefixCache(8 << 20) // 8 MiB; 0 selects this default
+defer runner.DisableMistralPromptPrefixCache()
+
+// Optional explicit boundary when rotating sensitive system instructions.
+runner.ClearMistralPromptPrefixCache()
+```
+
+It retains only tokenized BOS/system/tool-prefix text; message content, image
+embeddings, logits, and KV state are not stored by this cache. The normal
+generation KV-prefix cache remains independent.
 
 ### Package layout
 
@@ -429,13 +448,18 @@ Requantize a GGUF to a smaller format and write it to a new file:
 bin/gopherllm /path/to/model.gguf --compress --compress-format Q4_K --compress-out smaller.gguf
 ```
 
-Supported target formats: `Q8_0`, `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K` — the formats
-with dedicated AVX2/NEON matvec kernels (see
-[Performance Notes](#performance-notes)). Every eligible weight matrix (2-D
-or higher, row length divisible by the target format's block size — 32 for
-Q8_0/Q4_0, 256 for Q4_K/Q5_K/Q6_K) is dequantized, if not already plain
-float, and requantized with round-to-nearest; norm/bias vectors and any
-tensor that doesn't fit the target block size are copied through unchanged.
+Supported target formats: `Q8_0`, `Q4_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
+`Q6_K`. Every eligible weight matrix (2-D or higher, row length divisible by
+the target format's block size — 32 for Q8_0/Q4_0, 256 for K-quants) is
+dequantized, if not already plain float, and requantized with
+round-to-nearest; norm/bias vectors and any tensor that doesn't fit the target
+block size are copied through unchanged. `Q3_K` reduces packed weight traffic
+by about 24% relative to Q4_K (110 vs. 144 bytes per 256 weights); `Q2_K`
+reduces it about 42% (84 vs. 144 bytes), but both are explicitly quality-for-
+speed trade-offs and should be evaluated on representative prompts.
+They currently use the CPU quantized kernels rather than the selective
+Q4_K/Q6_K Metal fast path, so use `--bench-json` on the deployment machine
+before choosing a low-bit artifact for GPU inference.
 The result is an ordinary, independently loadable GGUF — no relationship to
 the source file is retained, and the output is re-parsed and spot-checked
 against the plan before `--compress` reports success.

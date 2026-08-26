@@ -96,7 +96,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --token-neighbors <t>     Show embedding-space nearest neighbors of a token (id or text)")
 	fmt.Fprintln(os.Stderr, "  --neighbors <N>           Neighbor count for --token-neighbors (default: 12)")
 	fmt.Fprintln(os.Stderr, "  --compress                Requantize the GGUF to --compress-format via round-to-nearest and exit")
-	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target format: Q8_0 | Q4_0 | Q4_K | Q5_K | Q6_K")
+	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target: Q8_0 | Q4_0 | Q2_K | Q3_K | Q4_K | Q5_K | Q6_K")
 	fmt.Fprintln(os.Stderr, "  --compress-out <path>     Output path for --compress (required, must differ from the source)")
 	fmt.Fprintln(os.Stderr, "  --compress-uniform        Quantize token_embd/output tensors to --compress-format too")
 	fmt.Fprintln(os.Stderr, "                            (default: floor them at Q6_K, matching llama.cpp's quantize tool)")
@@ -1165,7 +1165,10 @@ func runCompress(modelPath string, cfg cliConfig) error {
 	}
 	format, ok := gopherllm.ParseCompressFormat(cfg.compressFormat)
 	if !ok {
-		return fmt.Errorf("--compress-format %q is not supported (want one of: Q8_0, Q4_0, Q4_K, Q5_K, Q6_K)", cfg.compressFormat)
+		return fmt.Errorf("--compress-format %q is not supported (want one of: Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)", cfg.compressFormat)
+	}
+	if format == gopherllm.GGMLTypeQ2_K || format == gopherllm.GGMLTypeQ3_K {
+		fmt.Fprintf(os.Stderr, "Warning: %s is an aggressive low-bit target; evaluate output quality on representative prompts before replacing the source model.\n", format)
 	}
 	fmt.Fprintf(os.Stderr, "Compressing %s -> %s (%s)\n", modelPath, cfg.compressOut, format)
 	if err := gopherllm.CompressModel(modelPath, cfg.compressOut, gopherllm.CompressOptions{

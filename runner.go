@@ -101,7 +101,13 @@ type Runner struct {
 	workspaceBuf   *DecodeBuffer
 	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
-	mappedFile     *MmapFile
+	// mistralPrefixCacheMu protects the opt-in render-time cache used by the
+	// Mistral/Ministral chat renderer. Unlike prefixCache, it is intentionally
+	// reachable from concurrent PrepareChatContext calls, which do not take
+	// genLock. It holds tokenized static prompt text only, never model state.
+	mistralPrefixCacheMu     sync.Mutex
+	mistralPrefixRenderCache mistralPromptPrefixCache
+	mappedFile               *MmapFile
 	// extraMappedFiles holds the additional shard mappings of an out-of-core
 	// split GGUF. Those models have no single mappedFile: every weight is a
 	// view into one of these, so all of them must outlive the Runner and all
@@ -555,6 +561,7 @@ func (r *Runner) Close() error {
 	r.workspaceBuf = nil
 	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
+	r.DisableMistralPromptPrefixCache()
 	// Close every shard of an out-of-core split model, keeping the first
 	// error but never leaving a mapping behind: on Windows a live mapping
 	// keeps the file locked.

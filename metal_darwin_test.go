@@ -12,6 +12,50 @@ import (
 	metalbackend "github.com/SimonWaldherr/GopherLLM/internal/metal"
 )
 
+func TestMetalMinistralSelectivePreparationThresholds(t *testing.T) {
+	// Ministral-3 GQA has 3K/5K Q and O projections and 1K K/V
+	// projections. Those matrices are deliberately CPU-side: no current Metal
+	// operation can dispatch them, so preparing GPU buffers for them would only
+	// extend model load and consume unified memory. Its 3B FFN and vocabulary
+	// projection remain above the crossover.
+	tests := []struct {
+		name string
+		typ  GGMLType
+		rows int
+		want bool
+	}{
+		{name: "3B query", typ: GGMLTypeQ4_K, rows: 3072, want: false},
+		{name: "14B attention output", typ: GGMLTypeQ4_K, rows: 5120, want: false},
+		{name: "GQA key", typ: GGMLTypeQ4_K, rows: 1024, want: false},
+		{name: "GQA value", typ: GGMLTypeQ6_K, rows: 1024, want: false},
+		{name: "3B FFN gate", typ: GGMLTypeQ4_K, rows: 9216, want: true},
+		{name: "3B FFN down", typ: GGMLTypeQ6_K, rows: 3072, want: true},
+		{name: "vocabulary output", typ: GGMLTypeQ6_K, rows: 131072, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := metalWeightMayUseDirect(tt.typ, tt.rows); got != tt.want {
+				t.Fatalf("metalWeightMayUseDirect(%v, %d) = %v, want %v", tt.typ, tt.rows, got, tt.want)
+			}
+		})
+	}
+	if !MetalAvailable() {
+		return
+	}
+	for _, tt := range tests {
+		if tt.want {
+			continue
+		}
+		// The data need not describe a usable matrix because the threshold must
+		// reject it before the backend sees it. Before this guard, the same
+		// shape allocated a Metal handle despite having no eligible dispatch.
+		if w := prepareMetalWeight([]byte{0}, tt.typ, tt.rows, 256, false); w != nil {
+			releaseMetalWeight(w)
+			t.Fatalf("prepareMetalWeight retained ineligible %s matrix", tt.name)
+		}
+	}
+}
+
 func TestMetalQ4KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())

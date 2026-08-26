@@ -642,9 +642,9 @@ func loadWeight(data []byte, dataOffset int, name string, tensors map[string]Ten
 		// WebGPU only ever exists under GOOS=js, where useMetal is already
 		// always false, so the two GPU backends can never conflict.
 		w.GPU = prepareWebGPUWeight(raw, info.DType, rows, cols)
-		// Direct Metal weights skip redundant prepared data. Small Q/K/V handles
-		// retain prepared CPU data so fused-attention dispatch can roll back
-		// without changing results if a GPU command fails.
+		// Direct Metal weights skip redundant prepared data. CPU-side matrices
+		// retain their prepared representation; in particular, narrow GQA
+		// Q/K/V projections are intentionally never made into Metal handles.
 		if !metalWeightUsesDirect(w.Metal) && prepareQuantized && (info.DType == GGMLTypeQ4_K || info.DType == GGMLTypeQ6_K) {
 			w.Prepared = PrepareQuantizedWeight(raw, info.DType, rows, cols)
 		}

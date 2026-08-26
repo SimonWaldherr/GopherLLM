@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"github.com/SimonWaldherr/GopherLLM/agentos"
 	"github.com/SimonWaldherr/GopherLLM/server"
 )
@@ -131,6 +132,18 @@ func TestParseCLICompressFlags(t *testing.T) {
 	}
 	if !cfg.compress || cfg.compressFormat != "Q4_K" || cfg.compressOut != "out.gguf" || !cfg.compressUniform {
 		t.Fatalf("compress flags not recorded correctly: %+v", cfg)
+	}
+}
+
+func TestRunCompressAcceptsLowBitFormats(t *testing.T) {
+	for _, format := range []string{"Q2_K", "Q3_K"} {
+		cfg, err := parseCLI([]string{"model.gguf", "--compress", "--compress-format", format, "--compress-out", "out.gguf"})
+		if err != nil {
+			t.Fatalf("parseCLI(%s): %v", format, err)
+		}
+		if _, ok := gopherllm.ParseCompressFormat(cfg.compressFormat); !ok {
+			t.Fatalf("%s was not accepted as a compression format", format)
+		}
 	}
 }
 
