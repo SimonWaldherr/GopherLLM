@@ -667,44 +667,35 @@ func nemotronMoEForward(cfg Config, w NemotronMoEWeights, x []float32, buf *Deco
 	}
 }
 
-// releaseNemotronHMetalWeights releases every optional Metal backing buffer
-// owned by the hybrid graph. Expert planes intentionally do not get prepared
-// as Metal matrices (they are selected dynamically), but keeping them in this
-// traversal makes the ownership rule explicit and protects future kernels.
+// releaseNemotronHMetalWeights releases every optional accelerator backing
+// buffer owned by the hybrid graph. Expert planes intentionally do not get
+// prepared as Metal matrices (they are selected dynamically), but keeping
+// them in this traversal makes the ownership rule explicit and protects
+// future kernels.
 func releaseNemotronHMetalWeights(weights *NemotronHWeights) {
 	if weights == nil {
 		return
 	}
-	seen := map[*MetalWeight]bool{}
-	release := func(w *Weight) {
-		if w == nil || w.Metal == nil {
-			return
-		}
-		if !seen[w.Metal] {
-			releaseMetalWeight(w.Metal)
-			seen[w.Metal] = true
-		}
-		w.Metal = nil
-	}
-	release(&weights.TokenEmbd)
-	release(&weights.Output)
+	var releaser weightResourceReleaser
+	releaser.release(&weights.TokenEmbd)
+	releaser.release(&weights.Output)
 	for i := range weights.Layers {
 		layer := &weights.Layers[i]
-		release(&layer.Attention.Q)
-		release(&layer.Attention.K)
-		release(&layer.Attention.V)
-		release(&layer.Attention.O)
-		release(&layer.Mamba.In)
-		release(&layer.Mamba.Conv)
-		release(&layer.Mamba.Out)
-		release(&layer.MoE.Router)
-		release(&layer.MoE.Up.Weight)
-		release(&layer.MoE.Down.Weight)
-		release(layer.MoE.LatentIn)
-		release(layer.MoE.LatentOut)
-		release(layer.MoE.SharedUp)
-		release(layer.MoE.SharedDown)
-		release(&layer.DenseFFN.Up)
-		release(&layer.DenseFFN.Down)
+		releaser.release(&layer.Attention.Q)
+		releaser.release(&layer.Attention.K)
+		releaser.release(&layer.Attention.V)
+		releaser.release(&layer.Attention.O)
+		releaser.release(&layer.Mamba.In)
+		releaser.release(&layer.Mamba.Conv)
+		releaser.release(&layer.Mamba.Out)
+		releaser.release(&layer.MoE.Router)
+		releaser.release(&layer.MoE.Up.Weight)
+		releaser.release(&layer.MoE.Down.Weight)
+		releaser.release(layer.MoE.LatentIn)
+		releaser.release(layer.MoE.LatentOut)
+		releaser.release(layer.MoE.SharedUp)
+		releaser.release(layer.MoE.SharedDown)
+		releaser.release(&layer.DenseFFN.Up)
+		releaser.release(&layer.DenseFFN.Down)
 	}
 }

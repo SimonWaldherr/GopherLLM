@@ -92,6 +92,67 @@ func TestNearestTokensTinyModel(t *testing.T) {
 	}
 }
 
+func TestNearestTokensUsesArchitectureSpecificEmbeddingTables(t *testing.T) {
+	// The specialized architectures keep their embeddings outside
+	// Runner.standard. Give that fallback a deliberately different nearest
+	// neighbor so this checks the public token-neighborhood path rather than
+	// merely the private selector.
+	standard := Weight{F32: []float32{
+		1, 0,
+		1, 0,
+		0, 1,
+	}}
+	specialized := Weight{F32: []float32{
+		1, 0,
+		0, 1,
+		1, 1,
+	}}
+	tests := []struct {
+		name string
+		kind loadedKind
+		set  func(*Runner)
+	}{
+		{
+			name: "bert",
+			kind: loadedBERT,
+			set:  func(r *Runner) { r.bert.TokenEmbd = specialized },
+		},
+		{
+			name: "nemotron_h",
+			kind: loadedNemotronH,
+			set:  func(r *Runner) { r.nemotronH.TokenEmbd = specialized },
+		},
+		{
+			name: "mamba2",
+			kind: loadedMamba2,
+			set:  func(r *Runner) { r.mamba2.TokenEmbd = specialized },
+		},
+		{
+			name: "qwen35",
+			kind: loadedQwen35,
+			set:  func(r *Runner) { r.qwen35.TokenEmbd = specialized },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Runner{
+				kind:     tt.kind,
+				config:   Config{Dim: 2, VocabSize: 3},
+				tok:      &Tokenizer{Vocab: []string{"zero", "one", "two"}},
+				standard: ModelWeights{TokenEmbd: standard},
+			}
+			tt.set(r)
+			matches, err := r.NearestTokens(0, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(matches) != 1 || matches[0].ID != 2 {
+				t.Fatalf("nearest = %#v, want token 2 from the specialized embedding table", matches)
+			}
+		})
+	}
+}
+
 func TestAnalyzeKVCacheUsesHybridPhysicalDepth(t *testing.T) {
 	g, err := ParseGGUFQuiet(buildTinyQwen35MoEGGUF(false))
 	if err != nil {

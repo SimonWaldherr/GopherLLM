@@ -29,6 +29,9 @@ func (r *Runner) GenerateStream(prompt string, options GenerationOptions, onToke
 }
 
 func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOptions, onToken func(string)) (GenerationResult, error) {
+	if onToken == nil {
+		return r.GenerateChatStreamUntil(messages, options, nil)
+	}
 	return r.GenerateChatStreamUntil(messages, options, func(text string) bool {
 		onToken(text)
 		return true
@@ -43,10 +46,18 @@ func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOp
 // valid-UTF-8 text increments (bytes are buffered across token boundaries
 // until they complete a rune, and the tail is held back while it could still
 // be a stop-sequence prefix); returning false cancels generation, yielding
-// the partial result with ErrGenerationCanceled. The final result carries
+// the partial result with ErrGenerationCanceled. A nil onToken discards
+// streamed text and lets generation continue. The final result carries
 // content with reasoning and tool calls already extracted (classifyOutput)
 // and a FinishReason of "stop", "length", or "tool_calls".
 func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
+	if onToken == nil {
+		onToken = func(string) bool { return true }
+	}
+	if err := r.acquireModelLease(); err != nil {
+		return GenerationResult{}, err
+	}
+	defer r.releaseModelLease()
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
 	// The vision cache is deliberately NOT cleared here. It used to be, on the

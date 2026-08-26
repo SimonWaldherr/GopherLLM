@@ -128,6 +128,17 @@ func TestGenerateRejectsPromptExceedingContextLength(t *testing.T) {
 	}
 }
 
+func TestEmbedRejectsInvalidContextLength(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.config.MaxSeqLen = 0
+	if _, err := r.Embed("a"); err == nil {
+		t.Fatal("expected Embed to reject a zero context length")
+	}
+}
+
 func TestWeightAndForwardWrappers(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {

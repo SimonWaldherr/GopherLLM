@@ -324,6 +324,14 @@ func (r *Runner) tokenEmbedding() Weight {
 		return r.gptOss.Standard.TokenEmbd
 	case loadedGemma4:
 		return r.gemma4.TokenEmbd
+	case loadedNemotronH:
+		return r.nemotronH.TokenEmbd
+	case loadedMamba2:
+		return r.mamba2.TokenEmbd
+	case loadedBERT:
+		return r.bert.TokenEmbd
+	case loadedQwen35:
+		return r.qwen35.TokenEmbd
 	default:
 		return r.standard.TokenEmbd
 	}
@@ -335,6 +343,10 @@ func (r *Runner) tokenEmbedding() Weight {
 // scans the full embedding table (parallelized), so expect O(vocab*dim) work:
 // fractions of a second for 32K vocabularies, a few seconds at 262K.
 func (r *Runner) NearestTokens(id uint32, k int) ([]TokenMatch, error) {
+	if err := r.acquireModelLease(); err != nil {
+		return nil, err
+	}
+	defer r.releaseModelLease()
 	if k <= 0 {
 		k = 10
 	}

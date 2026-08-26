@@ -105,7 +105,7 @@ func reusableBERTScratch(n, dim, hidden int, useGate, hasFusedQKV, allFusedQKV b
 	// On Apple Silicon the worker pool may over-dispatch up to 8x to balance
 	// performance and efficiency cores.
 	scoreSlots := min(numThreads(), n)
-	if oversubscribeDispatch && n >= scoreSlots*128 {
+	if oversubscribeDispatch.Load() && n >= scoreSlots*128 {
 		scoreSlots *= 8
 	}
 	values += int64(scoreSlots) * int64(n) * int64(bertAttentionScoreWidth())
@@ -336,7 +336,7 @@ func reuseBERTViews(views *[][]float32, n int) [][]float32 {
 
 func (s *bertEmbeddingScratch) prepareParallelAttentionScores(n int) {
 	slots := min(numThreads(), n)
-	if oversubscribeDispatch && n >= slots*128 {
+	if oversubscribeDispatch.Load() && n >= slots*128 {
 		slots *= 8
 	}
 	ensureLenNoClear(&s.AttentionScoresFlat, slots*n*bertAttentionScoreWidth())
@@ -779,23 +779,18 @@ func releaseBERTMetalWeights(weights *BERTWeights) {
 	if weights == nil {
 		return
 	}
-	release := func(w *Weight) {
-		if w != nil && w.Metal != nil {
-			releaseMetalWeight(w.Metal)
-			w.Metal = nil
-		}
-	}
-	release(&weights.TokenEmbd)
-	release(&weights.PositionEmbd)
+	var releaser weightResourceReleaser
+	releaser.release(&weights.TokenEmbd)
+	releaser.release(&weights.PositionEmbd)
 	for i := range weights.Layers {
 		layer := &weights.Layers[i]
-		release(&layer.Q)
-		release(&layer.K)
-		release(&layer.V)
-		release(&layer.QKV)
-		release(&layer.Output)
-		release(&layer.FFNUp)
-		release(&layer.FFNDown)
-		release(&layer.FFNGate)
+		releaser.release(&layer.Q)
+		releaser.release(&layer.K)
+		releaser.release(&layer.V)
+		releaser.release(&layer.QKV)
+		releaser.release(&layer.Output)
+		releaser.release(&layer.FFNUp)
+		releaser.release(&layer.FFNDown)
+		releaser.release(&layer.FFNGate)
 	}
 }

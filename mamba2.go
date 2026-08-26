@@ -169,23 +169,13 @@ func releaseMamba2MetalWeights(weights *Mamba2Weights) {
 	if weights == nil {
 		return
 	}
-	seen := map[*MetalWeight]bool{}
-	release := func(w *Weight) {
-		if w == nil || w.Metal == nil {
-			return
-		}
-		if !seen[w.Metal] {
-			releaseMetalWeight(w.Metal)
-			seen[w.Metal] = true
-		}
-		w.Metal = nil
-	}
-	release(&weights.TokenEmbd)
-	release(&weights.Output)
+	var releaser weightResourceReleaser
+	releaser.release(&weights.TokenEmbd)
+	releaser.release(&weights.Output)
 	for i := range weights.Layers {
 		m := &weights.Layers[i].Mamba
-		release(&m.In)
-		release(&m.Conv)
-		release(&m.Out)
+		releaser.release(&m.In)
+		releaser.release(&m.Conv)
+		releaser.release(&m.Out)
 	}
 }

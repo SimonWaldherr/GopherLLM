@@ -211,6 +211,33 @@ type batchQ8Scratch struct {
 
 var batchQ8Pool = sync.Pool{New: func() any { return &batchQ8Scratch{} }}
 
+type batchQ8MatvecTask struct {
+	w                Weight
+	outs             [][]float32
+	layout           q8kRowLayout
+	q8All            []int8
+	xscAll, xsumsAll []float32
+	p, cols, blocks  int
+}
+
+func (t *batchQ8MatvecTask) runRows(start, end int) {
+	const rowTile = 16
+	for tileStart := start; tileStart < end; tileStart += rowTile {
+		tileEnd := min(tileStart+rowTile, end)
+		for token := 0; token < t.p; token++ {
+			q8 := t.q8All[token*t.cols:]
+			xsc := t.xscAll[token*t.blocks:]
+			xsum := t.xsumsAll[token*t.layout.sumsPerTok:]
+			out := t.outs[token]
+			for row := tileStart; row < tileEnd; row++ {
+				out[row] = t.layout.dot(t.w.Raw[row*t.layout.rowBytes:], q8, xsc, xsum, t.blocks)
+			}
+		}
+	}
+}
+
+var batchQ8MatvecTaskPool = sync.Pool{New: func() any { return new(batchQ8MatvecTask) }}
+
 // matvecBatchQ8 is the batched-prefill analogue of the int8-activation matvec:
 // each prompt token's activations are quantized once, then every weight row is
 // streamed from memory exactly once and dotted against all tokens in row tiles
@@ -258,26 +285,18 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 		fillQ8KXSums(w.Type, xs[t], cols, &sub)
 	}
 
-	// Row tile sized so a tile of raw rows stays L2-resident while each token's
-	// int8 activations run through L1.
-	const rowTile = 16
 	// Each row performs the complete prompt batch. Keep one coarse range per
 	// worker: ARM's decode-oriented over-dispatch creates many wakeups here
-	// without exposing additional independent work.
-	parallelRowsBatched(w.Rows, func(start, end int) {
-		for tileStart := start; tileStart < end; tileStart += rowTile {
-			tileEnd := min(tileStart+rowTile, end)
-			for t := range p {
-				q8 := q8All[t*cols:]
-				xsc := xscAll[t*blocks:]
-				xsum := xsumsAll[t*layout.sumsPerTok:]
-				out := outs[t]
-				for r := tileStart; r < tileEnd; r++ {
-					out[r] = layout.dot(w.Raw[r*layout.rowBytes:], q8, xsc, xsum, blocks)
-				}
-			}
-		}
-	})
+	// without exposing additional independent work. The reusable task also
+	// avoids retaining this projection's large slice graph in an escaping
+	// worker closure.
+	task := batchQ8MatvecTaskPool.Get().(*batchQ8MatvecTask)
+	task.w, task.outs, task.layout = w, outs, layout
+	task.q8All, task.xscAll, task.xsumsAll = q8All, xscAll, xsumsAll
+	task.p, task.cols, task.blocks = p, cols, blocks
+	parallelRowsBatchedTask(w.Rows, task)
+	*task = batchQ8MatvecTask{}
+	batchQ8MatvecTaskPool.Put(task)
 	batchQ8Pool.Put(scratch)
 	return true
 }
@@ -290,19 +309,83 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 // identical to matvecBatchQ8, so this is a scheduling/data-reuse optimization
 // rather than a numerics change.
 func matvecBatchQ8Fused2(a, b Weight, xs, aOut, bOut [][]float32) bool {
-	weights := [2]Weight{a, b}
-	outs := [2][][]float32{aOut, bOut}
-	return matvecBatchQ8Fused(weights[:], xs, outs[:])
+	// Keep the small-prompt fallback allocation-free. matvecBatchQ8Fused makes
+	// the same decision, but constructing the two slice-backed argument arrays
+	// first makes them escape even when the fused path immediately declines.
+	if !useQ8Activations.Load() || len(xs) < 32 {
+		return false
+	}
+	task := batchQ8FusedTaskPool.Get().(*batchQ8FusedTask)
+	task.count = 2
+	task.weights[0], task.weights[1] = a, b
+	task.outs[0], task.outs[1] = aOut, bOut
+	ok := matvecBatchQ8Fused(task, xs)
+	*task = batchQ8FusedTask{}
+	batchQ8FusedTaskPool.Put(task)
+	return ok
 }
 
 func matvecBatchQ8Fused3(a, b, c Weight, xs, aOut, bOut, cOut [][]float32) bool {
-	weights := [3]Weight{a, b, c}
-	outs := [3][][]float32{aOut, bOut, cOut}
-	return matvecBatchQ8Fused(weights[:], xs, outs[:])
+	if !useQ8Activations.Load() || len(xs) < 32 {
+		return false
+	}
+	task := batchQ8FusedTaskPool.Get().(*batchQ8FusedTask)
+	task.count = 3
+	task.weights[0], task.weights[1], task.weights[2] = a, b, c
+	task.outs[0], task.outs[1], task.outs[2] = aOut, bOut, cOut
+	ok := matvecBatchQ8Fused(task, xs)
+	*task = batchQ8FusedTask{}
+	batchQ8FusedTaskPool.Put(task)
+	return ok
 }
 
-func matvecBatchQ8Fused(weights []Weight, xs [][]float32, outs [][][]float32) bool {
-	if !useQ8Activations.Load() || len(weights) < 2 || len(weights) > 3 || len(weights) != len(outs) {
+// batchQ8FusedTask carries the fixed-arity projection metadata through the
+// worker pool. Keeping both the wrapper arrays and the row loop in this pooled
+// task removes the last three heap allocations from long Q8 prompt batches:
+// two escaping slice-backed argument arrays plus the worker closure.
+type batchQ8FusedTask struct {
+	weights [3]Weight
+	outs    [3][][]float32
+	layouts [3]q8kRowLayout
+	offsets [4]int
+	sums    [3][]float32
+	q8All   []int8
+	xscAll  []float32
+	count   int
+	p       int
+	cols    int
+	blocks  int
+}
+
+func (t *batchQ8FusedTask) runRows(start, end int) {
+	const rowTile = 16
+	for wi := 0; wi < t.count; wi++ {
+		w := t.weights[wi]
+		localStart := max(start, t.offsets[wi]) - t.offsets[wi]
+		localEnd := min(end, t.offsets[wi+1]) - t.offsets[wi]
+		if localStart >= localEnd {
+			continue
+		}
+		layout := t.layouts[wi]
+		for tileStart := localStart; tileStart < localEnd; tileStart += rowTile {
+			tileEnd := min(tileStart+rowTile, localEnd)
+			for token := 0; token < t.p; token++ {
+				q8 := t.q8All[token*t.cols:]
+				xsc := t.xscAll[token*t.blocks:]
+				xsum := t.sums[wi][token*layout.sumsPerTok:]
+				out := t.outs[wi][token]
+				for row := tileStart; row < tileEnd; row++ {
+					out[row] = layout.dot(w.Raw[row*layout.rowBytes:], q8, xsc, xsum, t.blocks)
+				}
+			}
+		}
+	}
+}
+
+var batchQ8FusedTaskPool = sync.Pool{New: func() any { return new(batchQ8FusedTask) }}
+
+func matvecBatchQ8Fused(task *batchQ8FusedTask, xs [][]float32) bool {
+	if !useQ8Activations.Load() || task.count < 2 || task.count > 3 {
 		return false
 	}
 	p := len(xs)
@@ -318,11 +401,9 @@ func matvecBatchQ8Fused(weights []Weight, xs [][]float32, outs [][][]float32) bo
 		return false
 	}
 	blocks := cols / 256
-	var layouts [3]q8kRowLayout
-	var offsets [4]int
-	for wi := range weights {
-		w := weights[wi]
-		if w.Rows <= 0 || w.Cols != cols || len(outs[wi]) != p {
+	for wi := 0; wi < task.count; wi++ {
+		w := task.weights[wi]
+		if w.Rows <= 0 || w.Cols != cols || len(task.outs[wi]) != p {
 			return false
 		}
 		layout, ok := q8kLayoutFor(w.Type, blocks)
@@ -330,12 +411,12 @@ func matvecBatchQ8Fused(weights []Weight, xs [][]float32, outs [][][]float32) bo
 			return false
 		}
 		for t := range p {
-			if len(xs[t]) < cols || len(outs[wi][t]) < w.Rows {
+			if len(xs[t]) < cols || len(task.outs[wi][t]) < w.Rows {
 				return false
 			}
 		}
-		layouts[wi] = layout
-		offsets[wi+1] = offsets[wi] + w.Rows
+		task.layouts[wi] = layout
+		task.offsets[wi+1] = task.offsets[wi] + w.Rows
 	}
 
 	scratch := batchQ8Pool.Get().(*batchQ8Scratch)
@@ -343,211 +424,149 @@ func matvecBatchQ8Fused(weights []Weight, xs [][]float32, outs [][][]float32) bo
 	ensureLenNoClear(&scratch.xsc, p*blocks)
 	q8All, xscAll := scratch.q8, scratch.xsc
 	sumStorage := [3]*[]float32{&scratch.xsums, &scratch.xsums2, &scratch.xsums3}
-	var sums [3][]float32
 	var owner [3]int
 	uniqueSums := 0
-	for wi := range weights {
+	for wi := 0; wi < task.count; wi++ {
 		owner[wi] = wi
 		for prior := 0; prior < wi; prior++ {
-			if weights[prior].Type == weights[wi].Type {
+			if task.weights[prior].Type == task.weights[wi].Type {
 				owner[wi] = owner[prior]
-				sums[wi] = sums[prior]
+				task.sums[wi] = task.sums[prior]
 				break
 			}
 		}
 		if owner[wi] != wi {
 			continue
 		}
-		ensureLenNoClear(sumStorage[uniqueSums], p*layouts[wi].sumsPerTok)
-		sums[wi] = *sumStorage[uniqueSums]
+		ensureLenNoClear(sumStorage[uniqueSums], p*task.layouts[wi].sumsPerTok)
+		task.sums[wi] = *sumStorage[uniqueSums]
 		uniqueSums++
 	}
 	for t := range p {
 		q8kQuantize(xs[t], q8All[t*cols:], xscAll[t*blocks:], blocks)
-		for wi := range weights {
+		for wi := 0; wi < task.count; wi++ {
 			if owner[wi] != wi {
 				continue
 			}
-			sumsPerTok := layouts[wi].sumsPerTok
-			sub := sums[wi][t*sumsPerTok : (t+1)*sumsPerTok : (t+1)*sumsPerTok]
-			fillQ8KXSums(weights[wi].Type, xs[t], cols, &sub)
+			sumsPerTok := task.layouts[wi].sumsPerTok
+			sub := task.sums[wi][t*sumsPerTok : (t+1)*sumsPerTok : (t+1)*sumsPerTok]
+			fillQ8KXSums(task.weights[wi].Type, xs[t], cols, &sub)
 		}
 	}
 
-	// Keep the same small row tile as matvecBatchQ8. A single worker dispatch
-	// covers all projections; rows from each weight remain contiguous inside a
-	// worker range, preserving cache-friendly streaming of every raw matrix.
-	const rowTile = 16
 	// The fused projection has the same long, weight-stationary row work as
 	// matvecBatchQ8 above. One chunk per worker avoids dispatch overhead on
 	// heterogeneous ARM CPUs while retaining the shared activation preparation.
-	parallelRowsBatched(offsets[len(weights)], func(start, end int) {
-		for wi, w := range weights {
-			localStart := max(start, offsets[wi]) - offsets[wi]
-			localEnd := min(end, offsets[wi+1]) - offsets[wi]
-			if localStart >= localEnd {
-				continue
-			}
-			layout := layouts[wi]
-			for tileStart := localStart; tileStart < localEnd; tileStart += rowTile {
-				tileEnd := min(tileStart+rowTile, localEnd)
-				for t := range p {
-					q8 := q8All[t*cols:]
-					xsc := xscAll[t*blocks:]
-					xsum := sums[wi][t*layout.sumsPerTok:]
-					out := outs[wi][t]
-					for row := tileStart; row < tileEnd; row++ {
-						out[row] = layout.dot(w.Raw[row*layout.rowBytes:], q8, xsc, xsum, blocks)
-					}
-				}
-			}
-		}
-	})
+	task.p, task.cols, task.blocks = p, cols, blocks
+	task.q8All, task.xscAll = q8All, xscAll
+	parallelRowsBatchedTask(task.offsets[task.count], task)
 	batchQ8Pool.Put(scratch)
 	return true
+}
+
+type argmaxQ8Task struct {
+	data       []byte
+	q8         []int8
+	xsc, xsums []float32
+	kind       GGMLType
+	blocks     int
+	rowBytes   int
+	mu         sync.Mutex
+	bestToken  int
+	bestValue  float32
+	found      bool
+}
+
+func (t *argmaxQ8Task) runRows(start, end int) {
+	localToken := start
+	localValue := negInf32
+	localFound := false
+	// Select the concrete kernel once per worker range. Keeping the switch out
+	// of the row loop avoids the indirect function-value call that is material
+	// at vocabulary-output sizes.
+	switch t.kind {
+	case GGMLTypeQ6_K:
+		for row := start; row < end; row++ {
+			v := q6kDotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.xsums, t.blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+	case GGMLTypeQ4_K:
+		for row := start; row < end; row++ {
+			v := q4kDotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.xsums, t.blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+	case GGMLTypeQ5_K:
+		for row := start; row < end; row++ {
+			v := q5kDotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.xsums, t.blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+	case GGMLTypeQ8_0:
+		for row := start; row < end; row++ {
+			v := q8_0DotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.blocks)
+			if finiteLogit(v) && (!localFound || v > localValue) {
+				localToken, localValue, localFound = row, v, true
+			}
+		}
+	}
+	if !localFound {
+		return
+	}
+	t.mu.Lock()
+	if !t.found || localValue > t.bestValue || (localValue == t.bestValue && localToken < t.bestToken) {
+		t.bestToken, t.bestValue, t.found = localToken, localValue, true
+	}
+	t.mu.Unlock()
+}
+
+var argmaxQ8TaskPool = sync.Pool{New: func() any { return new(argmaxQ8Task) }}
+
+func argmaxRowsQ8(kind GGMLType, raw []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
+	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
+		return 0, false
+	}
+	blocks := cols / 256
+	q8, xsc, lease := acquireQ8(x, cols)
+	task := argmaxQ8TaskPool.Get().(*argmaxQ8Task)
+	task.data, task.q8, task.xsc, task.xsums = raw, q8, xsc, xsums
+	task.kind, task.blocks, task.rowBytes = kind, blocks, rowBytes
+	task.bestValue = negInf32
+	parallelRowsTask(rows, task)
+	bestToken := task.bestToken
+	*task = argmaxQ8Task{}
+	argmaxQ8TaskPool.Put(task)
+	releaseQ8(q8, xsc, lease)
+	return uint32(bestToken), true
 }
 
 // argmaxQ6KRowsQ8 finds argmax(W·x) over a Q6_K matrix with the same int8
 // kernel as the materializing matvec, skipping the logits writeback. Returns
 // false when the int8 path is off so callers keep the exact float kernel.
 func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
-	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
-		return 0, false
-	}
-	blocks := cols / 256
-	q8, xsc, lease := acquireQ8(x, cols)
-	defer releaseQ8(q8, xsc, lease)
-	var mu sync.Mutex
-	bestToken := 0
-	bestValue := negInf32
-	found := false
-	parallelRows(rows, func(start, end int) {
-		localToken := start
-		localValue := negInf32
-		localFound := false
-		for r := start; r < end; r++ {
-			// Rows are scanned ascending and the comparison is strict, so ties
-			// keep the lowest token id — matching argmaxMatvecRows.
-			v := q6kDotQ8KRow(data[r*rowBytes:], q8, xsc, xsums, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
-				localToken, localValue, localFound = r, v, true
-			}
-		}
-		if !localFound {
-			return
-		}
-		mu.Lock()
-		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
-			bestToken, bestValue, found = localToken, localValue, true
-		}
-		mu.Unlock()
-	})
-	return uint32(bestToken), true
+	return argmaxRowsQ8(GGMLTypeQ6_K, data, x, xsums, rows, cols, rowBytes)
 }
 
 // argmaxQ4KRowsQ8 is the Q4_K analogue of argmaxQ6KRowsQ8. xsums must be the
 // per-32-element sums of the original activations (fillQ4KXSums).
 func argmaxQ4KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
-	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
-		return 0, false
-	}
-	blocks := cols / 256
-	q8, xsc, lease := acquireQ8(x, cols)
-	defer releaseQ8(q8, xsc, lease)
-	var mu sync.Mutex
-	bestToken := 0
-	bestValue := negInf32
-	found := false
-	parallelRows(rows, func(start, end int) {
-		localToken := start
-		localValue := negInf32
-		localFound := false
-		for r := start; r < end; r++ {
-			v := q4kDotQ8KRow(data[r*rowBytes:], q8, xsc, xsums, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
-				localToken, localValue, localFound = r, v, true
-			}
-		}
-		if !localFound {
-			return
-		}
-		mu.Lock()
-		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
-			bestToken, bestValue, found = localToken, localValue, true
-		}
-		mu.Unlock()
-	})
-	return uint32(bestToken), true
+	return argmaxRowsQ8(GGMLTypeQ4_K, data, x, xsums, rows, cols, rowBytes)
 }
 
 // argmaxQ5KRowsQ8 is the Q5_K analogue of argmaxQ4KRowsQ8. xsums are the same
 // per-32-element sums Q5_K shares with Q4_K (fillQ4KXSums).
 func argmaxQ5KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) (uint32, bool) {
-	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
-		return 0, false
-	}
-	blocks := cols / 256
-	q8, xsc, lease := acquireQ8(x, cols)
-	defer releaseQ8(q8, xsc, lease)
-	var mu sync.Mutex
-	bestToken := 0
-	bestValue := negInf32
-	found := false
-	parallelRows(rows, func(start, end int) {
-		localToken := start
-		localValue := negInf32
-		localFound := false
-		for r := start; r < end; r++ {
-			v := q5kDotQ8KRow(data[r*rowBytes:], q8, xsc, xsums, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
-				localToken, localValue, localFound = r, v, true
-			}
-		}
-		if !localFound {
-			return
-		}
-		mu.Lock()
-		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
-			bestToken, bestValue, found = localToken, localValue, true
-		}
-		mu.Unlock()
-	})
-	return uint32(bestToken), true
+	return argmaxRowsQ8(GGMLTypeQ5_K, data, x, xsums, rows, cols, rowBytes)
 }
 
 // argmaxQ8_0RowsQ8 is the Q8_0 analogue of argmaxQ4KRowsQ8. Q8_0 is symmetric
 // (no dmin term), so unlike the K-quant variants it needs no xsums.
 func argmaxQ8_0RowsQ8(data []byte, x []float32, rows, cols, rowBytes int) (uint32, bool) {
-	if !useQ8Activations.Load() || rows <= 0 || cols <= 0 || cols%256 != 0 {
-		return 0, false
-	}
-	blocks := cols / 256
-	q8, xsc, lease := acquireQ8(x, cols)
-	defer releaseQ8(q8, xsc, lease)
-	var mu sync.Mutex
-	bestToken := 0
-	bestValue := negInf32
-	found := false
-	parallelRows(rows, func(start, end int) {
-		localToken := start
-		localValue := negInf32
-		localFound := false
-		for r := start; r < end; r++ {
-			v := q8_0DotQ8KRow(data[r*rowBytes:], q8, xsc, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
-				localToken, localValue, localFound = r, v, true
-			}
-		}
-		if !localFound {
-			return
-		}
-		mu.Lock()
-		if !found || localValue > bestValue || (localValue == bestValue && localToken < bestToken) {
-			bestToken, bestValue, found = localToken, localValue, true
-		}
-		mu.Unlock()
-	})
-	return uint32(bestToken), true
+	return argmaxRowsQ8(GGMLTypeQ8_0, data, x, nil, rows, cols, rowBytes)
 }
 
 // The int8-activation path is now implemented everywhere, so the autotuner is

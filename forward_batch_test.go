@@ -41,6 +41,29 @@ func TestParallelRowsBatchedUsesOneRangePerWorker(t *testing.T) {
 	}
 }
 
+type batchRangeCounterTask struct {
+	calls   atomic.Int32
+	covered atomic.Int64
+}
+
+func (t *batchRangeCounterTask) runRows(start, end int) {
+	t.calls.Add(1)
+	t.covered.Add(int64(end - start))
+}
+
+func TestParallelRowsBatchedTaskUsesOneRangePerWorker(t *testing.T) {
+	threads := numThreads()
+	rows := threads * 128
+	task := &batchRangeCounterTask{}
+	parallelRowsBatchedTask(rows, task)
+	if got := int(task.calls.Load()); got != threads {
+		t.Fatalf("batch task dispatch ranges = %d, want one per worker (%d)", got, threads)
+	}
+	if got := int(task.covered.Load()); got != rows {
+		t.Fatalf("batch task dispatch covered %d rows, want %d", got, rows)
+	}
+}
+
 func TestBatchedPrefillMatchesPerToken(t *testing.T) {
 	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "32")
 	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
@@ -415,6 +438,62 @@ func TestMatvecBatchQ8FusedProjectionsMatchSeparate(t *testing.T) {
 			}
 		}
 	}
+}
+
+// BenchmarkMatvecBatchQ8Fused3_256x512_P32 keeps the Q8 fused-prompt path
+// above its 32-token admission threshold. It makes allocation and throughput
+// regressions in the shared Q/K/V prefill projection visible independently of
+// the rest of ForwardBatchInto.
+func BenchmarkMatvecBatchQ8Fused3_256x512_P32(b *testing.B) {
+	rng := rand.New(rand.NewSource(73))
+	const (
+		rows = 256
+		cols = 512
+		p    = 32
+	)
+	makeWeight := func(typ GGMLType, seedOffset int) Weight {
+		rowRNG := rand.New(rand.NewSource(int64(73 + seedOffset)))
+		var raw []byte
+		for range rows {
+			switch typ {
+			case GGMLTypeQ4_K:
+				raw = append(raw, randomQ4KRow(rowRNG, cols)...)
+			case GGMLTypeQ6_K:
+				raw = append(raw, randomQ6KRow(rowRNG, cols)...)
+			default:
+				b.Fatalf("unsupported fixture type %s", typ)
+			}
+		}
+		return Weight{Raw: raw, Type: typ, Rows: rows, Cols: cols}
+	}
+	newOutputs := func() [][]float32 {
+		out := make([][]float32, p)
+		for token := range out {
+			out[token] = make([]float32, rows)
+		}
+		return out
+	}
+	xs := make([][]float32, p)
+	for token := range xs {
+		xs[token] = randomVec(rng, cols)
+	}
+	a := makeWeight(GGMLTypeQ4_K, 1)
+	bWeight := makeWeight(GGMLTypeQ4_K, 2)
+	c := makeWeight(GGMLTypeQ6_K, 3)
+	aOut, bOut, cOut := newOutputs(), newOutputs(), newOutputs()
+
+	withQ8Activations(true, func() {
+		if !matvecBatchQ8Fused3(a, bWeight, c, xs, aOut, bOut, cOut) {
+			b.Skip("Q8 fused prefill is unavailable on this architecture")
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if !matvecBatchQ8Fused3(a, bWeight, c, xs, aOut, bOut, cOut) {
+				b.Fatal("Q8 fused prefill unexpectedly declined a validated shape")
+			}
+		}
+	})
 }
 
 func TestSameTypeQ4_0FusionMatchesSeparateMatvecs(t *testing.T) {

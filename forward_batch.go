@@ -44,6 +44,158 @@ func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]flo
 	return *views
 }
 
+// batchAttentionTask holds the per-layer state for independent prompt-token
+// attention work. Keeping it in a pool lets ForwardBatchInto reuse the worker
+// pool without creating an escaping closure for every transformer layer.
+type batchAttentionTask struct {
+	cache      *KVCache
+	q, attnOut [][]float32
+
+	l, startPos                                int
+	headDim, valueDim, nHeads, nKVHeads, kvMul int
+	slidingWindow                              int
+	scale, softcap, alibiMaxBias               float32
+	usesSWA, groupedGQA, alibi                 bool
+}
+
+func (t *batchAttentionTask) runRows(start, end int) {
+	for token := start; token < end; token++ {
+		pos := t.startPos + token
+		attnStart := 0
+		if t.usesSWA {
+			attnStart = max(0, pos-t.slidingWindow)
+		}
+		clear(t.attnOut[token])
+		if t.groupedGQA {
+			for kvH := 0; kvH < t.nKVHeads; kvH++ {
+				hStart := kvH * t.kvMul
+				hEnd := min(hStart+t.kvMul, t.nHeads)
+				if hStart >= hEnd {
+					break
+				}
+				t.cache.attendHeadGroup(t.l, kvH,
+					t.q[token][hStart*t.headDim:hEnd*t.headDim], hEnd-hStart,
+					t.headDim, t.valueDim, attnStart, pos, t.scale, t.softcap,
+					t.attnOut[token][hStart*t.valueDim:hEnd*t.valueDim])
+			}
+			continue
+		}
+		for h := 0; h < t.nHeads; h++ {
+			kvH := h / t.kvMul
+			var alibiSlope float32
+			if t.alibi {
+				alibiSlope = aLiBiSlope(h, t.nHeads, t.alibiMaxBias)
+			}
+			t.cache.attendHeadWithSink(t.l, kvH, t.q[token][h*t.headDim:h*t.headDim+t.headDim],
+				t.headDim, t.valueDim, attnStart, pos, t.scale, t.softcap,
+				alibiSlope, 0, false,
+				t.attnOut[token][h*t.valueDim:h*t.valueDim+t.valueDim])
+		}
+	}
+}
+
+var batchAttentionTaskPool = sync.Pool{New: func() any { return new(batchAttentionTask) }}
+
+// batchActivationTask is the allocation-free equivalent of the short
+// per-token FFN activation closure in ForwardBatchInto.
+type batchActivationTask struct {
+	gate, up, hidden             [][]float32
+	hiddenDim                    int
+	plainMLP, exactGELU, useGELU bool
+}
+
+func (t *batchActivationTask) runRows(start, end int) {
+	for token := start; token < end; token++ {
+		if t.plainMLP {
+			if t.exactGELU {
+				for i := 0; i < t.hiddenDim; i++ {
+					t.hidden[token][i] = geluExact(t.up[token][i])
+				}
+			} else {
+				for i := 0; i < t.hiddenDim; i++ {
+					t.hidden[token][i] = geluTanhScalar(t.up[token][i])
+				}
+			}
+		} else if t.useGELU {
+			geluMulF32(t.gate[token][:t.hiddenDim], t.up[token][:t.hiddenDim], t.hidden[token][:t.hiddenDim])
+		} else {
+			siluMulF32(t.gate[token][:t.hiddenDim], t.up[token][:t.hiddenDim], t.hidden[token][:t.hiddenDim])
+		}
+	}
+}
+
+var batchActivationTaskPool = sync.Pool{New: func() any { return new(batchActivationTask) }}
+
+// batchF32MatvecTask streams an expanded f32 matrix once across a prompt
+// batch. Its pooled state replaces the callback allocation on every dense
+// batch projection.
+type batchF32MatvecTask struct {
+	weights  []float32
+	xs, outs [][]float32
+	p, cols  int
+	tiled    bool
+}
+
+func (t *batchF32MatvecTask) runRows(start, end int) {
+	for rowIndex := start; rowIndex < end; rowIndex++ {
+		row := t.weights[rowIndex*t.cols : (rowIndex+1)*t.cols]
+		dotRowIntoBatch(row, t.xs, t.outs, rowIndex, t.p, t.cols, t.tiled)
+	}
+}
+
+var batchF32MatvecTaskPool = sync.Pool{New: func() any { return new(batchF32MatvecTask) }}
+
+// batchRawScalarMatvecTask keeps raw f16/bf16/f32 weights in their compact
+// representation while applying every row to the prompt batch.
+type batchRawScalarMatvecTask struct {
+	raw      []byte
+	typeID   GGMLType
+	xs, outs [][]float32
+	p, cols  int
+	rowBytes int
+}
+
+func (t *batchRawScalarMatvecTask) runRows(start, end int) {
+	for rowIndex := start; rowIndex < end; rowIndex++ {
+		offset := rowIndex * t.rowBytes
+		for token := 0; token < t.p; token++ {
+			t.outs[token][rowIndex] = rawScalarDot(t.raw, t.typeID, offset, t.xs[token], t.cols)
+		}
+	}
+}
+
+var batchRawScalarMatvecTaskPool = sync.Pool{New: func() any { return new(batchRawScalarMatvecTask) }}
+
+// batchDequantMatvecTask owns the row range for formats that are dequantized
+// once then dotted against every prompt token. The scratch remains local to a
+// worker range exactly as in the callback implementation.
+type batchDequantMatvecTask struct {
+	raw      []byte
+	dequant  func(src []byte, cols int, dst []float32)
+	xs, outs [][]float32
+	p, cols  int
+	rowBytes int
+	tiled    bool
+}
+
+func (t *batchDequantMatvecTask) runRows(start, end int) {
+	scratch := batchDequantScratchPool.Get().(*[]float32)
+	if cap(*scratch) < t.cols {
+		*scratch = make([]float32, t.cols)
+	} else {
+		*scratch = (*scratch)[:t.cols]
+	}
+	dequantized := *scratch
+	for rowIndex := start; rowIndex < end; rowIndex++ {
+		t.dequant(t.raw[rowIndex*t.rowBytes:(rowIndex+1)*t.rowBytes], t.cols, dequantized)
+		dotRowIntoBatch(dequantized, t.xs, t.outs, rowIndex, t.p, t.cols, t.tiled)
+	}
+	*scratch = dequantized[:0]
+	batchDequantScratchPool.Put(scratch)
+}
+
+var batchDequantMatvecTaskPool = sync.Pool{New: func() any { return new(batchDequantMatvecTask) }}
+
 // Batched (prefill) matvec and forward pass. During prompt processing the
 // per-token path re-streams every weight from memory once per token; batching
 // reads each weight row once and applies it to all prompt tokens, so a P-token
@@ -129,12 +281,12 @@ func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
 
 	if w.F32 != nil {
 		rows := len(w.F32) / cols
-		parallelRowsBatched(rows, func(start, end int) {
-			for r := start; r < end; r++ {
-				row := w.F32[r*cols : (r+1)*cols]
-				dotRowIntoBatch(row, xs, outs, r, p, cols, tiled)
-			}
-		})
+		task := batchF32MatvecTaskPool.Get().(*batchF32MatvecTask)
+		task.weights, task.xs, task.outs = w.F32, xs, outs
+		task.p, task.cols, task.tiled = p, cols, tiled
+		parallelRowsBatchedTask(rows, task)
+		*task = batchF32MatvecTask{}
+		batchF32MatvecTaskPool.Put(task)
 		return
 	}
 
@@ -160,14 +312,12 @@ func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
 		if width := scalarBytesPerElement(w.Type); width > 0 {
 			rowBytes := cols * width
 			if len(w.Raw) >= w.Rows*rowBytes {
-				parallelRowsBatched(w.Rows, func(start, end int) {
-					for r := start; r < end; r++ {
-						off := r * rowBytes
-						for t := 0; t < p; t++ {
-							outs[t][r] = rawScalarDot(w.Raw, w.Type, off, xs[t], cols)
-						}
-					}
-				})
+				task := batchRawScalarMatvecTaskPool.Get().(*batchRawScalarMatvecTask)
+				task.raw, task.typeID, task.xs, task.outs = w.Raw, w.Type, xs, outs
+				task.p, task.cols, task.rowBytes = p, cols, rowBytes
+				parallelRowsBatchedTask(w.Rows, task)
+				*task = batchRawScalarMatvecTask{}
+				batchRawScalarMatvecTaskPool.Put(task)
 				return
 			}
 		}
@@ -186,21 +336,12 @@ func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
 		return
 	}
 	rowBytes := len(w.Raw) / w.Rows
-	parallelRowsBatched(w.Rows, func(start, end int) {
-		scratch := batchDequantScratchPool.Get().(*[]float32)
-		if cap(*scratch) < cols {
-			*scratch = make([]float32, cols)
-		} else {
-			*scratch = (*scratch)[:cols]
-		}
-		deq := *scratch
-		for r := start; r < end; r++ {
-			dequant(w.Raw[r*rowBytes:(r+1)*rowBytes], cols, deq)
-			dotRowIntoBatch(deq, xs, outs, r, p, cols, tiled)
-		}
-		*scratch = deq[:0]
-		batchDequantScratchPool.Put(scratch)
-	})
+	task := batchDequantMatvecTaskPool.Get().(*batchDequantMatvecTask)
+	task.raw, task.dequant, task.xs, task.outs = w.Raw, dequant, xs, outs
+	task.p, task.cols, task.rowBytes, task.tiled = p, cols, rowBytes, tiled
+	parallelRowsBatchedTask(w.Rows, task)
+	*task = batchDequantMatvecTask{}
+	batchDequantMatvecTaskPool.Put(task)
 }
 
 // matvecBatch2/3 keep projections with a shared activation batch together.
@@ -470,46 +611,19 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 
 		// Attention is independent per token, so spread the chunk across workers.
 		alibi := config.usesALiBi()
-		attend := func(ts, te int) {
-			for t := ts; t < te; t++ {
-				pos := startPos + t
-				attnStart := 0
-				if config.layerUsesSWA(l) {
-					attnStart = max(0, pos-config.SlidingWindow)
-				}
-				clear(AttnOut[t])
-				if useGroupedGQAAttention && kvMul > 1 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !alibi {
-					for kvH := 0; kvH < config.NKVHeads; kvH++ {
-						hStart := kvH * kvMul
-						hEnd := min(hStart+kvMul, config.NHeads)
-						if hStart >= hEnd {
-							break
-						}
-						cache.attendHeadGroup(l, kvH,
-							Q[t][hStart*headDim:hEnd*headDim], hEnd-hStart,
-							headDim, valueDim, attnStart, pos, scale, config.AttnLogitSoftcap,
-							AttnOut[t][hStart*valueDim:hEnd*valueDim])
-					}
-				} else {
-					for h := 0; h < config.NHeads; h++ {
-						kvH := h / kvMul
-						var alibiSlope float32
-						if alibi {
-							alibiSlope = aLiBiSlope(h, config.NHeads, config.ALiBiMaxBias)
-						}
-						cache.attendHeadWithSink(l, kvH, Q[t][h*headDim:h*headDim+headDim],
-							headDim, valueDim, attnStart, pos, scale,
-							config.AttnLogitSoftcap, alibiSlope, 0, false,
-							AttnOut[t][h*valueDim:h*valueDim+valueDim])
-					}
-				}
-			}
-		}
-		if p > 1 {
-			parallelChunks(p, attend)
-		} else {
-			attend(0, p)
-		}
+		attendTask := batchAttentionTaskPool.Get().(*batchAttentionTask)
+		attendTask.cache, attendTask.q, attendTask.attnOut = cache, Q, AttnOut
+		attendTask.l, attendTask.startPos = l, startPos
+		attendTask.headDim, attendTask.valueDim = headDim, valueDim
+		attendTask.nHeads, attendTask.nKVHeads, attendTask.kvMul = config.NHeads, config.NKVHeads, kvMul
+		attendTask.slidingWindow = config.SlidingWindow
+		attendTask.scale, attendTask.softcap, attendTask.alibiMaxBias = scale, config.AttnLogitSoftcap, config.ALiBiMaxBias
+		attendTask.usesSWA = config.layerUsesSWA(l)
+		attendTask.groupedGQA = useGroupedGQAAttention && kvMul > 1 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !alibi
+		attendTask.alibi = alibi
+		parallelChunksTask(p, attendTask)
+		*attendTask = batchAttentionTask{}
+		batchAttentionTaskPool.Put(attendTask)
 
 		matvecBatch(layer.WO, AttnOut, Proj)
 		for t := 0; t < p; t++ {
@@ -550,32 +664,13 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		} else {
 			matvecBatch2(layer.W1, layer.W3, XN, Gate, Up)
 		}
-		activateFFN := func(ts, te int) {
-			for t := ts; t < te; t++ {
-				if config.usesPlainMLP() {
-					if config.UseExactGELU {
-						for i := 0; i < hDim; i++ {
-							Hidden[t][i] = geluExact(Up[t][i])
-						}
-					} else {
-						for i := 0; i < hDim; i++ {
-							Hidden[t][i] = geluTanhScalar(Up[t][i])
-						}
-					}
-				} else if config.UseGELU {
-					geluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])
-				} else {
-					siluMulF32(Gate[t][:hDim], Up[t][:hDim], Hidden[t][:hDim])
-				}
-			}
-		}
-		if p > 1 {
-			parallelChunks(p, func(ts, te int) {
-				activateFFN(ts, te)
-			})
-		} else {
-			activateFFN(0, 1)
-		}
+		activationTask := batchActivationTaskPool.Get().(*batchActivationTask)
+		activationTask.gate, activationTask.up, activationTask.hidden = Gate, Up, Hidden
+		activationTask.hiddenDim = hDim
+		activationTask.plainMLP, activationTask.exactGELU, activationTask.useGELU = config.usesPlainMLP(), config.UseExactGELU, config.UseGELU
+		parallelChunksTask(p, activationTask)
+		*activationTask = batchActivationTask{}
+		batchActivationTaskPool.Put(activationTask)
 		matvecBatch(layer.W2, Hidden, Proj)
 		for t := 0; t < p; t++ {
 			addInPlace(Proj[t], layer.FFNDownBias)

@@ -60,6 +60,30 @@ type PixtralVisionWeights struct {
 	ImgBreak    []float32 // v.token_embd.img_break -- lives in the TEXT decoder's embedding space, width == the paired LLM's Dim
 }
 
+// releasePixtralVisionWeights releases all accelerator copies owned by a
+// companion Pixtral tower. Vision weights can borrow a dedicated mmap, so this
+// must run before Runner.Close unmaps visionMappedFile.
+func releasePixtralVisionWeights(weights *PixtralVisionWeights) {
+	if weights == nil {
+		return
+	}
+	var releaser weightResourceReleaser
+	releaser.release(&weights.PatchEmbd)
+	for i := range weights.Layers {
+		layer := &weights.Layers[i]
+		releaser.release(&layer.Q)
+		releaser.release(&layer.K)
+		releaser.release(&layer.V)
+		releaser.release(&layer.Out)
+		releaser.release(&layer.FFNGate)
+		releaser.release(&layer.FFNUp)
+		releaser.release(&layer.FFNDown)
+	}
+	releaser.release(&weights.PatchMerger)
+	releaser.release(&weights.Proj1)
+	releaser.release(&weights.Proj2)
+}
+
 // LoadPixtralVisionModel loads a Pixtral-projector "mmproj" GGUF (companion
 // to, and structurally unrelated to, a text-decoder GGUF loaded separately
 // via LoadModel/RunnerFromGGUFBytes*). It fails loudly if the file isn't a

@@ -1027,63 +1027,53 @@ func qwen35FFNForward(w Qwen35FFNWeights, x []float32, buf *DecodeBuffer) {
 	w.Down.MatvecInto(buf.Hidden, &buf.Proj)
 }
 
-// releaseQwen35MetalWeights releases every optional Metal backing buffer owned
-// by the hybrid graph, mirroring releaseNemotronHMetalWeights.
+// releaseQwen35MetalWeights releases every optional accelerator backing
+// buffer owned by the hybrid graph, mirroring releaseNemotronHMetalWeights.
 func releaseQwen35MetalWeights(weights *Qwen35Weights) {
 	if weights == nil {
 		return
 	}
-	seen := map[*MetalWeight]bool{}
-	release := func(w *Weight) {
-		if w == nil || w.Metal == nil {
-			return
-		}
-		if !seen[w.Metal] {
-			releaseMetalWeight(w.Metal)
-			seen[w.Metal] = true
-		}
-		w.Metal = nil
-	}
-	release(&weights.TokenEmbd)
-	release(&weights.Output)
+	var releaser weightResourceReleaser
+	releaser.release(&weights.TokenEmbd)
+	releaser.release(&weights.Output)
 	if weights.MTP != nil {
 		mtp := weights.MTP
-		release(&mtp.TokenEmbd)
-		release(&mtp.EHProj)
-		release(&mtp.Attention.Q)
-		release(&mtp.Attention.K)
-		release(&mtp.Attention.V)
-		release(&mtp.Attention.O)
-		release(&mtp.FFN.Gate)
-		release(&mtp.FFN.Up)
-		release(&mtp.FFN.Down)
-		release(&mtp.Output)
+		releaser.release(&mtp.TokenEmbd)
+		releaser.release(&mtp.EHProj)
+		releaser.release(&mtp.Attention.Q)
+		releaser.release(&mtp.Attention.K)
+		releaser.release(&mtp.Attention.V)
+		releaser.release(&mtp.Attention.O)
+		releaser.release(&mtp.FFN.Gate)
+		releaser.release(&mtp.FFN.Up)
+		releaser.release(&mtp.FFN.Down)
+		releaser.release(&mtp.Output)
 	}
 	for i := range weights.Layers {
 		layer := &weights.Layers[i]
-		release(&layer.Attention.Q)
-		release(&layer.Attention.K)
-		release(&layer.Attention.V)
-		release(&layer.Attention.O)
-		release(&layer.DeltaNet.QKVConv)
-		release(&layer.DeltaNet.ConvKernel)
-		release(&layer.DeltaNet.Gate)
-		release(&layer.DeltaNet.AlphaProj)
-		release(&layer.DeltaNet.BetaProj)
-		release(&layer.DeltaNet.Out)
-		release(&layer.FFN.Gate)
-		release(&layer.FFN.Up)
-		release(&layer.FFN.Down)
+		releaser.release(&layer.Attention.Q)
+		releaser.release(&layer.Attention.K)
+		releaser.release(&layer.Attention.V)
+		releaser.release(&layer.Attention.O)
+		releaser.release(&layer.DeltaNet.QKVConv)
+		releaser.release(&layer.DeltaNet.ConvKernel)
+		releaser.release(&layer.DeltaNet.Gate)
+		releaser.release(&layer.DeltaNet.AlphaProj)
+		releaser.release(&layer.DeltaNet.BetaProj)
+		releaser.release(&layer.DeltaNet.Out)
+		releaser.release(&layer.FFN.Gate)
+		releaser.release(&layer.FFN.Up)
+		releaser.release(&layer.FFN.Down)
 		if layer.FFN.MoE != nil {
 			moe := layer.FFN.MoE
-			release(&moe.Router)
-			release(&moe.Gate.Weight)
-			release(&moe.Up.Weight)
-			release(&moe.Down.Weight)
-			release(moe.SharedGateIn)
-			release(moe.SharedGate)
-			release(moe.SharedUp)
-			release(moe.SharedDown)
+			releaser.release(&moe.Router)
+			releaser.release(&moe.Gate.Weight)
+			releaser.release(&moe.Up.Weight)
+			releaser.release(&moe.Down.Weight)
+			releaser.release(moe.SharedGateIn)
+			releaser.release(moe.SharedGate)
+			releaser.release(moe.SharedUp)
+			releaser.release(moe.SharedDown)
 		}
 	}
 }

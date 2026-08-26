@@ -28,8 +28,10 @@ import (
 
 // oversubscribeDispatch issues more matvec chunks than workers so faster
 // cores absorb stragglers — a win on heterogeneous big.LITTLE parts (Apple
-// Silicon), pure channel-wakeup overhead on homogeneous x86 cores.
-var oversubscribeDispatch = runtime.GOARCH == "arm64"
+// Silicon), pure channel-wakeup overhead on homogeneous x86 cores. Auto Mode
+// changes it process-wide while other Runners may be generating, so reads on
+// the hot path must be atomic.
+var oversubscribeDispatch = newAtomicBool(runtime.GOARCH == "arm64")
 
 var configuredThreads atomic.Int64
 
@@ -183,14 +185,32 @@ func MatvecF32(data, x []float32, rows, cols int) []float32 {
 	return out
 }
 
+// matvecF32Task keeps the hot F32 path out of an escaping callback. F32
+// checkpoints invoke this for every projection, so even one closure allocation
+// per matvec becomes visible in small/full-precision models and benchmarks.
+type matvecF32Task struct {
+	data []float32
+	x    []float32
+	out  []float32
+	cols int
+}
+
+func (t *matvecF32Task) runRows(start, end int) {
+	for r := start; r < end; r++ {
+		row := t.data[r*t.cols : min((r+1)*t.cols, len(t.data))]
+		t.out[r] = DotF32(row, t.x)
+	}
+}
+
+var matvecF32TaskPool = sync.Pool{New: func() any { return new(matvecF32Task) }}
+
 func MatvecF32Into(data, x []float32, rows, cols int, out *[]float32) {
 	ensureLenNoClear(out, rows)
-	parallelRows(rows, func(start, end int) {
-		for r := start; r < end; r++ {
-			row := data[r*cols : min((r+1)*cols, len(data))]
-			(*out)[r] = DotF32(row, x)
-		}
-	})
+	task := matvecF32TaskPool.Get().(*matvecF32Task)
+	task.data, task.x, task.out, task.cols = data, x, *out, cols
+	parallelRowsTask(rows, task)
+	*task = matvecF32Task{}
+	matvecF32TaskPool.Put(task)
 }
 
 var xsumsScratchPool = sync.Pool{New: func() any {

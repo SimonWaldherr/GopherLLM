@@ -15,6 +15,10 @@ type EmbeddingResult struct {
 // equals cosine similarity). Dimension is the model's hidden size — note this
 // uses the generation model's hidden states, not a dedicated embedding head.
 func (r *Runner) Embed(text string) (EmbeddingResult, error) {
+	if err := r.acquireModelLease(); err != nil {
+		return EmbeddingResult{}, err
+	}
+	defer r.releaseModelLease()
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
 	if r.kind == loadedBERT {
@@ -27,7 +31,13 @@ func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	if len(tokens) == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: input tokenised to zero tokens")
 	}
-	if r.config.MaxSeqLen > 0 && len(tokens) > r.config.MaxSeqLen {
+	// generationWorkspace allocates its KV cache from MaxSeqLen. A malformed
+	// or manually constructed decoder with a zero context length used to get
+	// as far as a zero-sized cache and panic inside the forward pass.
+	if r.config.MaxSeqLen <= 0 {
+		return EmbeddingResult{}, fmt.Errorf("embed: model has an invalid context length (%d)", r.config.MaxSeqLen)
+	}
+	if len(tokens) > r.config.MaxSeqLen {
 		return EmbeddingResult{}, fmt.Errorf("embed: input (%d tokens) exceeds the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
 	}
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+1)

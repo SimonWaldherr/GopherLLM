@@ -27,6 +27,12 @@ import (
 // no other renderer understands ChatMessage.Images and would just drop the
 // image data instead of erroring.
 func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, map[int][]float32, bool, error) {
+	// This renderer is also used by PrepareChatContext, which deliberately
+	// does not take genLock. Keep the whole image-rendering transaction under
+	// one shared tower lease so Close cannot release Metal/WebGPU resources or
+	// unmap a borrowed projector while EncodeImagePixtral is using it.
+	r.visionMu.RLock()
+	defer r.visionMu.RUnlock()
 	instTok, ok1 := r.tok.SpecialID("[INST]")
 	instEndTok, ok2 := r.tok.SpecialID("[/INST]")
 	if !(ok1 && ok2) {
@@ -110,7 +116,10 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 				if len(m.Images) > 1 {
 					return nil, nil, true, fmt.Errorf("rendering message %d: only one image per message is supported, got %d", i, len(m.Images))
 				}
-				if !r.HasVision() {
+				// We already hold visionMu; calling HasVision here would take a
+				// recursive RLock and can deadlock when Close is waiting for its
+				// exclusive lease.
+				if r.vision == nil {
 					return nil, nil, true, fmt.Errorf("rendering message %d: message includes an image but no vision projector is loaded for this model", i)
 				}
 				imgTok, ok1 := r.tok.SpecialID("[IMG]")

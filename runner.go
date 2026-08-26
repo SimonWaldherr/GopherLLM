@@ -1,12 +1,19 @@
 package gopherllm
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ErrRunnerClosed is returned when an operation begins after Runner.Close.
+// A Runner may be shared between goroutines; the generation lock makes a
+// concurrent Close deterministic rather than letting a waiter reach cleared
+// or unmapped weights after Close wins the lock.
+var ErrRunnerClosed = errors.New("runner closed")
 
 type LoadInfo struct {
 	FileSizeBytes int
@@ -26,7 +33,9 @@ type LoadOptions struct {
 	// not mutate the input while the Runner is in use. This is useful for
 	// browser/WASM loads, where the input has already been copied into the Go
 	// heap and a second full model-sized copy can exceed the address-space
-	// budget.
+	// budget. It is disabled for byte-backed loads with UseMetal because
+	// Metal's no-copy buffers may retain only OS-mapped memory, never a Go
+	// heap pointer.
 	BorrowQuantized bool
 	// OutOfCore keeps scalar and quantized matrices as views of a real mmap,
 	// disables GPU/prepared copies, and avoids prewarming sparse expert banks.
@@ -62,22 +71,32 @@ const (
 // tokenizer, config, and weights (one of the three kind-specific sets).
 // Generations and embeddings are serialized by genLock — a Runner is safe to
 // share across goroutines (the HTTP server does), but runs one request at a
-// time. Close releases the memory-mapped weight file; quantized weights
-// borrow from it, so no method may be called after Close.
+// time. modelMu keeps borrowed weight storage alive for every active reader;
+// Close takes it exclusively, then resource-consuming calls begun afterwards
+// return ErrRunnerClosed.
 type Runner struct {
-	gguf           *GGUFFile
-	arch           string
-	tok            *Tokenizer
-	config         Config
-	kind           loadedKind
-	standard       ModelWeights
-	gptOss         GptOssWeights
-	gemma4         Gemma4Weights
-	nemotronH      NemotronHWeights
-	mamba2         Mamba2Weights
-	bert           BERTWeights
-	qwen35         Qwen35Weights
-	genLock        sync.Mutex
+	gguf      *GGUFFile
+	arch      string
+	tok       *Tokenizer
+	config    Config
+	kind      loadedKind
+	standard  ModelWeights
+	gptOss    GptOssWeights
+	gemma4    Gemma4Weights
+	nemotronH NemotronHWeights
+	mamba2    Mamba2Weights
+	bert      BERTWeights
+	qwen35    Qwen35Weights
+	// modelMu protects the lifecycle of all CPU/GPU weight storage. The
+	// lock order for resource-consuming work is modelMu, then genLock, then
+	// visionMu (and finally visionCacheMu when needed).
+	modelMu sync.RWMutex
+	genLock sync.Mutex
+	// closed is protected by modelMu. Resource-consuming public operations
+	// acquire a shared model lease before reading weights, so a call queued
+	// behind Close returns ErrRunnerClosed rather than touching containers that
+	// Close cleared.
+	closed         bool
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
 	bertScratch    bertEmbeddingScratch
@@ -97,6 +116,15 @@ type Runner struct {
 	vision           *PixtralVisionWeights
 	visionConfig     PixtralVisionConfig
 	visionMappedFile *MmapFile
+	// visionMu protects the vision tower and its dedicated mapping. Unlike
+	// generation, PrepareChatContext is intentionally usable concurrently and
+	// can encode an image through renderMessages, so genLock alone cannot
+	// protect a Close from releasing the tower underneath that reader.
+	//
+	// Lock order is modelMu, genLock, then visionMu when more than one is
+	// needed. Never call HasVision while already holding a visionMu read lock:
+	// a waiting writer makes recursive RLock deadlock.
+	visionMu sync.RWMutex
 	// visionCacheMu guards the three vision-cache fields below.
 	//
 	// Deliberately its own lock rather than genLock: PrepareChatContext is
@@ -155,7 +183,14 @@ type visionImageCacheEntry struct {
 }
 
 // HasVision reports whether this Runner has a paired vision encoder loaded.
-func (r *Runner) HasVision() bool { return r != nil && r.vision != nil }
+func (r *Runner) HasVision() bool {
+	if r == nil {
+		return false
+	}
+	r.visionMu.RLock()
+	defer r.visionMu.RUnlock()
+	return r.vision != nil
+}
 
 // ArchitectureSupported reports whether the loader accepts this
 // general.architecture value. Notes on specific families:
@@ -221,6 +256,12 @@ func RunnerFromGGUFBytes(data []byte) (*Runner, error) {
 func RunnerFromGGUFBytesWithOptions(data []byte, options LoadOptions) (*Runner, error) {
 	if options.OutOfCore {
 		return nil, fmt.Errorf("out-of-core loading requires RunnerFromPathWithOptions: byte-backed models already reside in memory")
+	}
+	// Metal's zero-copy path retains the supplied address in an Objective-C
+	// buffer. A byte-backed GGUF is Go-managed memory, not an OS mapping, so
+	// it must be copied before crossing that ownership boundary.
+	if options.UseMetal {
+		options.BorrowQuantized = false
 	}
 	return runnerFromGGUFBytes(data, options.BorrowQuantized, options)
 }
@@ -375,7 +416,12 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		}
 		var vc PixtralVisionConfig
 		var vw PixtralVisionWeights
-		if options.BorrowQuantized {
+		// A Metal zero-copy buffer may retain only an OS-mapped address. The
+		// text model's effective borrow mode does not establish that the
+		// companion uses a mapping: a second OpenMmap can fall back to a Go
+		// heap read, and VisionProjectorBytes is always heap-backed.
+		visionBorrow := borrowQuantized && (!options.UseMetal || (visionFile != nil && visionFile.IsMapped()))
+		if visionBorrow {
 			vc, vw, err = loadPixtralVisionModel(visionData, visionGGUF, options.UseMetal, true, logw)
 		} else {
 			vc, vw, err = LoadPixtralVisionModel(visionData, visionGGUF, options.UseMetal, logw)
@@ -387,6 +433,7 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 			return nil, fmt.Errorf("loading vision projector: %w", err)
 		}
 		if len(vw.ImgBreak) != r.config.Dim {
+			releasePixtralVisionWeights(&vw)
 			if visionFile != nil {
 				_ = visionFile.Close()
 			}
@@ -466,7 +513,12 @@ func (r *Runner) OutOfCore() bool           { return r != nil && r.outOfCore }
 // was loaded alongside this Runner's text decoder. ok is false for a
 // text-only model (see HasVision).
 func (r *Runner) VisionConfig() (cfg PixtralVisionConfig, ok bool) {
-	if r == nil || r.vision == nil {
+	if r == nil {
+		return PixtralVisionConfig{}, false
+	}
+	r.visionMu.RLock()
+	defer r.visionMu.RUnlock()
+	if r.vision == nil {
 		return PixtralVisionConfig{}, false
 	}
 	return r.visionConfig, true
@@ -476,18 +528,33 @@ func (r *Runner) Close() error {
 	if r == nil {
 		return nil
 	}
+	r.modelMu.Lock()
+	defer r.modelMu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
 	r.releaseMetalWeights()
-	r.workspaceCache = nil
-	r.workspaceBuf = nil
-	r.bertScratch = bertEmbeddingScratch{}
-	r.prefixCache = prefixCacheState{}
+	r.clearWeightContainers()
+	// PrepareChatContext may render an image without taking genLock. Hold the
+	// exclusive vision lease across both accelerator release and unmapping so
+	// no image encoder can observe a torn tower or an invalid mmap range.
+	r.visionMu.Lock()
+	releasePixtralVisionWeights(r.vision)
+	r.vision = nil
+	r.visionConfig = PixtralVisionConfig{}
 	r.visionCacheReset()
 	if r.visionMappedFile != nil {
 		_ = r.visionMappedFile.Close()
 		r.visionMappedFile = nil
 	}
+	r.visionMu.Unlock()
+	r.workspaceCache = nil
+	r.workspaceBuf = nil
+	r.bertScratch = bertEmbeddingScratch{}
+	r.prefixCache = prefixCacheState{}
 	// Close every shard of an out-of-core split model, keeping the first
 	// error but never leaving a mapping behind: on Windows a live mapping
 	// keeps the file locked.
@@ -511,6 +578,19 @@ func (r *Runner) Close() error {
 	return err
 }
 
+// acquireModelLease keeps mapped and accelerator-backed weights alive for a
+// resource-consuming operation. Its caller must invoke releaseModelLease.
+func (r *Runner) acquireModelLease() error {
+	r.modelMu.RLock()
+	if r.closed {
+		r.modelMu.RUnlock()
+		return ErrRunnerClosed
+	}
+	return nil
+}
+
+func (r *Runner) releaseModelLease() { r.modelMu.RUnlock() }
+
 func (r *Runner) releaseMetalWeights() {
 	if r == nil {
 		return
@@ -531,4 +611,21 @@ func (r *Runner) releaseMetalWeights() {
 	default:
 		releaseModelMetalWeights(&r.standard)
 	}
+}
+
+// clearWeightContainers drops every CPU-side tensor reference after the
+// accelerator handles have been released. This matters for byte-backed
+// models: individual Raw views otherwise keep the caller's entire GGUF slice
+// alive after Close. The Runner contract already forbids use after Close.
+func (r *Runner) clearWeightContainers() {
+	if r == nil {
+		return
+	}
+	r.standard = ModelWeights{}
+	r.gptOss = GptOssWeights{}
+	r.gemma4 = Gemma4Weights{}
+	r.nemotronH = NemotronHWeights{}
+	r.mamba2 = Mamba2Weights{}
+	r.bert = BERTWeights{}
+	r.qwen35 = Qwen35Weights{}
 }

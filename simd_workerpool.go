@@ -7,12 +7,13 @@ import "sync"
 // Small row counts (< 8 rows per worker) run inline — the dispatch overhead
 // would exceed the work.
 func parallelRows(rows int, fn func(start, end int)) {
-	threads := min(numThreads(), rows)
+	poolThreads := numThreads()
+	threads := min(poolThreads, rows)
 	if threads <= 1 || rows < threads*8 {
 		fn(0, rows)
 		return
 	}
-	dispatchParallel(threads, rows, fn)
+	dispatchParallel(poolThreads, threads, rows, fn)
 }
 
 // rowTask is the allocation-free counterpart of the callback accepted by
@@ -24,12 +25,13 @@ type rowTask interface {
 }
 
 func parallelRowsTask(rows int, task rowTask) {
-	threads := min(numThreads(), rows)
+	poolThreads := numThreads()
+	threads := min(poolThreads, rows)
 	if threads <= 1 || rows < threads*8 {
 		task.runRows(0, rows)
 		return
 	}
-	dispatchParallelTask(threads, rows, task)
+	dispatchParallelTask(poolThreads, threads, rows, task)
 }
 
 // parallelRowsBatched keeps one coarse range per worker. A batch row already
@@ -37,45 +39,64 @@ func parallelRowsTask(rows int, task rowTask) {
 // decode rows adds scheduling overhead instead. The regular parallelRows path
 // remains unchanged, providing a local rollback for this prefill-only tuning.
 func parallelRowsBatched(rows int, fn func(start, end int)) {
-	threads := min(numThreads(), rows)
+	poolThreads := numThreads()
+	threads := min(poolThreads, rows)
 	if threads <= 1 || rows < threads*8 {
 		fn(0, rows)
 		return
 	}
-	dispatchParallelMode(threads, rows, false, fn)
+	dispatchParallelMode(poolThreads, threads, rows, false, fn)
+}
+
+// parallelRowsBatchedTask preserves parallelRowsBatched's one-range-per-
+// worker scheduling for callers that carry their work in a reusable rowTask.
+func parallelRowsBatchedTask(rows int, task rowTask) {
+	poolThreads := numThreads()
+	threads := min(poolThreads, rows)
+	if threads <= 1 || rows < threads*8 {
+		task.runRows(0, rows)
+		return
+	}
+	dispatchParallelTaskMode(poolThreads, threads, rows, false, task)
 }
 
 // parallelChunks splits n items across the worker pool without the minimum
 // per-thread row count required by parallelRows. Intended for coarse-grained
 // items (e.g. attention heads) where even a single item is substantial work.
 func parallelChunks(n int, fn func(start, end int)) {
-	threads := min(numThreads(), n)
+	poolThreads := numThreads()
+	threads := min(poolThreads, n)
 	if threads <= 1 {
 		fn(0, n)
 		return
 	}
-	dispatchParallel(threads, n, fn)
+	dispatchParallel(poolThreads, threads, n, fn)
 }
 
 // parallelChunksTask is parallelChunks without an escaping callback. It is
 // used by attention, where even one head is enough work to justify a worker.
 func parallelChunksTask(n int, task rowTask) {
-	threads := min(numThreads(), n)
+	poolThreads := numThreads()
+	threads := min(poolThreads, n)
 	if threads <= 1 {
 		task.runRows(0, n)
 		return
 	}
-	dispatchParallelTask(threads, n, task)
+	dispatchParallelTask(poolThreads, threads, n, task)
 }
 
-func dispatchParallel(threads, rows int, fn func(start, end int)) {
-	dispatchParallelMode(threads, rows, true, fn)
+func dispatchParallel(poolThreads, threads, rows int, fn func(start, end int)) {
+	dispatchParallelMode(poolThreads, threads, rows, true, fn)
 }
 
-func dispatchParallelTask(threads, rows int, task rowTask) {
-	pool := getRowWorkerPool(numThreads())
+func dispatchParallelTask(poolThreads, threads, rows int, task rowTask) {
+	dispatchParallelTaskMode(poolThreads, threads, rows, true, task)
+}
+
+func dispatchParallelTaskMode(poolThreads, threads, rows int, allowOversubscribe bool, task rowTask) {
+	pool := acquireRowWorkerPool(poolThreads)
 	chunks := threads
-	if oversubscribeDispatch && rows >= threads*128 {
+	if allowOversubscribe && oversubscribeDispatch.Load() && rows >= threads*128 {
 		chunks = min(threads*8, cap(pool.jobs))
 	}
 	wg := wgPool.Get().(*sync.WaitGroup)
@@ -88,23 +109,24 @@ func dispatchParallelTask(threads, rows int, task rowTask) {
 	task.runRows(0, rows/chunks)
 	wg.Wait()
 	wgPool.Put(wg)
+	releaseRowWorkerPool(pool)
 }
 
-func dispatchParallelMode(threads, rows int, allowOversubscribe bool, fn func(start, end int)) {
+func dispatchParallelMode(poolThreads, threads, rows int, allowOversubscribe bool, fn func(start, end int)) {
 	// The pool belongs to the configured runtime, not to an individual job.
 	// Some kernels expose fewer independent units than numThreads (Ministral
 	// has only eight KV-head groups); rebuilding an 8-worker pool for attention
 	// and a 12-worker pool for every following matvec was dramatically more
 	// expensive than the kernels themselves. Submit fewer jobs to one stable
 	// max-sized pool instead.
-	pool := getRowWorkerPool(numThreads())
+	pool := acquireRowWorkerPool(poolThreads)
 	// Issue more chunks than workers so faster cores naturally pick up the
 	// slack of slower ones (e.g. efficiency cores on Apple Silicon). On
 	// homogeneous-core amd64 the oversubscription only multiplies channel
 	// wakeups, so chunks stay 1:1 with workers there. Small matvecs stay at
 	// one chunk per worker to avoid channel wakeup overhead.
 	chunks := threads
-	if allowOversubscribe && oversubscribeDispatch && rows >= threads*128 {
+	if allowOversubscribe && oversubscribeDispatch.Load() && rows >= threads*128 {
 		chunks = min(threads*8, cap(pool.jobs))
 	}
 	// Keep the calling goroutine useful: it owns one chunk while the persistent
@@ -126,6 +148,7 @@ func dispatchParallelMode(threads, rows int, allowOversubscribe bool, fn func(st
 	fn(0, rows/chunks)
 	wg.Wait()
 	wgPool.Put(wg)
+	releaseRowWorkerPool(pool)
 }
 
 var wgPool = sync.Pool{New: func() any { return new(sync.WaitGroup) }}
@@ -144,9 +167,12 @@ type rowJob struct {
 // alive across calls avoids per-matvec spawn cost — matvecs run ~30x per
 // generated token.
 type rowWorkerPool struct {
-	threads int
-	jobs    chan rowJob
-	stop    chan struct{}
+	threads  int
+	jobs     chan rowJob
+	stop     chan struct{}
+	active   int
+	retiring bool
+	stopped  bool
 }
 
 var (
@@ -154,14 +180,20 @@ var (
 	rowPool   *rowWorkerPool
 )
 
-func getRowWorkerPool(threads int) *rowWorkerPool {
+// acquireRowWorkerPool leases the current worker pool for one dispatch. A
+// thread-count change replaces the global pool, but an older pool stays alive
+// until every dispatch that already obtained it has completed. Without that
+// lease, closing its workers could strand queued jobs and leave their
+// WaitGroup waiting forever.
+func acquireRowWorkerPool(threads int) *rowWorkerPool {
 	rowPoolMu.Lock()
 	defer rowPoolMu.Unlock()
 	if rowPool != nil && rowPool.threads == threads {
+		rowPool.active++
 		return rowPool
 	}
-	if rowPool != nil {
-		close(rowPool.stop)
+	if old := rowPool; old != nil {
+		retireRowWorkerPoolLocked(old)
 	}
 	pool := &rowWorkerPool{
 		threads: threads,
@@ -172,7 +204,31 @@ func getRowWorkerPool(threads int) *rowWorkerPool {
 		go rowWorker(pool.jobs, pool.stop)
 	}
 	rowPool = pool
+	pool.active++
 	return pool
+}
+
+func releaseRowWorkerPool(pool *rowWorkerPool) {
+	rowPoolMu.Lock()
+	defer rowPoolMu.Unlock()
+	if pool == nil || pool.active == 0 {
+		return
+	}
+	pool.active--
+	if pool.retiring && pool.active == 0 && !pool.stopped {
+		close(pool.stop)
+		pool.stopped = true
+	}
+}
+
+// retireRowWorkerPoolLocked marks a replaced pool for shutdown. rowPoolMu must
+// be held by the caller.
+func retireRowWorkerPoolLocked(pool *rowWorkerPool) {
+	pool.retiring = true
+	if pool.active == 0 && !pool.stopped {
+		close(pool.stop)
+		pool.stopped = true
+	}
 }
 
 func rowWorker(jobs <-chan rowJob, stop <-chan struct{}) {

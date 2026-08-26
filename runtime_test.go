@@ -347,6 +347,54 @@ func TestGenerateChatReusesKVPrefixForFollowup(t *testing.T) {
 	}
 }
 
+func TestLowLevelStreamingAllowsNilCallbacks(t *testing.T) {
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 4
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	tests := []struct {
+		name     string
+		generate func(*Runner) (GenerationResult, error)
+	}{
+		{
+			name: "prompt",
+			generate: func(r *Runner) (GenerationResult, error) {
+				return r.GenerateStream("hi", opts, nil)
+			},
+		},
+		{
+			name: "chat",
+			generate: func(r *Runner) (GenerationResult, error) {
+				return r.GenerateChatStream([]ChatMessage{UserMessage("hi")}, opts, nil)
+			},
+		},
+		{
+			name: "until",
+			generate: func(r *Runner) (GenerationResult, error) {
+				return r.GenerateChatStreamUntil([]ChatMessage{UserMessage("hi")}, opts, nil)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			result, err := tt.generate(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Stats.GeneratedTokens == 0 || result.Text == "" {
+				t.Fatalf("fixture must produce streamed text, got %#v", result)
+			}
+		})
+	}
+}
+
 func TestGenerateChatPrefixCacheKeepsSamplingDeterministic(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {

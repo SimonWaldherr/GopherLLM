@@ -1,57 +1,77 @@
 package gopherllm
 
+// weightResourceReleaser releases accelerator copies once even when tied
+// weights share the same backing handle. It also clears every visited Weight,
+// including duplicate references, so Runner.Close does not retain a stale
+// accelerator pointer.
+type weightResourceReleaser struct {
+	metal map[*MetalWeight]bool
+	gpu   map[*GPUWeight]bool
+}
+
+func (r *weightResourceReleaser) release(w *Weight) {
+	if w == nil {
+		return
+	}
+	if w.Metal != nil {
+		if r.metal == nil {
+			r.metal = make(map[*MetalWeight]bool)
+		}
+		if !r.metal[w.Metal] {
+			releaseMetalWeight(w.Metal)
+			r.metal[w.Metal] = true
+		}
+		w.Metal = nil
+	}
+	if w.GPU != nil {
+		if r.gpu == nil {
+			r.gpu = make(map[*GPUWeight]bool)
+		}
+		if !r.gpu[w.GPU] {
+			releaseWebGPUWeight(w.GPU)
+			r.gpu[w.GPU] = true
+		}
+		w.GPU = nil
+	}
+}
+
 func releaseModelMetalWeights(weights *ModelWeights) {
 	if weights == nil {
 		return
 	}
-	seen := map[*MetalWeight]bool{}
-	seenGPU := map[*GPUWeight]bool{}
-	release := func(w *Weight) {
-		if w == nil {
-			return
-		}
-		if w.Metal != nil && !seen[w.Metal] {
-			releaseMetalWeight(w.Metal)
-			seen[w.Metal] = true
-		}
-		if w.GPU != nil && !seenGPU[w.GPU] {
-			releaseWebGPUWeight(w.GPU)
-			seenGPU[w.GPU] = true
-		}
-		w.Metal = nil
-		w.GPU = nil
-	}
-	release(&weights.TokenEmbd)
-	release(&weights.Output)
+	var releaser weightResourceReleaser
+	releaser.release(&weights.TokenEmbd)
+	releaser.release(&weights.PositionEmbd)
+	releaser.release(&weights.Output)
 	for i := range weights.Layers {
 		layer := &weights.Layers[i]
-		release(&layer.WQ)
-		release(&layer.WK)
-		release(&layer.WV)
-		release(&layer.WQKV)
-		release(&layer.WO)
-		release(&layer.W1)
-		release(&layer.W2)
-		release(&layer.W3)
-		release(&layer.WGateUp)
+		releaser.release(&layer.WQ)
+		releaser.release(&layer.WK)
+		releaser.release(&layer.WV)
+		releaser.release(&layer.WQKV)
+		releaser.release(&layer.WO)
+		releaser.release(&layer.W1)
+		releaser.release(&layer.W2)
+		releaser.release(&layer.W3)
+		releaser.release(&layer.WGateUp)
 		if layer.MLA != nil {
-			release(&layer.MLA.Q)
-			release(&layer.MLA.QA)
-			release(&layer.MLA.QB)
-			release(&layer.MLA.KVA)
-			release(&layer.MLA.KB.Weight)
-			release(&layer.MLA.VB.Weight)
+			releaser.release(&layer.MLA.Q)
+			releaser.release(&layer.MLA.QA)
+			releaser.release(&layer.MLA.QB)
+			releaser.release(&layer.MLA.KVA)
+			releaser.release(&layer.MLA.KB.Weight)
+			releaser.release(&layer.MLA.VB.Weight)
 		}
 		if layer.MoE != nil {
 			moe := layer.MoE
-			release(&moe.Router)
-			release(&moe.Gate.Weight)
-			release(&moe.Up.Weight)
-			release(&moe.Down.Weight)
-			release(moe.SharedGateIn)
-			release(moe.SharedGate)
-			release(moe.SharedUp)
-			release(moe.SharedDown)
+			releaser.release(&moe.Router)
+			releaser.release(&moe.Gate.Weight)
+			releaser.release(&moe.Up.Weight)
+			releaser.release(&moe.Down.Weight)
+			releaser.release(moe.SharedGateIn)
+			releaser.release(moe.SharedGate)
+			releaser.release(moe.SharedUp)
+			releaser.release(moe.SharedDown)
 		}
 	}
 }

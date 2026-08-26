@@ -861,40 +861,32 @@ func releaseGemma4MetalWeights(weights *Gemma4Weights) {
 		}
 		return
 	}
-	seen := map[*MetalWeight]bool{}
-	release := func(w *Weight) {
-		if w == nil || w.Metal == nil || seen[w.Metal] {
-			return
-		}
-		releaseMetalWeight(w.Metal)
-		seen[w.Metal] = true
-		w.Metal = nil
-	}
-	release(&weights.TokenEmbd)
-	release(&weights.Output)
+	var releaser weightResourceReleaser
+	releaser.release(&weights.TokenEmbd)
+	releaser.release(&weights.Output)
 	if weights.PerLayer != nil {
-		release(&weights.PerLayer.TokenEmbd)
-		release(&weights.PerLayer.ModelProj)
+		releaser.release(&weights.PerLayer.TokenEmbd)
+		releaser.release(&weights.PerLayer.ModelProj)
 	}
 	for i := range weights.Layers {
 		layer := &weights.Layers[i]
-		release(&layer.AttnQ)
-		release(&layer.AttnK)
-		release(&layer.AttnV)
-		release(&layer.AttnOutput)
-		release(&layer.FFNGate)
-		release(&layer.FFNUp)
-		release(&layer.FFNDown)
-		release(&layer.PerLayerInputGate)
-		release(&layer.PerLayerProj)
+		releaser.release(&layer.AttnQ)
+		releaser.release(&layer.AttnK)
+		releaser.release(&layer.AttnV)
+		releaser.release(&layer.AttnOutput)
+		releaser.release(&layer.FFNGate)
+		releaser.release(&layer.FFNUp)
+		releaser.release(&layer.FFNDown)
+		releaser.release(&layer.PerLayerInputGate)
+		releaser.release(&layer.PerLayerProj)
 	}
 	for _, moe := range weights.MoE {
 		if moe == nil {
 			continue
 		}
-		release(&moe.Router)
-		release(&moe.Gate.Weight)
-		release(&moe.Up.Weight)
-		release(&moe.Down.Weight)
+		releaser.release(&moe.Router)
+		releaser.release(&moe.Gate.Weight)
+		releaser.release(&moe.Up.Weight)
+		releaser.release(&moe.Down.Weight)
 	}
 }

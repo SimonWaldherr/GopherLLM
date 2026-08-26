@@ -138,6 +138,10 @@ func TestMetalQ5KMatvecMatchesCPU(t *testing.T) {
 		t.Fatalf("Q5_K Metal matvec: %s", MetalError())
 	}
 	assertMetalMatvecClose(t, got, want)
+	releaseMetalWeight(w)
+	if w.q5 != nil {
+		t.Fatal("releaseMetalWeight retained the Q5_K Metal handle")
+	}
 }
 
 func TestMetalBorrowedQ5KMatvecMatchesCPU(t *testing.T) {

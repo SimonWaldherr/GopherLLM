@@ -29,6 +29,32 @@ func TestDotF32MatchesScalar(t *testing.T) {
 	}
 }
 
+func TestMatvecF32IntoMatchesScalarAndReusesOutput(t *testing.T) {
+	data := []float32{
+		1, 2, 3,
+		-2, 0.5, 4,
+		7, -1, 0,
+	}
+	x := []float32{0.25, -2, 3}
+	out := make([]float32, 0, 8)
+	MatvecF32Into(data, x, 3, 3, &out)
+	if len(out) != 3 {
+		t.Fatalf("output len = %d, want 3", len(out))
+	}
+	want := []float32{
+		dotF32Scalar(data[0:3], x),
+		dotF32Scalar(data[3:6], x),
+		dotF32Scalar(data[6:9], x),
+	}
+	assertFloatSlicesClose(t, "matvec-f32", out, want)
+
+	// The output buffer is caller-owned and must remain reusable on the hot
+	// path even when it arrives at a shorter length.
+	out = out[:0]
+	MatvecF32Into(data, x, 3, 3, &out)
+	assertFloatSlicesClose(t, "matvec-f32-reused", out, want)
+}
+
 func TestVectorOpsMatchScalar(t *testing.T) {
 	for _, n := range []int{0, 1, 2, 3, 4, 5, 15, 16, 17, 64} {
 		base := make([]float32, n)

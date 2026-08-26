@@ -26,6 +26,10 @@ type KernelBenchRow struct {
 // table or, with jsonOut, the machine-readable llm-kernel-bench.v1 document
 // that `make kernel-bench` emits for cross-runtime comparisons.
 func RunKernelBench(r *Runner, modelPath string, runs, requestedLayer int, jsonOut bool) error {
+	if err := r.acquireModelLease(); err != nil {
+		return err
+	}
+	defer r.releaseModelLease()
 	if runs <= 0 {
 		return fmt.Errorf("--kernel-bench-runs must be greater than 0")
 	}

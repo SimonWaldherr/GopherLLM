@@ -169,7 +169,16 @@ cleanup.
 
 Nothing is synchronised to a third party by default. Assets use `no-store` and
 same-origin security headers; run on a trusted local address unless a reverse
-proxy adds network security.
+proxy adds network security. The embedded UI loads no packages, fonts, or
+scripts by default. An operator can opt into a Mermaid renderer with
+`?mermaid=jsdelivr` (or `unpkg`/`cdnjs`); only then is that chosen origin added
+to the page's content-security policy.
+
+**Model & chat** presents discovered GGUFs as a searchable library with
+architecture, file size, context length, compatibility, load progress, and the
+active model. Unsupported or auxiliary GGUFs stay hidden unless requested.
+Settings separate model/chat, capabilities, generation, and workspace controls
+without replacing manual sampling or context choices.
 
 For a shared-device workspace, opt into server-backed history:
 

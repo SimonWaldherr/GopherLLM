@@ -134,6 +134,27 @@ func TestRunAgenticChatNoSkillsIsPassthrough(t *testing.T) {
 	}
 }
 
+func TestRunAgenticChatNoSkillsAllowsNilCallback(t *testing.T) {
+	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	opts := DefaultGenerationOptions()
+	opts.MaxTokens = 4
+	opts.SystemPrompt = ""
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+
+	result, err := RunAgenticChat(r, []ChatMessage{UserMessage("hi")}, opts, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Stats.GeneratedTokens == 0 || result.Text == "" {
+		t.Fatalf("fixture must produce streamed text, got %#v", result)
+	}
+}
+
 func TestRunAgenticChatCallerToolsWithoutSkillsBuffers(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {

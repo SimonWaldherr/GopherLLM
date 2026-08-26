@@ -177,6 +177,10 @@ func releaseMetalWeight(w *MetalWeight) {
 		metalbackend.Release(w.q4)
 		w.q4 = nil
 	}
+	if w.q5 != nil {
+		metalbackend.Release(w.q5)
+		w.q5 = nil
+	}
 	if w.q6 != nil {
 		metalbackend.Release(w.q6)
 		w.q6 = nil

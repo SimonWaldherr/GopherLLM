@@ -192,7 +192,7 @@ func (r AutoTuneResult) Apply() {
 	}
 	setQ8Activations(r.Q8Activations)
 	setKVF16(r.KVCacheF16)
-	oversubscribeDispatch = r.OversubscribeDispatch
+	oversubscribeDispatch.Store(r.OversubscribeDispatch)
 	SetPrefillChunk(r.PrefillChunk)
 }
 
@@ -274,7 +274,7 @@ func captureTunerConfig(Config) tunerConfig {
 		threads:       numThreads(),
 		q8:            q8ActivationsEnabled(),
 		kvF16:         kvF16Enabled(),
-		oversubscribe: oversubscribeDispatch,
+		oversubscribe: oversubscribeDispatch.Load(),
 		prefillChunk:  prefillChunkOverrideValue(),
 	}
 }
@@ -292,7 +292,7 @@ func (c tunerConfig) apply() {
 	runtime.GOMAXPROCS(c.threads)
 	setQ8Activations(c.q8)
 	setKVF16(c.kvF16)
-	oversubscribeDispatch = c.oversubscribe
+	oversubscribeDispatch.Store(c.oversubscribe)
 	SetPrefillChunk(c.prefillChunk)
 }
 
@@ -346,6 +346,10 @@ func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
 		return AutoTuneResult{}, fmt.Errorf("auto-tuning is disabled for out-of-core models because calibration streams the full model")
 	}
 	opts = opts.withDefaults()
+	if err := r.acquireModelLease(); err != nil {
+		return AutoTuneResult{}, err
+	}
+	defer r.releaseModelLease()
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
 	// Calibration writes probe tokens into the shared KV workspace and can also
@@ -769,8 +773,8 @@ func threadCandidates(nproc int) []int {
 }
 
 func (t *autoTuner) tuneDispatch() {
-	t.chooseToggle("oversubscribe", oversubscribeDispatch,
-		func(on bool) { oversubscribeDispatch = on })
+	t.chooseToggle("oversubscribe", oversubscribeDispatch.Load(),
+		func(on bool) { oversubscribeDispatch.Store(on) })
 }
 
 func (t *autoTuner) tuneKVF16() {
@@ -925,7 +929,11 @@ func autoTuneCachePath(key string) (string, error) {
 // LoadAutoTune returns a previously measured result for this model+machine, or
 // ok=false when none is cached.
 func (r *Runner) LoadAutoTune() (AutoTuneResult, bool) {
+	if err := r.acquireModelLease(); err != nil {
+		return AutoTuneResult{}, false
+	}
 	key := r.autoTuneKey()
+	r.releaseModelLease()
 	path, err := autoTuneCachePath(key)
 	if err != nil {
 		return AutoTuneResult{}, false
@@ -1003,10 +1011,14 @@ func (r *Runner) AutoTuneOrCached(opts AutoTuneOptions, refresh bool) (AutoTuneR
 		if res, ok := r.LoadAutoTune(); ok {
 			// Under the generation lock, like AutoTune, so installing a cached
 			// result cannot race a request that is already running.
+			if err := r.acquireModelLease(); err != nil {
+				return AutoTuneResult{}, false, err
+			}
 			r.genLock.Lock()
 			r.clearPrefixCache()
 			res.Apply()
 			r.genLock.Unlock()
+			r.releaseModelLease()
 			return res, true, nil
 		}
 	}
