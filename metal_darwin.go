@@ -124,6 +124,20 @@ func argmaxMetalQ6KPenalized(w *MetalWeight, x []float32, recent []uint32, repea
 	return metalbackend.ArgmaxQ6KPenalized(w.q6, x, recent, repeatPenalty)
 }
 
+// argmaxMetalQ6KBatch keeps a short Q6_K vocabulary verification window on
+// the GPU. xs is contiguous [batch][hidden] data and tokens receives one
+// greedy winner per position. Unlike the single-token path it deliberately
+// has no repeat penalty: each verifier position has different history, so
+// sharing one penalty set would be incorrect. The backend preserves the
+// sampler's finite-value filtering and lowest-token tie rule.
+func argmaxMetalQ6KBatch(w *MetalWeight, xs []float32, tokens []uint32, batch int) bool {
+	if !metalWeightUsesDirect(w) || w.q6 == nil || w.typ != GGMLTypeQ6_K || batch <= 0 || batch > metalBatchArgmaxMaxTokens ||
+		w.cols <= 0 || batch > len(xs)/w.cols || len(tokens) < batch {
+		return false
+	}
+	return metalbackend.ArgmaxQ6KBatch(w.q6, xs, tokens, batch)
+}
+
 func matvecMetalQ4K2Into(a, b *MetalWeight, x []float32, aRows, bRows, cols int, aOut, bOut *[]float32) bool {
 	if !metalWeightUsesDirect(a) || !metalWeightUsesDirect(b) || a.q4 == nil || b.q4 == nil ||
 		a.typ != GGMLTypeQ4_K || b.typ != GGMLTypeQ4_K ||
@@ -180,6 +194,38 @@ func matvecMetalSwiGLUBatchInto(gate, up, down *MetalWeight, x []float32, batch 
 	}
 	ensureLenNoClear(out, batch*down.rows)
 	return metalbackend.MatvecQ4K2SwiGLUQ6KBatch(gate.q4, up.q4, down.q6, x, *out, batch)
+}
+
+// metalBatchFFNPrefillChunk returns the larger runner-local default only when
+// every layer of a standard dense decoder can take the GPU-resident SwiGLU
+// batch path. Checking the actual prepared handles matters: LoadOptions may
+// request Metal while a particular tensor is unsupported or preparation
+// failed, and such a mixed graph must retain the CPU-oriented chunk size.
+func (r *Runner) metalBatchFFNPrefillChunk() int {
+	if r == nil || r.kind != loadedStandard || r.outOfCore || r.config.UsesMLA ||
+		r.config.usesPlainMLP() || r.config.UseGELU || !metalFusedFFNEnabled || len(r.standard.Layers) == 0 {
+		return 0
+	}
+	for i := range r.standard.Layers {
+		layer := &r.standard.Layers[i]
+		if layer.MoE != nil || layer.HasGateUp || len(layer.FFNUpBias) != 0 || len(layer.FFNDownBias) != 0 ||
+			!metalSwiGLUBatchWeightsReady(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal) {
+			return 0
+		}
+	}
+	return metalBatchFFNMaxTokens
+}
+
+// metalSwiGLUBatchWeightsReady mirrors the shape and handle portion of
+// matvecMetalSwiGLUBatchInto. It intentionally does not inspect activations:
+// this is a load-time/default decision, while the dispatcher keeps validating
+// every call before submitting work to Metal.
+func metalSwiGLUBatchWeightsReady(gate, up, down *MetalWeight) bool {
+	return metalWeightUsesDirect(gate) && metalWeightUsesDirect(up) && metalWeightUsesDirect(down) &&
+		gate.q4 != nil && up.q4 != nil && down.q6 != nil &&
+		gate.typ == GGMLTypeQ4_K && up.typ == GGMLTypeQ4_K && down.typ == GGMLTypeQ6_K &&
+		gate.cols > 0 && gate.rows > 0 && down.rows > 0 &&
+		gate.cols == up.cols && gate.rows == up.rows && down.cols == gate.rows
 }
 
 func releaseMetalWeight(w *MetalWeight) {

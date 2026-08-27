@@ -217,6 +217,25 @@ func TestPrefillChunkSizeEnvOverride(t *testing.T) {
 	}
 }
 
+// The runner-specific resolver must retain the exported/global resolver's
+// override order. The Metal-only preference itself is covered by the tagged
+// Metal test; this portable check prevents an explicit operator or autotuner
+// choice from being bypassed on every other build.
+func TestRunnerPrefillChunkSizeHonorsExplicitSettings(t *testing.T) {
+	old := prefillChunkOverrideValue()
+	defer SetPrefillChunk(old)
+	SetPrefillChunk(0)
+	r := &Runner{config: Config{Dim: 3072, HiddenDim: 9216}}
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "64")
+	if got := r.prefillChunkSize(); got != 64 {
+		t.Fatalf("environment override chunk = %d, want 64", got)
+	}
+	SetPrefillChunk(96)
+	if got := r.prefillChunkSize(); got != 96 {
+		t.Fatalf("global override chunk = %d, want 96", got)
+	}
+}
+
 func TestGenerationWorkspaceReusesAndGrowsBuffers(t *testing.T) {
 	r := &Runner{config: Config{
 		Dim: 8, HiddenDim: 16, NLayers: 2, NHeads: 2, NKVHeads: 1,

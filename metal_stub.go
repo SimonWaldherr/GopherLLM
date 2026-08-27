@@ -32,6 +32,8 @@ func argmaxMetalQ6KPenalized(_ *MetalWeight, _ []float32, _ []uint32, _ float32)
 	return 0, false
 }
 
+func argmaxMetalQ6KBatch(_ *MetalWeight, _ []float32, _ []uint32, _ int) bool { return false }
+
 func matvecMetalQ4K2Into(_, _ *MetalWeight, _ []float32, _, _, _ int, _, _ *[]float32) bool {
 	return false
 }
@@ -47,5 +49,7 @@ func matvecMetalSwiGLUInto(_, _, _ *MetalWeight, _ []float32, _ *[]float32) bool
 func matvecMetalSwiGLUBatchInto(_, _, _ *MetalWeight, _ []float32, _ int, _ *[]float32) bool {
 	return false
 }
+
+func (r *Runner) metalBatchFFNPrefillChunk() int { return 0 }
 
 func releaseMetalWeight(_ *MetalWeight) {}

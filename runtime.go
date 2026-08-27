@@ -139,12 +139,39 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if len(imageEmbeds) > 0 {
 		r.clearPrefixCache()
 	}
+	// The ordinary workspace cache covers the immediately preceding complete
+	// prompt. An opt-in Mistral cache additionally keeps immutable K/V snapshots
+	// of the static system-and-tools prefix, allowing divergent conversations to
+	// share that expensive prefill. Derive it from the renderer and verify it
+	// against the already-rendered token stream; images always opt out because
+	// token IDs alone cannot identify their substituted embeddings.
+	var mistralStaticPrefix []uint32
+	var mistralKVPrefixEpoch uint64
+	if cacheEligible {
+		mistralStaticPrefix = r.mistralStaticPromptPrefix(messages, options.SystemPrompt, options.ActiveTools(), tokens)
+		if len(mistralStaticPrefix) > 0 {
+			if epoch, enabled := r.mistralKVPrefixCacheEpoch(); enabled {
+				mistralKVPrefixEpoch = epoch
+			} else {
+				mistralStaticPrefix = nil
+			}
+		}
+	}
 	cachedResidentTokens := r.prefixCache.tokens
 	cachedPromptTokens := r.prefixCache.promptTokens
 	cachedPromptLogits := r.prefixCache.promptLogits
 	if cacheEligible {
 		cacheInfo.Mode = "prefix"
 		reusedTokens = r.prefixReuseWithMTP(cache, tokens, mtpDraftTokens > 0)
+		// Prefer the full, most-recent prompt cache when it has a longer match.
+		// The static Mistral snapshot is only a proper token prefix, so it cannot
+		// supply final-prompt logits and never takes the identical-prompt fast
+		// path below.
+		if len(mistralStaticPrefix) > reusedTokens {
+			if copied, hit := r.mistralKVPrefixCacheReuse(cache, mistralStaticPrefix); hit && copied > reusedTokens {
+				reusedTokens = copied
+			}
+		}
 		cacheInfo.Hit = reusedTokens > 0
 		cacheInfo.ReusedTokens = reusedTokens
 	}
@@ -177,8 +204,16 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	prefillBegan := time.Now()
 	residentTokens := cachedResidentTokens[:0]
 	promptLogits := cachedPromptLogits[:0]
+	prefillComplete := false
 	defer func() {
 		buf.Logits = logits
+		// Clone only after the full prompt prefill succeeded. A canceled or
+		// failed prefill may have written a partial set of rows, which must never
+		// become a reusable prefix. This deliberately runs after streaming/decode
+		// so copying an opt-in snapshot does not add to TTFT.
+		if cacheEligible && prefillComplete && len(mistralStaticPrefix) > 0 && mistralKVPrefixEpoch != 0 {
+			r.putMistralKVPrefixSnapshot(cache, mistralStaticPrefix, mistralKVPrefixEpoch)
+		}
 		if !cacheEligible {
 			return
 		}
@@ -238,6 +273,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		copy(promptLogits, logits)
 	}
 	residentTokens = append(residentTokens, tokens...)
+	prefillComplete = true
 	prefillTime := time.Since(prefillBegan)
 	decodeStart := time.Now()
 	var ttft time.Duration

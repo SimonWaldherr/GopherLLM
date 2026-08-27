@@ -195,7 +195,7 @@ func (r *Runner) prefillBatchedAt(ctx context.Context, cache *KVCache, buf *Deco
 	if !ok {
 		return fmt.Errorf("gopherllm: prefillBatchedAt called for a kind that cannot batch prefill")
 	}
-	chunk := prefillChunkSize(r.config)
+	chunk := r.prefillChunkSize()
 	n := len(tokens)
 	for start := 0; start < n; start += chunk {
 		if err := ctx.Err(); err != nil {
@@ -229,6 +229,28 @@ func prefillChunkSize(config Config) int {
 		return n
 	}
 	return prefillChunkDefault(config)
+}
+
+// prefillChunkSize resolves a runner-local prefill default without changing
+// the package-level heuristic used by CPU-only and non-standard models. A
+// complete direct-Metal SwiGLU graph benefits from keeping the whole 256-token
+// slab in its GPU workspace: splitting it at the ordinary 128-token default
+// pays the command-buffer setup and synchronization cost twice. Any explicit
+// process override (the autotuner) or environment value remains authoritative.
+//
+// The Metal predicate is deliberately runner-local: it verifies the real
+// prepared handles for every layer rather than guessing from model geometry.
+// This means models with a partial/off Metal load, an unsupported FFN, or a
+// non-standard graph retain the established CPU default.
+func (r *Runner) prefillChunkSize() int {
+	chunk := prefillChunkSize(r.config)
+	if prefillChunkOverrideValue() > 0 || strings.TrimSpace(os.Getenv("GOPHERLLM_PREFILL_CHUNK")) != "" {
+		return chunk
+	}
+	if metalChunk := r.metalBatchFFNPrefillChunk(); metalChunk > chunk {
+		return metalChunk
+	}
+	return chunk
 }
 
 // prefillChunkOverrideValue reports the raw override, 0 when unset. Callers that

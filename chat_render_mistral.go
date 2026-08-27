@@ -189,6 +189,37 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 	return tokens, imageEmbeds, true, nil
 }
 
+// mistralStaticPromptPrefix returns the exact token IDs that the Mistral
+// renderer emits before the first dynamic chat turn: BOS, an optional native
+// system block, and optional available-tools block. It deliberately reuses the
+// renderer itself (with only system-role messages) instead of duplicating its
+// whitespace, JSON, and special-token rules in the KV-cache path.
+//
+// A static K/V snapshot is useful only when it is a proper prefix of the
+// already-rendered prompt. The final prefix check makes this a conservative
+// no-op for legacy Mistral templates that fold a system prompt into a user
+// turn, malformed tool definitions, and any future template variation which
+// changes the relative layout.
+func (r *Runner) mistralStaticPromptPrefix(messages []ChatMessage, systemPrompt string, tools []ToolDefinition, fullTokens []uint32) []uint32 {
+	if r == nil || r.kind != loadedStandard || r.chatTemplateKind() != "mistral-inst" || len(fullTokens) <= 1 {
+		return nil
+	}
+	var systems []ChatMessage
+	for _, message := range messages {
+		if message.Role == ChatRoleSystem {
+			systems = append(systems, message)
+		}
+	}
+	prefix, _, ok, err := r.renderMistralInstMessages(systems, systemPrompt, tools)
+	if err != nil || !ok || len(prefix) <= 1 || len(prefix) >= len(fullTokens) {
+		return nil
+	}
+	if sharedTokenPrefix(prefix, fullTokens) != len(prefix) {
+		return nil
+	}
+	return prefix
+}
+
 // mistralMarker returns literal as a single control token when the vocabulary
 // defines one (true for every marker on real Mistral/Ministral Tekken
 // tokenizers, verified directly against a Ministral-3-3B-Instruct-2512 GGUF),

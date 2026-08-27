@@ -57,6 +57,85 @@ func TestMetalMinistralSelectivePreparationThresholds(t *testing.T) {
 	}
 }
 
+func TestMetalBatchFFNPrefillChunkUsesVerifiedAllLayerHandles(t *testing.T) {
+	old := prefillChunkOverrideValue()
+	defer SetPrefillChunk(old)
+	SetPrefillChunk(0)
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "")
+
+	newQ4 := func(rows, cols int) *MetalWeight {
+		return &MetalWeight{q4: &metalbackend.Weight{}, typ: GGMLTypeQ4_K, rows: rows, cols: cols}
+	}
+	newQ6 := func(rows, cols int) *MetalWeight {
+		return &MetalWeight{q6: &metalbackend.Weight{}, typ: GGMLTypeQ6_K, rows: rows, cols: cols}
+	}
+	newLayer := func() LayerWeights {
+		return LayerWeights{
+			W1: Weight{Metal: newQ4(9216, 3072)},
+			W3: Weight{Metal: newQ4(9216, 3072)},
+			W2: Weight{Metal: newQ6(3072, 9216)},
+		}
+	}
+	r := &Runner{
+		kind:     loadedStandard,
+		config:   Config{Dim: 3072, HiddenDim: 9216},
+		standard: ModelWeights{Layers: []LayerWeights{newLayer()}},
+	}
+	if got := r.prefillChunkSize(); got != metalBatchFFNMaxTokens {
+		t.Fatalf("single-layer direct-Metal FFN chunk = %d, want %d", got, metalBatchFFNMaxTokens)
+	}
+
+	// One missing prepared handle in a later layer makes the graph mixed
+	// CPU/GPU, so the regular default must stay in force rather than assuming
+	// the 256-token crossover.
+	r.standard.Layers = append(r.standard.Layers, newLayer())
+	r.standard.Layers[1].W2.Metal = nil
+	if got := r.prefillChunkSize(); got != 128 {
+		t.Fatalf("partial Metal graph chunk = %d, want ordinary default 128", got)
+	}
+	r.standard.Layers[1].W2.Metal = newQ6(3072, 9216)
+	oldFused := metalFusedFFNEnabled
+	t.Cleanup(func() { metalFusedFFNEnabled = oldFused })
+	metalFusedFFNEnabled = false
+	if got := r.prefillChunkSize(); got != 128 {
+		t.Fatalf("disabled fused FFN chunk = %d, want ordinary default 128", got)
+	}
+	metalFusedFFNEnabled = oldFused
+	r.kind = loadedGemma4
+	if got := r.prefillChunkSize(); got != 128 {
+		t.Fatalf("non-standard runner chunk = %d, want ordinary default 128", got)
+	}
+	r.kind = loadedStandard
+	r.outOfCore = true
+	if got := r.prefillChunkSize(); got != 128 {
+		t.Fatalf("out-of-core runner chunk = %d, want ordinary default 128", got)
+	}
+}
+
+func TestMetalBatchFFNPrefillChunkExplicitSettingsWin(t *testing.T) {
+	old := prefillChunkOverrideValue()
+	defer SetPrefillChunk(old)
+	SetPrefillChunk(0)
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "")
+	r := &Runner{
+		kind:   loadedStandard,
+		config: Config{Dim: 3072, HiddenDim: 9216},
+		standard: ModelWeights{Layers: []LayerWeights{{
+			W1: Weight{Metal: &MetalWeight{q4: &metalbackend.Weight{}, typ: GGMLTypeQ4_K, rows: 9216, cols: 3072}},
+			W3: Weight{Metal: &MetalWeight{q4: &metalbackend.Weight{}, typ: GGMLTypeQ4_K, rows: 9216, cols: 3072}},
+			W2: Weight{Metal: &MetalWeight{q6: &metalbackend.Weight{}, typ: GGMLTypeQ6_K, rows: 3072, cols: 9216}},
+		}}},
+	}
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "64")
+	if got := r.prefillChunkSize(); got != 64 {
+		t.Fatalf("environment chunk = %d, want 64", got)
+	}
+	SetPrefillChunk(96)
+	if got := r.prefillChunkSize(); got != 96 {
+		t.Fatalf("global/autotuner chunk = %d, want 96", got)
+	}
+}
+
 func TestMetalQ4KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())

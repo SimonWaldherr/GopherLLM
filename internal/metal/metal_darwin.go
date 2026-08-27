@@ -43,6 +43,11 @@ typedef struct {
 
 enum {
 	GLLM_REPEAT_WINDOW = 64,
+	// Exact multi-position verification only needs a short draft window. Keeping
+	// the GPU workspace bounded avoids retaining a second vocabulary-sized slab
+	// for arbitrary caller-provided batches.
+	// Keep in sync with gopherllm.metalBatchArgmaxMaxTokens.
+	GLLM_BATCH_ARGMAX_MAX_TOKENS = 8,
 	// Keep the shared workspace bounded even when callers invoke the exported
 	// ForwardBatchInto with an arbitrarily large custom slice. The runtime's
 	// production prefill candidates already top out at 256; larger batches
@@ -60,6 +65,7 @@ typedef struct {
 	id<MTLBuffer> up;
 	id<MTLBuffer> hidden;
 	id<MTLBuffer> out;
+	id<MTLBuffer> argmax;
 } GLLMMetalBatchWorkspace;
 
 static id<MTLDevice> gllm_device = nil;
@@ -758,16 +764,35 @@ static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	gllm_metal_encode_q6k_to(enc, w, x_buffer, w->out, 1, default_rows_per_group);
 }
 
-static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, uint32_t recent_count, float repeat_penalty) {
+// gllm_metal_encode_argmax_to reduces one contiguous vocabulary row. The
+// caller may select a slot in the shared multi-position workspace through
+// byte offsets, while the ordinary decode path keeps using the descriptor's
+// one-vector buffers below. A separate dispatch per position is intentional:
+// the reduction needs a whole-threadgroup view of one vocabulary row, but all
+// projections and reductions still share one command buffer.
+static void gllm_metal_encode_argmax_to(
+	id<MTLComputeCommandEncoder> enc,
+	GLLMMetalWeight* w,
+	id<MTLBuffer> values,
+	NSUInteger values_offset,
+	id<MTLBuffer> result,
+	NSUInteger result_offset,
+	uint32_t recent_count,
+	float repeat_penalty
+) {
 	[enc setComputePipelineState:gllm_argmax_pipeline];
-	[enc setBuffer:w->out offset:0 atIndex:0];
-	[enc setBuffer:w->argmax offset:0 atIndex:1];
+	[enc setBuffer:values offset:values_offset atIndex:0];
+	[enc setBuffer:result offset:result_offset atIndex:1];
 	uint32_t rows = (uint32_t)w->rows;
 	[enc setBytes:&rows length:sizeof(rows) atIndex:2];
 	[enc setBuffer:w->recent offset:0 atIndex:3];
 	[enc setBytes:&recent_count length:sizeof(recent_count) atIndex:4];
 	[enc setBytes:&repeat_penalty length:sizeof(repeat_penalty) atIndex:5];
 	[enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, uint32_t recent_count, float repeat_penalty) {
+	gllm_metal_encode_argmax_to(enc, w, w->out, 0, w->argmax, 0, recent_count, repeat_penalty);
 }
 
 static void gllm_metal_encode_silu(
@@ -804,6 +829,26 @@ static bool gllm_metal_ensure_batch_buffer(id<MTLBuffer>* buffer, NSUInteger len
 	}
 	*buffer = replacement;
 	return true;
+}
+
+// gllm_metal_ensure_batch_argmax_buffers owns only the input, projected
+// vocabulary values, and one tiny result record per draft position. Unlike a
+// materialized [batch][vocab] readback, the projected values stay on device;
+// only batch GLLMArgmaxResults are copied back after the command buffer.
+static bool gllm_metal_ensure_batch_argmax_buffers(GLLMMetalWeight* w, int batch) {
+	if (w == NULL || batch <= 0 || batch > GLLM_BATCH_ARGMAX_MAX_TOKENS || w->cols <= 0 || w->rows <= 0) {
+		return false;
+	}
+	NSUInteger count = (NSUInteger)batch;
+	if (count > NSUIntegerMax / sizeof(float) / (NSUInteger)w->cols ||
+		count > NSUIntegerMax / sizeof(float) / (NSUInteger)w->rows ||
+		count > NSUIntegerMax / sizeof(GLLMArgmaxResult)) {
+		strncpy(gllm_error, "Metal batch argmax is too large", sizeof(gllm_error) - 1);
+		return false;
+	}
+	return gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x, count * (NSUInteger)w->cols * sizeof(float)) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.out, count * (NSUInteger)w->rows * sizeof(float)) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.argmax, count * sizeof(GLLMArgmaxResult));
 }
 
 static bool gllm_metal_ensure_batch_ffn_buffers(GLLMMetalWeight* gate, GLLMMetalWeight* up, GLLMMetalWeight* down, int batch) {
@@ -1157,6 +1202,74 @@ static int gllm_metal_q6k_argmax(void* handle, const float* x, const uint32_t* r
 	}
 }
 
+// gllm_metal_q6k_argmax_batch is the short-window verifier primitive. It
+// projects a contiguous [batch][cols] input on the GPU, then reduces each
+// vocabulary row on-device. This deliberately does not expose logits: a
+// speculative greedy verifier needs only one valid token per position, and
+// copying [batch][vocab] floats would erase the benefit of batching.
+//
+// Repeat penalties are intentionally out of scope here. They have a distinct
+// recent-token set at every speculative position, so applying them safely
+// belongs in a later verifier graph rather than incorrectly sharing one set.
+static int gllm_metal_q6k_argmax_batch(void* handle, const float* xs, uint32_t* tokens, int batch) {
+	@autoreleasepool {
+		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
+		if (w == NULL || w->weights == nil || xs == NULL || tokens == NULL || batch <= 0 || batch > GLLM_BATCH_ARGMAX_MAX_TOKENS ||
+			w->rows <= 0 || w->cols <= 0 || w->row_bytes != (w->cols / 256) * 210 ||
+			!gllm_metal_init_q6k()) {
+			return 0;
+		}
+		if (w->recent == nil) {
+			strncpy(gllm_error, "missing Metal batch argmax buffers", sizeof(gllm_error) - 1);
+			return 0;
+		}
+
+		// The workspace is shared with batched FFN prefill. Every command here is
+		// synchronous, so holding its short critical section prevents two runners
+		// from overwriting either inputs or result records without retaining one
+		// vocabulary-sized slab per output tensor.
+		@synchronized(gllm_queue) {
+			if (!gllm_metal_ensure_batch_argmax_buffers(w, batch)) {
+				return 0;
+			}
+			NSUInteger count = (NSUInteger)batch;
+			NSUInteger x_len = count * (NSUInteger)w->cols * sizeof(float);
+			NSUInteger value_stride = (NSUInteger)w->rows * sizeof(float);
+			NSUInteger result_stride = sizeof(GLLMArgmaxResult);
+			memcpy([gllm_batch_workspace.x contents], xs, x_len);
+
+			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			gllm_metal_encode_q6k_to(enc, w, gllm_batch_workspace.x, gllm_batch_workspace.out, batch, 4);
+			for (int position = 0; position < batch; ++position) {
+				gllm_metal_encode_argmax_to(enc, w,
+					gllm_batch_workspace.out, (NSUInteger)position * value_stride,
+					gllm_batch_workspace.argmax, (NSUInteger)position * result_stride,
+					0, 1.0f);
+			}
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			if ([cb status] != MTLCommandBufferStatusCompleted) {
+				strncpy(gllm_error, "Metal batch argmax command buffer failed", sizeof(gllm_error) - 1);
+				return 0;
+			}
+			const GLLMArgmaxResult* results = (const GLLMArgmaxResult*)[gllm_batch_workspace.argmax contents];
+			for (int position = 0; position < batch; ++position) {
+				if (results[position].index >= (uint32_t)w->rows || !isfinite(results[position].value)) {
+					strncpy(gllm_error, "Metal batch argmax produced an invalid result", sizeof(gllm_error) - 1);
+					return 0;
+				}
+			}
+			for (int position = 0; position < batch; ++position) {
+				tokens[position] = results[position].index;
+			}
+			return 1;
+		}
+		return 0; // unreachable, keeps C's control-flow analysis explicit.
+	}
+}
+
 static void gllm_metal_release_weight(void* handle) {
 	@autoreleasepool {
 		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
@@ -1370,6 +1483,26 @@ func ArgmaxQ6KPenalized(w *Weight, x []float32, recent []uint32, repeatPenalty f
 		return 0, false
 	}
 	return uint32(token), true
+}
+
+// ArgmaxQ6KBatch finds the deterministic argmax for each contiguous input in
+// xs ([batch][cols]) without reading a [batch][rows] logits slab back to the
+// CPU. It is intentionally limited to the short greedy-verification window;
+// repeat penalties are position-specific and are not silently approximated.
+// The Metal reduction retains the lowest vocabulary index on ties, matching
+// ArgmaxQ6KPenalized and the package sampler.
+func ArgmaxQ6KBatch(w *Weight, xs []float32, tokens []uint32, batch int) bool {
+	if w == nil || w.ptr == nil || batch <= 0 || batch > 8 || w.rows <= 0 || w.cols <= 0 ||
+		batch > len(xs)/w.cols || len(tokens) < batch {
+		return false
+	}
+	ok := C.gllm_metal_q6k_argmax_batch(
+		w.ptr,
+		(*C.float)(unsafe.Pointer(&xs[0])),
+		(*C.uint32_t)(unsafe.Pointer(&tokens[0])),
+		C.int(batch),
+	)
+	return ok != 0
 }
 
 func Release(w *Weight) {

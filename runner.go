@@ -107,7 +107,14 @@ type Runner struct {
 	// genLock. It holds tokenized static prompt text only, never model state.
 	mistralPrefixCacheMu     sync.Mutex
 	mistralPrefixRenderCache mistralPromptPrefixCache
-	mappedFile               *MmapFile
+	// mistralKVPrefixCacheMu protects the opt-in immutable K/V snapshots for
+	// static Mistral/Ministral system-and-tools prefixes. Generation itself is
+	// still serialized by genLock, but callers may enable, clear, or inspect
+	// this cache while another request is running; the separate mutex gives
+	// those control operations a defined invalidation boundary.
+	mistralKVPrefixCacheMu sync.Mutex
+	mistralKVPrefixCache   mistralKVPrefixCache
+	mappedFile             *MmapFile
 	// extraMappedFiles holds the additional shard mappings of an out-of-core
 	// split GGUF. Those models have no single mappedFile: every weight is a
 	// view into one of these, so all of them must outlive the Runner and all
@@ -562,6 +569,7 @@ func (r *Runner) Close() error {
 	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
 	r.DisableMistralPromptPrefixCache()
+	r.DisableMistralKVPrefixCache()
 	// Close every shard of an out-of-core split model, keeping the first
 	// error but never leaving a mapping behind: on Windows a live mapping
 	// keeps the file locked.

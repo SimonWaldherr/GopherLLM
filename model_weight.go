@@ -213,6 +213,76 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 	}
 }
 
+// argmaxBatchInputScratchPool holds only a short verifier window of hidden
+// states. It is deliberately separate from DecodeBuffer: callers commonly
+// hold their positions as individual views, whereas Metal wants a contiguous
+// [batch][hidden] input slab.
+var argmaxBatchInputScratchPool = sync.Pool{New: func() any {
+	scratch := make([]float32, 0)
+	return &scratch
+}}
+
+// ArgmaxMatvecBatch computes one greedy argmax per activation vector without
+// materializing logits. It is the bounded foundation for exact greedy
+// verification: on Metal Q6_K vocabulary weights it projects up to eight
+// positions and reduces each vocabulary row on-device in one command buffer;
+// elsewhere it preserves the established per-position ArgmaxMatvec semantics.
+//
+// The operation is the raw W·x argmax only. Callers must retain the usual
+// greedy fast-path preconditions themselves: no output bias, no position-wise
+// repeat penalty, and only ordering-preserving positive logit scaling/softcap.
+// This prevents an apparently fast verifier from silently changing sampling
+// behaviour. On ties, every backend retains the lowest valid token index.
+func (w Weight) ArgmaxMatvecBatch(xs [][]float32, tokens *[]uint32) bool {
+	if tokens == nil || len(xs) == 0 || len(xs[0]) == 0 {
+		return false
+	}
+	batch, cols := len(xs), len(xs[0])
+	if w.Cols > 0 && w.Cols != cols {
+		return false
+	}
+	for i := range xs {
+		if len(xs[i]) != cols {
+			return false
+		}
+	}
+	ensureLenNoClear(tokens, batch)
+
+	// The one-position call uses its descriptor-local buffers. A genuine batch
+	// reuses the shared bounded workspace, avoiding P command-buffer commits and
+	// (critically) any [P][vocabulary] CPU readback.
+	if w.Type == GGMLTypeQ6_K && w.Metal != nil {
+		if batch == 1 {
+			if token, ok := argmaxMetalQ6K(w.Metal, xs[0]); ok {
+				(*tokens)[0] = token
+				return true
+			}
+		} else if batch <= metalBatchArgmaxMaxTokens {
+			scratch := argmaxBatchInputScratchPool.Get().(*[]float32)
+			ensureLenNoClear(scratch, batch*cols)
+			flat := *scratch
+			for position := range batch {
+				copy(flat[position*cols:(position+1)*cols], xs[position])
+			}
+			ok := argmaxMetalQ6KBatch(w.Metal, flat, *tokens, batch)
+			*scratch = flat[:0]
+			argmaxBatchInputScratchPool.Put(scratch)
+			if ok {
+				return true
+			}
+		}
+	}
+
+	for position := range batch {
+		token, ok := w.ArgmaxMatvec(xs[position])
+		if !ok {
+			return false
+		}
+		(*tokens)[position] = token
+	}
+	return true
+}
+
 // argmaxQ6KRowsWithXSums is the f32-activation counterpart of the amd64
 // Q8-activation greedy path. It keeps the Q6_K row dot directly in the loop
 // instead of passing it through argmaxMatvecRows' function value: on ARM64
