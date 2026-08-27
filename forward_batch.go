@@ -648,30 +648,41 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				normalizeDecoderInto(config, X[t], layer.FFNNorm, layer.FFNNormBias, &XN[t])
 			}
 		}
-		if config.usesPlainMLP() {
-			matvecBatch(layer.W3, XN, Up)
-			for t := 0; t < p; t++ {
-				addInPlace(Up[t], layer.FFNUpBias)
+		// In the ordinary CPU batch graph, the FFN's three large intermediate
+		// slabs (Gate, Up, Hidden) cross several kernel boundaries. The Metal
+		// fast path keeps those slabs GPU-resident for a complete prompt chunk,
+		// then returns only the final model-width projection for the residual.
+		// It admits precisely the established Q4_K/Q4_K/SiLU/Q6_K no-bias
+		// shape; every other architecture keeps the reference batch path.
+		fusedMetalBatchFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
+			len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
+			matvecMetalSwiGLUBatchInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, b.XNFlat, p, &b.ProjFlat)
+		if !fusedMetalBatchFFN {
+			if config.usesPlainMLP() {
+				matvecBatch(layer.W3, XN, Up)
+				for t := 0; t < p; t++ {
+					addInPlace(Up[t], layer.FFNUpBias)
+				}
+			} else if layer.HasGateUp {
+				gateUpLen := hDim * 2
+				GateUp = reuseBatchViews(&b.GateUpFlat, &b.GateUp, p, gateUpLen)
+				matvecBatch(layer.WGateUp, XN, GateUp)
+				for t := 0; t < p; t++ {
+					copy(Gate[t], GateUp[t][:hDim])
+					copy(Up[t], GateUp[t][hDim:gateUpLen])
+				}
+			} else {
+				matvecBatch2(layer.W1, layer.W3, XN, Gate, Up)
 			}
-		} else if layer.HasGateUp {
-			gateUpLen := hDim * 2
-			GateUp = reuseBatchViews(&b.GateUpFlat, &b.GateUp, p, gateUpLen)
-			matvecBatch(layer.WGateUp, XN, GateUp)
-			for t := 0; t < p; t++ {
-				copy(Gate[t], GateUp[t][:hDim])
-				copy(Up[t], GateUp[t][hDim:gateUpLen])
-			}
-		} else {
-			matvecBatch2(layer.W1, layer.W3, XN, Gate, Up)
+			activationTask := batchActivationTaskPool.Get().(*batchActivationTask)
+			activationTask.gate, activationTask.up, activationTask.hidden = Gate, Up, Hidden
+			activationTask.hiddenDim = hDim
+			activationTask.plainMLP, activationTask.exactGELU, activationTask.useGELU = config.usesPlainMLP(), config.UseExactGELU, config.UseGELU
+			parallelChunksTask(p, activationTask)
+			*activationTask = batchActivationTask{}
+			batchActivationTaskPool.Put(activationTask)
+			matvecBatch(layer.W2, Hidden, Proj)
 		}
-		activationTask := batchActivationTaskPool.Get().(*batchActivationTask)
-		activationTask.gate, activationTask.up, activationTask.hidden = Gate, Up, Hidden
-		activationTask.hiddenDim = hDim
-		activationTask.plainMLP, activationTask.exactGELU, activationTask.useGELU = config.usesPlainMLP(), config.UseExactGELU, config.UseGELU
-		parallelChunksTask(p, activationTask)
-		*activationTask = batchActivationTask{}
-		batchActivationTaskPool.Put(activationTask)
-		matvecBatch(layer.W2, Hidden, Proj)
 		for t := 0; t < p; t++ {
 			addInPlace(Proj[t], layer.FFNDownBias)
 			if layer.PostFFNNorm != nil {

@@ -12,6 +12,9 @@ const (
 	metalQ4KDirectMinRows = 8192
 	metalQ5KDirectMinRows = 3072
 	metalQ6KDirectMinRows = 3072
+	// Bound the process-wide Metal prefill workspace. Larger externally supplied
+	// ForwardBatchInto calls retain the exact CPU batch implementation.
+	metalBatchFFNMaxTokens = 256
 )
 
 var metalFusedFFNEnabled = os.Getenv("GOPHERLLM_METAL_FUSED_FFN") != "0"
@@ -160,6 +163,23 @@ func matvecMetalSwiGLUInto(gate, up, down *MetalWeight, x []float32, out *[]floa
 	}
 	ensureLenNoClear(out, down.rows)
 	return metalbackend.MatvecQ4K2SwiGLUQ6K(gate.q4, up.q4, down.q6, x, *out)
+}
+
+// matvecMetalSwiGLUBatchInto keeps the complete SwiGLU FFN on Metal across a
+// contiguous prefill chunk. The generic batched graph owns X and Proj as
+// [batch][width] slabs, so this can avoid materializing the much larger
+// [batch][hidden] Gate, Up, and Hidden arrays on the CPU.
+func matvecMetalSwiGLUBatchInto(gate, up, down *MetalWeight, x []float32, batch int, out *[]float32) bool {
+	if !metalFusedFFNEnabled || batch < 2 || batch > metalBatchFFNMaxTokens || !metalWeightUsesDirect(gate) || !metalWeightUsesDirect(up) || !metalWeightUsesDirect(down) ||
+		gate.q4 == nil || up.q4 == nil || down.q6 == nil ||
+		gate.typ != GGMLTypeQ4_K || up.typ != GGMLTypeQ4_K || down.typ != GGMLTypeQ6_K ||
+		gate.cols <= 0 || gate.rows <= 0 || down.rows <= 0 ||
+		gate.cols != up.cols || gate.rows != up.rows || down.cols != gate.rows ||
+		batch > len(x)/gate.cols || batch > int(^uint(0)>>1)/down.rows {
+		return false
+	}
+	ensureLenNoClear(out, batch*down.rows)
+	return metalbackend.MatvecQ4K2SwiGLUQ6KBatch(gate.q4, up.q4, down.q6, x, *out, batch)
 }
 
 func releaseMetalWeight(w *MetalWeight) {

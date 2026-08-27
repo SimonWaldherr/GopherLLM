@@ -33,6 +33,7 @@ typedef struct {
 	uint32_t row_bytes;
 	uint32_t n_blocks;
 	uint32_t rows_per_group;
+	uint32_t batch;
 } GLLMMetalParams;
 
 typedef struct {
@@ -40,7 +41,26 @@ typedef struct {
 	uint32_t index;
 } GLLMArgmaxResult;
 
-enum { GLLM_REPEAT_WINDOW = 64 };
+enum {
+	GLLM_REPEAT_WINDOW = 64,
+	// Keep the shared workspace bounded even when callers invoke the exported
+	// ForwardBatchInto with an arbitrarily large custom slice. The runtime's
+	// production prefill candidates already top out at 256; larger batches
+	// safely fall back to the established CPU path.
+	GLLM_BATCH_FFN_MAX_TOKENS = 256,
+};
+
+// One reusable workspace serves all transformer layers. Retaining batch
+// buffers on every Gate/Up/Down descriptor would multiply prompt scratch by
+// the layer count (hundreds of MiB for Ministral); the FFN command buffer is
+// synchronous, so one workspace is sufficient.
+typedef struct {
+	id<MTLBuffer> x;
+	id<MTLBuffer> gate;
+	id<MTLBuffer> up;
+	id<MTLBuffer> hidden;
+	id<MTLBuffer> out;
+} GLLMMetalBatchWorkspace;
 
 static id<MTLDevice> gllm_device = nil;
 static id<MTLCommandQueue> gllm_queue = nil;
@@ -49,6 +69,7 @@ static id<MTLComputePipelineState> gllm_q5k_pipeline = nil;
 static id<MTLComputePipelineState> gllm_q6k_pipeline = nil;
 static id<MTLComputePipelineState> gllm_silu_pipeline = nil;
 static id<MTLComputePipelineState> gllm_argmax_pipeline = nil;
+static GLLMMetalBatchWorkspace gllm_batch_workspace = {0};
 static char gllm_error[1024];
 
 static void gllm_set_error(NSString* prefix, NSError* error) {
@@ -60,19 +81,21 @@ static void gllm_set_error(NSString* prefix, NSError* error) {
 static const char* gllm_q4k_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; uint batch; };\n"
 "kernel void gllm_q4k_matvec(\n"
 "    const device uchar* data [[buffer(0)]],\n"
 "    const device float* x [[buffer(1)]],\n"
 "    device float* out [[buffer(2)]],\n"
 "    constant Params& p [[buffer(3)]],\n"
-"    uint group [[threadgroup_position_in_grid]],\n"
+"    uint2 group [[threadgroup_position_in_grid]],\n"
 "    uint sg [[simdgroup_index_in_threadgroup]],\n"
 "    uint lane [[thread_index_in_simdgroup]]) {\n"
 "  uint row_half = lane >> 4;\n"
 "  uint sublane = lane & 15;\n"
-"  uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
+"  uint row = group.x * p.rows_per_group + sg * 2 + row_half;\n"
 "  if (row >= p.rows) { return; }\n"
+"  const device float* x_batch = x + group.y * p.cols;\n"
+"  device float* out_batch = out + group.y * p.rows;\n"
 "  const device uchar* row_base = data + row * p.row_bytes;\n"
 "  float sum = 0.0f;\n"
 "  for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
@@ -105,8 +128,8 @@ static const char* gllm_q4k_source =
 "      #pragma unroll(32)\n"
 "      for (uint l = 0; l < 32; ++l) {\n"
 "        uchar packed = qsub[l];\n"
-"        float xv1 = x[y + l];\n"
-"        float xv2 = x[y + 32 + l];\n"
+"        float xv1 = x_batch[y + l];\n"
+"        float xv2 = x_batch[y + 32 + l];\n"
 "        qd1 += float(packed & 15) * xv1;\n"
 "        qd2 += float(packed >> 4) * xv2;\n"
 "        xs1 += xv1;\n"
@@ -119,7 +142,7 @@ static const char* gllm_q4k_source =
 "  for (ushort offset = 8; offset > 0; offset >>= 1) {\n"
 "    sum += simd_shuffle_xor(sum, offset);\n"
 "  }\n"
-"  if (sublane == 0) { out[row] = sum; }\n"
+"  if (sublane == 0) { out_batch[row] = sum; }\n"
 "}\n"
 "kernel void gllm_silu_mul(\n"
 "    const device float* gate [[buffer(0)]],\n"
@@ -136,7 +159,7 @@ static const char* gllm_q4k_source =
 static const char* gllm_q6k_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; uint batch; };\n"
 "static inline int gllm_i8(uchar v) {\n"
 "  int x = int(v);\n"
 "  return x >= 128 ? x - 256 : x;\n"
@@ -146,13 +169,15 @@ static const char* gllm_q6k_source =
 "    const device float* x [[buffer(1)]],\n"
 "    device float* out [[buffer(2)]],\n"
 "    constant Params& p [[buffer(3)]],\n"
-"    uint group [[threadgroup_position_in_grid]],\n"
+"    uint2 group [[threadgroup_position_in_grid]],\n"
 "    uint sg [[simdgroup_index_in_threadgroup]],\n"
 "    uint lane [[thread_index_in_simdgroup]]) {\n"
 "  uint row_half = lane >> 4;\n"
 "  uint sublane = lane & 15;\n"
-"  uint row = group * p.rows_per_group + sg * 2 + row_half;\n"
+"  uint row = group.x * p.rows_per_group + sg * 2 + row_half;\n"
 "  if (row >= p.rows) { return; }\n"
+"  const device float* x_batch = x + group.y * p.cols;\n"
+"  device float* out_batch = out + group.y * p.rows;\n"
 "  const device uchar* row_base = data + row * p.row_bytes;\n"
 "  float sum = 0.0f;\n"
 "  for (uint b = sublane; b < p.n_blocks; b += 16) {\n"
@@ -178,10 +203,10 @@ static const char* gllm_q6k_source =
 "        uchar ql0 = ql_sub[l];\n"
 "        uchar ql32 = ql_sub[l + 32];\n"
 "        uchar qh0 = qh_sub[l];\n"
-"        sum += dsc0 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x[y + l];\n"
-"        sum += dsc2 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x[y + 32 + l];\n"
-"        sum += dsc4 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x[y + 64 + l];\n"
-"        sum += dsc6 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x[y + 96 + l];\n"
+"        sum += dsc0 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x_batch[y + l];\n"
+"        sum += dsc2 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x_batch[y + 32 + l];\n"
+"        sum += dsc4 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x_batch[y + 64 + l];\n"
+"        sum += dsc6 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x_batch[y + 96 + l];\n"
 "      }\n"
 "      float dsc1 = d * float(gllm_i8(sc_sub[1]));\n"
 "      float dsc3 = d * float(gllm_i8(sc_sub[3]));\n"
@@ -192,17 +217,17 @@ static const char* gllm_q6k_source =
 "        uchar ql0 = ql_sub[l];\n"
 "        uchar ql32 = ql_sub[l + 32];\n"
 "        uchar qh0 = qh_sub[l];\n"
-"        sum += dsc1 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x[y + l];\n"
-"        sum += dsc3 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x[y + 32 + l];\n"
-"        sum += dsc5 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x[y + 64 + l];\n"
-"        sum += dsc7 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x[y + 96 + l];\n"
+"        sum += dsc1 * float(int((ql0 & 15) | ((qh0 & 3) << 4)) - 32) * x_batch[y + l];\n"
+"        sum += dsc3 * float(int((ql32 & 15) | (((qh0 >> 2) & 3) << 4)) - 32) * x_batch[y + 32 + l];\n"
+"        sum += dsc5 * float(int((ql0 >> 4) | (((qh0 >> 4) & 3) << 4)) - 32) * x_batch[y + 64 + l];\n"
+"        sum += dsc7 * float(int((ql32 >> 4) | (((qh0 >> 6) & 3) << 4)) - 32) * x_batch[y + 96 + l];\n"
 "      }\n"
 "    }\n"
 "  }\n"
 "  for (ushort offset = 8; offset > 0; offset >>= 1) {\n"
 "    sum += simd_shuffle_xor(sum, offset);\n"
 "  }\n"
-"  if (sublane == 0) { out[row] = sum; }\n"
+"  if (sublane == 0) { out_batch[row] = sum; }\n"
 "}\n"
 "struct ArgmaxResult { float value; uint index; };\n"
 "static inline bool gllm_argmax_better(float candidate, uint candidate_index, float best, uint best_index) {\n"
@@ -325,7 +350,7 @@ static bool gllm_metal_init(void) {
 static const char* gllm_q5k_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; };\n"
+"struct Params { uint rows; uint cols; uint row_bytes; uint n_blocks; uint rows_per_group; uint batch; };\n"
 "kernel void gllm_q5k_matvec(\n"
 "    const device uchar* data [[buffer(0)]],\n"
 "    const device float* x [[buffer(1)]],\n"
@@ -651,11 +676,18 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 	}
 }
 
-static void gllm_metal_encode_q4k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
+static void gllm_metal_encode_q4k_to(
+	id<MTLComputeCommandEncoder> enc,
+	GLLMMetalWeight* w,
+	id<MTLBuffer> x_buffer,
+	id<MTLBuffer> out_buffer,
+	int batch,
+	int default_rows_per_group
+) {
 	[enc setComputePipelineState:gllm_q4k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
-	[enc setBuffer:w->out offset:0 atIndex:2];
+	[enc setBuffer:out_buffer offset:0 atIndex:2];
 	int rows_per_group = gllm_metal_rows_per_group(w->rows, default_rows_per_group);
 	GLLMMetalParams params = {
 		.rows = (uint32_t)w->rows,
@@ -663,11 +695,16 @@ static void gllm_metal_encode_q4k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 		.row_bytes = (uint32_t)w->row_bytes,
 		.n_blocks = (uint32_t)(w->cols / 256),
 		.rows_per_group = (uint32_t)rows_per_group,
+		.batch = (uint32_t)batch,
 	};
 	[enc setBytes:&params length:sizeof(params) atIndex:3];
-	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, 1, 1);
+	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, (NSUInteger)batch, 1);
 	MTLSize threads = MTLSizeMake(32 * ((NSUInteger)rows_per_group / 2), 1, 1);
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+static void gllm_metal_encode_q4k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
+	gllm_metal_encode_q4k_to(enc, w, x_buffer, w->out, 1, default_rows_per_group);
 }
 
 static void gllm_metal_encode_q5k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer) {
@@ -682,6 +719,7 @@ static void gllm_metal_encode_q5k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 		.row_bytes = (uint32_t)w->row_bytes,
 		.n_blocks = (uint32_t)(w->cols / 256),
 		.rows_per_group = (uint32_t)rows_per_group,
+		.batch = 1,
 	};
 	[enc setBytes:&params length:sizeof(params) atIndex:3];
 	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, 1, 1);
@@ -689,11 +727,18 @@ static void gllm_metal_encode_q5k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 }
 
-static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
+static void gllm_metal_encode_q6k_to(
+	id<MTLComputeCommandEncoder> enc,
+	GLLMMetalWeight* w,
+	id<MTLBuffer> x_buffer,
+	id<MTLBuffer> out_buffer,
+	int batch,
+	int default_rows_per_group
+) {
 	[enc setComputePipelineState:gllm_q6k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
-	[enc setBuffer:w->out offset:0 atIndex:2];
+	[enc setBuffer:out_buffer offset:0 atIndex:2];
 	int rows_per_group = gllm_metal_rows_per_group(w->rows, default_rows_per_group);
 	GLLMMetalParams params = {
 		.rows = (uint32_t)w->rows,
@@ -701,11 +746,16 @@ static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 		.row_bytes = (uint32_t)w->row_bytes,
 		.n_blocks = (uint32_t)(w->cols / 256),
 		.rows_per_group = (uint32_t)rows_per_group,
+		.batch = (uint32_t)batch,
 	};
 	[enc setBytes:&params length:sizeof(params) atIndex:3];
-	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, 1, 1);
+	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, (NSUInteger)batch, 1);
 	MTLSize threads = MTLSizeMake(32 * ((NSUInteger)rows_per_group / 2), 1, 1);
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
+	gllm_metal_encode_q6k_to(enc, w, x_buffer, w->out, 1, default_rows_per_group);
 }
 
 static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, uint32_t recent_count, float repeat_penalty) {
@@ -735,6 +785,47 @@ static void gllm_metal_encode_silu(
 	NSUInteger threads = MIN((NSUInteger)256, [gllm_silu_pipeline maxTotalThreadsPerThreadgroup]);
 	MTLSize groups = MTLSizeMake(((NSUInteger)n + threads - 1) / threads, 1, 1);
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+}
+
+// gllm_metal_ensure_batch_buffer retains the largest prefill chunk seen. The
+// caller holds @synchronized(gllm_queue), so the shared workspace cannot be
+// overwritten by a concurrent runner before its command buffer completes.
+static bool gllm_metal_ensure_batch_buffer(id<MTLBuffer>* buffer, NSUInteger length) {
+	if (*buffer != nil && [*buffer length] >= length) {
+		return true;
+	}
+	id<MTLBuffer> replacement = [gllm_device newBufferWithLength:length options:MTLResourceStorageModeShared];
+	if (replacement == nil) {
+		strncpy(gllm_error, "failed to allocate Metal prefill buffer", sizeof(gllm_error) - 1);
+		return false;
+	}
+	if (*buffer != nil) {
+		[*buffer release];
+	}
+	*buffer = replacement;
+	return true;
+}
+
+static bool gllm_metal_ensure_batch_ffn_buffers(GLLMMetalWeight* gate, GLLMMetalWeight* up, GLLMMetalWeight* down, int batch) {
+	if (gate == NULL || up == NULL || down == NULL || batch <= 0 || batch > GLLM_BATCH_FFN_MAX_TOKENS || gate->cols <= 0 || gate->rows <= 0 || down->rows <= 0) {
+		return false;
+	}
+	NSUInteger count = (NSUInteger)batch;
+	if (count > NSUIntegerMax / sizeof(float) / (NSUInteger)gate->cols ||
+		count > NSUIntegerMax / sizeof(float) / (NSUInteger)gate->rows ||
+		count > NSUIntegerMax / sizeof(float) / (NSUInteger)down->rows ||
+		count > UINT32_MAX / (NSUInteger)gate->rows) {
+		strncpy(gllm_error, "Metal prefill batch is too large", sizeof(gllm_error) - 1);
+		return false;
+	}
+	NSUInteger gate_x_len = count * (NSUInteger)gate->cols * sizeof(float);
+	NSUInteger hidden_len = count * (NSUInteger)gate->rows * sizeof(float);
+	NSUInteger out_len = count * (NSUInteger)down->rows * sizeof(float);
+	return gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x, gate_x_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.gate, hidden_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.up, hidden_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.hidden, hidden_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.out, out_len);
 }
 
 static int gllm_metal_q4k_matvec(void* handle, const float* x, float* out) {
@@ -900,6 +991,68 @@ static int gllm_metal_q4k2_silu_q6k(
 			strncpy(gllm_error, "Metal fused FFN command buffer failed", sizeof(gllm_error) - 1);
 		}
 		return ok;
+	}
+}
+
+// gllm_metal_q4k2_silu_q6k_batch is the prefill counterpart to the
+// single-vector fused FFN above. Its two-dimensional Q4_K/Q6_K grids process
+// every activation vector in one command buffer; Gate, Up, and Hidden never
+// cross the CPU/GPU boundary. Only the final [batch][model_dim] projection is
+// copied back for the residual path.
+static int gllm_metal_q4k2_silu_q6k_batch(
+	void* gate_handle,
+	void* up_handle,
+	void* down_handle,
+	const float* x,
+	float* out,
+	int batch
+) {
+	@autoreleasepool {
+		GLLMMetalWeight* gate = (GLLMMetalWeight*)gate_handle;
+		GLLMMetalWeight* up = (GLLMMetalWeight*)up_handle;
+		GLLMMetalWeight* down = (GLLMMetalWeight*)down_handle;
+		if (gate == NULL || up == NULL || down == NULL || batch <= 0 ||
+			gate->weights == nil || up->weights == nil || down->weights == nil ||
+			x == NULL || out == NULL || gate->cols != up->cols || gate->rows != up->rows ||
+			down->cols != gate->rows ||
+			gate->row_bytes != (gate->cols / 256) * 144 || up->row_bytes != (up->cols / 256) * 144 ||
+			down->row_bytes != (down->cols / 256) * 210 ||
+			!gllm_metal_init_q4k() || !gllm_metal_init_q6k()) {
+			return 0;
+		}
+		// gllm_queue is process-global. Locking its small reusable workspace
+		// avoids retaining five prompt slabs for every layer and protects two
+		// concurrent runners from overlapping writes; the command buffer is
+		// already synchronous, so this does not add a GPU synchronization point.
+		@synchronized(gllm_queue) {
+			if (!gllm_metal_ensure_batch_ffn_buffers(gate, up, down, batch)) {
+				return 0;
+			}
+			NSUInteger count = (NSUInteger)batch;
+			NSUInteger x_len = count * (NSUInteger)gate->cols * sizeof(float);
+			NSUInteger out_len = count * (NSUInteger)down->rows * sizeof(float);
+			memcpy([gllm_batch_workspace.x contents], x, x_len);
+
+			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			int ffn_rows_per_group =
+				gate->cols <= 3072 && gate->rows <= 9216 && down->rows <= 3072 ? 6 : 4;
+			gllm_metal_encode_q4k_to(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, ffn_rows_per_group);
+			gllm_metal_encode_q4k_to(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, ffn_rows_per_group);
+			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, gllm_batch_workspace.hidden, (uint32_t)(count * (NSUInteger)gate->rows));
+			gllm_metal_encode_q6k_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group);
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			int ok = [cb status] == MTLCommandBufferStatusCompleted;
+			if (ok) {
+				memcpy(out, [gllm_batch_workspace.out contents], out_len);
+			} else {
+				strncpy(gllm_error, "Metal batched fused FFN command buffer failed", sizeof(gllm_error) - 1);
+			}
+			return ok;
+		}
+		return 0; // unreachable, keeps C's control-flow analysis explicit.
 	}
 }
 
@@ -1160,6 +1313,29 @@ func MatvecQ4K2SwiGLUQ6K(gate, up, down *Weight, x, out []float32) bool {
 		down.ptr,
 		(*C.float)(unsafe.Pointer(&x[0])),
 		(*C.float)(unsafe.Pointer(&out[0])),
+	)
+	return ok != 0
+}
+
+// MatvecQ4K2SwiGLUQ6KBatch applies a whole prompt chunk through the fused
+// Q4_K/Q4_K/SiLU/Q6_K FFN. x and out are contiguous [batch][cols] and
+// [batch][down.rows] slabs, respectively. It deliberately exposes only the
+// complete FFN sequence: returning intermediate Gate/Up/Hidden slabs would
+// reintroduce the CPU/GPU traffic this path removes.
+func MatvecQ4K2SwiGLUQ6KBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
+	if gate == nil || up == nil || down == nil || gate.ptr == nil || up.ptr == nil || down.ptr == nil || batch <= 0 ||
+		gate.cols != up.cols || gate.rows != up.rows || down.cols != gate.rows ||
+		gate.cols <= 0 || gate.rows <= 0 || down.rows <= 0 ||
+		batch > len(x)/gate.cols || batch > len(out)/down.rows {
+		return false
+	}
+	ok := C.gllm_metal_q4k2_silu_q6k_batch(
+		gate.ptr,
+		up.ptr,
+		down.ptr,
+		(*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&out[0])),
+		C.int(batch),
 	)
 	return ok != 0
 }

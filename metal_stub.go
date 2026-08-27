@@ -44,4 +44,8 @@ func matvecMetalSwiGLUInto(_, _, _ *MetalWeight, _ []float32, _ *[]float32) bool
 	return false
 }
 
+func matvecMetalSwiGLUBatchInto(_, _, _ *MetalWeight, _ []float32, _ int, _ *[]float32) bool {
+	return false
+}
+
 func releaseMetalWeight(_ *MetalWeight) {}

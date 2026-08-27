@@ -3,6 +3,7 @@
 package gopherllm
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"os"
@@ -320,6 +321,234 @@ func TestMetalQ4K2SwiGLUQ6KMatchesCPU(t *testing.T) {
 	assertMetalMatvecClose(t, got, want)
 }
 
+func TestMetalQ4K2SwiGLUQ6KBatchMatchesCPU(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const inputCols, hiddenRows, outputRows, batch = 256, 1024, 256, 5
+	rng := rand.New(rand.NewSource(197))
+	gateData := make([]byte, 0, hiddenRows*144)
+	upData := make([]byte, 0, hiddenRows*144)
+	for range hiddenRows {
+		gateData = append(gateData, randomQ4KRow(rng, inputCols)...)
+		upData = append(upData, randomQ4KRow(rng, inputCols)...)
+	}
+	downData := make([]byte, 0, outputRows*(hiddenRows/256)*210)
+	for range outputRows {
+		downData = append(downData, randomQ6KRow(rng, hiddenRows)...)
+	}
+	inputs := make([]float32, batch*inputCols)
+	for i := range inputs {
+		inputs[i] = float32((i*17)%43-21) / 13
+	}
+	want := make([]float32, batch*outputRows)
+	for token := 0; token < batch; token++ {
+		x := inputs[token*inputCols : (token+1)*inputCols]
+		gate, up := []float32{}, []float32{}
+		hidden := make([]float32, hiddenRows)
+		MatvecQ4KInto(gateData, x, hiddenRows, inputCols, &gate)
+		MatvecQ4KInto(upData, x, hiddenRows, inputCols, &up)
+		siluMulF32(gate, up, hidden)
+		got := want[token*outputRows : (token+1)*outputRows]
+		MatvecQ6KInto(downData, hidden, outputRows, hiddenRows, &got)
+	}
+	gateWeight := metalbackend.PrepareQ4K(gateData, hiddenRows, inputCols, false)
+	upWeight := metalbackend.PrepareQ4K(upData, hiddenRows, inputCols, false)
+	downWeight := metalbackend.PrepareQ6K(downData, outputRows, hiddenRows, false)
+	if gateWeight == nil || upWeight == nil || downWeight == nil {
+		metalbackend.Release(gateWeight)
+		metalbackend.Release(upWeight)
+		metalbackend.Release(downWeight)
+		t.Fatalf("prepare batched fused FFN Metal weights: %s", MetalError())
+	}
+	defer metalbackend.Release(gateWeight)
+	defer metalbackend.Release(upWeight)
+	defer metalbackend.Release(downWeight)
+	got := make([]float32, batch*outputRows)
+	if !metalbackend.MatvecQ4K2SwiGLUQ6KBatch(gateWeight, upWeight, downWeight, inputs, got, batch) {
+		t.Fatalf("batched fused FFN Metal matvec: %s", MetalError())
+	}
+	assertMetalMatvecClose(t, got, want)
+}
+
+// This uses the production 3B geometry (rather than the compact backend test
+// above) to lock in the package-level dispatch gate used by ForwardBatchInto.
+func TestMetalMinistral3BFFNBatchDispatchMatchesCPU(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const inputCols, hiddenRows, outputRows, batch = 3072, 9216, 3072, 2
+	rng := rand.New(rand.NewSource(199))
+	gateRow := randomQ4KRow(rng, inputCols)
+	upRow := randomQ4KRow(rng, inputCols)
+	downRow := randomQ6KRow(rng, hiddenRows)
+	gateData := make([]byte, hiddenRows*len(gateRow))
+	upData := make([]byte, hiddenRows*len(upRow))
+	downData := make([]byte, outputRows*len(downRow))
+	for r := range hiddenRows {
+		copy(gateData[r*len(gateRow):], gateRow)
+		copy(upData[r*len(upRow):], upRow)
+	}
+	for r := range outputRows {
+		copy(downData[r*len(downRow):], downRow)
+	}
+	inputs := make([]float32, batch*inputCols)
+	for i := range inputs {
+		inputs[i] = float32((i*23)%67-33) / 19
+	}
+	want := make([]float32, batch*outputRows)
+	for token := 0; token < batch; token++ {
+		x := inputs[token*inputCols : (token+1)*inputCols]
+		gate, up := []float32{}, []float32{}
+		hidden := make([]float32, hiddenRows)
+		MatvecQ4KInto(gateData, x, hiddenRows, inputCols, &gate)
+		MatvecQ4KInto(upData, x, hiddenRows, inputCols, &up)
+		siluMulF32(gate, up, hidden)
+		out := want[token*outputRows : (token+1)*outputRows]
+		MatvecQ6KInto(downData, hidden, outputRows, hiddenRows, &out)
+	}
+	gateWeight := prepareMetalWeight(gateData, GGMLTypeQ4_K, hiddenRows, inputCols, false)
+	upWeight := prepareMetalWeight(upData, GGMLTypeQ4_K, hiddenRows, inputCols, false)
+	downWeight := prepareMetalWeight(downData, GGMLTypeQ6_K, outputRows, hiddenRows, false)
+	if gateWeight == nil || upWeight == nil || downWeight == nil {
+		releaseMetalWeight(gateWeight)
+		releaseMetalWeight(upWeight)
+		releaseMetalWeight(downWeight)
+		t.Fatalf("prepare Ministral batch Metal weights: %s", MetalError())
+	}
+	defer releaseMetalWeight(gateWeight)
+	defer releaseMetalWeight(upWeight)
+	defer releaseMetalWeight(downWeight)
+	got := []float32{}
+	if !matvecMetalSwiGLUBatchInto(gateWeight, upWeight, downWeight, inputs, batch, &got) {
+		t.Fatalf("Ministral batch Metal dispatch: %s", MetalError())
+	}
+	assertMetalMatvecClose(t, got, want)
+}
+
+// TestMetalMinistral3BForwardBatchMatchesCPU exercises the production caller,
+// not only the backend kernel: Q/K/V and attention remain on the CPU while a
+// real-shape no-bias SwiGLU block takes the GPU-resident batch route. This
+// catches a stale Proj view or a failed Metal dispatch incorrectly leaking
+// into the residual path.
+func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const (
+		dim      = 3072
+		hidden   = 9216
+		headDim  = 128
+		nHeads   = 24
+		nKVHeads = 8
+		batch    = 2
+		vocab    = 4
+	)
+	rng := rand.New(rand.NewSource(200))
+	q4Data := func(rows, cols int) []byte {
+		row := randomQ4KRow(rng, cols)
+		data := make([]byte, rows*len(row))
+		for r := range rows {
+			copy(data[r*len(row):], row)
+		}
+		return data
+	}
+	q6Data := func(rows, cols int) []byte {
+		row := randomQ6KRow(rng, cols)
+		data := make([]byte, rows*len(row))
+		for r := range rows {
+			copy(data[r*len(row):], row)
+		}
+		return data
+	}
+	qData := q4Data(dim, dim)
+	kData := q4Data(nKVHeads*headDim, dim)
+	vData := q6Data(nKVHeads*headDim, dim)
+	oData := q4Data(dim, dim)
+	gateData := q4Data(hidden, dim)
+	upData := q4Data(hidden, dim)
+	downData := q6Data(dim, hidden)
+	ones := make([]float32, dim)
+	for i := range ones {
+		ones[i] = 1
+	}
+	embedding := make([]float32, vocab*dim)
+	output := make([]float32, vocab*dim)
+	for i := range embedding {
+		embedding[i] = float32((i*7)%31-15) / 31
+		output[i] = float32((i*11)%37-18) / 37
+	}
+	config := Config{
+		Arch:               "ministral",
+		Dim:                dim,
+		HiddenDim:          hidden,
+		NLayers:            1,
+		NHeads:             nHeads,
+		NKVHeads:           nKVHeads,
+		VocabSize:          vocab,
+		HeadDim:            headDim,
+		ValueDim:           headDim,
+		KVDim:              nKVHeads * headDim,
+		KVMul:              nHeads / nKVHeads,
+		RopeTheta:          10000,
+		RopeDimensionCount: headDim,
+		RMSNormEps:         1e-5,
+		EmbeddingScale:     1,
+		ResidualScale:      1,
+		LogitScale:         1,
+	}
+	layer := LayerWeights{
+		AttnNorm: ones, FFNNorm: ones,
+		WQ: Weight{Raw: qData, Type: GGMLTypeQ4_K, Rows: dim, Cols: dim},
+		WK: Weight{Raw: kData, Type: GGMLTypeQ4_K, Rows: nKVHeads * headDim, Cols: dim},
+		WV: Weight{Raw: vData, Type: GGMLTypeQ6_K, Rows: nKVHeads * headDim, Cols: dim},
+		WO: Weight{Raw: oData, Type: GGMLTypeQ4_K, Rows: dim, Cols: dim},
+		W1: Weight{Raw: gateData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
+		W2: Weight{Raw: downData, Type: GGMLTypeQ6_K, Rows: dim, Cols: hidden},
+		W3: Weight{Raw: upData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
+	}
+	cpuWeights := ModelWeights{
+		TokenEmbd:  Weight{F32: embedding, Rows: vocab, Cols: dim},
+		OutputNorm: ones,
+		Output:     Weight{F32: output, Rows: vocab, Cols: dim},
+		Layers:     []LayerWeights{layer},
+	}
+	metalLayer := layer
+	metalLayer.W1.Metal = prepareMetalWeight(gateData, GGMLTypeQ4_K, hidden, dim, false)
+	metalLayer.W3.Metal = prepareMetalWeight(upData, GGMLTypeQ4_K, hidden, dim, false)
+	metalLayer.W2.Metal = prepareMetalWeight(downData, GGMLTypeQ6_K, dim, hidden, false)
+	if metalLayer.W1.Metal == nil || metalLayer.W3.Metal == nil || metalLayer.W2.Metal == nil {
+		releaseMetalWeight(metalLayer.W1.Metal)
+		releaseMetalWeight(metalLayer.W3.Metal)
+		releaseMetalWeight(metalLayer.W2.Metal)
+		t.Fatalf("prepare forward-batch Metal weights: %s", MetalError())
+	}
+	defer releaseMetalWeight(metalLayer.W1.Metal)
+	defer releaseMetalWeight(metalLayer.W3.Metal)
+	defer releaseMetalWeight(metalLayer.W2.Metal)
+	metalWeights := cpuWeights
+	metalWeights.Layers = []LayerWeights{metalLayer}
+	tokens := []uint32{0, 1}
+	newState := func() (*KVCache, *DecodeBuffer) {
+		return NewKVCache(1, nKVHeads*headDim, nKVHeads*headDim, batch), NewDecodeBuffer(config, headDim, nKVHeads, headDim)
+	}
+	cpuCache, cpuBuf := newState()
+	metalCache, metalBuf := newState()
+	cpuLogits, metalLogits := []float32{}, []float32{}
+	ForwardBatchInto(config, cpuWeights, cpuCache, cpuBuf, tokens, 0, true, &cpuLogits)
+	ForwardBatchInto(config, metalWeights, metalCache, metalBuf, tokens, 0, true, &metalLogits)
+	assertMetalMatvecClose(t, metalLogits, cpuLogits)
+	assertMetalMatvecClose(t, metalBuf.XN, cpuBuf.XN)
+	for i := range cpuCache.K[0] {
+		if d := math.Abs(float64(metalCache.K[0][i] - cpuCache.K[0][i])); d > 1e-3*math.Max(1, math.Abs(float64(cpuCache.K[0][i]))) {
+			t.Fatalf("K cache[%d] = %g, want %g", i, metalCache.K[0][i], cpuCache.K[0][i])
+		}
+	}
+}
+
 // BenchmarkMetalMinistral3BFFN covers the dominant dense block in the
 // Ministral-3 3B decode path: Q4_K gate/up projections, SwiGLU, then a Q6_K
 // down projection. Keeping the production shape here makes Metal scheduling
@@ -330,6 +559,97 @@ func BenchmarkMetalMinistral3BFFN(b *testing.B) {
 
 func BenchmarkMetalMinistral14BFFN(b *testing.B) {
 	benchmarkMetalMinistralFFN(b, 5120, 16384, 5120)
+}
+
+// BenchmarkMetalMinistral3BFFNBatch compares the experimental GPU-resident
+// prompt FFN to the production CPU Q8 batch kernels at the exact Ministral-3B
+// geometry. Prefill normally uses 128-token chunks, while the smaller samples
+// expose whether command-buffer amortization has a useful crossover.
+func BenchmarkMetalMinistral3BFFNBatch(b *testing.B) {
+	if !MetalAvailable() {
+		b.Skip(MetalError())
+	}
+	const inputCols, hiddenRows, outputRows = 3072, 9216, 3072
+	rng := rand.New(rand.NewSource(198))
+	gateRow := randomQ4KRow(rng, inputCols)
+	upRow := randomQ4KRow(rng, inputCols)
+	downRow := randomQ6KRow(rng, hiddenRows)
+	gateData := make([]byte, hiddenRows*len(gateRow))
+	upData := make([]byte, hiddenRows*len(upRow))
+	downData := make([]byte, outputRows*len(downRow))
+	for r := range hiddenRows {
+		copy(gateData[r*len(gateRow):], gateRow)
+		copy(upData[r*len(upRow):], upRow)
+	}
+	for r := range outputRows {
+		copy(downData[r*len(downRow):], downRow)
+	}
+	gateWeight := metalbackend.PrepareQ4K(gateData, hiddenRows, inputCols, false)
+	upWeight := metalbackend.PrepareQ4K(upData, hiddenRows, inputCols, false)
+	downWeight := metalbackend.PrepareQ6K(downData, outputRows, hiddenRows, false)
+	if gateWeight == nil || upWeight == nil || downWeight == nil {
+		metalbackend.Release(gateWeight)
+		metalbackend.Release(upWeight)
+		metalbackend.Release(downWeight)
+		b.Fatalf("prepare batched fused FFN Metal weights: %s", MetalError())
+	}
+	b.Cleanup(func() {
+		metalbackend.Release(gateWeight)
+		metalbackend.Release(upWeight)
+		metalbackend.Release(downWeight)
+	})
+	gate := Weight{Raw: gateData, Type: GGMLTypeQ4_K, Rows: hiddenRows, Cols: inputCols}
+	up := Weight{Raw: upData, Type: GGMLTypeQ4_K, Rows: hiddenRows, Cols: inputCols}
+	down := Weight{Raw: downData, Type: GGMLTypeQ6_K, Rows: outputRows, Cols: hiddenRows}
+	for _, batch := range []int{2, 4, 8, 32, 64, 128} {
+		b.Run(fmt.Sprintf("P%d", batch), func(b *testing.B) {
+			xFlat := make([]float32, batch*inputCols)
+			for i := range xFlat {
+				xFlat[i] = float32((i*19)%59-29) / 17
+			}
+			xs := make([][]float32, batch)
+			gateOut, upOut, hiddenOut, out := make([][]float32, batch), make([][]float32, batch), make([][]float32, batch), make([][]float32, batch)
+			gateFlat, upFlat := make([]float32, batch*hiddenRows), make([]float32, batch*hiddenRows)
+			hiddenFlat, outFlat := make([]float32, batch*hiddenRows), make([]float32, batch*outputRows)
+			for token := range batch {
+				xs[token] = xFlat[token*inputCols : (token+1)*inputCols]
+				gateOut[token] = gateFlat[token*hiddenRows : (token+1)*hiddenRows]
+				upOut[token] = upFlat[token*hiddenRows : (token+1)*hiddenRows]
+				hiddenOut[token] = hiddenFlat[token*hiddenRows : (token+1)*hiddenRows]
+				out[token] = outFlat[token*outputRows : (token+1)*outputRows]
+			}
+			b.Run("CPU_Q8_batch", func(b *testing.B) {
+				withQ8Activations(true, func() {
+					matvecBatch2(gate, up, xs, gateOut, upOut)
+					for token := range batch {
+						siluMulF32(gateOut[token], upOut[token], hiddenOut[token])
+					}
+					matvecBatch(down, hiddenOut, out)
+					b.ReportAllocs()
+					b.ResetTimer()
+					for b.Loop() {
+						matvecBatch2(gate, up, xs, gateOut, upOut)
+						for token := range batch {
+							siluMulF32(gateOut[token], upOut[token], hiddenOut[token])
+						}
+						matvecBatch(down, hiddenOut, out)
+					}
+				})
+			})
+			b.Run("Metal_resident", func(b *testing.B) {
+				if !metalbackend.MatvecQ4K2SwiGLUQ6KBatch(gateWeight, upWeight, downWeight, xFlat, outFlat, batch) {
+					b.Fatal(MetalError())
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				for b.Loop() {
+					if !metalbackend.MatvecQ4K2SwiGLUQ6KBatch(gateWeight, upWeight, downWeight, xFlat, outFlat, batch) {
+						b.Fatal(MetalError())
+					}
+				}
+			})
+		})
+	}
 }
 
 func benchmarkMetalMinistralFFN(b *testing.B, inputCols, hiddenRows, outputRows int) {
