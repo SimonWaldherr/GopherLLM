@@ -13,7 +13,7 @@ import (
 // that don't belong to a protocol family: /health, /deployment, /privacy,
 // /remote, /remote/models, and /batch/parse. Extracted from NewHandler's
 // inline handlers for these routes.
-func registerSystemRoutes(mux *http.ServeMux, state *runnerState, deployment deploymentAccess, remote *remoteState, history *chatHistoryStore) {
+func registerSystemRoutes(mux *http.ServeMux, state *runnerState, deployment deploymentAccess, remote *remoteState, history *chatHistoryStore, features Features) {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, req *http.Request) {
 		status := deployment.status(req)
 		status["ok"] = true
@@ -26,8 +26,38 @@ func registerSystemRoutes(mux *http.ServeMux, state *runnerState, deployment dep
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		writeJSON(w, deployment.status(req))
+		status := deployment.status(req)
+		status["features"] = features.status()
+		writeJSON(w, status)
 	})
+	if features.Spreadsheet {
+		registerSpreadsheetRoute(mux)
+	}
+	if features.RemoteProxy {
+		registerRemoteRoutes(mux, remote)
+	}
+	mux.HandleFunc("/privacy", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		writeJSON(w, map[string]any{
+			"report": gopherllm.DefaultPrivacyReport(),
+			"chat_history": map[string]any{
+				"configured": history.enabled(),
+				"mode":       map[bool]string{true: "server-file-opt-in", false: "browser-default"}[history.enabled()],
+			},
+			"features": features.status(),
+			"research_tools": map[string]any{
+				"default":              map[bool]string{true: "request-flag", false: "disabled"}[features.WebLookup],
+				"request_flags":        []string{"gopherllm_wikimedia", "gopherllm_openstreetmap"},
+				"openstreetmap_notice": OSMUsageNotice,
+			},
+		})
+	})
+}
+
+func registerSpreadsheetRoute(mux *http.ServeMux) {
 	mux.HandleFunc("/batch/parse", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -49,24 +79,12 @@ func registerSystemRoutes(mux *http.ServeMux, state *runnerState, deployment dep
 		}
 		writeJSON(w, result)
 	})
-	mux.HandleFunc("/privacy", func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		writeJSON(w, map[string]any{
-			"report": gopherllm.DefaultPrivacyReport(),
-			"chat_history": map[string]any{
-				"configured": history.enabled(),
-				"mode":       map[bool]string{true: "server-file-opt-in", false: "browser-default"}[history.enabled()],
-			},
-			"research_tools": map[string]any{
-				"default":              "disabled",
-				"request_flags":        []string{"gopherllm_wikimedia", "gopherllm_openstreetmap"},
-				"openstreetmap_notice": OSMUsageNotice,
-			},
-		})
-	})
+}
+
+// registerRemoteRoutes registers the forwarding configuration. POST /remote
+// redirects every later completion at a base URL of the caller's choosing, so
+// it is one of the routes a bare local server no longer exposes by default.
+func registerRemoteRoutes(mux *http.ServeMux, remote *remoteState) {
 	mux.HandleFunc("/remote", func(w http.ResponseWriter, req *http.Request) {
 		switch req.Method {
 		case http.MethodGet:

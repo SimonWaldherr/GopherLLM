@@ -15,6 +15,11 @@ import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
+// DefaultAddr is the listen address Serve uses when ServeOptions.Addr is
+// empty. Loopback, so a server nobody configured is reachable from this
+// machine only; see NetworkExposureWarning for what changes otherwise.
+const DefaultAddr = "127.0.0.1:8080"
+
 // Handler is the mountable HTTP API returned by NewHandler. Close releases
 // the currently active chat and embedding runners, including memory-mapped
 // GGUF files installed through a hot-swap. Hosts should stop their HTTP server
@@ -52,9 +57,13 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := validateDeploymentOptions(mode, opts.AdminToken, opts.Addr, opts.WasmDir, opts.ChatUI, true); err != nil {
+	if err := validateDeploymentOptions(mode, opts.AdminToken, opts.WasmDir, opts.ChatUI); err != nil {
 		return err
 	}
+	if strings.TrimSpace(opts.Addr) == "" {
+		opts.Addr = DefaultAddr
+	}
+	networkExposed := !isLoopbackListenAddress(opts.Addr)
 	if mode == DeploymentBrowser && initialRunner != nil {
 		return errors.New("browser deployment must not be started with a server-side model runner")
 	}
@@ -63,6 +72,8 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		logw = os.Stderr
 	}
 	handler := NewHandler(initialRunner, HandlerOptions{
+		Features:              opts.Features,
+		NetworkExposed:        networkExposed,
 		DeploymentMode:        mode,
 		AdminToken:            opts.AdminToken,
 		Defaults:              opts.Defaults,
@@ -93,6 +104,14 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 	fmt.Fprintf(logw, "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
+	if enabled := opts.Features.EnabledNames(); len(enabled) > 0 {
+		fmt.Fprintf(logw, "Optional features: %s\n", strings.Join(enabled, ", "))
+	} else {
+		fmt.Fprintln(logw, "Optional features: none (chat and completions only; see --enable)")
+	}
+	if warning := NetworkExposureWarning(mode, opts.Addr, opts.AdminToken); warning != "" {
+		fmt.Fprint(logw, warning)
+	}
 	shutdownDone := make(chan struct{})
 	shutdownFinished := make(chan struct{})
 	go func() {
@@ -142,7 +161,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		// mode without a usable token, so privileged routes stay unavailable.
 		fmt.Fprintf(logw, "Warning: invalid deployment mode: %v; privileged routes are disabled\n", err)
 	}
-	deployment := newDeploymentAccess(opts.DeploymentMode, opts.AdminToken)
+	deployment := newDeploymentAccess(opts.DeploymentMode, opts.AdminToken, opts.NetworkExposed)
 	if deployment.mode != DeploymentLocal && strings.TrimSpace(opts.ChatHistoryPath) != "" {
 		// A single shared history file has no user identity boundary. Managed
 		// and browser deployments therefore keep workspaces in each browser,
@@ -191,6 +210,12 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		return skills
 	}
 	agenticToolsFor := func(wikimedia, openStreetMap bool) []gopherllm.AgenticTool {
+		// A request asking for a lookup tool the operator did not enable gets
+		// a normal answer without it, not an error: the flags are hints from
+		// the client, and the server decides what exists.
+		if !opts.Features.WebLookup {
+			return nil
+		}
 		var tools []gopherllm.AgenticTool
 		if wikimedia {
 			tools = append(tools, wikimediaTools...)
@@ -215,12 +240,16 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	var modelLoadMu sync.Mutex
 	mux := http.NewServeMux()
 
-	registerSystemRoutes(mux, state, deployment, remote, history)
+	// Optional capabilities are not registered unless the host asked for them,
+	// so a disabled one answers 404 rather than presenting a permission check.
+	registerSystemRoutes(mux, state, deployment, remote, history, opts.Features)
 	registerChatWorkspaceRoutes(mux, history)
 	registerOpenAIRoutes(mux, state, embedder, sem, opts, skills, skillsFor, agenticToolsFor, logw)
 	registerOllamaRoutes(mux, state, embedder, sem, opts, skills, agenticToolsFor, logw)
 	registerModelRoutes(mux, state, embedder, sem, opts, deployment, &modelLoadMu, logw)
-	registerAutoTuneRoutes(mux, state, sem, logw)
+	if opts.Features.AutoTune {
+		registerAutoTuneRoutes(mux, state, sem, logw)
+	}
 	registerAgentOSRoutes(mux, state, sem, opts)
 	if opts.ChatUI {
 		registerChatUIRoutes(mux, state, opts, deployment, logw)

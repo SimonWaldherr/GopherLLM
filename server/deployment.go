@@ -19,9 +19,10 @@ import (
 type DeploymentMode string
 
 const (
-	// DeploymentLocal is the single-user profile. Serve only accepts a loopback
-	// address for it. Embedders that create their own listener are responsible
-	// for binding it to loopback as well.
+	// DeploymentLocal is the single-user profile. A loopback listener is the
+	// default; binding it to the network is allowed but locks the privileged
+	// routes off, since local mode has no token to check. See
+	// NetworkExposureWarning and HandlerOptions.NetworkExposed.
 	DeploymentLocal DeploymentMode = "local"
 	// DeploymentManaged is for a server shared by users. Generation remains
 	// publicly available to the surrounding deployment, but shared settings and
@@ -63,7 +64,7 @@ func (m DeploymentMode) adminRequired() bool { return m == DeploymentManaged }
 // or useful server behavior. NewHandler cannot return an error for historical
 // API reasons, so Serve calls this before opening a listener; NewHandler still
 // fails closed for privileged routes if it is called directly with bad input.
-func validateDeploymentOptions(mode DeploymentMode, adminToken, addr, wasmDir string, chatUI bool, serving bool) error {
+func validateDeploymentOptions(mode DeploymentMode, adminToken, wasmDir string, chatUI bool) error {
 	if mode == DeploymentManaged && strings.TrimSpace(adminToken) == "" {
 		return errors.New("managed deployment requires an admin token (use --admin-token-file or GOPHERLLM_ADMIN_TOKEN)")
 	}
@@ -75,10 +76,34 @@ func validateDeploymentOptions(mode DeploymentMode, adminToken, addr, wasmDir st
 			return errors.New("browser deployment requires a WasmDir containing gopherllm.wasm and wasm_exec.js")
 		}
 	}
-	if serving && mode == DeploymentLocal && !isLoopbackListenAddress(addr) {
-		return fmt.Errorf("local deployment only accepts a loopback --serve address (got %q)", addr)
-	}
 	return nil
+}
+
+// NetworkExposureWarning returns the operator-facing warning for a listener
+// that is reachable beyond loopback, or "" for a loopback-only one.
+//
+// Binding to the network is allowed — sharing a model with a phone or a second
+// machine is a real and reasonable thing to want — but it is never the quiet
+// default. The warning says what actually changes, because "listening on
+// 0.0.0.0" does not tell a first-time user that the whole subnet can now spend
+// their CPU. Local deployment additionally locks the privileged routes off
+// when it is exposed this way; see deploymentAccess.adminAuthorized.
+func NetworkExposureWarning(mode DeploymentMode, addr, adminToken string) string {
+	if isLoopbackListenAddress(addr) {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "WARNING: listening on %s, which is reachable from your network, not just this machine.\n", strings.TrimSpace(addr))
+	b.WriteString("         Anyone who can reach this port can send prompts and use your CPU.\n")
+	switch {
+	case mode == DeploymentManaged && strings.TrimSpace(adminToken) != "":
+		b.WriteString("         Managed deployment is active, so server settings stay behind the admin token.\n")
+	default:
+		b.WriteString("         Model loading, downloads, autotune, remote forwarding and OS commands are\n")
+		b.WriteString("         disabled while exposed this way. Use --deployment managed with an admin\n")
+		b.WriteString("         token to keep them available, or bind 127.0.0.1 to stay local-only.\n")
+	}
+	return b.String()
 }
 
 func wasmRuntimeAvailable(dir string) bool {
@@ -90,9 +115,17 @@ func wasmRuntimeAvailable(dir string) bool {
 type deploymentAccess struct {
 	mode       DeploymentMode
 	adminToken string
+	// lockPrivileged denies the admin-only routes outright rather than
+	// checking a token. It is set for a local deployment on a listener that
+	// reaches the network: local mode has no token to check, and "anyone on
+	// the subnet is an administrator" is not a boundary worth having.
+	lockPrivileged bool
+	// networkExposed is the raw fact, reported by GET /deployment so the Web
+	// UI can say so; lockPrivileged is what it implies for local mode.
+	networkExposed bool
 }
 
-func newDeploymentAccess(raw DeploymentMode, adminToken string) deploymentAccess {
+func newDeploymentAccess(raw DeploymentMode, adminToken string, networkExposed bool) deploymentAccess {
 	mode, err := ParseDeploymentMode(string(raw))
 	if err != nil {
 		// Invalid direct-library input must not quietly become a permissive
@@ -100,12 +133,17 @@ func newDeploymentAccess(raw DeploymentMode, adminToken string) deploymentAccess
 		mode = DeploymentManaged
 		adminToken = ""
 	}
-	return deploymentAccess{mode: mode, adminToken: strings.TrimSpace(adminToken)}
+	return deploymentAccess{
+		mode:           mode,
+		adminToken:     strings.TrimSpace(adminToken),
+		lockPrivileged: networkExposed && mode == DeploymentLocal,
+		networkExposed: networkExposed,
+	}
 }
 
 func (a deploymentAccess) adminAuthorized(req *http.Request) bool {
 	if a.mode != DeploymentManaged {
-		return true
+		return !a.lockPrivileged
 	}
 	if a.adminToken == "" || req == nil {
 		return false
@@ -132,6 +170,7 @@ func (a deploymentAccess) status(req *http.Request) map[string]any {
 		"server_inference":  !a.mode.browserOnly(),
 		"admin_required":    a.mode.adminRequired(),
 		"admin":             a.adminAuthorized(req),
+		"network_exposed":   a.networkExposed,
 	}
 }
 
@@ -200,8 +239,15 @@ func (a deploymentAccess) wrap(next http.Handler) http.Handler {
 			http.Error(w, "cross-site requests are not accepted for this method", http.StatusForbidden)
 			return
 		}
-		if a.mode.adminRequired() && adminOnlyRequest(req) && !a.adminAuthorized(req) {
+		// Not gated on adminRequired(): a local deployment exposed to the
+		// network has no token to present, and adminAuthorized reports the
+		// denial for it too.
+		if adminOnlyRequest(req) && !a.adminAuthorized(req) {
 			w.Header().Set("Cache-Control", "no-store")
+			if a.lockPrivileged {
+				http.Error(w, "server settings are disabled while this local server is exposed to the network", http.StatusForbidden)
+				return
+			}
 			http.Error(w, "administrator authorization is required for this server setting", http.StatusForbidden)
 			return
 		}

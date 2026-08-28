@@ -37,7 +37,7 @@ func TestModelsDownloadVariantsListsQuantizations(t *testing.T) {
 	defer hf.Close()
 	t.Setenv("HF_ENDPOINT", hf.URL)
 
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()}))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/models/download/variants?ref=org/model")
@@ -73,7 +73,7 @@ func TestModelsDownloadVariantsListsQuantizations(t *testing.T) {
 }
 
 func TestModelsDownloadVariantsRejectsMissingRef(t *testing.T) {
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()}))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/models/download/variants")
@@ -101,7 +101,7 @@ func TestModelsSearchFindsGGUFRepositories(t *testing.T) {
 	defer hf.Close()
 	t.Setenv("HF_ENDPOINT", hf.URL)
 
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()}))
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/models/search?q=qwen&limit=2")
@@ -152,7 +152,7 @@ func TestModelsSearchValidatesRequest(t *testing.T) {
 		t.Fatalf("disabled search status = %d, want 404", resp.StatusCode)
 	}
 
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()}))
 	defer srv.Close()
 	for _, target := range []string{
 		"/models/search",
@@ -179,7 +179,7 @@ func TestModelsSearchValidatesRequest(t *testing.T) {
 }
 
 func TestModelsDownloadRejectsInvalidRef(t *testing.T) {
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()}))
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/models/download", "application/json", strings.NewReader(`{"ref":"not-a-repository"}`))
@@ -226,7 +226,7 @@ func TestModelsDownloadPlacesFileAndAppearsInCatalog(t *testing.T) {
 	t.Setenv("HF_HOME", t.TempDir())
 
 	modelDir := t.TempDir()
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: modelDir}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: modelDir, Features: AllFeatures()}))
 	defer srv.Close()
 
 	resp, err := http.Post(srv.URL+"/models/download", "application/json", strings.NewReader(`{"ref":"org/tiny:Q4_K_M"}`))
@@ -329,7 +329,7 @@ func TestModelsDownloadRejectsDuplicateConcurrentRef(t *testing.T) {
 	t.Setenv("HF_ENDPOINT", hf.URL)
 	t.Setenv("HF_HOME", t.TempDir())
 
-	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir()}))
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()}))
 	defer srv.Close()
 
 	type result struct {

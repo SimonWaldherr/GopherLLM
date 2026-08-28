@@ -7,18 +7,43 @@ directly in the calling process, with no external runtime or child process
 required. The Go package and CLI cover generation, streaming chat, embeddings,
 tokenization, model inspection, compression, and benchmarks.
 
+It is an independent implementation. GopherLLM does not wrap, bind to, or link
+against llama.cpp or any other inference library: the GGUF parser, the
+tokenizers, the quantized kernels, and the assembly are written for this
+project. `go.mod` has no `require` block at all, and `make deps-check` keeps it
+that way — see [Dependency policy and layout](#dependency-policy-and-layout).
+The same reasoning has its own Rust sibling in
+**[RustyLLM](https://github.com/SimonWaldherr/RustyLLM)**.
+
 **[Project website](https://simonwaldherr.github.io/GopherLLM/)** ·
 **[Go package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM)** ·
 **[Demo application documentation](server/README.md)**
 
+## Try it in five minutes
+
+```sh
+make build
+bin/gopherllm --model-dir /path/to/your/models --serve --chat
+```
+
+That opens a chat server on `http://127.0.0.1:8080/chat`: loopback only, with
+the optional features off, and a model picker for the GGUFs in that directory.
+If you have no GGUF yet, `bin/gopherllm --hf-list <owner/repo>` lists the
+variants in a Hugging Face repository and `hf:<owner>/<repo>:<quant>` in place
+of the model path downloads one into the shared HF cache. See
+[Serving and safety defaults](#serving-and-safety-defaults) for what "optional"
+covers and how to turn things on.
+
 ## Contents
 
+- [Try it in five minutes](#try-it-in-five-minutes)
 - [Features](#features)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
 - [Use as a Go Library](#use-as-a-go-library)
 - [Build](#build)
+- [Serving and safety defaults](#serving-and-safety-defaults)
 - [CLI Usage](#cli-usage)
 - [GGUF Analyzer](#gguf-analyzer)
 - [Model Compression](#model-compression)
@@ -350,6 +375,55 @@ Line Tools `make` directly if that happens:
 ```sh
 /Library/Developer/CommandLineTools/usr/bin/make build-metal
 ```
+
+## Serving and safety defaults
+
+`--serve` starts the HTTP API; `--chat` adds the browser workspace at `/chat`.
+
+```sh
+bin/gopherllm --model-dir /path/to/models --serve --chat
+```
+
+Two defaults are deliberate.
+
+**It listens on loopback.** `--serve` without an address binds
+`127.0.0.1:8080`, so nothing outside the machine can reach it. Giving it a
+network address is allowed — sharing a model with a phone or a second machine
+is a reasonable thing to want — but it prints what that exposes, and a *local*
+deployment reached that way switches its privileged routes off: model loading,
+downloads, autotune, remote forwarding, and OS commands all answer 403, because
+local mode has no token to check and "everyone on the subnet is an
+administrator" is not a boundary. Use `--deployment managed` with an admin
+token to keep those controls available on a shared server.
+
+**Optional capabilities are off.** A server that nobody configured is a chat
+and completions server plus the model catalog for `--model-dir`. Anything that
+reaches the internet, rewrites process-wide state, or benchmarks the host has
+to be asked for by name:
+
+| `--enable` name  | Adds                                                    |
+| ---------------- | ------------------------------------------------------- |
+| `model-download` | `/models/search`, `/models/download` (Hugging Face)      |
+| `autotune`       | `/autotune`, `/autotune/run`                             |
+| `remote`         | `/remote` — forwards completions to another endpoint     |
+| `web-lookup`     | Wikimedia and OpenStreetMap tools for chat requests      |
+| `spreadsheet`    | `/batch/parse` for the batch runner                      |
+| `all`            | Everything above (also spelled `--full`)                 |
+
+```sh
+bin/gopherllm --model-dir /path/to/models --serve --chat --enable model-download,autotune
+```
+
+A capability that is off is not registered at all, so its route answers 404
+rather than presenting a permission check, and the Web UI drops the panels for
+it instead of showing controls that cannot work. OS commands stay separate and
+off unless `--os-commands` sets a policy. The same set is available to library
+users through `server.Features` and `server.AllFeatures()`, and to config files
+under `server.features`.
+
+The Web UI itself opens in a **Simple** mode that shows the handful of settings
+most people change; the **Advanced** toggle in the settings header reveals the
+rest. That choice is per browser and changes nothing on the server.
 
 ## CLI Usage
 

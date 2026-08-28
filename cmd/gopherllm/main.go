@@ -42,9 +42,13 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --privacy                Print the local-first privacy and network-use report, then exit")
 	fmt.Fprintln(os.Stderr, "  --prompt <text>           Input prompt (interactive if omitted)")
 	fmt.Fprintln(os.Stderr, "  --repl                    Start an interactive REPL session")
-	fmt.Fprintln(os.Stderr, "  --serve <addr>            Start HTTP API server, e.g. 127.0.0.1:8080")
+	fmt.Fprintln(os.Stderr, "  --serve [addr]            Start the HTTP API server (default: 127.0.0.1:8080, this machine only)")
+	fmt.Fprintln(os.Stderr, "                            A non-loopback address is allowed and prints what it exposes")
+	fmt.Fprintln(os.Stderr, "  --enable <list>           Add optional features (model-catalog is already on):")
+	fmt.Fprintln(os.Stderr, "                            model-download, autotune, remote, web-lookup, spreadsheet, all")
+	fmt.Fprintln(os.Stderr, "  --full                    Shorthand for --enable all")
 	fmt.Fprintln(os.Stderr, "  --deployment <mode>       Server profile: local | managed | browser (default: local)")
-	fmt.Fprintln(os.Stderr, "                           local binds only loopback; managed protects shared settings; browser runs models in each browser")
+	fmt.Fprintln(os.Stderr, "                           local is single-user; managed protects shared settings behind a token; browser runs models in each browser")
 	fmt.Fprintln(os.Stderr, "  --admin-token-file <path> Read the managed-server admin token from a file (preferred over CLI tokens)")
 	fmt.Fprintln(os.Stderr, "  --admin-token <token>     Managed-server admin token (or use GOPHERLLM_ADMIN_TOKEN)")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
@@ -119,6 +123,8 @@ type cliConfig struct {
 	listTensors             bool
 	repl                    bool
 	serveAddr               string
+	features                server.Features
+	featuresSet             bool
 	deploymentMode          server.DeploymentMode
 	adminToken              string
 	adminTokenFile          string
@@ -256,6 +262,7 @@ func run() error {
 		return server.Serve(nil, server.ServeOptions{
 			Context:                  commandCtx,
 			Addr:                     cfg.serveAddr,
+			Features:                 cfg.features,
 			DeploymentMode:           cfg.deploymentMode,
 			Defaults:                 cfg.options,
 			MaxConcurrentConnections: cfg.maxConn,
@@ -307,6 +314,7 @@ func run() error {
 		return server.Serve(nil, server.ServeOptions{
 			Context:                  commandCtx,
 			Addr:                     cfg.serveAddr,
+			Features:                 cfg.features,
 			DeploymentMode:           cfg.deploymentMode,
 			AdminToken:               cfg.adminToken,
 			Defaults:                 cfg.options,
@@ -458,7 +466,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -789,11 +797,29 @@ func parseCLI(args []string) (cliConfig, error) {
 		case "--repl":
 			cfg.repl = true
 		case "--serve":
+			// The address is optional: `--serve` alone is the beginner path
+			// and binds loopback. A following token that looks like another
+			// flag is not swallowed as an address.
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				i++
+				cfg.serveAddr = args[i]
+			} else {
+				cfg.serveAddr = server.DefaultAddr
+			}
+		case "--enable":
 			v, err := next(arg)
 			if err != nil {
 				return cfg, err
 			}
-			cfg.serveAddr = v
+			features, err := server.ParseFeatures(v)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.features = cfg.features.Merge(features)
+			cfg.featuresSet = true
+		case "--full":
+			cfg.features = cfg.features.Merge(server.AllFeatures())
+			cfg.featuresSet = true
 		case "--deployment":
 			v, err := next(arg)
 			if err != nil {
@@ -1068,6 +1094,12 @@ func parseCLI(args []string) (cliConfig, error) {
 			}
 		}
 	}
+	// The catalog is the CLI's baseline rather than an --enable option: it only
+	// lists and loads GGUFs from --model-dir, and without it someone who
+	// started the server with no model has no way to pick one. Everything that
+	// reaches the network or the host still has to be asked for. --enable adds
+	// to this baseline, so the flag never silently takes the catalog away.
+	cfg.features = cfg.features.Merge(server.Features{ModelCatalog: true})
 	if cfg.chatUI && cfg.serveAddr == "" {
 		return cfg, fmt.Errorf("--chat requires --serve <addr>")
 	}

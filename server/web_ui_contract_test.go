@@ -240,3 +240,80 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		}
 	}
 }
+
+// TestChatUIRendersOnlyBackedFeatures pins the two halves of the slimmed-down
+// UI: the page advertises the server's enabled feature set so it can drop the
+// panels nothing backs, and it starts in the simple mode with the advanced
+// sections marked. Both are cross-file contracts — Go template data on one
+// side, markup and script on the other — so a rename on either side should
+// fail here rather than silently produce a settings panel full of controls
+// that 404.
+func TestChatUIRendersOnlyBackedFeatures(t *testing.T) {
+	page := func(t *testing.T, opts HandlerOptions) string {
+		t.Helper()
+		opts.ChatUI = true
+		h := NewHandler(nil, opts)
+		t.Cleanup(func() { _ = h.Close() })
+		srv := httptest.NewServer(h)
+		t.Cleanup(srv.Close)
+		resp, err := srv.Client().Get(srv.URL + "/chat")
+		if err != nil {
+			t.Fatalf("GET /chat: %v", err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read /chat: %v", err)
+		}
+		return string(body)
+	}
+
+	bare := page(t, HandlerOptions{})
+	if !strings.Contains(bare, `data-features=""`) {
+		t.Fatal("/chat does not advertise an empty feature set for a bare server")
+	}
+	if !strings.Contains(bare, `data-ui-mode="simple"`) {
+		t.Fatal("/chat does not start in simple mode")
+	}
+	if !strings.Contains(bare, `data-network-exposed="false"`) {
+		t.Fatal("/chat does not report its network exposure")
+	}
+
+	full := page(t, HandlerOptions{Features: AllFeatures(), NetworkExposed: true})
+	for _, name := range FeatureNames() {
+		if !strings.Contains(full, name) {
+			t.Fatalf("/chat with every feature enabled does not mention %q", name)
+		}
+	}
+	if !strings.Contains(full, `data-network-exposed="true"`) {
+		t.Fatal("/chat does not report a network-exposed listener")
+	}
+
+	// The markup must actually carry the hooks the script and stylesheet key
+	// off, or the mode toggle silently becomes a no-op.
+	for _, marker := range []string{`data-advanced`, `data-feature="model-download"`, `data-feature="autotune"`, `data-feature="web-lookup"`, `id="uiModeSimple"`, `id="uiModeAdvanced"`} {
+		if !strings.Contains(full, marker) {
+			t.Fatalf("chat page is missing %s", marker)
+		}
+	}
+
+	srv := httptest.NewServer(NewHandler(nil, HandlerOptions{ChatUI: true}))
+	t.Cleanup(srv.Close)
+	for _, asset := range []struct{ path, needle string }{
+		{"/style.css", `body[data-ui-mode="simple"] [data-advanced]`},
+		{"/script.js", "applyUIMode"},
+	} {
+		resp, err := srv.Client().Get(srv.URL + asset.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", asset.path, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("read %s: %v", asset.path, err)
+		}
+		if !strings.Contains(string(body), asset.needle) {
+			t.Fatalf("%s is missing %q, so the simple/advanced mode is a no-op", asset.path, asset.needle)
+		}
+	}
+}

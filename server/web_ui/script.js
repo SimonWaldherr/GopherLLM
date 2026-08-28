@@ -605,6 +605,76 @@ function usesSharedServerDeployment() {
   return deploymentModeValue() === "managed" || usesBrowserOnlyDeployment();
 }
 
+/* ── What this server actually offers ─────────────────────────────────────
+   The page ships every panel, but a given server only backs the optional
+   features its operator enabled (server.Features). The enabled set arrives in
+   data-features, and anything marked data-feature="…" that is missing from it
+   is removed from the DOM rather than disabled: a control for a route that
+   answers 404 is worse than no control at all.
+
+   Separately, data-ui-mode picks how much of what remains is shown. Simple is
+   the default because the settings panel had grown past twenty sections, which
+   is a wall rather than a choice for someone opening it for the first time.
+   The preference is per browser; it changes nothing on the server. */
+
+const UI_MODE_KEY = "gopherllm.ui-mode";
+
+function serverFeatureSet() {
+  const raw = (document.body && document.body.dataset.features) || "";
+  return new Set(raw.split(/\s+/).filter(Boolean));
+}
+
+function applyFeatureGating() {
+  const enabled = serverFeatureSet();
+  document.querySelectorAll("[data-feature]").forEach((element) => {
+    const needed = (element.dataset.feature || "").split(/\s+/).filter(Boolean);
+    if (needed.length && !needed.every((name) => enabled.has(name))) element.remove();
+  });
+  const notice = document.getElementById("networkExposureNotice");
+  if (notice) notice.hidden = !(document.body && document.body.dataset.networkExposed === "true");
+}
+
+function storedUIMode() {
+  try {
+    const stored = localStorage.getItem(UI_MODE_KEY);
+    if (stored === "simple" || stored === "advanced") return stored;
+  } catch (error) {
+    /* Private windows and blocked site data both throw; simple is a fine default. */
+  }
+  return "simple";
+}
+
+function applyUIMode(mode) {
+  const resolved = mode === "advanced" ? "advanced" : "simple";
+  if (document.body) document.body.dataset.uiMode = resolved;
+  try {
+    localStorage.setItem(UI_MODE_KEY, resolved);
+  } catch (error) {
+    /* A mode we cannot remember still applies to this tab. */
+  }
+  const simpleButton = document.getElementById("uiModeSimple");
+  const advancedButton = document.getElementById("uiModeAdvanced");
+  if (simpleButton) simpleButton.setAttribute("aria-pressed", String(resolved === "simple"));
+  if (advancedButton) advancedButton.setAttribute("aria-pressed", String(resolved === "advanced"));
+  // Two of the settings tabs hold nothing but advanced sections, so simple
+  // mode hides the tabs themselves. Leaving one of them as the open page
+  // would show an empty panel; click the first tab simple mode still keeps.
+  const activeTab = document.querySelector(".settings-tab.is-active");
+  if (resolved === "simple" && activeTab && activeTab.hasAttribute("data-advanced")) {
+    const firstSimple = document.querySelector(".settings-tab:not([data-advanced])");
+    if (firstSimple) firstSimple.click();
+  }
+}
+
+function setupUIMode() {
+  applyFeatureGating();
+  applyUIMode(storedUIMode());
+  const simpleButton = document.getElementById("uiModeSimple");
+  const advancedButton = document.getElementById("uiModeAdvanced");
+  if (simpleButton) simpleButton.addEventListener("click", () => applyUIMode("simple"));
+  if (advancedButton) advancedButton.addEventListener("click", () => applyUIMode("advanced"));
+}
+
 function openDB() {
   if (dbPromise) return dbPromise;
   if (!("indexedDB" in window)) return Promise.reject(new Error("IndexedDB unavailable"));
@@ -3528,14 +3598,17 @@ function toMarkdown(chat) {
   }
 
   async function loadModels() {
-	if (browserOnlyDeployment) return;
+	if (browserOnlyDeployment || !serverFeatureSet().has("model-catalog")) return;
     try {
       const response = await fetch("/models");
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
       if (!data.models || !data.models.length) {
         modelLibraryEl.setAttribute("aria-busy", "false");
-        modelLibraryEl.querySelector(".model-library-empty").textContent = "No GGUF models found in the configured model directory. Download one below to get started.";
+        // Only point at the download panel when this server actually has one.
+        modelLibraryEl.querySelector(".model-library-empty").textContent = serverFeatureSet().has("model-download")
+          ? "No GGUF models found in the configured model directory. Download one below to get started."
+          : "No GGUF models found in the configured model directory. Put a .gguf file there, or restart the server with --enable model-download.";
         modelResultCountEl.textContent = "0 models";
         return;
       }
@@ -3959,6 +4032,9 @@ function toMarkdown(chat) {
   }
 
   async function loadAutoTuneStatus() {
+	// The route only exists where the operator enabled the feature; asking
+	// anyway would put a 404 in every first-time user's console.
+	if (!serverFeatureSet().has("autotune")) return;
 	if (browserOnlyDeployment || (adminRequiredDeployment && !adminAuthorized)) return;
     try {
       const response = await adminFetch("/autotune");
@@ -3973,7 +4049,9 @@ function toMarkdown(chat) {
      Power commands
      ════════════════════════════════ */
   const COMMANDS = [
-    { name: "/batch", desc: "Run one prompt over every row, record, or chapter of a file", run: () => openBatch() },
+    // /batch parses the uploaded file through /batch/parse, so it is only
+    // offered where the server actually registered that route.
+    { name: "/batch", desc: "Run one prompt over every row, record, or chapter of a file", run: () => openBatch(), hidden: () => !serverFeatureSet().has("spreadsheet") },
     { name: "/goal", desc: "Draft, self-critique, and improve across several rounds", run: (rest) => runGoal(rest) },
     { name: "/review", desc: "Audit the current chat for gaps, risks, and concrete fixes", run: (rest) => runExpertReview(rest) },
     { name: "/plan", desc: "Turn the current chat or an instruction into an actionable plan", run: (rest) => runExpertPlan(rest) },
@@ -5247,14 +5325,19 @@ function toMarkdown(chat) {
     setSettingsTab("model");
     openSettings(modelSearchEl, modelNameEl);
   });
-  settingsTabEls.forEach((tab, index) => {
+  settingsTabEls.forEach((tab) => {
     tab.addEventListener("click", () => setSettingsTab(tab.dataset.settingsTab));
     tab.addEventListener("keydown", (event) => {
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
       event.preventDefault();
+      // Cycle over the tabs simple mode leaves on screen, not over the full
+      // list: arrowing onto a hidden tab would open an empty panel.
+      const reachable = settingsTabEls.filter((candidate) => candidate.offsetParent !== null);
+      const tabs = reachable.length ? reachable : settingsTabEls;
+      const from = Math.max(0, tabs.indexOf(tab));
       const direction = event.key === "ArrowRight" ? 1 : -1;
-      const next = (index + direction + settingsTabEls.length) % settingsTabEls.length;
-      setSettingsTab(settingsTabEls[next].dataset.settingsTab, true);
+      const next = (from + direction + tabs.length) % tabs.length;
+      setSettingsTab(tabs[next].dataset.settingsTab, true);
     });
   });
   settingsCloseEl.addEventListener("click", closeSettings);
@@ -6925,6 +7008,7 @@ function toMarkdown(chat) {
   goalRoundsEl.value = preferences.goalRounds;
   initInferenceMode();
 	syncDeploymentControls();
+  setupUIMode();
   renderWorkspace(true);
 	if (!browserOnlyDeployment) {
 		loadModels();

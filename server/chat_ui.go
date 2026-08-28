@@ -48,6 +48,14 @@ type chatTemplateData struct {
 	// WasmDir (see HandlerOptions.WasmDir) — the page only offers the
 	// "run locally in this browser tab" inference-mode toggle when true.
 	HasLocalRuntime bool
+	// Features is the space-separated list of optional capabilities this
+	// server actually backs (see Features.EnabledNames). The page removes the
+	// panels for everything absent from it, so the UI a beginner opens is the
+	// UI this server can honour rather than the full catalogue of options.
+	Features string
+	// NetworkExposed tells the page that this listener is reachable beyond
+	// loopback, so it can say so instead of leaving it to the terminal.
+	NetworkExposed bool
 	// DeploymentMode describes the server policy without exposing any secret.
 	// BrowserOnly forces the UI into its on-device WASM/WebGPU path, while
 	// AdminRequired lets a managed deployment keep ordinary chat preferences
@@ -119,6 +127,8 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 			RepeatPenalty:   opts.Defaults.Sampler.RepeatPenalty,
 			MermaidCDN:      mermaid,
 			HasLocalRuntime: hasLocalRuntime,
+			Features:        strings.Join(opts.Features.EnabledNames(), " "),
+			NetworkExposed:  opts.NetworkExposed,
 			DeploymentMode:  string(deployment.mode),
 			BrowserOnly:     deployment.mode.browserOnly(),
 			AdminRequired:   deployment.mode.adminRequired(),

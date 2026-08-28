@@ -9,7 +9,7 @@
   <meta name="color-scheme" content="light dark">
   <link rel="stylesheet" href="/style.css">
 </head>
-<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}" data-local-runtime="{{.HasLocalRuntime}}" data-deployment-mode="{{.DeploymentMode}}" data-browser-only="{{.BrowserOnly}}" data-admin-required="{{.AdminRequired}}" data-admin-authorized="{{.AdminAuthorized}}">
+<body class="chat" data-mermaid-cdn="{{.MermaidCDN}}" data-local-runtime="{{.HasLocalRuntime}}" data-deployment-mode="{{.DeploymentMode}}" data-browser-only="{{.BrowserOnly}}" data-admin-required="{{.AdminRequired}}" data-admin-authorized="{{.AdminAuthorized}}" data-features="{{.Features}}" data-network-exposed="{{.NetworkExposed}}" data-ui-mode="simple">
 
 <!-- Icon sprite: plain geometric outlines, hand-drawn for this page, so every
      chrome icon renders from one same-origin vector source at a consistent
@@ -185,7 +185,7 @@
           <input id="composerMaxTokens" type="number" min="1" max="4096" inputmode="numeric" autocomplete="off">
         </label>
         <label class="composer-power"><input id="composerPowerCommands" type="checkbox"> Enable slash commands</label>
-        <label class="composer-power"><input id="composerWikimediaTools" type="checkbox"> Wikipedia &amp; Wikidata research</label>
+        <label class="composer-power" data-feature="web-lookup"><input id="composerWikimediaTools" type="checkbox"> Wikipedia &amp; Wikidata research</label>
         <button id="composerSettings" class="composer-button" type="button">All settings</button>
       </div>
       <div class="composer-tools">
@@ -241,8 +241,13 @@
         <h2 id="settingsTitle">Settings</h2>
         <p>Changes are saved to this chat automatically.</p>
       </div>
+      <div class="settings-mode" role="group" aria-label="How much to show">
+        <button id="uiModeSimple" class="settings-mode-button" type="button" aria-pressed="true">Simple</button>
+        <button id="uiModeAdvanced" class="settings-mode-button" type="button" aria-pressed="false">Advanced</button>
+      </div>
       <button id="settingsClose" class="icon-button" type="button" aria-label="Close settings"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
     </div>
+    <p id="networkExposureNotice" class="settings-notice" hidden>This server is reachable from your network, so anyone who can reach it can chat with your model. Model loading, downloads and tuning are switched off while it is exposed this way.</p>
     <div class="settings-panel-body">
 	  <section id="managedAccessNotice" class="settings-section" hidden>
 		<div class="settings-section-head">
@@ -266,15 +271,15 @@
         </label>
         <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
           <button class="settings-tab is-active" type="button" role="tab" id="settingsTabModel" aria-controls="settingsPageModel" aria-selected="true" data-settings-tab="model"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span>Model &amp; chat</span></button>
-          <button class="settings-tab" type="button" role="tab" id="settingsTabCapabilities" aria-controls="settingsPageCapabilities" aria-selected="false" tabindex="-1" data-settings-tab="capabilities"><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span>Capabilities</span></button>
-          <button class="settings-tab" type="button" role="tab" id="settingsTabGeneration" aria-controls="settingsPageGeneration" aria-selected="false" tabindex="-1" data-settings-tab="generation"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Generation</span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabCapabilities" aria-controls="settingsPageCapabilities" aria-selected="false" tabindex="-1" data-settings-tab="capabilities" data-advanced><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span>Capabilities</span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabGeneration" aria-controls="settingsPageGeneration" aria-selected="false" tabindex="-1" data-settings-tab="generation" data-advanced><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Generation</span></button>
           <button class="settings-tab" type="button" role="tab" id="settingsTabWorkspace" aria-controls="settingsPageWorkspace" aria-selected="false" tabindex="-1" data-settings-tab="workspace"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg><span>Workspace</span></button>
         </nav>
       </div>
       <p id="settingsSearchEmpty" class="settings-search-empty" hidden>No settings match “<span id="settingsSearchEmptyQuery"></span>”.<span id="settingsSearchEmptyHint"></span></p>
 
       <div id="settingsPageModel" class="settings-page" role="tabpanel" aria-labelledby="settingsTabModel" data-settings-page="model">
-        <section class="settings-section engine-overview" aria-labelledby="engineOverviewTitle">
+        <section class="settings-section engine-overview" data-advanced aria-labelledby="engineOverviewTitle">
           <div class="settings-section-head">
             <div>
               <h3 id="engineOverviewTitle">Inference engine first</h3>
@@ -386,7 +391,7 @@
           </div>
         </section>
 
-        <section class="settings-section settings-download-section" id="modelDownloadSection" data-admin-control>
+        <section class="settings-section settings-download-section" id="modelDownloadSection" data-admin-control data-feature="model-download">
           <details class="settings-disclosure">
             <summary class="settings-section-head">
               <div>
@@ -469,7 +474,7 @@
       </div>
 
       <div id="settingsPageCapabilities" class="settings-page" role="tabpanel" aria-labelledby="settingsTabCapabilities" data-settings-page="capabilities" hidden>
-        <section class="settings-section">
+        <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
               <h3>Tools &amp; agents</h3>
@@ -477,11 +482,11 @@
             </div>
           </div>
           <div class="settings-option-list">
-            <label class="toggle-row settings-option">
+            <label class="toggle-row settings-option" data-feature="web-lookup">
               <input id="wikimediaTools" type="checkbox">
               <span><strong>Wikipedia &amp; Wikidata research</strong><span class="field-note">Sends only model-requested search queries to Wikimedia.</span></span>
             </label>
-            <label class="toggle-row settings-option">
+            <label class="toggle-row settings-option" data-feature="web-lookup">
               <input id="openStreetMapTools" type="checkbox">
               <span><strong>OpenStreetMap place research</strong><span class="field-note">Sends only model-requested place queries to Nominatim. No personal data, autocomplete, or bulk lookup. <a href="https://operations.osmfoundation.org/policies/nominatim/" target="_blank" rel="noopener noreferrer">Usage policy</a>.</span></span>
             </label>
@@ -496,7 +501,7 @@
           </div>
         </section>
 
-        <section class="settings-section">
+        <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
               <h3>Memory &amp; retrieval</h3>
@@ -524,7 +529,7 @@
       </div>
 
       <div id="settingsPageGeneration" class="settings-page" role="tabpanel" aria-labelledby="settingsTabGeneration" data-settings-page="generation" hidden>
-        <section class="settings-section">
+        <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
               <h3>Sampling</h3>
@@ -557,7 +562,7 @@
           </div>
         </section>
 
-		<section class="settings-section" data-admin-control>
+		<section class="settings-section" data-admin-control data-advanced data-feature="autotune">
           <div class="settings-section-head">
             <div>
               <h3>Performance</h3>
@@ -614,7 +619,7 @@
           <p class="settings-note">Mermaid is not bundled. Choosing a CDN reloads this page and permits scripts from that origin; “Off” keeps the strict same-origin policy.</p>
         </section>
 
-        <section class="settings-section">
+        <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
               <h3>Chat data</h3>
@@ -638,7 +643,7 @@
           </div>
         </section>
 
-        <section class="settings-section">
+        <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
               <h3>Power commands</h3>

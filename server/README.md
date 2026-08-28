@@ -10,6 +10,7 @@ package and command-line inference workflow are documented in the
 
 - [Start locally](#start-locally)
 - [Embed the handler](#embed-the-handler)
+- [Optional features](#optional-features)
 - [Configuration and deployment profiles](#configuration-and-deployment-profiles)
 - [Remote OpenAI-compatible APIs](#remote-openai-compatible-apis)
 - [Browser workspace](#browser-workspace)
@@ -28,12 +29,21 @@ Build the CLI, load a local GGUF, and serve the embedded chat UI:
 make build
 bin/gopherllm --model-dir "$HOME/.cache/lm-studio/models" \
   --model "model-name-or-file-fragment" \
-  --serve 127.0.0.1:8080 \
+  --serve \
   --chat
 ```
 
 Open <http://127.0.0.1:8080/chat>. The application is optional: importing the
 root Go package or using the CLI for local generation does not start it.
+
+`--serve` without an address binds `127.0.0.1:8080`. What you get is a chat and
+completions server plus the model catalog for `--model-dir`; everything that
+reaches the internet or the host is off until you name it with `--enable`. See
+[Optional features](#optional-features).
+
+The chat UI opens in **Simple** mode, which shows the settings most people
+actually change. The **Advanced** toggle in the settings header reveals the
+rest; the choice is remembered per browser and changes nothing on the server.
 
 The CLI remembers the successfully loaded local GGUF in `last-model.json`
 below the platform configuration directory (override with
@@ -77,6 +87,37 @@ The server API moved out of the root package: use `server.NewHandler`,
 `server.HandlerForModel(model, opts)` instead of the former `gopherllm.*`
 server symbols.
 
+## Optional features
+
+A server nobody configured answers chat, completions, and embeddings, and lists
+the GGUFs in `--model-dir`. Every capability that reaches the network, rewrites
+process-wide state, or benchmarks the machine is opt-in:
+
+| `--enable` name  | `server.Features` field | Adds |
+| ---------------- | ----------------------- | ---- |
+| `model-download` | `ModelDownload` | `/models/search`, `/models/download`, `/models/download/variants` — outbound Hugging Face requests that write GGUFs to disk |
+| `autotune`       | `AutoTune`      | `/autotune`, `/autotune/run` — saturates the machine, then changes runtime tuning for every later request |
+| `remote`         | `RemoteProxy`   | `/remote`, `/remote/models` — points every subsequent completion at another endpoint |
+| `web-lookup`     | `WebLookup`     | The Wikimedia and OpenStreetMap tools. Requests still ask for them per call; this is the outer switch |
+| `spreadsheet`    | `Spreadsheet`   | `/batch/parse` for the batch runner |
+| `model-catalog`  | `ModelCatalog`  | `/models`, `/models/load`, `/models/architecture`, embedding-model routes. On by default in the CLI, off in the zero-value `Features` |
+| `all`            | `AllFeatures()` | Everything above; `--full` is the same thing |
+
+```sh
+bin/gopherllm --model-dir /path/to/models --serve --chat \
+  --enable model-download,autotune
+```
+
+A disabled capability is not registered, so its path answers 404 rather than
+presenting a permission check, and `GET /deployment` reports the enabled set so
+the Web UI can drop the panels nothing backs. `--enable` may be repeated and
+adds up. Library users pass `server.Features` in `HandlerOptions`; its zero
+value enables nothing, and `server.AllFeatures()` restores the pre-`Features`
+surface in one line.
+
+Agentic OS commands are separate and stay off unless `--os-commands` sets a
+policy (or `HandlerOptions.AgentOS` is non-nil).
+
 ## Configuration and deployment profiles
 
 The server portion of an explicit `--config` file lives under `server`:
@@ -87,6 +128,7 @@ The server portion of an explicit `--config` file lives under `server`:
   "model_dir": "/path/to/models",
   "server": {
     "address": "127.0.0.1:8080",
+    "features": ["model-download", "autotune"],
     "chat": true,
     "max_connections": 16
   }
@@ -99,14 +141,14 @@ protection.
 
 | Profile | Intended use | Inference and control boundary |
 | --- | --- | --- |
-| `local` (default) | One person on one laptop | Listener must use a loopback address. The owner may select models, download, tune, and change settings. |
+| `local` (default) | One person on one laptop | Loopback by default. The owner may select models, download, tune, and change settings. A non-loopback listener is allowed, prints a warning saying so, and switches those privileged routes off for everyone — there is no token in this profile to distinguish the owner from the rest of the network. |
 | `managed` | Shared server | Users can generate replies. Model changes, downloads, embedding-model loads, tuning, remote credentials, and agentic OS actions require the administrator token. |
 | `browser` | Browser-hosted local inference | The app serves only the UI and WASM runtime. Each tab selects and runs its own GGUF through WASM/WebGPU; server inference and model controls are disabled. |
 
 Local setup:
 
 ```sh
-bin/gopherllm --model-dir /path/to/models --serve 127.0.0.1:8080 --chat \
+bin/gopherllm --model-dir /path/to/models --serve --chat \
   --deployment local
 ```
 
@@ -236,6 +278,17 @@ expose `gopherllm_cache` with `mode`, `hit`, `reused_tokens`, and
 `usage.prompt_tokens_details.cached_tokens`.
 
 ## HTTP API
+
+Chat, completions, embeddings, `/health`, `/deployment`, and `/privacy` are
+always present. The model, download, autotune, remote, and batch routes below
+exist only where the matching capability is enabled; see
+[Optional features](#optional-features). `GET /deployment` lists what this
+server actually registered:
+
+```sh
+curl -s http://127.0.0.1:8080/deployment
+# {"admin":true,"admin_required":false,...,"features":{"autotune":false,"model-catalog":true,...}}
+```
 
 Minimal OpenAI-compatible request:
 

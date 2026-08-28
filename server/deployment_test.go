@@ -31,14 +31,112 @@ func TestDeploymentModeParsingAndLocalBindPolicy(t *testing.T) {
 	if _, err := ParseDeploymentMode("internet"); err == nil {
 		t.Fatal("ParseDeploymentMode accepted an unknown mode")
 	}
+	if err := validateDeploymentOptions(DeploymentLocal, "", "", false); err != nil {
+		t.Fatalf("local deployment rejected: %v", err)
+	}
 	for _, addr := range []string{"127.0.0.1:8080", "localhost:8080", "[::1]:8080"} {
-		if err := validateDeploymentOptions(DeploymentLocal, "", addr, "", false, true); err != nil {
-			t.Fatalf("local address %q rejected: %v", addr, err)
+		if warning := NetworkExposureWarning(DeploymentLocal, addr, ""); warning != "" {
+			t.Fatalf("loopback address %q warned: %q", addr, warning)
 		}
 	}
 	for _, addr := range []string{":8080", "0.0.0.0:8080", "[::]:8080", "192.168.1.3:8080"} {
-		if err := validateDeploymentOptions(DeploymentLocal, "", addr, "", false, true); err == nil {
-			t.Fatalf("non-loopback local address %q was accepted", addr)
+		warning := NetworkExposureWarning(DeploymentLocal, addr, "")
+		if warning == "" {
+			t.Fatalf("non-loopback address %q produced no warning", addr)
+		}
+		if !strings.Contains(warning, "reachable from your network") {
+			t.Fatalf("warning for %q does not say what changes: %q", addr, warning)
+		}
+	}
+	// A managed deployment with a token keeps its controls, so the warning
+	// must not claim they were disabled.
+	managed := NetworkExposureWarning(DeploymentManaged, "0.0.0.0:8080", "token")
+	if managed == "" || strings.Contains(managed, "disabled while exposed") {
+		t.Fatalf("managed warning should not claim a lockout: %q", managed)
+	}
+}
+
+// TestLocalDeploymentOnNetworkLocksPrivilegedRoutes covers the security
+// consequence of the loopback default being relaxed: exposing a local server
+// to the network is allowed, but it must not hand every caller on the subnet
+// the ability to load models, download GGUFs, or retune the process.
+func TestLocalDeploymentOnNetworkLocksPrivilegedRoutes(t *testing.T) {
+	h := NewHandler(nil, HandlerOptions{
+		NetworkExposed: true,
+		Features:       AllFeatures(),
+		ChatUI:         true,
+	})
+	t.Cleanup(func() { _ = h.Close() })
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/models/load"},
+		{http.MethodPost, "/models/download"},
+		{http.MethodGet, "/models/search"},
+		{http.MethodPost, "/autotune/run"},
+		{http.MethodPost, "/remote"},
+	} {
+		req, err := http.NewRequest(tc.method, srv.URL+tc.path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatalf("build %s %s: %v", tc.method, tc.path, err)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", tc.method, tc.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s %s = %d, want 403 while exposed to the network", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+	// Generation itself stays available: exposing the server is the point.
+	resp, err := srv.Client().Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /health = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestDisabledFeaturesAreNotRegistered checks the stronger half of the
+// promise: a capability the operator did not enable answers 404, so it is
+// absent rather than merely guarded.
+func TestDisabledFeaturesAreNotRegistered(t *testing.T) {
+	h := NewHandler(nil, HandlerOptions{ChatUI: true})
+	t.Cleanup(func() { _ = h.Close() })
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	for _, path := range []string{"/models", "/models/search", "/models/download", "/autotune", "/remote", "/batch/parse"} {
+		resp, err := srv.Client().Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404 with no features enabled", path, resp.StatusCode)
+		}
+	}
+	resp, err := srv.Client().Get(srv.URL + "/deployment")
+	if err != nil {
+		t.Fatalf("GET /deployment: %v", err)
+	}
+	defer resp.Body.Close()
+	var status struct {
+		Features map[string]bool `json:"features"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode /deployment: %v", err)
+	}
+	if len(status.Features) != len(FeatureNames()) {
+		t.Fatalf("/deployment reported %d features, want %d", len(status.Features), len(FeatureNames()))
+	}
+	for name, on := range status.Features {
+		if on {
+			t.Fatalf("/deployment reports %q enabled with a zero-value Features", name)
 		}
 	}
 }

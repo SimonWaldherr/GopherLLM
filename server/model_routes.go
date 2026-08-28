@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -87,19 +88,21 @@ func hfRepoDirName(repository string) string {
 // its own hfSearchSem/downloadMu/activeDownloads locally since those guard
 // only routes registered here; modelLoadMu is shared with the caller because
 // it also serializes NewHandler's own construction-time model swap bookkeeping.
+// registerModelRoutes registers the model catalog and, separately, the
+// Hugging Face download routes. They are split because they differ in kind:
+// the catalog only reads and hot-swaps GGUFs the operator already placed in
+// ModelDir, while the download routes make outbound requests and write new
+// files. Features decides which of the two exists.
 func registerModelRoutes(mux *http.ServeMux, state *runnerState, embedder *embeddingState, sem chan struct{}, opts HandlerOptions, deployment deploymentAccess, modelLoadMu *sync.Mutex, logw io.Writer) {
-	// Model search has its own tiny outbound-request budget so repeated
-	// type-ahead queries cannot consume inference capacity or fan out into an
-	// unbounded number of Hub requests.
-	hfSearchSem := make(chan struct{}, hfSearchConcurrency)
-	// Guards against two requests downloading the same Hugging Face reference
-	// concurrently, which would otherwise let two goroutines append to the
-	// same .incomplete blob at once and corrupt it. Keyed by the exact
-	// normalized ref string, not a distributed lock: it only protects against
-	// this one server process racing itself (e.g. a doubled click).
-	var downloadMu sync.Mutex
-	activeDownloads := map[string]struct{}{}
+	if opts.Features.ModelCatalog {
+		registerModelCatalogRoutes(mux, state, embedder, sem, opts, deployment, modelLoadMu, logw)
+	}
+	if opts.Features.ModelDownload {
+		registerModelDownloadRoutes(mux, state, opts, logw)
+	}
+}
 
+func registerModelCatalogRoutes(mux *http.ServeMux, state *runnerState, embedder *embeddingState, sem chan struct{}, opts HandlerOptions, deployment deploymentAccess, modelLoadMu *sync.Mutex, logw io.Writer) {
 	mux.HandleFunc("/models", func(w http.ResponseWriter, req *http.Request) {
 		type modelInfo struct {
 			ID            string  `json:"id"`
@@ -118,7 +121,7 @@ func registerModelRoutes(mux *http.ServeMux, state *runnerState, embedder *embed
 			writeJSON(w, map[string]any{"models": []modelInfo{}})
 			return
 		}
-		entries, err := gopherllm.DiscoverModels(opts.ModelDir, io.Discard)
+		entries, err := discoverCatalog(opts.ModelDir)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -188,7 +191,7 @@ func registerModelRoutes(mux *http.ServeMux, state *runnerState, embedder *embed
 			http.Error(w, "missing model selector", http.StatusBadRequest)
 			return
 		}
-		entries, err := gopherllm.DiscoverModels(opts.ModelDir, io.Discard)
+		entries, err := discoverCatalog(opts.ModelDir)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -231,7 +234,7 @@ func registerModelRoutes(mux *http.ServeMux, state *runnerState, embedder *embed
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		entries, err := gopherllm.DiscoverModels(opts.ModelDir, io.Discard)
+		entries, err := discoverCatalog(opts.ModelDir)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -286,6 +289,21 @@ func registerModelRoutes(mux *http.ServeMux, state *runnerState, embedder *embed
 		}
 		writeJSON(w, map[string]any{"model": model, "embeddings": vectors})
 	}))
+}
+
+func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOptions, logw io.Writer) {
+	// Model search has its own tiny outbound-request budget so repeated
+	// type-ahead queries cannot consume inference capacity or fan out into an
+	// unbounded number of Hub requests.
+	hfSearchSem := make(chan struct{}, hfSearchConcurrency)
+	// Guards against two requests downloading the same Hugging Face reference
+	// concurrently, which would otherwise let two goroutines append to the
+	// same .incomplete blob at once and corrupt it. Keyed by the exact
+	// normalized ref string, not a distributed lock: it only protects against
+	// this one server process racing itself (e.g. a doubled click).
+	var downloadMu sync.Mutex
+	activeDownloads := map[string]struct{}{}
+
 	mux.HandleFunc("/models/download/variants", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -421,4 +439,19 @@ func registerModelRoutes(mux *http.ServeMux, state *runnerState, embedder *embed
 		}
 		send(map[string]any{"status": "success", "id": id, "path": placed[0], "file": filepath.Base(placed[0])})
 	})
+}
+
+// discoverCatalog lists the GGUFs under dir. A directory that does not exist
+// is an empty catalog rather than an error: the CLI ships a default model
+// directory, and someone who has not created it yet should see "no models
+// found" in the Web UI instead of a 500 on their first page load.
+func discoverCatalog(dir string) ([]gopherllm.ModelEntry, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, nil
+	}
+	entries, err := gopherllm.DiscoverModels(dir, io.Discard)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return entries, err
 }

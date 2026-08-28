@@ -45,7 +45,7 @@ func TestRemoteChatProxyWorksWithoutLocalModel(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := httptest.NewServer(NewHandler(nil, HandlerOptions{}))
+	server := httptest.NewServer(NewHandler(nil, HandlerOptions{Features: AllFeatures()}))
 	defer server.Close()
 	config := `{"base_url":"` + upstream.URL + `","model":"remote-test"}`
 	response, err := http.Post(server.URL+"/remote", "application/json", strings.NewReader(config))

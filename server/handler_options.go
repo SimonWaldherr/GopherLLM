@@ -11,6 +11,17 @@ import (
 
 // HandlerOptions configures the mountable HTTP API handler.
 type HandlerOptions struct {
+	// Features selects the optional capabilities this server exposes. The zero
+	// value enables none of them, which is the safe default for a machine a
+	// beginner just started: see Features. AllFeatures() restores the full
+	// surface in one line.
+	Features Features
+	// NetworkExposed marks a listener reachable beyond loopback. Local
+	// deployment then refuses the privileged routes — model load and download,
+	// autotune, remote, agentos — instead of trusting every caller that can
+	// reach the port. Serve sets it from the listen address; hosts that create
+	// their own listener set it themselves.
+	NetworkExposed bool
 	// DeploymentMode selects the ownership boundary for inference and shared
 	// server settings. The zero value is DeploymentLocal for backward
 	// compatibility. See DeploymentMode for the semantics of local, managed,
@@ -88,7 +99,9 @@ type HandlerOptions struct {
 type ServeOptions struct {
 	// Context controls the lifetime of the listener. Cancelling it gracefully
 	// stops accepting requests and releases the active runner.
-	Context                  context.Context
+	Context context.Context
+	// Features selects the optional capabilities; see HandlerOptions.Features.
+	Features                 Features
 	Addr                     string
 	DeploymentMode           DeploymentMode
 	AdminToken               string

@@ -1414,3 +1414,17 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .live-output-panel { height: 108px; }
   #captureModal .live-prompt-panel textarea { min-height: 30px; }
 }
+
+/* ── Simple / Advanced settings ───────────────────────────────────────────
+   The settings panel had grown past twenty sections, which reads as a wall
+   rather than a choice on first contact. Simple mode shows the handful most
+   people actually change — model, this chat, appearance — and Advanced
+   reveals the rest. This is presentation only: what the server offers is
+   decided by server.Features, and a panel for a capability the server does
+   not back is removed from the DOM entirely, not merely hidden here. */
+body[data-ui-mode="simple"] [data-advanced] { display: none; }
+.settings-mode { display: inline-flex; gap: 2px; padding: 2px; margin-left: auto; margin-right: var(--sp-2); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); }
+.settings-mode-button { padding: var(--sp-1) var(--sp-2h); border: 0; border-radius: var(--r-sm); background: transparent; color: var(--muted); font: inherit; font-size: var(--fs-2xs); font-weight: 650; cursor: pointer; }
+.settings-mode-button:hover { color: var(--ink); }
+.settings-mode-button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / 12%); }
+.settings-notice { margin: 0; padding: var(--sp-2h) 16px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--warn, #b45309) 12%, transparent); color: var(--ink); font-size: var(--fs-2xs); font-weight: 650; }

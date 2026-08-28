@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"math/rand"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -399,6 +400,41 @@ func BenchmarkEncodeSentencePiece(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = tok.EncodeWithoutBOS(text)
+	}
+}
+
+// Long prompts and unspaced scripts are what the merge heap exists for: both
+// used to be quadratic in the symbol run, so a chat turn paid seconds of
+// tokenizer time before the first token was even embedded.
+
+const benchLongPrompt = "Der schnelle braune Fuchs springt ueber den faulen Hund und fragt sich warum die Sonne scheint. "
+
+func BenchmarkEncodeSentencePieceLongPrompt(b *testing.B) {
+	corpus := strings.Repeat(benchLongPrompt, 44)[:4096]
+	tok := randomSentencePieceVocab(rand.New(rand.NewSource(1)), corpus, 0.6, 64)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = tok.encodeSentencePiece(corpus)
+	}
+}
+
+func BenchmarkEncodeGPT2BPEWords(b *testing.B) {
+	corpus := strings.Repeat(benchLongPrompt, 11)
+	tok := randomGPT2Vocab(rand.New(rand.NewSource(1)), corpus, 0.6, 4096)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = tok.encodeGPT2BPE(corpus)
+	}
+}
+
+// The GPT-2 pretokenizers emit \p{L}+ runs, so a Japanese sentence arrives at
+// the merge loop as one symbol run of unbounded length.
+func BenchmarkEncodeGPT2BPEUnspaced(b *testing.B) {
+	corpus := strings.Repeat("日本語のテキストはスペースで区切られないので長い語になる", 25)
+	tok := randomGPT2Vocab(rand.New(rand.NewSource(1)), corpus, 0.6, 4096)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = tok.encodeGPT2BPE(corpus)
 	}
 }
 

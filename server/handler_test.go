@@ -123,6 +123,7 @@ func TestHandlerModelHotSwapUsesConfiguredCatalog(t *testing.T) {
 	defer runner.Close()
 	var recorded []string
 	srv := newManagedTestServer(t, NewHandler(runner, HandlerOptions{
+		Features:  AllFeatures(),
 		ModelDir:  " " + modelDir + " ", // whitespace is normalized at the boundary.
 		ModelPath: allowedPath,
 		ModelLoaded: func(path string) {
@@ -211,6 +212,7 @@ func TestHandlerHotSwapPropagatesOutOfCoreLoadOptions(t *testing.T) {
 	}
 	defer initial.Close()
 	srv := newManagedTestServer(t, NewHandler(initial, HandlerOptions{
+		Features:         AllFeatures(),
 		ModelDir:         modelDir,
 		ModelPath:        path,
 		ModelLoadOptions: gopherllm.LoadOptions{OutOfCore: true},
@@ -251,7 +253,7 @@ func TestHandlerLoadsDedicatedEmbeddingModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer runner.Close()
-	handler := NewHandler(runner, HandlerOptions{ModelDir: modelDir, ModelPath: chatPath})
+	handler := NewHandler(runner, HandlerOptions{ModelDir: modelDir, ModelPath: chatPath, Features: AllFeatures()})
 	srv := newManagedTestServer(t, handler)
 
 	body, err := json.Marshal(map[string]string{"model": filepath.Join("catalog", "tiny-embedding")})

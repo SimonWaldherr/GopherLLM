@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/SimonWaldherr/GopherLLM/internal/wordpiece"
 )
@@ -289,30 +290,58 @@ func (t *Tokenizer) SpecialID(token string) (uint32, bool) {
 
 func (t *Tokenizer) encodeSentencePiece(text string) []uint32 {
 	processed := strings.ReplaceAll(" "+text, " ", "\u2581")
-	current := t.encodeFromPieces(strings.Split(processed, ""))
-	for len(current) >= 2 {
-		bestScore := float32(-3.4e38)
-		bestIdx := -1
-		var bestID uint32
-		for i := 0; i+1 < len(current); i++ {
-			merged := t.decodeRaw(current[i]) + t.decodeRaw(current[i+1])
-			if id, ok := t.TokenToID[merged]; ok {
-				score := float32(0)
-				if int(id) < len(t.Scores) {
-					score = t.Scores[id]
-				}
-				if score > bestScore {
-					bestScore, bestIdx, bestID = score, i, id
-				}
-			}
-		}
-		if bestIdx < 0 {
-			break
-		}
-		current[bestIdx] = bestID
-		current = append(current[:bestIdx+1], current[bestIdx+2:]...)
+	current := t.seedSentencePiece(processed)
+	if len(current) < 2 {
+		return current
 	}
-	return current
+	syms := newBPESymbols(len(current))
+	for i, id := range current {
+		syms[i].id = id
+		syms[i].text = t.decodeRaw(id)
+	}
+	var heap bpeHeap
+	var key []byte
+	mergeBPESymbols(syms, &heap,
+		func(l, r *bpeSymbol) (float64, uint32, bool) {
+			// Concatenating into a reusable buffer keeps the vocabulary
+			// probe allocation-free: the compiler elides the copy for a
+			// []byte map key.
+			key = append(append(key[:0], l.text...), r.text...)
+			id, ok := t.TokenToID[string(key)]
+			if !ok {
+				return 0, 0, false
+			}
+			score := float32(0)
+			if int(id) < len(t.Scores) {
+				score = t.Scores[id]
+			}
+			// The linear scan seeded its best score with -3.4e38 and
+			// required a strict improvement, so anything at or below it
+			// (and any NaN) never merged.
+			if !(score > -3.4e38) {
+				return 0, 0, false
+			}
+			return -float64(score), id, true
+		},
+		func(l, r *bpeSymbol, id uint32) string { return t.decodeRaw(id) })
+	out := current[:0]
+	for i := int32(0); i >= 0; i = syms[i].next {
+		out = append(out, syms[i].id)
+	}
+	return out
+}
+
+// seedSentencePiece splits the ▁-marked text into its initial one-rune
+// symbols. Ranging over the string keeps every piece a substring of the
+// input, so neither the split nor the vocabulary probe allocates.
+func (t *Tokenizer) seedSentencePiece(processed string) []uint32 {
+	out := make([]uint32, 0, utf8.RuneCountInString(processed))
+	for i := 0; i < len(processed); {
+		_, size := utf8.DecodeRuneInString(processed[i:])
+		out = t.appendPieceTokens(out, processed[i:i+size])
+		i += size
+	}
+	return out
 }
 
 func (t *Tokenizer) encodeWordPiece(text string) []uint32 {
@@ -401,56 +430,69 @@ func isWordPieceCJK(r rune) bool {
 }
 
 func (t *Tokenizer) encodeGPT2BPE(text string) []uint32 {
-	out := []uint32{}
+	out := make([]uint32, 0, len(text)/3+8)
+	var syms []bpeSymbol
+	var heap bpeHeap
 	for _, piece := range t.pretokenize(text) {
 		var encoded strings.Builder
-		for _, b := range []byte(piece) {
-			if ch, ok := t.ByteEncoder[b]; ok {
+		encoded.Grow(2 * len(piece))
+		for i := 0; i < len(piece); i++ {
+			if ch, ok := t.ByteEncoder[piece[i]]; ok {
 				encoded.WriteRune(ch)
 			}
 		}
-		symbols := strings.Split(encoded.String(), "")
-		for len(symbols) > 1 {
-			bestRank := int(^uint(0) >> 1)
-			bestIdx := -1
-			for i := 0; i+1 < len(symbols); i++ {
-				if rank, ok := t.MergeRanks[Pair{symbols[i], symbols[i+1]}]; ok && rank < bestRank {
-					bestRank, bestIdx = rank, i
-				}
-			}
-			if bestIdx < 0 {
-				break
-			}
-			symbols[bestIdx] += symbols[bestIdx+1]
-			symbols = append(symbols[:bestIdx+1], symbols[bestIdx+2:]...)
+		mapped := encoded.String()
+		if mapped == "" {
+			continue
 		}
-		for _, symbol := range symbols {
-			if id, ok := t.TokenToID[symbol]; ok {
-				out = append(out, id)
-			} else {
-				out = append(out, t.encodeFromPieces([]string{symbol})...)
-			}
+		syms = bpeSymbolsFromRunes(syms, mapped)
+		mergeBPESymbols(syms, &heap,
+			func(l, r *bpeSymbol) (float64, uint32, bool) {
+				rank, ok := t.MergeRanks[Pair{l.text, r.text}]
+				if !ok {
+					return 0, 0, false
+				}
+				return float64(rank), 0, true
+			},
+			func(l, r *bpeSymbol, _ uint32) string { return l.text + r.text })
+		for i := int32(0); i >= 0; i = syms[i].next {
+			out = t.appendPieceTokens(out, syms[i].text)
 		}
 	}
 	return out
 }
 
 func (t *Tokenizer) encodeFromPieces(pieces []string) []uint32 {
-	out := []uint32{}
+	out := make([]uint32, 0, len(pieces))
 	for _, piece := range pieces {
-		if id, ok := t.TokenToID[piece]; ok {
+		out = t.appendPieceTokens(out, piece)
+	}
+	return out
+}
+
+// appendPieceTokens resolves one piece to its token id, falling back to the
+// SentencePiece <0xNN> byte tokens for anything the vocabulary lacks.
+func (t *Tokenizer) appendPieceTokens(out []uint32, piece string) []uint32 {
+	if id, ok := t.TokenToID[piece]; ok {
+		return append(out, id)
+	}
+	for i := 0; i < len(piece); i++ {
+		if id, ok := t.TokenToID[spByteTokens[piece[i]]]; ok {
 			out = append(out, id)
-			continue
-		}
-		for _, b := range []byte(piece) {
-			byteTok := fmt.Sprintf("<0x%02X>", b)
-			if id, ok := t.TokenToID[byteTok]; ok {
-				out = append(out, id)
-			}
 		}
 	}
 	return out
 }
+
+// spByteTokens is the "<0xNN>" byte-fallback vocabulary, precomputed because
+// the fallback is on the per-character seeding path of every prompt.
+var spByteTokens = func() (tokens [256]string) {
+	const hex = "0123456789ABCDEF"
+	for i := range tokens {
+		tokens[i] = string([]byte{'<', '0', 'x', hex[i>>4], hex[i&0x0F], '>'})
+	}
+	return tokens
+}()
 
 func (t *Tokenizer) decodeGPT2Bytes(raw string) string {
 	bytes := make([]byte, 0, len(raw))

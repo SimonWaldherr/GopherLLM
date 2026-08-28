@@ -215,6 +215,7 @@ func TestAutoTuneEndpointsReportStatusAndInvalidateOnSwap(t *testing.T) {
 	defer runner.Close()
 
 	srv := newManagedTestServer(t, NewHandler(runner, HandlerOptions{
+		Features:              AllFeatures(),
 		ModelDir:              modelDir,
 		ModelPath:             modelPath,
 		BaselineRuntimeTuning: &baseline,

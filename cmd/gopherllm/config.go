@@ -59,8 +59,11 @@ type fileRuntimeConfig struct {
 }
 
 type fileServerConfig struct {
-	Address    *string `json:"address,omitempty"`
-	Deployment *string `json:"deployment,omitempty"`
+	Address *string `json:"address,omitempty"`
+	// Features lists the optional capabilities to enable, by the same names
+	// --enable accepts. Absent means none, matching the CLI default.
+	Features   []string `json:"features,omitempty"`
+	Deployment *string  `json:"deployment,omitempty"`
 	// AdminTokenFile is deliberately a file reference rather than the token
 	// itself. Deployment secrets should live in an environment variable or a
 	// permission-restricted file, and --print-config must never reproduce one.
@@ -77,6 +80,14 @@ type fileHuggingFaceConfig struct {
 	Offline *bool `json:"offline,omitempty"`
 }
 
+// cliOptionalValueOptions are the flags in cliValueOptions whose argument may
+// be omitted. The early scan must not swallow the following token for them
+// when it is itself a flag: `--serve --config x.json` still has to find the
+// config file.
+var cliOptionalValueOptions = map[string]bool{
+	"--serve": true,
+}
+
 // cliValueOptions identifies flags whose following argument is data, not a
 // second flag. The early config/preset scan uses it so a system prompt such as
 // "--preset" cannot accidentally be interpreted as an option.
@@ -91,6 +102,7 @@ var cliValueOptions = map[string]bool{
 	"--prompt":             true,
 	"-p":                   true,
 	"--serve":              true,
+	"--enable":             true,
 	"--deployment":         true,
 	"--admin-token":        true,
 	"--admin-token-file":   true,
@@ -134,7 +146,8 @@ func singleCLIOptionValue(args []string, option string) (string, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if arg != option {
-			if cliValueOptions[arg] && i+1 < len(args) {
+			if cliValueOptions[arg] && i+1 < len(args) &&
+				(!cliOptionalValueOptions[arg] || !strings.HasPrefix(args[i+1], "-")) {
 				i++
 			}
 			continue
@@ -279,6 +292,14 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		if s.Address != nil {
 			cfg.serveAddr = *s.Address
 		}
+		if len(s.Features) > 0 {
+			features, err := server.ParseFeatures(strings.Join(s.Features, ","))
+			if err != nil {
+				return fmt.Errorf("config server.features: %w", err)
+			}
+			cfg.features = cfg.features.Merge(features)
+			cfg.featuresSet = true
+		}
 		if s.Deployment != nil {
 			mode, err := server.ParseDeploymentMode(*s.Deployment)
 			if err != nil {
@@ -391,15 +412,16 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		AutoEffort   string `json:"auto_effort,omitempty"`
 	}
 	type effectiveServerConfig struct {
-		Address         string `json:"address,omitempty"`
-		Deployment      string `json:"deployment,omitempty"`
-		AdminTokenFile  string `json:"admin_token_file,omitempty"`
-		Chat            bool   `json:"chat,omitempty"`
-		ChatHistoryPath string `json:"chat_history_path,omitempty"`
-		MaxConnections  int    `json:"max_connections,omitempty"`
-		SkillsDir       string `json:"skills_dir,omitempty"`
-		OSCommands      string `json:"os_commands,omitempty"`
-		OSCommandsAllow string `json:"os_commands_allow,omitempty"`
+		Address         string   `json:"address,omitempty"`
+		Features        []string `json:"features,omitempty"`
+		Deployment      string   `json:"deployment,omitempty"`
+		AdminTokenFile  string   `json:"admin_token_file,omitempty"`
+		Chat            bool     `json:"chat,omitempty"`
+		ChatHistoryPath string   `json:"chat_history_path,omitempty"`
+		MaxConnections  int      `json:"max_connections,omitempty"`
+		SkillsDir       string   `json:"skills_dir,omitempty"`
+		OSCommands      string   `json:"os_commands,omitempty"`
+		OSCommandsAllow string   `json:"os_commands_allow,omitempty"`
 	}
 	type effectiveConfig struct {
 		Version     int                       `json:"version"`
@@ -448,9 +470,10 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	if cfg.modelSelector != nil {
 		result.Model = *cfg.modelSelector
 	}
-	if cfg.serveAddr != "" || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
+	if cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
 		result.Server = &effectiveServerConfig{
 			Address:         cfg.serveAddr,
+			Features:        cfg.features.EnabledNames(),
 			Deployment:      string(cfg.deploymentMode),
 			AdminTokenFile:  cfg.adminTokenFile,
 			Chat:            cfg.chatUI,
