@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"strings"
 	"sync"
 	"time"
@@ -239,24 +240,69 @@ func (r *Runner) HasVision() bool {
 // class names, hyphen/underscore forms) and falls back to the hyperparameter
 // namespace actually present in the file, so a mislabeled GGUF whose contents
 // are a supported architecture still loads.
-func ArchitectureSupported(arch string) bool {
-	switch arch {
-	case "llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
-		"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2", "kimi_k2", "phi3", "granite", "granitemoe", "exaone", "internlm2", "stablelm", "gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe", "mamba2", "bert", "nomic-bert":
-		return true
-	case "smollm3", "exaone4":
-		return true
-	case "gpt2", "gptneox", "gptj", "bloom", "mpt", "falcon", "starcoder", "starcoder2":
-		return true
-	case "chatglm", "glm4", "command-r", "minicpm":
-		return true
-	case "olmo2":
-		return true
-	case "phi2":
-		return true
-	default:
+// supportedArchitectureList backs both ArchitectureSupported and
+// SupportedArchitectures, so the two can never drift apart the way a
+// hand-maintained switch and a hand-maintained doc table otherwise would.
+// Order is declaration order, grouped roughly by family; callers must not
+// depend on it.
+var supportedArchitectureList = []string{
+	"llama", "llama2", "llama3", "mistral", "mistral3", "ministral", "mixtral",
+	"qwen2", "qwen2moe", "qwen3", "qwen3moe", "qwen35", "qwen35moe", "deepseek2",
+	"kimi_k2", "phi3", "granite", "granitemoe", "exaone", "internlm2", "stablelm",
+	"gpt-oss", "gemma", "gemma2", "gemma3", "gemma4", "nemotron_h", "nemotron_h_moe",
+	"mamba2", "bert", "nomic-bert",
+	"smollm3", "exaone4",
+	"gpt2", "gptneox", "gptj", "bloom", "mpt", "falcon", "starcoder", "starcoder2",
+	"chatglm", "glm4", "command-r", "minicpm",
+	"olmo2",
+	"phi2",
+}
+
+var supportedArchitectureSet = func() map[string]bool {
+	m := make(map[string]bool, len(supportedArchitectureList))
+	for _, a := range supportedArchitectureList {
+		m[a] = true
+	}
+	return m
+}()
+
+// looksLikeHubReference reports whether a path that failed to open with
+// fs.ErrNotExist has the shape of a Hugging Face "owner/repo" reference
+// rather than a mistyped local path — Open itself never resolves one (that
+// is the huggingface package's job), so a caller who reasonably tries the
+// same "owner/repo" string every other local-model tool accepts hits a bare
+// not-exist error with no hint that resolution exists.
+//
+// This is deliberately conservative: it must not fire on a real local path a
+// caller fat-fingered, since "did you mean the Hub?" is actively misleading
+// noise on top of that mistake. A local reference to a GGUF overwhelmingly
+// names the file directly (thus contains ".gguf") or uses a path separator
+// a Hub slug never does; requiring exactly one "/", no "\\", and no ".gguf"
+// keeps this narrow.
+func looksLikeHubReference(path string) bool {
+	if strings.ContainsAny(path, `\`) {
 		return false
 	}
+	if strings.Contains(strings.ToLower(path), ".gguf") {
+		return false
+	}
+	return strings.Count(path, "/") == 1 && !strings.HasPrefix(path, "/")
+}
+
+func ArchitectureSupported(arch string) bool { return supportedArchitectureSet[arch] }
+
+// SupportedArchitectures returns every general.architecture label the loader
+// currently accepts, after ResolveArchitecture's alias and hyperparameter-
+// namespace normalization — the same check ArchitectureSupported makes, so
+// this list and that predicate cannot silently diverge. Useful to list valid
+// values without grepping source or the README's Supported Architectures
+// table, e.g. to grey out an incompatible file in a model picker before ever
+// calling Open. The order is unspecified; callers must not depend on it. The
+// returned slice is a fresh copy and may be mutated freely.
+func SupportedArchitectures() []string {
+	out := make([]string, len(supportedArchitectureList))
+	copy(out, supportedArchitectureList)
+	return out
 }
 
 // RunnerFromGGUFBytes loads a model from an in-memory GGUF, copying quantized
@@ -333,9 +379,9 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 			return nil, fmt.Errorf("this GGUF is a CLIP/mmproj vision projector, not a text model; load it alongside a text-model GGUF via LoadOptions.VisionProjectorPath (CLI: --mmproj)")
 		}
 		if hparamNS != arch {
-			return nil, fmt.Errorf("unsupported architecture: %s (hyperparameters found under %s.*)", arch, hparamNS)
+			return nil, fmt.Errorf("unsupported architecture: %s (hyperparameters found under %s.*); see gopherllm.SupportedArchitectures() or the README's Supported Architectures section for the full list", arch, hparamNS)
 		}
-		return nil, fmt.Errorf("unsupported architecture: %s", arch)
+		return nil, fmt.Errorf("unsupported architecture: %s; see gopherllm.SupportedArchitectures() or the README's Supported Architectures section for the full list", arch)
 	}
 	tok, err := TokenizerFromMetadata(gguf.Metadata)
 	if err != nil {
@@ -473,6 +519,9 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	t0 := time.Now()
 	mmap, err := OpenMmap(path)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) && looksLikeHubReference(path) {
+			return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w (not a local file: to fetch %q from Hugging Face see the huggingface package's Resolve, or to find a model already on disk see DiscoverModels/DefaultModelDir)", err, path)
+		}
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
 	if options.OutOfCore && !mmap.IsMapped() {

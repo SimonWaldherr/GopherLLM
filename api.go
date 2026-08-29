@@ -221,7 +221,17 @@ func WithStop(sequences ...string) GenOption {
 }
 
 // WithTools offers OpenAI-shaped tool definitions to the model; calls the
-// model makes come back in Result.ToolCalls with FinishReason "tool_calls".
+// model makes come back in Result.ToolCalls with FinishReason "tool_calls"
+// for the CALLER to execute and continue itself (e.g. via ToolResultMessage
+// on a follow-up Chat call).
+//
+// For a tool the loop should execute and answer with automatically — the
+// far more common case for a "give the model a Go function" tool — build one
+// with NewTool and run it through RunAgenticChatWithTools(model.Runner(),
+// ...) instead, or use the agent package's Agent.Ask/Chat, which wraps that
+// same loop with retrieval and citations on top. WithTools and an
+// AgenticTool's Definition are otherwise the same OpenAI-shaped schema; the
+// difference is only who executes the call.
 func WithTools(tools ...ToolDefinition) GenOption {
 	return func(o *GenerationOptions) { o.Tools = append(o.Tools, tools...) }
 }
@@ -249,6 +259,26 @@ func buildGenOptions(ctx context.Context, opts []GenOption) GenerationOptions {
 		opt(&options)
 	}
 	return options
+}
+
+// ApplyGenOptions builds a GenerationOptions the same way Model's own
+// context-first methods do (DefaultGenerationOptions plus every opt, in
+// order, with ctx attached), for the functions that don't take ...GenOption
+// themselves — RunAgenticChat, RunAgenticChatWithTools, RunAgenticChatObserved,
+// and RunAgenticChatWithGenerator all take a plain GenerationOptions, since
+// they existed before the GenOption veneer and are also called by hosts (the
+// HTTP server, the CLI) that already build one by hand from their own
+// request/flag parsing.
+//
+//	options := gopherllm.ApplyGenOptions(ctx, gopherllm.WithTemperature(0.2))
+//	result, err := gopherllm.RunAgenticChatWithTools(model.Runner(), messages, options, nil, tools, nil)
+//
+// Without this, reaching for WithTemperature/WithMaxTokens/etc. on that path
+// means either setting the corresponding GenerationOptions field directly, or
+// noticing that a GenOption is just a func(*GenerationOptions) and invoking
+// one by hand.
+func ApplyGenOptions(ctx context.Context, opts ...GenOption) GenerationOptions {
+	return buildGenOptions(ctx, opts)
 }
 
 // Generate runs a single-prompt completion. Cancellation via ctx takes effect

@@ -246,6 +246,11 @@ model, err := gopherllm.Open(ctx, "model.gguf")
 if err != nil { ... }
 defer model.Close()
 
+// Don't have a .gguf yet? huggingface.Resolve turns an "owner/repo" Hugging
+// Face reference into a local path (see "Hugging Face imports" below); Open
+// itself only understands local paths, and its error says so when a path
+// looks like an unresolved Hub reference instead of a typo'd local file.
+
 // One-shot generation with functional options.
 res, err := model.Generate(ctx, "Explain GGUF in one sentence.",
     gopherllm.WithMaxTokens(128), gopherllm.WithTemperature(0.7))
@@ -278,11 +283,22 @@ weather := gopherllm.NewTool("get_weather", "Current weather for a city.",
     })
 weather.Trusted = true // first-party data, skip the injection-warning wrapper
 
+// RunAgenticChatWithTools predates the GenOption veneer and takes a plain
+// GenerationOptions; ApplyGenOptions builds one the same way Model's own
+// methods do, ctx included — that's what makes the loop's per-call tool
+// timeouts and generation itself actually cancel with ctx, easy to forget
+// since every other Model method takes ctx as a plain first argument instead.
+options := gopherllm.ApplyGenOptions(ctx, gopherllm.WithTemperature(0.2))
+
 result, err := gopherllm.RunAgenticChatWithTools(model.Runner(),
     []gopherllm.ChatMessage{gopherllm.UserMessage("Weather in Hamburg?")},
-    gopherllm.DefaultGenerationOptions(), nil, []gopherllm.AgenticTool{weather},
+    options, nil, []gopherllm.AgenticTool{weather},
     func(s string) bool { fmt.Print(s); return true })
 ```
+
+Prefer a `*Model` you already own, tools with retrieval, or citations? The
+[`agent` package](#retrieval-over-your-own-documents) wraps this same loop
+into `Agent.Ask`/`Chat` with a validated `ToolSet` and deduplicated sources.
 
 The agent loop that executes a tool call bounds it with a per-call timeout
 (default 30s), recovers a panic as a failed call instead of crashing the
@@ -1109,7 +1125,10 @@ the rest of the process.
 
 ## Supported Architectures
 
-The loader currently accepts GGUF files whose `general.architecture` is one of:
+The loader currently accepts GGUF files whose `general.architecture` is one of
+(also available at runtime via `gopherllm.SupportedArchitectures()`, which
+backs the same check `ArchitectureSupported` makes — useful to check a file
+before ever calling `Open`, e.g. to grey it out in a picker):
 
 ```text
 llama, llama2, llama3, mistral, mistral3, ministral, mixtral, qwen2, qwen2moe, qwen3, qwen3moe,
