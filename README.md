@@ -314,6 +314,11 @@ doc comment for the full contract.
 > this is a no-op here — but an unkeyed literal (`AgenticTool{def, exec}`)
 > outside this repo will now fail to compile. Add the field names.
 
+[`examples/tool-calling`](examples/tool-calling) is this pattern as a
+complete, runnable program (`go run ./examples/tool-calling -model
+/path/to/model.gguf`) with a real arithmetic tool instead of a fake string, so
+the output is self-verifying.
+
 ### Retrieval over your own documents
 
 `rag.Index` is a hybrid BM25 + optional-vector index — a chunker, an inverted
