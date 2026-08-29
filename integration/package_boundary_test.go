@@ -109,6 +109,81 @@ func TestImageDecodersAreDroppable(t *testing.T) {
 	}
 }
 
+// TestInferencePackageDependsOnReflectForToolSchemas pins a deliberate,
+// bounded addition rather than banning it: NewTool/SchemaOf (tool_schema.go)
+// derive a tool's JSON Schema from a Go struct by reflection. Asserting its
+// presence, not just its absence from a ban list, means a refactor that
+// quietly stops using reflect (say, a hand-rolled type switch that no longer
+// needs it) shows up here as a diff worth looking at, the same way the other
+// tests in this file catch an accidental addition.
+func TestInferencePackageDependsOnReflectForToolSchemas(t *testing.T) {
+	out, err := exec.Command("go", "list", "-deps", "github.com/SimonWaldherr/GopherLLM").CombinedOutput()
+	if err != nil {
+		t.Skipf("go list unavailable: %v (%s)", err, out)
+	}
+	deps := string(out)
+	if !strings.Contains(deps, "reflect") {
+		t.Error("inference package no longer depends on reflect; is NewTool/SchemaOf still reflection-based?")
+	}
+}
+
+// TestRAGAndAgentPackagesStayFreeOfServerDependencies extends the root
+// package's HTTP/templating boundary (see
+// TestInferencePackageStaysFreeOfServerDependencies) to the two subpackages
+// added alongside it: an application that indexes its own documents or
+// builds a tool-using Agent should not pay for the HTTP server or its
+// templating either.
+func TestRAGAndAgentPackagesStayFreeOfServerDependencies(t *testing.T) {
+	for _, pkg := range []string{"github.com/SimonWaldherr/GopherLLM/rag", "github.com/SimonWaldherr/GopherLLM/agent"} {
+		out, err := exec.Command("go", "list", "-deps", pkg).CombinedOutput()
+		if err != nil {
+			t.Skipf("go list unavailable: %v (%s)", err, out)
+		}
+		deps := make(map[string]bool)
+		for _, line := range strings.Split(string(out), "\n") {
+			deps[strings.TrimSpace(line)] = true
+		}
+		for _, banned := range []string{"net/http", "html/template", "text/template"} {
+			if deps[banned] {
+				t.Errorf("%s depends on %q — HTTP/templating belongs in the server subpackage", pkg, banned)
+			}
+		}
+		if !deps[pkg] {
+			t.Fatalf("go list did not report %s itself; output was:\n%s", pkg, out)
+		}
+	}
+}
+
+// TestRAGAndAgentPackagesStayFreeOfTheCryptoAndRegexpTrees extends
+// TestInferencePackageStaysFreeOfTheCryptoAndRegexpTrees's reasoning to rag
+// and agent: neither has any reason to hash anything cryptographically or to
+// parse a fixed-shape string with a regexp, and either package growing one of
+// those dependencies later would be exactly the kind of one-import-away
+// regression that test's own comment describes for the root package.
+func TestRAGAndAgentPackagesStayFreeOfTheCryptoAndRegexpTrees(t *testing.T) {
+	for _, pkg := range []string{"github.com/SimonWaldherr/GopherLLM/rag", "github.com/SimonWaldherr/GopherLLM/agent"} {
+		out, err := exec.Command("go", "list", "-deps", pkg).CombinedOutput()
+		if err != nil {
+			t.Skipf("go list unavailable: %v (%s)", err, out)
+		}
+		deps := make(map[string]bool)
+		for _, line := range strings.Split(string(out), "\n") {
+			deps[strings.TrimSpace(line)] = true
+		}
+		for _, banned := range []string{"crypto/sha256", "regexp"} {
+			if deps[banned] {
+				t.Errorf("%s depends on %q; see TestInferencePackageStaysFreeOfTheCryptoAndRegexpTrees for why", pkg, banned)
+			}
+		}
+		for dep := range deps {
+			if strings.HasPrefix(dep, "crypto/internal/fips140") {
+				t.Errorf("%s pulled the FIPS-140 crypto tree in (via %q)", pkg, dep)
+				break
+			}
+		}
+	}
+}
+
 // TestServerPackageStillProvidesTheHTTPSurface guards the other direction: the
 // split is only useful if the server subpackage remains a complete drop-in for
 // what used to live in the root package.

@@ -290,6 +290,10 @@ curl -s http://127.0.0.1:8080/deployment
 # {"admin":true,"admin_required":false,...,"features":{"autotune":false,"model-catalog":true,...}}
 ```
 
+A closed connection or client-side timeout cancels the request's generation
+and any in-flight agentic tool call, rather than letting either run to
+completion for nobody to read.
+
 Minimal OpenAI-compatible request:
 
 ```sh

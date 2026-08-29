@@ -292,6 +292,12 @@ re-executing it — all opt-out-able per `AgenticTool` field
 (`gopherllm.NoToolTimeout`, `gopherllm.NoToolResultLimit`). See `AgenticTool`'s
 doc comment for the full contract.
 
+> **Compile-time note:** `AgenticTool` gained the `Timeout`, `MaxResultBytes`
+> and `Trusted` fields above. Every construction site in this repository
+> already used field names (`AgenticTool{Definition: ..., Execute: ...}`), so
+> this is a no-op here — but an unkeyed literal (`AgenticTool{def, exec}`)
+> outside this repo will now fail to compile. Add the field names.
+
 ### Retrieval over your own documents
 
 `rag.Index` is a hybrid BM25 + optional-vector index — a chunker, an inverted
