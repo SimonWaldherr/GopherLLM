@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -27,6 +28,57 @@ func (r *Runner) Embed(text string) (EmbeddingResult, error) {
 	// Embeddings reuse the same scratch KV workspace but have unrelated token
 	// positions, so they must never overwrite a live chat-prefix cache.
 	r.clearPrefixCache()
+	return r.embedDecoderLocked(text)
+}
+
+// EmbedBatch embeds texts under a single model lease and lock, honoring ctx
+// between texts. Runner.Embed takes the lease and lock per call and, on a
+// decoder model, clears the KV prefix cache every time; indexing a thousand
+// chunks through Embed therefore paid that setup a thousand times and could
+// not be interrupted. EmbedBatch pays it once — which is what makes
+// cancellation (via ctx) work during a bulk ingest.
+//
+// It is a loop, not a batched forward pass: the win is amortized setup and
+// cancellation, not arithmetic. Results are returned in input order; a
+// partial result is never returned alongside a nil error.
+func (r *Runner) EmbedBatch(ctx context.Context, texts []string) ([]EmbeddingResult, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	if err := r.acquireModelLease(); err != nil {
+		return nil, err
+	}
+	defer r.releaseModelLease()
+	r.genLock.Lock()
+	defer r.genLock.Unlock()
+	if r.kind != loadedBERT {
+		r.clearPrefixCache()
+	}
+	out := make([]EmbeddingResult, 0, len(texts))
+	for i, text := range texts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var res EmbeddingResult
+		var err error
+		if r.kind == loadedBERT {
+			res, err = r.embedBERT(text)
+		} else {
+			res, err = r.embedDecoderLocked(text)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("embed_batch: item %d: %w", i, err)
+		}
+		out = append(out, res)
+	}
+	return out, nil
+}
+
+// embedDecoderLocked is Embed's decoder-path body, extracted so EmbedBatch can
+// clear the prefix cache once for the whole batch instead of once per text.
+// Callers must already hold the model lease and genLock, and must have
+// already cleared the prefix cache for this batch.
+func (r *Runner) embedDecoderLocked(text string) (EmbeddingResult, error) {
 	tokens := r.tok.Encode(text)
 	if len(tokens) == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: input tokenised to zero tokens")

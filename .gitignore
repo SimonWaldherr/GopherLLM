@@ -5,7 +5,6 @@ bin/
 *.gguf
 scratch/p.prof
 /prof*.pprof
-/rag
 /data
 /archive-web
 *.pprof

@@ -54,8 +54,25 @@ func ensureRequestID(w http.ResponseWriter, req *http.Request) string {
 	return id
 }
 
+// withRequestContext binds the HTTP request's context to the generation
+// options, so a client that disconnects or times out stops the work it asked
+// for: GenerateChatStreamUntil checks the context between prefill chunks and
+// decoded tokens, and the agentic loop hands the same context to every
+// AgenticTool.Execute.
+//
+// This used to return options unchanged, which meant a browser tab closed
+// mid-answer left the model generating to completion and left any in-flight
+// tool fetch running against a caller nobody would read. The cancellation
+// machinery was already there on both sides; only this wiring was missing.
+//
+// The visible consequence is that a cancelled request now ends with a context
+// error rather than a full answer. Routes turn that into a 400 nobody is left
+// to read, and logInferenceResult records it as the cancellation it is.
 func withRequestContext(options gopherllm.GenerationOptions, req *http.Request) gopherllm.GenerationOptions {
-	return options
+	if req == nil {
+		return options
+	}
+	return options.WithContext(req.Context())
 }
 
 // requireLoadedModel keeps catalog, UI and model-loading routes available when

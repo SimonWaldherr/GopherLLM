@@ -11,7 +11,7 @@ func observedToolCalls(t *testing.T, tool AgenticTool, calls []ToolCall) []Agent
 	t.Helper()
 	var events []AgentEvent
 	_, ok := resolveInternalToolCalls(context.Background(), calls, nil, []AgenticTool{tool}, 2,
-		func(e AgentEvent) { events = append(events, e) })
+		func(e AgentEvent) { events = append(events, e) }, false, map[string]toolCacheEntry{})
 	if !ok {
 		t.Fatal("calls were not resolved internally")
 	}
@@ -101,7 +101,7 @@ func TestObserverTruncatesLongResults(t *testing.T) {
 func TestNilObserverIsSafe(t *testing.T) {
 	tool := testTool("noop", func() (string, error) { return "ok", nil })
 	if _, ok := resolveInternalToolCalls(context.Background(),
-		[]ToolCall{{ID: "c", Function: ToolCallFunction{Name: "noop"}}}, nil, []AgenticTool{tool}, 1, nil); !ok {
+		[]ToolCall{{ID: "c", Function: ToolCallFunction{Name: "noop"}}}, nil, []AgenticTool{tool}, 1, nil, false, map[string]toolCacheEntry{}); !ok {
 		t.Fatal("nil observer changed resolution behaviour")
 	}
 }

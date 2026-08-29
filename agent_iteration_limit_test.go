@@ -8,7 +8,7 @@ import (
 // A model that keeps insisting on calling a tool, forever. Real models don't
 // literally never stop, but the point of the iteration cap is to survive one
 // that effectively doesn't for a given turn.
-func alwaysWantsToolGenerator(toolName string) chatGenerator {
+func alwaysWantsToolGenerator(toolName string) ChatGenerator {
 	return func(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
 		if len(options.Tools) == 0 {
 			// Tools were withdrawn for this call (the forced final pass):
@@ -39,7 +39,7 @@ func TestRunAgenticChatForcesATextAnswerWhenIterationsRunOutMidToolCall(t *testi
 	var events []AgentEvent
 	observe := func(e AgentEvent) { events = append(events, e) }
 
-	result, err := runAgenticChatWith(alwaysWantsToolGenerator("lookup"),
+	result, err := RunAgenticChatWithGenerator(alwaysWantsToolGenerator("lookup"),
 		[]ChatMessage{UserMessage("hi")}, DefaultGenerationOptions(), nil, []AgenticTool{tool}, nil, observe)
 	if err != nil {
 		t.Fatal(err)
@@ -57,12 +57,12 @@ func TestRunAgenticChatForcesATextAnswerWhenIterationsRunOutMidToolCall(t *testi
 			toolCalls++
 		}
 	}
-	if toolCalls != maxAgenticIterations {
-		t.Fatalf("expected exactly %d tool calls (one per allowed iteration), got %d", maxAgenticIterations, toolCalls)
+	if toolCalls != DefaultToolRounds {
+		t.Fatalf("expected exactly %d tool calls (one per allowed iteration), got %d", DefaultToolRounds, toolCalls)
 	}
 
 	last := events[len(events)-1]
-	if last.Kind != AgentEventIteration || last.Iteration != maxAgenticIterations+1 {
+	if last.Kind != AgentEventIteration || last.Iteration != DefaultToolRounds+1 {
 		t.Fatalf("expected a final iteration event marking the forced answer pass, got %+v", last)
 	}
 }
@@ -87,7 +87,7 @@ func TestRunAgenticChatDoesNotForceAnExtraPassWhenTheLoopEndsNaturally(t *testin
 		Execute:    func(ctx context.Context, c ToolCall) (string, error) { return "fact", nil },
 	}
 
-	result, err := runAgenticChatWith(generate, []ChatMessage{UserMessage("hi")}, DefaultGenerationOptions(), nil, []AgenticTool{tool}, nil, nil)
+	result, err := RunAgenticChatWithGenerator(generate, []ChatMessage{UserMessage("hi")}, DefaultGenerationOptions(), nil, []AgenticTool{tool}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -261,6 +261,64 @@ ids := model.Tokenize("hello")
 gopherllm.AnalyzeGGUF(model.GGUF(), model.Tokenizer()).WriteText(os.Stdout)
 ```
 
+### Tools with a Go function
+
+`gopherllm.NewTool` derives a tool's JSON Schema from a plain Go struct by
+reflection, so a function is a tool with no schema string to keep in sync:
+
+```go
+type WeatherArgs struct {
+    City string `json:"city" desc:"City name, e.g. Hamburg"`
+    Unit string `json:"unit,omitempty" desc:"Temperature unit" enum:"c,f"`
+}
+
+weather := gopherllm.NewTool("get_weather", "Current weather for a city.",
+    func(ctx context.Context, a WeatherArgs) (string, error) {
+        return fmt.Sprintf("22 degrees in %s", a.City), nil
+    })
+weather.Trusted = true // first-party data, skip the injection-warning wrapper
+
+result, err := gopherllm.RunAgenticChatWithTools(model.Runner(),
+    []gopherllm.ChatMessage{gopherllm.UserMessage("Weather in Hamburg?")},
+    gopherllm.DefaultGenerationOptions(), nil, []gopherllm.AgenticTool{weather},
+    func(s string) bool { fmt.Print(s); return true })
+```
+
+The agent loop that executes a tool call bounds it with a per-call timeout
+(default 30s), recovers a panic as a failed call instead of crashing the
+process, caps and marks a truncated result before it reaches the model, and
+replays an identical `(name, arguments)` call from an earlier round instead of
+re-executing it — all opt-out-able per `AgenticTool` field
+(`gopherllm.NoToolTimeout`, `gopherllm.NoToolResultLimit`). See `AgenticTool`'s
+doc comment for the full contract.
+
+### Retrieval over your own documents
+
+`rag.Index` is a hybrid BM25 + optional-vector index — a chunker, an inverted
+keyword index, and (when you supply an `Embedder`) a cosine-similarity scan —
+with no database and no third-party dependency:
+
+```go
+import "github.com/SimonWaldherr/GopherLLM/rag"
+
+ix := rag.New(rag.Options{}) // pure BM25; add Embedder: model for hybrid search
+if err := ix.Add(ctx, rag.Doc{ID: "handbook", Title: "Employee Handbook", Text: handbookText}); err != nil {
+    return err
+}
+hits, err := ix.Search(ctx, "return window for GX-1180", rag.Query{TopK: 3})
+for _, h := range hits {
+    fmt.Printf("%s (score %.2f): %s\n", h.Title, h.Score, h.Text)
+}
+```
+
+BM25 alone already wins the queries people actually type at their own
+documents — part numbers, error codes, invoice ids, surnames — which a
+chat model's mean-pooled hidden states (not a trained embedding head) tend to
+lose; see `rag.Options.Embedder`'s doc comment before wiring one up.
+`Index.Save`/`rag.Load` persist a built index so a second run skips
+re-embedding. See the [rag package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM/rag)
+for chunking, ranking weights, and directory ingestion via `Index.AddFS`.
+
 ### Repeated Mistral chat prefixes
 
 For a Ministral/Mistral application that repeatedly renders the same system
@@ -288,6 +346,7 @@ demo application and its UI assets:
 | Import | You get | Transitive deps |
 |---|---|---|
 | `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 90 |
+| `github.com/SimonWaldherr/GopherLLM/rag` | Document chunking, hybrid BM25 + vector retrieval | 94 |
 | `github.com/SimonWaldherr/GopherLLM/huggingface` | Hub search, variant listing, and `owner/repo` → local GGUF resolution | 192 |
 
 `TestInferencePackageStaysFreeOfServerDependencies` enforces that boundary

@@ -297,6 +297,18 @@ func (m *Model) Embed(ctx context.Context, text string) (EmbeddingResult, error)
 	return m.r.Embed(text)
 }
 
+// EmbedBatch is Model.Embed for a batch of texts, embedding all of them under
+// a single model lease. See Runner.EmbedBatch for why this is not merely a
+// loop over Embed at the call site: setup (and, on a decoder model, the KV
+// prefix-cache clear) is paid once for the whole batch instead of once per
+// text, and ctx is honored between texts rather than only around the call.
+func (m *Model) EmbedBatch(ctx context.Context, texts []string) ([]EmbeddingResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.r.EmbedBatch(ctx, texts)
+}
+
 // HTTP serving lives in the server subpackage so that importing this one for
 // inference alone does not pull in net/http, html/template, or the embedded
 // web UI. Use server.HandlerForModel(m, opts) instead of a method here.

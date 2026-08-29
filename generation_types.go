@@ -92,6 +92,12 @@ type GenerationOptions struct {
 	// offering to just that tool; any other value (including the default
 	// "auto") offers all of Tools.
 	ToolChoice string
+	// MaxToolRounds bounds how many times the agent loop will feed tool
+	// results back to the model before forcing a final, tools-withdrawn pass.
+	// Zero means DefaultToolRounds; values are clamped into
+	// [1, MaxToolRoundsCeiling]. Zero-value behavior is byte-identical to the
+	// loop's historical fixed budget, so no existing caller moves.
+	MaxToolRounds int
 	// ctx, when set (by the Model API's context-first methods), cancels
 	// generation between prefill chunks and between decoded tokens. Stored on
 	// the options value rather than passed positionally so the many existing
