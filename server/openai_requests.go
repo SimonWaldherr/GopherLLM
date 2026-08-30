@@ -27,6 +27,7 @@ type GenerateRequest struct {
 	ToolChoice    any                        `json:"tool_choice"`
 	Wikimedia     bool                       `json:"gopherllm_wikimedia"`
 	OpenStreetMap bool                       `json:"gopherllm_openstreetmap"`
+	RAG           bool                       `json:"gopherllm_rag"`
 }
 
 func (g GenerateRequest) ToMessagesAndOptions(def gopherllm.GenerationOptions) ([]gopherllm.ChatMessage, gopherllm.GenerationOptions) {
@@ -188,6 +189,9 @@ type OpenAIChatRequest struct {
 	GopherLLMContextMode string `json:"gopherllm_context_mode"`
 	Wikimedia            bool   `json:"gopherllm_wikimedia"`
 	OpenStreetMap        bool   `json:"gopherllm_openstreetmap"`
+	// RAG requests the search_documents tool, offered only when
+	// Features.RAG is enabled and the server's knowledge base is non-empty.
+	RAG bool `json:"gopherllm_rag"`
 	// Skills is a pointer so an absent field keeps the historical default
 	// (skills offered whenever --skills-dir is configured) while a client that
 	// wants them off can say so.

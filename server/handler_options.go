@@ -91,6 +91,32 @@ type HandlerOptions struct {
 	// operator-managed compatible endpoint. The source remains disabled until
 	// a request explicitly sets gopherllm_openstreetmap to true.
 	OSMSearchURL string
+	// RAGDocsDir, if set, is indexed once at handler construction into the
+	// server-side knowledge base a search_documents tool searches (see
+	// Features.RAG and registerRAGRoutes). Uses the same default plain-text
+	// ingestion as rag.Index.AddFS and agent.Agent's WithDocuments. Ignored
+	// unless Features.RAG is also set — a directory named without the feature
+	// enabled would otherwise index documents nothing can ever search or
+	// list. POST /rag/reload re-runs this scan on a running server, so files
+	// added or edited under this directory need not restart the process.
+	RAGDocsDir string
+	// RAGEmbedModelPath, if set, is loaded once at handler construction as a
+	// dedicated embedding model for the RAG knowledge base, giving it real
+	// vector (not just BM25 keyword) search — see rag.Options.Embedder. This
+	// is independent of /models/embed/load, which loads the model backing
+	// the browser's own client-side RAG mode: the knowledge base's Embedder
+	// is fixed for the process lifetime (rag.Index does not support swapping
+	// it), so it is configured the same way RAGDocsDir and SkillsDir are,
+	// not through a runtime HTTP route. Ignored unless Features.RAG is set.
+	RAGEmbedModelPath string
+	// RAGSnapshotPath, if set, persists the RAG knowledge base to this file
+	// (encoding/gob, written by rag.Index.Save) after every add or remove,
+	// and restores it from that file at handler construction. Without this,
+	// a document added through POST /rag/documents, /rag/upload, or
+	// /rag/fetch exists only for the life of the process; RAGDocsDir content
+	// is unaffected either way, since it is always re-read from disk.
+	// Ignored unless Features.RAG is set.
+	RAGSnapshotPath string
 }
 
 // ServeOptions is HandlerOptions plus the listen address, for the Serve
@@ -130,4 +156,10 @@ type ServeOptions struct {
 	AgentOS *agentos.Runner
 	// OSMSearchURL is forwarded to HandlerOptions.OSMSearchURL.
 	OSMSearchURL string
+	// RAGDocsDir is forwarded to HandlerOptions.RAGDocsDir.
+	RAGDocsDir string
+	// RAGEmbedModelPath is forwarded to HandlerOptions.RAGEmbedModelPath.
+	RAGEmbedModelPath string
+	// RAGSnapshotPath is forwarded to HandlerOptions.RAGSnapshotPath.
+	RAGSnapshotPath string
 }

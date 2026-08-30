@@ -621,6 +621,13 @@ func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
 	ForwardBatchInto(config, metalWeights, metalCache, metalBuf, tokens, 0, true, &metalLogits)
 	assertMetalMatvecClose(t, metalLogits, cpuLogits)
 	assertMetalMatvecClose(t, metalBuf.XN, cpuBuf.XN)
+	// The direct batch kernel writes straight from GPU-resident FFN
+	// intermediates into Proj. Retaining the CPU gate/up/hidden slabs here
+	// would add three unused large allocations to every Metal prompt chunk.
+	if len(metalBuf.batch.GateFlat) != 0 || len(metalBuf.batch.UpFlat) != 0 || len(metalBuf.batch.HiddenFlat) != 0 {
+		t.Fatalf("Metal batch FFN retained unused CPU slabs: gate=%d up=%d hidden=%d",
+			len(metalBuf.batch.GateFlat), len(metalBuf.batch.UpFlat), len(metalBuf.batch.HiddenFlat))
+	}
 	for i := range cpuCache.K[0] {
 		if d := math.Abs(float64(metalCache.K[0][i] - cpuCache.K[0][i])); d > 1e-3*math.Max(1, math.Abs(float64(cpuCache.K[0][i]))) {
 			t.Fatalf("K cache[%d] = %g, want %g", i, metalCache.K[0][i], cpuCache.K[0][i])
@@ -680,7 +687,7 @@ func BenchmarkMetalMinistral3BFFNBatch(b *testing.B) {
 	gate := Weight{Raw: gateData, Type: GGMLTypeQ4_K, Rows: hiddenRows, Cols: inputCols}
 	up := Weight{Raw: upData, Type: GGMLTypeQ4_K, Rows: hiddenRows, Cols: inputCols}
 	down := Weight{Raw: downData, Type: GGMLTypeQ6_K, Rows: outputRows, Cols: hiddenRows}
-	for _, batch := range []int{2, 4, 8, 32, 64, 128} {
+	for _, batch := range []int{2, 4, 8, 32, 64, 128, 256} {
 		b.Run(fmt.Sprintf("P%d", batch), func(b *testing.B) {
 			xFlat := make([]float32, batch*inputCols)
 			for i := range xFlat {

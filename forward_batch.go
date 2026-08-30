@@ -99,7 +99,7 @@ var batchAttentionTaskPool = sync.Pool{New: func() any { return new(batchAttenti
 // batchActivationTask is the allocation-free equivalent of the short
 // per-token FFN activation closure in ForwardBatchInto.
 type batchActivationTask struct {
-	gate, up, hidden             [][]float32
+	gate, up, gateUp, hidden     [][]float32
 	hiddenDim                    int
 	plainMLP, exactGELU, useGELU bool
 }
@@ -115,6 +115,14 @@ func (t *batchActivationTask) runRows(start, end int) {
 				for i := 0; i < t.hiddenDim; i++ {
 					t.hidden[token][i] = geluTanhScalar(t.up[token][i])
 				}
+			}
+		} else if t.gateUp != nil {
+			gateUp := t.gateUp[token]
+			gate, up := gateUp[:t.hiddenDim], gateUp[t.hiddenDim:2*t.hiddenDim]
+			if t.useGELU {
+				geluMulF32(gate, up, t.hidden[token][:t.hiddenDim])
+			} else {
+				siluMulF32(gate, up, t.hidden[token][:t.hiddenDim])
 			}
 		} else if t.useGELU {
 			geluMulF32(t.gate[token][:t.hiddenDim], t.up[token][:t.hiddenDim], t.hidden[token][:t.hiddenDim])
@@ -505,11 +513,13 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	if config.ParallelResidual {
 		AttnProj = reuseBatchViews(&b.AttnProjFlat, &b.AttnProj, p, dim)
 	}
-	Gate := reuseBatchViews(&b.GateFlat, &b.Gate, p, hDim)
-	Up := reuseBatchViews(&b.UpFlat, &b.Up, p, hDim)
+	// The CPU FFN intermediates are deliberately allocated lazily below. A
+	// direct Metal SwiGLU block keeps them on-device, so eagerly reserving the
+	// three p*HiddenDim slabs here would add large, untouched allocations to
+	// every GPU prompt chunk (about 27 MiB at Ministral-3B, 256 tokens).
+	var Gate, Up, Hidden [][]float32
 	QKV := [][]float32(nil)
 	GateUp := [][]float32(nil)
-	Hidden := reuseBatchViews(&b.HiddenFlat, &b.Hidden, p, hDim)
 
 	usesPosEmbd := config.usesAbsolutePositionEmbd()
 	for t := 0; t < p; t++ {
@@ -657,28 +667,40 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		// then returns only the final model-width projection for the residual.
 		// It admits precisely the established Q4_K/Q4_K/SiLU/Q6_K no-bias
 		// shape; every other architecture keeps the reference batch path.
+		// GateUp is layer-local: a mixed-model graph may follow a fused layer
+		// with a split one, and the activation task must never observe a stale
+		// fused view from the preceding layer.
+		GateUp = nil
 		fusedMetalBatchFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
 			len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
 			matvecMetalSwiGLUBatchInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, b.XNFlat, p, &b.ProjFlat)
 		if !fusedMetalBatchFFN {
+			// Every CPU FFN form needs its final hidden slab. The other inputs
+			// stay lazy: a fused gate/up tensor can feed the activation directly
+			// from its two halves, avoiding two p*HiddenDim copies and slabs.
+			Hidden = reuseBatchViews(&b.HiddenFlat, &b.Hidden, p, hDim)
+			if !config.usesPlainMLP() {
+				if layer.HasGateUp {
+					GateUp = reuseBatchViews(&b.GateUpFlat, &b.GateUp, p, 2*hDim)
+				} else {
+					Gate = reuseBatchViews(&b.GateFlat, &b.Gate, p, hDim)
+					Up = reuseBatchViews(&b.UpFlat, &b.Up, p, hDim)
+				}
+			} else {
+				Up = reuseBatchViews(&b.UpFlat, &b.Up, p, hDim)
+			}
 			if config.usesPlainMLP() {
 				matvecBatch(layer.W3, XN, Up)
 				for t := 0; t < p; t++ {
 					addInPlace(Up[t], layer.FFNUpBias)
 				}
 			} else if layer.HasGateUp {
-				gateUpLen := hDim * 2
-				GateUp = reuseBatchViews(&b.GateUpFlat, &b.GateUp, p, gateUpLen)
 				matvecBatch(layer.WGateUp, XN, GateUp)
-				for t := 0; t < p; t++ {
-					copy(Gate[t], GateUp[t][:hDim])
-					copy(Up[t], GateUp[t][hDim:gateUpLen])
-				}
 			} else {
 				matvecBatch2(layer.W1, layer.W3, XN, Gate, Up)
 			}
 			activationTask := batchActivationTaskPool.Get().(*batchActivationTask)
-			activationTask.gate, activationTask.up, activationTask.hidden = Gate, Up, Hidden
+			activationTask.gate, activationTask.up, activationTask.gateUp, activationTask.hidden = Gate, Up, GateUp, Hidden
 			activationTask.hiddenDim = hDim
 			activationTask.plainMLP, activationTask.exactGELU, activationTask.useGELU = config.usesPlainMLP(), config.UseExactGELU, config.UseGELU
 			parallelChunksTask(p, activationTask)

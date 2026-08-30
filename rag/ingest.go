@@ -45,14 +45,29 @@ func (o IngestOptions) match() func(string, fs.FileInfo) bool {
 var defaultIngestExtensions = map[string]bool{
 	".txt": true, ".md": true, ".markdown": true, ".csv": true, ".tsv": true,
 	".json": true, ".log": true, ".go": true, ".yaml": true, ".yml": true,
-	".rst": true, ".org": true,
+	".rst": true, ".org": true, ".toml": true, ".ini": true, ".cfg": true,
+	".conf": true, ".sql": true, ".py": true, ".js": true, ".ts": true,
+	".jsx": true, ".tsx": true, ".java": true, ".c": true, ".h": true,
+	".cc": true, ".cpp": true, ".rs": true, ".rb": true, ".php": true,
+	".sh": true, ".zsh": true, ".fish": true, ".ps1": true, ".css": true,
+	".scss": true, ".vue": true, ".svelte": true,
+}
+
+// DefaultTextExtension reports whether name's extension is one AddFS indexes
+// by default (case-insensitive). Exported so a caller building its own
+// ingestion path — a file-upload HTTP handler, say — can apply the same
+// plain-text allowlist without duplicating it, and reject a binary format
+// (PDF, DOCX, a compiled image) before it gets indexed as garbled text
+// instead of after.
+func DefaultTextExtension(name string) bool {
+	return defaultIngestExtensions[strings.ToLower(path.Ext(name))]
 }
 
 func defaultIngestMatch(p string, info fs.FileInfo) bool {
 	if info.IsDir() {
 		return false
 	}
-	return defaultIngestExtensions[strings.ToLower(path.Ext(p))]
+	return DefaultTextExtension(p)
 }
 
 func (o IngestOptions) extract() func(string, []byte) (Doc, error) {

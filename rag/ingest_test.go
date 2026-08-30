@@ -98,3 +98,16 @@ func TestAddFSSkipsSymlinksByDefault(t *testing.T) {
 		t.Fatalf("added = %d, want 1", added)
 	}
 }
+
+func TestDefaultTextExtensionIncludesCommonSourceFiles(t *testing.T) {
+	for _, name := range []string{"notes.MD", "service.py", "query.sql", "component.tsx", "settings.toml"} {
+		if !DefaultTextExtension(name) {
+			t.Errorf("DefaultTextExtension(%q) = false, want true", name)
+		}
+	}
+	for _, name := range []string{"manual.pdf", "archive.zip", "photo.png"} {
+		if DefaultTextExtension(name) {
+			t.Errorf("DefaultTextExtension(%q) = true, want false", name)
+		}
+	}
+}

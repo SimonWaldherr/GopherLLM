@@ -45,7 +45,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --serve [addr]            Start the HTTP API server (default: 127.0.0.1:8080, this machine only)")
 	fmt.Fprintln(os.Stderr, "                            A non-loopback address is allowed and prints what it exposes")
 	fmt.Fprintln(os.Stderr, "  --enable <list>           Add optional features (model-catalog is already on):")
-	fmt.Fprintln(os.Stderr, "                            model-download, autotune, remote, web-lookup, spreadsheet, all")
+	fmt.Fprintln(os.Stderr, "                            model-download, autotune, remote, web-lookup, spreadsheet, rag, all")
 	fmt.Fprintln(os.Stderr, "  --full                    Shorthand for --enable all")
 	fmt.Fprintln(os.Stderr, "  --deployment <mode>       Server profile: local | managed | browser (default: local)")
 	fmt.Fprintln(os.Stderr, "                           local is single-user; managed protects shared settings behind a token; browser runs models in each browser")
@@ -73,6 +73,9 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
 	fmt.Fprintln(os.Stderr, "  --skills-dir <path>       Directory of SKILL.md files offered via a load_skill tool")
+	fmt.Fprintln(os.Stderr, "  --rag-docs <path>         Directory of documents indexed into a search_documents tool (needs --enable rag)")
+	fmt.Fprintln(os.Stderr, "  --rag-embed-model <path>  GGUF embedding model giving the RAG knowledge base real vector search")
+	fmt.Fprintln(os.Stderr, "  --rag-snapshot <path>     Persist added/uploaded/fetched RAG documents here across restarts")
 	fmt.Fprintln(os.Stderr, "  --os-commands <policy>    Enable /agentos endpoints: deny | whitelist | allow (default: disabled)")
 	fmt.Fprintln(os.Stderr, "                            deny still lets a model propose a command, but a human must approve every one")
 	fmt.Fprintln(os.Stderr, "  --os-commands-allow <l>   Comma-separated program names auto-approved under whitelist, e.g. ls,git,cat")
@@ -160,6 +163,9 @@ type cliConfig struct {
 	inspect          bool
 	listMetadata     bool
 	skillsDir        string
+	ragDocsDir       string
+	ragEmbedModel    string
+	ragSnapshotPath  string
 	analyze          bool
 	findToken        string
 	tokenNeighbors   string
@@ -325,6 +331,9 @@ func run() error {
 			ModelDir:                 cfg.modelDir,
 			WasmDir:                  resolveWasmDir(cfg),
 			SkillsDir:                cfg.skillsDir,
+			RAGDocsDir:               cfg.ragDocsDir,
+			RAGEmbedModelPath:        cfg.ragEmbedModel,
+			RAGSnapshotPath:          cfg.ragSnapshotPath,
 			ModelLoadOptions:         serverModelLoadOptions(cfg),
 			AgentOS:                  agentOSRunner,
 		})
@@ -466,7 +475,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, RAGDocsDir: cfg.ragDocsDir, RAGEmbedModelPath: cfg.ragEmbedModel, RAGSnapshotPath: cfg.ragSnapshotPath, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -955,6 +964,24 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.skillsDir = v
+		case "--rag-docs":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.ragDocsDir = v
+		case "--rag-embed-model":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.ragEmbedModel = v
+		case "--rag-snapshot":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.ragSnapshotPath = v
 		case "--os-commands":
 			v, err := next(arg)
 			if err != nil {

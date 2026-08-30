@@ -341,3 +341,47 @@ func TestGuessLexicalModeOnNaturalQuestion(t *testing.T) {
 		t.Fatal("expected LexicalAny for an ordinary natural-language question")
 	}
 }
+
+func TestIndexListReportsDocsInInsertionOrderWithChunkCounts(t *testing.T) {
+	ix := New(Options{})
+	if err := ix.Add(context.Background(),
+		Doc{ID: "d1", Title: "First", Text: "alpha beta gamma"},
+		Doc{ID: "d2", Title: "Second", Text: "delta epsilon zeta"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	list := ix.List()
+	if len(list) != 2 || list[0].ID != "d1" || list[1].ID != "d2" {
+		t.Fatalf("List() = %+v, want d1 then d2", list)
+	}
+	if list[0].Title != "First" || list[0].Chunks == 0 {
+		t.Fatalf("list[0] = %+v", list[0])
+	}
+}
+
+func TestIndexRemoveDeletesChunksAndPostings(t *testing.T) {
+	ix := New(Options{})
+	if err := ix.Add(context.Background(),
+		Doc{ID: "d1", Text: "the rare term xylophone appears here"},
+		Doc{ID: "d2", Text: "an unrelated document about oranges"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if n := ix.Remove("d1", "missing"); n != 1 {
+		t.Fatalf("Remove returned %d, want 1", n)
+	}
+	if ix.Docs() != 1 || ix.Len() != 1 {
+		t.Fatalf("Docs()=%d Len()=%d, want 1, 1 after removing d1", ix.Docs(), ix.Len())
+	}
+	hits, err := ix.Search(context.Background(), "xylophone", Query{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("hits = %+v, want none for a removed doc's term", hits)
+	}
+	list := ix.List()
+	if len(list) != 1 || list[0].ID != "d2" {
+		t.Fatalf("List() after Remove = %+v, want only d2", list)
+	}
+}

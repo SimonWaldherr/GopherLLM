@@ -13,6 +13,8 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/agent"
+	"github.com/SimonWaldherr/GopherLLM/rag"
 )
 
 // DefaultAddr is the listen address Serve uses when ServeOptions.Addr is
@@ -28,6 +30,7 @@ type Handler struct {
 	next      http.Handler
 	state     *runnerState
 	embedder  *embeddingState
+	rag       *ragState
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -41,7 +44,7 @@ func (h *Handler) Close() error {
 		return nil
 	}
 	h.closeOnce.Do(func() {
-		h.closeErr = errors.Join(h.embedder.close(), h.state.close())
+		h.closeErr = errors.Join(h.embedder.close(), h.rag.close(), h.state.close())
 	})
 	return h.closeErr
 }
@@ -91,6 +94,9 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		LogWriter:             logw,
 		AgentOS:               opts.AgentOS,
 		OSMSearchURL:          opts.OSMSearchURL,
+		RAGDocsDir:            opts.RAGDocsDir,
+		RAGEmbedModelPath:     opts.RAGEmbedModelPath,
+		RAGSnapshotPath:       opts.RAGSnapshotPath,
 	})
 	defer handler.Close()
 	ctx := opts.Context
@@ -186,6 +192,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		opts.ModelDir = ""
 		opts.ModelPath = ""
 		opts.AgentOS = nil
+		// Browser deployment disables every server-side chat/completion route
+		// (see browserDisabledPath), so a search_documents tool and its
+		// management routes would have nothing to serve them into.
+		opts.Features.RAG = false
 	}
 	opts.ModelDir = strings.TrimSpace(opts.ModelDir)
 	if opts.MaxConcurrentRequests <= 0 {
@@ -203,25 +213,68 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	}
 	wikimediaTools := NewResearchTools(ResearchOptions{Wikimedia: true})
 	osmTools := NewResearchTools(ResearchOptions{OpenStreetMap: true, OSMSearchURL: opts.OSMSearchURL})
+	ragOpts := rag.Options{}
+	var ragEmbedRunner *gopherllm.Runner
+	if opts.Features.RAG {
+		// A dedicated embedding model turns the knowledge base from BM25-only
+		// keyword search into the hybrid vector+keyword search rag.Index
+		// otherwise only offers a caller who constructs one directly (see
+		// rag.Options.Embedder's doc comment on why that stays opt-in). It is
+		// loaded once, here, rather than through the hot-swappable
+		// /models/embed/load path the browser's client-side RAG mode uses:
+		// rag.Index fixes its Embedder at construction, so a knowledge base
+		// whose vector half could disappear mid-process is not a contract this
+		// package offers.
+		if path := strings.TrimSpace(opts.RAGEmbedModelPath); path != "" {
+			runner, _, err := gopherllm.RunnerFromPathWithOptions(path, opts.ModelLoadOptions)
+			if err != nil {
+				fmt.Fprintf(logw, "Warning: rag: embedding model %s: %v (continuing with keyword-only search)\n", path, err)
+			} else {
+				ragOpts.Embedder, ragOpts.EmbedderID = runner, path
+				ragEmbedRunner = runner
+			}
+		}
+	}
+	ragState := newRAGState(ragStateConfig{
+		Options: ragOpts, DocsDir: opts.RAGDocsDir, SnapshotPath: opts.RAGSnapshotPath,
+		LogWriter: logw, EmbedRunner: ragEmbedRunner,
+	})
+	if opts.Features.RAG {
+		// A snapshot (documents pasted, uploaded, or fetched at runtime) is
+		// restored before the directory reseed below, so a directory file
+		// sharing its ID with a snapshot entry — always its own path, since
+		// that is what seedFromDir uses as Doc.ID — deterministically wins:
+		// the file on disk is the more current source for its own content.
+		ragState.loadSnapshot(ragOpts)
+		if _, _, err := ragState.seedFromDir(context.Background(), opts.RAGDocsDir); err != nil {
+			fmt.Fprintf(logw, "Warning: rag: %v (continuing with an empty knowledge base)\n", err)
+		}
+	}
 	skillsFor := func(enabled bool) []gopherllm.Skill {
 		if !enabled {
 			return nil
 		}
 		return skills
 	}
-	agenticToolsFor := func(wikimedia, openStreetMap bool) []gopherllm.AgenticTool {
-		// A request asking for a lookup tool the operator did not enable gets
-		// a normal answer without it, not an error: the flags are hints from
+	agenticToolsFor := func(wikimedia, openStreetMap, ragSearch bool) []gopherllm.AgenticTool {
+		// A request asking for a tool the operator did not enable gets a
+		// normal answer without it, not an error: the flags are hints from
 		// the client, and the server decides what exists.
-		if !opts.Features.WebLookup {
-			return nil
-		}
 		var tools []gopherllm.AgenticTool
-		if wikimedia {
-			tools = append(tools, wikimediaTools...)
+		if opts.Features.WebLookup {
+			if wikimedia {
+				tools = append(tools, wikimediaTools...)
+			}
+			if openStreetMap {
+				tools = append(tools, osmTools...)
+			}
 		}
-		if openStreetMap {
-			tools = append(tools, osmTools...)
+		// An empty index has nothing to offer the model beyond a tool call
+		// that always answers "No matching passages found.", which only
+		// spends a slot in every offered-tools list for no benefit — see
+		// agent.RetrieveByTool's identical Len()>0 gate.
+		if opts.Features.RAG && ragSearch && ragState.index.Len() > 0 {
+			tools = append(tools, gopherllm.AgenticTool(agent.SearchDocumentsTool(ragState.index, rag.Query{})))
 		}
 		return tools
 	}
@@ -251,6 +304,9 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		registerAutoTuneRoutes(mux, state, sem, logw)
 	}
 	registerAgentOSRoutes(mux, state, sem, opts)
+	if opts.Features.RAG {
+		registerRAGRoutes(mux, ragState, sem)
+	}
 	if opts.ChatUI {
 		registerChatUIRoutes(mux, state, opts, deployment, logw)
 	}
@@ -259,6 +315,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		next:     deployment.wrap(remoteOrLoadedModel(state, remote, mux)),
 		state:    state,
 		embedder: embedder,
+		rag:      ragState,
 	}
 }
 

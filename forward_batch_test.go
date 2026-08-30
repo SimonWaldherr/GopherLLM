@@ -220,6 +220,12 @@ func TestBatchedPrefillSupportsFusedQKVAndGateUp(t *testing.T) {
 	c2, b2 := newRun()
 	got := []float32{}
 	_ = r.prefillBatched(context.Background(), c2, b2, tokens, &got)
+	// The fused gate_up layout already owns adjacent gate and up vectors. The
+	// batch activation must consume those halves directly rather than retaining
+	// duplicate Gate/Up slabs alongside GateUp and Hidden.
+	if len(b2.batch.GateFlat) != 0 || len(b2.batch.UpFlat) != 0 {
+		t.Fatalf("fused gate_up prefill retained duplicate slabs: gate=%d up=%d", len(b2.batch.GateFlat), len(b2.batch.UpFlat))
+	}
 
 	if len(got) != len(ref) {
 		t.Fatalf("logit len %d vs %d", len(got), len(ref))

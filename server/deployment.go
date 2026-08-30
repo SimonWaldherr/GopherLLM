@@ -265,7 +265,7 @@ func adminOnlyRequest(req *http.Request) bool {
 	switch req.URL.Path {
 	case "/models/load", "/models/embed/load", "/models/download", "/models/download/variants", "/models/search", "/autotune", "/autotune/run":
 		return true
-	case "/remote":
+	case "/remote", "/rag/documents", "/rag/upload", "/rag/fetch", "/rag/reload":
 		return req.Method != http.MethodGet
 	default:
 		return strings.HasPrefix(req.URL.Path, "/agentos/")
@@ -277,7 +277,7 @@ func adminOnlyRequest(req *http.Request) bool {
 // discover an abandoned server catalog. Static UI/WASM assets and local-only
 // workspace helpers remain available.
 func browserDisabledPath(path string) bool {
-	if strings.HasPrefix(path, "/models") || strings.HasPrefix(path, "/autotune") || strings.HasPrefix(path, "/remote") || strings.HasPrefix(path, "/agentos") {
+	if strings.HasPrefix(path, "/models") || strings.HasPrefix(path, "/autotune") || strings.HasPrefix(path, "/remote") || strings.HasPrefix(path, "/agentos") || strings.HasPrefix(path, "/rag") {
 		return true
 	}
 	switch path {

@@ -72,6 +72,9 @@ type fileServerConfig struct {
 	ChatHistoryPath *string `json:"chat_history_path,omitempty"`
 	MaxConnections  *int    `json:"max_connections,omitempty"`
 	SkillsDir       *string `json:"skills_dir,omitempty"`
+	RAGDocsDir      *string `json:"rag_docs_dir,omitempty"`
+	RAGEmbedModel   *string `json:"rag_embed_model,omitempty"`
+	RAGSnapshotPath *string `json:"rag_snapshot_path,omitempty"`
 	OSCommands      *string `json:"os_commands,omitempty"`
 	OSCommandsAllow *string `json:"os_commands_allow,omitempty"`
 }
@@ -124,6 +127,9 @@ var cliValueOptions = map[string]bool{
 	"--system-prompt":      true,
 	"--stop":               true,
 	"--skills-dir":         true,
+	"--rag-docs":           true,
+	"--rag-embed-model":    true,
+	"--rag-snapshot":       true,
 	"--os-commands":        true,
 	"--os-commands-allow":  true,
 	"--bench-runs":         true,
@@ -322,6 +328,15 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		if s.SkillsDir != nil {
 			cfg.skillsDir = *s.SkillsDir
 		}
+		if s.RAGDocsDir != nil {
+			cfg.ragDocsDir = *s.RAGDocsDir
+		}
+		if s.RAGEmbedModel != nil {
+			cfg.ragEmbedModel = *s.RAGEmbedModel
+		}
+		if s.RAGSnapshotPath != nil {
+			cfg.ragSnapshotPath = *s.RAGSnapshotPath
+		}
 		if s.OSCommands != nil {
 			cfg.osCommandsPolicy = *s.OSCommands
 		}
@@ -420,6 +435,9 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		ChatHistoryPath string   `json:"chat_history_path,omitempty"`
 		MaxConnections  int      `json:"max_connections,omitempty"`
 		SkillsDir       string   `json:"skills_dir,omitempty"`
+		RAGDocsDir      string   `json:"rag_docs_dir,omitempty"`
+		RAGEmbedModel   string   `json:"rag_embed_model,omitempty"`
+		RAGSnapshotPath string   `json:"rag_snapshot_path,omitempty"`
 		OSCommands      string   `json:"os_commands,omitempty"`
 		OSCommandsAllow string   `json:"os_commands_allow,omitempty"`
 	}
@@ -470,7 +488,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	if cfg.modelSelector != nil {
 		result.Model = *cfg.modelSelector
 	}
-	if cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
+	if cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.ragDocsDir != "" || cfg.ragEmbedModel != "" || cfg.ragSnapshotPath != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
 		result.Server = &effectiveServerConfig{
 			Address:         cfg.serveAddr,
 			Features:        cfg.features.EnabledNames(),
@@ -480,6 +498,9 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 			ChatHistoryPath: cfg.chatHistoryPath,
 			MaxConnections:  cfg.maxConn,
 			SkillsDir:       cfg.skillsDir,
+			RAGDocsDir:      cfg.ragDocsDir,
+			RAGEmbedModel:   cfg.ragEmbedModel,
+			RAGSnapshotPath: cfg.ragSnapshotPath,
 			OSCommands:      cfg.osCommandsPolicy,
 			OSCommandsAllow: cfg.osCommandsAllow,
 		}

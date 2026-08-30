@@ -42,6 +42,15 @@ type Features struct {
 	// Spreadsheet adds /batch/parse, which turns an uploaded CSV/TSV
 	// spreadsheet into prompts for batch runs.
 	Spreadsheet bool
+	// RAG adds knowledge-base status, document, upload, URL-import, reload, and
+	// search routes, and offers chat requests a search_documents tool (see the
+	// rag and agent packages) once
+	// at least one document is indexed. Listing and searching are always
+	// available to any caller who can reach a route this feature registers;
+	// adding or removing a document is a change to a corpus every user's chat
+	// then searches, so it is treated like a shared server setting — see
+	// adminOnlyRequest.
+	RAG bool
 }
 
 // AllFeatures returns every optional capability enabled. It is the explicit
@@ -55,6 +64,7 @@ func AllFeatures() Features {
 		RemoteProxy:   true,
 		WebLookup:     true,
 		Spreadsheet:   true,
+		RAG:           true,
 	}
 }
 
@@ -74,6 +84,8 @@ func (f *Features) fieldFor(name string) *bool {
 		return &f.WebLookup
 	case "spreadsheet", "batch":
 		return &f.Spreadsheet
+	case "rag", "documents":
+		return &f.RAG
 	default:
 		return nil
 	}
@@ -82,7 +94,7 @@ func (f *Features) fieldFor(name string) *bool {
 // FeatureNames lists the canonical wire names in the order the CLI help and
 // the Web UI present them.
 func FeatureNames() []string {
-	return []string{"model-catalog", "model-download", "autotune", "remote", "web-lookup", "spreadsheet"}
+	return []string{"model-catalog", "model-download", "autotune", "remote", "web-lookup", "spreadsheet", "rag"}
 }
 
 // ParseFeatures reads a comma-separated capability list, as accepted by the
@@ -126,6 +138,7 @@ func (f Features) status() map[string]any {
 		"remote":         f.RemoteProxy,
 		"web-lookup":     f.WebLookup,
 		"spreadsheet":    f.Spreadsheet,
+		"rag":            f.RAG,
 	}
 }
 

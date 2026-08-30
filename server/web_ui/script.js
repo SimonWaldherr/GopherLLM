@@ -850,7 +850,7 @@ const WORKFLOWS = {
     description: "Evidence-oriented answers with source-aware uncertainty and retrieval tools.",
     persona: "general",
     systemPrompt: PERSONAS.general + " Separate established facts, retrieved evidence, and inference. Name sources when tools provide them and never pretend an unavailable source was checked.",
-    settings: { maxTokens: 1024, temperature: .3, topP: .9, topK: 40, minP: .05, repeatPenalty: 1.1, contextWindowMode: "autoCompress", ragMode: true, wikimediaTools: true, openStreetMapTools: true, skillsTools: true }
+    settings: { maxTokens: 1024, temperature: .3, topP: .9, topK: 40, minP: .05, repeatPenalty: 1.1, contextWindowMode: "autoCompress", ragMode: true, wikimediaTools: true, openStreetMapTools: true, documentSearch: true, skillsTools: true }
   },
   writing: {
     label: "Writing & ideation",
@@ -926,6 +926,7 @@ function cleanSettings(value, defaults) {
     ragMode: value.ragMode === true,
     wikimediaTools: value.wikimediaTools === true,
     openStreetMapTools: value.openStreetMapTools === true,
+    documentSearch: value.documentSearch === true,
     skillsTools: value.skillsTools !== false
   };
 }
@@ -1227,11 +1228,22 @@ function toMarkdown(chat) {
   const ragModeEl = $("ragMode");
   const wikimediaToolsEl = $("wikimediaTools");
   const openStreetMapToolsEl = $("openStreetMapTools");
+  const documentSearchToolsEl = $("documentSearchTools");
   const skillsToolsEl = $("skillsTools");
   const skillsToolsRowEl = $("skillsToolsRow");
   const showAgentActivityEl = $("showAgentActivity");
   const ragModelEl = $("ragModel");
   const ragStatusEl = $("ragStatus");
+  const ragKnowledgeBaseStatusEl = $("ragKnowledgeBaseStatus");
+  const ragDocumentsListEl = $("ragDocumentsList");
+  const ragUploadFormEl = $("ragUploadForm");
+  const ragUploadFilesEl = $("ragUploadFiles");
+  const ragURLFormEl = $("ragURLForm");
+  const ragURLEl = $("ragURL");
+  const ragURLTitleEl = $("ragURLTitle");
+  const ragDocumentFormEl = $("ragDocumentForm");
+  const ragDocumentTitleEl = $("ragDocumentTitle");
+  const ragDocumentTextEl = $("ragDocumentText");
   const contextWindowStatusEl = $("contextWindowStatus");
   const composerContextWindowEl = $("composerContextWindow");
   const composerMaxTokensEl = $("composerMaxTokens");
@@ -2189,6 +2201,7 @@ function toMarkdown(chat) {
     ragModeEl.checked = settings.ragMode && !ragModeEl.disabled && Boolean(ragModelEl.value);
     wikimediaToolsEl.checked = settings.wikimediaTools;
     openStreetMapToolsEl.checked = settings.openStreetMapTools;
+    documentSearchToolsEl.checked = settings.documentSearch === true;
     if (skillsToolsEl) skillsToolsEl.checked = settings.skillsTools;
     personaEl.value = workflow.persona;
     systemPromptEl.value = workflow.systemPrompt;
@@ -2230,6 +2243,7 @@ function toMarkdown(chat) {
     ragModeEl.checked = chat.settings.ragMode;
     wikimediaToolsEl.checked = chat.settings.wikimediaTools;
     openStreetMapToolsEl.checked = chat.settings.openStreetMapTools === true;
+    documentSearchToolsEl.checked = chat.settings.documentSearch === true;
     if (skillsToolsEl) skillsToolsEl.checked = chat.settings.skillsTools !== false;
     composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
     workflowSelectEl.value = Object.prototype.hasOwnProperty.call(WORKFLOWS, chat.workflow) ? chat.workflow : "custom";
@@ -2914,6 +2928,7 @@ function toMarkdown(chat) {
       gopherllm_context_mode: chat.settings.contextWindowMode,
       gopherllm_wikimedia: chat.settings.wikimediaTools === true,
       gopherllm_openstreetmap: chat.settings.openStreetMapTools === true,
+      gopherllm_rag: chat.settings.documentSearch === true,
       gopherllm_skills: chat.settings.skillsTools !== false,
       system_prompt: [chat.systemPrompt.trim(), ragContext].filter(Boolean).join("\n\n") || undefined
     });
@@ -2938,6 +2953,7 @@ function toMarkdown(chat) {
         // for this frame-by-frame path instead of making the output look hung.
         gopherllm_wikimedia: useTools && settings.wikimediaTools === true,
         gopherllm_openstreetmap: useTools && settings.openStreetMapTools === true,
+        gopherllm_rag: useTools && settings.documentSearch === true,
         gopherllm_skills: useTools ? undefined : false
       }))
     });
@@ -3372,6 +3388,7 @@ function toMarkdown(chat) {
       stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, ragMode: ragModeEl.checked,
       wikimediaTools: wikimediaToolsEl.checked,
       openStreetMapTools: openStreetMapToolsEl.checked,
+      documentSearch: documentSearchToolsEl.checked,
       skillsTools: skillsToolsEl ? skillsToolsEl.checked : true
     }, defaults);
     // A changed system prompt, output reserve, or model-side sampler setting
@@ -4042,6 +4059,77 @@ function toMarkdown(chat) {
       autoTuneStatusEl.textContent = formatAutoTuneStatus(await response.json());
     } catch (_) {
       autoTuneStatusEl.textContent = "Could not check tuning status.";
+    }
+  }
+
+  /* The server-side knowledge base only exists when an operator enabled
+     --enable rag; GET /rag/status and GET /rag/documents stay public reads
+     (see adminOnlyRequest), so listing needs no admin unlock, only the
+     add/remove actions below route through adminFetch. */
+  async function loadRAGDocuments() {
+    if (!serverFeatureSet().has("rag") || browserOnlyDeployment) return;
+    await refreshRAGDocuments();
+  }
+
+  async function refreshRAGDocuments() {
+    try {
+      const [statusResponse, listResponse] = await Promise.all([
+        fetch("/rag/status", { cache: "no-store" }),
+        fetch("/rag/documents", { cache: "no-store" })
+      ]);
+      if (!statusResponse.ok || !listResponse.ok) return;
+      const status = await statusResponse.json();
+      const listing = await listResponse.json();
+      renderRAGDocuments(Array.isArray(listing.documents) ? listing.documents : [], status);
+    } catch (_) {
+      /* The knowledge base panel simply keeps its last known state. */
+    }
+  }
+
+  function renderRAGDocuments(docs, status) {
+    ragDocumentsListEl.replaceChildren();
+    docs.forEach((doc) => {
+      const item = document.createElement("li");
+      item.className = "model-download-variant";
+      const copy = document.createElement("div");
+      copy.className = "model-download-variant-copy";
+      const title = document.createElement("span");
+      title.className = "model-download-variant-quant";
+      title.textContent = doc.title || doc.id || "Untitled";
+      const meta = document.createElement("span");
+      meta.className = "model-download-variant-meta";
+      const chunks = Number(doc.chunks) || 0;
+      const source = doc.path ? " · " + doc.path : "";
+      meta.textContent = chunks + (chunks === 1 ? " chunk" : " chunks") + source;
+      copy.append(title, meta);
+      const action = document.createElement("button");
+      action.type = "button";
+      action.className = "text-button";
+      action.textContent = "Remove";
+      action.addEventListener("click", () => removeRAGDocument(doc.id));
+      item.append(copy, action);
+      ragDocumentsListEl.appendChild(item);
+    });
+    ragDocumentsListEl.hidden = docs.length === 0;
+    const docCount = (status && Number(status.documents)) || docs.length;
+    const chunkCount = (status && Number(status.chunks)) || 0;
+    const mode = status && status.vector_search ? " Hybrid vector + keyword search." : " Keyword search.";
+    ragKnowledgeBaseStatusEl.textContent = docCount
+      ? docCount + (docCount === 1 ? " document" : " documents") + ", " + chunkCount + (chunkCount === 1 ? " chunk" : " chunks") + " indexed." + mode
+      : "No documents indexed yet.";
+  }
+
+  async function removeRAGDocument(id) {
+    try {
+      const response = await adminFetch("/rag/documents", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id })
+      });
+      if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      await refreshRAGDocuments();
+    } catch (error) {
+      showToast("Could not remove document: " + (error && error.message ? error.message : String(error)), "error");
     }
   }
 
@@ -5385,7 +5473,7 @@ function toMarkdown(chat) {
   const emptyChooseModelEl = $("emptyChooseModel");
   if (emptyChooseModelEl) emptyChooseModelEl.addEventListener("click", (event) => openModelPicker(event.currentTarget));
   workflowSelectEl.addEventListener("change", () => applyWorkflow(workflowSelectEl.value));
-  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, skillsToolsEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, documentSearchToolsEl, skillsToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });
@@ -5466,6 +5554,83 @@ function toMarkdown(chat) {
   composerWikimediaToolsEl.addEventListener("change", () => {
     wikimediaToolsEl.checked = composerWikimediaToolsEl.checked;
     updateSettings();
+  });
+  ragDocumentFormEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = ragDocumentTextEl.value.trim();
+    if (!text) {
+      ragDocumentTextEl.focus();
+      return;
+    }
+    const submitButton = ragDocumentFormEl.querySelector("button[type=submit]");
+    submitButton.disabled = true;
+    try {
+      const response = await adminFetch("/rag/documents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: ragDocumentTitleEl.value.trim(), text })
+      });
+      if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      ragDocumentTitleEl.value = "";
+      ragDocumentTextEl.value = "";
+      await refreshRAGDocuments();
+      showToast("Document added to the knowledge base.", "success");
+    } catch (error) {
+      showToast("Could not add document: " + (error && error.message ? error.message : String(error)), "error");
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+  ragUploadFormEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!ragUploadFilesEl.files.length) {
+      ragUploadFilesEl.focus();
+      return;
+    }
+    const submitButton = ragUploadFormEl.querySelector("button[type=submit]");
+    submitButton.disabled = true;
+    try {
+      const response = await adminFetch("/rag/upload", {
+        method: "POST",
+        body: new FormData(ragUploadFormEl)
+      });
+      if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      const result = await response.json();
+      ragUploadFormEl.reset();
+      await refreshRAGDocuments();
+      const added = Array.isArray(result.documents) ? result.documents.length : 0;
+      const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+      showToast(added + (added === 1 ? " file" : " files") + " indexed" + (skipped ? "; " + skipped + " skipped." : "."), skipped ? "warning" : "success");
+    } catch (error) {
+      showToast("Could not upload files: " + (error && error.message ? error.message : String(error)), "error");
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+  ragURLFormEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const sourceURL = ragURLEl.value.trim();
+    if (!sourceURL) {
+      ragURLEl.focus();
+      return;
+    }
+    const submitButton = ragURLFormEl.querySelector("button[type=submit]");
+    submitButton.disabled = true;
+    try {
+      const response = await adminFetch("/rag/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: sourceURL, title: ragURLTitleEl.value.trim() })
+      });
+      if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      ragURLFormEl.reset();
+      await refreshRAGDocuments();
+      showToast("Web source imported into the knowledge base.", "success");
+    } catch (error) {
+      showToast("Could not import source: " + (error && error.message ? error.message : String(error)), "error");
+    } finally {
+      submitButton.disabled = false;
+    }
   });
   composerProToggleEl.addEventListener("click", () => {
     setComposerProOpen(composerProPanelEl.hidden);
@@ -7015,5 +7180,6 @@ function toMarkdown(chat) {
 		loadSkills();
 		loadAutoTuneStatus();
 		loadAgentOSStatus();
+		loadRAGDocuments();
 	}
 }());

@@ -12,7 +12,7 @@ import (
 // (GopherLLM's native shape), /v1/chat/completions, /v1/completions,
 // /v1/embeddings, /v1/models, and /v1/skills. Extracted from NewHandler's
 // inline handlers for these routes.
-func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embeddingState, sem chan struct{}, opts HandlerOptions, skills []gopherllm.Skill, skillsFor func(bool) []gopherllm.Skill, agenticToolsFor func(wikimedia, openStreetMap bool) []gopherllm.AgenticTool, logw io.Writer) {
+func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embeddingState, sem chan struct{}, opts HandlerOptions, skills []gopherllm.Skill, skillsFor func(bool) []gopherllm.Skill, agenticToolsFor func(wikimedia, openStreetMap, ragSearch bool) []gopherllm.AgenticTool, logw io.Writer) {
 	mux.HandleFunc("/generate", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		requestID := ensureRequestID(w, req)
 		var body GenerateRequest
@@ -24,7 +24,7 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 		options = withRequestContext(options, req)
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
-			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, messages, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), alwaysContinue)
 			logInferenceResult(logw, requestID, "/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -66,7 +66,7 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 			// token. Dropping the duplicate cut a non-streaming request's
 			// allocations by 48%.
 			if body.Stream && contextMode != gopherllm.ContextWindowFull {
-				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
+				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG))
 				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
 				if err != nil {
 					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, gopherllm.GenerationResult{}, err)
@@ -76,12 +76,12 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 			}
 			if body.Stream {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
-				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia, body.OpenStreetMap), includeUsage)
+				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), includeUsage)
 				return
 			}
 			var timeline []gopherllm.AgentEvent
 			observe := func(e gopherllm.AgentEvent) { timeline = append(timeline, e) }
-			result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue, observe)
+			result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skillsFor(body.SkillsEnabled()), agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), alwaysContinue, observe)
 			logInferenceResult(logw, requestID, "/v1/chat/completions", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)

@@ -358,6 +358,68 @@ func (ix *Index) Docs() int {
 	return len(ix.docs)
 }
 
+// HasEmbedder reports whether this Index was constructed with an Embedder and
+// therefore blends vector similarity into Search, rather than scoring on
+// BM25 keyword matching alone. Exported so a caller reporting the index's
+// capabilities (a status endpoint, a CLI summary) does not need its own copy
+// of Options to know which mode is active.
+func (ix *Index) HasEmbedder() bool {
+	return ix.opts.Embedder != nil
+}
+
+// DocInfo summarizes one indexed Doc for a listing UI, without its
+// (potentially large) Text.
+type DocInfo struct {
+	ID, Title, Path, Kind string
+	Time                  time.Time
+	Chunks                int
+}
+
+// List reports every indexed Doc, in the order each was first added (or, for
+// an Index rebuilt by Load, the order Save wrote them in).
+func (ix *Index) List() []DocInfo {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	seen := make(map[string]bool, len(ix.docs))
+	out := make([]DocInfo, 0, len(ix.docs))
+	for _, key := range ix.order {
+		id := ix.chunks[key].chunk.DocID
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		entry := ix.docs[id]
+		out = append(out, DocInfo{
+			ID: entry.doc.ID, Title: entry.doc.Title, Path: entry.doc.Path,
+			Kind: entry.doc.Kind, Time: entry.doc.Time, Chunks: len(entry.chunkKeys),
+		})
+	}
+	return out
+}
+
+// Remove deletes docs by ID, along with their chunks and BM25 postings. An ID
+// not present in the Index is silently ignored. It returns how many of the
+// given IDs were actually present and removed.
+func (ix *Index) Remove(ids ...string) int {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	removed := 0
+	for _, id := range ids {
+		entry, ok := ix.docs[id]
+		if !ok {
+			continue
+		}
+		for _, key := range entry.chunkKeys {
+			ix.bm25.remove(key)
+			delete(ix.chunks, key)
+		}
+		ix.order = removeAll(ix.order, entry.chunkKeys)
+		delete(ix.docs, id)
+		removed++
+	}
+	return removed
+}
+
 type scored struct {
 	key                string
 	vecRaw, kwRaw, rec float32

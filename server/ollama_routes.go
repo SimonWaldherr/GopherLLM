@@ -13,7 +13,7 @@ import (
 // /api/generate, /api/chat, /api/embeddings, /api/embed, /api/tags, /api/ps,
 // /api/show, and /api/version. Extracted from NewHandler's inline handlers
 // for these routes.
-func registerOllamaRoutes(mux *http.ServeMux, state *runnerState, embedder *embeddingState, sem chan struct{}, opts HandlerOptions, skills []gopherllm.Skill, agenticToolsFor func(wikimedia, openStreetMap bool) []gopherllm.AgenticTool, logw io.Writer) {
+func registerOllamaRoutes(mux *http.ServeMux, state *runnerState, embedder *embeddingState, sem chan struct{}, opts HandlerOptions, skills []gopherllm.Skill, agenticToolsFor func(wikimedia, openStreetMap, ragSearch bool) []gopherllm.AgenticTool, logw io.Writer) {
 	mux.HandleFunc("/api/generate", withLimit(sem, func(w http.ResponseWriter, req *http.Request) {
 		requestID := ensureRequestID(w, req)
 		var body OllamaGenerateRequest
@@ -26,10 +26,10 @@ func registerOllamaRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
-				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
+				streamOllamaGenerate(w, req, logw, requestID, r, model, body.Prompt, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG))
 				return
 			}
-			result, err := gopherllm.RunAgenticChatWithTools(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, []gopherllm.ChatMessage{gopherllm.UserMessage(body.Prompt)}, options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/generate", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -54,10 +54,10 @@ func registerOllamaRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 		state.withRunner(func(r *gopherllm.Runner) {
 			model := modelID(r)
 			if streamEnabled(body.Stream) {
-				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap))
+				streamOllamaChat(w, req, logw, requestID, r, model, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG))
 				return
 			}
-			result, err := gopherllm.RunAgenticChatWithTools(r, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap), alwaysContinue)
+			result, err := gopherllm.RunAgenticChatWithTools(r, body.ChatMessages(), options, skills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), alwaysContinue)
 			logInferenceResult(logw, requestID, "/api/chat", model, false, result, err)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)

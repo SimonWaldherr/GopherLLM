@@ -17,6 +17,7 @@ package and command-line inference workflow are documented in the
 - [Context and prefix cache](#context-and-prefix-cache)
 - [HTTP API](#http-api)
 - [Tools, skills, and research](#tools-skills-and-research)
+  - [Knowledge base search (RAG)](#knowledge-base-search-rag)
 - [Autotuning from the UI](#autotuning-from-the-ui)
 - [Server Make targets](#server-make-targets)
 - [Privacy](#privacy)
@@ -100,6 +101,7 @@ process-wide state, or benchmarks the machine is opt-in:
 | `remote`         | `RemoteProxy`   | `/remote`, `/remote/models` — points every subsequent completion at another endpoint |
 | `web-lookup`     | `WebLookup`     | The Wikimedia and OpenStreetMap tools. Requests still ask for them per call; this is the outer switch |
 | `spreadsheet`    | `Spreadsheet`   | `/batch/parse` for the batch runner |
+| `rag`            | `RAG`           | Knowledge-base status, document, upload, URL-import, reload, and search routes, plus a `search_documents` tool chat requests can opt into — see [Knowledge base search (RAG)](#knowledge-base-search-rag) |
 | `model-catalog`  | `ModelCatalog`  | `/models`, `/models/load`, `/models/architecture`, embedding-model routes. On by default in the CLI, off in the zero-value `Features` |
 | `all`            | `AllFeatures()` | Everything above; `--full` is the same thing |
 
@@ -331,6 +333,9 @@ Set `"stream": true` for SSE streaming. The handler exposes:
 | GET | `/chat/storage` | Report server-history availability |
 | GET / PUT / DELETE | `/chat/workspace` | Read, replace, or clear server workspace |
 | POST | `/batch/parse` | Parse local `.xlsx`/`.ods` batch data |
+| GET | `/rag/status` | Document/chunk counts for the knowledge base |
+| GET / POST / DELETE | `/rag/documents` | List, add, or remove an indexed document |
+| POST | `/rag/search` | Preview a search against the knowledge base without a chat turn |
 
 ## Tools, skills, and research
 
@@ -368,6 +373,62 @@ full skill body only if it asks for it. In the server application that loop is
 resolved internally before a response is returned; callers still receive their
 own non-skill tool calls as usual. `GET /v1/skills` lists configured skills.
 `--skills-dir` also works in CLI one-shot and REPL mode.
+
+### Knowledge base search (RAG)
+
+`--enable rag` turns on a server-side document index (the `rag` package's
+hybrid BM25/vector search) and offers chat requests a `search_documents`
+tool built from the `agent` package's `agent.SearchDocumentsTool`:
+
+```sh
+bin/gopherllm --model-dir /path/to/models --serve --chat \
+  --enable rag --rag-docs ./docs
+```
+
+`--rag-docs <dir>` indexes every plain-text file under `dir` at startup. The
+same directory can be scanned again with `POST /rag/reload`. The Web UI's
+**Knowledge base** panel (Settings → Capabilities) can also paste text, upload
+several supported text files at once, and import public HTTP(S) sources.
+Wikipedia article URLs use MediaWiki's plaintext API, including article
+redirects, so the complete article is indexed without Wikipedia navigation or
+page chrome. Other HTML pages are reduced to readable text; scripts, styles,
+navigation, headers, and footers are discarded.
+
+The default file allowlist and 4 MiB per-file cap match `rag.Index.AddFS` and
+`agent.Agent`'s `WithDocuments`. URL imports are capped at 2 MiB and protected
+against requests to loopback, private, link-local, and metadata addresses.
+Examples:
+
+```sh
+curl -X POST http://127.0.0.1:8080/rag/documents \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "Return Policy", "text": "Products may be returned within 30 days..."}'
+
+curl -X POST http://127.0.0.1:8080/rag/upload \
+  -F 'files=@handbook.md' -F 'files=@faq.txt'
+
+curl -X POST http://127.0.0.1:8080/rag/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://de.wikipedia.org/wiki/Retrieval-Augmented_Generation"}'
+
+curl -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "What is our return policy?"}], "gopherllm_rag": true}'
+```
+
+The model decides whether to call `search_documents` at all — an empty index
+offers no tool, and a request that does not set `"gopherllm_rag": true` never
+sees it. `search_documents` is offered only once the corpus is non-empty, the
+same `Len() > 0` gate `agent.Agent`'s default `RetrieveByTool` mode uses.
+
+Adding, uploading, importing, reloading, or removing a document changes a
+corpus every user's chat then searches, so in `managed` deployment those
+actions require the administrator token; listing, status, and search stay
+public reads (like `GET /remote`). Use `--rag-snapshot <path>` to persist
+runtime additions across restarts, and `--rag-embed-model <model.gguf>` to
+enable hybrid vector + keyword search instead of the default keyword-only
+mode. See [Configuration and deployment
+profiles](#configuration-and-deployment-profiles).
 
 ### Wikimedia and OpenStreetMap
 

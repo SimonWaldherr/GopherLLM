@@ -1206,6 +1206,17 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .settings-option > span { display: grid; gap: 2px; }
 .settings-option strong { color: var(--ink); font-size: var(--fs-xs); }
 .settings-option .field-note { display: block; font-size: var(--fs-2xs); line-height: 1.4; }
+.rag-import-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 10px; }
+.rag-document-form { display: grid; align-content: start; gap: 10px; }
+.rag-import-card { padding: 11px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); }
+.rag-import-card:last-child { grid-column: 1 / -1; }
+.rag-import-card > div > strong { color: var(--ink); font-size: var(--fs-xs); }
+.rag-import-card > div > p { margin: 3px 0 0; line-height: 1.45; }
+#ragDocumentsList .model-download-variant-meta { overflow-wrap: anywhere; }
+.rag-import-card input[type="file"] { padding: 5px; background: var(--panel); font-size: var(--fs-2xs); }
+.rag-import-card input[type="file"]::file-selector-button { margin-right: 8px; padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--panel-2); color: var(--ink); cursor: pointer; }
+.rag-document-form .autotune-run { justify-self: start; }
+@media (max-width: 620px) { .rag-import-grid { grid-template-columns: 1fr; } .rag-import-card:last-child { grid-column: auto; } }
 .settings-export-actions { gap: 7px; }
 .settings-export-actions .text-button {
   min-height: 31px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--panel-2);

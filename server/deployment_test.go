@@ -110,7 +110,7 @@ func TestDisabledFeaturesAreNotRegistered(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	for _, path := range []string{"/models", "/models/search", "/models/download", "/autotune", "/remote", "/batch/parse"} {
+	for _, path := range []string{"/models", "/models/search", "/models/download", "/autotune", "/remote", "/batch/parse", "/rag/status"} {
 		resp, err := srv.Client().Get(srv.URL + path)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)

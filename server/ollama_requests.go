@@ -13,6 +13,7 @@ type OllamaGenerateRequest struct {
 	Stop          any           `json:"stop"`
 	Wikimedia     bool          `json:"gopherllm_wikimedia"`
 	OpenStreetMap bool          `json:"gopherllm_openstreetmap"`
+	RAG           bool          `json:"gopherllm_rag"`
 }
 
 func (o OllamaGenerateRequest) GenerationOptions(def gopherllm.GenerationOptions) gopherllm.GenerationOptions {
@@ -31,6 +32,7 @@ type OllamaChatRequest struct {
 	Tools         []gopherllm.ToolDefinition `json:"tools"`
 	Wikimedia     bool                       `json:"gopherllm_wikimedia"`
 	OpenStreetMap bool                       `json:"gopherllm_openstreetmap"`
+	RAG           bool                       `json:"gopherllm_rag"`
 }
 
 // streamEnabled implements Ollama's default-true streaming semantics: the

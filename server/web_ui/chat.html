@@ -490,6 +490,10 @@
               <input id="openStreetMapTools" type="checkbox">
               <span><strong>OpenStreetMap place research</strong><span class="field-note">Sends only model-requested place queries to Nominatim. No personal data, autocomplete, or bulk lookup. <a href="https://operations.osmfoundation.org/policies/nominatim/" target="_blank" rel="noopener noreferrer">Usage policy</a>.</span></span>
             </label>
+            <label class="toggle-row settings-option" data-feature="rag">
+              <input id="documentSearchTools" type="checkbox">
+              <span><strong>Search this server's documents</strong><span class="field-note">Lets the model call search_documents against the knowledge base below.</span></span>
+            </label>
             <label class="toggle-row settings-option" id="skillsToolsRow" hidden>
               <input id="skillsTools" type="checkbox" checked>
               <span><strong>Skills</strong><span class="field-note">Lets the model load SKILL.md files from this server.</span></span>
@@ -524,6 +528,55 @@
             </label>
           </div>
           <p id="ragStatus" class="settings-note" hidden></p>
+        </section>
+
+        <section class="settings-section" data-advanced data-feature="rag">
+          <div class="settings-section-head">
+            <div>
+              <h3>Knowledge base</h3>
+              <p>Documents indexed here are searchable by every chat on this server via search_documents.</p>
+            </div>
+          </div>
+          <p id="ragKnowledgeBaseStatus" class="settings-note" aria-live="polite">No documents indexed yet.</p>
+          <ul id="ragDocumentsList" class="model-download-variants" aria-label="Indexed documents" hidden></ul>
+          <div class="rag-import-grid" data-admin-control>
+          <form id="ragUploadForm" class="rag-document-form rag-import-card" enctype="multipart/form-data">
+            <div>
+              <strong>Upload files</strong>
+              <p class="field-note">Add several text, Markdown, CSV, JSON, YAML, source-code, or log files at once (up to 4 MiB each).</p>
+            </div>
+            <label class="model-download-label" for="ragUploadFiles">Files
+              <input type="file" id="ragUploadFiles" name="files" multiple required accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.go,.yaml,.yml,.rst,.org,.toml,.ini,.cfg,.conf,.sql,.py,.js,.ts,.jsx,.tsx,.java,.c,.h,.cc,.cpp,.rs,.rb,.php,.sh,.zsh,.fish,.ps1,.css,.scss,.vue,.svelte,.html,.htm,text/plain,text/markdown,text/csv,text/html,application/json">
+            </label>
+            <button type="submit" class="autotune-run">Upload and index</button>
+          </form>
+          <form id="ragURLForm" class="rag-document-form rag-import-card">
+            <div>
+              <strong>Import from the web</strong>
+              <p class="field-note">Paste a Wikipedia article or another public HTTP(S) page. Wikipedia articles are imported as clean, complete article text.</p>
+            </div>
+            <label class="model-download-label" for="ragURL">Source URL
+              <input type="url" id="ragURL" placeholder="https://de.wikipedia.org/wiki/…" autocomplete="url" required>
+            </label>
+            <label class="model-download-label" for="ragURLTitle">Title override (optional)
+              <input type="text" id="ragURLTitle" placeholder="Detected from the source" autocomplete="off" maxlength="200">
+            </label>
+            <button type="submit" class="autotune-run">Import and index</button>
+          </form>
+          <form id="ragDocumentForm" class="rag-document-form rag-import-card">
+            <div>
+              <strong>Paste text</strong>
+              <p class="field-note">Add notes or other content that is not already available as a file or URL.</p>
+            </div>
+            <label class="model-download-label" for="ragDocumentTitle">Title (optional)
+              <input type="text" id="ragDocumentTitle" placeholder="e.g. Return Policy" autocomplete="off" maxlength="200">
+            </label>
+            <label class="model-download-label" for="ragDocumentText">Document text
+              <textarea id="ragDocumentText" rows="4" placeholder="Paste or type the text to index…"></textarea>
+            </label>
+            <button type="submit" class="autotune-run">Add to knowledge base</button>
+          </form>
+          </div>
         </section>
         <p id="skillsNote" class="skills-note" hidden></p>
       </div>

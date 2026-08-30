@@ -35,7 +35,7 @@ func TestParseCLIServeAndStops(t *testing.T) {
 	cfg, err := parseCLI([]string{
 		"m", "--serve", "127.0.0.1:8080", "--chat",
 		"--system-prompt", "be nice", "--stop", "END", "--stop", "STOP", "--repl",
-		"--skills-dir", "/tmp/skills",
+		"--skills-dir", "/tmp/skills", "--rag-docs", "/tmp/docs",
 	})
 	if err != nil {
 		t.Fatalf("parseCLI: %v", err)
@@ -51,6 +51,9 @@ func TestParseCLIServeAndStops(t *testing.T) {
 	}
 	if cfg.skillsDir != "/tmp/skills" {
 		t.Fatalf("skillsDir = %q", cfg.skillsDir)
+	}
+	if cfg.ragDocsDir != "/tmp/docs" {
+		t.Fatalf("ragDocsDir = %q", cfg.ragDocsDir)
 	}
 }
 
