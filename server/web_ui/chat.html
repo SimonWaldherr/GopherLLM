@@ -539,43 +539,58 @@
           </div>
           <p id="ragKnowledgeBaseStatus" class="settings-note" aria-live="polite">No documents indexed yet.</p>
           <ul id="ragDocumentsList" class="model-download-variants" aria-label="Indexed documents" hidden></ul>
+          <form id="ragSearchForm" class="rag-search-preview">
+            <label class="model-download-label" for="ragSearchQuery">Test retrieval
+              <input type="search" id="ragSearchQuery" placeholder="Search the indexed knowledge base…" autocomplete="off" required>
+            </label>
+            <label class="model-download-label" for="ragSearchTopK">Results
+              <select id="ragSearchTopK">
+                <option value="3">3</option>
+                <option value="5" selected>5</option>
+                <option value="10">10</option>
+              </select>
+            </label>
+            <button type="submit" class="autotune-run">Preview search</button>
+          </form>
+          <p id="ragSearchStatus" class="settings-note" aria-live="polite" hidden></p>
+          <ol id="ragSearchResults" class="rag-search-results" aria-label="RAG search preview results" hidden></ol>
           <div class="rag-import-grid" data-admin-control>
-          <form id="ragUploadForm" class="rag-document-form rag-import-card" enctype="multipart/form-data">
-            <div>
-              <strong>Upload files</strong>
-              <p class="field-note">Add several text, Markdown, CSV, JSON, YAML, source-code, or log files at once (up to 4 MiB each).</p>
-            </div>
-            <label class="model-download-label" for="ragUploadFiles">Files
-              <input type="file" id="ragUploadFiles" name="files" multiple required accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.go,.yaml,.yml,.rst,.org,.toml,.ini,.cfg,.conf,.sql,.py,.js,.ts,.jsx,.tsx,.java,.c,.h,.cc,.cpp,.rs,.rb,.php,.sh,.zsh,.fish,.ps1,.css,.scss,.vue,.svelte,.html,.htm,text/plain,text/markdown,text/csv,text/html,application/json">
-            </label>
-            <button type="submit" class="autotune-run">Upload and index</button>
-          </form>
-          <form id="ragURLForm" class="rag-document-form rag-import-card">
-            <div>
-              <strong>Import from the web</strong>
-              <p class="field-note">Paste up to 20 Wikipedia articles or other public HTTP(S) pages, one URL per line. Re-importing the same URL updates its existing entry.</p>
-            </div>
-            <label class="model-download-label" for="ragURL">Source URLs
-              <textarea id="ragURL" rows="3" placeholder="https://de.wikipedia.org/wiki/…&#10;https://example.com/handbook" required></textarea>
-            </label>
-            <label class="model-download-label" for="ragURLTitle">Title override (optional)
-              <input type="text" id="ragURLTitle" placeholder="Available for a single URL" autocomplete="off" maxlength="200">
-            </label>
-            <button type="submit" class="autotune-run">Import and index</button>
-          </form>
-          <form id="ragDocumentForm" class="rag-document-form rag-import-card">
-            <div>
-              <strong>Paste text</strong>
-              <p class="field-note">Add notes or other content that is not already available as a file or URL.</p>
-            </div>
-            <label class="model-download-label" for="ragDocumentTitle">Title (optional)
-              <input type="text" id="ragDocumentTitle" placeholder="e.g. Return Policy" autocomplete="off" maxlength="200">
-            </label>
-            <label class="model-download-label" for="ragDocumentText">Document text
-              <textarea id="ragDocumentText" rows="4" placeholder="Paste or type the text to index…"></textarea>
-            </label>
-            <button type="submit" class="autotune-run">Add to knowledge base</button>
-          </form>
+            <form id="ragUploadForm" class="rag-document-form rag-import-card" enctype="multipart/form-data">
+              <div>
+                <strong>Upload files or ZIP</strong>
+                <p class="field-note">Add text, Markdown, HTML, data, source-code, logs, or a ZIP collection. Archives may contain up to 200 supported files.</p>
+              </div>
+              <label class="model-download-label" for="ragUploadFiles">Files
+                <input type="file" id="ragUploadFiles" name="files" multiple required accept=".txt,.md,.markdown,.csv,.tsv,.json,.log,.go,.yaml,.yml,.rst,.org,.toml,.ini,.cfg,.conf,.sql,.py,.js,.ts,.jsx,.tsx,.java,.c,.h,.cc,.cpp,.rs,.rb,.php,.sh,.zsh,.fish,.ps1,.css,.scss,.vue,.svelte,.html,.htm,.zip,text/plain,text/markdown,text/csv,text/html,application/json,application/zip">
+              </label>
+              <button type="submit" class="autotune-run">Upload and index</button>
+            </form>
+            <form id="ragURLForm" class="rag-document-form rag-import-card">
+              <div>
+                <strong>Import from the web</strong>
+                <p class="field-note">Paste up to 20 Wikipedia articles or other public HTTP(S) pages, one URL per line. Re-importing the same URL updates its existing entry.</p>
+              </div>
+              <label class="model-download-label" for="ragURL">Source URLs
+                <textarea id="ragURL" rows="3" placeholder="https://de.wikipedia.org/wiki/…&#10;https://example.com/handbook" required></textarea>
+              </label>
+              <label class="model-download-label" for="ragURLTitle">Title override (optional)
+                <input type="text" id="ragURLTitle" placeholder="Available for a single URL" autocomplete="off" maxlength="200">
+              </label>
+              <button type="submit" class="autotune-run">Import and index</button>
+            </form>
+            <form id="ragDocumentForm" class="rag-document-form rag-import-card">
+              <div>
+                <strong>Paste text</strong>
+                <p class="field-note">Add notes or other content that is not already available as a file or URL.</p>
+              </div>
+              <label class="model-download-label" for="ragDocumentTitle">Title (optional)
+                <input type="text" id="ragDocumentTitle" placeholder="e.g. Return Policy" autocomplete="off" maxlength="200">
+              </label>
+              <label class="model-download-label" for="ragDocumentText">Document text
+                <textarea id="ragDocumentText" rows="4" placeholder="Paste or type the text to index…"></textarea>
+              </label>
+              <button type="submit" class="autotune-run">Add to knowledge base</button>
+            </form>
           </div>
         </section>
         <p id="skillsNote" class="skills-note" hidden></p>

@@ -389,7 +389,9 @@ bin/gopherllm --model-dir /path/to/models --serve --chat \
 same directory can be scanned again with `POST /rag/reload`. The Web UI's
 **Knowledge base** panel (Settings → Capabilities) can also paste text, upload
 several supported text files at once, and import up to 20 public HTTP(S)
-sources per request.
+sources per request. A ZIP upload expands into one document per supported
+entry without writing the archive to disk; archives are bounded to 200
+entries, 4 MiB per extracted file, and 20 MiB total extracted text.
 Wikipedia article URLs use MediaWiki's plaintext API, including article
 redirects, so the complete article is indexed without Wikipedia navigation or
 page chrome. Other HTML pages are reduced to readable text; scripts, styles,
@@ -397,6 +399,9 @@ navigation, headers, and footers are discarded. URL-based documents receive a
 stable ID derived from their normalized source URL: importing the same source
 again updates it instead of creating a duplicate. The Web UI exposes the same
 operation as **Refresh** next to every imported web source.
+The panel's **Test retrieval** form previews the same ranked chunks and source
+metadata that `search_documents` can return to a chat, making it possible to
+check ingestion and chunking before asking the model a question.
 
 The default file allowlist and 4 MiB per-file cap match `rag.Index.AddFS` and
 `agent.Agent`'s `WithDocuments`. URL imports are capped at 2 MiB and protected
@@ -411,6 +416,9 @@ curl -X POST http://127.0.0.1:8080/rag/documents \
 curl -X POST http://127.0.0.1:8080/rag/upload \
   -F 'files=@handbook.md' -F 'files=@faq.txt'
 
+curl -X POST http://127.0.0.1:8080/rag/upload \
+  -F 'files=@engineering-docs.zip'
+
 curl -X POST http://127.0.0.1:8080/rag/fetch \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://de.wikipedia.org/wiki/Retrieval-Augmented_Generation"}'
@@ -421,6 +429,10 @@ curl -X POST http://127.0.0.1:8080/rag/fetch \
     {"url": "https://example.com/handbook"},
     {"url": "https://en.wikipedia.org/wiki/Retrieval-augmented_generation"}
   ]}'
+
+curl -X POST http://127.0.0.1:8080/rag/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "return window", "top_k": 5}'
 
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \

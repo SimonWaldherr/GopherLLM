@@ -1236,6 +1236,11 @@ function toMarkdown(chat) {
   const ragStatusEl = $("ragStatus");
   const ragKnowledgeBaseStatusEl = $("ragKnowledgeBaseStatus");
   const ragDocumentsListEl = $("ragDocumentsList");
+  const ragSearchFormEl = $("ragSearchForm");
+  const ragSearchQueryEl = $("ragSearchQuery");
+  const ragSearchTopKEl = $("ragSearchTopK");
+  const ragSearchStatusEl = $("ragSearchStatus");
+  const ragSearchResultsEl = $("ragSearchResults");
   const ragUploadFormEl = $("ragUploadForm");
   const ragUploadFilesEl = $("ragUploadFiles");
   const ragURLFormEl = $("ragURLForm");
@@ -4161,6 +4166,39 @@ function toMarkdown(chat) {
     }
   }
 
+  function renderRAGSearchResults(hits, query) {
+    ragSearchResultsEl.replaceChildren();
+    if (!hits.length) {
+      ragSearchResultsEl.hidden = true;
+      ragSearchStatusEl.hidden = false;
+      ragSearchStatusEl.textContent = "No matching chunks found for “" + query + "”.";
+      return;
+    }
+    hits.forEach((hit, index) => {
+      const item = document.createElement("li");
+      item.className = "rag-search-result";
+      const head = document.createElement("div");
+      head.className = "rag-search-result-head";
+      const title = document.createElement("strong");
+      title.textContent = hit.title || hit.doc_id || "Untitled source";
+      const score = document.createElement("span");
+      const scoreValue = Math.max(0, Math.min(1, Number(hit.score) || 0));
+      score.textContent = Math.round(scoreValue * 100) + "% match";
+      head.append(title, score);
+      const meta = document.createElement("div");
+      meta.className = "rag-search-result-meta";
+      const details = ["#" + (index + 1), hit.kind, hit.path, Number.isFinite(Number(hit.chunk_index)) ? "chunk " + hit.chunk_index : ""].filter(Boolean);
+      meta.textContent = details.join(" · ");
+      const excerpt = document.createElement("p");
+      excerpt.textContent = hit.excerpt || "";
+      item.append(head, meta, excerpt);
+      ragSearchResultsEl.appendChild(item);
+    });
+    ragSearchResultsEl.hidden = false;
+    ragSearchStatusEl.hidden = false;
+    ragSearchStatusEl.textContent = hits.length + (hits.length === 1 ? " matching chunk" : " matching chunks") + " for “" + query + "”.";
+  }
+
   /* ════════════════════════════════
      Power commands
      ════════════════════════════════ */
@@ -5609,6 +5647,33 @@ function toMarkdown(chat) {
       submitButton.disabled = false;
     }
   });
+  ragSearchFormEl.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const query = ragSearchQueryEl.value.trim();
+    if (!query) {
+      ragSearchQueryEl.focus();
+      return;
+    }
+    const submitButton = ragSearchFormEl.querySelector("button[type=submit]");
+    submitButton.disabled = true;
+    ragSearchStatusEl.hidden = false;
+    ragSearchStatusEl.textContent = "Searching the knowledge base…";
+    try {
+      const response = await fetch("/rag/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, top_k: Number(ragSearchTopKEl.value) || 5 })
+      });
+      if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      const result = await response.json();
+      renderRAGSearchResults(Array.isArray(result.hits) ? result.hits : [], query);
+    } catch (error) {
+      ragSearchResultsEl.hidden = true;
+      ragSearchStatusEl.textContent = "Search failed: " + (error && error.message ? error.message : String(error));
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
   ragUploadFormEl.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!ragUploadFilesEl.files.length) {
@@ -5626,9 +5691,15 @@ function toMarkdown(chat) {
       const result = await response.json();
       ragUploadFormEl.reset();
       await refreshRAGDocuments();
-      const added = Array.isArray(result.documents) ? result.documents.length : 0;
+      const documents = Array.isArray(result.documents) ? result.documents : [];
+      const updated = documents.filter((doc) => doc && doc.updated).length;
+      const added = documents.length - updated;
       const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
-      showToast(added + (added === 1 ? " file" : " files") + " indexed" + (skipped ? "; " + skipped + " skipped." : "."), skipped ? "warning" : "success");
+      const parts = [];
+      if (added) parts.push(added + (added === 1 ? " document indexed" : " documents indexed"));
+      if (updated) parts.push(updated + (updated === 1 ? " document updated" : " documents updated"));
+      if (skipped) parts.push(skipped + " skipped");
+      showToast(parts.join(", ") + ".", skipped ? "warning" : "success");
     } catch (error) {
       showToast("Could not upload files: " + (error && error.message ? error.message : String(error)), "error");
     } finally {

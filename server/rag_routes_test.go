@@ -1,8 +1,10 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -97,6 +99,135 @@ func TestRAGUploadIndexesTextFilesAndReportsSkippedFiles(t *testing.T) {
 	}
 }
 
+func TestRAGUploadIndexesSupportedZIPEntries(t *testing.T) {
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	entries := map[string][]byte{
+		"docs/readme.md":  []byte("The copper telescope requires monthly collimation."),
+		"src/control.py":  []byte("def calibrate_mount(): return 'polaris'"),
+		"assets/logo.png": {0x89, 'P', 'N', 'G'},
+		"../escape.txt":   []byte("must not be accepted"),
+	}
+	for name, data := range entries {
+		entry, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := ragTestServer(t, HandlerOptions{})
+	upload := func() map[string]any {
+		t.Helper()
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("files", "observatory.zip")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = part.Write(archive.Bytes())
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		req, err := http.NewRequest(http.MethodPost, srv.URL+"/rag/upload", &body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var result map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("POST ZIP upload = %d: %+v", resp.StatusCode, result)
+		}
+		return result
+	}
+
+	first := upload()
+	docs, _ := first["documents"].([]any)
+	if len(docs) != 2 {
+		t.Fatalf("ZIP documents = %+v, want Markdown and Python entries", first)
+	}
+	for _, raw := range docs {
+		doc := raw.(map[string]any)
+		if doc["kind"] != "archive" || !strings.HasPrefix(doc["path"].(string), "observatory.zip!/") || doc["updated"] != false {
+			t.Fatalf("archive document = %+v", doc)
+		}
+	}
+	if skipped, _ := first["skipped"].([]any); len(skipped) != 2 {
+		t.Fatalf("ZIP skipped = %+v, want binary and unsafe path", first)
+	}
+
+	second := upload()
+	for _, raw := range second["documents"].([]any) {
+		if raw.(map[string]any)["updated"] != true {
+			t.Fatalf("re-uploaded archive document = %+v, want updated", raw)
+		}
+	}
+	var status map[string]any
+	getJSON(t, srv.Client(), srv.URL+"/rag/status", &status)
+	if int(status["documents"].(float64)) != 2 {
+		t.Fatalf("status after ZIP re-upload = %+v, want two documents", status)
+	}
+
+	search, err := srv.Client().Post(srv.URL+"/rag/search", "application/json", strings.NewReader(`{"query":"telescope collimation"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer search.Body.Close()
+	var searched map[string]any
+	if err := json.NewDecoder(search.Body).Decode(&searched); err != nil {
+		t.Fatal(err)
+	}
+	if hits, _ := searched["hits"].([]any); len(hits) == 0 {
+		t.Fatalf("search over ZIP upload = %+v, want a hit", searched)
+	}
+}
+
+func TestRAGUploadRejectsArchiveWithTooManyEntries(t *testing.T) {
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	for i := 0; i < maxRAGArchiveEntries+1; i++ {
+		entry, err := zw.Create(fmt.Sprintf("doc-%03d.txt", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = entry.Write([]byte("small"))
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := ragTestServer(t, HandlerOptions{})
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("files", "too-many.zip")
+	_, _ = part.Write(archive.Bytes())
+	_ = writer.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/rag/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(data), "limit is 200") {
+		t.Fatalf("oversized archive = %d %q, want 400 with entry limit", resp.StatusCode, data)
+	}
+}
+
 func TestRAGFetchExtractsWebPageTitleAndContent(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -159,7 +290,7 @@ func TestRAGFetchExtractsWebPageTitleAndContent(t *testing.T) {
 	if len(hits) == 0 {
 		t.Fatalf("search over fetched page = %+v, want a hit", searched)
 	}
-	if text, _ := hits[0].(map[string]any)["text"].(string); strings.Contains(text, "secretNavigationNoise") || strings.Contains(text, "Site links") {
+	if text, _ := hits[0].(map[string]any)["excerpt"].(string); strings.Contains(text, "secretNavigationNoise") || strings.Contains(text, "Site links") {
 		t.Fatalf("fetched text retained ignored page chrome: %q", text)
 	}
 }
@@ -341,6 +472,15 @@ func TestRAGDocumentLifecycle(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty query search = %d, want 400", resp.StatusCode)
+	}
+
+	resp, err = client.Post(srv.URL+"/rag/search", "application/json", strings.NewReader(`{"query":"refund","top_k":51}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized top_k search = %d, want 400", resp.StatusCode)
 	}
 
 	// Deleting an unknown document is a 404, not a silent success.

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"archive/zip"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,6 +30,8 @@ const maxRAGUploadFileBytes = 4 << 20
 const maxRAGUploadTotalBytes = 20 << 20
 
 const (
+	maxRAGArchiveEntries    = 200
+	maxRAGArchiveTotalBytes = 20 << 20
 	maxRAGFetchSources      = 20
 	maxRAGFetchRequestBytes = 64 << 10
 )
@@ -164,6 +168,10 @@ func registerRAGRoutes(mux *http.ServeMux, state *ragState, sem chan struct{}) {
 			http.Error(w, "query must not be empty", http.StatusBadRequest)
 			return
 		}
+		if body.TopK < 0 || body.TopK > 50 {
+			http.Error(w, "top_k must be between 1 and 50 (or zero for the default)", http.StatusBadRequest)
+			return
+		}
 		q := rag.Query{TopK: body.TopK, Lexical: rag.GuessLexicalMode(body.Query)}
 		hits, err := state.index.Search(req.Context(), body.Query, q)
 		if err != nil {
@@ -252,11 +260,10 @@ func addRAGDocuments(w http.ResponseWriter, req *http.Request, state *ragState) 
 
 // uploadRAGDocuments implements POST /rag/upload: a multipart/form-data
 // request carrying one or more files under any field name(s), each indexed
-// as its own Doc. A file whose extension is not in rag.DefaultTextExtension's
-// allowlist, or that exceeds maxRAGUploadFileBytes, is skipped rather than
-// failing the whole request — the same "skip, don't fail the batch" policy
-// rag.Index.AddFS applies to a directory walk, so one oversized or binary
-// file among several does not block the rest.
+// as its own Doc. ZIP archives expand into one Doc per supported entry under
+// strict count and uncompressed-size limits. Unsupported, oversized, or
+// invalid files are skipped rather than failing the whole request — the same
+// "skip, don't fail the batch" policy rag.Index.AddFS applies.
 func uploadRAGDocuments(w http.ResponseWriter, req *http.Request, state *ragState) {
 	req.Body = http.MaxBytesReader(w, req.Body, maxRAGUploadTotalBytes)
 	if err := req.ParseMultipartForm(maxRAGUploadTotalBytes); err != nil {
@@ -279,9 +286,14 @@ func uploadRAGDocuments(w http.ResponseWriter, req *http.Request, state *ragStat
 	now := time.Now()
 	for _, fh := range headers {
 		name := filepath.Base(fh.Filename)
-		isHTML := strings.EqualFold(filepath.Ext(name), ".html") || strings.EqualFold(filepath.Ext(name), ".htm")
+		if strings.EqualFold(filepath.Ext(name), ".zip") {
+			archiveDocs, archiveSkipped := readRAGArchive(fh, now)
+			docs = append(docs, archiveDocs...)
+			skipped = append(skipped, archiveSkipped...)
+			continue
+		}
 		switch {
-		case !rag.DefaultTextExtension(name) && !isHTML:
+		case !ragUploadFileSupported(name):
 			skipped = append(skipped, name+": unsupported file type")
 			continue
 		case fh.Size > maxRAGUploadFileBytes:
@@ -293,24 +305,26 @@ func uploadRAGDocuments(w http.ResponseWriter, req *http.Request, state *ragStat
 			skipped = append(skipped, name+": "+err.Error())
 			continue
 		}
-		if !validRAGText(data) {
-			skipped = append(skipped, name+": file is empty or not valid UTF-8 text")
+		doc, err := ragDocFromUpload(name, name, data, "upload", now)
+		if err != nil {
+			skipped = append(skipped, name+": "+err.Error())
 			continue
 		}
-		title, text := name, strings.TrimSpace(string(data))
-		if isHTML {
-			extractedTitle, extractedText := extractRAGHTML(data)
-			text = extractedText
-			if extractedTitle != "" {
-				title = extractedTitle
-			}
-		}
-		if text == "" {
-			skipped = append(skipped, name+": file is empty or had no extractable text")
-			continue
-		}
-		docs = append(docs, rag.Doc{ID: newDocID(), Title: title, Path: name, Text: text, Time: now, Kind: "upload"})
+		docs = append(docs, doc)
 	}
+	seen := make(map[string]bool, len(docs))
+	unique := docs[:0]
+	updated := make([]bool, 0, len(docs))
+	for _, doc := range docs {
+		if seen[doc.ID] {
+			skipped = append(skipped, doc.Path+": duplicate upload source in this request")
+			continue
+		}
+		seen[doc.ID] = true
+		updated = append(updated, docExists(state.index, doc.ID))
+		unique = append(unique, doc)
+	}
+	docs = unique
 	if len(docs) == 0 {
 		http.Error(w, "no uploaded file could be indexed: "+strings.Join(skipped, "; "), http.StatusBadRequest)
 		return
@@ -325,8 +339,118 @@ func uploadRAGDocuments(w http.ResponseWriter, req *http.Request, state *ragStat
 	out := make([]map[string]any, len(docs))
 	for i, d := range docs {
 		out[i] = docInfoJSON(docByID(state.index, d.ID))
+		out[i]["updated"] = updated[i]
 	}
 	writeJSON(w, map[string]any{"documents": out, "skipped": skipped})
+}
+
+func ragUploadFileSupported(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return rag.DefaultTextExtension(name) || ext == ".html" || ext == ".htm"
+}
+
+func ragUploadDocID(source string) string {
+	digest := sha256.Sum256([]byte(source))
+	return fmt.Sprintf("upload-%x", digest[:12])
+}
+
+func ragDocFromUpload(source, displayPath string, data []byte, kind string, now time.Time) (rag.Doc, error) {
+	if !validRAGText(data) {
+		return rag.Doc{}, fmt.Errorf("not valid UTF-8 text")
+	}
+	title, text := path.Base(displayPath), strings.TrimSpace(string(data))
+	ext := strings.ToLower(path.Ext(displayPath))
+	if ext == ".html" || ext == ".htm" {
+		extractedTitle, extractedText := extractRAGHTML(data)
+		text = extractedText
+		if extractedTitle != "" {
+			title = extractedTitle
+		}
+	}
+	if text == "" {
+		return rag.Doc{}, fmt.Errorf("empty or had no extractable text")
+	}
+	return rag.Doc{ID: ragUploadDocID(source), Title: title, Path: displayPath, Text: text, Time: now, Kind: kind}, nil
+}
+
+// readRAGArchive indexes supported regular files from one ZIP without ever
+// extracting to disk. Paths are still validated because they become visible
+// citation metadata, and rejecting traversal-shaped names avoids teaching a
+// caller that a malicious archive layout was accepted as meaningful input.
+func readRAGArchive(fh *multipart.FileHeader, now time.Time) ([]rag.Doc, []string) {
+	archiveName := filepath.Base(fh.Filename)
+	if fh.Size <= 0 || fh.Size > maxRAGUploadTotalBytes {
+		return nil, []string{archiveName + ": archive exceeds the compressed size limit"}
+	}
+	f, err := fh.Open()
+	if err != nil {
+		return nil, []string{archiveName + ": " + err.Error()}
+	}
+	defer f.Close()
+	zr, err := zip.NewReader(f, fh.Size)
+	if err != nil {
+		return nil, []string{archiveName + ": invalid ZIP archive"}
+	}
+	if len(zr.File) > maxRAGArchiveEntries {
+		return nil, []string{fmt.Sprintf("%s: archive contains %d entries; limit is %d", archiveName, len(zr.File), maxRAGArchiveEntries)}
+	}
+
+	var docs []rag.Doc
+	var skipped []string
+	var total int64
+	for _, entry := range zr.File {
+		entryName := path.Clean(strings.ReplaceAll(entry.Name, "\\", "/"))
+		displayPath := archiveName + "!/" + entryName
+		if entry.FileInfo().IsDir() {
+			continue
+		}
+		firstSegment := strings.SplitN(entryName, "/", 2)[0]
+		if entryName == "." || strings.HasPrefix(entryName, "../") || path.IsAbs(entryName) || strings.Contains(firstSegment, ":") {
+			skipped = append(skipped, displayPath+": unsafe archive path")
+			continue
+		}
+		if !entry.Mode().IsRegular() {
+			skipped = append(skipped, displayPath+": non-regular archive entry")
+			continue
+		}
+		if !ragUploadFileSupported(entryName) {
+			skipped = append(skipped, displayPath+": unsupported file type")
+			continue
+		}
+		if entry.UncompressedSize64 > maxRAGUploadFileBytes {
+			skipped = append(skipped, displayPath+": exceeds the per-file size limit")
+			continue
+		}
+		remaining := int64(maxRAGArchiveTotalBytes) - total
+		if remaining <= 0 {
+			skipped = append(skipped, displayPath+": archive exceeds the total uncompressed size limit")
+			continue
+		}
+		rc, err := entry.Open()
+		if err != nil {
+			skipped = append(skipped, displayPath+": "+err.Error())
+			continue
+		}
+		limit := min(int64(maxRAGUploadFileBytes), remaining)
+		data, readErr := io.ReadAll(io.LimitReader(rc, limit+1))
+		rc.Close()
+		if readErr != nil {
+			skipped = append(skipped, displayPath+": "+readErr.Error())
+			continue
+		}
+		if int64(len(data)) > limit {
+			skipped = append(skipped, displayPath+": exceeds an uncompressed size limit")
+			continue
+		}
+		total += int64(len(data))
+		doc, err := ragDocFromUpload(archiveName+"\x00"+entryName, displayPath, data, "archive", now)
+		if err != nil {
+			skipped = append(skipped, displayPath+": "+err.Error())
+			continue
+		}
+		docs = append(docs, doc)
+	}
+	return docs, skipped
 }
 
 func readUploadedFile(fh *multipart.FileHeader) ([]byte, error) {

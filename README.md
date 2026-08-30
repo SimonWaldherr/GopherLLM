@@ -344,8 +344,9 @@ chat model's mean-pooled hidden states (not a trained embedding head) tend to
 lose; see `rag.Options.Embedder`'s doc comment before wiring one up.
 `Index.Save`/`rag.Load` persist a built index so a second run skips
 re-embedding. The bundled server adds runtime ingestion for pasted text,
-multi-file uploads, and public web URLs (with clean full-article imports for
-Wikipedia); see [Knowledge base search](server/README.md#knowledge-base-search-rag).
+multi-file and ZIP uploads, and public web URLs (with clean full-article
+imports for Wikipedia), plus an interactive retrieval preview; see
+[Knowledge base search](server/README.md#knowledge-base-search-rag).
 See the [rag package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM/rag)
 for chunking, ranking weights, and directory ingestion via `Index.AddFS`.
 
