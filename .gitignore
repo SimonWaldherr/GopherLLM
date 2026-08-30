@@ -10,3 +10,6 @@ scratch/p.prof
 *.pprof
 /pool-lifeguard-assist
 GopherLLM.test
+
+# Local exports may contain private conversation or retrieval data.
+/rag/private/

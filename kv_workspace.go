@@ -3,15 +3,20 @@ package gopherllm
 // prefixCacheState points at the retained generation workspace. tokens are
 // exactly the positions resident in it. promptLogits is a bounded,
 // vocab-sized snapshot taken before sampling mutates the live logits; it lets
-// an identical request skip even the final prompt-token forward pass. Qwen35
-// additionally needs its independent DeltaNet state to resume the prefix.
-// Runner.genLock protects the whole structure.
+// an identical request skip even the final prompt-token forward pass. Greedy
+// Q6_K output can retain its exact next token instead, avoiding that large
+// snapshot and preserving the GPU no-readback win across an identical prompt.
+// Qwen35 additionally needs its independent DeltaNet state to resume the
+// prefix. Runner.genLock protects the whole structure.
 type prefixCacheState struct {
-	cache        *KVCache
-	tokens       []uint32
-	promptTokens int
-	promptLogits []float32
-	qwen35       *Qwen35Cache
+	cache                     *KVCache
+	tokens                    []uint32
+	promptTokens              int
+	promptLogits              []float32
+	promptGreedyToken         uint32
+	promptGreedyRepeatPenalty float32
+	promptHasGreedyToken      bool
+	qwen35                    *Qwen35Cache
 	// qwen35MTP is only present for a request that opted into MTP. Its KV rows
 	// remain in the shared workspace alongside ordinary Qwen K/V; this tiny
 	// snapshot carries the one recurrent boundary value that those rows need.

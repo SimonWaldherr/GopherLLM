@@ -453,7 +453,10 @@ func dequantRowInto(w Weight, cols int) func(row []byte, cols int, out []float32
 // startPos..startPos+len(tokens)-1) through the standard transformer, populating
 // the KV cache. The matvecs are batched so each weight is streamed once for the
 // whole chunk. When computeLast is set, the final token's logits are written to
-// logits. Only the non-fused standard path is supported (callers must check).
+// logits. Passing nil still leaves the final normalized hidden state in
+// buf.XN, but skips the vocabulary projection; greedy prefill then reduces
+// that state through the exact no-logits argmax path. Only the non-fused
+// standard path is supported (callers must check).
 func ForwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, computeLast bool, logits *[]float32) {
 	forwardBatchInto(config, weights, cache, buf, tokens, startPos, computeLast, logits, nil)
 }
@@ -707,13 +710,15 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	if computeLast {
 		last := p - 1
 		normalizeDecoderInto(config, X[last], weights.OutputNorm, weights.OutputNormBias, &buf.XN)
-		weights.Output.MatvecInto(buf.XN, logits)
-		addInPlace(*logits, weights.OutputBias)
-		if config.LogitScale != 1 {
-			ScaleF32(*logits, 1/config.LogitScale)
-		}
-		if config.FinalLogitSoftcap > 0 {
-			softcapF32(*logits, config.FinalLogitSoftcap)
+		if logits != nil {
+			weights.Output.MatvecInto(buf.XN, logits)
+			addInPlace(*logits, weights.OutputBias)
+			if config.LogitScale != 1 {
+				ScaleF32(*logits, 1/config.LogitScale)
+			}
+			if config.FinalLogitSoftcap > 0 {
+				softcapF32(*logits, config.FinalLogitSoftcap)
+			}
 		}
 	}
 }

@@ -50,35 +50,36 @@ func (r *Runner) mtpDraftTokenCount(options GenerationOptions) (int, error) {
 	return options.MTPDraftTokens, nil
 }
 
-func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {
+// greedyOutputToken finds the deterministic next token from a transformer body
+// already left in buf.XN. Keeping this separate from forwardGreedyToken lets
+// greedy prompt prefill use the same no-logits argmax path as decode: a
+// vocabulary-sized projection does not need to cross back to Go merely to
+// select one token. If an output form cannot take that shortcut, this function
+// restores the established materialized-logits fallback for the sampler.
+func (r *Runner) greedyOutputToken(buf *DecodeBuffer, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {
 	switch r.kind {
 	case loadedNemotronH:
-		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenPenalizedInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.nemotronH.Output}, buf, logits)
 	case loadedMamba2:
-		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenPenalizedInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.mamba2.Output}, buf, logits)
 	case loadedQwen35:
-		ForwardQwen35BodyInto(r.config, r.qwen35, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenPenalizedInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, ModelWeights{Output: r.qwen35.Output}, buf, logits)
 	case loadedGptOss:
-		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenPenalizedInto(r.config, r.gptOss.Standard, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.gptOss.Standard, buf, logits)
 	case loadedGemma4:
 		if r.gemma4.Native {
-			forwardNativeGemma4BodyInto(r.config, r.gemma4, cache, buf, token, pos)
 			nativeOutput := ModelWeights{Output: r.gemma4.Output}
 			if next, ok := argmaxOutputTokenPenalizedInto(r.config, nativeOutput, buf, recent, repeatPenalty, logits); ok {
 				return next, true
@@ -86,19 +87,39 @@ func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uin
 			projectNativeGemma4Logits(r.config, r.gemma4, buf, logits)
 			break
 		}
-		ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenPenalizedInto(r.config, r.gemma4.Standard, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.gemma4.Standard, buf, logits)
 	default:
-		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
 		if next, ok := argmaxOutputTokenPenalizedInto(r.config, r.standard, buf, recent, repeatPenalty, logits); ok {
 			return next, true
 		}
 		ProjectLogitsInto(r.config, r.standard, buf, logits)
 	}
 	return 0, false
+}
+
+func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {
+	switch r.kind {
+	case loadedNemotronH:
+		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
+	case loadedMamba2:
+		ForwardMamba2BodyInto(r.config, r.mamba2, cache, buf, token, pos)
+	case loadedQwen35:
+		ForwardQwen35BodyInto(r.config, r.qwen35, cache, buf, token, pos)
+	case loadedGptOss:
+		ForwardBodyInto(r.config, r.gptOss.Standard, cache, buf, token, pos)
+	case loadedGemma4:
+		if r.gemma4.Native {
+			forwardNativeGemma4BodyInto(r.config, r.gemma4, cache, buf, token, pos)
+		} else {
+			ForwardBodyInto(r.config, r.gemma4.Standard, cache, buf, token, pos)
+		}
+	default:
+		ForwardBodyInto(r.config, r.standard, cache, buf, token, pos)
+	}
+	return r.greedyOutputToken(buf, recent, repeatPenalty, logits)
 }
 
 func (r *Runner) forwardHiddenToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int) []float32 {

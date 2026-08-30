@@ -116,6 +116,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	buf.ImageEmbeds = imageEmbeds
 	defer func() { buf.ImageEmbeds = nil }()
 	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
+	greedyFastPath := r.canGreedyOutputFastPath(options)
 	reusedTokens := 0
 	// Prefix-cache matching is purely token-ID based (sharedTokenPrefix): it
 	// cannot distinguish two different images that render to the same
@@ -160,6 +161,9 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	cachedResidentTokens := r.prefixCache.tokens
 	cachedPromptTokens := r.prefixCache.promptTokens
 	cachedPromptLogits := r.prefixCache.promptLogits
+	cachedPromptGreedyToken := r.prefixCache.promptGreedyToken
+	cachedPromptGreedyRepeatPenalty := r.prefixCache.promptGreedyRepeatPenalty
+	cachedPromptHasGreedyToken := r.prefixCache.promptHasGreedyToken
 	if cacheEligible {
 		cacheInfo.Mode = "prefix"
 		reusedTokens = r.prefixReuseWithMTP(cache, tokens, mtpDraftTokens > 0)
@@ -191,10 +195,22 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	}
 	prefillOffset := reusedTokens
 	logits := buf.Logits
+	var initialNextToken uint32
+	haveInitialNextToken := false
+	promptGreedyToken := uint32(0)
+	promptGreedyRepeatPenalty := float32(0)
+	promptHasGreedyToken := false
 	if prefillOffset == len(tokens) {
 		if cachedPromptTokens == len(tokens) && len(cachedPromptLogits) > 0 {
 			ensureLenNoClear(&logits, len(cachedPromptLogits))
 			copy(logits, cachedPromptLogits)
+		} else if cachedPromptTokens == len(tokens) && greedyFastPath && cachedPromptHasGreedyToken &&
+			cachedPromptGreedyRepeatPenalty == options.Sampler.RepeatPenalty {
+			initialNextToken = cachedPromptGreedyToken
+			haveInitialNextToken = true
+			promptGreedyToken = cachedPromptGreedyToken
+			promptGreedyRepeatPenalty = cachedPromptGreedyRepeatPenalty
+			promptHasGreedyToken = true
 		} else {
 			prefillOffset = max(0, len(tokens)-1)
 			cacheInfo.Hit = prefillOffset > 0
@@ -204,6 +220,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	prefillBegan := time.Now()
 	residentTokens := cachedResidentTokens[:0]
 	promptLogits := cachedPromptLogits[:0]
+	recent := recentTokenWindowInto(buf.RecentTokens[:0], tokens)
 	prefillComplete := false
 	defer func() {
 		buf.Logits = logits
@@ -238,18 +255,32 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			}
 		}
 		state := prefixCacheState{
-			cache:        cache,
-			tokens:       residentTokens,
-			promptTokens: len(tokens),
-			promptLogits: promptLogits,
-			qwen35:       qwen35Snapshot,
-			qwen35MTP:    qwen35MTP,
+			cache:                     cache,
+			tokens:                    residentTokens,
+			promptTokens:              len(tokens),
+			promptLogits:              promptLogits,
+			promptGreedyToken:         promptGreedyToken,
+			promptGreedyRepeatPenalty: promptGreedyRepeatPenalty,
+			promptHasGreedyToken:      promptHasGreedyToken,
+			qwen35:                    qwen35Snapshot,
+			qwen35MTP:                 qwen35MTP,
 		}
 		r.prefixCache = state
 	}()
 	if prefillOffset < len(tokens) {
 		if r.canBatchPrefill() {
-			if err := r.prefillBatchedAt(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, &logits); err != nil {
+			// Greedy output needs only the final normalized hidden state. Asking
+			// the batch graph to omit its vocabulary projection lets
+			// greedyOutputToken retain a direct Metal Q6_K reduction on-device;
+			// unsupported heads still materialize logits immediately afterwards.
+			if greedyFastPath {
+				logits = logits[:0]
+			}
+			var batchLogits *[]float32
+			if !greedyFastPath {
+				batchLogits = &logits
+			}
+			if err := r.prefillBatchedAt(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, batchLogits); err != nil {
 				return GenerationResult{}, err
 			}
 		} else {
@@ -257,7 +288,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 				if err := ctx.Err(); err != nil {
 					return GenerationResult{}, err
 				}
-				if pos == len(tokens)-1 {
+				if pos == len(tokens)-1 && !greedyFastPath {
 					r.forwardTokenInto(cache, buf, tokens[pos], pos, &logits)
 				} else {
 					r.forwardPrefillToken(cache, buf, tokens[pos], pos)
@@ -265,6 +296,15 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 				if mtpDraftTokens > 0 {
 					qwen35MTPProcess(r.config, r.qwen35.MTP, cache.Qwen35MTP, tokens[pos], buf.XN, pos)
 				}
+			}
+		}
+		if greedyFastPath {
+			if next, ok := r.greedyOutputToken(buf, recent, options.Sampler.RepeatPenalty, &logits); ok {
+				initialNextToken = next
+				haveInitialNextToken = true
+				promptGreedyToken = next
+				promptGreedyRepeatPenalty = options.Sampler.RepeatPenalty
+				promptHasGreedyToken = true
 			}
 		}
 	}
@@ -313,7 +353,6 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return true
 	}
 	generated := buf.GeneratedTokens[:0]
-	recent := recentTokenWindowInto(buf.RecentTokens[:0], tokens)
 	defer func() {
 		buf.GeneratedTokens = generated[:0]
 		buf.RecentTokens = recent[:0]
@@ -321,9 +360,8 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	}()
 	pos := len(tokens)
 	finishReason := "length"
-	greedyFastPath := r.canGreedyOutputFastPath(options)
-	haveNextToken := false
-	var nextToken uint32
+	haveNextToken := haveInitialNextToken
+	nextToken := initialNextToken
 	buildResult := func() GenerationResult {
 		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
 		content, reasoning, calls := r.classifyOutput(output.String(), options.ActiveTools(), rng)

@@ -451,6 +451,64 @@ func TestGenerateChatPrefixCacheKeepsSamplingDeterministic(t *testing.T) {
 	}
 }
 
+func TestGreedyQuantizedPrefillAvoidsLogitsAndCachesToken(t *testing.T) {
+	// The tiny Mistral fixture uses a genuine Q6_K vocabulary head. With a
+	// unit repeat penalty the CPU argmax is exact too, so this verifies both
+	// the no-logits prefill handoff and the compact exact-prompt cache entry
+	// without depending on Metal being available in this build.
+	data := buildTinyQuantizedMistralGGUF()
+	fast, err := RunnerFromGGUFBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.Close()
+	opts := DefaultGenerationOptions()
+	opts.SystemPrompt = ""
+	opts.MaxTokens = 4
+	opts.Seed = 17
+	opts.Sampler.Temperature = 0
+	opts.Sampler.TopK = 1
+	opts.Sampler.RepeatPenalty = 1
+	prompt := "a b c"
+
+	first, err := fast.Generate(prompt, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fast.prefixCache.promptHasGreedyToken {
+		t.Fatal("greedy Q6_K prefill did not retain its exact next token")
+	}
+	if len(fast.prefixCache.promptLogits) != 0 {
+		t.Fatalf("greedy Q6_K prefill retained %d materialized logits", len(fast.prefixCache.promptLogits))
+	}
+	second, err := fast.Generate(prompt, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.PromptCache == nil || !second.PromptCache.Hit || second.PromptCache.ReusedTokens != second.Stats.PromptTokens {
+		t.Fatalf("same-prompt greedy cache = %+v, want full direct-token reuse", second.PromptCache)
+	}
+	if !fast.prefixCache.promptHasGreedyToken || len(fast.prefixCache.promptLogits) != 0 {
+		t.Fatalf("same-prompt reuse lost compact greedy cache: %+v", fast.prefixCache)
+	}
+
+	// The escape hatch makes prefill materialize logits and use the generic
+	// sampler. Its generated text must remain bit-for-bit equivalent.
+	t.Setenv("GOPHERLLM_NO_GREEDY_ARGMAX", "1")
+	baseline, err := RunnerFromGGUFBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer baseline.Close()
+	want, err := baseline.Generate(prompt, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Text != want.Text || second.Text != want.Text {
+		t.Fatalf("greedy prefill text first=%q second=%q, materialized baseline=%q", first.Text, second.Text, want.Text)
+	}
+}
+
 func TestEmbeddingInvalidatesKVPrefix(t *testing.T) {
 	r, err := RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {
