@@ -553,13 +553,13 @@
           <form id="ragURLForm" class="rag-document-form rag-import-card">
             <div>
               <strong>Import from the web</strong>
-              <p class="field-note">Paste a Wikipedia article or another public HTTP(S) page. Wikipedia articles are imported as clean, complete article text.</p>
+              <p class="field-note">Paste up to 20 Wikipedia articles or other public HTTP(S) pages, one URL per line. Re-importing the same URL updates its existing entry.</p>
             </div>
-            <label class="model-download-label" for="ragURL">Source URL
-              <input type="url" id="ragURL" placeholder="https://de.wikipedia.org/wiki/…" autocomplete="url" required>
+            <label class="model-download-label" for="ragURL">Source URLs
+              <textarea id="ragURL" rows="3" placeholder="https://de.wikipedia.org/wiki/…&#10;https://example.com/handbook" required></textarea>
             </label>
             <label class="model-download-label" for="ragURLTitle">Title override (optional)
-              <input type="text" id="ragURLTitle" placeholder="Detected from the source" autocomplete="off" maxlength="200">
+              <input type="text" id="ragURLTitle" placeholder="Available for a single URL" autocomplete="off" maxlength="200">
             </label>
             <button type="submit" class="autotune-run">Import and index</button>
           </form>

@@ -1,10 +1,13 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -24,6 +27,11 @@ const maxRAGUploadFileBytes = 4 << 20
 // POST /rag/reload are for.
 const maxRAGUploadTotalBytes = 20 << 20
 
+const (
+	maxRAGFetchSources      = 20
+	maxRAGFetchRequestBytes = 64 << 10
+)
+
 // registerRAGRoutes registers the management, search, and ingestion
 // endpoints for the server-side knowledge base a search_documents tool (see
 // agenticToolsFor in server.go) searches during chat:
@@ -31,7 +39,7 @@ const maxRAGUploadTotalBytes = 20 << 20
 //   - GET  /rag/status    — document/chunk counts and which capabilities are active
 //   - GET/POST/DELETE /rag/documents — list, add (one or many, pasted as JSON), or remove
 //   - POST /rag/upload    — add one or more uploaded files
-//   - POST /rag/fetch     — add a document by fetching and extracting a URL
+//   - POST /rag/fetch     — add or update documents by fetching up to 20 URLs
 //   - POST /rag/reload    — re-scan HandlerOptions.RAGDocsDir for new or changed files
 //   - POST /rag/search    — preview a search without a chat turn
 //
@@ -337,40 +345,143 @@ func readUploadedFile(fh *multipart.FileHeader) ([]byte, error) {
 	return data, nil
 }
 
-// fetchRAGDocument implements POST /rag/fetch: it retrieves body.URL through
-// ragFetchClient's SSRF-guarded transport and indexes the result as one Doc.
-// Wikipedia article URLs use the plaintext MediaWiki API; other sources are
-// accepted by Content-Type and HTML is reduced to readable text.
+type ragFetchInput struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+type ragFetchError struct {
+	status int
+	err    error
+}
+
+func (e *ragFetchError) Error() string { return e.err.Error() }
+
+func newRAGFetchError(status int, format string, args ...any) error {
+	return &ragFetchError{status: status, err: fmt.Errorf(format, args...)}
+}
+
+func ragFetchErrorStatus(err error) int {
+	if typed, ok := err.(*ragFetchError); ok {
+		return typed.status
+	}
+	return http.StatusInternalServerError
+}
+
+// fetchRAGDocument implements POST /rag/fetch. The legacy top-level
+// id/title/url fields import one source; "sources" imports up to 20 in one
+// request and adds every successful result through a single Index.Add call,
+// which also means a single embedding batch. Failed entries in a batch are
+// reported without discarding successful imports.
 func fetchRAGDocument(w http.ResponseWriter, req *http.Request, state *ragState) {
+	req.Body = http.MaxBytesReader(w, req.Body, maxRAGFetchRequestBytes)
 	var body struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
-		URL   string `json:"url"`
+		ragFetchInput
+		Sources []ragFetchInput `json:"sources"`
 	}
 	if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	body.URL = strings.TrimSpace(body.URL)
-	if body.URL == "" {
-		http.Error(w, "url must not be empty", http.StatusBadRequest)
-		return
+	inputs := body.Sources
+	batch := len(inputs) > 0
+	if !batch {
+		inputs = []ragFetchInput{body.ragFetchInput}
 	}
-	target, err := url.Parse(body.URL)
-	if err != nil || target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
-		http.Error(w, "url must be an absolute http or https URL", http.StatusBadRequest)
+	if len(inputs) > maxRAGFetchSources {
+		http.Error(w, fmt.Sprintf("at most %d sources may be imported at once", maxRAGFetchSources), http.StatusBadRequest)
 		return
 	}
 
-	fetchURL := target.String()
+	docs := make([]rag.Doc, 0, len(inputs))
+	updated := make([]bool, 0, len(inputs))
+	var skipped []map[string]string
+	seen := make(map[string]bool, len(inputs))
+	client := ragFetchClientFunc()
+	for _, input := range inputs {
+		doc, err := fetchRAGSource(req.Context(), client, input)
+		if err != nil {
+			if !batch {
+				http.Error(w, err.Error(), ragFetchErrorStatus(err))
+				return
+			}
+			skipped = append(skipped, map[string]string{"url": strings.TrimSpace(input.URL), "error": err.Error()})
+			continue
+		}
+		if seen[doc.ID] {
+			skipped = append(skipped, map[string]string{"url": doc.Path, "error": "duplicate source in this request"})
+			continue
+		}
+		seen[doc.ID] = true
+		docs = append(docs, doc)
+		updated = append(updated, docExists(state.index, doc.ID))
+	}
+	if len(docs) == 0 {
+		http.Error(w, "no web source could be imported", http.StatusUnprocessableEntity)
+		return
+	}
+	if err := state.index.Add(req.Context(), docs...); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	state.save()
+
+	out := make([]map[string]any, len(docs))
+	for i, doc := range docs {
+		out[i] = docInfoJSON(docByID(state.index, doc.ID))
+		out[i]["updated"] = updated[i]
+	}
+	if !batch {
+		writeJSON(w, out[0])
+		return
+	}
+	writeJSON(w, map[string]any{"documents": out, "skipped": skipped})
+}
+
+// fetchRAGSource retrieves one public URL through the SSRF-guarded client and
+// converts it into a Doc. Default IDs are stable hashes of the normalized
+// source URL, so importing the same source again updates its chunks instead
+// of silently creating a duplicate. A caller can still provide an explicit
+// ID, which the UI uses for the Refresh action.
+func fetchRAGSource(ctx context.Context, client *http.Client, input ragFetchInput) (rag.Doc, error) {
+	rawURL := strings.TrimSpace(input.URL)
+	if rawURL == "" {
+		return rag.Doc{}, newRAGFetchError(http.StatusBadRequest, "url must not be empty")
+	}
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		return rag.Doc{}, newRAGFetchError(http.StatusBadRequest, "url must be an absolute http or https URL")
+	}
+	target.Scheme = strings.ToLower(target.Scheme)
+	if target.Host == "" || (target.Scheme != "http" && target.Scheme != "https") {
+		return rag.Doc{}, newRAGFetchError(http.StatusBadRequest, "url must be an absolute http or https URL")
+	}
+	hostname := strings.ToLower(target.Hostname())
+	port := target.Port()
+	if (target.Scheme == "http" && port == "80") || (target.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		target.Host = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		target.Host = "[" + hostname + "]"
+	} else {
+		target.Host = hostname
+	}
+	target.Fragment = ""
+	target.RawFragment = ""
+	target.RawQuery = target.Query().Encode()
+	sourceURL := target.String()
+
+	fetchURL := sourceURL
 	isWikipedia := false
 	if endpoint, ok := wikipediaArticleEndpoint(target); ok {
 		fetchURL, isWikipedia = endpoint, true
 	}
-	httpReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, fetchURL, nil)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
+		return rag.Doc{}, newRAGFetchError(http.StatusBadRequest, "%v", err)
 	}
 	httpReq.Header.Set("User-Agent", "GopherLLM-RAG-Fetch/1.0 (+document import)")
 	if isWikipedia {
@@ -379,15 +490,13 @@ func fetchRAGDocument(w http.ResponseWriter, req *http.Request, state *ragState)
 		httpReq.Header.Set("Accept", "text/plain, text/markdown, text/html, application/json, text/xml, application/xml")
 	}
 
-	resp, err := ragFetchClientFunc().Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
-		http.Error(w, "fetch: "+err.Error(), http.StatusBadGateway)
-		return
+		return rag.Doc{}, newRAGFetchError(http.StatusBadGateway, "fetch: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf("fetch: upstream returned %s", resp.Status), http.StatusBadGateway)
-		return
+		return rag.Doc{}, newRAGFetchError(http.StatusBadGateway, "fetch: upstream returned %s", resp.Status)
 	}
 	data, err := readRAGFetchBody(resp.Body)
 	if err != nil {
@@ -397,17 +506,15 @@ func fetchRAGDocument(w http.ResponseWriter, req *http.Request, state *ragState)
 		} else if strings.Contains(err.Error(), "UTF-8") {
 			status = http.StatusUnsupportedMediaType
 		}
-		http.Error(w, "fetch: "+err.Error(), status)
-		return
+		return rag.Doc{}, newRAGFetchError(status, "fetch: %v", err)
 	}
-	title := strings.TrimSpace(body.Title)
+	title := strings.TrimSpace(input.Title)
 	text := ""
 	kind := "web"
 	if isWikipedia {
 		wikiTitle, wikiText, decodeErr := decodeWikipediaArticle(data)
 		if decodeErr != nil {
-			http.Error(w, decodeErr.Error(), http.StatusUnprocessableEntity)
-			return
+			return rag.Doc{}, newRAGFetchError(http.StatusUnprocessableEntity, "%v", decodeErr)
 		}
 		text, kind = wikiText, "wikipedia"
 		if title == "" {
@@ -416,8 +523,7 @@ func fetchRAGDocument(w http.ResponseWriter, req *http.Request, state *ragState)
 	} else {
 		isHTML, ok := fetchContentAllowed(resp.Header.Get("Content-Type"))
 		if !ok {
-			http.Error(w, "unsupported content type: "+resp.Header.Get("Content-Type"), http.StatusUnsupportedMediaType)
-			return
+			return rag.Doc{}, newRAGFetchError(http.StatusUnsupportedMediaType, "unsupported content type: %s", resp.Header.Get("Content-Type"))
 		}
 		text = string(data)
 		if isHTML {
@@ -430,24 +536,18 @@ func fetchRAGDocument(w http.ResponseWriter, req *http.Request, state *ragState)
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		http.Error(w, "fetched content had no extractable text", http.StatusUnprocessableEntity)
-		return
+		return rag.Doc{}, newRAGFetchError(http.StatusUnprocessableEntity, "fetched content had no extractable text")
 	}
 
-	id := strings.TrimSpace(body.ID)
+	id := strings.TrimSpace(input.ID)
 	if id == "" {
-		id = newDocID()
+		digest := sha256.Sum256([]byte(sourceURL))
+		id = fmt.Sprintf("url-%x", digest[:12])
 	}
 	if title == "" {
-		title = target.String()
+		title = sourceURL
 	}
-	doc := rag.Doc{ID: id, Title: title, Path: target.String(), Text: text, Time: time.Now(), Kind: kind}
-	if err := state.index.Add(req.Context(), doc); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	state.save()
-	writeJSON(w, docInfoJSON(docByID(state.index, id)))
+	return rag.Doc{ID: id, Title: title, Path: sourceURL, Text: text, Time: time.Now(), Kind: kind}, nil
 }
 
 // docByID looks up one Doc's summary by ID, for reporting back the document a
@@ -461,6 +561,15 @@ func docByID(ix *rag.Index, id string) rag.DocInfo {
 		}
 	}
 	return rag.DocInfo{ID: id}
+}
+
+func docExists(ix *rag.Index, id string) bool {
+	for _, doc := range ix.List() {
+		if doc.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func docInfoJSON(d rag.DocInfo) map[string]any {

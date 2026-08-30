@@ -388,11 +388,15 @@ bin/gopherllm --model-dir /path/to/models --serve --chat \
 `--rag-docs <dir>` indexes every plain-text file under `dir` at startup. The
 same directory can be scanned again with `POST /rag/reload`. The Web UI's
 **Knowledge base** panel (Settings → Capabilities) can also paste text, upload
-several supported text files at once, and import public HTTP(S) sources.
+several supported text files at once, and import up to 20 public HTTP(S)
+sources per request.
 Wikipedia article URLs use MediaWiki's plaintext API, including article
 redirects, so the complete article is indexed without Wikipedia navigation or
 page chrome. Other HTML pages are reduced to readable text; scripts, styles,
-navigation, headers, and footers are discarded.
+navigation, headers, and footers are discarded. URL-based documents receive a
+stable ID derived from their normalized source URL: importing the same source
+again updates it instead of creating a duplicate. The Web UI exposes the same
+operation as **Refresh** next to every imported web source.
 
 The default file allowlist and 4 MiB per-file cap match `rag.Index.AddFS` and
 `agent.Agent`'s `WithDocuments`. URL imports are capped at 2 MiB and protected
@@ -410,6 +414,13 @@ curl -X POST http://127.0.0.1:8080/rag/upload \
 curl -X POST http://127.0.0.1:8080/rag/fetch \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://de.wikipedia.org/wiki/Retrieval-Augmented_Generation"}'
+
+curl -X POST http://127.0.0.1:8080/rag/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"sources": [
+    {"url": "https://example.com/handbook"},
+    {"url": "https://en.wikipedia.org/wiki/Retrieval-augmented_generation"}
+  ]}'
 
 curl -X POST http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \

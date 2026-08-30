@@ -1213,6 +1213,7 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .rag-import-card > div > strong { color: var(--ink); font-size: var(--fs-xs); }
 .rag-import-card > div > p { margin: 3px 0 0; line-height: 1.45; }
 #ragDocumentsList .model-download-variant-meta { overflow-wrap: anywhere; }
+.rag-document-actions { display: flex; align-items: center; gap: 6px; }
 .rag-import-card input[type="file"] { padding: 5px; background: var(--panel); font-size: var(--fs-2xs); }
 .rag-import-card input[type="file"]::file-selector-button { margin-right: 8px; padding: 5px 8px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--panel-2); color: var(--ink); cursor: pointer; }
 .rag-document-form .autotune-run { justify-self: start; }

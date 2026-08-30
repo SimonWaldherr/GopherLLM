@@ -120,6 +120,31 @@ func TestRAGFetchExtractsWebPageTitleAndContent(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || created["title"] != "Orchard Manual" || created["kind"] != "web" {
 		t.Fatalf("POST fetch = %d: %+v", resp.StatusCode, created)
 	}
+	createdID, _ := created["id"].(string)
+	if !strings.HasPrefix(createdID, "url-") || created["updated"] != false {
+		t.Fatalf("created source identity = %+v, want a stable new URL document", created)
+	}
+
+	// Re-importing the same normalized URL replaces the existing document
+	// instead of growing the corpus with a duplicate.
+	second, err := srv.Client().Post(srv.URL+"/rag/fetch", "application/json", strings.NewReader(`{"url":`+strconv.Quote(upstream.URL+"/manual#section")+`}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refreshed map[string]any
+	if err := json.NewDecoder(second.Body).Decode(&refreshed); err != nil {
+		second.Body.Close()
+		t.Fatal(err)
+	}
+	second.Body.Close()
+	if refreshed["id"] != createdID || refreshed["updated"] != true || refreshed["path"] != upstream.URL+"/manual" {
+		t.Fatalf("refreshed = %+v, want id %q marked updated", refreshed, createdID)
+	}
+	var status map[string]any
+	getJSON(t, srv.Client(), srv.URL+"/rag/status", &status)
+	if int(status["documents"].(float64)) != 1 {
+		t.Fatalf("status after URL re-import = %+v, want one document", status)
+	}
 
 	search, err := srv.Client().Post(srv.URL+"/rag/search", "application/json", strings.NewReader(`{"query":"espalier winter solstice"}`))
 	if err != nil {
@@ -136,6 +161,43 @@ func TestRAGFetchExtractsWebPageTitleAndContent(t *testing.T) {
 	}
 	if text, _ := hits[0].(map[string]any)["text"].(string); strings.Contains(text, "secretNavigationNoise") || strings.Contains(text, "Site links") {
 		t.Fatalf("fetched text retained ignored page chrome: %q", text)
+	}
+}
+
+func TestRAGFetchBatchKeepsSuccessfulSources(t *testing.T) {
+	previousClient := ragFetchClientFunc
+	ragFetchClientFunc = func() *http.Client {
+		return &http.Client{Transport: ragRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("Imported content from " + req.URL.Path)),
+				Request:    req,
+			}, nil
+		})}
+	}
+	t.Cleanup(func() { ragFetchClientFunc = previousClient })
+
+	srv := ragTestServer(t, HandlerOptions{})
+	body := `{"sources":[{"url":"https://example.com/alpha"},{"url":"ftp://example.com/refused"},{"url":"https://example.com/beta"}]}`
+	resp, err := srv.Client().Post(srv.URL+"/rag/fetch", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var result map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST batch fetch = %d: %+v", resp.StatusCode, result)
+	}
+	if docs, _ := result["documents"].([]any); len(docs) != 2 {
+		t.Fatalf("batch documents = %+v, want two successful imports", result)
+	}
+	if skipped, _ := result["skipped"].([]any); len(skipped) != 1 {
+		t.Fatalf("batch skipped = %+v, want the invalid URL reported", result)
 	}
 }
 

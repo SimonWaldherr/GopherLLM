@@ -4102,12 +4102,23 @@ function toMarkdown(chat) {
       const source = doc.path ? " · " + doc.path : "";
       meta.textContent = chunks + (chunks === 1 ? " chunk" : " chunks") + source;
       copy.append(title, meta);
-      const action = document.createElement("button");
-      action.type = "button";
-      action.className = "text-button";
-      action.textContent = "Remove";
-      action.addEventListener("click", () => removeRAGDocument(doc.id));
-      item.append(copy, action);
+      const actions = document.createElement("div");
+      actions.className = "rag-document-actions";
+      if ((doc.kind === "web" || doc.kind === "wikipedia") && /^https?:\/\//i.test(doc.path || "")) {
+        const refresh = document.createElement("button");
+        refresh.type = "button";
+        refresh.className = "text-button";
+        refresh.textContent = "Refresh";
+        refresh.addEventListener("click", () => refreshRAGSource(doc, refresh));
+        actions.appendChild(refresh);
+      }
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "text-button";
+      remove.textContent = "Remove";
+      remove.addEventListener("click", () => removeRAGDocument(doc.id));
+      actions.appendChild(remove);
+      item.append(copy, actions);
       ragDocumentsListEl.appendChild(item);
     });
     ragDocumentsListEl.hidden = docs.length === 0;
@@ -4130,6 +4141,23 @@ function toMarkdown(chat) {
       await refreshRAGDocuments();
     } catch (error) {
       showToast("Could not remove document: " + (error && error.message ? error.message : String(error)), "error");
+    }
+  }
+
+  async function refreshRAGSource(doc, button) {
+    button.disabled = true;
+    try {
+      const response = await adminFetch("/rag/fetch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: doc.id, url: doc.path })
+      });
+      if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      await refreshRAGDocuments();
+      showToast("Source refreshed from " + doc.path, "success");
+    } catch (error) {
+      showToast("Could not refresh source: " + (error && error.message ? error.message : String(error)), "error");
+      button.disabled = false;
     }
   }
 
@@ -5609,9 +5637,15 @@ function toMarkdown(chat) {
   });
   ragURLFormEl.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const sourceURL = ragURLEl.value.trim();
-    if (!sourceURL) {
+    const sourceURLs = ragURLEl.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    if (!sourceURLs.length) {
       ragURLEl.focus();
+      return;
+    }
+    const title = ragURLTitleEl.value.trim();
+    if (sourceURLs.length > 1 && title) {
+      showToast("A title override can only be used with one URL.", "error");
+      ragURLTitleEl.focus();
       return;
     }
     const submitButton = ragURLFormEl.querySelector("button[type=submit]");
@@ -5620,12 +5654,23 @@ function toMarkdown(chat) {
       const response = await adminFetch("/rag/fetch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: sourceURL, title: ragURLTitleEl.value.trim() })
+        body: JSON.stringify(sourceURLs.length === 1
+          ? { url: sourceURLs[0], title }
+          : { sources: sourceURLs.map((url) => ({ url })) })
       });
       if (!response.ok) throw new Error((await response.text()) || ("HTTP " + response.status));
+      const result = await response.json();
       ragURLFormEl.reset();
       await refreshRAGDocuments();
-      showToast("Web source imported into the knowledge base.", "success");
+      const documents = Array.isArray(result.documents) ? result.documents : [result];
+      const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+      const updated = documents.filter((doc) => doc && doc.updated).length;
+      const added = documents.length - updated;
+      const parts = [];
+      if (added) parts.push(added + (added === 1 ? " source added" : " sources added"));
+      if (updated) parts.push(updated + (updated === 1 ? " source updated" : " sources updated"));
+      if (skipped) parts.push(skipped + " skipped");
+      showToast(parts.join(", ") + ".", skipped ? "warning" : "success");
     } catch (error) {
       showToast("Could not import source: " + (error && error.message ? error.message : String(error)), "error");
     } finally {
