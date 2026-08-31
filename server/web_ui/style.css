@@ -368,7 +368,9 @@ body.chat .app { grid-template-columns: var(--sidebar) minmax(0, 1fr); height: 1
   gap: 12px;
   padding: 15px 12px 11px;
   border-right: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 88%, var(--panel-2));
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--accent) 3%, var(--panel)) 0, transparent 170px),
+    color-mix(in srgb, var(--panel) 88%, var(--panel-2));
 }
 .sidebar-brand { display: flex; align-items: center; gap: 8px; padding: 0 5px; font-size: var(--fs-md); font-weight: 760; letter-spacing: -.01em; }
 .logo {
@@ -524,7 +526,8 @@ h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 }
 .model-name:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .top { flex: 0 0 auto; gap: var(--sp-2h); margin-left: auto; }
-.header-brief, .header-share { min-height: 30px; padding: 0 var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: var(--panel); color: var(--ink); font-size: var(--fs-xs); font-weight: 700; }
+.header-brief, .header-share { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 33px; padding: 0 var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel); color: var(--ink); box-shadow: var(--shadow); font-size: var(--fs-xs); font-weight: 700; }
+.header-brief .icon, .header-share .icon { width: 15px; height: 15px; }
 .header-brief:hover:not(:disabled), .header-share:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); }
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; }
 .status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ok); }
@@ -537,13 +540,14 @@ h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
   display: grid; place-items: center; width: 33px; height: 33px; min-width: 0; min-height: 0;
   border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel); color: var(--ink);
 }
+.icon-button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--panel)); }
 .sidebar-toggle { display: none; }
 @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.75); } }
 
 /* ════════════════════════════════
    Conversation
    ════════════════════════════════ */
-body.chat main { position: relative; overflow-y: auto; overflow-x: hidden; padding: var(--sp-6) clamp(var(--sp-3), 3vw, var(--sp-7)); scrollbar-gutter: stable; }
+body.chat main { position: relative; overflow-y: auto; overflow-x: hidden; padding: var(--sp-6) clamp(var(--sp-3), 3vw, var(--sp-7)); scrollbar-gutter: stable; background: radial-gradient(circle at 50% 12%, color-mix(in srgb, var(--accent) 4%, transparent), transparent min(42vw, 520px)); }
 body.chat .messages { width: min(880px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-5); }
 body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; color: var(--muted); text-align: center; }
 .empty-mark {
@@ -575,6 +579,7 @@ body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; col
   transition: border-color .15s, color .15s, transform .15s;
 }
 .suggestion:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); transform: translateY(-1px); }
+.suggestion:active:not(:disabled) { transform: translateY(0); }
 kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: var(--r-xs); background: var(--panel); color: var(--ink); font: var(--fs-xs)/1.4 var(--mono); }
 
 /* ── Message cards ──
@@ -1392,10 +1397,13 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
      vw cap would strand empty space next to a short title. */
   .top { margin-left: auto; }
   .status > span:last-child { display: none; }
-  .header-brief, .header-share { min-height: 36px; padding: 0 var(--sp-2); }
+  .header-brief, .header-share { width: 36px; min-width: 36px; min-height: 36px; padding: 0; }
+  .header-brief > span, .header-share > span { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+  .header-brief .icon, .header-share .icon { width: 17px; height: 17px; }
   header .icon-button { width: 36px; height: 36px; }
   .status-dot { width: 9px; height: 9px; }
-  .suggestions { margin-inline: -4px; }
+  .suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-inline: 0; }
+  .suggestion { width: 100%; padding-inline: var(--sp-2); }
   body.chat .composer { gap: 6px; }
   body.chat #send { width: 44px; min-width: 44px; padding: 0; }
   body.chat #send.editing { width: auto; min-width: 104px; padding: 0 10px; }
