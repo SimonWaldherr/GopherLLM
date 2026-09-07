@@ -221,6 +221,9 @@ type batchQ8MatvecTask struct {
 }
 
 func (t *batchQ8MatvecTask) runRows(start, end int) {
+	if batchQ4KRows4(t.w, t.outs[:t.p], t.q8All, t.xscAll, t.xsumsAll, start, end) {
+		return
+	}
 	const rowTile = 16
 	for tileStart := start; tileStart < end; tileStart += rowTile {
 		tileEnd := min(tileStart+rowTile, end)
@@ -364,6 +367,9 @@ func (t *batchQ8FusedTask) runRows(start, end int) {
 		localStart := max(start, t.offsets[wi]) - t.offsets[wi]
 		localEnd := min(end, t.offsets[wi+1]) - t.offsets[wi]
 		if localStart >= localEnd {
+			continue
+		}
+		if batchQ4KRows4(w, t.outs[wi][:t.p], t.q8All, t.xscAll, t.sums[wi], localStart, localEnd) {
 			continue
 		}
 		layout := t.layouts[wi]

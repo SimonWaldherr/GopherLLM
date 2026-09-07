@@ -227,32 +227,29 @@ func sampleTopPFromWeights(weights []float32, total, topP, minP float32, rng *Rn
 	return uint32((*candidates)[cutoff-1].Token)
 }
 
-// sampleTopK selects the top-K logits with a bounded insertion pass (no full
-// vocab sort), softmaxes just those, then applies min-p and top-p within the
-// candidate set. This is the common path: K is ~40-64 while vocabularies run
-// 32K-262K, so avoiding the full-vocab sort dominates sampler cost.
+// sampleTopK selects logits with a bounded min-heap, then sorts only the K
+// survivors. Selection is O(vocab * log K) even for ascending logits; the
+// scratch buffer is reused across decode steps.
 func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
 	*candidates = (*candidates)[:0]
-	var threshold float32 = negInf32
 	for i, logit := range logits {
+		if !finiteLogit(logit) {
+			continue
+		}
+		item := TokenProb{i, logit}
 		if len(*candidates) < topK {
-			if !finiteLogit(logit) {
-				logit = negInf32
-			}
-			*candidates = append(*candidates, TokenProb{i, logit})
-			bubbleUpLast(*candidates)
+			*candidates = append(*candidates, item)
 			if len(*candidates) == topK {
-				threshold = (*candidates)[topK-1].Prob
+				for j := topK/2 - 1; j >= 0; j-- {
+					siftDownTokenProbs(*candidates, j)
+				}
 			}
-		} else if logit > threshold {
-			if !finiteLogit(logit) {
-				continue
-			}
-			(*candidates)[topK-1] = TokenProb{i, logit}
-			bubbleUpLast(*candidates)
-			threshold = (*candidates)[topK-1].Prob
+		} else if tokenProbLess(item, (*candidates)[0]) {
+			(*candidates)[0] = item
+			siftDownTokenProbs(*candidates, 0)
 		}
 	}
+	sortTokenProbs(*candidates)
 	if len(*candidates) == 0 || math.IsInf(float64((*candidates)[0].Prob), -1) {
 		return argmaxFiniteToken(logits)
 	}
@@ -306,11 +303,22 @@ func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rn
 	return uint32((*candidates)[cutoff-1].Token)
 }
 
-// bubbleUpLast restores descending-probability order after appending or
-// replacing the last element of an otherwise-sorted candidate slice.
-func bubbleUpLast(c []TokenProb) {
-	for i := len(c) - 1; i > 0 && c[i].Prob > c[i-1].Prob; i-- {
-		c[i], c[i-1] = c[i-1], c[i]
+// siftDownTokenProbs keeps the worst candidate at the root. For equal
+// logits the larger token id is worse, preserving deterministic tie-breaking.
+func siftDownTokenProbs(c []TokenProb, root int) {
+	for {
+		child := 2*root + 1
+		if child >= len(c) {
+			return
+		}
+		if child+1 < len(c) && tokenProbLess(c[child], c[child+1]) {
+			child++
+		}
+		if !tokenProbLess(c[root], c[child]) {
+			return
+		}
+		c[root], c[child] = c[child], c[root]
+		root = child
 	}
 }
 

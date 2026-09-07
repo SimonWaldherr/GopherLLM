@@ -1,5 +1,57 @@
 "use strict";
 
+// Decode complete SSE events even when UTF-8 or CRLF boundaries span packets.
+async function readSSE(response, onData) {
+  if (!response.body) throw new Error("Streaming response has no body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let ended = false;
+  const dispatch = (block) => {
+    const data = block.split(/\r?\n/).filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, "")).join("\n");
+    if (data.trim() === "[DONE]") return false;
+    if (data) onData(data);
+    return true;
+  };
+  try {
+    while (true) {
+      const packet = await reader.read();
+      ended = packet.done;
+      buffer += packet.done ? decoder.decode() : decoder.decode(packet.value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() || "";
+      for (const block of blocks) {
+        if (!dispatch(block)) return;
+      }
+      if (packet.done) {
+        if (buffer.trim()) dispatch(buffer);
+        return;
+      }
+    }
+  } finally {
+    try {
+      if (!ended) await reader.cancel();
+    } finally {
+      reader.releaseLock();
+    }
+  }
+}
+
+// Keep one text node alive while tokens arrive, preserving selection and
+// avoiding a replacement of the entire answer on every animation frame.
+function createStreamTextRenderer(content) {
+  const node = document.createTextNode("");
+  content.replaceChildren(node);
+  let rendered = "";
+  return (text) => {
+    if (text === rendered) return;
+    if (text.startsWith(rendered)) node.appendData(text.slice(rendered.length));
+    else node.data = text;
+    rendered = text;
+  };
+}
+
 const TICK = String.fromCharCode(96);
 const FENCE = TICK.repeat(3);
 
@@ -1725,7 +1777,7 @@ function toMarkdown(chat) {
   }
 
   function setStatus(text) {
-    statusTextEl.textContent = text;
+    if (statusTextEl.textContent !== text) statusTextEl.textContent = text;
   }
 
   // setIdleStatus is what every "an operation just finished" call site should
@@ -2772,10 +2824,6 @@ function toMarkdown(chat) {
   }
 
   async function readStream(response, onToken, onAgent) {
-    if (!response.body) throw new Error("Streaming response has no body");
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
     const out = { answer: "", reasoning: "", toolCalls: null, usage: null, finishReason: "", contextWindow: null, promptCache: null };
     const applyChunk = (payload) => {
       if (!payload || payload === "[DONE]") return;
@@ -2803,20 +2851,7 @@ function toMarkdown(chat) {
         onToken(out.answer, out.reasoning, false);
       }
     };
-    const applyBlock = (block) => {
-      const data = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
-      if (data) applyChunk(data);
-    };
-    while (true) {
-      const packet = await reader.read();
-      if (packet.done) break;
-      buffer += decoder.decode(packet.value, { stream: true });
-      const blocks = buffer.split("\n\n");
-      buffer = blocks.pop() || "";
-      blocks.forEach(applyBlock);
-    }
-    buffer += decoder.decode();
-    if (buffer.trim()) applyBlock(buffer);
+    await readSSE(response, applyChunk);
     return out;
   }
 
@@ -3196,6 +3231,7 @@ function toMarkdown(chat) {
     let reasoning = "";
     let streamFinished = false;
     let pending = false;
+    let renderStreamText = null;
     // Live progress. Before the first token the server is reading the prompt,
     // which on a large context is the longest part of the wait and used to look
     // identical to a hung request; after it, the meter is the only place the
@@ -3213,12 +3249,13 @@ function toMarkdown(chat) {
       const parsed = splitStream(answer);
       latest = parsed.answer;
       reasoning = nextReasoning || parsed.reasoning;
-      assistantEl.dataset.raw = latest;
       tokenCount++;
       thinkingNow = Boolean(thinking || parsed.isThinking);
       if (!firstTokenAt) {
         firstTokenAt = performance.now();
-        assistantEl.querySelector(".content").classList.add("streaming");
+        const content = assistantEl.querySelector(".content");
+        content.classList.add("streaming");
+        renderStreamText = createStreamTextRenderer(content);
       }
       setStatus(thinkingNow ? "Thinking…" : "Generating…");
       if (pending) return;
@@ -3226,9 +3263,9 @@ function toMarkdown(chat) {
       requestAnimationFrame(() => {
         pending = false;
         if (streamFinished) return;
-        const content = assistantEl.querySelector(".content");
-        if (content) content.textContent = latest;
-        upsertReasoning(assistantEl, reasoning, thinking || parsed.isThinking);
+        renderStreamText(latest);
+        assistantEl.dataset.raw = latest;
+        upsertReasoning(assistantEl, reasoning, thinkingNow);
         scrollToBottom(false);
       });
     };
@@ -3287,7 +3324,8 @@ function toMarkdown(chat) {
     } catch (error) {
       streamFinished = true;
       lastContextWindow = null;
-      const partial = assistantEl.dataset.raw || "";
+      // The last token may arrive before its animation frame is painted.
+      const partial = latest;
       if (error && error.name === "AbortError") {
         if (partial || reasoning) {
           const stored = { role: "assistant", content: partial, reasoning, tool_calls: null, usage: null, finishReason: "stopped" };

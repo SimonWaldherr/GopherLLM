@@ -5,6 +5,23 @@ on:
   pull_request:
 
 jobs:
+  ui:
+    name: UI streaming tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check JavaScript and streaming behavior
+        run: |
+          node --check server/web_ui/script.js
+          node --test server/web_ui/stream_test.cjs
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
