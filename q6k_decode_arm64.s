@@ -106,9 +106,9 @@ rowhalf:
 	VMOV V28.S[0], V15.S[3]
 	// Eight signed sub-scales, widened to int32 and multiplied by the dots.
 	VLD1.P 8(R3), [V24.B8]
-	VSXTL V24.B8, V24.H8
-	VSXTL2 V24.H8, V25.S4
-	VSXTL V24.H4, V24.S4
+	WORD $0x0f08a718 // sshll  v24.8h, v24.8b, #0
+	WORD $0x4f10a719 // sshll2 v25.4s, v24.8h, #0
+	WORD $0x0f10a718 // sshll  v24.4s, v24.4h, #0
 	WORD $0x4eb89dce // mul v14.4s,v14.4s,v24.4s
 	WORD $0x4eb99def // mul v15.4s,v15.4s,v25.4s
 	VADD V14.S4, V15.S4, V14.S4
