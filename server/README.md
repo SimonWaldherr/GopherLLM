@@ -14,6 +14,7 @@ package and command-line inference workflow are documented in the
 - [Configuration and deployment profiles](#configuration-and-deployment-profiles)
 - [Remote OpenAI-compatible APIs](#remote-openai-compatible-apis)
 - [Browser workspace](#browser-workspace)
+- [Voxtral audio transcription](#voxtral-audio-transcription)
 - [Context and prefix cache](#context-and-prefix-cache)
 - [HTTP API](#http-api)
 - [Tools, skills, and research](#tools-skills-and-research)
@@ -45,6 +46,17 @@ reaches the internet or the host is off until you name it with `--enable`. See
 The chat UI opens in **Simple** mode, which shows the settings most people
 actually change. The **Advanced** toggle in the settings header reveals the
 rest; the choice is remembered per browser and changes nothing on the server.
+Settings search covers all available sections and selects a matching tab.
+In Simple mode, a separate button reveals matches in Advanced settings.
+Clear the search (or press Escape) to return to the previous section; use the
+arrow keys, Home, and End to navigate tabs. Scope labels distinguish options
+for this chat, this browser, and the server.
+
+With a Voxtral Realtime GGUF in the model directory, the audio panel can also
+start **live transcription**. The browser sends 16 kHz PCM while the microphone
+is open and replaces the draft transcript as the server returns updates. One
+live audio model is held at a time and is released when recording stops; the
+regular file/upload transcription remains limited to 30 seconds.
 
 The CLI remembers the successfully loaded local GGUF in `last-model.json`
 below the platform configuration directory (override with
@@ -102,7 +114,7 @@ process-wide state, or benchmarks the machine is opt-in:
 | `web-lookup`     | `WebLookup`     | The Wikimedia and OpenStreetMap tools. Requests still ask for them per call; this is the outer switch |
 | `spreadsheet`    | `Spreadsheet`   | `/batch/parse` for the batch runner |
 | `rag`            | `RAG`           | Knowledge-base status, document, upload, URL-import, reload, and search routes, plus a `search_documents` tool chat requests can opt into — see [Knowledge base search (RAG)](#knowledge-base-search-rag) |
-| `model-catalog`  | `ModelCatalog`  | `/models`, `/models/load`, `/models/architecture`, embedding-model routes. On by default in the CLI, off in the zero-value `Features` |
+| `model-catalog`  | `ModelCatalog`  | `/models`, `/models/load`, `/models/architecture`, embedding-model and Voxtral audio routes. On by default in the CLI, off in the zero-value `Features` |
 | `all`            | `AllFeatures()` | Everything above; `--full` is the same thing |
 
 ```sh
@@ -249,6 +261,89 @@ an ordered implementation plan. Intermediate prompts are retained as ordinary
 workspace history and passed to the model with an explicit untrusted-reference
 boundary.
 
+## Voxtral audio transcription
+
+Place a **Voxtral Realtime GGUF** (`general.architecture=voxtral_realtime`) in
+`--model-dir`, rebuild/restart the server, and open `/chat`:
+
+```sh
+go run ./cmd/gopherllm --model-dir /path/to/models --serve --chat
+```
+
+1. Click **Audio** below the message field.
+2. Select the Voxtral model. **Refresh models** rescans the directory after
+   adding a GGUF.
+3. Choose an audio file or click **Record microphone**, then **Stop & transcribe**.
+4. Review the transcript and click **Use in message**. It is appended to the
+   current draft; sending the chat message remains a separate action.
+
+The audio model is separate from the chat model. A chat model need not be
+loaded to transcribe, and transcription does not replace it. This feature is
+included in `model-catalog` (enabled by default in the CLI); embedders enable
+`HandlerOptions.Features.ModelCatalog`. Browser-only deployment and the
+on-device browser inference mode do not offer server transcription.
+
+Audio stays between the browser and this server. Browser-supported formats
+such as WAV, MP3, and WebM are decoded, averaged to mono, and resampled to
+16 kHz by Web Audio before upload; no server-side ffmpeg is required for the
+Web UI. Microphone access requires localhost or HTTPS and browser permission.
+Recordings stop automatically at 30 seconds. File inputs are limited to
+25 MiB and 30 seconds; the server accepts at most 2 MiB of WAV per request.
+
+**Start live transcription** continuously captures audio with an AudioWorklet
+in 200 ms blocks. Each session retains STFT/convolution tails and bounded
+encoder/decoder attention caches; it processes only newly arrived audio.
+Queued blocks are combined without waiting for a fixed recording length.
+The draft updates while speaking, and stopping flushes the model's delayed
+last words. No speech-boundary pause is required. Model loading and silence
+warmup finish before capture starts. Only idle sessions expire after two
+minutes; active capture can continue longer than 30 seconds.
+
+On Apple Silicon, build with `go build -tags metal ./cmd/gopherllm` for the
+fused GPU decoder and Accelerate encoder. The portable CPU path remains
+available, but may not keep pace with microphone input. Realtime throughput
+depends on hardware and competing inference; the UI reports a backlog and
+stops with an error if more than ten seconds queue up. The model itself also
+has a configured transcription delay, so 200 ms capture does not promise
+200 ms word latency.
+
+**Record microphone** and file uploads use the separate complete-clip path:
+transcription begins after recording stops, with one model load per request.
+**Cancel** stops either path at the next encoder frame/layer or decoder step.
+
+The live API is `POST /v1/audio/realtime/sessions` with JSON `{"model":"…"}`,
+followed by sequential `POST /v1/audio/realtime/sessions/{id}` requests with
+raw mono 16 kHz little-endian PCM16 (at most two seconds per request).
+Responses contain cumulative `text`. Add `?final=1` to flush and close; an
+empty final body is valid. `DELETE` cancels a session. One live model is held
+at a time and its weights are released on finalization, cancellation or idle
+timeout.
+
+The HTTP surface is `GET /models/audio` for audio model IDs and
+`POST /v1/audio/transcriptions` with multipart `model` and `file` fields.
+API clients must send **mono 16 kHz PCM16 or IEEE float32 WAV**. Optional
+`response_format` accepts `json` (default, `{"text":"…"}`) or `text`.
+Use the exact ID returned by `/models/audio`, not an arbitrary file path:
+
+```sh
+curl http://127.0.0.1:8080/models/audio
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F 'model=Voxtral-Mini-4B-Realtime-2602-Q6_K' \
+  -F 'file=@clip-16k-mono.wav'
+```
+
+The standalone CLI uses the same model loading and decode schedule:
+
+```sh
+go run ./cmd/voxtral-transcribe --model /path/to/voxtral.gguf --audio clip.wav
+```
+
+It optionally uses ffmpeg for broader file support. Its `--max-extra-steps`
+flag adds encoded silence on the right (default zero); decoding never repeats
+the final embedding beyond the encoded audio span. GGUF Q/K projections use
+split-half RoPE to match their permuted rows. Control tokens such as
+`[STREAMING_WORD]` are excluded from the transcript.
+
 ## Context and prefix cache
 
 The chat defaults to **Smart — recent complete turns**. Full history stays in
@@ -332,6 +427,8 @@ Set `"stream": true` for SSE streaming. The handler exposes:
 | GET | `/chat`, `/style.css`, `/script.js` | Browser UI (`--chat`) |
 | GET | `/chat/storage` | Report server-history availability |
 | GET / PUT / DELETE | `/chat/workspace` | Read, replace, or clear server workspace |
+| GET | `/models/audio` | List local Voxtral Realtime models |
+| POST | `/v1/audio/transcriptions` | Transcribe mono 16 kHz WAV (multipart `model`, `file`) |
 | POST | `/batch/parse` | Parse local `.xlsx`/`.ods` batch data |
 | GET | `/rag/status` | Document/chunk counts for the knowledge base |
 | GET / POST / DELETE | `/rag/documents` | List, add, or remove an indexed document |

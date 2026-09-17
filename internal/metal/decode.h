@@ -131,6 +131,8 @@ static id<MTLComputePipelineState> gllm_dec_pipes[9]={nil,nil,nil,nil,nil,nil,ni
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
  @synchronized(gllm_queue) {
+  // SiLU is shared with the Q4 library, even for a decoder with only Q6 weights.
+  if(!gllm_metal_init_q4k())return false;
   if(gllm_dec_pipes[0]!=nil)return true;
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_decode_source] options:nil error:&error];
@@ -224,6 +226,16 @@ static void gllm_decode_cache(void* ptr,int layer,int pos,float* k,float* v,bool
  if(l->sharedKV)return;
  if(upload){if(pos>0){memcpy([l->k contents],k,pos*stride);memcpy([l->v contents],v,pos*stride);}}
  else {memcpy(k,(char*)[l->k contents]+pos*stride,stride);memcpy(v,(char*)[l->v contents]+pos*stride,stride);}
+}
+static bool gllm_decode_shift_cache(void* ptr,int length,int drop) {
+ GLLMDecoder* d=ptr;NSUInteger stride=d->kvheads*128*sizeof(float);
+ for(int i=0;i<d->layers;i++){if(d->layer[i].sharedKV)return false;}
+ for(int i=0;i<d->layers;i++){
+  GLLMDecodeLayer* l=&d->layer[i];
+  memmove([l->k contents],(char*)[l->k contents]+drop*stride,(length-drop)*stride);
+  memmove([l->v contents],(char*)[l->v contents]+drop*stride,(length-drop)*stride);
+ }
+ return true;
 }
 static void gllm_decode_norm(id<MTLComputeCommandEncoder> e,id<MTLBuffer> x,id<MTLBuffer> w,id<MTLBuffer> out,int n,int groups,float eps) {
  [e setComputePipelineState:gllm_dec_pipes[0]];[e setBuffer:x offset:0 atIndex:0];[e setBuffer:w offset:0 atIndex:1];[e setBuffer:out offset:0 atIndex:2];

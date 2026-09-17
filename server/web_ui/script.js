@@ -1257,6 +1257,29 @@ function toMarkdown(chat) {
   return lines.join("\n");
 }
 
+// Search only controls the presentation of settings. Hidden capabilities and
+// administrator-only sections are excluded by the caller before planning.
+function planSettingsSearch(pages, query, activeKey, simple) {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const counts = {}, advancedCounts = {}, matches = [];
+  for (const page of pages) {
+    counts[page.key] = 0;
+    advancedCounts[page.key] = 0;
+    for (const section of page.sections) {
+      const hit = section.available && terms.every(term => section.text.toLowerCase().includes(term));
+      matches.push({ section: section.element, hit });
+      if (!hit) continue;
+      if (simple && (page.advanced || section.advanced)) advancedCounts[page.key]++;
+      else counts[page.key]++;
+    }
+  }
+  const selected = terms.length && !counts[activeKey]
+    ? pages.find(page => counts[page.key] > 0)?.key || activeKey : activeKey;
+  return { counts, advancedCounts, matches, selected,
+    total: Object.values(counts).reduce((a, b) => a + b, 0),
+    advanced: Object.values(advancedCounts).reduce((a, b) => a + b, 0) };
+}
+
 (async function initChat() {
   const $ = (id) => document.getElementById(id);
   const form = $("form");
@@ -1328,6 +1351,9 @@ function toMarkdown(chat) {
   const settingsCloseEl = $("settingsClose");
   const settingsDoneEl = $("settingsDone");
   const settingsSearchEl = $("settingsSearch");
+  const settingsSearchClearEl = $("settingsSearchClear");
+  const settingsSearchStatusEl = $("settingsSearchStatus");
+  const settingsSearchAdvancedEl = $("settingsSearchAdvanced");
   const settingsSearchEmptyEl = $("settingsSearchEmpty");
   const settingsSearchEmptyQueryEl = $("settingsSearchEmptyQuery");
   const settingsSearchEmptyHintEl = $("settingsSearchEmptyHint");
@@ -1469,6 +1495,8 @@ function toMarkdown(chat) {
   const liveContextModeEl = $("liveContextMode");
   const livePauseButtonEl = $("livePauseButton");
   const livePromptInputEl = $("livePromptInput");
+  const liveAlertsDisclosureEl = $("liveAlertsDisclosure");
+  const liveAlertsSummaryNoteEl = $("liveAlertsSummaryNote");
   const liveZoneInputEl = $("liveZoneInput");
   const liveActionConditionEl = $("liveActionCondition");
   const liveActionSoundEl = $("liveActionSound");
@@ -1588,6 +1616,21 @@ function toMarkdown(chat) {
 			if (adminRequiredDeployment && !adminAuthorized) agentOSEnabled = false;
 		}
 	}
+  const audioControls = window.GopherLLMAudio?.init({
+    fetch: adminFetch,
+    insert(text) {
+      if (busy || tuning || batchRunning || loadingModel || !activeChat()) return false;
+      promptEl.value = promptEl.value.trimEnd() + (promptEl.value.trim() ? "\n" : "") + text;
+      updateComposer(true);
+      promptEl.dispatchEvent(new Event("input", { bubbles: true }));
+      promptEl.focus();
+      return true;
+    }
+  });
+  function syncAudioAvailability() {
+    audioControls?.setAvailable(!browserOnlyDeployment && preferences.inferenceMode !== "browser" && serverFeatureSet().has("model-catalog"));
+  }
+  syncAudioAvailability();
   let loadingEmbeddingModel = false;
   let activeEmbeddingModel = "";
   let ragSearching = false;
@@ -3580,7 +3623,7 @@ function toMarkdown(chat) {
   function renderModelLibrary() {
     const query = modelSearchEl.value.trim().toLowerCase();
     const showUnsupported = modelShowUnsupportedEl.checked;
-    const chatModels = modelCatalog.filter((model) => model.embedding !== true);
+    const chatModels = modelCatalog.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
     const unsupportedHidden = chatModels.filter((model) => !model.supported && !showUnsupported).length;
     const visible = chatModels.filter((model) => {
       if (!showUnsupported && !model.supported) return false;
@@ -3674,7 +3717,7 @@ function toMarkdown(chat) {
       }
       modelSelectEl.replaceChildren();
       modelSelectEl.disabled = false;
-      const chatModels = data.models.filter((model) => model.embedding !== true);
+      const chatModels = data.models.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
       modelCatalog = data.models.map((model) => Object.assign({}, model, {
         search: [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB", model.reasoning ? "thinking reasoning" : "no thinking", model.vision ? "vision" : "no vision"].filter(Boolean).join(" ").toLowerCase()
       }));
@@ -5415,7 +5458,7 @@ function toMarkdown(chat) {
   chatSearchEl.addEventListener("input", renderChatList);
   sidebarToggleEl.addEventListener("click", () => setSidebar(!sidebarEl.classList.contains("is-open")));
   sidebarScrimEl.addEventListener("click", () => setSidebar(false));
-  function setSettingsTab(name, focusTab) {
+  function setSettingsTab(name, focusTab, skipSearch) {
     const selected = settingsTabEls.find((tab) => tab.dataset.settingsTab === name) || settingsTabEls[0];
     settingsTabEls.forEach((tab) => {
       const active = tab === selected;
@@ -5427,64 +5470,68 @@ function toMarkdown(chat) {
     if (focusTab) selected.focus();
     // Switching tabs changes which match count is "active" for the empty-
     // state message; re-evaluate it against the tab just switched to.
-    if (settingsSearchEl.value.trim()) applySettingsSearch();
+    if (!skipSearch && settingsSearchEl.value.trim()) applySettingsSearch(false);
   }
 
-  // The settings panel has grown to four tabs and several dozen individual
-  // options -- textContent search across each top-level section is the
-  // cheapest way to make all of it findable without hand-maintaining a
-  // separate search index. Cached per section since section contents are
-  // static once rendered (nothing here is re-templated at runtime).
-  const settingsSectionTextCache = new WeakMap();
-  function settingsSectionSearchText(section) {
-    let text = settingsSectionTextCache.get(section);
-    if (text === undefined) {
-      text = section.textContent.toLowerCase();
-      settingsSectionTextCache.set(section, text);
-    }
-    return text;
-  }
-
-  function applySettingsSearch() {
-    const query = settingsSearchEl.value.trim().toLowerCase();
-    const tabLabels = {};
-    settingsTabEls.forEach((tab) => { tabLabels[tab.dataset.settingsTab] = tab.textContent.trim(); });
-    const tabMatchCounts = {};
-    settingsPageEls.forEach((page) => {
-      let matches = 0;
-      page.querySelectorAll(":scope > .settings-section").forEach((section) => {
-        const visible = !query || settingsSectionSearchText(section).includes(query);
-        section.classList.toggle("search-hidden", !visible);
-        // A match inside a collapsed disclosure (the "Download a model"
-        // section) would otherwise be invisible even though its parent
-        // section is shown -- open it for the duration of the search, but
-        // only restore the user's own state (not force it back closed) once
-        // the query is cleared.
-        const details = section.querySelector(":scope > details.settings-disclosure");
-        if (details) {
-          if (query && visible && !details.open) {
-            details.open = true;
-            details.dataset.searchOpened = "true";
-          } else if ((!query || !visible) && details.dataset.searchOpened === "true") {
-            details.open = false;
-            delete details.dataset.searchOpened;
-          }
+  let settingsTabBeforeSearch = null;
+  function applySettingsSearch(autoSelect = true) {
+    const query = settingsSearchEl.value.trim();
+    const simple = document.body.dataset.uiMode !== "advanced";
+    const activeKey = settingsTabEls.find(tab => tab.classList.contains("is-active"))?.dataset.settingsTab;
+    if (query && settingsTabBeforeSearch === null) settingsTabBeforeSearch = activeKey;
+    const pages = settingsPageEls.map(page => ({
+      key: page.dataset.settingsPage,
+      advanced: settingsTabEls.find(tab => tab.dataset.settingsTab === page.dataset.settingsPage)?.hasAttribute("data-advanced"),
+      sections: Array.from(page.querySelectorAll(":scope > .settings-section")).map(section => ({
+        element: section,
+        // A hidden section belongs to an unavailable runtime, feature or admin
+        // scope. Searching must never reveal it or advertise inaccessible hits.
+        available: !section.hidden,
+        advanced: section.hasAttribute("data-advanced"),
+        text: Array.from(section.querySelectorAll("h3, p, label, summary"))
+          .filter(node => !node.closest("[hidden]") || node.closest("[hidden]") === page)
+          .map(node => node.textContent).join(" ").replace(/\s+/g, " ")
+      }))
+    }));
+    const plan = planSettingsSearch(pages, query, activeKey, simple);
+    for (const {section, hit} of plan.matches) {
+      section.classList.toggle("search-hidden", Boolean(query) && !hit);
+      for (const details of section.querySelectorAll("details.settings-disclosure")) {
+        if (query && hit && !details.open) {
+          details.open = true;
+          details.dataset.searchOpened = "true";
+        } else if ((!query || !hit) && details.dataset.searchOpened === "true") {
+          details.open = false;
+          delete details.dataset.searchOpened;
         }
-        if (visible) matches++;
-      });
-      tabMatchCounts[page.dataset.settingsPage] = matches;
+      }
+    }
+    settingsTabEls.forEach(tab => {
+      const count = plan.counts[tab.dataset.settingsTab] || 0;
+      tab.classList.toggle("has-no-matches", Boolean(query) && count === 0);
+      const badge = tab.querySelector(".settings-match-count");
+      badge.hidden = !query;
+      badge.textContent = String(count);
     });
-    settingsTabEls.forEach((tab) => {
-      tab.classList.toggle("has-no-matches", Boolean(query) && tabMatchCounts[tab.dataset.settingsTab] === 0);
-    });
-    const activeTab = settingsTabEls.find((tab) => tab.classList.contains("is-active"));
-    const activeKey = activeTab ? activeTab.dataset.settingsTab : null;
-    const noResults = Boolean(query) && activeKey && tabMatchCounts[activeKey] === 0;
+    if (query && autoSelect && plan.selected !== activeKey) setSettingsTab(plan.selected, false, true);
+    if (!query && settingsTabBeforeSearch !== null) {
+      const previous = settingsTabEls.find(tab => tab.dataset.settingsTab === settingsTabBeforeSearch && tab.offsetParent !== null);
+      settingsTabBeforeSearch = null;
+      if (previous) setSettingsTab(previous.dataset.settingsTab, false, true);
+    }
+    const shownKey = settingsTabEls.find(tab => tab.classList.contains("is-active"))?.dataset.settingsTab;
+    settingsSearchClearEl.hidden = !query;
+    settingsSearchStatusEl.hidden = !query;
+    settingsSearchStatusEl.textContent = query
+      ? plan.total + " matching section" + (plan.total === 1 ? "" : "s") + " across settings." : "";
+    settingsSearchAdvancedEl.hidden = !query || !plan.advanced;
+    settingsSearchAdvancedEl.textContent = "Show " + plan.advanced + " advanced result" + (plan.advanced === 1 ? "" : "s");
+    const noResults = Boolean(query) && !plan.counts[shownKey];
     settingsSearchEmptyEl.hidden = !noResults;
     if (noResults) {
-      settingsSearchEmptyQueryEl.textContent = settingsSearchEl.value.trim();
-      const otherTabs = Object.keys(tabMatchCounts).filter((key) => key !== activeKey && tabMatchCounts[key] > 0);
-      settingsSearchEmptyHintEl.textContent = otherTabs.length ? " Try " + otherTabs.map((key) => tabLabels[key]).join(", ") + "." : "";
+      settingsSearchEmptyQueryEl.textContent = query;
+      settingsSearchEmptyHintEl.textContent = plan.advanced
+        ? " Matching options are available in Advanced mode." : plan.total ? " Select a tab with results." : " Try a shorter or different search.";
     }
   }
 
@@ -5494,14 +5541,26 @@ function toMarkdown(chat) {
     applySettingsSearch();
   }
 
-  settingsSearchEl.addEventListener("input", applySettingsSearch);
+  settingsSearchEl.addEventListener("input", () => applySettingsSearch());
+  settingsSearchClearEl.addEventListener("click", () => { clearSettingsSearch(); settingsSearchEl.focus(); });
+  settingsSearchAdvancedEl.addEventListener("click", () => {
+    applyUIMode("advanced");
+    applySettingsSearch();
+    settingsSearchEl.focus();
+  });
+  [$("uiModeSimple"), $("uiModeAdvanced")].forEach(button => button.addEventListener("click", () => applySettingsSearch()));
+  settingsSearchEl.addEventListener("keydown", event => {
+    if (event.key === "Escape" && settingsSearchEl.value) {
+      event.preventDefault(); event.stopPropagation(); clearSettingsSearch();
+    }
+  });
 
   function openSettings(initialFocus, opener) {
     settingsToggleEl.setAttribute("aria-expanded", "true");
     // A stale filter from the last visit would silently hide sections the
     // user never searched for this time -- start every visit unfiltered.
     clearSettingsSearch();
-    openDialog(settingsEl, opener || settingsToggleEl, initialFocus || settingsCloseEl);
+    openDialog(settingsEl, opener || settingsToggleEl, initialFocus || settingsSearchEl);
   }
   function closeSettings() {
     if (settingsEl.hidden) return;
@@ -5520,7 +5579,7 @@ function toMarkdown(chat) {
   settingsTabEls.forEach((tab) => {
     tab.addEventListener("click", () => setSettingsTab(tab.dataset.settingsTab));
     tab.addEventListener("keydown", (event) => {
-      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
       // Cycle over the tabs simple mode leaves on screen, not over the full
       // list: arrowing onto a hidden tab would open an empty panel.
@@ -5528,7 +5587,7 @@ function toMarkdown(chat) {
       const tabs = reachable.length ? reachable : settingsTabEls;
       const from = Math.max(0, tabs.indexOf(tab));
       const direction = event.key === "ArrowRight" ? 1 : -1;
-      const next = (from + direction + tabs.length) % tabs.length;
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (from + direction + tabs.length) % tabs.length;
       setSettingsTab(tabs[next].dataset.settingsTab, true);
     });
   });
@@ -5987,6 +6046,7 @@ function toMarkdown(chat) {
     // condition/action and leaves whatever the user already typed alone.
     if (button.dataset.prompt) livePromptInputEl.value = button.dataset.prompt;
     if (button.dataset.condition) {
+      liveAlertsDisclosureEl.open = true;
       liveActionConditionEl.value = button.dataset.condition;
       (button.dataset.arm || "").split(",").filter(Boolean).forEach((key) => {
         if (key === "alert") liveActionSoundEl.checked = true;
@@ -6042,6 +6102,7 @@ function toMarkdown(chat) {
   }
 
   function applyInferenceMode(mode) {
+    syncAudioAvailability();
     const browser = browserOnlyDeployment || (!adminRequiredDeployment && mode === "browser");
     browserModelSectionEl.hidden = !browser;
     serverModelSectionEl.hidden = browser || (adminRequiredDeployment && !adminAuthorized);
@@ -6064,6 +6125,7 @@ function toMarkdown(chat) {
       ? "browser"
       : (adminRequiredDeployment ? "server" : (value === "browser" && hasLocalRuntime() ? "browser" : "server"));
     preferences.inferenceMode = next;
+    syncAudioAvailability();
     inferenceModeEl.value = next;
     applyInferenceMode(next);
     save();
@@ -6761,6 +6823,12 @@ function toMarkdown(chat) {
       notify: liveActionNotifyEl.checked,
       mark: liveActionMarkEl.checked
     };
+    // The condition/toggle fields live inside a collapsed <details> by
+    // default -- without this, arming a watch condition and then closing
+    // the disclosure would leave no visible trace that anything is armed.
+    const armed = liveActionsArmed.alert || liveActionsArmed.notify || liveActionsArmed.mark;
+    liveAlertsSummaryNoteEl.hidden = !(armed && liveActionCondition);
+    if (!liveAlertsSummaryNoteEl.hidden) liveAlertsSummaryNoteEl.textContent = "armed · " + liveActionCondition;
   }
 
   function setLiveOutputText(text, streaming, isError) {
@@ -7080,6 +7148,8 @@ function toMarkdown(chat) {
     liveActionNotifyEl.checked = false;
     liveActionMarkEl.checked = false;
     liveActionConditionEl.value = "";
+    liveAlertsDisclosureEl.open = false;
+    liveAlertsSummaryNoteEl.hidden = true;
     setLiveCaptureButtonState(false, liveCaptureMode);
     livePauseButtonEl.classList.remove("is-paused");
     livePauseButtonEl.setAttribute("aria-label", "Pause live vision");

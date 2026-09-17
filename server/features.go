@@ -18,7 +18,7 @@ import (
 // Hosts that want the pre-Features behavior back can pass AllFeatures().
 type Features struct {
 	// ModelCatalog serves GET /models and the /models/load hot-swap, plus
-	// /models/architecture and the embedding-model routes. Loads stay
+	// /models/architecture, embedding-model routes, and Voxtral transcription. Loads stay
 	// restricted to ModelDir; this only decides whether the routes exist.
 	ModelCatalog bool
 	// ModelDownload adds /models/search and /models/download. Both make

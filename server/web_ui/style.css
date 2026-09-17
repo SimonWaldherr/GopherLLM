@@ -526,8 +526,12 @@ h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 }
 .model-name:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
 .top { flex: 0 0 auto; gap: var(--sp-2h); margin-left: auto; }
-.header-brief, .header-share { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 33px; padding: 0 var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel); color: var(--ink); box-shadow: var(--shadow); font-size: var(--fs-xs); font-weight: 700; }
-.header-brief .icon, .header-share .icon { width: 15px; height: 15px; }
+/* Icon-only by default, like the other header actions (Settings, Architecture):
+   a text-labeled "Briefing" / "Share" pair stood out as the busiest thing in
+   the header. The label stays for screen readers via the visually-hidden span. */
+.header-brief, .header-share { display: grid; place-items: center; width: 33px; height: 33px; min-width: 0; min-height: 0; padding: 0; border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel); color: var(--ink); box-shadow: var(--shadow); font-size: var(--fs-xs); font-weight: 700; }
+.header-brief .icon, .header-share .icon { width: 17px; height: 17px; }
+.header-brief > span, .header-share > span { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .header-brief:hover:not(:disabled), .header-share:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); }
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; }
 .status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ok); }
@@ -880,7 +884,23 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
   display: block; width: 100%; min-height: 40px; max-height: 120px; padding: var(--sp-1h) 2px; resize: none;
   border: 0; background: transparent; color: var(--ink); font: var(--fs-md)/1.4 var(--mono); outline: none;
 }
-.live-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 5px; }
+/* Collapsed by default: zone/condition/action-toggles are for the
+   watch-and-alert workflow, not the default "what do you see" ask, and
+   having them permanently open crowded the video feed underneath with
+   controls most sessions never touch. A "Danger alert"-style suggestion
+   chip still opens this itself (see the livePromptSuggestionsEl handler)
+   so the shortcut stays one click, not two. */
+.live-alerts { margin-top: 5px; }
+.live-alerts-summary {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2);
+  list-style: none; cursor: pointer; color: var(--muted); font: 700 var(--fs-3xs)/1.6 var(--mono); letter-spacing: .06em; text-transform: uppercase;
+}
+.live-alerts-summary::-webkit-details-marker { display: none; }
+.live-alerts-summary:hover { color: var(--ink); }
+.live-alerts-summary .settings-disclosure-chevron { width: 13px; height: 13px; }
+.live-alerts[open] > .live-alerts-summary .settings-disclosure-chevron { transform: rotate(180deg); }
+.live-alerts-summary .field-note { text-transform: none; letter-spacing: normal; color: var(--accent); }
+.live-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 6px; }
 #captureModal .live-action-condition {
   flex: 1 1 160px; min-width: 0; height: 22px; padding: 0 8px; border: 1px solid var(--line); border-radius: var(--r-pill);
   background: var(--panel-2); color: var(--ink); font: var(--fs-2xs)/1 var(--mono); outline: none;
@@ -1176,7 +1196,16 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .model-download-status.is-success { color: var(--ok); }
 .settings-actions { display: flex; flex-wrap: wrap; gap: 8px 14px; }
 .settings-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 12px; }
-.settings-primary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px 12px; }
+/* 6 fields (temperature/topP/topK/minP/repeatPenalty/seed), not 4 or 8: at
+   the base 4-column grid the 5th and 6th field wrap alone onto a second row
+   with two conspicuously empty trailing cells. 3 columns divides 6 evenly
+   into two full rows instead. Compound selector so it beats .settings-grid's
+   own media-query overrides by specificity, not source order. */
+.settings-grid.settings-advanced-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+/* Two items (workflow/persona/maxTokens/contextStrategy is the one 4-item
+   user of this class) divide evenly at 2 columns; at 3 they left the 4th
+   field alone in a row with two empty cells beside it. */
+.settings-primary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; }
 .settings label { display: grid; align-content: start; gap: 4px; min-width: 0; color: var(--muted); font-size: var(--fs-xs); font-weight: 680; }
 .settings input, .settings select, .settings textarea { min-width: 0; border: 0px solid var(--line-strong); border-radius: var(--r-sm); background: var(--bg); color: var(--ink); font-size: var(--fs-sm); }
 .settings input, .settings select { width: 100%; min-height: 31px; padding: 4px 7px; }
@@ -1354,7 +1383,6 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 @media (max-width: 900px) {
   body.chat .app { grid-template-columns: 232px minmax(0, 1fr); }
   :root { --sidebar: 232px; }
-  .settings-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 @media (max-width: 720px) {
   body.chat .app { grid-template-columns: minmax(0, 1fr); }
@@ -1382,8 +1410,6 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .model-name { max-width: 40vw; }
   body.chat main { padding: var(--sp-3) var(--sp-2h); }
   .msg { max-width: 96%; }
-  .settings-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .settings-primary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-library { grid-template-columns: 1fr; max-height: 330px; }
   .live-bottom { grid-template-columns: 1fr; }
   .live-output-panel { height: 132px; }
@@ -1397,9 +1423,7 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
      vw cap would strand empty space next to a short title. */
   .top { margin-left: auto; }
   .status > span:last-child { display: none; }
-  .header-brief, .header-share { width: 36px; min-width: 36px; min-height: 36px; padding: 0; }
-  .header-brief > span, .header-share > span { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-  .header-brief .icon, .header-share .icon { width: 17px; height: 17px; }
+  .header-brief, .header-share { width: 36px; height: 36px; }
   header .icon-button { width: 36px; height: 36px; }
   .status-dot { width: 9px; height: 9px; }
   .suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-inline: 0; }
@@ -1429,6 +1453,10 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .model-download-form { flex-direction: column; align-items: stretch; }
   .model-download-form .autotune-run { align-self: flex-start; }
   .settings-grid { grid-template-columns: 1fr 1fr; }
+  /* Same specificity trick as the base rule (see its comment) so this phone
+     override actually wins back over the unconditional 3-column rule above
+     instead of losing to it on specificity. */
+  .settings-grid.settings-advanced-grid { grid-template-columns: 1fr 1fr; }
   .settings-primary-grid { grid-template-columns: 1fr; }
   .workspace-fields { grid-template-columns: 1fr; }
   .settings-memory { grid-template-columns: 1fr; align-items: start; }
@@ -1455,3 +1483,45 @@ body[data-ui-mode="simple"] [data-advanced] { display: none; }
 .settings-mode-button:hover { color: var(--ink); }
 .settings-mode-button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: 0 1px 2px rgb(0 0 0 / 12%); }
 .settings-notice { margin: 0; padding: var(--sp-2h) 16px; border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--warn, #b45309) 12%, transparent); color: var(--ink); font-size: var(--fs-2xs); font-weight: 650; }
+
+/* Audio transcription is a composer disclosure, separate from chat models. */
+.audio-panel {
+  margin-top: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.audio-panel-heading, .audio-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.audio-panel-heading { justify-content: space-between; }
+.audio-panel-heading span { color: var(--muted); font-size: 12px; }
+.audio-controls select { flex: 1; min-width: 140px; max-width: 100%; }
+.audio-panel textarea { width: 100%; box-sizing: border-box; margin: 8px 0; resize: vertical; }
+#audioRecord[aria-pressed="true"], #audioStatus.is-error { color: var(--stop); }
+.audio-panel .composer-button { white-space: normal; }
+
+/* Settings: preserve the inline search layout against generic label rules. */
+#settings .settings-search { display: flex; min-height: 42px; gap: 8px; }
+#settings .settings-search input { min-height: 40px; font-size: var(--fs-sm); }
+#settings .settings-search .icon { flex: none; }
+#settings .settings-tabs { display: flex; gap: 6px; }
+#settings .settings-tab { flex: 1; min-height: 40px; }
+.settings-search-clear { justify-self: end; }
+.settings-search-feedback { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 0 16px; }
+.settings-search-feedback p { margin: 12px 0; font-size: var(--fs-xs); color: var(--muted); }
+.settings-search-feedback button { margin: 8px 0; }
+.settings-match-count { flex: none; min-width: 18px; border-radius: var(--r-pill); background: var(--bg); padding: 2px 5px; font-size: var(--fs-2xs); }
+.settings-scope { display: inline-block; margin-left: 8px; padding: 3px 6px; border: 1px solid var(--line); border-radius: var(--r-sm); color: var(--muted); font-size: var(--fs-3xs); font-weight: 600; letter-spacing: 0; text-transform: none; vertical-align: middle; }
+#settings .settings-tab:focus-visible, #settings .settings-search:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (max-width: 640px) {
+  #settings .settings-tabs { flex-wrap: wrap; }
+  #settings .settings-tab { flex-basis: calc(50% - 6px); min-height: 44px; }
+  #settings .settings-panel-foot { align-items: flex-start; }
+  #settings .settings-panel-foot span { max-width: 75%; line-height: 1.5; }
+}

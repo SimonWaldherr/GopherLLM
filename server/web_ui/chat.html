@@ -143,6 +143,7 @@
             <div class="prompt-footer-start">
               <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
               <input id="fileInput" type="file" multiple hidden>
+              <button id="audioToggle" class="composer-button" type="button" data-feature="model-catalog" aria-expanded="false" aria-controls="audioPanel">Audio</button>
               <button id="attachImage" class="composer-icon-button" type="button" aria-label="Attach an image" title="Attach an image" hidden><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg></button>
               <input id="imageFileInput" type="file" accept="image/*" hidden>
               <div id="cameraCaptureGroup" class="capture-action-group" hidden>
@@ -171,6 +172,24 @@
           <button id="send" type="submit" aria-label="Send message" title="Send message" disabled><span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg></span><span class="send-label">Send</span></button>
         </div>
       </div>
+      <section id="audioPanel" class="audio-panel" data-feature="model-catalog" aria-label="Voxtral audio transcription" hidden>
+        <div class="audio-panel-heading"><strong>Voxtral transcription</strong><span>Live microphone or up to 30 seconds · local server</span></div>
+        <div class="audio-controls">
+          <label for="audioModel">Audio model</label>
+          <select id="audioModel" aria-label="Voxtral audio model"></select>
+          <button id="audioRefresh" class="composer-button" type="button">Refresh models</button>
+        </div>
+        <div class="audio-controls">
+          <button id="audioUpload" class="composer-button" type="button" disabled>Choose audio file</button>
+          <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.ogg,.webm,.flac" hidden>
+          <button id="audioRecord" class="composer-button" type="button" aria-pressed="false" disabled>Record microphone</button>
+          <button id="audioLive" class="composer-button" type="button" aria-pressed="false" disabled>Start live transcription</button>
+          <button id="audioCancel" class="composer-button" type="button" hidden>Cancel</button>
+        </div>
+        <p id="audioStatus" class="settings-note" role="status" aria-live="polite">Choose a Voxtral model to transcribe audio. Microphone recording requires localhost or HTTPS.</p>
+        <textarea id="audioResult" aria-label="Recognized transcript" rows="3" readonly hidden></textarea>
+        <button id="audioInsert" class="composer-button" type="button" hidden>Use in message</button>
+      </section>
       <div id="composerProPanel" class="composer-pro" hidden>
         <div class="composer-pro-head">
           <span>Reply controls</span>
@@ -241,7 +260,7 @@
     <div class="settings-panel-head">
       <div>
         <h2 id="settingsTitle">Settings</h2>
-        <p>Changes are saved to this chat automatically.</p>
+        <p>Chat options apply to this chat. Workspace preferences stay in this browser.</p>
       </div>
       <div class="settings-mode" role="group" aria-label="How much to show">
         <button id="uiModeSimple" class="settings-mode-button" type="button" aria-pressed="true">Simple</button>
@@ -269,16 +288,21 @@
       <div class="settings-toolbar">
         <label class="settings-search">
           <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
-          <input id="settingsSearch" type="search" placeholder="Search settings…" aria-label="Search settings" autocomplete="off">
+          <input id="settingsSearch" type="search" aria-describedby="settingsSearchStatus" placeholder="Search all settings…" aria-label="Search settings" autocomplete="off">
         </label>
+        <button id="settingsSearchClear" class="text-button settings-search-clear" type="button" hidden>Clear search</button>
         <nav class="settings-tabs" role="tablist" aria-label="Settings sections">
-          <button class="settings-tab is-active" type="button" role="tab" id="settingsTabModel" aria-controls="settingsPageModel" aria-selected="true" data-settings-tab="model"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span>Model &amp; chat</span></button>
-          <button class="settings-tab" type="button" role="tab" id="settingsTabCapabilities" aria-controls="settingsPageCapabilities" aria-selected="false" tabindex="-1" data-settings-tab="capabilities" data-advanced><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span>Capabilities</span></button>
-          <button class="settings-tab" type="button" role="tab" id="settingsTabGeneration" aria-controls="settingsPageGeneration" aria-selected="false" tabindex="-1" data-settings-tab="generation" data-advanced><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Generation</span></button>
-          <button class="settings-tab" type="button" role="tab" id="settingsTabWorkspace" aria-controls="settingsPageWorkspace" aria-selected="false" tabindex="-1" data-settings-tab="workspace"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg><span>Workspace</span></button>
+          <button class="settings-tab is-active" type="button" role="tab" id="settingsTabModel" aria-controls="settingsPageModel" aria-selected="true" data-settings-tab="model"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span>Model &amp; chat</span><span class="settings-match-count" aria-hidden="true" hidden></span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabCapabilities" aria-controls="settingsPageCapabilities" aria-selected="false" tabindex="-1" data-settings-tab="capabilities" data-advanced><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span>Capabilities</span><span class="settings-match-count" aria-hidden="true" hidden></span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabGeneration" aria-controls="settingsPageGeneration" aria-selected="false" tabindex="-1" data-settings-tab="generation" data-advanced><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>Generation</span><span class="settings-match-count" aria-hidden="true" hidden></span></button>
+          <button class="settings-tab" type="button" role="tab" id="settingsTabWorkspace" aria-controls="settingsPageWorkspace" aria-selected="false" tabindex="-1" data-settings-tab="workspace"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg><span>Workspace</span><span class="settings-match-count" aria-hidden="true" hidden></span></button>
         </nav>
       </div>
-      <p id="settingsSearchEmpty" class="settings-search-empty" hidden>No settings match “<span id="settingsSearchEmptyQuery"></span>”.<span id="settingsSearchEmptyHint"></span></p>
+      <div class="settings-search-feedback">
+        <p id="settingsSearchStatus" role="status" aria-live="polite" hidden></p>
+        <button id="settingsSearchAdvanced" class="text-button" type="button" hidden>Show advanced results</button>
+      </div>
+      <p id="settingsSearchEmpty" class="settings-search-empty" hidden>No matches in this section for “<span id="settingsSearchEmptyQuery"></span>”.<span id="settingsSearchEmptyHint"></span></p>
 
       <div id="settingsPageModel" class="settings-page" role="tabpanel" aria-labelledby="settingsTabModel" data-settings-page="model">
         <section class="settings-section engine-overview" data-advanced aria-labelledby="engineOverviewTitle">
@@ -349,7 +373,7 @@
         <section class="settings-section settings-model-section" id="serverModelSection" data-admin-control>
           <div class="settings-section-head">
             <div>
-              <h3>Local model</h3>
+              <h3>Local model <span class="settings-scope">Server</span></h3>
               <p>Search the GGUF library and switch the model used by this server.</p>
             </div>
           </div>
@@ -429,7 +453,7 @@
         <section class="settings-section settings-chat-section">
           <div class="settings-section-head">
             <div>
-              <h3>This chat</h3>
+              <h3>This chat <span class="settings-scope">This chat</span></h3>
               <p>Set the assistant’s role, response budget, and memory strategy.</p>
             </div>
           </div>
@@ -602,7 +626,7 @@
         <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
-              <h3>Sampling</h3>
+              <h3>Sampling <span class="settings-scope">This chat</span></h3>
               <p>Fine-tune creativity and repeatability. Defaults are best for most models.</p>
             </div>
           </div>
@@ -635,7 +659,7 @@
 		<section class="settings-section" data-admin-control data-advanced data-feature="autotune">
           <div class="settings-section-head">
             <div>
-              <h3>Performance</h3>
+              <h3>Performance <span class="settings-scope">Server</span></h3>
               <p>Calibrate inference for the active model and this machine.</p>
             </div>
           </div>
@@ -661,7 +685,7 @@
         <section class="settings-section">
           <div class="settings-section-head">
             <div>
-              <h3>Appearance</h3>
+              <h3>Appearance <span class="settings-scope">This browser</span></h3>
               <p>Personalize this browser without changing server behavior.</p>
             </div>
           </div>
@@ -716,7 +740,7 @@
         <section class="settings-section" data-advanced>
           <div class="settings-section-head">
             <div>
-              <h3>Power commands</h3>
+              <h3>Power commands <span class="settings-scope">This browser</span></h3>
               <p>Expose batch, goal, and help commands in the composer.</p>
             </div>
           </div>
@@ -734,7 +758,7 @@
       </div>
     </div>
     <div class="settings-panel-foot">
-      <span>Saved automatically</span>
+      <span>Preferences save automatically. Server actions use their own buttons.</span>
       <button id="settingsDone" class="autotune-run" type="button">Done</button>
     </div>
   </div>
@@ -872,15 +896,21 @@
             <div class="live-prompt-panel">
               <span class="live-panel-label">Prompt</span>
               <textarea id="livePromptInput" rows="1" placeholder="Describe what you see in one sentence."></textarea>
-              <div class="live-actions">
-                <input id="liveZoneInput" type="text" class="live-zone-input" placeholder="Zone / camera (e.g. Pool A)" maxlength="80" aria-label="Observed pool zone or camera">
-                <input id="liveActionCondition" type="text" class="live-action-condition" placeholder="Watch for… (e.g. someone enters the room)" maxlength="200" aria-label="Situation to watch for">
-                <div class="live-action-toggles">
-                  <label class="live-action-toggle" title="Sound an audible alarm"><input id="liveActionSound" type="checkbox"><span>🔊 Sound</span></label>
-                  <label class="live-action-toggle" title="Send a system notification"><input id="liveActionNotify" type="checkbox"><span>🔔 Notify</span></label>
-                  <label class="live-action-toggle" title="Bookmark this moment in the history log"><input id="liveActionMark" type="checkbox"><span>📌 Mark</span></label>
+              <details id="liveAlertsDisclosure" class="live-alerts">
+                <summary class="live-alerts-summary">
+                  <span>Alerts <span id="liveAlertsSummaryNote" class="field-note" hidden></span></span>
+                  <svg class="icon settings-disclosure-chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+                </summary>
+                <div class="live-actions">
+                  <input id="liveZoneInput" type="text" class="live-zone-input" placeholder="Zone / camera (e.g. Pool A)" maxlength="80" aria-label="Observed pool zone or camera">
+                  <input id="liveActionCondition" type="text" class="live-action-condition" placeholder="Watch for… (e.g. someone enters the room)" maxlength="200" aria-label="Situation to watch for">
+                  <div class="live-action-toggles">
+                    <label class="live-action-toggle" title="Sound an audible alarm"><input id="liveActionSound" type="checkbox"><span>🔊 Sound</span></label>
+                    <label class="live-action-toggle" title="Send a system notification"><input id="liveActionNotify" type="checkbox"><span>🔔 Notify</span></label>
+                    <label class="live-action-toggle" title="Bookmark this moment in the history log"><input id="liveActionMark" type="checkbox"><span>📌 Mark</span></label>
+                  </div>
                 </div>
-              </div>
+              </details>
               <div id="livePromptSuggestions" class="live-suggestions">
                 <button type="button" class="live-suggestion" data-prompt="Describe what you see in one sentence.">Describe the scene</button>
                 <button type="button" class="live-suggestion" data-prompt="What is the color of my shirt?">What color is my shirt?</button>
@@ -972,6 +1002,7 @@
 </noscript>
 
 {{if .MermaidScript}}<script src="{{.MermaidScript}}"></script>{{end}}
+<script src="/audio.js"></script>
 <script src="/script.js"></script>
 </body>
 </html>

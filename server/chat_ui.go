@@ -21,6 +21,12 @@ var chatCSS string
 //go:embed web_ui/script.js
 var chatJS string
 
+//go:embed web_ui/audio.js
+var audioJS string
+
+//go:embed web_ui/audio-worklet.js
+var audioWorkletJS string
+
 //go:embed web_ui/wasm-bridge.js
 var wasmBridgeJS string
 
@@ -150,6 +156,16 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/css; charset=utf-8")
 		fmt.Fprint(w, chatCSS)
+	})
+	mux.HandleFunc("/audio.js", func(w http.ResponseWriter, _ *http.Request) {
+		setChatUIHeaders(w, "", hasLocalRuntime)
+		w.Header().Set("content-type", "text/javascript; charset=utf-8")
+		fmt.Fprint(w, audioJS)
+	})
+	mux.HandleFunc("/audio-worklet.js", func(w http.ResponseWriter, _ *http.Request) {
+		setChatUIHeaders(w, "", hasLocalRuntime)
+		w.Header().Set("content-type", "text/javascript; charset=utf-8")
+		fmt.Fprint(w, audioWorkletJS)
 	})
 	mux.HandleFunc("/script.js", func(w http.ResponseWriter, _ *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)

@@ -27,12 +27,13 @@ const DefaultAddr = "127.0.0.1:8080"
 // GGUF files installed through a hot-swap. Hosts should stop their HTTP server
 // before calling Close so no new requests can enter.
 type Handler struct {
-	next      http.Handler
-	state     *runnerState
-	embedder  *embeddingState
-	rag       *ragState
-	closeOnce sync.Once
-	closeErr  error
+	next       http.Handler
+	state      *runnerState
+	embedder   *embeddingState
+	rag        *ragState
+	audioClose func()
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -44,6 +45,9 @@ func (h *Handler) Close() error {
 		return nil
 	}
 	h.closeOnce.Do(func() {
+		if h.audioClose != nil {
+			h.audioClose()
+		}
 		h.closeErr = errors.Join(h.embedder.close(), h.rag.close(), h.state.close())
 	})
 	return h.closeErr
@@ -299,6 +303,9 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	registerChatWorkspaceRoutes(mux, history)
 	registerOpenAIRoutes(mux, state, embedder, sem, opts, skills, skillsFor, agenticToolsFor, logw)
 	registerOllamaRoutes(mux, state, embedder, sem, opts, skills, agenticToolsFor, logw)
+	audioClose := registerAudioRoutesWithRealtime(mux, sem, opts, gopherllm.TranscribeVoxtralRealtime, func(ctx context.Context, path string) (realtimeTranscriber, error) {
+		return gopherllm.NewVoxtralRealtimeSessionContext(ctx, path, logw)
+	})
 	registerModelRoutes(mux, state, embedder, sem, opts, deployment, &modelLoadMu, logw)
 	if opts.Features.AutoTune {
 		registerAutoTuneRoutes(mux, state, sem, logw)
@@ -312,10 +319,11 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	}
 
 	return &Handler{
-		next:     deployment.wrap(remoteOrLoadedModel(state, remote, mux)),
-		state:    state,
-		embedder: embedder,
-		rag:      ragState,
+		next:       deployment.wrap(remoteOrLoadedModel(state, remote, mux)),
+		state:      state,
+		embedder:   embedder,
+		rag:        ragState,
+		audioClose: audioClose,
 	}
 }
 

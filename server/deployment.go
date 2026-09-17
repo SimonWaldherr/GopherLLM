@@ -277,11 +277,14 @@ func adminOnlyRequest(req *http.Request) bool {
 // discover an abandoned server catalog. Static UI/WASM assets and local-only
 // workspace helpers remain available.
 func browserDisabledPath(path string) bool {
+	if strings.HasPrefix(path, "/v1/audio/") {
+		return true
+	}
 	if strings.HasPrefix(path, "/models") || strings.HasPrefix(path, "/autotune") || strings.HasPrefix(path, "/remote") || strings.HasPrefix(path, "/agentos") || strings.HasPrefix(path, "/rag") {
 		return true
 	}
 	switch path {
-	case "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/skills", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/api/tags", "/api/ps", "/api/show":
+	case "/v1/audio/transcriptions", "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/skills", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/api/tags", "/api/ps", "/api/show":
 		return true
 	default:
 		return false

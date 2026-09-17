@@ -1626,7 +1626,7 @@ type Decoder struct {
 }
 
 func NewDecoder(dim, hidden, heads, kvheads, layers, maxlen int, eps, scale float32, norm []float32) *Decoder {
-	if dim <= 0 || dim > 65536 || hidden <= 0 || hidden > 262144 || heads <= 0 || heads > 256 || kvheads <= 0 || heads%kvheads != 0 || layers <= 0 || layers > 256 || maxlen <= 0 || maxlen > 4096 || len(norm) != dim {
+	if dim <= 0 || dim > 65536 || hidden <= 0 || hidden > 262144 || heads <= 0 || heads > 256 || kvheads <= 0 || heads%kvheads != 0 || layers <= 0 || layers > 256 || maxlen <= 0 || maxlen > 16384 || len(norm) != dim {
 		return nil
 	}
 	p := C.gllm_decode_new(C.int(dim), C.int(hidden), C.int(heads), C.int(kvheads), C.int(layers), C.int(maxlen), C.float(eps), C.float(scale), (*C.float)(unsafe.Pointer(&norm[0])))
@@ -1662,6 +1662,15 @@ func (d *Decoder) BindLayer(index int, w [7]*Weight, quant [7]uint32, norm, ffn,
 	ok := bool(C.gllm_decode_layer(d.ptr, C.int(index), w[0].ptr, w[1].ptr, w[2].ptr, w[3].ptr, w[4].ptr, w[5].ptr, w[6].ptr, (*C.uint32_t)(unsafe.Pointer(&quant[0])), (*C.float)(unsafe.Pointer(&norm[0])), (*C.float)(unsafe.Pointer(&ffn[0])), qn, kn, C.int(window)))
 	runtime.KeepAlive(w)
 	return ok
+}
+
+// ShiftCache retains a chronological suffix. Absolute RoPE angles are supplied
+// separately from the physical cache position by Step's caller.
+func (d *Decoder) ShiftCache(length, drop int) bool {
+	if d == nil || d.ptr == nil || length < 0 || length > d.maxlen || drop <= 0 || drop > length {
+		return false
+	}
+	return bool(C.gllm_decode_shift_cache(d.ptr, C.int(length), C.int(drop)))
 }
 func (d *Decoder) Cache(layer, pos int, k, v []float32, upload bool) bool {
 	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || pos < 0 || pos >= d.maxlen {
