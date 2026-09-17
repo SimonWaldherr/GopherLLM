@@ -179,7 +179,9 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 			r.standard.Output.Cols,
 			runs,
 			func() {
-				_, _ = argmaxMetalQ6KPenalized(r.standard.Output.Metal, dimInput, recent, 1.1)
+				if _, ok := argmaxMetalQ6KPenalized(r.standard.Output.Metal, dimInput, recent, 1.1); !ok {
+					_, _ = argmaxMetalQ8_0Penalized(r.standard.Output.Metal, dimInput, recent, 1.1)
+				}
 			},
 		))
 	}

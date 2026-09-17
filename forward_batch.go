@@ -665,8 +665,8 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		// slabs (Gate, Up, Hidden) cross several kernel boundaries. The Metal
 		// fast path keeps those slabs GPU-resident for a complete prompt chunk,
 		// then returns only the final model-width projection for the residual.
-		// It admits precisely the established Q4_K/Q4_K/SiLU/Q6_K no-bias
-		// shape; every other architecture keeps the reference batch path.
+		// It admits prepared Q4_K gate/up with Q4_K or Q6_K down, or all-Q8_0
+		// no-bias shapes; other architectures keep the reference batch path.
 		// GateUp is layer-local: a mixed-model graph may follow a fused layer
 		// with a split one, and the activation task must never observe a stale
 		// fused view from the preceding layer.
@@ -674,6 +674,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		fusedMetalBatchFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
 			len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
 			matvecMetalSwiGLUBatchInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, b.XNFlat, p, &b.ProjFlat)
+		if !fusedMetalBatchFFN && config.UseGELU && !config.UseExactGELU && !config.usesPlainMLP() && !layer.HasGateUp && len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 {
+			fusedMetalBatchFFN = matvecMetalGeGLUInto(layer.W1, layer.W3, layer.W2, b.XNFlat, p, &b.ProjFlat)
+		}
 		if !fusedMetalBatchFFN {
 			// Every CPU FFN form needs its final hidden slab. The other inputs
 			// stay lazy: a fused gate/up tensor can feed the activation directly

@@ -556,6 +556,9 @@ static bool gllm_metal_init_q6k(void) {
 	}
 }
 
+#include "matrix.h"
+#include "coalesced.h"
+
 static id<MTLCommandBuffer> gllm_metal_new_command_buffer(void) {
 	// Every matvec waits before returning and weight handles outlive the wait, so
 	// retaining every referenced resource per dispatch is redundant. Rollback is
@@ -593,6 +596,8 @@ static void* gllm_metal_new_q4k(const void* data, long len, int rows, int cols, 
 		if (!gllm_metal_init_q4k()) {
 			return NULL;
 		}
+		gllm_metal_coalesced_pipeline(false);
+		gllm_metal_matrix_pipeline(4);
 		GLLMMetalWeight* w = (GLLMMetalWeight*)calloc(1, sizeof(GLLMMetalWeight));
 		if (w == NULL) {
 			strncpy(gllm_error, "failed to allocate Metal weight handle", sizeof(gllm_error) - 1);
@@ -655,6 +660,8 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 		if (!gllm_metal_init_q6k()) {
 			return NULL;
 		}
+		gllm_metal_coalesced_pipeline(true);
+		gllm_metal_matrix_pipeline(6);
 		GLLMMetalWeight* w = (GLLMMetalWeight*)calloc(1, sizeof(GLLMMetalWeight));
 		if (w == NULL) {
 			strncpy(gllm_error, "failed to allocate Metal weight handle", sizeof(gllm_error) - 1);
@@ -690,6 +697,8 @@ static void gllm_metal_encode_q4k_to(
 	int batch,
 	int default_rows_per_group
 ) {
+	if (gllm_metal_encode_matrix(enc, w, x_buffer, out_buffer, batch, 4)) return;
+	if (gllm_metal_encode_coalesced(enc, w, x_buffer, out_buffer, batch, false)) return;
 	[enc setComputePipelineState:gllm_q4k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
@@ -741,6 +750,8 @@ static void gllm_metal_encode_q6k_to(
 	int batch,
 	int default_rows_per_group
 ) {
+	if (gllm_metal_encode_matrix(enc, w, x_buffer, out_buffer, batch, 6)) return;
+	if (gllm_metal_encode_coalesced(enc, w, x_buffer, out_buffer, batch, true)) return;
 	[enc setComputePipelineState:gllm_q6k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
@@ -1044,13 +1055,14 @@ static int gllm_metal_q4k2_silu_q6k(
 // every activation vector in one command buffer; Gate, Up, and Hidden never
 // cross the CPU/GPU boundary. Only the final [batch][model_dim] projection is
 // copied back for the residual path.
-static int gllm_metal_q4k2_silu_q6k_batch(
+static int gllm_metal_q4k2_silu_batch(
 	void* gate_handle,
 	void* up_handle,
 	void* down_handle,
 	const float* x,
 	float* out,
-	int batch
+	int batch,
+	bool down_q4
 ) {
 	@autoreleasepool {
 		GLLMMetalWeight* gate = (GLLMMetalWeight*)gate_handle;
@@ -1061,7 +1073,7 @@ static int gllm_metal_q4k2_silu_q6k_batch(
 			x == NULL || out == NULL || gate->cols != up->cols || gate->rows != up->rows ||
 			down->cols != gate->rows ||
 			gate->row_bytes != (gate->cols / 256) * 144 || up->row_bytes != (up->cols / 256) * 144 ||
-			down->row_bytes != (down->cols / 256) * 210 ||
+			down->row_bytes != (down->cols / 256) * (down_q4 ? 144 : 210) ||
 			!gllm_metal_init_q4k() || !gllm_metal_init_q6k()) {
 			return 0;
 		}
@@ -1085,7 +1097,8 @@ static int gllm_metal_q4k2_silu_q6k_batch(
 			gllm_metal_encode_q4k_to(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, ffn_rows_per_group);
 			gllm_metal_encode_q4k_to(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, ffn_rows_per_group);
 			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, gllm_batch_workspace.hidden, (uint32_t)(count * (NSUInteger)gate->rows));
-			gllm_metal_encode_q6k_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group);
+			if (down_q4) gllm_metal_encode_q4k_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group);
+			else gllm_metal_encode_q6k_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group);
 			[enc endEncoding];
 			[cb commit];
 			[cb waitUntilCompleted];
@@ -1299,11 +1312,15 @@ static void gllm_metal_release_weight(void* handle) {
 		free(w);
 	}
 }
+#include "q8_0.h"
+#include "decode.h"
+#include "geglu.h"
 */
 import "C"
 
 import (
 	"math"
+	"os"
 	"runtime"
 	"unsafe"
 )
@@ -1436,20 +1453,33 @@ func MatvecQ4K2SwiGLUQ6K(gate, up, down *Weight, x, out []float32) bool {
 // complete FFN sequence: returning intermediate Gate/Up/Hidden slabs would
 // reintroduce the CPU/GPU traffic this path removes.
 func MatvecQ4K2SwiGLUQ6KBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
-	if gate == nil || up == nil || down == nil || gate.ptr == nil || up.ptr == nil || down.ptr == nil || batch <= 0 ||
+	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, false)
+}
+
+// MatvecQ4K2SwiGLUQ4KBatch includes contracting Q4_K FFN projections.
+func MatvecQ4K2SwiGLUQ4KBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
+	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, true)
+}
+
+func matvecQ4K2SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int, downQ4 bool) bool {
+	if gate == nil || up == nil || down == nil || gate.ptr == nil || up.ptr == nil || down.ptr == nil || batch <= 0 || batch > 256 ||
 		gate.cols != up.cols || gate.rows != up.rows || down.cols != gate.rows ||
 		gate.cols <= 0 || gate.rows <= 0 || down.rows <= 0 ||
 		batch > len(x)/gate.cols || batch > len(out)/down.rows {
 		return false
 	}
-	ok := C.gllm_metal_q4k2_silu_q6k_batch(
+	ok := C.gllm_metal_q4k2_silu_batch(
 		gate.ptr,
 		up.ptr,
 		down.ptr,
 		(*C.float)(unsafe.Pointer(&x[0])),
 		(*C.float)(unsafe.Pointer(&out[0])),
 		C.int(batch),
+		C.bool(downQ4),
 	)
+	runtime.KeepAlive(gate)
+	runtime.KeepAlive(up)
+	runtime.KeepAlive(down)
 	return ok != 0
 }
 
@@ -1512,4 +1542,234 @@ func Release(w *Weight) {
 	C.gllm_metal_release_weight(w.ptr)
 	w.ptr = nil
 	runtime.SetFinalizer(w, nil)
+}
+
+func PrepareQ8_0(data []byte, rows, cols int, noCopy bool) *Weight {
+	if rows <= 0 || cols <= 0 || cols%32 != 0 || len(data) == 0 {
+		return nil
+	}
+	if rows > math.MaxInt32 || cols/32 > math.MaxInt32/34 || cols/32 > len(data)/34/rows {
+		return nil
+	}
+	ptr := C.gllm_metal_new_q8_0(unsafe.Pointer(&data[0]), C.long(len(data)), C.int(rows), C.int(cols), C.bool(noCopy))
+	if ptr == nil {
+		return nil
+	}
+	w := &Weight{ptr: ptr, rows: rows, cols: cols}
+	runtime.SetFinalizer(w, Release)
+	return w
+}
+
+func MatvecQ8_0(w *Weight, x, out []float32) bool {
+	if w == nil || w.ptr == nil || len(x) < w.cols || len(out) < w.rows || w.rows == 0 {
+		return false
+	}
+	ok := C.gllm_metal_q8_0_matvec(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])))
+	runtime.KeepAlive(w)
+	return ok != 0
+}
+
+func ArgmaxQ8_0Penalized(w *Weight, x []float32, recent []uint32, repeatPenalty float32) (uint32, bool) {
+	if w == nil || w.ptr == nil || len(x) < w.cols || w.rows == 0 {
+		return 0, false
+	}
+	if len(recent) > C.GLLM_REPEAT_WINDOW || math.IsNaN(float64(repeatPenalty)) || math.IsInf(float64(repeatPenalty), 0) || repeatPenalty <= 0 {
+		return 0, false
+	}
+	var recentPtr *C.uint32_t
+	if len(recent) > 0 {
+		recentPtr = (*C.uint32_t)(unsafe.Pointer(&recent[0]))
+	}
+	var token C.uint32_t
+	ok := C.gllm_metal_q8_0_argmax(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), recentPtr, C.uint32_t(len(recent)), C.float(repeatPenalty), &token)
+	runtime.KeepAlive(w)
+	if ok == 0 {
+		return 0, false
+	}
+	return uint32(token), true
+}
+
+func MatvecQ8_0SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
+	if gate == nil || up == nil || down == nil || gate.ptr == nil || up.ptr == nil || down.ptr == nil || batch <= 0 || batch > 256 ||
+		gate.cols != up.cols || gate.rows != up.rows || down.cols != gate.rows ||
+		gate.cols <= 0 || gate.rows <= 0 || down.rows <= 0 ||
+		batch > len(x)/gate.cols || batch > len(out)/down.rows {
+		return false
+	}
+	ok := C.gllm_metal_q8_0_silu_batch(
+		gate.ptr,
+		up.ptr,
+		down.ptr,
+		(*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&out[0])),
+		C.int(batch),
+	)
+	runtime.KeepAlive(gate)
+	runtime.KeepAlive(up)
+	runtime.KeepAlive(down)
+	return ok != 0
+}
+
+// CoalescedAvailable verifies the four-token Q4_K/Q6_K prefill pipelines.
+func CoalescedAvailable() bool { return bool(C.gllm_metal_coalesced_available()) }
+
+// MatrixAvailable checks all quantized SIMD-group matrix pipelines.
+func MatrixAvailable() bool { return bool(C.gllm_metal_matrix_available()) }
+
+// Decoder owns device activations and KV staging for one serialized workspace.
+// The caller retains every bound Weight until Close.
+type Decoder struct {
+	ptr                                 unsafe.Pointer
+	dim, heads, kvheads, layers, maxlen int
+	hidden                              int
+	outputRows                          int
+}
+
+func NewDecoder(dim, hidden, heads, kvheads, layers, maxlen int, eps, scale float32, norm []float32) *Decoder {
+	if dim <= 0 || dim > 65536 || hidden <= 0 || hidden > 262144 || heads <= 0 || heads > 256 || kvheads <= 0 || heads%kvheads != 0 || layers <= 0 || layers > 256 || maxlen <= 0 || maxlen > 4096 || len(norm) != dim {
+		return nil
+	}
+	p := C.gllm_decode_new(C.int(dim), C.int(hidden), C.int(heads), C.int(kvheads), C.int(layers), C.int(maxlen), C.float(eps), C.float(scale), (*C.float)(unsafe.Pointer(&norm[0])))
+	if p == nil {
+		return nil
+	}
+	return &Decoder{ptr: p, hidden: hidden, dim: dim, heads: heads, kvheads: kvheads, layers: layers, maxlen: maxlen}
+}
+func (d *Decoder) Close() {
+	if d != nil && d.ptr != nil {
+		C.gllm_decode_release(d.ptr)
+		d.ptr = nil
+	}
+}
+func (d *Decoder) BindLayer(index int, w [7]*Weight, quant [7]uint32, norm, ffn, qnorm, knorm []float32, window int) bool {
+	if d == nil || d.ptr == nil || index < 0 || index >= d.layers || len(norm) != d.dim || len(ffn) != d.dim || (len(qnorm) != 0 && len(qnorm) != 128) || (len(knorm) != 0 && len(knorm) != 128) {
+		return false
+	}
+	rows := [7]int{d.heads * 128, d.kvheads * 128, d.kvheads * 128, d.dim, d.hidden, d.hidden, d.dim}
+	cols := [7]int{d.dim, d.dim, d.dim, d.heads * 128, d.dim, d.dim, d.hidden}
+	for i, v := range w {
+		if v == nil || v.ptr == nil || v.rows != rows[i] || v.cols != cols[i] || (quant[i] != 4 && quant[i] != 6 && quant[i] != 8) {
+			return false
+		}
+	}
+	var qn, kn *C.float
+	if len(qnorm) > 0 {
+		qn = (*C.float)(unsafe.Pointer(&qnorm[0]))
+	}
+	if len(knorm) > 0 {
+		kn = (*C.float)(unsafe.Pointer(&knorm[0]))
+	}
+	ok := bool(C.gllm_decode_layer(d.ptr, C.int(index), w[0].ptr, w[1].ptr, w[2].ptr, w[3].ptr, w[4].ptr, w[5].ptr, w[6].ptr, (*C.uint32_t)(unsafe.Pointer(&quant[0])), (*C.float)(unsafe.Pointer(&norm[0])), (*C.float)(unsafe.Pointer(&ffn[0])), qn, kn, C.int(window)))
+	runtime.KeepAlive(w)
+	return ok
+}
+func (d *Decoder) Cache(layer, pos int, k, v []float32, upload bool) bool {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || pos < 0 || pos >= d.maxlen {
+		return false
+	}
+	n := d.kvheads * 128
+	if upload {
+		n *= pos
+	}
+	if len(k) < n || len(v) < n {
+		return false
+	}
+	if n == 0 {
+		return true
+	}
+	C.gllm_decode_cache(d.ptr, C.int(layer), C.int(pos), (*C.float)(unsafe.Pointer(&k[0])), (*C.float)(unsafe.Pointer(&v[0])), C.bool(upload))
+	runtime.KeepAlive(d)
+	return true
+}
+func (d *Decoder) Step(input, sn, cs []float32, pairs, pos int, interleaved bool, temperature float32, residual, output []float32, logits []float32, recent []uint32, penalty float32, next *uint32) bool {
+	if d == nil || d.ptr == nil || pos < 0 || pos >= d.maxlen || pairs != 64 || len(input) < d.dim || len(residual) < d.dim || len(output) < d.dim || len(sn) < pairs || len(cs) < pairs {
+		return false
+	}
+	var lp *C.float
+	if logits != nil {
+		if d.outputRows == 0 || len(logits) != d.outputRows {
+			return false
+		}
+		lp = (*C.float)(unsafe.Pointer(&logits[0]))
+	}
+	var rp, np *C.uint32_t
+	if next != nil {
+		if d.outputRows == 0 || len(recent) > 64 || (penalty <= 0 || math.IsNaN(float64(penalty)) || math.IsInf(float64(penalty), 0)) {
+			return false
+		}
+		np = (*C.uint32_t)(unsafe.Pointer(next))
+		if len(recent) > 0 {
+			rp = (*C.uint32_t)(unsafe.Pointer(&recent[0]))
+		}
+	}
+	ok := bool(C.gllm_decode_step(d.ptr, (*C.float)(unsafe.Pointer(&input[0])), (*C.float)(unsafe.Pointer(&sn[0])), (*C.float)(unsafe.Pointer(&cs[0])), C.int(pairs), C.int(pos), C.bool(interleaved), C.float(temperature), (*C.float)(unsafe.Pointer(&residual[0])), (*C.float)(unsafe.Pointer(&output[0])), lp, rp, C.uint32_t(len(recent)), C.float(penalty), np))
+	runtime.KeepAlive(d)
+	return ok
+}
+
+func (d *Decoder) BindOutput(w *Weight, quant uint32) bool {
+	if d == nil || d.ptr == nil || w == nil || w.ptr == nil || w.cols != d.dim || w.rows <= 0 || (quant != 4 && quant != 6 && quant != 8) {
+		return false
+	}
+	ok := bool(C.gllm_decode_output(d.ptr, w.ptr, C.uint32_t(quant)))
+	runtime.KeepAlive(w)
+	if ok {
+		d.outputRows = w.rows
+	}
+	return ok
+}
+
+// BindCache borrows already pinned Go allocations. The owner must release
+// the decoder before unpinning or replacing either allocation.
+func (d *Decoder) BindCache(index int, k, v []float32) bool {
+	if d == nil || d.ptr == nil || index < 0 || index >= d.layers {
+		return false
+	}
+	n := d.maxlen * d.kvheads * 128
+	page := os.Getpagesize()
+	bytes := (n*4 + page - 1) / page * page
+	if len(k) < n || len(v) < n || cap(k) < bytes/4 || cap(v) < bytes/4 || uintptr(unsafe.Pointer(&k[0]))%uintptr(page) != 0 || uintptr(unsafe.Pointer(&v[0]))%uintptr(page) != 0 {
+		return false
+	}
+	ok := bool(C.gllm_decode_bind_cache(d.ptr, C.int(index), unsafe.Pointer(&k[0]), unsafe.Pointer(&v[0]), C.NSUInteger(bytes)))
+	runtime.KeepAlive(k)
+	runtime.KeepAlive(v)
+	runtime.KeepAlive(d)
+	return ok
+}
+
+// GeluFFN keeps all intermediate activations on the GPU. batch is bounded
+// to the shared prefill workspace limit; inputs/outputs are token-major.
+func GeluFFN(g, u, d *Weight, quant [3]uint32, x, out []float32, batch int) bool {
+	if g == nil || u == nil || d == nil || g.ptr == nil || u.ptr == nil || d.ptr == nil || batch < 1 || batch > 256 || g.rows != u.rows || g.cols != u.cols || d.cols != g.rows || len(x) != batch*g.cols || len(out) != batch*d.rows {
+		return false
+	}
+	ok := bool(C.gllm_geglu(g.ptr, u.ptr, d.ptr, (*C.uint32_t)(unsafe.Pointer(&quant[0])), (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])), C.int(batch)))
+	runtime.KeepAlive(g)
+	runtime.KeepAlive(u)
+	runtime.KeepAlive(d)
+	return ok
+}
+
+// GemmaOutput uses the vectorized matvec and optionally reduces logits on GPU.
+func GemmaOutput(w *Weight, quant uint32, x, out []float32, recent []uint32, penalty float32, next *uint32) bool {
+	if w == nil || w.ptr == nil || len(x) != w.cols || w.cols <= 0 || w.rows <= 0 || len(recent) > 64 || penalty <= 0 || math.IsNaN(float64(penalty)) || math.IsInf(float64(penalty), 0) {
+		return false
+	}
+	var op *C.float
+	var rp, np *C.uint32_t
+	if next == nil {
+		if len(out) != w.rows {
+			return false
+		}
+		op = (*C.float)(unsafe.Pointer(&out[0]))
+	} else {
+		np = (*C.uint32_t)(unsafe.Pointer(next))
+	}
+	if len(recent) > 0 {
+		rp = (*C.uint32_t)(unsafe.Pointer(&recent[0]))
+	}
+	ok := bool(C.gllm_gemma_output(w.ptr, C.uint32_t(quant), (*C.float)(unsafe.Pointer(&x[0])), op, rp, C.uint32_t(len(recent)), C.float(penalty), np))
+	runtime.KeepAlive(w)
+	return ok
 }

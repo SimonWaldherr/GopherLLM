@@ -135,6 +135,14 @@ func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuanti
 	if err != nil {
 		return config, Gemma4Weights{}, err
 	}
+	if useMetal {
+		for i := range std.Layers {
+			l := &std.Layers[i]
+			prepareMetalGeluWeight(&l.W1, borrowQuantized)
+			prepareMetalGeluWeight(&l.W3, borrowQuantized)
+			prepareMetalGeluWeight(&l.W2, borrowQuantized)
+		}
+	}
 	layers := make([]Gemma4LayerWeights, len(std.Layers))
 	for i, l := range std.Layers {
 		layers[i] = Gemma4LayerWeights{

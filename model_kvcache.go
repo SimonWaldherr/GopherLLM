@@ -74,8 +74,8 @@ func NewKVCache(layers, kDim, vDim, maxLen int) *KVCache {
 	k := make([][]float32, layers)
 	v := make([][]float32, layers)
 	for i := range layers {
-		k[i] = make([]float32, maxLen*kDim)
-		v[i] = make([]float32, maxLen*vDim)
+		k[i] = makeKVF32(maxLen * kDim)
+		v[i] = makeKVF32(maxLen * vDim)
 	}
 	return &KVCache{K: k, V: v, PerPosKDim: kDim, PerPosVDim: vDim, MaxLen: maxLen}
 }

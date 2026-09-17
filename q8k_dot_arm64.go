@@ -379,11 +379,10 @@ func validateMXFP4Q8Dots8Asm() bool {
 
 /* ── Row kernels ─────────────────────────────────────────────────────────── */
 
-// The per-row loops stay separate per format rather than sharing one function
-// with a callback. The repo already measured that a func-value call per row
-// costs ~50ns against a ~127ns kernel (see argmaxQ6KRowsQ8 on amd64), so a
-// closure here would give back a third of the win these kernels exist for. What
-// IS shared is the scale arithmetic, one static call per block.
+// Keep format-specific row entry points: an indirect callback for every row
+// adds noticeable cost to the vocabulary projection. Validated full-row
+// assembly avoids the repeated Go/assembly transitions where available; the
+// block implementations remain fallback paths and compatibility references.
 
 // combineQ4KStyle folds Q4_K/Q5_K's packed 6-bit scale/min pairs into 8 raw
 // unsigned sub-block dots. The two formats differ only in block stride and
@@ -441,6 +440,9 @@ func q4kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 	if !q4kDotAsmOK {
 		return q4kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
 	}
+	if q4kDecodeAsmOK {
+		return q4kRowDecode(row, q8, xscales, xsums, blocks)
+	}
 	var qdots [8]int32
 	var sum float32
 	for b := range blocks {
@@ -482,6 +484,14 @@ func q6kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 	if !q6kDotAsmOK {
 		return q6kDotQ8KRowPortable(row, q8, xscales, xsums, blocks)
 	}
+	if q6kDecodeAsmOK {
+		return q6kRowDecode(row, q8, xscales, xsums, blocks)
+	}
+	return q6kDotQ8KRowBlock(row, q8, xscales, xsums, blocks)
+}
+
+// Retain the block-at-a-time implementation for fallback and differential tests.
+func q6kDotQ8KRowBlock(row []byte, q8 []int8, xscales, xsums []float32, blocks int) float32 {
 	var qdots [16]int32
 	var sum float32
 	for b := range blocks {
@@ -508,6 +518,9 @@ func q6kDotQ8KRow(row []byte, q8 []int8, xscales, xsums []float32, blocks int) f
 func q8_0DotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 {
 	if !q8_0DotAsmOK {
 		return q8_0DotQ8KRowPortable(row, q8, xscales, blocks)
+	}
+	if q8_0DecodeAsmOK {
+		return q8_0RowDecode(row, q8, xscales, blocks)
 	}
 	var qdots [8]int32
 	var sum float32

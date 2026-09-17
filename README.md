@@ -369,6 +369,24 @@ It retains only tokenized BOS/system/tool-prefix text; message content, image
 embeddings, logits, and KV state are not stored by this cache. The normal
 generation KV-prefix cache remains independent.
 
+### Reusing conversations
+
+A Runner reuses exact token prefixes in its live KV workspace. For standard
+attention-only models and Gemma, it also retains up to four displaced text
+conversations, capped at 128 MiB of KV snapshots and token IDs, so returning to
+an earlier chat can skip its already processed prefix. Historical snapshots
+require at least 32 matching tokens and compatible KV storage. Recurrent models,
+MLA, image-bearing requests, and out-of-core execution keep their existing paths.
+
+```go
+runner.SetConversationCacheLimit(64 << 20) // optional smaller history budget
+runner.SetConversationCacheLimit(0)       // disable history; keep live prefix reuse
+runner.ClearConversationCache()          // clear history and resident reuse metadata
+```
+
+The history budget is additional to the live workspace. See
+[prefill and conversation measurements](benchmarks/prefill-cache/README.md).
+
 ### Package layout
 
 The root package is inference only. Its import closure excludes the optional
@@ -929,7 +947,15 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   Command Line Tools are present; `make build-metal` does it explicitly
   regardless of platform detection) and must be enabled with `--metal` at
   runtime (also automatic from the `make` targets above; pass it yourself for
-  a manually built binary). The selective
+  a manually built binary). Supported dense Ministral/Mistral 3 and Qwen 3
+  models now use a complete Metal decoder by default: normalization, attention,
+  Q4_K/Q6_K/Q8_0 projections, FFN and vocabulary output share one command buffer.
+  Independent projections run concurrently, and aligned F32 KV caches share
+  pinned memory with Go instead of copying the prefix each token. This path
+  requires 128-dimensional heads and at most 4096 allocated KV slots. Unsupported
+  configurations retain the selective path. Set `GOPHERLLM_METAL_DENSE_DECODE=0`
+  to compare with that fallback. See the [matched llama.cpp comparisons](benchmarks/metal-dense/README.md).
+  The selective
   path fuses sufficiently large mixed Q4_K/Q4_K/Q6_K Q/K/V projections into
   one command buffer and offloads large Q4_K projections, Q4_K gate/up + SiLU
   + Q6_K FFN-down in one command buffer, and Q6_K vocabulary-output
@@ -946,6 +972,43 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   kernels remain as the fallback for small projections and Metal failures. The
   path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
+- Metal also supports large Q8_0 FFNs and vocabulary projections, including
+  on-device greedy argmax with repeat penalties. This enables selective GPU
+  offload for Qwen Q8_0 while its narrow attention projections stay on CPU.
+  Q4_K/Q6_K prefill uses four-token kernels with adjacent SIMD lanes reading
+  adjacent quantized values; the selective single-token fallback retains its previous kernels.
+  Metal uses float activations and can produce different text from the CPU
+  int8-activation path. See the [cooled Metal comparisons](benchmarks/metal-inference/README.md)
+  for numerical checks, measurements and rejected experiments.
+- Dense Gemma uses fused quantized Gate/Up → tanh-GELU → Down on Metal,
+  including the narrower FFNs in Gemma 4 E2B. Native Gemma 4 supports batched
+  Metal FFNs during prefill; attention, shared KV and per-layer embeddings keep
+  their existing semantics. Q4_K/Q6_K/Q8_0 vocabulary projections use vectorized
+  Metal kernels. Set `GOPHERLLM_METAL_GEMMA=0` to compare the previous path.
+  See the [cooled Gemma measurements](benchmarks/metal-gemma/README.md) for
+  tested checkpoints and numerical validation.
+- Prefill batches of at least 16 tokens use 32×32 tiled Q4_K/Q6_K/Q8_0
+  matrix kernels with Metal SIMD-group matrix multiply-accumulate and float32
+  operands. Weights are decoded into shared tiles without expanding the model.
+  Smaller batches and unavailable pipelines retain the previous kernels.
+  See [matrix-prefill measurements](benchmarks/metal-matrix/README.md), which document the earlier prefill-focused optimization round.
+  Contracting Q4_K down projections now also participate in the complete
+  GPU-resident FFN. This covers the half of Ministral Q4_K_M layers that
+  previously missed FFN fusion because their down projection was not Q6_K.
+- ARM64 Q8_0 prefill processes four tokens together while preserving the
+  existing Q8 arithmetic. Native dense Gemma 4 uses layer-wise prompt batches,
+  including its token-dependent per-layer projections. On the measured M2 Max,
+  these additional changes reduced TTFT by 58–59% for Qwen 4B Q8_0 and 24–26%
+  for Gemma 4 E2B Q4_K_M, with identical text in the comparison runs. See the
+  [prefill measurements and limits](benchmarks/prefill-cache/README.md).
+- Q8_0 Q/K/V and gate/up projection groups share activation quantization and
+  dispatch through the existing int8 kernels. Native Gemma also groups compatible
+  CPU Q4_K/Q6_K attention and dense FFN projections, preserving its shared-KV
+  behavior. On the measured M2 Max, Qwen 4B Q8_0 decode improved by 2.3–2.4×;
+  Gemma 4 E2B Q4_K_M decode improved by 5–6% and TTFT fell by 7%. Qwen output
+  can change because more projections now use Q8 activation approximation;
+  `GOPHERLLM_Q8_ACTIVATIONS=0` retains float fusion. See the
+  [measurements and limitations](benchmarks/qwen-gemma/README.md).
 - On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K, Q5_K, Q6_K,
   Q8_0, Q4_0, Q4_1, MXFP4, Q2_K, and Q3_K matvecs default to int8-activation full-row kernels: the activation
   vector is quantized once per matvec to int8 with one scale per 256-element
@@ -1003,6 +1066,13 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   size on the deployment machine.
 - SwiGLU's `x*sigmoid(x)*up` runs through an AVX2 kernel with a Cephes-style
   expf polynomial (~1e-7 relative error) instead of per-element `math.Exp`.
+- ARM64 CPUs with SDOT use full-row Q4_K, Q6_K and Q8_0 decode kernels.
+  Prefill shares Q6_K unpacking across four tokens and packs Q8_0 activations
+  once per batch for four-token SIMD dot products. Decode workers claim fine
+  row partitions through a shared cursor, reducing channel dispatch overhead.
+  These paths preserve the existing ARM64 arithmetic and have startup checks
+  and fallbacks. See the [Ministral/Qwen measurements with cooling intervals](benchmarks/cooled-inference/README.md)
+  for results, baseline definitions and limitations.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
   spread across the worker pool at longer contexts, and single-token matvec work
   is split into eight ranges per worker so performance cores absorb
@@ -1125,8 +1195,15 @@ details in the bullets they annotate):
 | `GOPHERLLM_NO_PREFAULT` | Skip the post-mmap page warm-up; restores pure lazy paging |
 | `GOPHERLLM_KV_F16` | `0` stores the KV cache as exact f32 instead of the default f16 cache on fast x86-64; `1` opts into f16 on other targets (NEON-accelerated on all of arm64) to halve KV memory |
 | `GOPHERLLM_KV_I8` | `1` opts into the Q8_0-block KV cache tier (off by default everywhere) — a memory-capacity option, not a speed one; see the KV cache section above |
-| `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`, adaptively `6` for the fused Ministral-3B-sized FFN) |
-| `GOPHERLLM_METAL_FUSED_FFN` | `0` disables Metal Gate/Up + SiLU + Down fusion |
+| `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override legacy Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`, adaptively `6` for Ministral-3B FFNs); new Q8_0 and coalesced prefill kernels use four rows |
+| `GOPHERLLM_METAL_COALESCED` | `0` disables the four-token Q4_K/Q6_K prefill fallback; also set `GOPHERLLM_METAL_MATRIX=0` to restore the legacy prefill kernels |
+| `GOPHERLLM_METAL_MATRIX` | `0` disables SIMD-group matrix prefill and restores the four-token kernels; decode is unchanged |
+| `GOPHERLLM_METAL_GEMMA` | `0` disables fused GeGLU, vectorized Gemma output and native Metal batch prefill (enabled by default) |
+| `GOPHERLLM_METAL_DENSE_DECODE` | `0` disables complete dense Metal decode for eligible Ministral/Qwen models (enabled by default) |
+| `GOPHERLLM_METAL_DENSE_VECTOR` | `0` uses legacy matvec kernels within complete Metal decode for comparison |
+| `GOPHERLLM_METAL_DENSE_CONCURRENT` | `0` serializes all dispatches within complete Metal decode |
+| `GOPHERLLM_METAL_DENSE_SHARED_KV` | `0` uses staging copies instead of pinned shared F32 KV buffers |
+| `GOPHERLLM_METAL_FUSED_FFN` | `0` disables hybrid-path Metal Gate/Up + SiLU + Down fusion; disable dense decode above to select that path |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
 
 Settings chosen by `--auto` override the corresponding environment variables for

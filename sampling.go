@@ -231,24 +231,31 @@ func sampleTopPFromWeights(weights []float32, total, topP, minP float32, rng *Rn
 // survivors. Selection is O(vocab * log K) even for ascending logits; the
 // scratch buffer is reused across decode steps.
 func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rng, candidates *[]TokenProb) uint32 {
-	*candidates = (*candidates)[:0]
-	for i, logit := range logits {
-		if !finiteLogit(logit) {
-			continue
+	c := (*candidates)[:0]
+	next := 0
+	for next < len(logits) && len(c) < topK {
+		if logit := logits[next]; finiteLogit(logit) {
+			c = append(c, TokenProb{next, logit})
 		}
-		item := TokenProb{i, logit}
-		if len(*candidates) < topK {
-			*candidates = append(*candidates, item)
-			if len(*candidates) == topK {
-				for j := topK/2 - 1; j >= 0; j-- {
-					siftDownTokenProbs(*candidates, j)
-				}
+		next++
+	}
+	if len(c) == topK {
+		for j := topK/2 - 1; j >= 0; j-- {
+			siftDownTokenProbs(c, j)
+		}
+		threshold := c[0].Prob
+		for i, logit := range logits[next:] {
+			// Token ids arrive in ascending order, so a tie can never replace
+			// an existing candidate. Most vocabulary entries need only this
+			// comparison; NaN and -Inf also fail it without a finite check.
+			if logit > threshold && finiteLogit(logit) {
+				c[0] = TokenProb{next + i, logit}
+				siftDownTokenProbs(c, 0)
+				threshold = c[0].Prob
 			}
-		} else if tokenProbLess(item, (*candidates)[0]) {
-			(*candidates)[0] = item
-			siftDownTokenProbs(*candidates, 0)
 		}
 	}
+	*candidates = c
 	sortTokenProbs(*candidates)
 	if len(*candidates) == 0 || math.IsInf(float64((*candidates)[0].Prob), -1) {
 		return argmaxFiniteToken(logits)

@@ -1,6 +1,9 @@
 package gopherllm
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // parallelRows splits [0, rows) across the persistent worker pool, running
 // fn(start, end) on each range concurrently and returning when all are done.
@@ -99,6 +102,11 @@ func dispatchParallelTaskMode(poolThreads, threads, rows int, allowOversubscribe
 	if allowOversubscribe && oversubscribeDispatch.Load() && rows >= threads*128 {
 		chunks = min(threads*8, cap(pool.jobs))
 	}
+	if chunks > threads {
+		dispatchRowBatch(pool, threads, rows, chunks, nil, task)
+		releaseRowWorkerPool(pool)
+		return
+	}
 	wg := wgPool.Get().(*sync.WaitGroup)
 	wg.Add(chunks - 1)
 	for w := 1; w < chunks; w++ {
@@ -120,14 +128,16 @@ func dispatchParallelMode(poolThreads, threads, rows int, allowOversubscribe boo
 	// expensive than the kernels themselves. Submit fewer jobs to one stable
 	// max-sized pool instead.
 	pool := acquireRowWorkerPool(poolThreads)
-	// Issue more chunks than workers so faster cores naturally pick up the
-	// slack of slower ones (e.g. efficiency cores on Apple Silicon). On
-	// homogeneous-core amd64 the oversubscription only multiplies channel
-	// wakeups, so chunks stay 1:1 with workers there. Small matvecs stay at
-	// one chunk per worker to avoid channel wakeup overhead.
+	// Extra chunks let faster cores absorb work from slower ones. Claim them
+	// inside each participant instead of sending every chunk through a channel.
 	chunks := threads
 	if allowOversubscribe && oversubscribeDispatch.Load() && rows >= threads*128 {
 		chunks = min(threads*8, cap(pool.jobs))
+	}
+	if chunks > threads {
+		dispatchRowBatch(pool, threads, rows, chunks, fn, nil)
+		releaseRowWorkerPool(pool)
+		return
 	}
 	// Keep the calling goroutine useful: it owns one chunk while the persistent
 	// workers consume the rest. This preserves `threads` total compute
@@ -149,6 +159,46 @@ func dispatchParallelMode(poolThreads, threads, rows int, allowOversubscribe boo
 	wg.Wait()
 	wgPool.Put(wg)
 	releaseRowWorkerPool(pool)
+}
+
+// rowBatch preserves the original fine-grained row partitions while requiring
+// only one channel job per participant. Each participant owns an initial chunk
+// and claims further chunks from next, so heterogeneous cores still balance
+// the work without dozens of channel wakeups and WaitGroup updates per matvec.
+type rowBatch struct {
+	fn           func(start, end int)
+	task         rowTask
+	rows, chunks int
+	next         atomic.Int64
+	wg           sync.WaitGroup
+}
+
+func (b *rowBatch) runRows(first, _ int) {
+	for chunk := first; chunk < b.chunks; chunk = int(b.next.Add(1) - 1) {
+		start, end := b.rows*chunk/b.chunks, b.rows*(chunk+1)/b.chunks
+		if b.task != nil {
+			b.task.runRows(start, end)
+		} else {
+			b.fn(start, end)
+		}
+	}
+}
+
+var rowBatchPool = sync.Pool{New: func() any { return new(rowBatch) }}
+
+func dispatchRowBatch(pool *rowWorkerPool, threads, rows, chunks int, fn func(int, int), task rowTask) {
+	b := rowBatchPool.Get().(*rowBatch)
+	b.fn, b.task, b.rows, b.chunks = fn, task, rows, chunks
+	b.next.Store(int64(threads))
+	b.wg.Add(threads - 1)
+	for w := 1; w < threads; w++ {
+		pool.jobs <- rowJob{start: w, task: b, wg: &b.wg}
+	}
+	b.runRows(0, 0)
+	b.wg.Wait()
+	// Do not retain model tensors or callback captures between dispatches.
+	b.fn, b.task = nil, nil
+	rowBatchPool.Put(b)
 }
 
 var wgPool = sync.Pool{New: func() any { return new(sync.WaitGroup) }}

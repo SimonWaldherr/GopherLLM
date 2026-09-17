@@ -102,6 +102,7 @@ type Runner struct {
 	workspaceBuf   *DecodeBuffer
 	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
+	conversations  conversationCache
 	// mistralPrefixCacheMu protects the opt-in render-time cache used by the
 	// Mistral/Ministral chat renderer. Unlike prefixCache, it is intentionally
 	// reachable from concurrent PrepareChatContext calls, which do not take
@@ -598,6 +599,10 @@ func (r *Runner) Close() error {
 	r.closed = true
 	r.genLock.Lock()
 	defer r.genLock.Unlock()
+	if r.workspaceBuf != nil && r.workspaceBuf.metalDense != nil {
+		r.workspaceBuf.metalDense.close()
+		r.workspaceBuf.metalDense = nil
+	}
 	r.releaseMetalWeights()
 	r.clearWeightContainers()
 	// PrepareChatContext may render an image without taking genLock. Hold the
@@ -617,6 +622,7 @@ func (r *Runner) Close() error {
 	r.workspaceBuf = nil
 	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
+	r.conversations = conversationCache{}
 	r.DisableMistralPromptPrefixCache()
 	r.DisableMistralKVPrefixCache()
 	// Close every shard of an out-of-core split model, keeping the first

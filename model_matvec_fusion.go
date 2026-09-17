@@ -1,15 +1,20 @@
 package gopherllm
 
-// tryMatvec3Into / tryMatvec2Into route same-typed Q4_K or Q6_K weight groups
-// (Q/K/V projections; FFN gate+up) through the fused kernels that share one
-// activation-sums pass and one worker-pool dispatch. They return false —
-// having written nothing — whenever types or shapes don't line up, and the
+// tryMatvec3Into / tryMatvec2Into route compatible weight groups
+// (Q/K/V projections; FFN gate+up) through fused kernels. Specialized kernels
+// share activation preprocessing and one worker dispatch. They return false,
+// having written nothing, whenever types or shapes do not line up, and the
 // caller falls back to independent matvecs.
 func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) bool {
 	if wq.Type != wk.Type || wq.Type != wv.Type || wq.Cols != wk.Cols || wq.Cols != wv.Cols || wq.Cols != len(x) || wq.F32 != nil || wk.F32 != nil || wv.F32 != nil {
 		return false
 	}
 	switch wq.Type {
+	case GGMLTypeQ8_0:
+		if useQ8Activations.Load() && wq.Cols > 0 && wq.Cols%256 == 0 {
+			return matvecQ8_0GroupInto([]Weight{wq, wk, wv}, x, []*[]float32{q, k, v})
+		}
+		return matvecSameType3Into(wq, wk, wv, x, q, k, v)
 	case GGMLTypeQ4_K:
 		if wq.Prepared != nil && wk.Prepared != nil && wv.Prepared != nil {
 			if MatvecPreparedQ4K3IntoWithXSums(
@@ -97,6 +102,11 @@ func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[
 		return false
 	}
 	switch a.Type {
+	case GGMLTypeQ8_0:
+		if useQ8Activations.Load() && a.Cols > 0 && a.Cols%256 == 0 {
+			return matvecQ8_0GroupInto([]Weight{a, b}, x, []*[]float32{aOut, bOut})
+		}
+		return matvecSameType2Into(a, b, x, aOut, bOut)
 	case GGMLTypeQ4_K:
 		if matvecMetalQ4K2Into(a.Metal, b.Metal, x, a.Rows, b.Rows, a.Cols, aOut, bOut) {
 			return true

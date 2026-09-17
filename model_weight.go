@@ -51,6 +51,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 	}
 	switch w.Type {
 	case GGMLTypeQ8_0:
+		if matvecMetalQ8_0Into(w.Metal, x, w.Rows, w.Cols, out) {
+			return
+		}
 		MatvecQ8_0Into(w.Raw, x, w.Rows, w.Cols, out)
 	case GGMLTypeQ4_0:
 		MatvecQ4_0Into(w.Raw, x, w.Rows, w.Cols, out)
@@ -196,6 +199,9 @@ func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 		xsumsScratchPool.Put(scratch)
 		return tok, true
 	case GGMLTypeQ8_0:
+		if token, ok := argmaxMetalQ8_0Penalized(w.Metal, x, nil, 1); ok {
+			return token, true
+		}
 		if w.Cols%256 != 0 {
 			return 0, false
 		}

@@ -355,6 +355,7 @@ func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
 	// Calibration writes probe tokens into the shared KV workspace and can also
 	// change its f16 representation. A chat prefix must be rebuilt afterward.
 	r.clearPrefixCache()
+	r.conversations = conversationCache{limit: r.conversations.limit}
 
 	start := time.Now()
 	t := &autoTuner{r: r, opts: opts}
@@ -1016,6 +1017,7 @@ func (r *Runner) AutoTuneOrCached(opts AutoTuneOptions, refresh bool) (AutoTuneR
 			}
 			r.genLock.Lock()
 			r.clearPrefixCache()
+			r.conversations = conversationCache{limit: r.conversations.limit}
 			res.Apply()
 			r.genLock.Unlock()
 			r.releaseModelLease()

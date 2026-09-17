@@ -23,6 +23,7 @@ type MetalWeight struct {
 	q4   *metalbackend.Weight
 	q5   *metalbackend.Weight
 	q6   *metalbackend.Weight
+	q8   *metalbackend.Weight
 	typ  GGMLType
 	rows int
 	cols int
@@ -36,12 +37,9 @@ func MetalError() string {
 	return metalbackend.LastError()
 }
 
-// metalWeightMayUseDirect is deliberately shared by preparation and dispatch.
-// A Metal handle owns several shared buffers, so retaining a matrix below the
-// direct-dispatch crossover wastes load time and memory: every current Metal
-// call rejects it on the same row threshold. This matters for Ministral GQA,
-// whose narrow Q/K/V and attention-output projections stay on the CPU while
-// its large FFN and vocabulary projections still use Metal.
+// metalWeightMayUseDirect gates standalone matvec offload. Contracting Q4_K
+// FFN weights have a separate preparation exception for fused FFNs; this
+// must not lower the standalone threshold for narrow attention projections.
 func metalWeightMayUseDirect(typ GGMLType, rows int) bool {
 	switch typ {
 	case GGMLTypeQ4_K:
@@ -59,13 +57,23 @@ func metalWeightMayUseDirect(typ GGMLType, rows int) bool {
 		return rows >= metalQ5KDirectMinRows
 	case GGMLTypeQ6_K:
 		return rows >= metalQ6KDirectMinRows
+	case GGMLTypeQ8_0:
+		return rows >= 2048
 	default:
 		return false
 	}
 }
 
 func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int, borrow bool) *MetalWeight {
-	if cols <= 0 || cols%256 != 0 || !metalWeightMayUseDirect(typ, rows) {
+	// Contracting Q4_K FFN weights are prepared for fusion only; standalone
+	// attention-sized Q4_K matvecs retain their CPU crossover.
+	fusedQ4Down := typ == GGMLTypeQ4_K && rows >= 2048 && cols/2 >= rows
+	if cols <= 0 || cols%256 != 0 || (!metalWeightMayUseDirect(typ, rows) && !fusedQ4Down) {
+		return nil
+	}
+	// Keep narrow Qwen attention projections on the CPU. Retain large FFN
+	// gate/up, contracting FFN down, and vocabulary projections for offload.
+	if typ == GGMLTypeQ8_0 && rows < 8192 && cols/2 < rows {
 		return nil
 	}
 	w := &MetalWeight{typ: typ, rows: rows, cols: cols}
@@ -76,10 +84,12 @@ func prepareMetalWeight(data []byte, typ GGMLType, rows, cols int, borrow bool) 
 		w.q5 = metalbackend.PrepareQ5K(data, rows, cols, borrow)
 	case GGMLTypeQ6_K:
 		w.q6 = metalbackend.PrepareQ6K(data, rows, cols, borrow)
+	case GGMLTypeQ8_0:
+		w.q8 = metalbackend.PrepareQ8_0(data, rows, cols, borrow)
 	default:
 		return nil
 	}
-	if w.q4 == nil && w.q5 == nil && w.q6 == nil {
+	if w.q4 == nil && w.q5 == nil && w.q6 == nil && w.q8 == nil {
 		return nil
 	}
 	return w
@@ -169,6 +179,20 @@ func matvecMetalQ4K2Q6KInto(qWeight, kWeight, vWeight *MetalWeight, x []float32,
 }
 
 func matvecMetalSwiGLUInto(gate, up, down *MetalWeight, x []float32, out *[]float32) bool {
+	if metalFusedFFNEnabled && metalQ4DownSwiGLUWeightsReady(gate, up, down) {
+		if len(x) < gate.cols {
+			return false
+		}
+		ensureLenNoClear(out, down.rows)
+		return metalbackend.MatvecQ4K2SwiGLUQ4KBatch(gate.q4, up.q4, down.q4, x, *out, 1)
+	}
+	if metalFusedFFNEnabled && metalQ8SwiGLUWeightsReady(gate, up, down) {
+		if len(x) < gate.cols {
+			return false
+		}
+		ensureLenNoClear(out, down.rows)
+		return metalbackend.MatvecQ8_0SwiGLUBatch(gate.q8, up.q8, down.q8, x, *out, 1)
+	}
 	if !metalFusedFFNEnabled || !metalWeightUsesDirect(gate) || !metalWeightUsesDirect(up) || !metalWeightUsesDirect(down) ||
 		gate.q4 == nil || up.q4 == nil || down.q6 == nil ||
 		gate.typ != GGMLTypeQ4_K || up.typ != GGMLTypeQ4_K || down.typ != GGMLTypeQ6_K ||
@@ -184,6 +208,20 @@ func matvecMetalSwiGLUInto(gate, up, down *MetalWeight, x []float32, out *[]floa
 // [batch][width] slabs, so this can avoid materializing the much larger
 // [batch][hidden] Gate, Up, and Hidden arrays on the CPU.
 func matvecMetalSwiGLUBatchInto(gate, up, down *MetalWeight, x []float32, batch int, out *[]float32) bool {
+	if metalFusedFFNEnabled && metalQ4DownSwiGLUWeightsReady(gate, up, down) {
+		if batch < 2 || batch > metalBatchFFNMaxTokens || batch > len(x)/gate.cols || batch > int(^uint(0)>>1)/down.rows {
+			return false
+		}
+		ensureLenNoClear(out, batch*down.rows)
+		return metalbackend.MatvecQ4K2SwiGLUQ4KBatch(gate.q4, up.q4, down.q4, x, *out, batch)
+	}
+	if metalFusedFFNEnabled && metalQ8SwiGLUWeightsReady(gate, up, down) {
+		if batch < 2 || batch > metalBatchFFNMaxTokens || batch > len(x)/gate.cols || batch > int(^uint(0)>>1)/down.rows {
+			return false
+		}
+		ensureLenNoClear(out, batch*down.rows)
+		return metalbackend.MatvecQ8_0SwiGLUBatch(gate.q8, up.q8, down.q8, x, *out, batch)
+	}
 	if !metalFusedFFNEnabled || batch < 2 || batch > metalBatchFFNMaxTokens || !metalWeightUsesDirect(gate) || !metalWeightUsesDirect(up) || !metalWeightUsesDirect(down) ||
 		gate.q4 == nil || up.q4 == nil || down.q6 == nil ||
 		gate.typ != GGMLTypeQ4_K || up.typ != GGMLTypeQ4_K || down.typ != GGMLTypeQ6_K ||
@@ -206,14 +244,19 @@ func (r *Runner) metalBatchFFNPrefillChunk() int {
 		r.config.usesPlainMLP() || r.config.UseGELU || !metalFusedFFNEnabled || len(r.standard.Layers) == 0 {
 		return 0
 	}
+	chunk := metalBatchFFNMaxTokens
 	for i := range r.standard.Layers {
 		layer := &r.standard.Layers[i]
+		if layer.W1.Type == GGMLTypeQ8_0 {
+			// Keep Qwen attention on its CPU-oriented slab size.
+			chunk = 128
+		}
 		if layer.MoE != nil || layer.HasGateUp || len(layer.FFNUpBias) != 0 || len(layer.FFNDownBias) != 0 ||
 			!metalSwiGLUBatchWeightsReady(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal) {
 			return 0
 		}
 	}
-	return metalBatchFFNMaxTokens
+	return chunk
 }
 
 // metalSwiGLUBatchWeightsReady mirrors the shape and handle portion of
@@ -221,6 +264,9 @@ func (r *Runner) metalBatchFFNPrefillChunk() int {
 // this is a load-time/default decision, while the dispatcher keeps validating
 // every call before submitting work to Metal.
 func metalSwiGLUBatchWeightsReady(gate, up, down *MetalWeight) bool {
+	if metalQ8SwiGLUWeightsReady(gate, up, down) || metalQ4DownSwiGLUWeightsReady(gate, up, down) {
+		return true
+	}
 	return metalWeightUsesDirect(gate) && metalWeightUsesDirect(up) && metalWeightUsesDirect(down) &&
 		gate.q4 != nil && up.q4 != nil && down.q6 != nil &&
 		gate.typ == GGMLTypeQ4_K && up.typ == GGMLTypeQ4_K && down.typ == GGMLTypeQ6_K &&
@@ -244,4 +290,40 @@ func releaseMetalWeight(w *MetalWeight) {
 		metalbackend.Release(w.q6)
 		w.q6 = nil
 	}
+	if w.q8 != nil {
+		metalbackend.Release(w.q8)
+		w.q8 = nil
+	}
+}
+
+func metalQ8SwiGLUWeightsReady(gate, up, down *MetalWeight) bool {
+	return metalWeightUsesDirect(gate) && metalWeightUsesDirect(up) && metalWeightUsesDirect(down) &&
+		gate.typ == GGMLTypeQ8_0 && up.typ == GGMLTypeQ8_0 && down.typ == GGMLTypeQ8_0 &&
+		gate.q8 != nil && up.q8 != nil && down.q8 != nil &&
+		gate.cols > 0 && gate.rows > 0 && down.rows > 0 &&
+		gate.cols == up.cols && gate.rows == up.rows && down.cols == gate.rows
+}
+
+func matvecMetalQ8_0Into(w *MetalWeight, x []float32, rows, cols int, out *[]float32) bool {
+	if !metalWeightUsesDirect(w) || w.typ != GGMLTypeQ8_0 || w.q8 == nil || w.rows != rows || w.cols != cols || len(x) < cols {
+		return false
+	}
+	ensureLenNoClear(out, rows)
+	return metalbackend.MatvecQ8_0(w.q8, x, *out)
+}
+
+func argmaxMetalQ8_0Penalized(w *MetalWeight, x []float32, recent []uint32, penalty float32) (uint32, bool) {
+	if !metalWeightUsesDirect(w) || w.typ != GGMLTypeQ8_0 || w.q8 == nil || len(x) < w.cols {
+		return 0, false
+	}
+	return metalbackend.ArgmaxQ8_0Penalized(w.q8, x, recent, penalty)
+}
+
+// Q4_K contractions are eligible only as part of a complete FFN.
+func metalQ4DownSwiGLUWeightsReady(gate, up, down *MetalWeight) bool {
+	return metalWeightUsesDirect(gate) && metalWeightUsesDirect(up) && down != nil &&
+		gate.typ == GGMLTypeQ4_K && up.typ == GGMLTypeQ4_K && down.typ == GGMLTypeQ4_K &&
+		gate.q4 != nil && up.q4 != nil && down.q4 != nil &&
+		gate.cols > 0 && gate.rows > 0 && down.rows >= 2048 && down.cols/2 >= down.rows &&
+		gate.cols == up.cols && gate.rows == up.rows && down.cols == gate.rows
 }

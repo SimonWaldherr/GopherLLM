@@ -101,6 +101,11 @@ func (r *Runner) greedyOutputToken(buf *DecodeBuffer, recent []uint32, repeatPen
 }
 
 func (r *Runner) forwardGreedyToken(cache *KVCache, buf *DecodeBuffer, token uint32, pos int, recent []uint32, repeatPenalty float32, logits *[]float32) (uint32, bool) {
+	if r.kind == loadedStandard {
+		if next, ok := tryMetalDenseGreedy(r.config, r.standard, cache, buf, token, pos, recent, repeatPenalty); ok {
+			return next, true
+		}
+	}
 	switch r.kind {
 	case loadedNemotronH:
 		ForwardNemotronHBodyInto(r.config, r.nemotronH, cache, buf, token, pos)
@@ -212,6 +217,19 @@ func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *Decode
 // offset is what lets an append-only chat process only the new rendered-token
 // suffix while attention still reads the cached prefix rows.
 func (r *Runner) prefillBatchedAt(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
+	if r.canBatchNativeGemma4() {
+		// Bound native per-token PLE and mixed-head scratch independently of the
+		// generic transformer's flat batch slabs.
+		chunk := min(r.prefillChunkSize(), 32)
+		for start := 0; start < len(tokens); start += chunk {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			end := min(start+chunk, len(tokens))
+			forwardNativeGemma4BatchInto(r.config, r.gemma4, cache, buf, tokens[start:end], startPos+start, end == len(tokens), logits)
+		}
+		return nil
+	}
 	weights, ok := r.batchPrefillWeights()
 	if !ok {
 		return fmt.Errorf("gopherllm: prefillBatchedAt called for a kind that cannot batch prefill")

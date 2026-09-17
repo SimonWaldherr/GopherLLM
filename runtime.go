@@ -167,6 +167,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if cacheEligible {
 		cacheInfo.Mode = "prefix"
 		reusedTokens = r.prefixReuseWithMTP(cache, tokens, mtpDraftTokens > 0)
+		reusedTokens = r.reuseConversation(cache, tokens, reusedTokens)
 		// Prefer the full, most-recent prompt cache when it has a longer match.
 		// The static Mistral snapshot is only a proper token prefix, so it cannot
 		// supply final-prompt logits and never takes the identical-prompt fast
@@ -268,7 +269,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		r.prefixCache = state
 	}()
 	if prefillOffset < len(tokens) {
-		if r.canBatchPrefill() {
+		if r.canBatchPrefill() || r.canBatchNativeGemma4() {
 			// Greedy output needs only the final normalized hidden state. Asking
 			// the batch graph to omit its vocabulary projection lets
 			// greedyOutputToken retain a direct Metal Q6_K reduction on-device;

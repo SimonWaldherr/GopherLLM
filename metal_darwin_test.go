@@ -89,6 +89,13 @@ func TestMetalBatchFFNPrefillChunkUsesVerifiedAllLayerHandles(t *testing.T) {
 	// CPU/GPU, so the regular default must stay in force rather than assuming
 	// the 256-token crossover.
 	r.standard.Layers = append(r.standard.Layers, newLayer())
+	r.standard.Layers[1].W2.Metal = newQ4(3072, 9216)
+	if got := r.prefillChunkSize(); got != metalBatchFFNMaxTokens {
+		t.Fatalf("mixed Q4/Q6 down graph chunk = %d, want %d", got, metalBatchFFNMaxTokens)
+	}
+	if metalWeightUsesDirect(r.standard.Layers[1].W2.Metal) {
+		t.Fatal("contracting Q4 FFN weight became eligible for standalone GPU matvec")
+	}
 	r.standard.Layers[1].W2.Metal = nil
 	if got := r.prefillChunkSize(); got != 128 {
 		t.Fatalf("partial Metal graph chunk = %d, want ordinary default 128", got)
@@ -513,6 +520,15 @@ func TestMetalMinistral3BFFNBatchDispatchMatchesCPU(t *testing.T) {
 // catches a stale Proj view or a failed Metal dispatch incorrectly leaking
 // into the residual path.
 func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
+	testMetalMinistralForwardBatch(t, false, 2)
+}
+
+func TestMetalMinistral3BQ4DownForwardBatchMatchesCPU(t *testing.T) {
+	testMetalMinistralForwardBatch(t, true, 35)
+}
+
+func testMetalMinistralForwardBatch(t *testing.T, downQ4 bool, batch int) {
+	t.Helper()
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
@@ -523,7 +539,6 @@ func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
 		headDim  = 128
 		nHeads   = 24
 		nKVHeads = 8
-		batch    = 2
 		vocab    = 4
 	)
 	rng := rand.New(rand.NewSource(200))
@@ -550,6 +565,11 @@ func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
 	gateData := q4Data(hidden, dim)
 	upData := q4Data(hidden, dim)
 	downData := q6Data(dim, hidden)
+	downType := GGMLTypeQ6_K
+	if downQ4 {
+		downData = q4Data(dim, hidden)
+		downType = GGMLTypeQ4_K
+	}
 	ones := make([]float32, dim)
 	for i := range ones {
 		ones[i] = 1
@@ -586,7 +606,7 @@ func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
 		WV: Weight{Raw: vData, Type: GGMLTypeQ6_K, Rows: nKVHeads * headDim, Cols: dim},
 		WO: Weight{Raw: oData, Type: GGMLTypeQ4_K, Rows: dim, Cols: dim},
 		W1: Weight{Raw: gateData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
-		W2: Weight{Raw: downData, Type: GGMLTypeQ6_K, Rows: dim, Cols: hidden},
+		W2: Weight{Raw: downData, Type: downType, Rows: dim, Cols: hidden},
 		W3: Weight{Raw: upData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
 	}
 	cpuWeights := ModelWeights{
@@ -598,7 +618,7 @@ func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
 	metalLayer := layer
 	metalLayer.W1.Metal = prepareMetalWeight(gateData, GGMLTypeQ4_K, hidden, dim, false)
 	metalLayer.W3.Metal = prepareMetalWeight(upData, GGMLTypeQ4_K, hidden, dim, false)
-	metalLayer.W2.Metal = prepareMetalWeight(downData, GGMLTypeQ6_K, dim, hidden, false)
+	metalLayer.W2.Metal = prepareMetalWeight(downData, downType, dim, hidden, false)
 	if metalLayer.W1.Metal == nil || metalLayer.W3.Metal == nil || metalLayer.W2.Metal == nil {
 		releaseMetalWeight(metalLayer.W1.Metal)
 		releaseMetalWeight(metalLayer.W3.Metal)
@@ -610,9 +630,21 @@ func TestMetalMinistral3BForwardBatchMatchesCPU(t *testing.T) {
 	defer releaseMetalWeight(metalLayer.W2.Metal)
 	metalWeights := cpuWeights
 	metalWeights.Layers = []LayerWeights{metalLayer}
-	tokens := []uint32{0, 1}
+	tokens := make([]uint32, batch)
+	for i := range tokens {
+		tokens[i] = uint32(i % vocab)
+	}
 	newState := func() (*KVCache, *DecodeBuffer) {
 		return NewKVCache(1, nKVHeads*headDim, nKVHeads*headDim, batch), NewDecodeBuffer(config, headDim, nKVHeads, headDim)
+	}
+	if downQ4 {
+		cpuCache, cpuBuf := newState()
+		metalCache, metalBuf := newState()
+		var cpuLogits, metalLogits []float32
+		ForwardInto(config, cpuWeights, cpuCache, cpuBuf, 0, 0, &cpuLogits)
+		ForwardInto(config, metalWeights, metalCache, metalBuf, 0, 0, &metalLogits)
+		assertMetalFiniteClose(t, metalLogits, cpuLogits)
+		assertMetalFiniteClose(t, metalBuf.XN, cpuBuf.XN)
 	}
 	cpuCache, cpuBuf := newState()
 	metalCache, metalBuf := newState()

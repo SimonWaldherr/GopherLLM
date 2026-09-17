@@ -16,12 +16,22 @@ func Forward(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuf
 }
 
 func ForwardInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int, logits *[]float32) {
+	if tryMetalDenseDecodeOutput(config, weights, cache, buf, token, pos, logits) {
+		finishLogits(config, weights, logits)
+		return
+	}
 	ForwardBodyInto(config, weights, cache, buf, token, pos)
 	ProjectLogitsInto(config, weights, buf, logits)
 }
 
 func ProjectLogitsInto(config Config, weights ModelWeights, buf *DecodeBuffer, logits *[]float32) {
-	weights.Output.MatvecInto(buf.XN, logits)
+	if !gemmaMetalOutputArch(config.Arch) || !matvecMetalGemmaOutputInto(weights.Output, buf.XN, logits) {
+		weights.Output.MatvecInto(buf.XN, logits)
+	}
+	finishLogits(config, weights, logits)
+}
+
+func finishLogits(config Config, weights ModelWeights, logits *[]float32) {
 	addInPlace(*logits, weights.OutputBias)
 	if config.LogitScale != 1 {
 		ScaleF32(*logits, 1/config.LogitScale)
@@ -56,11 +66,19 @@ func argmaxOutputTokenPenalizedInto(config Config, weights ModelWeights, buf *De
 		}
 		return argmaxFiniteToken(buf.Logits), true
 	}
+	if gemmaMetalOutputArch(config.Arch) {
+		if next, ok := argmaxMetalGemmaOutput(weights.Output, buf.XN, recent, repeatPenalty); ok {
+			return next, true
+		}
+	}
 	// Greedy decode only needs the winning token. Positive logit scaling and the
 	// optional positive softcap preserve argmax ordering, so Metal can reduce its
 	// Q6_K output buffer on-device and avoid a 131k-logit readback plus CPU scan.
 	// Sampling and unsupported output types retain the materialized fallback.
 	if token, ok := argmaxMetalQ6KPenalized(weights.Output.Metal, buf.XN, recent, repeatPenalty); ok {
+		return token, true
+	}
+	if token, ok := argmaxMetalQ8_0Penalized(weights.Output.Metal, buf.XN, recent, repeatPenalty); ok {
 		return token, true
 	}
 	if weights.Output.Metal != nil && logits != nil {
@@ -88,6 +106,9 @@ func argmaxOutputTokenPenalizedInto(config Config, weights ModelWeights, buf *De
 // Q/K/V and gate/up matvecs go through the fused multi-matrix kernels when
 // the quant types allow (tryMatvec3Into/tryMatvec2Into).
 func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, token uint32, pos int) {
+	if tryMetalDenseDecode(config, weights, cache, buf, token, pos) {
+		return
+	}
 	if config.UsesMLA {
 		ForwardDeepSeek2BodyInto(config, weights, cache, buf, token, pos)
 		return
@@ -218,10 +239,14 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			// Decode bottleneck: the selective Metal path previously synchronized and
 			// copied Gate/Up to the CPU for SiLU, then copied Hidden back for Down.
 			// Keep all three stages in one command buffer when the measured
-			// Q4_K/Q4_K/Q6_K shape matches. Any unsupported shape or GPU failure falls
+			// supported quantized shape matches. Any unsupported shape or GPU failure falls
 			// through to the unchanged CPU/GPU path; removing this branch is rollback.
 			fusedMetalFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
+				len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
 				matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
+			if !fusedMetalFFN && config.UseGELU && !config.UseExactGELU && !config.usesPlainMLP() && !layer.HasGateUp && len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 {
+				fusedMetalFFN = matvecMetalGeGLUInto(layer.W1, layer.W3, layer.W2, buf.XN2, 1, &buf.Proj)
+			}
 			if !fusedMetalFFN {
 				if config.usesPlainMLP() {
 					layer.W3.MatvecInto(buf.XN2, &buf.Up)
@@ -455,4 +480,8 @@ func shouldParallelGroupedGQAAttention(cache *KVCache, kvMul, nKVHeads, attnLen 
 
 func addInPlace(dst, src []float32) {
 	AxpyF32(dst, 1.0, src)
+}
+
+func gemmaMetalOutputArch(arch string) bool {
+	return arch == "gemma" || arch == "gemma2" || arch == "gemma3" || arch == "gemma4"
 }

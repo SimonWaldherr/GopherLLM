@@ -205,6 +205,7 @@ func fillQ8KXSums(t GGMLType, x []float32, cols int, sub *[]float32) {
 
 type batchQ8Scratch struct {
 	q8                    []int8
+	q8Packed              []int8
 	xsc                   []float32
 	xsums, xsums2, xsums3 []float32
 }
@@ -216,12 +217,22 @@ type batchQ8MatvecTask struct {
 	outs             [][]float32
 	layout           q8kRowLayout
 	q8All            []int8
+	q8Packed         []int8
 	xscAll, xsumsAll []float32
 	p, cols, blocks  int
 }
 
 func (t *batchQ8MatvecTask) runRows(start, end int) {
+	if batchQ8_0PackedRows4(t.w, t.outs[:t.p], t.q8All, t.q8Packed, t.xscAll, start, end) {
+		return
+	}
+	if batchQ8_0Rows4(t.w, t.outs[:t.p], t.q8All, t.xscAll, start, end) {
+		return
+	}
 	if batchQ4KRows4(t.w, t.outs[:t.p], t.q8All, t.xscAll, t.xsumsAll, start, end) {
+		return
+	}
+	if batchQ6KRows4(t.w, t.outs[:t.p], t.q8All, t.xscAll, t.xsumsAll, start, end) {
 		return
 	}
 	const rowTile = 16
@@ -296,6 +307,9 @@ func matvecBatchQ8(w Weight, xs, outs [][]float32) bool {
 	task := batchQ8MatvecTaskPool.Get().(*batchQ8MatvecTask)
 	task.w, task.outs, task.layout = w, outs, layout
 	task.q8All, task.xscAll, task.xsumsAll = q8All, xscAll, xsumsAll
+	if w.Type == GGMLTypeQ8_0 && prepareQ8_0PackedBatch(&scratch.q8Packed, q8All, cols, p) {
+		task.q8Packed = scratch.q8Packed
+	}
 	task.p, task.cols, task.blocks = p, cols, blocks
 	parallelRowsBatchedTask(w.Rows, task)
 	*task = batchQ8MatvecTask{}
@@ -347,17 +361,18 @@ func matvecBatchQ8Fused3(a, b, c Weight, xs, aOut, bOut, cOut [][]float32) bool 
 // task removes the last three heap allocations from long Q8 prompt batches:
 // two escaping slice-backed argument arrays plus the worker closure.
 type batchQ8FusedTask struct {
-	weights [3]Weight
-	outs    [3][][]float32
-	layouts [3]q8kRowLayout
-	offsets [4]int
-	sums    [3][]float32
-	q8All   []int8
-	xscAll  []float32
-	count   int
-	p       int
-	cols    int
-	blocks  int
+	weights  [3]Weight
+	outs     [3][][]float32
+	layouts  [3]q8kRowLayout
+	offsets  [4]int
+	sums     [3][]float32
+	q8All    []int8
+	q8Packed []int8
+	xscAll   []float32
+	count    int
+	p        int
+	cols     int
+	blocks   int
 }
 
 func (t *batchQ8FusedTask) runRows(start, end int) {
@@ -369,7 +384,16 @@ func (t *batchQ8FusedTask) runRows(start, end int) {
 		if localStart >= localEnd {
 			continue
 		}
+		if batchQ8_0PackedRows4(w, t.outs[wi][:t.p], t.q8All, t.q8Packed, t.xscAll, localStart, localEnd) {
+			continue
+		}
+		if batchQ8_0Rows4(w, t.outs[wi][:t.p], t.q8All, t.xscAll, localStart, localEnd) {
+			continue
+		}
 		if batchQ4KRows4(w, t.outs[wi][:t.p], t.q8All, t.xscAll, t.sums[wi], localStart, localEnd) {
+			continue
+		}
+		if batchQ6KRows4(w, t.outs[wi][:t.p], t.q8All, t.xscAll, t.sums[wi], localStart, localEnd) {
 			continue
 		}
 		layout := t.layouts[wi]
@@ -465,6 +489,12 @@ func matvecBatchQ8Fused(task *batchQ8FusedTask, xs [][]float32) bool {
 	// heterogeneous ARM CPUs while retaining the shared activation preparation.
 	task.p, task.cols, task.blocks = p, cols, blocks
 	task.q8All, task.xscAll = q8All, xscAll
+	for wi := 0; wi < task.count; wi++ {
+		if task.weights[wi].Type == GGMLTypeQ8_0 && prepareQ8_0PackedBatch(&scratch.q8Packed, q8All, cols, p) {
+			task.q8Packed = scratch.q8Packed
+			break
+		}
+	}
 	parallelRowsBatchedTask(task.offsets[task.count], task)
 	batchQ8Pool.Put(scratch)
 	return true

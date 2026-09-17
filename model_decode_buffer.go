@@ -10,7 +10,8 @@ package gopherllm
 // activation slabs. Not safe for concurrent use; Runner.genLock serializes
 // requests.
 type DecodeBuffer struct {
-	X []float32
+	metalDense *metalDenseState
+	X          []float32
 	// PosEmbd is scratch space for the gathered absolute-position-embedding
 	// row (GPT-2/StarCoder v1 only; see Config.usesAbsolutePositionEmbd).
 	PosEmbd  []float32
@@ -101,6 +102,7 @@ type DecodeBuffer struct {
 	// same size.
 	Gemma4PLE      []float32
 	Gemma4PLEInput []float32
+	gemmaBatch     gemma4BatchScratch
 	batch          batchDecodeBuffer
 	// ImageEmbeds maps an absolute sequence position to a vision-projector
 	// embedding that must overwrite the ordinary token-embedding-table

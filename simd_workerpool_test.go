@@ -26,10 +26,8 @@ func TestRowWorkerPoolRetiresOnlyAfterInFlightDispatch(t *testing.T) {
 	defer oversubscribeDispatch.Store(previousOversubscribe)
 
 	SetNumThreads(2)
-	// Force enough chunks that, after the caller and both workers have started
-	// one task each, the old pool still owns queued work. The original bug
-	// required precisely that state: stopping a retired pool at this point can
-	// strand those jobs before their WaitGroup.Done calls.
+	// Force multiple dynamically claimed chunks per participant. Retiring a
+	// pool must keep its participants alive until all these chunks complete.
 	oversubscribeDispatch.Store(true)
 	started := make(chan struct{}, 16)
 	release := make(chan struct{})
@@ -38,11 +36,11 @@ func TestRowWorkerPoolRetiresOnlyAfterInFlightDispatch(t *testing.T) {
 		parallelRowsTask(256, &blockingRowTask{started: started, release: release})
 		close(done)
 	}()
-	for range 3 { // caller + both old-pool workers
+	for range 2 { // caller + one worker participant
 		select {
 		case <-started:
 		case <-time.After(time.Second):
-			t.Fatal("old worker pool did not start caller and both worker chunks")
+			t.Fatal("old worker pool did not start caller and worker chunks")
 		}
 	}
 
@@ -52,11 +50,7 @@ func TestRowWorkerPoolRetiresOnlyAfterInFlightDispatch(t *testing.T) {
 	if oldPool == nil {
 		t.Fatal("missing active worker pool")
 	}
-	if len(oldPool.jobs) == 0 {
-		t.Fatal("test setup error: old worker pool has no queued jobs")
-	}
-
-	// Trigger a resize while an old-pool dispatch owns queued work. A retiring
+	// Trigger a resize while an old-pool dispatch owns unfinished work. A retiring
 	// pool must not stop workers yet: doing so can strand a job before it calls
 	// its WaitGroup.Done and hang the original caller.
 	SetNumThreads(3)

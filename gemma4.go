@@ -405,6 +405,11 @@ func loadNativeGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepare
 		if err != nil {
 			return config, Gemma4Weights{}, err
 		}
+		if useMetal {
+			prepareMetalGeluWeight(&wGate, borrowQuantized)
+			prepareMetalGeluWeight(&wUp, borrowQuantized)
+			prepareMetalGeluWeight(&wDown, borrowQuantized)
+		}
 		var perLayerGate, perLayerProj Weight
 		var perLayerPostNorm []float32
 		if perLayer != nil {
@@ -630,46 +635,10 @@ func forwardNativeGemma4BodyInto(config Config, weights Gemma4Weights, cache *KV
 		if !kvSource.HasKV || kvSource.ValueDim != layer.HeadDim || kvSource.NKVHeads <= 0 {
 			panic("invalid native Gemma 4 shared-KV source")
 		}
-		qLen := config.NHeads * layer.HeadDim
-		kLen := kvSource.NKVHeads * kvSource.HeadDim
-		vLen := kvSource.NKVHeads * kvSource.ValueDim
 		normalizeDecoderInto(config, buf.X[:dim], layer.AttnNorm, nil, &buf.XN)
-		layer.AttnQ.MatvecInto(buf.XN[:dim], &buf.Q)
-		ensureLenNoClear(&buf.Q, qLen)
-		perHeadRMSNormInPlace(buf.Q[:qLen], layer.HeadDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
-		ropeHalf, ropePairs := prepareRopeScratch(pos, layer.HeadDim, layer.RopeDimension, layer.RopeInvFreq, 1, &buf.RopeSin, &buf.RopeCos)
-		// Gemma's HF layout uses the split-half (NeoX) ordering, including the
-		// proportional global RoPE variant.
-		applyPreparedRope(buf.Q[:qLen], layer.HeadDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, false)
-		if layer.HasKV {
-			layer.AttnK.MatvecInto(buf.XN[:dim], &buf.K)
-			ensureLenNoClear(&buf.K, kLen)
-			ensureLenNoClear(&buf.V, vLen)
-			if layer.UsesKAsV {
-				copy(buf.V[:vLen], buf.K[:kLen])
-			} else {
-				layer.AttnV.MatvecInto(buf.XN[:dim], &buf.V)
-			}
-			perHeadRMSNormInPlace(buf.K[:kLen], kvSource.HeadDim, kvSource.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
-			perHeadRMSNormUnitInPlace(buf.V[:vLen], kvSource.ValueDim, kvSource.NKVHeads, config.RMSNormEps)
-			applyPreparedRope(buf.K[:kLen], kvSource.HeadDim, kvSource.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, false)
-			cache.storeKV(layer.KVCacheSlot, pos, buf.K[:kLen], buf.V[:vLen])
-		}
-
+		projectGemma4QKV(layer, buf.XN[:dim], buf)
+		gemma4AttentionInto(config, layer, kvSource, cache, buf, pos)
 		attnOutLen := config.NHeads * kvSource.ValueDim
-		clear(buf.AttnOut[:attnOutLen])
-		attnStart := 0
-		if layer.IsSWA {
-			attnStart = max(0, pos-config.SlidingWindow)
-		}
-		kvMul := config.NHeads / kvSource.NKVHeads
-		for h := range config.NHeads {
-			kvH := h / kvMul
-			qOff := h * layer.HeadDim
-			outOff := h * kvSource.ValueDim
-			cache.attendHead(layer.KVCacheSlot, kvH, buf.Q[qOff:qOff+layer.HeadDim], layer.HeadDim, kvSource.ValueDim,
-				attnStart, pos, 1, 0, buf.AttnOut[outOff:outOff+kvSource.ValueDim])
-		}
 		layer.AttnOutput.MatvecInto(buf.AttnOut[:attnOutLen], &buf.Proj)
 		rmsNormInto(buf.Proj[:dim], layer.PostAttnNorm, config.RMSNormEps, &buf.Proj)
 		addInPlace(buf.X[:dim], buf.Proj[:dim])
@@ -680,12 +649,13 @@ func forwardNativeGemma4BodyInto(config Config, weights Gemma4Weights, cache *KV
 		}
 		if moe == nil {
 			normalizeDecoderInto(config, buf.X[:dim], layer.FFNNorm, nil, &buf.XN2)
-			layer.FFNGate.MatvecInto(buf.XN2[:dim], &buf.Gate)
-			layer.FFNUp.MatvecInto(buf.XN2[:dim], &buf.Up)
-			hiddenDim := layer.FFNHiddenDim
-			ensureLenNoClear(&buf.Hidden, hiddenDim)
-			geluMulF32(buf.Gate[:hiddenDim], buf.Up[:hiddenDim], buf.Hidden[:hiddenDim])
-			layer.FFNDown.MatvecInto(buf.Hidden[:hiddenDim], &buf.Proj)
+			if !matvecMetalGeGLUInto(layer.FFNGate, layer.FFNUp, layer.FFNDown, buf.XN2[:dim], 1, &buf.Proj) {
+				projectGemma4GateUp(layer, buf.XN2[:dim], buf)
+				hiddenDim := layer.FFNHiddenDim
+				ensureLenNoClear(&buf.Hidden, hiddenDim)
+				geluMulF32(buf.Gate[:hiddenDim], buf.Up[:hiddenDim], buf.Hidden[:hiddenDim])
+				layer.FFNDown.MatvecInto(buf.Hidden[:hiddenDim], &buf.Proj)
+			}
 			rmsNormInto(buf.Proj[:dim], layer.PostFFNNorm, config.RMSNormEps, &buf.Proj)
 			addInPlace(buf.X[:dim], buf.Proj[:dim])
 		} else {
@@ -723,6 +693,11 @@ func prepareNativeGemma4PerLayerInputs(config Config, weights *Gemma4PerLayerWei
 	}
 	weights.TokenEmbd.RowInto(int(token), total, &buf.Gemma4PLEInput)
 	weights.ModelProj.MatvecInto(buf.X[:config.Dim], &buf.Gemma4PLE)
+	finishNativeGemma4PerLayerInputs(config, weights, buf)
+}
+
+func finishNativeGemma4PerLayerInputs(config Config, weights *Gemma4PerLayerWeights, buf *DecodeBuffer) {
+	total := weights.Dim * config.NLayers
 	if len(buf.Gemma4PLEInput) != total || len(buf.Gemma4PLE) != total {
 		panic("native Gemma 4 per-layer embedding projection has an invalid shape")
 	}
@@ -787,8 +762,7 @@ func forwardNativeGemma4MoE(config Config, layer Gemma4LayerWeights, moe *Gemma4
 	// The normal ffn_* tensors stay meaningful in A4B: they form the shared,
 	// always-on dense GEGLU branch, rather than a fallback expert.
 	normalizeDecoderInto(config, buf.X[:dim], layer.FFNNorm, nil, &buf.XN2)
-	layer.FFNGate.MatvecInto(buf.XN2[:dim], &buf.Gate)
-	layer.FFNUp.MatvecInto(buf.XN2[:dim], &buf.Up)
+	projectGemma4GateUp(layer, buf.XN2[:dim], buf)
 	hiddenDim := layer.FFNHiddenDim
 	ensureLenNoClear(&buf.Hidden, hiddenDim)
 	geluMulF32(buf.Gate[:hiddenDim], buf.Up[:hiddenDim], buf.Hidden[:hiddenDim])
@@ -827,7 +801,9 @@ func forwardNativeGemma4MoE(config Config, layer Gemma4LayerWeights, moe *Gemma4
 }
 
 func projectNativeGemma4Logits(config Config, weights Gemma4Weights, buf *DecodeBuffer, logits *[]float32) {
-	weights.Output.MatvecInto(buf.XN[:config.Dim], logits)
+	if !matvecMetalGemmaOutputInto(weights.Output, buf.XN[:config.Dim], logits) {
+		weights.Output.MatvecInto(buf.XN[:config.Dim], logits)
+	}
 	if config.LogitScale != 1 {
 		ScaleF32(*logits, 1/config.LogitScale)
 	}
@@ -888,5 +864,80 @@ func releaseGemma4MetalWeights(weights *Gemma4Weights) {
 		releaser.release(&moe.Gate.Weight)
 		releaser.release(&moe.Up.Weight)
 		releaser.release(&moe.Down.Weight)
+	}
+}
+
+// Native Gemma's dense GEGLU branches share one normalized input. The fused
+// projection reuses activation preprocessing and one worker dispatch.
+func projectGemma4GateUp(layer Gemma4LayerWeights, x []float32, buf *DecodeBuffer) {
+	if !canFuseGemma4Projection(layer.FFNGate) || !canFuseGemma4Projection(layer.FFNUp) || !tryMatvec2Into(layer.FFNGate, layer.FFNUp, x, &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+		layer.FFNGate.MatvecInto(x, &buf.Gate)
+		layer.FFNUp.MatvecInto(x, &buf.Up)
+	}
+}
+
+// Restrict this optimization to the CPU kernels measured here. Generic
+// low-bit fusion and GPU dispatch can use different arithmetic or scheduling.
+func canFuseGemma4Projection(w Weight) bool {
+	return w.Metal == nil && w.GPU == nil && (w.Type == GGMLTypeQ4_K || w.Type == GGMLTypeQ6_K)
+}
+
+func projectGemma4QKV(layer Gemma4LayerWeights, x []float32, buf *DecodeBuffer) {
+	// Project shared normalized input together before applying the distinct
+	// Q/K/V norms. Shared-KV layers still compute only their query.
+	if !layer.HasKV {
+		layer.AttnQ.MatvecInto(x, &buf.Q)
+	} else if layer.UsesKAsV {
+		if !canFuseGemma4Projection(layer.AttnQ) || !canFuseGemma4Projection(layer.AttnK) || !tryMatvec2Into(layer.AttnQ, layer.AttnK, x, &buf.Q4KXSums, &buf.Q, &buf.K) {
+			layer.AttnQ.MatvecInto(x, &buf.Q)
+			layer.AttnK.MatvecInto(x, &buf.K)
+		}
+	} else if canFuseGemma4Projection(layer.AttnQ) && canFuseGemma4Projection(layer.AttnK) && canFuseGemma4Projection(layer.AttnV) {
+		tryMatvecAttentionInto(layer.AttnQ, layer.AttnK, layer.AttnV, x, &buf.Q4KXSums, &buf.Q, &buf.K, &buf.V)
+	} else {
+		layer.AttnQ.MatvecInto(x, &buf.Q)
+		layer.AttnK.MatvecInto(x, &buf.K)
+		layer.AttnV.MatvecInto(x, &buf.V)
+	}
+}
+
+// gemma4AttentionInto is shared by token decode and layer-wise prefill.
+// Attention always ends at pos, even if a source layer has stored later rows.
+func gemma4AttentionInto(config Config, layer, kvSource Gemma4LayerWeights, cache *KVCache, buf *DecodeBuffer, pos int) {
+	qLen := config.NHeads * layer.HeadDim
+	kLen := kvSource.NKVHeads * kvSource.HeadDim
+	vLen := kvSource.NKVHeads * kvSource.ValueDim
+	ensureLenNoClear(&buf.Q, qLen)
+	perHeadRMSNormInPlace(buf.Q[:qLen], layer.HeadDim, config.NHeads, layer.AttnQNorm, config.RMSNormEps)
+	ropeHalf, ropePairs := prepareRopeScratch(pos, layer.HeadDim, layer.RopeDimension, layer.RopeInvFreq, 1, &buf.RopeSin, &buf.RopeCos)
+	// Gemma's HF layout uses the split-half (NeoX) ordering, including the
+	// proportional global RoPE variant.
+	applyPreparedRope(buf.Q[:qLen], layer.HeadDim, config.NHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, false)
+	if layer.HasKV {
+		ensureLenNoClear(&buf.K, kLen)
+		ensureLenNoClear(&buf.V, vLen)
+		if layer.UsesKAsV {
+			copy(buf.V[:vLen], buf.K[:kLen])
+		}
+		perHeadRMSNormInPlace(buf.K[:kLen], kvSource.HeadDim, kvSource.NKVHeads, layer.AttnKNorm, config.RMSNormEps)
+		perHeadRMSNormUnitInPlace(buf.V[:vLen], kvSource.ValueDim, kvSource.NKVHeads, config.RMSNormEps)
+		applyPreparedRope(buf.K[:kLen], kvSource.HeadDim, kvSource.NKVHeads, ropeHalf, ropePairs, buf.RopeSin, buf.RopeCos, false)
+		cache.storeKV(layer.KVCacheSlot, pos, buf.K[:kLen], buf.V[:vLen])
+	}
+
+	attnOutLen := config.NHeads * kvSource.ValueDim
+	ensureLenNoClear(&buf.AttnOut, attnOutLen)
+	clear(buf.AttnOut[:attnOutLen])
+	attnStart := 0
+	if layer.IsSWA {
+		attnStart = max(0, pos-config.SlidingWindow)
+	}
+	kvMul := config.NHeads / kvSource.NKVHeads
+	for h := range config.NHeads {
+		kvH := h / kvMul
+		qOff := h * layer.HeadDim
+		outOff := h * kvSource.ValueDim
+		cache.attendHead(layer.KVCacheSlot, kvH, buf.Q[qOff:qOff+layer.HeadDim], layer.HeadDim, kvSource.ValueDim,
+			attnStart, pos, 1, 0, buf.AttnOut[outOff:outOff+kvSource.ValueDim])
 	}
 }

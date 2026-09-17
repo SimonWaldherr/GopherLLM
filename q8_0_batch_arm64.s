@@ -1,0 +1,72 @@
+//go:build arm64
+#include "textflag.h"
+#define SDOT(D,N,M) WORD $(0x4E809400 | ((M)<<16) | ((N)<<5) | (D))
+// Four token lanes preserve independent scalar FMA accumulation orders.
+TEXT ·q8_0Rows4Asm(SB), NOSPLIT|NOFRAME, $0-56
+ MOVD row+0(FP),R0
+ MOVD q8+8(FP),R1
+ MOVD scales+16(FP),R5
+ MOVD lut+24(FP),R10
+ MOVD stride+32(FP),R6
+ MOVD blocks+40(FP),R7
+ MOVD out+48(FP),R11
+ LSL $2,R7,R9
+ ADD R6,R1,R2
+ ADD R6,R2,R3
+ ADD R6,R3,R4
+ VEOR V20.B16,V20.B16,V20.B16
+ CBZ R7,rowdone
+rowblock:
+ VEOR V16.B16,V16.B16,V16.B16
+ MOVD $8,R8
+rowsub:
+ MOVHU (R0),R12
+ FMOVS (R10)(R12<<2),F24
+ VDUP V24.S[0],V24.S4
+ ADD $2,R0
+ VLD1.P 32(R0),[V0.B16,V1.B16]
+ VLD1.P 32(R1),[V2.B16,V3.B16]
+ VLD1.P 32(R2),[V8.B16,V9.B16]
+ VLD1.P 32(R3),[V10.B16,V11.B16]
+ VLD1.P 32(R4),[V12.B16,V13.B16]
+ VEOR V4.B16,V4.B16,V4.B16
+ VEOR V5.B16,V5.B16,V5.B16
+ VEOR V6.B16,V6.B16,V6.B16
+ VEOR V7.B16,V7.B16,V7.B16
+ SDOT(4,0,2)
+ SDOT(5,0,8)
+ SDOT(6,0,10)
+ SDOT(7,0,12)
+ SDOT(4,1,3)
+ SDOT(5,1,9)
+ SDOT(6,1,11)
+ SDOT(7,1,13)
+ VADDV V4.S4,V4
+ VADDV V5.S4,V5
+ VADDV V6.S4,V6
+ VADDV V7.S4,V7
+ VMOV V4.S[0],V8.S[0]
+ VMOV V5.S[0],V8.S[1]
+ VMOV V6.S[0],V8.S[2]
+ VMOV V7.S[0],V8.S[3]
+ WORD $0x4e21d908 // scvtf v8.4s,v8.4s
+ WORD $0x4e38cd10 // fmla v16.4s,v8.4s,v24.4s
+ SUB $1,R8
+ CBNZ R8,rowsub
+ FMOVS (R5),F24
+ ADD R9,R5,R13
+ FMOVS (R13),F25
+ VMOV V25.S[0],V24.S[1]
+ ADD R9,R13,R13
+ FMOVS (R13),F25
+ VMOV V25.S[0],V24.S[2]
+ ADD R9,R13,R13
+ FMOVS (R13),F25
+ VMOV V25.S[0],V24.S[3]
+ WORD $0x4e38ce14 // fmla v20.4s,v16.4s,v24.4s
+ ADD $4,R5
+ SUB $1,R7
+ CBNZ R7,rowblock
+rowdone:
+ VST1 [V20.S4],(R11)
+ RET
