@@ -555,3 +555,17 @@ func TestValidAutoTuneEffort(t *testing.T) {
 		t.Fatal("unknown effort was accepted")
 	}
 }
+
+// TestCPUFeatureStringContainsBaseline guards the feature string used in the
+// autotune cache key and log output. It should at least identify GOARCH and the
+// SIMD baseline; extended bits are machine-dependent but the string must be
+// non-empty and stable.
+func TestCPUFeatureStringContainsBaseline(t *testing.T) {
+	s := cpuFeatureString()
+	if s == "" {
+		t.Fatal("cpuFeatureString must not be empty")
+	}
+	if !strings.Contains(s, runtime.GOARCH) {
+		t.Fatalf("cpuFeatureString %q missing GOARCH", s)
+	}
+}

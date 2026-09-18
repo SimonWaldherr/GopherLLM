@@ -18,11 +18,23 @@ var hasAVX2 = detectAVX2()
 // AVX2+FMA CPU in practice also has F16C, but the check is cheap.
 var hasF16C = detectF16C()
 
+// hasAVX512F, hasAVX512VNNI, and hasAMXINT8 are detected at startup and made
+// available for future AVX-512/AMX kernels. They currently gate no hot path
+// (the existing kernels are AVX2), but exposing them lets tuning decisions and
+// future assembly branches depend on them without re-parsing CPUID.
+var (
+	hasAVX512F    = detectAVX512F()
+	hasAVX512VNNI = detectAVX512VNNI()
+	hasAMXINT8    = detectAMXINT8()
+)
+
 func cpuid(eaxArg, ecxArg uint32) (eax, ebx, ecx, edx uint32)
 func xgetbv() uint32
 
+func simdDisabled() bool { return os.Getenv("GOPHERLLM_DISABLE_SIMD") != "" }
+
 func detectF16C() bool {
-	if os.Getenv("GOPHERLLM_DISABLE_SIMD") != "" {
+	if simdDisabled() {
 		return false
 	}
 	const f16cBit = 1 << 29 // CPUID.1:ECX.F16C
@@ -31,7 +43,7 @@ func detectF16C() bool {
 }
 
 func detectAVX2() bool {
-	if os.Getenv("GOPHERLLM_DISABLE_SIMD") != "" {
+	if simdDisabled() {
 		return false
 	}
 	const (
@@ -50,6 +62,61 @@ func detectAVX2() bool {
 	}
 	_, ebx7, _, _ := cpuid(7, 0)
 	return ebx7&avx2Bit != 0
+}
+
+func detectAVX512F() bool {
+	if simdDisabled() {
+		return false
+	}
+	const (
+		osxsaveBit = 1 << 27 // CPUID.1:ECX.OSXSAVE
+		avxBit     = 1 << 28 // CPUID.1:ECX.AVX
+		avx512fBit = 1 << 16 // CPUID.7:EBX.AVX512F
+	)
+	_, _, ecx1, _ := cpuid(1, 0)
+	if ecx1&(osxsaveBit|avxBit) != (osxsaveBit | avxBit) {
+		return false
+	}
+	// AVX-512 requires XMM, YMM, and ZMM (bits 1-2, 5-7) state saving.
+	if xgetbv()&0xe6 != 0xe6 {
+		return false
+	}
+	_, ebx7, _, _ := cpuid(7, 0)
+	return ebx7&avx512fBit != 0
+}
+
+func detectAVX512VNNI() bool {
+	if !hasAVX512F {
+		return false
+	}
+	const avx512vnniBit = 1 << 11 // CPUID.7:ECX.AVX512VNNI
+	_, _, ecx7, _ := cpuid(7, 0)
+	return ecx7&avx512vnniBit != 0
+}
+
+func detectAMXINT8() bool {
+	if simdDisabled() {
+		return false
+	}
+	if !hasAVX512F {
+		return false
+	}
+	const (
+		amxTileBit  = 1 << 24 // CPUID.7:EDX.AMX-TILE
+		amxInt8Bit  = 1 << 25 // CPUID.7:EDX.AMX-INT8
+		amxBf16Bit  = 1 << 22 // CPUID.7:EDX.AMX-BF16
+		amxEnabled  = 1 << 18 // XCR0.TILECFG | TILEDATA (bits 17-18)
+	)
+	_, _, _, edx7 := cpuid(7, 0)
+	if edx7&(amxTileBit|amxInt8Bit) != (amxTileBit | amxInt8Bit) {
+		return false
+	}
+	if xgetbv()&amxEnabled != amxEnabled {
+		return false
+	}
+	// Some parts expose AMX-BF16 without AMX-INT8; we only care about INT8 here.
+	_ = amxBf16Bit
+	return true
 }
 
 // dotF32AVX2 computes the dot product of the overlapping prefix of a and b
@@ -699,6 +766,15 @@ func cpuFeatureString() string {
 	}
 	if hasF16C {
 		s += "+f16c"
+	}
+	if hasAVX512F {
+		s += "+avx512f"
+	}
+	if hasAVX512VNNI {
+		s += "+avx512vnni"
+	}
+	if hasAMXINT8 {
+		s += "+amx_int8"
 	}
 	return s
 }
