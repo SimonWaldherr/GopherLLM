@@ -27,6 +27,14 @@ type reasoningStreamSplitter interface {
 // arrive; the final gopherllm.GenerationResult remains authoritative for tool calls and
 // for the buffered agentic path.
 func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool, includeUsage bool) {
+	streamChatWithGenerator(w, req, logw, requestID, r.Architecture(), model, options, includeUsage, func(onToken func(string) bool, observe func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
+		return gopherllm.RunAgenticChatObserved(r, messages, options, skills, tools, onToken, observe)
+	})
+}
+
+type chatGenerator func(func(string) bool, func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error)
+
+func streamChatWithGenerator(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID, arch, model string, options gopherllm.GenerationOptions, includeUsage bool, generate chatGenerator) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -37,7 +45,7 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	w.Header().Set("connection", "keep-alive")
 	w.Header().Set("x-accel-buffering", "no")
 
-	id := fmt.Sprintf("chatcmpl-gopherllm-%d", time.Now().UnixNano())
+	id := newCompletionID("chatcmpl")
 	created := time.Now().Unix()
 	if err := writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
 		return
@@ -48,7 +56,6 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	// prompt, so their first generated characters are reasoning and the first
 	// marker received is the closing tag. Other models emit the opening marker
 	// themselves.
-	arch := r.Architecture()
 	var thinkSplitter reasoningStreamSplitter
 	if arch == "mistral3" {
 		// Ministral-3-Reasoning uses the native [THINK] protocol recorded in
@@ -88,13 +95,16 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 			streamErr = err
 		}
 	}
-	result, err := gopherllm.RunAgenticChatObserved(r, messages, options, skills, tools, func(text string) bool {
+	result, err := generate(func(text string) bool {
 		if ctxErr := req.Context().Err(); ctxErr != nil {
 			streamErr = ctxErr
 			return false
 		}
 		return thinkSplitter.Push(text, emit)
 	}, observe)
+	if err == nil {
+		err = validateChatResult(result, options)
+	}
 	if streamErr != nil {
 		logInferenceResult(logw, requestID, "/v1/chat/completions", model, true, result, streamErr)
 		return
@@ -104,7 +114,9 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		if errors.Is(err, gopherllm.ErrGenerationCanceled) {
 			return
 		}
-		writeSSE(w, flusher, "error", map[string]string{"error": err.Error()})
+		_ = writeSSE(w, flusher, "", map[string]any{"error": apiError{err.Error(), "server_error", nil, "generation_failed"}})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
 		return
 	}
 	if !thinkSplitter.Flush(emit) {
@@ -117,7 +129,11 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 		finalDelta["reasoning_content"] = result.ReasoningText
 	}
 	if len(result.ToolCalls) > 0 {
-		finalDelta["tool_calls"] = result.ToolCalls
+		calls := make([]any, len(result.ToolCalls))
+		for i, c := range result.ToolCalls {
+			calls[i] = map[string]any{"index": i, "id": c.ID, "type": c.Type, "function": c.Function}
+		}
+		finalDelta["tool_calls"] = calls
 	}
 	extra := map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason)}
 	// Headers are already committed once an SSE stream begins. Put the final
@@ -130,9 +146,13 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 	if result.PromptCache != nil {
 		extra["gopherllm_cache"] = result.PromptCache
 	}
-	_ = writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra)
+	if writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra) != nil {
+		return
+	}
 	if includeUsage {
-		_ = writeOpenAIUsageChunk(w, flusher, id, model, created, usage(result))
+		if writeOpenAIUsageChunk(w, flusher, id, model, created, usage(result)) != nil {
+			return
+		}
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
@@ -145,7 +165,7 @@ func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, 
 const systemFingerprint = "fp_gopherllm"
 
 func writeOpenAIStreamChunk(w http.ResponseWriter, flusher http.Flusher, id, model string, created int64, delta map[string]any, extra map[string]any) error {
-	choice := map[string]any{"index": 0, "delta": delta}
+	choice := map[string]any{"index": 0, "delta": delta, "finish_reason": nil}
 	for k, v := range extra {
 		choice[k] = v
 	}
@@ -176,6 +196,7 @@ func writeOpenAIUsageChunk(w http.ResponseWriter, flusher http.Flusher, id, mode
 }
 
 func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, v any) error {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
 	if event != "" {
 		if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
 			return err
@@ -190,4 +211,32 @@ func writeSSE(w http.ResponseWriter, flusher http.Flusher, event string, v any) 
 	}
 	flusher.Flush()
 	return nil
+}
+
+// Structured streams are buffered until syntax/schema validation succeeds.
+// This intentionally trades TTFT for never publishing an invalid JSON success.
+func streamValidatedChat(w http.ResponseWriter, req *http.Request, model string, result gopherllm.GenerationResult, includeUsage bool) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeAPIError(w, 500, "stream_unavailable", "", "streaming unsupported")
+		return
+	}
+	if req.Context().Err() != nil {
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	id := newCompletionID("chatcmpl")
+	created := time.Now().Unix()
+	if writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{"role": "assistant", "content": result.Text}, nil) != nil {
+		return
+	}
+	if writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{}, map[string]any{"finish_reason": result.FinishReason}) != nil {
+		return
+	}
+	if includeUsage && writeOpenAIUsageChunk(w, flusher, id, model, created, usage(result)) != nil {
+		return
+	}
+	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }

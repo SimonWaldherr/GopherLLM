@@ -169,6 +169,7 @@ func TestHFDownloadResumesAnIncompleteBlob(t *testing.T) {
 			return
 		}
 		gotRange = r.Header.Get("Range")
+		w.Header().Set("Content-Range", "bytes 5-9/10")
 		w.WriteHeader(http.StatusPartialContent)
 		_, _ = io.WriteString(w, "world")
 	}))

@@ -5,12 +5,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
-	"io"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
@@ -20,15 +23,24 @@ type replyRequest struct {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	modelPath := flag.String("model", "", "path to local GGUF model (required)")
 	addr := flag.String("addr", "127.0.0.1:8091", "listen address")
 	flag.Parse()
 	if strings.TrimSpace(*modelPath) == "" {
-		log.Fatal("-model /path/to/model.gguf is required")
+		return errors.New("-model /path/to/model.gguf is required")
 	}
-	model, err := gopherllm.Open(context.Background(), *modelPath, gopherllm.WithLogWriter(os.Stderr))
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	model, err := gopherllm.Open(ctx, *modelPath, gopherllm.WithLogWriter(os.Stderr))
 	if err != nil {
-		log.Fatalf("load local model: %v", err)
+		return fmt.Errorf("load local model: %w", err)
 	}
 	defer model.Close()
 
@@ -40,13 +52,16 @@ func main() {
 	mux.HandleFunc("POST /reply", func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 		var input replyRequest
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&input); err != nil || strings.TrimSpace(input.Message) == "" {
 			http.Error(w, "JSON {message: non-empty string} required", http.StatusBadRequest)
 			return
 		}
-		result, err := model.Generate(r.Context(), input.Message,
+		requestCtx, cancel := context.WithCancel(r.Context())
+		stopCancel := context.AfterFunc(ctx, cancel)
+		defer func() { stopCancel(); cancel() }()
+		result, err := model.Generate(requestCtx, input.Message,
 			gopherllm.WithSystemPrompt("You are a concise local assistant. State uncertainty rather than inventing facts."),
 			gopherllm.WithMaxTokens(180), gopherllm.WithTemperature(0.3))
 		if err != nil {
@@ -57,5 +72,23 @@ func main() {
 		_ = json.NewEncoder(w).Encode(map[string]string{"reply": result.Text})
 	})
 	log.Printf("Embedded Reply Service: http://%s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe() }()
+	select {
+	case err := <-serveErr:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		// Stop accepting requests and cancel generation before unmapping weights.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
+			return err
+		}
+		return nil
+	}
 }

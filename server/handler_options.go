@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"github.com/SimonWaldherr/GopherLLM/agentos"
@@ -11,6 +12,11 @@ import (
 
 // HandlerOptions configures the mountable HTTP API handler.
 type HandlerOptions struct {
+	// RequestTimeout bounds each inference request; default two minutes.
+	RequestTimeout time.Duration
+	// ObserveRequest is called once per HTTP request, including admission errors.
+	// It must be concurrency-safe and return promptly. It receives no payloads.
+	ObserveRequest func(RequestObservation)
 	// Features selects the optional capabilities this server exposes. The zero
 	// value enables none of them, which is the safe default for a machine a
 	// beginner just started: see Features. AllFeatures() restores the full
@@ -35,7 +41,7 @@ type HandlerOptions struct {
 	// override individual fields.
 	Defaults gopherllm.GenerationOptions
 	// MaxConcurrentRequests bounds in-flight generation requests (default 8).
-	// Requests beyond the bound queue rather than failing.
+	// Requests beyond the bound fail with HTTP 429; no unbounded HTTP queue.
 	MaxConcurrentRequests int
 	// ChatUI serves the embedded browser chat at /chat (plus its assets).
 	ChatUI bool
@@ -123,6 +129,9 @@ type HandlerOptions struct {
 // convenience wrapper (used by the CLI). ChatHistoryLock remains for source
 // compatibility with older hosts; the handler serializes its own file access.
 type ServeOptions struct {
+	// ObserveRequest forwards transport observations to the embedding host.
+	ObserveRequest func(RequestObservation)
+	RequestTimeout time.Duration
 	// Context controls the lifetime of the listener. Cancelling it gracefully
 	// stops accepting requests and releases the active runner.
 	Context context.Context

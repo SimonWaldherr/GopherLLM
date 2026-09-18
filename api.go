@@ -324,7 +324,7 @@ func (m *Model) Embed(ctx context.Context, text string) (EmbeddingResult, error)
 	if err := ctx.Err(); err != nil {
 		return EmbeddingResult{}, err
 	}
-	return m.r.Embed(text)
+	return m.r.EmbedContext(ctx, text)
 }
 
 // EmbedBatch is Model.Embed for a batch of texts, embedding all of them under

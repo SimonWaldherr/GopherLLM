@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -54,12 +55,13 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if onToken == nil {
 		onToken = func(string) bool { return true }
 	}
-	if err := r.acquireModelLease(); err != nil {
+	admissionStart := time.Now()
+	release, err := r.acquireInference(options.generationContext())
+	if err != nil {
 		return GenerationResult{}, err
 	}
-	defer r.releaseModelLease()
-	r.genLock.Lock()
-	defer r.genLock.Unlock()
+	defer release()
+	queueTime := time.Since(admissionStart)
 	// The vision cache is deliberately NOT cleared here. It used to be, on the
 	// grounds that a webcam would otherwise grow it without bound -- true of
 	// the unbounded map it was then, but it also threw away the encoding of a
@@ -116,7 +118,11 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	buf.ImageEmbeds = imageEmbeds
 	defer func() { buf.ImageEmbeds = nil }()
 	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
-	greedyFastPath := r.canGreedyOutputFastPath(options)
+	greedyFastPath := !options.JSONObject && r.canGreedyOutputFastPath(options)
+	var constraint *jsonTokenConstraint
+	if options.JSONObject {
+		constraint = newJSONTokenConstraint(r.tok)
+	}
 	reusedTokens := 0
 	// Prefix-cache matching is purely token-ID based (sharedTokenPrefix): it
 	// cannot distinguish two different images that render to the same
@@ -364,10 +370,33 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	haveNextToken := haveInitialNextToken
 	nextToken := initialNextToken
 	buildResult := func() GenerationResult {
-		stats := GenerationStats{PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
+		stats := GenerationStats{QueueTime: queueTime, PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
 		content, reasoning, calls := r.classifyOutput(output.String(), options.ActiveTools(), rng)
-		reason := finishReason
+		if options.JSONObject {
+			content = output.String()
+			reasoning = ""
+			calls = nil
+		}
 		if len(calls) > 0 {
+			used := map[string]bool{}
+			for _, message := range messages {
+				for _, call := range message.ToolCalls {
+					used[call.ID] = true
+				}
+			}
+			for i := range calls {
+				for index := 0; used[calls[i].ID]; index++ {
+					if r.chatTemplateKind() == "kimi-chat" {
+						calls[i].ID = kimiToolCallID(calls[i].Function.Name, index)
+					} else {
+						calls[i].ID = newToolCallID(rng)
+					}
+				}
+				used[calls[i].ID] = true
+			}
+		}
+		reason := finishReason
+		if len(calls) > 0 && finishReason != "length" {
 			reason = "tool_calls"
 		}
 		return GenerationResult{Text: content, ReasoningText: reasoning, ToolCalls: calls, FinishReason: reason, Stats: stats, ContextWindow: contextWindow, PromptCache: &cacheInfo}
@@ -402,10 +431,10 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			}
 		}
 		streamBuf = append(streamBuf, text...)
+		generated = append(generated, token)
 		if !flushStream(false) {
 			return false, true
 		}
-		generated = append(generated, token)
 		recent = append(recent, token)
 		if len(recent) > repeatPenaltyWindow {
 			copy(recent, recent[len(recent)-repeatPenaltyWindow:])
@@ -451,17 +480,31 @@ decode:
 		if err := ctx.Err(); err != nil {
 			return buildResult(), err
 		}
+		if constraint != nil {
+			if err := constraint.mask(ctx, logits, r.isStopToken); err != nil {
+				return buildResult(), err
+			}
+		}
 		token := nextToken
 		if haveNextToken {
 			haveNextToken = false
 		} else {
 			token = SampleWithScratch(logits, options.Sampler, rng, recent, &buf.SamplerCandidates)
 		}
+		if constraint != nil {
+			if err := constraint.accept(token); err != nil {
+				return buildResult(), err
+			}
+		}
 		keepDecoding, canceled := emitToken(token)
 		if canceled {
 			return buildResult(), ErrGenerationCanceled
 		}
 		if !keepDecoding {
+			break
+		}
+		if constraint != nil && constraint.state.Complete() {
+			finishReason = "stop"
 			break
 		}
 		if len(generated) >= options.MaxTokens || pos >= cacheLen {
@@ -526,6 +569,9 @@ decode:
 	}
 	if !flushStream(true) {
 		return buildResult(), ErrGenerationCanceled
+	}
+	if constraint != nil && (!constraint.state.Complete() || !json.Valid([]byte(output.String())) || !utf8.ValidString(output.String())) {
+		return buildResult(), ErrStructuredOutputIncomplete
 	}
 	return buildResult(), nil
 }

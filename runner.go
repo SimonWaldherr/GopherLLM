@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -91,8 +92,9 @@ type Runner struct {
 	// modelMu protects the lifecycle of all CPU/GPU weight storage. The
 	// lock order for resource-consuming work is modelMu, then genLock, then
 	// visionMu (and finally visionCacheMu when needed).
-	modelMu sync.RWMutex
-	genLock sync.Mutex
+	modelMu          sync.RWMutex
+	genLock          contextMutex
+	inferencePending atomic.Int32
 	// closed is protected by modelMu. Resource-consuming public operations
 	// acquire a shared model lease before reading weights, so a call queued
 	// behind Close returns ErrRunnerClosed rather than touching containers that

@@ -1170,7 +1170,10 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .model-download-label { min-width: 0; flex: 1; margin: 0; color: var(--ink) !important; }
 .model-download-form { display: flex; align-items: flex-end; gap: 8px; }
 .model-download-form .autotune-run { flex: none; min-height: 31px; }
-.model-hub-search-form { margin-top: 2px; }
+.model-hub-search-form { margin-top: 2px; flex-wrap: wrap; }
+.model-hub-search-form .model-download-label { flex: 1 1 140px; }
+.model-hub-search-form .model-download-label:first-child { flex-basis: 100%; }
+.model-hub-search-form select { width: 100%; min-height: 34px; }
 .model-hub-search-status { margin-top: 7px; }
 .model-hub-search-results { display: grid; gap: 5px; max-height: 254px; margin: 8px 0 0; padding: 0; overflow-y: auto; list-style: none; }
 .model-hub-search-result { min-width: 0; }
@@ -1452,6 +1455,7 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .model-library-foot { align-items: flex-start; flex-direction: column; gap: 5px; }
   .model-download-form { flex-direction: column; align-items: stretch; }
   .model-download-form .autotune-run { align-self: flex-start; }
+  .model-hub-search-form .model-download-label, .model-hub-search-form .model-download-label:first-child { flex: 0 0 auto; }
   .settings-grid { grid-template-columns: 1fr 1fr; }
   /* Same specificity trick as the base rule (see its comment) so this phone
      override actually wins back over the unconditional 3-column rule above
@@ -1525,3 +1529,6 @@ body[data-ui-mode="simple"] [data-advanced] { display: none; }
   #settings .settings-panel-foot { align-items: flex-start; }
   #settings .settings-panel-foot span { max-width: 75%; line-height: 1.5; }
 }
+
+.settings .model-artifact-choice { display: flex; align-items: center; gap: 8px; overflow-wrap: anywhere; }
+.settings .model-artifact-choice input { flex: none; width: 18px; min-height: 18px; height: 18px; }

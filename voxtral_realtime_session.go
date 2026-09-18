@@ -16,6 +16,8 @@ import (
 // only new frames and tokens are evaluated on each Push.
 type VoxtralRealtimeSession struct {
 	mu           sync.Mutex
+	owner        *VoxtralModel
+	disableFast  bool
 	mmap         *MmapFile
 	cfg          VoxtralRealtimeConfig
 	weights      VoxtralRealtimeWeights
@@ -46,50 +48,15 @@ func NewVoxtralRealtimeSession(modelPath string, logw io.Writer) (*VoxtralRealti
 // NewVoxtralRealtimeSessionContext prepares the fixed silence prefix before
 // microphone capture begins. Loading, warmup and subsequent pushes can cancel.
 func NewVoxtralRealtimeSessionContext(ctx context.Context, modelPath string, logw io.Writer) (*VoxtralRealtimeSession, error) {
-	if err := ctx.Err(); err != nil {
+	model, err := OpenVoxtral(ctx, modelPath, WithVoxtralLogWriter(logw))
+	if err != nil {
 		return nil, err
 	}
-	if logw == nil {
-		logw = io.Discard
-	}
-	mmap, err := OpenMmap(modelPath)
-	if err != nil {
-		return nil, fmt.Errorf("opening model: %w", err)
-	}
-	data := mmap.Bytes()
-	gguf, err := ParseGGUF(data)
-	if err != nil {
-		mmap.Close()
-		return nil, fmt.Errorf("parsing GGUF: %w", err)
-	}
-	cfg, weights, err := LoadVoxtralRealtimeModel(data, gguf, MetalAvailable(), logw)
-	if err != nil {
-		releaseVoxtralRealtimeWeights(&weights)
-		mmap.Close()
-		return nil, fmt.Errorf("loading Voxtral Realtime model: %w", err)
-	}
-	tok, err := TokenizerFromMetadata(gguf.Metadata)
-	if err != nil {
-		releaseVoxtralRealtimeWeights(&weights)
-		mmap.Close()
-		return nil, fmt.Errorf("building tokenizer: %w", err)
-	}
-	if cfg.Mel.SampleRate != 16000 {
-		releaseVoxtralRealtimeWeights(&weights)
-		mmap.Close()
-		return nil, fmt.Errorf("Voxtral requires a 16 kHz frontend, got %d", cfg.Mel.SampleRate)
-	}
-	tokenTypes, _ := gguf.Metadata["tokenizer.ggml.token_type"].AsU32Array()
-	s := &VoxtralRealtimeSession{mmap: mmap, cfg: cfg, weights: weights, tokenizer: tok, tokenTypes: tokenTypes, eosID: int(gguf.GetU32("tokenizer.ggml.eos_token_id", 2)), bosID: int(gguf.GetU32("tokenizer.ggml.bos_token_id", 1))}
-	if err := prepareVoxtralStreamWeights(ctx, &s.weights); err != nil {
-		s.Close()
-		return nil, err
-	}
-	if _, err := s.Push(ctx, nil, false); err != nil {
-		s.Close()
-		return nil, err
-	}
-	return s, nil
+	session, err := model.NewSession(ctx)
+	// The convenience constructor transfers ownership to the session. Model
+	// Close defers unmapping until that session is closed.
+	_ = model.Close()
+	return session, err
 }
 
 // Push adds 16 kHz mono PCM and returns the accumulated transcript. final
@@ -99,7 +66,7 @@ func (s *VoxtralRealtimeSession) Push(ctx context.Context, pcm []float32, final 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.finished {
-		return "", fmt.Errorf("Voxtral realtime session is closed")
+		return "", ErrVoxtralSessionClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -113,13 +80,17 @@ func (s *VoxtralRealtimeSession) Push(ctx context.Context, pcm []float32, final 
 		var err error
 		s.audio, err = newVoxtralStreamAudio(s.cfg)
 		if err != nil {
+			s.finished = true
 			return "", err
 		}
 		s.decoder, err = NewVoxtralRealtimeDecoderState(s.cfg, s.weights, s.cfg.Time.DefaultNumDelayTokens)
 		if err != nil {
+			s.finished = true
 			return "", err
 		}
-		s.fast = newVoxtralFastDecoder(s.cfg, s.weights, s.decoder)
+		if !s.disableFast {
+			s.fast = newVoxtralFastDecoder(s.cfg, s.weights, s.decoder)
+		}
 	}
 	embeds, err := s.audio.push(ctx, s.weights, pcm, final)
 	if err != nil {
@@ -172,12 +143,25 @@ func (s *VoxtralRealtimeSession) Close() error {
 		s.fast.Close()
 		s.fast = nil
 	}
-	releaseVoxtralRealtimeWeights(&s.weights)
+	if s.owner == nil {
+		releaseVoxtralRealtimeWeights(&s.weights)
+	}
 	s.weights = VoxtralRealtimeWeights{}
 	s.audio = nil
 	s.decoder = nil
+	s.tokenizer = nil
+	s.tokenTypes = nil
+	s.text.Reset()
+	s.pendingUTF8 = ""
+	if s.owner != nil {
+		owner := s.owner
+		s.owner = nil
+		return owner.releaseSession()
+	}
 	if s.mmap != nil {
-		return s.mmap.Close()
+		mmap := s.mmap
+		s.mmap = nil
+		return mmap.Close()
 	}
 	return nil
 }

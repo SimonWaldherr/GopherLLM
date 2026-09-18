@@ -79,6 +79,8 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		logw = os.Stderr
 	}
 	handler := NewHandler(initialRunner, HandlerOptions{
+		RequestTimeout:        opts.RequestTimeout,
+		ObserveRequest:        opts.ObserveRequest,
 		Features:              opts.Features,
 		NetworkExposed:        networkExposed,
 		DeploymentMode:        mode,
@@ -110,7 +112,9 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 	server := &http.Server{
 		Addr:              opts.Addr,
 		Handler:           handler,
-		ReadHeaderTimeout: 30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 		BaseContext:       func(net.Listener) context.Context { return ctx },
 	}
 	fmt.Fprintf(logw, "Serving on %s\n", displayServerURL(opts.Addr, opts.ChatUI))
@@ -319,7 +323,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	}
 
 	return &Handler{
-		next:       deployment.wrap(remoteOrLoadedModel(state, remote, mux)),
+		next:       withInferenceDeadline(observeRequests(deployment.wrap(remoteOrLoadedModel(state, remote, mux)), opts.ObserveRequest), opts.RequestTimeout),
 		state:      state,
 		embedder:   embedder,
 		rag:        ragState,

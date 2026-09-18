@@ -422,7 +422,7 @@
             <summary class="settings-section-head">
               <div>
                 <h3>Download a model</h3>
-                <p>Search GGUF repositories on Hugging Face or fetch a known model straight into the local library.</p>
+                <p>Search text, speech and vision models. Download GGUF variants or select repository files for the local cache.</p>
               </div>
               <svg class="icon settings-disclosure-chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
             </summary>
@@ -430,10 +430,33 @@
               <label class="model-download-label" for="modelHubSearchQuery">Search Hugging Face
                 <input type="search" id="modelHubSearchQuery" placeholder="e.g. Ministral, Qwen, Gemma…" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="modelHubSearchStatus">
               </label>
+              <label class="model-download-label" for="modelHubSearchFormat">Format
+                <select id="modelHubSearchFormat">
+                  <option value="gguf">GGUF variants</option>
+                  <option value="all">All files / formats</option>
+                  <option value="safetensors">Safetensors</option>
+                  <option value="onnx">ONNX</option>
+                </select>
+              </label>
+              <label class="model-download-label" for="modelHubSearchTask">Task
+                <select id="modelHubSearchTask">
+                  <option value="">All tasks</option>
+                  <option value="text-generation">Text generation</option>
+                  <option value="automatic-speech-recognition">Speech recognition</option>
+                  <option value="text-to-speech">Speech synthesis</option>
+                  <option value="image-text-to-text">Vision + text</option>
+                  <option value="image-to-text">Image to text</option>
+                  <option value="feature-extraction">Embeddings</option>
+                  <option value="text-to-image">Image generation</option>
+                  <option value="image-classification">Image classification</option>
+                  <option value="audio-classification">Audio classification</option>
+                  <option value="video-text-to-text">Video + text</option>
+                </select>
+              </label>
               <button id="modelHubSearchSubmit" class="autotune-run" type="submit">Search</button>
             </form>
-            <p id="modelHubSearchStatus" class="settings-note model-hub-search-status" aria-live="polite">Showing up to 12 GGUF repositories, sorted by Hub downloads.</p>
-            <ul id="modelHubSearchResults" class="model-hub-search-results" aria-label="Hugging Face GGUF search results" hidden></ul>
+            <p id="modelHubSearchStatus" class="settings-note model-hub-search-status" aria-live="polite">Showing up to 12 repositories across tasks. Hub metadata does not guarantee local runtime support.</p>
+            <ul id="modelHubSearchResults" class="model-hub-search-results" aria-label="Hugging Face model search results" hidden></ul>
             <p class="model-download-separator" aria-hidden="true"><span>or use a repository directly</span></p>
             <form id="modelDownloadForm" class="model-download-form">
               <label class="model-download-label" for="modelDownloadRef">Hugging Face repository

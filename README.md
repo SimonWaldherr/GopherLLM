@@ -19,6 +19,9 @@ The same reasoning has its own Rust sibling in
 **[Go package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM)** ·
 **[Demo application documentation](server/README.md)**
 
+For strict embedding/server behavior, see the [inference contracts and compatibility matrix](docs/inference-contract.md)
+and [reproducible validation and evaluation runner](docs/inference-validation.md).
+
 ## Try it in five minutes
 
 ```sh
@@ -215,7 +218,7 @@ repository requests and active transfers through Go contexts while retaining
 the partial blobs for a later resume.
 
 Downloads, including every shard of split GGUFs, use the shared Hugging Face
-`blobs`/`refs`/`snapshots` cache under `$HF_HOME/hub` (or the platform cache
+`blobs`/`refs`/`snapshots` cache under `$HF_HUB_CACHE`, or `$HF_HOME/hub` (or the platform cache
 when `HF_HOME` is unset). Existing cached snapshots remain usable offline.
 Set `HF_TOKEN` for gated or private repositories.
 
@@ -230,7 +233,73 @@ bin/gopherllm hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main --hf-offline --repl
 HF_HUB_OFFLINE=1 bin/gopherllm --hf-list bartowski/Qwen3-4B-GGUF@main
 ```
 
+### Text, audio, vision and other model artifacts
+
+In the Web UI's **Download a model** section, choose a **Task** and a
+**Format**. GGUF mode offers quantization variants; ambiguous names (for
+example a model and vision projector both using F16) use exact file selectors.
+The filename and projector role are displayed alongside the quantization.
+**All files / formats**, **Safetensors** and **ONNX** enable repository file
+selection, including nested weights, tokenizer files, processor configuration,
+weight indexes and other assets. Select every required shard and companion
+file; the client does not guess which of several architectures or exports you
+intend to use. These selections are saved in the HF cache, preserving directory
+structure. They are not automatically loaded into the GGUF model library.
+
+The public Go API provides the same model-independent operations:
+
+```go
+opts := huggingface.DefaultOptions()
+models, err := huggingface.SearchModels(ctx, huggingface.SearchOptions{
+    Query: "voxtral", PipelineTag: "automatic-speech-recognition",
+    // Format: "safetensors", // omit to search every format
+}, opts)
+if err != nil { return err }
+_ = models
+
+manifest, err := huggingface.Inspect(ctx, "owner/repository@main", opts)
+if err != nil { return err }
+_ = manifest // present Files and select exact paths from this inventory
+
+files, err := huggingface.DownloadFiles(ctx, "owner/repository@main",
+    []string{"config.json", "tokenizer.json", "model.safetensors"},
+    os.Stderr, opts)
+if err != nil { return err }
+_ = files // local paths; use an appropriate runtime separately
+```
+
+`Inspect` returns file size, format and a filename-based role hint. Hub
+`pipeline_tag` and library metadata describe intended use, not runtime
+compatibility. Downloading Safetensors, ONNX, speech or vision artifacts does
+not add execution support for their architectures. Repository code is never
+executed. Existing `Search`, `Variants`, `Resolve` and `ResolveFiles` retain
+their GGUF-specific contracts.
+
+Transfers pin to the commit reported by the Hub, share bounded download
+workers, validate resume ranges and publish the revision reference after the
+requested set completes. Mirrors that omit the commit header retain
+revision-based resolution. Offline `Inspect` lists only locally available
+files; offline `DownloadFiles` requires every explicitly selected file. The
+client coordinates concurrent writers to identical blobs within one process;
+this is not a cross-process cache lock.
+
+For API consumers, `/models/search` accepts `task` and `format` (`gguf`,
+`all`, `safetensors`, `onnx`; default `gguf`).
+`/models/download/variants?ref=owner/repo&artifacts=1` returns the file inventory.
+POST `/models/download` with `{"ref":"owner/repo","files":["config.json"]}`
+uses the existing NDJSON progress stream and finishes with `artifacts: true`
+and local `files`. These operations retain the existing administrator and
+`model-download` feature controls.
+
+The integration belongs in GopherLLM's opt-in `huggingface` package so tinyRAG
+and other applications can reuse it without implementing another downloader.
+The root inference package continues to have no HTTP dependency.
+Hub task/filter semantics follow the [Hugging Face API documentation](https://huggingface.co/docs/hub/api).
+
 ## Use as a Go Library
+
+See the [Go embedding guide](docs/embedding-go.md) for model ownership,
+streaming, cancellation, reusable Voxtral sessions and application shutdown.
 
 GopherLLM is an importable module — inference runs in-process, with no child
 process and no HTTP round-trips:
@@ -396,7 +465,7 @@ demo application and its UI assets:
 |---|---|---|
 | `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 90 |
 | `github.com/SimonWaldherr/GopherLLM/rag` | Document chunking, hybrid BM25 + vector retrieval | 94 |
-| `github.com/SimonWaldherr/GopherLLM/huggingface` | Hub search, variant listing, and `owner/repo` → local GGUF resolution | 192 |
+| `github.com/SimonWaldherr/GopherLLM/huggingface` | Model/task search, artifact inspection/download, and local GGUF resolution | 192 |
 
 `TestInferencePackageStaysFreeOfServerDependencies` enforces that boundary
 against the real dependency graph, so it cannot regress silently.

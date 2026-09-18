@@ -356,3 +356,18 @@ func TestBuildAgentOSRunnerAllowAndDenyNeedNoAllowList(t *testing.T) {
 		}
 	}
 }
+
+func TestMinimalAndJSONCLI(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--serve", "--minimal", "--json-object", "--max-connections", "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.features.EnabledNames()) != 0 || !cfg.hfOffline || !cfg.options.JSONObject || cfg.maxConn != 1 {
+		t.Fatalf("%+v", cfg)
+	}
+	for _, flags := range [][]string{{"--minimal", "--full"}, {"--minimal", "--chat", "--serve"}, {"--minimal", "--auto"}} {
+		if _, err := parseCLI(flags); err == nil {
+			t.Fatal(flags)
+		}
+	}
+}

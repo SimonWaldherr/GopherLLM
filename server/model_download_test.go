@@ -379,3 +379,55 @@ func TestHFRepoDirNameNeverEscapesModelDir(t *testing.T) {
 		}
 	}
 }
+
+func TestModelSearchTaskAndFormat(t *testing.T) {
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("pipeline_tag") != "text-to-speech" || r.URL.Query().Has("filter") {
+			t.Errorf("query=%s", r.URL.RawQuery)
+		}
+		io.WriteString(w, `[{"id":"org/voice","pipeline_tag":"text-to-speech"}]`)
+	}))
+	defer hf.Close()
+	t.Setenv("HF_ENDPOINT", hf.URL)
+	handler := NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()})
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/models/search?q=voice&task=text-to-speech&format=all", nil))
+	if rr.Code != 200 || !strings.Contains(rr.Body.String(), `"pipeline_tag":"text-to-speech"`) || !strings.Contains(rr.Body.String(), `"gguf":false`) {
+		t.Fatalf("%d %s", rr.Code, rr.Body.String())
+	}
+	for _, query := range []string{"task=invalid", "format=invalid"} {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/models/search?q=voice&"+query, nil))
+		if rr.Code != 400 {
+			t.Fatalf("%s: %d", query, rr.Code)
+		}
+	}
+}
+
+func TestModelArtifactRoutes(t *testing.T) {
+	hf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/tree/") {
+			w.Header().Set("X-Repo-Commit", "revision123")
+			io.WriteString(w, `[{"path":"processor/config.json","type":"file","size":2}]`)
+			return
+		}
+		w.Header().Set("ETag", `"config-blob"`)
+		if r.Method == http.MethodGet {
+			io.WriteString(w, `{}`)
+		}
+	}))
+	defer hf.Close()
+	t.Setenv("HF_ENDPOINT", hf.URL)
+	t.Setenv("HF_HUB_CACHE", t.TempDir())
+	handler := NewHandler(nil, HandlerOptions{ModelDir: t.TempDir(), Features: AllFeatures()})
+	listing := httptest.NewRecorder()
+	handler.ServeHTTP(listing, httptest.NewRequest(http.MethodGet, "/models/download/variants?ref=org/voice&artifacts=1", nil))
+	if listing.Code != 200 || !strings.Contains(listing.Body.String(), `"path":"processor/config.json"`) {
+		t.Fatalf("%d %s", listing.Code, listing.Body.String())
+	}
+	result := httptest.NewRecorder()
+	handler.ServeHTTP(result, httptest.NewRequest(http.MethodPost, "/models/download", strings.NewReader(`{"ref":"org/voice","files":["processor/config.json"]}`)))
+	if result.Code != 200 || !strings.Contains(result.Body.String(), `"artifacts":true`) || !strings.Contains(result.Body.String(), `"status":"success"`) {
+		t.Fatalf("%d %s", result.Code, result.Body.String())
+	}
+}

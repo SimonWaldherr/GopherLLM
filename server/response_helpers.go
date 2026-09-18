@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -10,6 +12,8 @@ import (
 )
 
 type inferenceLogRecord struct {
+	QueueMS            int64  `json:"queue_ms"`
+	Cancelled          bool   `json:"cancelled"`
 	Event              string `json:"event"`
 	RequestID          string `json:"request_id"`
 	Endpoint           string `json:"endpoint"`
@@ -46,7 +50,7 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 	errorType, errorText := "", ""
 	if err != nil {
 		errorType = fmt.Sprintf("%T", err)
-		errorText = err.Error()
+		errorText = "inference failed" // never log raw errors that may contain request content
 	}
 	tps := float64(0)
 	if result.Stats.DecodeTime > 0 {
@@ -60,6 +64,8 @@ func logInferenceResult(logw io.Writer, requestID, endpoint, model string, strea
 	}
 	rec := inferenceLogRecord{
 		Event:              "inference",
+		QueueMS:            result.Stats.QueueTime.Milliseconds(),
+		Cancelled:          errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, gopherllm.ErrGenerationCanceled),
 		RequestID:          requestID,
 		Endpoint:           endpoint,
 		Provider:           "local",
@@ -110,7 +116,7 @@ func openAIChatResponse(model string, result gopherllm.GenerationResult) map[str
 	if result.ReasoningText != "" {
 		message["reasoning_content"] = result.ReasoningText
 	}
-	response := map[string]any{"id": "chatcmpl-gopherllm", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "system_fingerprint": systemFingerprint, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
+	response := map[string]any{"id": newCompletionID("chatcmpl"), "object": "chat.completion", "created": time.Now().Unix(), "model": model, "system_fingerprint": systemFingerprint, "choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": finishReasonOrDefault(result.FinishReason)}}, "usage": usage(result)}
 	if result.PromptCache != nil {
 		response["gopherllm_cache"] = result.PromptCache
 	}
@@ -163,4 +169,8 @@ func modelID(r *gopherllm.Runner) string {
 		return name
 	}
 	return "gopherllm"
+}
+
+func newCompletionID(prefix string) string {
+	return fmt.Sprintf("%s-gopherllm-%d-%d", prefix, time.Now().UnixNano(), inferenceRequestSeq.Add(1))
 }

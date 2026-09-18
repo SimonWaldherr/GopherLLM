@@ -16,19 +16,28 @@ type EmbeddingResult struct {
 // equals cosine similarity). Dimension is the model's hidden size — note this
 // uses the generation model's hidden states, not a dedicated embedding head.
 func (r *Runner) Embed(text string) (EmbeddingResult, error) {
-	if err := r.acquireModelLease(); err != nil {
+	return r.EmbedContext(context.Background(), text)
+}
+
+// EmbedContext supports cancellation while queued and between decoder chunks.
+// A BERT forward pass is atomic; cancellation is checked before and after it.
+func (r *Runner) EmbedContext(ctx context.Context, text string) (EmbeddingResult, error) {
+	release, err := r.acquireInference(ctx)
+	if err != nil {
 		return EmbeddingResult{}, err
 	}
-	defer r.releaseModelLease()
-	r.genLock.Lock()
-	defer r.genLock.Unlock()
+	defer release()
 	if r.kind == loadedBERT {
-		return r.embedBERT(text)
+		result, err := r.embedBERT(text)
+		if ctx.Err() != nil {
+			return EmbeddingResult{}, ctx.Err()
+		}
+		return result, err
 	}
 	// Embeddings reuse the same scratch KV workspace but have unrelated token
 	// positions, so they must never overwrite a live chat-prefix cache.
 	r.clearPrefixCache()
-	return r.embedDecoderLocked(text)
+	return r.embedDecoderLocked(ctx, text)
 }
 
 // EmbedBatch embeds texts under a single model lease and lock, honoring ctx
@@ -45,12 +54,11 @@ func (r *Runner) EmbedBatch(ctx context.Context, texts []string) ([]EmbeddingRes
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	if err := r.acquireModelLease(); err != nil {
+	release, err := r.acquireInference(ctx)
+	if err != nil {
 		return nil, err
 	}
-	defer r.releaseModelLease()
-	r.genLock.Lock()
-	defer r.genLock.Unlock()
+	defer release()
 	if r.kind != loadedBERT {
 		r.clearPrefixCache()
 	}
@@ -64,10 +72,13 @@ func (r *Runner) EmbedBatch(ctx context.Context, texts []string) ([]EmbeddingRes
 		if r.kind == loadedBERT {
 			res, err = r.embedBERT(text)
 		} else {
-			res, err = r.embedDecoderLocked(text)
+			res, err = r.embedDecoderLocked(ctx, text)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("embed_batch: item %d: %w", i, err)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		out = append(out, res)
 	}
@@ -78,7 +89,7 @@ func (r *Runner) EmbedBatch(ctx context.Context, texts []string) ([]EmbeddingRes
 // clear the prefix cache once for the whole batch instead of once per text.
 // Callers must already hold the model lease and genLock, and must have
 // already cleared the prefix cache for this batch.
-func (r *Runner) embedDecoderLocked(text string) (EmbeddingResult, error) {
+func (r *Runner) embedDecoderLocked(ctx context.Context, text string) (EmbeddingResult, error) {
 	tokens := r.tok.Encode(text)
 	if len(tokens) == 0 {
 		return EmbeddingResult{}, fmt.Errorf("embed: input tokenised to zero tokens")
@@ -102,11 +113,17 @@ func (r *Runner) embedDecoderLocked(text string) (EmbeddingResult, error) {
 		weights, _ := r.batchPrefillWeights()
 		chunk := prefillChunkSize(r.config)
 		for start := 0; start < len(tokens); start += chunk {
+			if err := ctx.Err(); err != nil {
+				return EmbeddingResult{}, err
+			}
 			end := min(start+chunk, len(tokens))
 			forwardBatchPoolInto(r.config, weights, cache, buf, tokens[start:end], start, sum)
 		}
 	} else {
 		for pos, tok := range tokens {
+			if err := ctx.Err(); err != nil {
+				return EmbeddingResult{}, err
+			}
 			h := r.forwardHiddenToken(cache, buf, tok, pos)
 			for i, v := range h {
 				sum[i] += v

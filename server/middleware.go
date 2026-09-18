@@ -16,9 +16,18 @@ var inferenceRequestSeq atomic.Uint64
 
 func withLimit(sem chan struct{}, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if err := r.Context().Err(); err != nil {
+			inferenceAPIError(w, err)
+			return
+		}
 		select {
 		case sem <- struct{}{}:
 		case <-r.Context().Done():
+			inferenceAPIError(w, r.Context().Err())
+			return
+		default:
+			w.Header().Set("Retry-After", "1")
+			writeAPIError(w, 429, "overloaded", "", "request capacity exceeded; retry later")
 			return
 		}
 		defer func() { <-sem }()
@@ -47,6 +56,15 @@ func writeContextWindowHeaders(w http.ResponseWriter, info gopherllm.ContextWind
 
 func ensureRequestID(w http.ResponseWriter, req *http.Request) string {
 	id := strings.TrimSpace(req.Header.Get("X-Request-ID"))
+	if len(id) > 128 {
+		id = ""
+	}
+	for _, c := range id {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			id = ""
+			break
+		}
+	}
 	if id == "" {
 		id = fmt.Sprintf("gopherllm-%d-%d", time.Now().UnixNano(), inferenceRequestSeq.Add(1))
 	}
@@ -84,8 +102,13 @@ func remoteOrLoadedModel(state *runnerState, remote *remoteState, next http.Hand
 			remote.proxyChat(w, req)
 			return
 		}
-		if state.get() == nil && needsLoadedModel(req.URL.Path) {
-			http.Error(w, "no model is loaded; choose one in the Web UI or POST /models/load", http.StatusServiceUnavailable)
+		loaded := false
+		if err := state.withRunnerContext(req.Context(), func(r *gopherllm.Runner) { loaded = r != nil }); err != nil {
+			inferenceAPIError(w, err)
+			return
+		}
+		if !loaded && needsLoadedModel(req.URL.Path) {
+			writeAPIError(w, 503, "model_unavailable", "model", "no model is loaded")
 			return
 		}
 		next.ServeHTTP(w, req)
@@ -94,7 +117,7 @@ func remoteOrLoadedModel(state *runnerState, remote *remoteState, next http.Hand
 
 func needsLoadedModel(path string) bool {
 	switch path {
-	case "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/autotune/run":
+	case "/generate", "/v1/chat/completions", "/v1/completions", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/autotune/run":
 		return true
 	default:
 		return false

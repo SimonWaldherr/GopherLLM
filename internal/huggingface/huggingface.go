@@ -27,6 +27,9 @@ import (
 
 const hfPrefix = "hf:"
 
+var hfRepositoryComponent = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$`)
+var hfFilter = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}$`)
+
 const (
 	// DefaultSearchLimit keeps interactive Hub searches small enough to remain
 	// responsive and considerate of the Hub API's rate limits.
@@ -88,8 +91,9 @@ func DefaultOptions() Options {
 // The quant selector is matched against GGUF filenames, for example
 // hf:bartowski/Qwen3-4B-GGUF:Q4_K_M@main.
 func ParseHuggingFaceReference(value string) (hfReference, error) {
+	value = strings.TrimSpace(value)
 	if !strings.HasPrefix(strings.ToLower(value), hfPrefix) {
-		return hfReference{}, fmt.Errorf("Hugging Face reference must start with %q", hfPrefix)
+		value = hfPrefix + strings.TrimSpace(value)
 	}
 	v := strings.TrimSpace(value[len(hfPrefix):])
 	if v == "" {
@@ -110,6 +114,14 @@ func ParseHuggingFaceReference(value string) (hfReference, error) {
 	}
 	if parts := strings.Split(v, "/"); len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.ContainsAny(v, "\\?") {
 		return r, fmt.Errorf("Hugging Face repository must be owner/repository")
+	}
+	for _, component := range strings.Split(v, "/") {
+		if !hfRepositoryComponent.MatchString(component) {
+			return r, errors.New("invalid Hugging Face repository")
+		}
+	}
+	if !safeHFFilePath(r.Revision) {
+		return r, errors.New("invalid Hugging Face revision")
 	}
 	r.Repository = v
 	return r, nil
@@ -196,7 +208,7 @@ func ListGGUFContextWithOptions(ctx context.Context, ref string, out io.Writer, 
 		if quant == "" {
 			quant = "unknown"
 		}
-		fmt.Fprintf(out, "%-14s %-10s %-7d %s\n", quant, formatHFSize(option.SizeBytes), option.Shards, hfSelector(r.Repository, r.Revision, option))
+		fmt.Fprintf(out, "%-14s %-10s %-7d %s\n", quant, formatHFSize(option.SizeBytes), option.Shards, hfVariantSelector(r.Repository, r.Revision, option, variants))
 	}
 	return nil
 }
@@ -205,6 +217,8 @@ func ListGGUFContextWithOptions(ctx context.Context, ref string, out io.Writer, 
 // selector ResolveHuggingFaceModelContextWithOptions (or
 // ResolveHuggingFaceModelFilesContextWithOptions) accepts to fetch it.
 type RepositoryVariant struct {
+	File      string
+	Role      string
 	Quant     string
 	SizeBytes int64
 	Shards    int
@@ -223,17 +237,20 @@ type RepositoryInfo struct {
 
 // SearchResult is the safe, small subset of a Hugging Face model record that
 // the browser model picker needs. GGUF means the result came from the Hub's
-// server-side GGUF filter; callers must still inspect variants before a
+// GGUF filter or carries its GGUF tag; callers must still inspect variants before a
 // download, because the repository tree is the authoritative file listing.
 type SearchResult struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Downloads int64  `json:"downloads"`
-	Likes     int64  `json:"likes"`
-	UpdatedAt string `json:"updated_at"`
-	GGUF      bool   `json:"gguf"`
-	Private   bool   `json:"private"`
-	Gated     bool   `json:"gated"`
+	PipelineTag string   `json:"pipeline_tag,omitempty"`
+	LibraryName string   `json:"library_name,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Downloads   int64    `json:"downloads"`
+	Likes       int64    `json:"likes"`
+	UpdatedAt   string   `json:"updated_at"`
+	GGUF        bool     `json:"gguf"`
+	Private     bool     `json:"private"`
+	Gated       bool     `json:"gated"`
 }
 
 // SearchGGUFRepositories finds a small, download-sorted set of public or
@@ -246,6 +263,27 @@ type SearchResult struct {
 // [1, MaxSearchLimit]. Search is intentionally unavailable in offline mode:
 // a local model cache has no repository search index.
 func SearchGGUFRepositories(ctx context.Context, query string, limit int, opts Options) ([]SearchResult, error) {
+	return SearchModels(ctx, SearchOptions{Query: query, Limit: limit, Format: "gguf"}, opts)
+}
+
+// SearchOptions selects Hub tasks and storage formats independently. Empty
+// PipelineTag and Format search all tasks and formats. Tags are Hub metadata,
+// not a promise that GopherLLM can execute the model.
+type SearchOptions struct {
+	Query       string
+	Limit       int
+	PipelineTag string
+	Format      string
+}
+
+// SearchModels searches models across text, audio, vision and other Hub tasks.
+func SearchModels(ctx context.Context, search SearchOptions, opts Options) ([]SearchResult, error) {
+	query, limit := search.Query, search.Limit
+	for _, value := range []string{search.PipelineTag, search.Format} {
+		if value != "" && !hfFilter.MatchString(value) {
+			return nil, errors.New("invalid Hugging Face task or format filter")
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -271,7 +309,12 @@ func SearchGGUFRepositories(ctx context.Context, query string, limit int, opts O
 	params.Set("search", query)
 	// "gguf" is a Hub model tag. Keeping the filter server-side avoids one
 	// tree request per result and makes search practical on limited networks.
-	params.Set("filter", "gguf")
+	if search.Format != "" {
+		params.Set("filter", search.Format)
+	}
+	if search.PipelineTag != "" {
+		params.Set("pipeline_tag", search.PipelineTag)
+	}
 	params.Set("sort", "downloads")
 	params.Set("direction", "-1")
 	params.Set("limit", strconv.Itoa(limit))
@@ -316,14 +359,17 @@ func SearchGGUFRepositories(ctx context.Context, query string, limit int, opts O
 			continue
 		}
 		results = append(results, SearchResult{
-			ID:        id,
-			Name:      id,
-			Downloads: record.Downloads,
-			Likes:     record.Likes,
-			UpdatedAt: record.LastModified,
-			GGUF:      true,
-			Private:   record.Private,
-			Gated:     record.isGated(),
+			ID:          id,
+			Name:        id,
+			Downloads:   record.Downloads,
+			Likes:       record.Likes,
+			UpdatedAt:   record.LastModified,
+			GGUF:        search.Format == "gguf" || containsHFTag(record.Tags, "gguf"),
+			PipelineTag: record.PipelineTag,
+			LibraryName: record.LibraryName,
+			Tags:        record.Tags,
+			Private:     record.Private,
+			Gated:       record.isGated(),
 		})
 		if len(results) == limit {
 			break
@@ -333,6 +379,9 @@ func SearchGGUFRepositories(ctx context.Context, query string, limit int, opts O
 }
 
 type hfSearchRecord struct {
+	PipelineTag  string          `json:"pipeline_tag"`
+	LibraryName  string          `json:"library_name"`
+	Tags         []string        `json:"tags"`
 	ID           string          `json:"id"`
 	ModelID      string          `json:"modelId"`
 	Downloads    int64           `json:"downloads"`
@@ -389,10 +438,12 @@ func RepositoryVariants(ctx context.Context, ref string, opts Options) (Reposito
 			quant = "unknown"
 		}
 		info.Variants = append(info.Variants, RepositoryVariant{
+			File:      option.File,
+			Role:      describeHFFile(hfTreeEntry{Path: option.File}).Role,
 			Quant:     quant,
 			SizeBytes: option.SizeBytes,
 			Shards:    option.Shards,
-			Selector:  hfSelector(r.Repository, r.Revision, option),
+			Selector:  hfVariantSelector(r.Repository, r.Revision, option, variants),
 		})
 	}
 	return info, nil
@@ -456,6 +507,19 @@ func listGGUFVariants(ctx context.Context, ref string, opts Options) (hfReferenc
 // hfSelector builds the exact "hf:owner/repository[:quant][@revision]"
 // string that resolves back to option, for callers that print or return a
 // runnable reference alongside a listed variant.
+func hfVariantSelector(repository, revision string, option GGUFOption, variants []GGUFOption) string {
+	matches := 0
+	for _, other := range variants {
+		if option.Quant != "" && strings.Contains(strings.ToLower(other.File), strings.ToLower(option.Quant)) {
+			matches++
+		}
+	}
+	if matches > 1 {
+		option.Quant = ""
+	}
+	return hfSelector(repository, revision, option)
+}
+
 func hfSelector(repository, revision string, option GGUFOption) string {
 	selector := hfPrefix + repository
 	if option.Quant != "" {
@@ -552,6 +616,7 @@ func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, op
 		}
 		return nil, err
 	}
+	resolvedCommit := commit
 	if commit == "" {
 		// The public Hub currently supplies X-Repo-Commit. Keeping this
 		// fallback also makes the importer compatible with simple Hub mirrors.
@@ -577,7 +642,11 @@ func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, op
 		}
 		tasks = append(tasks, hfDownloadTask{name: name, path: local, size: hfFileSize(entries, name)})
 	}
-	if err := downloadHFFiles(ctx, r, cache, tasks, logw, options.OnProgress); err != nil {
+	downloadRef := r
+	if resolvedCommit != "" {
+		downloadRef.Revision = resolvedCommit
+	}
+	if err := downloadHFFiles(ctx, downloadRef, cache, tasks, logw, options.OnProgress); err != nil {
 		return nil, err
 	}
 	if err := cache.writeRef(r.Revision, commit); err != nil {
@@ -686,6 +755,9 @@ func hfEndpoint() string {
 }
 
 func newHFCache(r hfReference) hfCache {
+	if root := strings.TrimSpace(os.Getenv("HF_HUB_CACHE")); root != "" {
+		return hfCache{repository: r.Repository, root: filepath.Join(root, "models--"+strings.ReplaceAll(r.Repository, "/", "--"))}
+	}
 	home := strings.TrimSpace(os.Getenv("HF_HOME"))
 	if home == "" {
 		if userCache, err := os.UserCacheDir(); err == nil {
@@ -763,7 +835,20 @@ func hfListFiles(ctx context.Context, r hfReference) ([]hfTreeEntry, string, err
 	u := hfEndpoint() + "/api/models/" + hfRepositoryPath(r.Repository) + "/tree/" + url.PathEscape(r.Revision) + "?recursive=true"
 	var entries []hfTreeEntry
 	var commit string
+	origin, err := url.Parse(hfEndpoint())
+	if err != nil {
+		return nil, "", err
+	}
+	visited := map[string]bool{}
 	for u != "" {
+		pageURL, err := url.Parse(u)
+		if err != nil || pageURL.Scheme != origin.Scheme || pageURL.Host != origin.Host || pageURL.User != nil {
+			return nil, "", errors.New("invalid Hugging Face pagination URL")
+		}
+		if visited[u] || len(visited) >= 100 {
+			return nil, "", errors.New("Hugging Face pagination exceeded limit or repeated a page")
+		}
+		visited[u] = true
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
 			return nil, "", err
@@ -779,10 +864,18 @@ func hfListFiles(ctx context.Context, r hfReference) ([]hfTreeEntry, string, err
 			return nil, "", err
 		}
 		if value := strings.TrimSpace(resp.Header.Get("X-Repo-Commit")); value != "" {
+			if value == "." || value == ".." || strings.ContainsAny(value, "/\\") {
+				resp.Body.Close()
+				return nil, "", errors.New("invalid Hugging Face commit")
+			}
+			if commit != "" && commit != value {
+				resp.Body.Close()
+				return nil, "", errors.New("Hugging Face revision changed during listing; retry")
+			}
 			commit = value
 		}
 		var page []hfTreeEntry
-		err = json.NewDecoder(resp.Body).Decode(&page)
+		err = json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&page)
 		next := hfNextPage(resp.Header.Get("Link"))
 		resp.Body.Close()
 		if err != nil {
@@ -817,6 +910,9 @@ func selectHFGGUF(entries []hfTreeEntry, quant string) ([]string, error) {
 		if quant == "" || strings.Contains(strings.ToLower(key), strings.ToLower(quant)) {
 			candidates = append(candidates, key)
 		}
+	}
+	if _, exact := groups[quant]; exact {
+		candidates = []string{quant}
 	}
 	sort.Strings(candidates)
 	if len(candidates) == 0 {
@@ -939,6 +1035,14 @@ func splitGroupKey(path string) string {
 }
 
 func safeHFFilePath(path string) bool {
+	if strings.ContainsAny(path, "\\:\x00") {
+		return false
+	}
+	for _, r := range path {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
 	for _, part := range strings.Split(path, "/") {
 		if part == "" || part == "." || part == ".." {
 			return false
@@ -953,6 +1057,11 @@ func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, 
 		return "", err
 	}
 	blob := filepath.Join(cache.root, "blobs", etag)
+	release, err := lockHFBlob(ctx, blob)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	if st, err := os.Stat(blob); err == nil && st.Size() > 0 && (expectedSize <= 0 || st.Size() == expectedSize) {
 		return blob, nil
 	}
@@ -989,6 +1098,12 @@ func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, 
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", hfStatusError(resp, name)
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		var start, end, total int64
+		if _, e := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &start, &end, &total); e != nil || start != offset || end < start || total <= end || (expectedSize > 0 && total != expectedSize) {
+			return "", fmt.Errorf("download %s: invalid Content-Range", name)
+		}
 	}
 	if offset > 0 && resp.StatusCode != http.StatusPartialContent {
 		// Some mirrors ignore Range. Restart rather than appending a full
@@ -1138,7 +1253,7 @@ func hfFileETag(ctx context.Context, r hfReference, name string) (string, error)
 
 func safeHFETag(value string) string {
 	value = strings.Trim(strings.TrimSpace(value), `"`)
-	if value == "" || strings.ContainsAny(value, `/\\`) {
+	if value == "" || value == "." || value == ".." || strings.ContainsAny(value, `/\\`) {
 		return ""
 	}
 	for _, r := range value {

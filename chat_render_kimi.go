@@ -60,6 +60,7 @@ func (r *Runner) renderKimiMessages(messages []ChatMessage, systemPrompt string,
 		appendTurn(systemTok, "system", system)
 	}
 
+	aliases := map[string]string{}
 	for _, message := range messages {
 		roleName := message.Name
 		if roleName == "" {
@@ -96,6 +97,7 @@ func (r *Runner) renderKimiMessages(messages []ChatMessage, systemPrompt string,
 					if _, _, ok := parseKimiToolCallID(callID); !ok {
 						callID = kimiToolCallID(call.Function.Name, index)
 					}
+					aliases[call.ID] = callID
 					arguments := call.Function.Arguments
 					if strings.TrimSpace(arguments) == "" {
 						arguments = "{}"
@@ -110,7 +112,11 @@ func (r *Runner) renderKimiMessages(messages []ChatMessage, systemPrompt string,
 			}
 			tokens = append(tokens, endTok)
 		case ChatRoleTool:
-			appendTurn(systemTok, roleName, "## Return of "+message.ToolCallID+" "+message.Content)
+			callID := message.ToolCallID
+			if mapped, ok := aliases[callID]; ok {
+				callID = mapped
+			}
+			appendTurn(systemTok, roleName, "## Return of "+callID+" "+message.Content)
 		case ChatRoleSystem:
 			appendTurn(systemTok, roleName, message.Content)
 		default:

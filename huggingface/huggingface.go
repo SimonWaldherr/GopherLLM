@@ -1,6 +1,6 @@
 // Package huggingface is the public Hugging Face Hub client for GopherLLM:
-// resolving an "owner/repo" reference to a local GGUF path, searching for
-// repositories that publish GGUF files, and listing a repository's variants.
+// searching across model tasks and formats, inspecting repository artifacts,
+// downloading exact file sets, and resolving GGUF variants for local inference.
 //
 // It exists as its own package for a specific reason. The Hub client needs
 // net/http, which pulls in crypto/tls and the whole HTTP/2 stack, and the root
@@ -84,8 +84,8 @@ func ResolveFiles(ctx context.Context, ref string, logw io.Writer, opts Options)
 	return internalhf.ResolveHuggingFaceModelFilesContextWithOptions(ctx, ref, logw, opts)
 }
 
-// Search finds Hub repositories publishing GGUF files. limit is clamped to the
-// Hub's supported range.
+// Search finds Hub repositories publishing GGUF files. Zero limit uses the
+// default; other limits must be in the supported range.
 func Search(ctx context.Context, query string, limit int, opts Options) ([]SearchResult, error) {
 	return internalhf.SearchGGUFRepositories(ctx, query, limit, opts)
 }
@@ -103,3 +103,29 @@ func List(ctx context.Context, ref string, out io.Writer, opts Options) error {
 
 // Repository normalises a reference to its "owner/repo" form.
 func Repository(ref string) (string, error) { return internalhf.Repository(ref) }
+
+// SearchOptions selects model task and format independently.
+type SearchOptions = internalhf.SearchOptions
+
+// File describes any repository artifact, including weights and companion files.
+type File = internalhf.File
+
+// Manifest describes the available files at a repository revision.
+type Manifest = internalhf.Manifest
+
+// SearchModels searches all model types. Empty task/format filters include all.
+// Metadata is not an assertion of local runtime support.
+func SearchModels(ctx context.Context, search SearchOptions, opts Options) ([]SearchResult, error) {
+	return internalhf.SearchModels(ctx, search, opts)
+}
+
+// Inspect lists all repository artifacts without downloading model weights.
+func Inspect(ctx context.Context, ref string, opts Options) (Manifest, error) {
+	return internalhf.Inspect(ctx, ref, opts)
+}
+
+// DownloadFiles downloads exact repository paths and preserves subdirectories.
+// It does not execute code, select a runtime, or infer a complete model bundle.
+func DownloadFiles(ctx context.Context, ref string, files []string, logw io.Writer, opts Options) ([]string, error) {
+	return internalhf.DownloadFiles(ctx, ref, files, logw, opts)
+}

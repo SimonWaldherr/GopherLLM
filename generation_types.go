@@ -65,6 +65,8 @@ func ToolResultMessage(callID, name, content string) ChatMessage {
 }
 
 type GenerationOptions struct {
+	// JSONObject enables grammar-constrained JSON-object decoding.
+	JSONObject    bool
 	MaxTokens     int
 	Sampler       SamplerConfig
 	Seed          uint64
@@ -147,6 +149,9 @@ func (o GenerationOptions) ActiveTools() []ToolDefinition {
 }
 
 func (o GenerationOptions) Validate() error {
+	if o.JSONObject && (len(o.ActiveTools()) > 0 || len(o.StopSequences) > 0 || o.MTPDraftTokens > 0) {
+		return fmt.Errorf("JSON output cannot be combined with tools, stop sequences or MTP")
+	}
 	if o.MaxTokens <= 0 {
 		return fmt.Errorf("max_tokens must be greater than 0")
 	}
@@ -179,6 +184,7 @@ func finite32(v float32) bool {
 }
 
 type GenerationStats struct {
+	QueueTime       time.Duration
 	PromptTokens    int
 	GeneratedTokens int
 	TTFT            time.Duration

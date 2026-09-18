@@ -34,6 +34,7 @@ type fileConfig struct {
 }
 
 type fileGenerationConfig struct {
+	JSONObject     *bool    `json:"json_object,omitempty"`
 	MaxTokens      *int     `json:"max_tokens,omitempty"`
 	MTPDraftTokens *int     `json:"mtp_draft_tokens,omitempty"`
 	Temperature    *float32 `json:"temperature,omitempty"`
@@ -59,7 +60,9 @@ type fileRuntimeConfig struct {
 }
 
 type fileServerConfig struct {
-	Address *string `json:"address,omitempty"`
+	RequestTimeout *string `json:"request_timeout,omitempty"`
+	Minimal        *bool   `json:"minimal,omitempty"`
+	Address        *string `json:"address,omitempty"`
 	// Features lists the optional capabilities to enable, by the same names
 	// --enable accepts. Absent means none, matching the CLI default.
 	Features   []string `json:"features,omitempty"`
@@ -135,6 +138,7 @@ var cliValueOptions = map[string]bool{
 	"--bench-runs":         true,
 	"--kernel-bench-runs":  true,
 	"--kernel-bench-layer": true,
+	"--request-timeout":    true,
 	"--timeout":            true,
 	"--auto-effort":        true,
 	"--cpuprofile":         true,
@@ -226,6 +230,9 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		if g.MTPDraftTokens != nil {
 			cfg.options.MTPDraftTokens = *g.MTPDraftTokens
 		}
+		if g.JSONObject != nil {
+			cfg.options.JSONObject = *g.JSONObject
+		}
 		if g.Temperature != nil {
 			cfg.options.Sampler.Temperature = *g.Temperature
 		}
@@ -295,6 +302,16 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		}
 	}
 	if s := raw.Server; s != nil {
+		if s.RequestTimeout != nil {
+			d, err := time.ParseDuration(*s.RequestTimeout)
+			if err != nil || d <= 0 {
+				return fmt.Errorf("server.request_timeout must be positive duration")
+			}
+			cfg.requestTimeout = d
+		}
+		if s.Minimal != nil {
+			cfg.minimal = *s.Minimal
+		}
 		if s.Address != nil {
 			cfg.serveAddr = *s.Address
 		}
@@ -404,6 +421,7 @@ func effectiveContextWindowMode(mode gopherllm.ContextWindowMode) string {
 // HF_TOKEN and transient user prompts are intentionally not part of the schema.
 func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	type effectiveGenerationConfig struct {
+		JSONObject     bool     `json:"json_object,omitempty"`
 		MaxTokens      int      `json:"max_tokens"`
 		MTPDraftTokens int      `json:"mtp_draft_tokens"`
 		Temperature    float32  `json:"temperature"`
@@ -427,6 +445,8 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		AutoEffort   string `json:"auto_effort,omitempty"`
 	}
 	type effectiveServerConfig struct {
+		RequestTimeout  string   `json:"request_timeout,omitempty"`
+		Minimal         bool     `json:"minimal,omitempty"`
 		Address         string   `json:"address,omitempty"`
 		Features        []string `json:"features,omitempty"`
 		Deployment      string   `json:"deployment,omitempty"`
@@ -456,6 +476,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		Preset:   cfg.preset,
 		ModelDir: cfg.modelDir,
 		Generation: effectiveGenerationConfig{
+			JSONObject:     cfg.options.JSONObject,
 			MaxTokens:      cfg.options.MaxTokens,
 			MTPDraftTokens: cfg.options.MTPDraftTokens,
 			Temperature:    cfg.options.Sampler.Temperature,
@@ -488,8 +509,9 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	if cfg.modelSelector != nil {
 		result.Model = *cfg.modelSelector
 	}
-	if cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.ragDocsDir != "" || cfg.ragEmbedModel != "" || cfg.ragSnapshotPath != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
+	if cfg.requestTimeout > 0 || cfg.minimal || cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.ragDocsDir != "" || cfg.ragEmbedModel != "" || cfg.ragSnapshotPath != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
 		result.Server = &effectiveServerConfig{
+			Minimal:         cfg.minimal,
 			Address:         cfg.serveAddr,
 			Features:        cfg.features.EnabledNames(),
 			Deployment:      string(cfg.deploymentMode),
@@ -504,6 +526,9 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 			OSCommands:      cfg.osCommandsPolicy,
 			OSCommandsAllow: cfg.osCommandsAllow,
 		}
+	}
+	if result.Server != nil && cfg.requestTimeout > 0 {
+		result.Server.RequestTimeout = cfg.requestTimeout.String()
 	}
 	if cfg.hfOffline {
 		result.HuggingFace = &fileHuggingFaceConfig{Offline: boolPtr(true)}

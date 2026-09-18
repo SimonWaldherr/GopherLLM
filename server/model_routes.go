@@ -45,8 +45,10 @@ func (r modelLoadRequest) selector() string {
 // cancel a GET while a user keeps typing, and the request does not carry any
 // sensitive model-download credential or arbitrary remote URL.
 type modelSearchRequest struct {
-	Query string
-	Limit int
+	Query  string
+	Limit  int
+	Task   string
+	Format string
 }
 
 func parseModelSearchRequest(req *http.Request) (modelSearchRequest, error) {
@@ -62,7 +64,25 @@ func parseModelSearchRequest(req *http.Request) (modelSearchRequest, error) {
 		}
 		limit = value
 	}
-	return modelSearchRequest{Query: query, Limit: limit}, nil
+	task := strings.TrimSpace(req.URL.Query().Get("task"))
+	switch task {
+	case "", "text-generation", "automatic-speech-recognition", "text-to-speech", "image-text-to-text", "image-to-text", "feature-extraction", "text-to-image", "image-classification", "audio-classification", "video-text-to-text":
+	default:
+		return modelSearchRequest{}, errors.New("unsupported task filter")
+	}
+	format := req.URL.Query().Get("format")
+	if format == "" {
+		format = "gguf"
+	}
+	switch format {
+	case "gguf", "all", "safetensors", "onnx":
+	default:
+		return modelSearchRequest{}, errors.New("unsupported format filter")
+	}
+	if format == "all" {
+		format = ""
+	}
+	return modelSearchRequest{Query: query, Limit: limit, Task: task, Format: format}, nil
 }
 
 // hfRepoDirName turns a Hugging Face "owner/repository" reference into a
@@ -182,7 +202,7 @@ func registerModelCatalogRoutes(mux *http.ServeMux, state *runnerState, embedder
 			return
 		}
 		var body modelLoadRequest
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -230,7 +250,7 @@ func registerModelCatalogRoutes(mux *http.ServeMux, state *runnerState, embedder
 			return
 		}
 		var body modelLoadRequest
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -264,7 +284,7 @@ func registerModelCatalogRoutes(mux *http.ServeMux, state *runnerState, embedder
 		var body struct {
 			Input []string `json:"input"`
 		}
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -318,6 +338,18 @@ func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts Ha
 			http.Error(w, "missing ref query parameter", http.StatusBadRequest)
 			return
 		}
+		if req.URL.Query().Get("artifacts") == "1" {
+			ctx, cancel := context.WithTimeout(req.Context(), hfSearchTimeout)
+			defer cancel()
+			info, err := huggingface.Inspect(ctx, ref, huggingface.DefaultOptions())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, info)
+			return
+		}
 		info, err := huggingface.RepositoryVariants(req.Context(), ref, huggingface.Options{})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -325,7 +357,7 @@ func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts Ha
 		}
 		variants := make([]map[string]any, len(info.Variants))
 		for i, v := range info.Variants {
-			variants[i] = map[string]any{"quant": v.Quant, "size_bytes": v.SizeBytes, "shards": v.Shards, "selector": v.Selector}
+			variants[i] = map[string]any{"file": v.File, "role": v.Role, "quant": v.Quant, "size_bytes": v.SizeBytes, "shards": v.Shards, "selector": v.Selector}
 		}
 		writeJSON(w, map[string]any{"repository": info.Repository, "revision": info.Revision, "variants": variants})
 	})
@@ -345,7 +377,7 @@ func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts Ha
 		}
 		ctx, cancel := context.WithTimeout(req.Context(), hfSearchTimeout)
 		defer cancel()
-		models, err := huggingface.SearchGGUFRepositories(ctx, search.Query, search.Limit, huggingface.DefaultOptions())
+		models, err := huggingface.SearchModels(ctx, huggingface.SearchOptions{Query: search.Query, Limit: search.Limit, PipelineTag: search.Task, Format: search.Format}, huggingface.DefaultOptions())
 		if err != nil {
 			if errors.Is(err, context.Canceled) && req.Context().Err() != nil {
 				// The browser aborted a type-ahead request. There is no client left
@@ -373,9 +405,10 @@ func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts Ha
 			return
 		}
 		var body struct {
-			Ref string `json:"ref"`
+			Ref   string   `json:"ref"`
+			Files []string `json:"files,omitempty"`
 		}
-		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, req.Body, 1<<20)).Decode(&body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -412,16 +445,31 @@ func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts Ha
 		}
 		w.Header().Set("content-type", "application/x-ndjson")
 		w.Header().Set("cache-control", "no-store")
-		send := func(event map[string]any) { _ = writeNDJSON(w, flusher, event) }
+		var progressMu sync.Mutex
+		send := func(event map[string]any) {
+			progressMu.Lock()
+			defer progressMu.Unlock()
+			_ = writeNDJSON(w, flusher, event)
+		}
 		send(map[string]any{"status": "resolving", "ref": ref})
-		files, err := huggingface.ResolveHuggingFaceModelFilesContextWithOptions(req.Context(), ref, io.Discard, huggingface.Options{
+		downloadOptions := huggingface.Options{
 			OnProgress: func(ev huggingface.ProgressEvent) {
 				if ev.Err != nil {
 					return
 				}
 				send(map[string]any{"status": "downloading", "file": ev.File, "completed": ev.Completed, "total": ev.Total})
 			},
-		})
+		}
+		if body.Files != nil {
+			files, err := huggingface.DownloadFiles(req.Context(), ref, body.Files, io.Discard, downloadOptions)
+			if err != nil {
+				send(map[string]any{"status": "error", "error": err.Error()})
+				return
+			}
+			send(map[string]any{"status": "success", "artifacts": true, "files": files, "file": fmt.Sprintf("%d selected files", len(files))})
+			return
+		}
+		files, err := huggingface.ResolveHuggingFaceModelFilesContextWithOptions(req.Context(), ref, io.Discard, downloadOptions)
 		if err != nil {
 			send(map[string]any{"status": "error", "error": err.Error()})
 			return

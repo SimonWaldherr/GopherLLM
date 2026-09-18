@@ -48,7 +48,14 @@ type APIMessage struct {
 
 func apiMessages(items []APIMessage) []gopherllm.ChatMessage {
 	out := make([]gopherllm.ChatMessage, 0, len(items))
+	names := map[string]string{}
 	for _, item := range items {
+		for _, call := range item.ToolCalls {
+			names[call.ID] = call.Function.Name
+		}
+		if item.Role == "tool" && item.Name == "" {
+			item.Name = names[item.ToolCallID]
+		}
 		role := gopherllm.ChatRoleUser
 		switch strings.ToLower(item.Role) {
 		case "system", "developer":
@@ -62,6 +69,32 @@ func apiMessages(items []APIMessage) []gopherllm.ChatMessage {
 			role = gopherllm.ChatRoleTool
 		}
 		out = append(out, gopherllm.ChatMessage{Role: role, Content: contentText(item.Content), Images: contentImages(item.Content), ToolCalls: item.ToolCalls, ToolCallID: item.ToolCallID, Name: item.Name})
+	}
+	// Native templates without call IDs associate results by position. Normalize
+	// a complete tool-result block into the preceding call order, using IDs.
+	for i := 0; i < len(out); i++ {
+		calls := out[i].ToolCalls
+		if len(calls) < 2 || i+len(calls) >= len(out) {
+			continue
+		}
+		byID := map[string]gopherllm.ChatMessage{}
+		for j := 1; j <= len(calls); j++ {
+			m := out[i+j]
+			if m.Role == gopherllm.ChatRoleTool {
+				byID[m.ToolCallID] = m
+			}
+		}
+		complete := true
+		for _, call := range calls {
+			if _, ok := byID[call.ID]; !ok {
+				complete = false
+			}
+		}
+		if complete {
+			for j, call := range calls {
+				out[i+j+1] = byID[call.ID]
+			}
+		}
 	}
 	return out
 }
@@ -163,11 +196,17 @@ func contentText(v any) string {
 		return strings.Join(parts, "\n")
 	default:
 		b, _ := json.Marshal(v)
+		if v == nil {
+			return ""
+		}
 		return string(b)
 	}
 }
 
 type OpenAIChatRequest struct {
+	ResponseFormat      *ResponseFormat            `json:"response_format,omitempty"`
+	N                   *int                       `json:"n,omitempty"`
+	ParallelToolCalls   *bool                      `json:"parallel_tool_calls,omitempty"`
 	Model               string                     `json:"model"`
 	Messages            []APIMessage               `json:"messages"`
 	Stream              bool                       `json:"stream"`
@@ -273,8 +312,10 @@ func (o OpenAICompletionRequest) Options(def gopherllm.GenerationOptions) gopher
 }
 
 type EmbeddingsRequest struct {
-	Model string `json:"model"`
-	Input any    `json:"input"`
+	EncodingFormat string `json:"encoding_format,omitempty"`
+	Dimensions     *int   `json:"dimensions,omitempty"`
+	Model          string `json:"model"`
+	Input          any    `json:"input"`
 }
 
 func (e EmbeddingsRequest) Inputs() []string {

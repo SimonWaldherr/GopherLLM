@@ -46,6 +46,9 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "                            A non-loopback address is allowed and prints what it exposes")
 	fmt.Fprintln(os.Stderr, "  --enable <list>           Add optional features (model-catalog is already on):")
 	fmt.Fprintln(os.Stderr, "                            model-download, autotune, remote, web-lookup, spreadsheet, rag, all")
+	fmt.Fprintln(os.Stderr, "  --minimal                 Inference only; no catalog/UI/tools/downloads (HF cache offline)")
+	fmt.Fprintln(os.Stderr, "  --request-timeout <d>      Per-inference HTTP deadline (default 2m)")
+	fmt.Fprintln(os.Stderr, "  --json-object             Grammar-constrained JSON object output; incompatible with stop/tools/MTP")
 	fmt.Fprintln(os.Stderr, "  --full                    Shorthand for --enable all")
 	fmt.Fprintln(os.Stderr, "  --deployment <mode>       Server profile: local | managed | browser (default: local)")
 	fmt.Fprintln(os.Stderr, "                           local is single-user; managed protects shared settings behind a token; browser runs models in each browser")
@@ -110,6 +113,8 @@ func printUsage(name string) {
 }
 
 type cliConfig struct {
+	requestTimeout          time.Duration
+	minimal                 bool
 	modelSelector           *string
 	modelSelectorFromConfig bool
 	modelDir                string
@@ -271,9 +276,9 @@ func run() error {
 			Features:                 cfg.features,
 			DeploymentMode:           cfg.deploymentMode,
 			Defaults:                 cfg.options,
-			MaxConcurrentConnections: cfg.maxConn,
-			ChatUI:                   true,
-			WasmDir:                  resolveWasmDir(cfg),
+			MaxConcurrentConnections: cfg.maxConn, RequestTimeout: cfg.requestTimeout,
+			ChatUI:  true,
+			WasmDir: resolveWasmDir(cfg),
 		})
 	}
 	if cfg.benchRuns <= 0 {
@@ -324,18 +329,18 @@ func run() error {
 			DeploymentMode:           cfg.deploymentMode,
 			AdminToken:               cfg.adminToken,
 			Defaults:                 cfg.options,
-			MaxConcurrentConnections: cfg.maxConn,
-			ChatUI:                   cfg.chatUI,
-			ChatHistoryPath:          cfg.chatHistoryPath,
-			ChatHistoryLock:          &sync.Mutex{},
-			ModelDir:                 cfg.modelDir,
-			WasmDir:                  resolveWasmDir(cfg),
-			SkillsDir:                cfg.skillsDir,
-			RAGDocsDir:               cfg.ragDocsDir,
-			RAGEmbedModelPath:        cfg.ragEmbedModel,
-			RAGSnapshotPath:          cfg.ragSnapshotPath,
-			ModelLoadOptions:         serverModelLoadOptions(cfg),
-			AgentOS:                  agentOSRunner,
+			MaxConcurrentConnections: cfg.maxConn, RequestTimeout: cfg.requestTimeout,
+			ChatUI:            cfg.chatUI,
+			ChatHistoryPath:   cfg.chatHistoryPath,
+			ChatHistoryLock:   &sync.Mutex{},
+			ModelDir:          cfg.modelDir,
+			WasmDir:           resolveWasmDir(cfg),
+			SkillsDir:         cfg.skillsDir,
+			RAGDocsDir:        cfg.ragDocsDir,
+			RAGEmbedModelPath: cfg.ragEmbedModel,
+			RAGSnapshotPath:   cfg.ragSnapshotPath,
+			ModelLoadOptions:  serverModelLoadOptions(cfg),
+			AgentOS:           agentOSRunner,
 		})
 	}
 	stopProfile, err := startCPUProfile(cfg.cpuProfile)
@@ -475,7 +480,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, RAGDocsDir: cfg.ragDocsDir, RAGEmbedModelPath: cfg.ragEmbedModel, RAGSnapshotPath: cfg.ragSnapshotPath, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, RequestTimeout: cfg.requestTimeout, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, RAGDocsDir: cfg.ragDocsDir, RAGEmbedModelPath: cfg.ragEmbedModel, RAGSnapshotPath: cfg.ragSnapshotPath, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -826,6 +831,10 @@ func parseCLI(args []string) (cliConfig, error) {
 			}
 			cfg.features = cfg.features.Merge(features)
 			cfg.featuresSet = true
+		case "--minimal":
+			cfg.minimal = true
+		case "--json-object":
+			cfg.options.JSONObject = true
 		case "--full":
 			cfg.features = cfg.features.Merge(server.AllFeatures())
 			cfg.featuresSet = true
@@ -865,6 +874,15 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.wasmDir, cfg.wasmDirSet = v, true
+		case "--request-timeout":
+			value, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.requestTimeout, err = time.ParseDuration(value)
+			if err != nil || cfg.requestTimeout <= 0 {
+				return cfg, fmt.Errorf("request-timeout must be positive duration")
+			}
 		case "--max-connections":
 			v, err := parseNextInt(next, arg)
 			if err != nil {
@@ -1126,7 +1144,15 @@ func parseCLI(args []string) (cliConfig, error) {
 	// started the server with no model has no way to pick one. Everything that
 	// reaches the network or the host still has to be asked for. --enable adds
 	// to this baseline, so the flag never silently takes the catalog away.
-	cfg.features = cfg.features.Merge(server.Features{ModelCatalog: true})
+	if cfg.minimal {
+		if len(cfg.features.EnabledNames()) > 0 || cfg.chatUI || cfg.skillsDir != "" || cfg.ragDocsDir != "" || cfg.osCommandsPolicy != "" || cfg.autoTune {
+			return cfg, fmt.Errorf("--minimal cannot enable optional features, UI, skills, OS commands or autotuning")
+		}
+		cfg.features = server.Features{}
+		cfg.hfOffline = true
+	} else {
+		cfg.features = cfg.features.Merge(server.Features{ModelCatalog: true})
+	}
 	if cfg.chatUI && cfg.serveAddr == "" {
 		return cfg, fmt.Errorf("--chat requires --serve <addr>")
 	}

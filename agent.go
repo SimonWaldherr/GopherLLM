@@ -345,7 +345,9 @@ func RunAgenticChatWithGenerator(generate ChatGenerator, messages []ChatMessage,
 	}
 	result.Stats = stats
 	if onToken != nil && result.Text != "" {
-		onToken(result.Text)
+		if !onToken(result.Text) && err == nil {
+			err = ErrGenerationCanceled
+		}
 	}
 	return result, err
 }
@@ -604,6 +606,7 @@ func sumGenerationStats(a, b GenerationStats) GenerationStats {
 		ttft = b.TTFT
 	}
 	return GenerationStats{
+		QueueTime:       a.QueueTime + b.QueueTime,
 		PromptTokens:    a.PromptTokens + b.PromptTokens,
 		GeneratedTokens: a.GeneratedTokens + b.GeneratedTokens,
 		TTFT:            ttft,

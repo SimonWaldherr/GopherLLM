@@ -1426,6 +1426,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const modelDownloadRefEl = $("modelDownloadRef");
   const modelDownloadFindEl = $("modelDownloadFind");
   const modelHubSearchFormEl = $("modelHubSearchForm");
+  const modelHubSearchFormatEl = $("modelHubSearchFormat");
+  const modelHubSearchTaskEl = $("modelHubSearchTask");
   const modelHubSearchQueryEl = $("modelHubSearchQuery");
   const modelHubSearchSubmitEl = $("modelHubSearchSubmit");
   const modelHubSearchStatusEl = $("modelHubSearchStatus");
@@ -3840,7 +3842,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     modelHubSearchResultsEl.replaceChildren();
     if (!models.length) {
       clearModelHubSearchResults();
-      setModelHubSearchStatus("No GGUF repositories matched that search.");
+      setModelHubSearchStatus("No model repositories matched that search.");
       return;
     }
     models.forEach((model) => {
@@ -3850,13 +3852,13 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       action.type = "button";
       action.className = "model-hub-search-action";
       action.dataset.repository = model.id;
-      action.title = "Show GGUF variants from " + model.id;
+      action.title = "Show files or variants from " + model.id;
 
       const title = document.createElement("strong");
       title.textContent = model.name || model.id;
       const meta = document.createElement("span");
       meta.className = "model-hub-search-meta";
-      const details = ["GGUF", formatHubCount(model.downloads) + " downloads", formatHubCount(model.likes) + " likes", formatHubUpdated(model.updated_at)];
+      const details = [model.gguf ? "GGUF" : "Repository files", model.pipeline_tag, model.library_name, formatHubCount(model.downloads) + " downloads", formatHubCount(model.likes) + " likes", formatHubUpdated(model.updated_at)];
       if (model.gated) details.push("gated");
       meta.textContent = details.filter(Boolean).join(" · ");
       action.append(title, meta);
@@ -3864,7 +3866,37 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       modelHubSearchResultsEl.appendChild(item);
     });
     modelHubSearchResultsEl.hidden = false;
-    setModelHubSearchStatus(models.length + " GGUF " + (models.length === 1 ? "repository" : "repositories") + " found. Choose one to see its variants.");
+    setModelHubSearchStatus(models.length + " " + (models.length === 1 ? "repository" : "repositories") + " found. Choose one to see its variants.");
+  }
+
+  function renderModelArtifacts(manifest) {
+    modelDownloadVariantsEl.replaceChildren();
+    const ref = "hf:" + manifest.repository + "@" + (manifest.commit || manifest.revision);
+    manifest.files.forEach((file) => {
+      const item = document.createElement("li");
+      const label = document.createElement("label");
+      label.className = "model-artifact-choice";
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.value = file.path;
+      label.append(check, document.createTextNode(" " + file.path + " · " + file.role + " · " + formatDownloadSize(file.size_bytes)));
+      item.append(label);
+      modelDownloadVariantsEl.append(item);
+    });
+    const item = document.createElement("li");
+    const download = document.createElement("button");
+    download.type = "button";
+    download.textContent = "Download selected files";
+    download.className = "autotune-run";
+    download.addEventListener("click", () => {
+      const files = Array.from(modelDownloadVariantsEl.querySelectorAll("input:checked"), (input) => input.value);
+      if (!files.length) { setModelDownloadStatus("Select the weights and companion files you need."); return; }
+      startModelDownload(ref, files);
+    });
+    item.append(download);
+    modelDownloadVariantsEl.append(item);
+    modelDownloadVariantsEl.hidden = false;
+    setModelDownloadStatus("Select all required shards, tokenizer and processor files. Files are cached locally. Loading them requires a compatible runtime.");
   }
 
   async function findModelDownloadVariants(ref) {
@@ -3874,9 +3906,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     modelDownloadVariantsEl.replaceChildren();
     setModelDownloadStatus("Looking up " + ref + "…");
     try {
-      const response = await adminFetch("/models/download/variants?ref=" + encodeURIComponent(ref));
+      const response = await adminFetch("/models/download/variants?ref=" + encodeURIComponent(ref) + (modelHubSearchFormatEl.value !== "gguf" ? "&artifacts=1" : ""));
       if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
       const data = await response.json();
+      if (data.files) { renderModelArtifacts(data); return; }
       renderModelDownloadVariants(data.repository || ref, data.revision || "main", data.variants || []);
     } catch (error) {
       setModelDownloadStatus("Could not list variants: " + (error.message || error), "error");
@@ -3889,7 +3922,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const text = query.trim();
     if (!text) {
       clearModelHubSearchResults();
-      setModelHubSearchStatus("Enter a model name to search GGUF repositories.");
+      setModelHubSearchStatus("Enter a model name to search model repositories.");
       return;
     }
     if (modelHubSearchController) modelHubSearchController.abort();
@@ -3897,9 +3930,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     modelHubSearchController = controller;
     const sequence = ++modelHubSearchSequence;
     modelHubSearchSubmitEl.disabled = true;
-    setModelHubSearchStatus("Searching Hugging Face for GGUF repositories…");
+    setModelHubSearchStatus("Searching Hugging Face for model repositories…");
     try {
-      const response = await adminFetch("/models/search?q=" + encodeURIComponent(text) + "&limit=12", { signal: controller.signal });
+      const response = await adminFetch("/models/search?q=" + encodeURIComponent(text) + "&limit=12&task=" + encodeURIComponent(modelHubSearchTaskEl.value) + "&format=" + encodeURIComponent(modelHubSearchFormatEl.value), { signal: controller.signal });
       if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
       const data = await response.json();
       if (sequence !== modelHubSearchSequence) return;
@@ -3931,10 +3964,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       copy.className = "model-download-variant-copy";
       const quant = document.createElement("span");
       quant.className = "model-download-variant-quant";
-      quant.textContent = variant.quant || "unknown";
+      quant.textContent = (variant.quant || "unknown") + (variant.role === "projector" ? " · Vision projector" : "");
       const meta = document.createElement("span");
       meta.className = "model-download-variant-meta";
-      meta.textContent = formatDownloadSize(variant.size_bytes) + (variant.shards > 1 ? " · " + variant.shards + " shards" : "");
+      meta.textContent = (variant.file ? variant.file + " · " : "") + formatDownloadSize(variant.size_bytes) + (variant.shards > 1 ? " · " + variant.shards + " shards" : "");
       copy.append(quant, meta);
       const action = document.createElement("button");
       action.type = "button";
@@ -3979,7 +4012,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     modelDownloadVariantsEl.querySelectorAll("button").forEach((button) => { button.disabled = disabled; });
   }
 
-  async function startModelDownload(selector) {
+  async function startModelDownload(selector, files) {
     if (modelDownloadBusy) return;
     modelDownloadBusy = true;
     modelDownloadController = new AbortController();
@@ -3993,7 +4026,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: modelDownloadController.signal,
-        body: JSON.stringify({ ref: selector })
+        body: JSON.stringify({ ref: selector, files })
       });
       if (!response.ok) throw new Error((await response.text()) || "HTTP " + response.status);
       let finalEvent = null;
@@ -4015,7 +4048,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         }
       });
       if (!finalEvent) throw new Error("Download ended unexpectedly");
-      setModelDownloadStatus("Downloaded " + (finalEvent.file || selector) + ". It's now in the local model library.", "success");
+      setModelDownloadStatus("Downloaded " + (finalEvent.file || selector) + (finalEvent.artifacts ? ". Saved in the Hugging Face cache; not automatically loaded." : ". It's now in the local model library."), "success");
       showToast("Model downloaded.", "success");
       modelDownloadVariantsEl.hidden = true;
       modelDownloadVariantsEl.replaceChildren();
@@ -5217,6 +5250,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     filterModelOptions();
     save();
   });
+  modelHubSearchFormatEl.addEventListener("change", () => { cancelModelHubSearch(); clearModelHubSearchResults(); modelDownloadVariantsEl.hidden = true; if (modelHubSearchQueryEl.value.trim()) searchModelHub(modelHubSearchQueryEl.value); });
+  modelHubSearchTaskEl.addEventListener("change", () => { cancelModelHubSearch(); clearModelHubSearchResults(); if (modelHubSearchQueryEl.value.trim()) searchModelHub(modelHubSearchQueryEl.value); });
   modelHubSearchFormEl.addEventListener("submit", (event) => {
     event.preventDefault();
     if (modelHubSearchTimer) {
@@ -5233,7 +5268,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const query = modelHubSearchQueryEl.value.trim();
     if (query.length < 2) {
       clearModelHubSearchResults();
-      setModelHubSearchStatus(query ? "Keep typing to search the Hub." : "Enter a model name to search GGUF repositories.");
+      setModelHubSearchStatus(query ? "Keep typing to search the Hub." : "Enter a model name to search model repositories.");
       return;
     }
     modelHubSearchTimer = setTimeout(() => {
