@@ -102,10 +102,10 @@ func detectAMXINT8() bool {
 		return false
 	}
 	const (
-		amxTileBit  = 1 << 24 // CPUID.7:EDX.AMX-TILE
-		amxInt8Bit  = 1 << 25 // CPUID.7:EDX.AMX-INT8
-		amxBf16Bit  = 1 << 22 // CPUID.7:EDX.AMX-BF16
-		amxEnabled  = 1 << 18 // XCR0.TILECFG | TILEDATA (bits 17-18)
+		amxTileBit = 1 << 24 // CPUID.7:EDX.AMX-TILE
+		amxInt8Bit = 1 << 25 // CPUID.7:EDX.AMX-INT8
+		amxBf16Bit = 1 << 22 // CPUID.7:EDX.AMX-BF16
+		amxEnabled = 1 << 18 // XCR0.TILECFG | TILEDATA (bits 17-18)
 	)
 	_, _, _, edx7 := cpuid(7, 0)
 	if edx7&(amxTileBit|amxInt8Bit) != (amxTileBit | amxInt8Bit) {
