@@ -50,6 +50,23 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	if info, ok := tensorIdx["rope_factors_short.weight"]; ok {
 		config.RopeFactorsShort = loadOptionalF32Vec(data, gguf.DataOffset, "rope_factors_short.weight", tensorIdx, inferred, info.Numel())
 	}
+	// Llama 3 checkpoints encode frequency scaling in a tensor rather than
+	// metadata. Ignoring it changes attention even at short context lengths.
+	if _, ok := tensorIdx["rope_freqs.weight"]; ok && len(config.RopeFactorsShort) == 0 {
+		factors, err := loadF32Vec(data, gguf.DataOffset, "rope_freqs.weight", tensorIdx, inferred)
+		if err != nil {
+			return config, ModelWeights{}, err
+		}
+		if len(factors) != config.RopeDimensionCount/2 {
+			return config, ModelWeights{}, fmt.Errorf("rope_freqs.weight: expected %d factors, got %d", config.RopeDimensionCount/2, len(factors))
+		}
+		for _, factor := range factors {
+			if !finite32(factor) || factor <= 0 {
+				return config, ModelWeights{}, fmt.Errorf("rope_freqs.weight: factors must be finite and positive")
+			}
+		}
+		config.RopeFactorsShort = factors
+	}
 
 	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
 	if err != nil {

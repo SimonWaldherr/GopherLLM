@@ -343,3 +343,27 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
  memcpy(residual,[d->x contents],d->dim*sizeof(float));memcpy(output,[d->xn contents],d->dim*sizeof(float));return true;
  }
 }
+
+// Bounded attention projections reuse the prepared decoder weights and the
+// serialized prefill workspace. CPU RoPE/attention keep the public KV authoritative.
+static bool gllm_decode_project(void* ptr,int layer,int matrix,const float* x,float* out,int batch) {
+ @autoreleasepool {
+ GLLMDecoder* d=ptr;
+ if(d==NULL || layer<0 || layer>=d->layers || matrix<0 || matrix>3 || batch<16 || batch>256)return false;
+ GLLMDecodeLayer* l=&d->layer[layer];GLLMMetalWeight* w=l->w[matrix];
+ @synchronized(gllm_queue) {
+  NSUInteger inBytes=(NSUInteger)batch*w->cols*sizeof(float),outBytes=(NSUInteger)batch*w->rows*sizeof(float);
+  if(!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x,inBytes) || !gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.out,outBytes))return false;
+  memcpy([gllm_batch_workspace.x contents],x,inBytes);
+  id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();
+  id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+  if(l->quant[matrix]==4)gllm_metal_encode_q4k_to(e,w,gllm_batch_workspace.x,gllm_batch_workspace.out,batch,4);
+  else if(l->quant[matrix]==6)gllm_metal_encode_q6k_to(e,w,gllm_batch_workspace.x,gllm_batch_workspace.out,batch,4);
+  else gllm_metal_encode_q8_0_to(e,w,gllm_batch_workspace.x,gllm_batch_workspace.out,batch);
+  [e endEncoding];[cb commit];[cb waitUntilCompleted];
+  bool ok=[cb status]==MTLCommandBufferStatusCompleted;
+  if(ok)memcpy(out,[gllm_batch_workspace.out contents],outBytes);
+  return ok;
+ }
+ }
+}

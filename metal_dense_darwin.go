@@ -44,7 +44,7 @@ func (s *metalDenseState) close() {
 
 func metalDenseEligible(c Config, w ModelWeights, k *KVCache) bool {
 	if !metalDenseDecodeEnabled || k == nil || k.F16 || k.I8 || k.MaxLen > 4096 || k.MaxLen <= 0 ||
-		(c.Arch != "mistral3" && c.Arch != "ministral" && c.Arch != "qwen3") ||
+		(c.Arch != "mistral3" && c.Arch != "ministral" && c.Arch != "qwen3" && c.Arch != "llama") ||
 		c.SWAPattern != nil || c.HeadDim != 128 || c.ValueDim != 128 || c.RopeDimensionCount != 128 || c.RopeThetaSWA != 0 ||
 		c.UseLayerNorm || c.ParallelResidual || c.UseGELU || c.UsesMLA || c.AttnLogitSoftcap != 0 ||
 		c.ResidualScale != 1 || c.usesAbsolutePositionEmbd() || c.usesALiBi() ||
@@ -163,37 +163,11 @@ func tryMetalDenseGreedy(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, 
 }
 
 func tryMetalDenseStep(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, token uint32, pos int, logits *[]float32, recent []uint32, penalty float32, next *uint32) bool {
-	if b == nil {
+	s := metalDenseFor(c, w, k, b)
+	if s == nil || pos < 0 || pos >= k.MaxLen {
 		return false
 	}
-	if !metalDenseEligible(c, w, k) {
-		if b.metalDense != nil {
-			b.metalDense.close()
-			b.metalDense = nil
-		}
-		return false
-	}
-	if pos < 0 || pos >= k.MaxLen {
-		return false
-	}
-	s := b.metalDense
-	if s != nil && !s.matchesCache(k) {
-		s.close()
-		b.metalDense = nil
-		s = nil
-	}
-	if s != nil && (s.owner != &w.Layers[0] || s.cache != k || s.dim != c.Dim || s.hidden != c.HiddenDim || s.heads != c.NHeads || s.kvheads != c.NKVHeads || s.layers != c.NLayers || s.window != c.SlidingWindow || s.eps != c.RMSNormEps || s.scale != c.AttentionScale) {
-		s.close()
-		b.metalDense = nil
-		s = nil
-	}
-	if s == nil {
-		s = newMetalDenseState(c, w, k)
-		if s == nil {
-			return false
-		}
-		b.metalDense = s
-	}
+
 	if logits != nil || next != nil {
 		if w.Output.F32 != nil || w.Output.Metal == nil || w.Output.Cols != c.Dim || w.Output.Rows != c.VocabSize {
 			return false
@@ -297,4 +271,49 @@ func (s *metalDenseState) matchesCache(k *KVCache) bool {
 		}
 	}
 	return true
+}
+
+func metalDenseFor(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) *metalDenseState {
+	if b == nil {
+		return nil
+	}
+	if !metalDenseEligible(c, w, k) {
+		if b.metalDense != nil {
+			b.metalDense.close()
+			b.metalDense = nil
+		}
+		return nil
+	}
+	s := b.metalDense
+	if s != nil && !s.matchesCache(k) {
+		s.close()
+		b.metalDense = nil
+		s = nil
+	}
+	if s != nil && (s.owner != &w.Layers[0] || s.cache != k || s.dim != c.Dim || s.hidden != c.HiddenDim || s.heads != c.NHeads || s.kvheads != c.NKVHeads || s.layers != c.NLayers || s.window != c.SlidingWindow || s.eps != c.RMSNormEps || s.scale != c.AttentionScale) {
+		s.close()
+		b.metalDense = nil
+		s = nil
+	}
+	if s == nil {
+		s = newMetalDenseState(c, w, k)
+		if s == nil {
+			return nil
+		}
+		b.metalDense = s
+	}
+	return s
+}
+
+func prepareMetalDenseBatch(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, batch int) bool {
+	return batch >= 16 && batch <= metalBatchFFNMaxTokens && os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" && metalDenseFor(c, w, k, b) != nil
+}
+func metalDenseBatchProjection(b *DecodeBuffer, layer, matrix int, x, out []float32, batch int) bool {
+	if b == nil || b.metalDense == nil {
+		return false
+	}
+	s := b.metalDense
+	ok := s.decoder.Project(layer, matrix, x, out, batch)
+	runtime.KeepAlive(s) // The state owns/pins the decoder's borrowed weights and KV.
+	return ok
 }

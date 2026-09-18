@@ -1782,3 +1782,23 @@ func GemmaOutput(w *Weight, quant uint32, x, out []float32, recent []uint32, pen
 	runtime.KeepAlive(w)
 	return ok
 }
+
+// Project computes one dense attention projection for a bounded contiguous batch.
+func (d *Decoder) Project(layer, matrix int, x, out []float32, batch int) bool {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || matrix < 0 || matrix > 3 || batch < 16 || batch > 256 {
+		return false
+	}
+	cols, rows := d.dim, d.heads*128
+	if matrix == 1 || matrix == 2 {
+		rows = d.kvheads * 128
+	}
+	if matrix == 3 {
+		cols, rows = d.heads*128, d.dim
+	}
+	if batch > len(x)/cols || batch > len(out)/rows {
+		return false
+	}
+	ok := bool(C.gllm_decode_project(d.ptr, C.int(layer), C.int(matrix), (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])), C.int(batch)))
+	runtime.KeepAlive(d)
+	return ok
+}

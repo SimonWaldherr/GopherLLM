@@ -3,9 +3,11 @@
 package gopherllm
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"testing"
 	"time"
@@ -49,16 +51,29 @@ func TestMetalFixedDecodeBenchmark(t *testing.T) {
 	if metalDenseDecodeEnabled && buf.metalDense == nil {
 		t.Fatalf("dense decoder was not active: %s config=%+v", MetalError(), c)
 	}
-	ForwardBatchInto(c, r.standard, cache, buf, tokens[:160], 0, true, &logits)
-	start := time.Now()
-	for i := 160; i < 224; i++ {
-		ForwardInto(c, r.standard, cache, buf, tokens[i], i, &logits)
+	for repeat := 0; repeat < 3; repeat++ {
+		start := time.Now()
+		ForwardBatchInto(c, r.standard, cache, buf, tokens[:160], 0, true, &logits)
+		prefill := time.Since(start).Seconds()
+		start = time.Now()
+		for i := 160; i < 224; i++ {
+			ForwardInto(c, r.standard, cache, buf, tokens[i], i, &logits)
+		}
+		elapsed := time.Since(start).Seconds()
+		if len(logits) == 0 || !finite32(logits[0]) {
+			t.Fatal("invalid logits")
+		}
+		report := map[string]any{"engine": "GopherLLM", "repetition": repeat, "dense": metalDenseDecodeEnabled, "depth": 160, "steps": 64, "threads": 8, "kv": "f32", "seed": 1, "vocab": c.VocabSize, "seconds": elapsed, "prefill_seconds": prefill, "tokens_per_second": 64 / elapsed, "first_logit": logits[0]}
+		raw, _ := json.Marshal(report)
+		fmt.Println("FIXED_DECODE_JSON " + string(raw))
 	}
-	elapsed := time.Since(start).Seconds()
-	if len(logits) == 0 || !finite32(logits[0]) {
-		t.Fatal("invalid logits")
+	if output := os.Getenv("GOPHERLLM_FIXED_LOGITS"); output != "" {
+		raw := make([]byte, len(logits)*4)
+		for i, value := range logits {
+			binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(value))
+		}
+		if err := os.WriteFile(output, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	report := map[string]any{"engine": "GopherLLM", "dense": metalDenseDecodeEnabled, "depth": 160, "steps": 64, "threads": 8, "kv": "f32", "seed": 1, "vocab": c.VocabSize, "seconds": elapsed, "tokens_per_second": 64 / elapsed, "first_logit": logits[0]}
-	raw, _ := json.Marshal(report)
-	fmt.Println("FIXED_DECODE_JSON " + string(raw))
 }

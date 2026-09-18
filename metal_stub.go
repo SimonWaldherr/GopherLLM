@@ -86,3 +86,6 @@ func matvecMetalGemmaOutputInto(w Weight, x []float32, out *[]float32) bool { re
 func argmaxMetalGemmaOutput(w Weight, x []float32, recent []uint32, penalty float32) (uint32, bool) {
 	return 0, false
 }
+
+func prepareMetalDenseBatch(Config, ModelWeights, *KVCache, *DecodeBuffer, int) bool    { return false }
+func metalDenseBatchProjection(*DecodeBuffer, int, int, []float32, []float32, int) bool { return false }

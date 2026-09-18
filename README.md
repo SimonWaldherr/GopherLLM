@@ -2,10 +2,17 @@
 
 [![DOI](https://zenodo.org/badge/1264366305.svg)](https://doi.org/10.5281/zenodo.21197831)
 
-GopherLLM is a local GGUF inference engine written in Go. It loads and runs models
+**GopherLLM has its own inference engine, written in Go with its own
+architecture-specific assembly kernels.** It loads and runs GGUF models
 directly in the calling process, with no external runtime or child process
 required. The Go package and CLI cover generation, streaming chat, embeddings,
 tokenization, model inspection, compression, and benchmarks.
+
+**GopherLLM is closer to llama.cpp in scope than to LM Studio or Ollama:**
+the core of the project is the inference engine itself, exposed as an embeddable
+library and CLI. Its chat UI, server, and model-management features build on
+that engine. The comparison describes its role, not a dependency on llama.cpp
+or a claim of feature or performance parity.
 
 It is an independent implementation. GopherLLM does not wrap, bind to, or link
 against llama.cpp or any other inference library: the GGUF parser, the
@@ -77,12 +84,15 @@ covers and how to turn things on.
 - Chain-of-thought extraction (`<think>` blocks, gpt-oss channels) into a
   separate `reasoning_content` field instead of leaving it in the answer text.
 - CLI generation, REPL mode, embeddings, metadata inspection, and tensor listing.
-- Model discovery across the complete local LM Studio model library.
+- Model discovery across the complete local LM Studio model library; discovered
+  GGUFs run through GopherLLM's own inference engine.
 - Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
   private/gated-model tokens, and revision selection.
 - `--compress`: requantize any GGUF to Q8_0/Q4_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
+- Native YOLOv8 image preparation and detection-head decoding (bounding-box
+  remapping and class-aware NMS), without an ONNX or other third-party runtime.
 
 ## Requirements
 
@@ -92,6 +102,9 @@ covers and how to turn things on.
 ```sh
 ~/.cache/lm-studio/models
 ```
+
+This is only a default location for model files. LM Studio and Ollama are not
+required; GopherLLM loads the GGUF files and performs inference itself.
 
 That default is resolved in this order: the `--model-dir <path>` flag (highest
 priority), then the `GOPHERLLM_MODEL_DIR` environment variable (with

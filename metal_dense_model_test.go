@@ -50,6 +50,26 @@ func TestMetalDenseModelParity(t *testing.T) {
 			gb.metalDense.close()
 		}
 	}()
+	// Exercise real checkpoint prefill, rewind and CPU/GPU cache equivalence.
+	tokens := make([]uint32, 32)
+	for i := range tokens {
+		tokens[i] = uint32(i+3) % uint32(c.VocabSize)
+	}
+	var batchWant, batchGot []float32
+	ForwardBatchInto(c, cpu, ck, cb, tokens, 0, true, &batchWant)
+	ForwardBatchInto(c, r.standard, gk, gb, tokens, 0, true, &batchGot)
+	var batchError, batchNorm float64
+	for i, v := range batchWant {
+		d := float64(batchGot[i] - v)
+		batchError += d * d
+		batchNorm += float64(v) * float64(v)
+	}
+	relativeBatch := math.Sqrt(batchError / math.Max(batchNorm, 1e-30))
+	t.Logf("prefill relative logit L2 error %.6g", relativeBatch)
+	if relativeBatch > 0.002 {
+		t.Fatalf("prefill mismatch: %g", relativeBatch)
+	}
+
 	var want, got []float32
 	state := uint32(1)
 	for pos := 0; pos < 5; pos++ {

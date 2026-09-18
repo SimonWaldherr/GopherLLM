@@ -29,7 +29,7 @@ func testMetalDenseDecodeParity(t *testing.T) {
 	old := metalDenseDecodeEnabled
 	metalDenseDecodeEnabled = true
 	t.Cleanup(func() { metalDenseDecodeEnabled = old })
-	for _, arch := range []string{"ministral", "qwen3"} {
+	for _, arch := range []string{"ministral", "qwen3", "llama"} {
 		t.Run(arch, func(t *testing.T) {
 			const dim, hidden, heads, kvheads, maxlen = 256, 8192, 4, 1, 161
 			rng := rand.New(rand.NewSource(982))
@@ -132,6 +132,15 @@ func testMetalDenseDecodeParity(t *testing.T) {
 					gpuBuf.metalDense.close()
 				}
 			}()
+			// Non-tile-aligned prefill followed by rewound single-token decode.
+			tokens := make([]uint32, 17)
+			for i := range tokens {
+				tokens[i] = uint32(i % 4)
+			}
+			var batchWant, batchGot []float32
+			ForwardBatchInto(c, w, cpuCache, cpuBuf, tokens, 0, true, &batchWant)
+			ForwardBatchInto(c, gpu, gpuCache, gpuBuf, tokens, 0, true, &batchGot)
+			assertMetalFiniteClose(t, batchGot, batchWant)
 			check := func(pos int) {
 				ForwardBodyInto(c, w, cpuCache, cpuBuf, uint32(pos%4), pos)
 				if !tryMetalDenseDecode(c, gpu, gpuCache, gpuBuf, uint32(pos%4), pos) {

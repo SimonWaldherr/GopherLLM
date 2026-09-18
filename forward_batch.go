@@ -572,6 +572,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	if config.Arch == "phi2" {
 		qScale, scale = scale, 1
 	}
+	denseBatch := prepareMetalDenseBatch(config, weights, cache, buf, p)
 	for l := 0; l < config.NLayers; l++ {
 		layer := weights.Layers[l]
 		for t := 0; t < p; t++ {
@@ -591,7 +592,10 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				copy(V[t], QKV[t][qLen+kLen:qLen+kLen+vLen])
 			}
 		} else {
-			matvecBatch3(layer.WQ, layer.WK, layer.WV, XN, Q, K, V)
+			if !denseBatch || !metalDenseBatchProjection(buf, l, 0, b.XNFlat, b.QFlat, p) ||
+				!metalDenseBatchProjection(buf, l, 1, b.XNFlat, b.KFlat, p) || !metalDenseBatchProjection(buf, l, 2, b.XNFlat, b.VFlat, p) {
+				matvecBatch3(layer.WQ, layer.WK, layer.WV, XN, Q, K, V)
+			}
 		}
 
 		// RoPE + KV cache write are sequential: RoPE reuses shared sin/cos
@@ -638,7 +642,9 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		*attendTask = batchAttentionTask{}
 		batchAttentionTaskPool.Put(attendTask)
 
-		matvecBatch(layer.WO, AttnOut, Proj)
+		if !denseBatch || !metalDenseBatchProjection(buf, l, 3, b.AttnOutFlat, b.ProjFlat, p) {
+			matvecBatch(layer.WO, AttnOut, Proj)
+		}
 		for t := 0; t < p; t++ {
 			addInPlace(Proj[t], layer.BO)
 			if layer.PostAttnNorm != nil {

@@ -193,3 +193,32 @@ func TestEmbedTinyModel(t *testing.T) {
 		t.Fatalf("embedding norm = %v, want ~1", norm)
 	}
 }
+
+func TestLoadStandardRopeFrequencyTensor(t *testing.T) {
+	for _, factors := range [][]float32{{1, 8}, {1}, {1, 0}, {1, float32(math.NaN())}} {
+		data := buildTinyLlamaGGUF()
+		gguf, err := ParseGGUFQuiet(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gguf.Tensors = append(gguf.Tensors, TensorInfo{Name: "rope_freqs.weight", Dims: []uint64{uint64(len(factors))}, DType: GGMLTypeF32, Offset: uint64(len(data) - gguf.DataOffset)})
+		data = append(data, f32Bytes(factors)...)
+		r, err := runnerFromParsedGGUF(data, gguf, false, LoadOptions{})
+		valid := len(factors) == 2 && factors[1] == 8
+		if !valid {
+			if err == nil {
+				r.Close()
+				t.Fatalf("accepted invalid factors %v", factors)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		inv, _ := buildRopeInvFreq(r.config, r.config.HeadDim)
+		if len(inv) != 2 || math.Abs(float64(inv[1]-0.00125)) > 1e-8 {
+			t.Fatalf("frequency factors ignored: %v", inv)
+		}
+		r.Close()
+	}
+}
