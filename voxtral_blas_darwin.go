@@ -64,7 +64,11 @@ func voxtralMatvecBatch(w Weight, xs, outs [][]float32) {
 	}
 }
 
-func voxtralAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, dim, past, window int, scale float32) bool {
+// stride is the per-head element stride within k/v; the caller may keep k/v
+// allocated to a larger, stable per-head capacity across calls than the
+// current valid position count (past+len(q)) so a persistent streaming
+// cache can just write its new rows in, instead of repacking on every call.
+func voxtralAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, dim, past, window, stride int, scale float32) bool {
 	n, total, width := len(q), past+len(q), heads*dim
 	if n == 0 {
 		return true
@@ -78,7 +82,7 @@ func voxtralAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads
 	for t := range q {
 		copy(queries[t*width:], q[t])
 	}
-	voxtralblas.Attention(n, total, heads, dim, past, window, scale, queries, k, v, b.scores, output)
+	voxtralblas.Attention(n, total, heads, dim, past, window, stride, scale, queries, k, v, b.scores, output)
 	for t := range out {
 		copy(out[t], output[t*width:(t+1)*width])
 	}

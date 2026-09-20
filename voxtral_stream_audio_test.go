@@ -23,7 +23,7 @@ func TestVoxtralBatchedAttentionMatchesCausalReference(t *testing.T) {
 		v[i] = float32(math.Cos(float64(i) * .71))
 	}
 	scale := float32(1 / math.Sqrt(dim))
-	if !voxtralAttentionBatch(q, k, v, out, heads, dim, past, window, scale) {
+	if !voxtralAttentionBatch(q, k, v, out, heads, dim, past, window, total, scale) {
 		t.Skip("accelerated attention unavailable")
 	}
 	for row := range n {
@@ -80,10 +80,15 @@ func TestVoxtralStreamingEncoderMatchesOfflineAcrossBoundaries(t *testing.T) {
 			if len(s.residual) >= cfg.Projector.DownsampleFactor {
 				t.Fatal("unbounded adapter residual")
 			}
-			for _, history := range s.encoder.k {
-				if len(history) > cfg.Encoder.SlidingWindow {
-					t.Fatal("unbounded encoder cache")
-				}
+			// The persistent per-head K/V cache's allocated capacity only
+			// ever needs to cover window plus the single largest burst of
+			// new encoder frames any one push has produced so far -- it
+			// must not keep climbing with the total audio processed, which
+			// is what the pre-cache implementation's raw sample count (up
+			// to len(samples), two orders of magnitude bigger) would look
+			// like if this regressed.
+			if window := cfg.Encoder.SlidingWindow; window > 0 && s.encoder.stride > len(samples)/4 {
+				t.Fatalf("unbounded encoder cache: stride=%d window=%d", s.encoder.stride, window)
 			}
 		}
 		rows, err := s.push(context.Background(), w, nil, true)

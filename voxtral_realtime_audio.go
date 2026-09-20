@@ -272,18 +272,62 @@ func EncodeAudioVoxtralRealtimeContext(ctx context.Context, cfg VoxtralRealtimeC
 
 // A nil state evaluates an offline clip; a state retains only the causal
 // attention window, with absolute positions independent of cache eviction.
+//
+// kHead/vHead are per-layer, head-major K/V caches (each heads*stride*headDim
+// floats; only the first `total` positions per head are valid at any time).
+// stride is the currently allocated per-head capacity, grown -- with a
+// one-time per-head reshuffle via growVoxtralHeadBuffer -- only when a chunk
+// needs more room than it already has. A stable streaming chunk size (the
+// common case) settles the stride once and then only ever writes the new
+// rows for that push and, once the window is full, shifts each head's
+// region left in one bulk copy; it does not repack the whole window's worth
+// of already-cached positions on every push the way rebuilding a flat
+// buffer from a row-major history would.
 type voxtralEncoderState struct {
-	pos  int
-	k, v [][][]float32
+	pos          int
+	kHead, vHead [][]float32
+	stride       int
+}
+
+// growVoxtralHeadBuffer enlarges a per-layer head-major K/V buffer from
+// oldStride to newStride per-head capacity, preserving each head's first
+// validLen positions at their new offset. A plain slice append cannot do
+// this: growing the per-head stride moves where every head after the first
+// begins, since each head's region is stride*headDim floats apart.
+func growVoxtralHeadBuffer(buf *[]float32, heads, headDim, oldStride, newStride, validLen int) {
+	grown := make([]float32, heads*newStride*headDim)
+	if oldStride > 0 && validLen > 0 {
+		for hh := range heads {
+			src := (*buf)[hh*oldStride*headDim : hh*oldStride*headDim+validLen*headDim]
+			dst := grown[hh*newStride*headDim : hh*newStride*headDim+validLen*headDim]
+			copy(dst, src)
+		}
+	}
+	*buf = grown
+}
+
+// evictVoxtralHeadBuffer keeps only the most recent window positions per
+// head, shifting each head's region left by the evicted amount with one
+// bulk copy (Go's copy is memmove-safe for overlapping ranges) instead of
+// appendVoxtralHistory's per-row shift-and-recycle.
+func evictVoxtralHeadBuffer(buf []float32, heads, headDim, stride, total, window int) {
+	if window <= 0 || total <= window {
+		return
+	}
+	evict := total - window
+	for hh := range heads {
+		base := hh * stride * headDim
+		copy(buf[base:base+window*headDim], buf[base+evict*headDim:base+total*headDim])
+	}
 }
 
 func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, h []float32, hLen int, state *voxtralEncoderState) ([][]float32, error) {
 	startPos := 0
 	if state != nil {
 		startPos = state.pos
-		if state.k == nil {
-			state.k = make([][][]float32, len(weights.Encoder.Layers))
-			state.v = make([][][]float32, len(weights.Encoder.Layers))
+		if state.kHead == nil {
+			state.kHead = make([][]float32, len(weights.Encoder.Layers))
+			state.vHead = make([][]float32, len(weights.Encoder.Layers))
 		}
 	}
 
@@ -359,7 +403,32 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 	}
 
 	window := cfg.Encoder.SlidingWindow
-	var kHead, vHead, scores []float32
+	var scores []float32
+	var kHeadScratch, vHeadScratch []float32 // offline (state == nil) path only
+
+	// past/total/stride are identical for every layer (all layers see the
+	// same new frames and the same window), so resolve and, rarely, grow
+	// every layer's persistent buffer once here rather than per layer.
+	past := 0
+	if state != nil {
+		if window > 0 {
+			past = min(state.pos, window)
+		} else {
+			past = state.pos
+		}
+	}
+	total := past + n
+	if state != nil && total > state.stride {
+		for li := range state.kHead {
+			growVoxtralHeadBuffer(&state.kHead[li], heads, headDim, state.stride, total, past)
+			growVoxtralHeadBuffer(&state.vHead[li], heads, headDim, state.stride, total, past)
+		}
+		state.stride = total
+	}
+	stride := total
+	if state != nil {
+		stride = state.stride
+	}
 
 	for li := range weights.Encoder.Layers {
 		if err := ctx.Err(); err != nil {
@@ -394,27 +463,27 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			}
 		}
 
-		allK, allV := k, v
-		past := 0
+		var kHead, vHead []float32
 		if state != nil {
-			past = len(state.k[li])
-			allK = append(append([][]float32(nil), state.k[li]...), k...)
-			allV = append(append([][]float32(nil), state.v[li]...), v...)
+			kHead, vHead = state.kHead[li], state.vHead[li]
+		} else {
+			ensureLenNoClear(&kHeadScratch, heads*total*headDim)
+			ensureLenNoClear(&vHeadScratch, heads*total*headDim)
+			kHead, vHead = kHeadScratch, vHeadScratch
 		}
-		total := past + n
-		ensureLenNoClear(&kHead, heads*total*headDim)
-		ensureLenNoClear(&vHead, heads*total*headDim)
-		for j := range total {
-			kj, vj := allK[j], allV[j]
+		// Only the new n rows need writing: any earlier [0,past) positions
+		// are already in place from a previous push (or, offline, past==0).
+		for t := range n {
+			kt, vt := k[t], v[t]
 			for hh := range heads {
 				off := hh * headDim
-				base := hh*total*headDim + j*headDim
-				copy(kHead[base:base+headDim], kj[off:off+headDim])
-				copy(vHead[base:base+headDim], vj[off:off+headDim])
+				base := hh*stride*headDim + (past+t)*headDim
+				copy(kHead[base:base+headDim], kt[off:off+headDim])
+				copy(vHead[base:base+headDim], vt[off:off+headDim])
 			}
 		}
 
-		if !voxtralAttentionBatch(q, kHead, vHead, attnOut, heads, headDim, past, window, scale) {
+		if !voxtralAttentionBatch(q, kHead, vHead, attnOut, heads, headDim, past, window, stride, scale) {
 			ensureLenNoClear(&scores, total)
 			for t := range n {
 				if err := ctx.Err(); err != nil {
@@ -428,8 +497,8 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 				for hh := range heads {
 					off := hh * headDim
 					query := q[t][off : off+headDim]
-					kh := kHead[hh*total*headDim : (hh+1)*total*headDim]
-					vh := vHead[hh*total*headDim : (hh+1)*total*headDim]
+					kh := kHead[hh*stride*headDim : hh*stride*headDim+total*headDim]
+					vh := vHead[hh*stride*headDim : hh*stride*headDim+total*headDim]
 					maxScore := negMaxF32
 					for j := lo; j <= end; j++ {
 						s := DotF32(query, kh[j*headDim:(j+1)*headDim]) * scale
@@ -453,10 +522,8 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			}
 		}
 		if state != nil {
-			for t := range n {
-				appendVoxtralHistory(&state.k[li], k[t], window)
-				appendVoxtralHistory(&state.v[li], v[t], window)
-			}
+			evictVoxtralHeadBuffer(kHead, heads, headDim, stride, total, window)
+			evictVoxtralHeadBuffer(vHead, heads, headDim, stride, total, window)
 		}
 		voxtralMatvecBatch(layer.Out, attnOut, outProj)
 		for t := range n {
