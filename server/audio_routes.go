@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
 const transcriptionMaxSeconds = 30
@@ -33,6 +35,75 @@ type realtimeTranscriber interface {
 }
 
 type realtimeFactory func(context.Context, string) (realtimeTranscriber, error)
+
+// voxtralModelCache keeps the most recently used Voxtral model resident
+// across requests instead of reloading its encoder+decoder weights (and, on
+// a Metal build, re-uploading and fully re-dequantizing the encoder) on
+// every single recording or live session. Only one model is kept, matching
+// the "one transcription at a time" limit the routes below already enforce
+// with their own semaphores; a request for a different model path evicts and
+// replaces it. The zero value is ready to use.
+type voxtralModelCache struct {
+	mu    sync.Mutex
+	path  string
+	model *gopherllm.VoxtralModel
+}
+
+func (c *voxtralModelCache) open(ctx context.Context, path string, logw io.Writer) (*gopherllm.VoxtralModel, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.model != nil && c.path == path {
+		return c.model, nil
+	}
+	stale := c.model
+	c.model, c.path = nil, ""
+	if stale != nil {
+		_ = stale.Close()
+	}
+	model, err := gopherllm.OpenVoxtral(ctx, path, gopherllm.WithVoxtralLogWriter(logw))
+	if err != nil {
+		return nil, err
+	}
+	c.model, c.path = model, path
+	return model, nil
+}
+
+// transcribe adapts the cache to transcriptionFunc for the one-shot endpoint.
+// extraSteps is accepted for interface compatibility; the server always
+// passes 0 today, same as before this cache existed.
+func (c *voxtralModelCache) transcribe(ctx context.Context, path string, samples []float32, extraSteps int, logw io.Writer) (string, error) {
+	model, err := c.open(ctx, path, logw)
+	if err != nil {
+		return "", err
+	}
+	return model.TranscribeOffline(ctx, samples, extraSteps, logw)
+}
+
+// newSession opens (or reuses) the cached model and starts a live session on
+// it. logw is accepted separately from realtimeFactory's signature so the
+// production wiring in server.go can still surface load progress on the
+// server's real log writer, matching the pre-caching behavior.
+func (c *voxtralModelCache) newSession(ctx context.Context, path string, logw io.Writer) (realtimeTranscriber, error) {
+	model, err := c.open(ctx, path, logw)
+	if err != nil {
+		return nil, err
+	}
+	session, err := model.NewSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// closeAll releases the cached model, if any. Call during server shutdown.
+func (c *voxtralModelCache) closeAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.model != nil {
+		_ = c.model.Close()
+		c.model, c.path = nil, ""
+	}
+}
 
 // Audio uses a separate catalog selection and never replaces the chat runner.
 // One transcription at a time bounds the offline encoder's working memory.

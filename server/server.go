@@ -307,9 +307,17 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	registerChatWorkspaceRoutes(mux, history)
 	registerOpenAIRoutes(mux, state, embedder, sem, opts, skills, skillsFor, agenticToolsFor, logw)
 	registerOllamaRoutes(mux, state, embedder, sem, opts, skills, agenticToolsFor, logw)
-	audioClose := registerAudioRoutesWithRealtime(mux, sem, opts, gopherllm.TranscribeVoxtralRealtime, func(ctx context.Context, path string) (realtimeTranscriber, error) {
-		return gopherllm.NewVoxtralRealtimeSessionContext(ctx, path, logw)
+	// Shared across the one-shot and realtime audio routes below so a loaded
+	// Voxtral model survives between requests instead of every recording or
+	// live session reloading its encoder+decoder from the GGUF from scratch.
+	voxtralCache := &voxtralModelCache{}
+	routesClose := registerAudioRoutesWithRealtime(mux, sem, opts, voxtralCache.transcribe, func(ctx context.Context, path string) (realtimeTranscriber, error) {
+		return voxtralCache.newSession(ctx, path, logw)
 	})
+	audioClose := func() {
+		routesClose()
+		voxtralCache.closeAll()
+	}
 	registerModelRoutes(mux, state, embedder, sem, opts, deployment, &modelLoadMu, logw)
 	if opts.Features.AutoTune {
 		registerAutoTuneRoutes(mux, state, sem, logw)

@@ -1409,6 +1409,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const modelSelectEl = $("modelSelect");
   const modelSearchEl = $("modelSearch");
   const modelLibraryEl = $("modelLibrary");
+  const modelLibraryTableWrapEl = $("modelLibraryTableWrap");
+  const modelLibraryTableBodyEl = $("modelLibraryTableBody");
+  const modelViewCardsEl = $("modelViewCards");
+  const modelViewTableEl = $("modelViewTable");
   const modelResultCountEl = $("modelResultCount");
   const modelShowUnsupportedEl = $("modelShowUnsupported");
   const modelHiddenCountEl = $("modelHiddenCount");
@@ -3508,6 +3512,59 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     }
   }
 
+  // The model library can switch between a card grid and a sortable table.
+  // The choice is a browser-local display preference, not a chat option, so
+  // it is stored the same way as UI_MODE_KEY rather than inside the saved
+  // chat.
+  const MODEL_VIEW_KEY = "gopherllm.model-view";
+
+  function storedModelView() {
+    try {
+      const stored = localStorage.getItem(MODEL_VIEW_KEY);
+      if (stored === "cards" || stored === "table") return stored;
+    } catch (error) {
+      /* Private windows and blocked site data both throw; cards is a fine default. */
+    }
+    return "cards";
+  }
+
+  let modelViewMode = storedModelView();
+  // Unsorted (null) keeps the catalog's own order in the table, matching the
+  // card grid, until the person actually asks for a sort.
+  let modelSortKey = null;
+  let modelSortDir = 1;
+
+  function applyModelView(mode) {
+    modelViewMode = mode === "table" ? "table" : "cards";
+    try {
+      localStorage.setItem(MODEL_VIEW_KEY, modelViewMode);
+    } catch (error) {
+      /* A view we cannot remember still applies to this tab. */
+    }
+    if (modelViewCardsEl) modelViewCardsEl.setAttribute("aria-pressed", String(modelViewMode === "cards"));
+    if (modelViewTableEl) modelViewTableEl.setAttribute("aria-pressed", String(modelViewMode === "table"));
+    if (modelLibraryEl) modelLibraryEl.hidden = modelViewMode !== "cards";
+    if (modelLibraryTableWrapEl) modelLibraryTableWrapEl.hidden = modelViewMode !== "table";
+  }
+
+  function setupModelView() {
+    applyModelView(modelViewMode);
+    if (modelViewCardsEl) modelViewCardsEl.addEventListener("click", () => applyModelView("cards"));
+    if (modelViewTableEl) modelViewTableEl.addEventListener("click", () => applyModelView("table"));
+    document.querySelectorAll(".model-table-sort").forEach((button) => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.sort;
+        if (modelSortKey === key) {
+          modelSortDir = -modelSortDir;
+        } else {
+          modelSortKey = key;
+          modelSortDir = 1;
+        }
+        renderModelLibrary();
+      });
+    });
+  }
+
   function modelContextLabel(value) {
     const n = Number(value) || 0;
     if (!n) return "";
@@ -3622,16 +3679,31 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     }, 650);
   }
 
-  function renderModelLibrary() {
-    const query = modelSearchEl.value.trim().toLowerCase();
-    const showUnsupported = modelShowUnsupportedEl.checked;
-    const chatModels = modelCatalog.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
-    const unsupportedHidden = chatModels.filter((model) => !model.supported && !showUnsupported).length;
-    const visible = chatModels.filter((model) => {
-      if (!showUnsupported && !model.supported) return false;
-      return !query || model.search.includes(query);
-    });
+  function modelStatusLabel(model) {
+    return loadingModelID === model.id ? "Loading" : model.loaded ? "Active" : !model.supported ? "Unsupported" : "Available";
+  }
 
+  // Shared by the card grid and the table's Status column/sort so the two
+  // views never disagree about what "active" or "loading" means.
+  function modelStatusRank(model) {
+    if (loadingModelID === model.id) return 2;
+    if (model.loaded) return 3;
+    if (!model.supported) return 0;
+    return 1;
+  }
+
+  function selectModelFromLibrary(id) {
+    if (!id) return;
+    const selected = modelCatalog.find((model) => model.id === id);
+    if (selected && selected.loaded) {
+      showToast("This model is already active.", "success");
+      return;
+    }
+    modelSelectEl.value = id;
+    modelSelectEl.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function renderModelCards(visible, query) {
     modelLibraryEl.replaceChildren();
     modelLibraryEl.setAttribute("aria-busy", "false");
     if (!visible.length) {
@@ -3680,6 +3752,126 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       card.append(name, state, meta, path);
       modelLibraryEl.appendChild(card);
     });
+  }
+
+  function sortedModels(visible) {
+    if (!modelSortKey) return visible;
+    const key = modelSortKey;
+    const dir = modelSortDir;
+    const value = (model) => {
+      switch (key) {
+        case "size_gb":
+        case "context_length":
+          return Number(model[key]) || 0;
+        case "reasoning":
+        case "vision":
+          return model[key] ? 1 : 0;
+        case "status":
+          return modelStatusRank(model);
+        case "architecture":
+          return (model.architecture || "").toLowerCase();
+        default:
+          return (model.name || model.id || "").toLowerCase();
+      }
+    };
+    return visible.slice().sort((a, b) => {
+      const av = value(a);
+      const bv = value(b);
+      if (av < bv) return -dir;
+      if (av > bv) return dir;
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    });
+  }
+
+  function updateModelTableSortIndicators() {
+    document.querySelectorAll(".model-table-sort").forEach((button) => {
+      const th = button.closest("th");
+      const active = button.dataset.sort === modelSortKey;
+      button.classList.toggle("is-active", active);
+      button.classList.toggle("is-desc", active && modelSortDir < 0);
+      if (th) th.setAttribute("aria-sort", active ? (modelSortDir < 0 ? "descending" : "ascending") : "none");
+    });
+  }
+
+  function renderModelTable(visible, query) {
+    if (!modelLibraryTableBodyEl) return;
+    updateModelTableSortIndicators();
+    modelLibraryTableBodyEl.replaceChildren();
+    if (!visible.length) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 7;
+      cell.className = "model-table-empty";
+      cell.textContent = query ? "No GGUF matches this search." : "No compatible chat model found.";
+      row.appendChild(cell);
+      modelLibraryTableBodyEl.appendChild(row);
+      return;
+    }
+    sortedModels(visible).forEach((model) => {
+      const row = document.createElement("tr");
+      row.className = "model-row";
+      row.dataset.model = model.id;
+      const disabled = !model.supported || loadingModel || busy || tuning;
+      row.dataset.disabled = String(disabled);
+      row.classList.toggle("is-loaded", Boolean(model.loaded));
+      row.classList.toggle("is-loading", loadingModelID === model.id);
+      row.classList.toggle("is-disabled", disabled);
+      row.tabIndex = disabled ? -1 : 0;
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", String(Boolean(model.loaded)));
+      row.title = !model.supported ? "This GGUF architecture is not supported for chat." : "Load " + (model.name || model.id);
+
+      const name = document.createElement("td");
+      name.className = "model-table-name";
+      name.textContent = model.name || model.id;
+      name.title = model.id;
+
+      const arch = document.createElement("td");
+      arch.textContent = model.architecture || "—";
+
+      const size = document.createElement("td");
+      size.className = "model-table-num";
+      size.textContent = model.size_gb ? model.size_gb.toFixed(1) + " GB" : "—";
+
+      const ctx = document.createElement("td");
+      ctx.className = "model-table-num";
+      ctx.textContent = modelContextLabel(model.context_length) || "—";
+
+      const thinking = document.createElement("td");
+      const thinkingBadge = document.createElement("span");
+      thinkingBadge.className = "model-badge model-badge-capability " + (model.reasoning ? "is-supported" : "is-unavailable");
+      thinkingBadge.textContent = model.reasoning ? "Yes" : "No";
+      thinking.appendChild(thinkingBadge);
+
+      const vision = document.createElement("td");
+      const visionBadge = document.createElement("span");
+      visionBadge.className = "model-badge model-badge-capability " + (model.vision ? "is-supported" : "is-unavailable");
+      visionBadge.textContent = model.vision ? "Yes" : "No";
+      vision.appendChild(visionBadge);
+
+      const status = document.createElement("td");
+      const statusBadge = document.createElement("span");
+      statusBadge.className = "model-badge" + (model.loaded ? " model-badge-active" : "");
+      statusBadge.textContent = modelStatusLabel(model);
+      status.appendChild(statusBadge);
+
+      row.append(name, arch, size, ctx, thinking, vision, status);
+      modelLibraryTableBodyEl.appendChild(row);
+    });
+  }
+
+  function renderModelLibrary() {
+    const query = modelSearchEl.value.trim().toLowerCase();
+    const showUnsupported = modelShowUnsupportedEl.checked;
+    const chatModels = modelCatalog.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
+    const unsupportedHidden = chatModels.filter((model) => !model.supported && !showUnsupported).length;
+    const visible = chatModels.filter((model) => {
+      if (!showUnsupported && !model.supported) return false;
+      return !query || model.search.includes(query);
+    });
+
+    renderModelCards(visible, query);
+    renderModelTable(visible, query);
     modelHiddenCountEl.textContent = unsupportedHidden ? "(" + unsupportedHidden + " hidden)" : "";
     const compatibleCount = chatModels.filter((model) => model.supported).length;
     modelResultCountEl.textContent = visible.length + " shown · " + compatibleCount + " compatible";
@@ -5299,14 +5491,22 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   modelLibraryEl.addEventListener("click", (event) => {
     const card = event.target.closest(".model-card");
     if (!card || card.disabled || !card.dataset.model) return;
-    const selected = modelCatalog.find((model) => model.id === card.dataset.model);
-    if (selected && selected.loaded) {
-      showToast("This model is already active.", "success");
-      return;
-    }
-    modelSelectEl.value = card.dataset.model;
-    modelSelectEl.dispatchEvent(new Event("change", { bubbles: true }));
+    selectModelFromLibrary(card.dataset.model);
   });
+  if (modelLibraryTableBodyEl) {
+    modelLibraryTableBodyEl.addEventListener("click", (event) => {
+      const row = event.target.closest(".model-row");
+      if (!row || row.dataset.disabled === "true" || !row.dataset.model) return;
+      selectModelFromLibrary(row.dataset.model);
+    });
+    modelLibraryTableBodyEl.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const row = event.target.closest(".model-row");
+      if (!row || row.dataset.disabled === "true" || !row.dataset.model) return;
+      event.preventDefault();
+      selectModelFromLibrary(row.dataset.model);
+    });
+  }
   modelSelectEl.addEventListener("change", async () => {
     const model = modelSelectEl.value;
     if (!model || busy || tuning || loadingModel) return;
@@ -7433,6 +7633,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   initInferenceMode();
 	syncDeploymentControls();
   setupUIMode();
+  setupModelView();
   renderWorkspace(true);
 	if (!browserOnlyDeployment) {
 		loadModels();

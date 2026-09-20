@@ -19,7 +19,15 @@ const (
 // Cancellation is checked between encoder frames/layers and decoder steps.
 // maxExtraSteps adds optional right-padding tokens (normally zero). Decoding
 // always stays within the encoded audio span, matching the reference schedule.
+//
+// This always decodes on CPU (disableFast=true below), matching its previous
+// behavior exactly: callers that already hold a loaded *VoxtralModel (which
+// may have prepared a Metal fast decoder) should use VoxtralModel.
+// TranscribeOffline instead, which shares this same decode algorithm but
+// skips the reload and can use that fast decoder.
 func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []float32, maxExtraSteps int, logw io.Writer) (string, error) {
+	// Cheap, load-independent checks first so an invalid request never pays
+	// for opening and mapping the (potentially multi-GB) GGUF at all.
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -60,11 +68,40 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 		return "", fmt.Errorf("building tokenizer: %w", err)
 	}
 
-	if cfg.Mel.SampleRate != 16000 {
-		return "", fmt.Errorf("Voxtral requires a 16 kHz frontend, got %d", cfg.Mel.SampleRate)
-	}
+	tokenTypes, _ := gguf.Metadata["tokenizer.ggml.token_type"].AsU32Array()
+	eosID := int(gguf.GetU32("tokenizer.ggml.eos_token_id", 2))
+	bosID := int(gguf.GetU32("tokenizer.ggml.bos_token_id", 1))
+
+	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, true, logw)
+}
+
+// decodeVoxtralRealtimeOffline runs the offline/batch encode-then-decode
+// algorithm shared by TranscribeVoxtralRealtime (which always loads its own
+// weights and decodes on CPU) and VoxtralModel.TranscribeOffline (which
+// reuses an already-loaded model and, when disableFast is false and the
+// build/checkpoint support it, decodes on the same Metal fast decoder the
+// live-session path uses). Only the decode loop's step function differs
+// between the two; encoding, prefill and text assembly are identical.
+func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, tok *Tokenizer, tokenTypes []uint32, eosID, bosID int, samples []float32, maxExtraSteps int, disableFast bool, logw io.Writer) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	if len(samples) == 0 {
+		return "", fmt.Errorf("audio is empty")
+	}
+	if maxExtraSteps < 0 || maxExtraSteps > 256 {
+		return "", fmt.Errorf("max extra steps must be between 0 and 256")
+	}
+	for _, sample := range samples {
+		if math.IsNaN(float64(sample)) || math.IsInf(float64(sample), 0) {
+			return "", fmt.Errorf("audio contains non-finite samples")
+		}
+	}
+	if logw == nil {
+		logw = io.Discard
+	}
+	if cfg.Mel.SampleRate != 16000 {
+		return "", fmt.Errorf("Voxtral requires a 16 kHz frontend, got %d", cfg.Mel.SampleRate)
 	}
 
 	// rawAudioLengthPerTok: samples of raw audio one adapter/decoder-aligned
@@ -90,9 +127,21 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 	if err != nil {
 		return "", fmt.Errorf("creating decoder state: %w", err)
 	}
+	var fast voxtralFastDecoder
+	if !disableFast {
+		fast = newVoxtralFastDecoder(cfg, w, state)
+	}
+	step := func(fused []float32, pos int, generate bool) (int, error) {
+		if fast != nil {
+			return fast.Step(fused, pos, generate)
+		}
+		logits, err := ForwardVoxtralRealtimeDecoderStep(cfg, w, state, fused, pos)
+		if err != nil {
+			return 0, err
+		}
+		return voxtralArgmax(logits), nil
+	}
 
-	eosID := int(gguf.GetU32("tokenizer.ggml.eos_token_id", 2))
-	bosID := int(gguf.GetU32("tokenizer.ggml.bos_token_id", 1))
 	padID := cfg.StreamingPadTokenID
 
 	// Prefill: BOS followed by (voxtralLeftPadTokens + DefaultNumDelayTokens) pad
@@ -124,19 +173,18 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 		for i := range fused {
 			fused[i] = te[i] + audioEmbeds[pos][i]
 		}
-		logits, err := ForwardVoxtralRealtimeDecoderStep(cfg, w, state, fused, pos)
+		next, err := step(fused, pos, pos == L-1)
 		if err != nil {
 			return "", fmt.Errorf("prefill pos %d: decoder step: %w", pos, err)
 		}
 		if pos == L-1 {
-			prevToken = voxtralArgmax(logits)
+			prevToken = next
 		}
 	}
 	if logw != io.Discard {
 		fmt.Fprintf(logw, "prefill done (%d positions), first generated token=%d %q\n", L, prevToken, tok.DecodeToken(uint32(prevToken)))
 	}
 
-	tokenTypes, _ := gguf.Metadata["tokenizer.ggml.token_type"].AsU32Array()
 	var out strings.Builder
 	if prevToken != padID && prevToken != eosID {
 		out.WriteString(voxtralTranscriptPiece(tok, tokenTypes, prevToken))
@@ -157,11 +205,10 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 			fused[i] = te[i] + ae[i]
 		}
 
-		logits, err := ForwardVoxtralRealtimeDecoderStep(cfg, w, state, fused, pos)
+		next, err := step(fused, pos, true)
 		if err != nil {
 			return "", fmt.Errorf("pos %d: decoder step: %w", pos, err)
 		}
-		next := voxtralArgmax(logits)
 		if logw != io.Discard {
 			fmt.Fprintf(logw, "pos=%d token=%d %q\n", pos, next, tok.DecodeToken(uint32(next)))
 		}

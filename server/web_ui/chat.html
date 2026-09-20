@@ -399,14 +399,36 @@
             </div>
             <p id="modelLoadDetail" class="model-load-detail">GopherLLM is opening the selected GGUF in the background.</p>
           </div>
-          <label class="model-search-label" for="modelSearch">Find a model
-            <input type="search" id="modelSearch" class="model-search" placeholder="Name, architecture, repository, or size…" aria-describedby="modelResultCount" autocomplete="off">
-          </label>
+          <div class="model-search-row">
+            <label class="model-search-label" for="modelSearch">Find a model
+              <input type="search" id="modelSearch" class="model-search" placeholder="Name, architecture, repository, or size…" aria-describedby="modelResultCount" autocomplete="off">
+            </label>
+            <div class="settings-mode model-view-mode" role="group" aria-label="Model list view">
+              <button id="modelViewCards" class="settings-mode-button" type="button" aria-pressed="true">Cards</button>
+              <button id="modelViewTable" class="settings-mode-button" type="button" aria-pressed="false">Table</button>
+            </div>
+          </div>
           <select id="modelSelect" class="model-native-select" aria-label="Select model" hidden>
             <option value="">{{.Model}}</option>
           </select>
           <div id="modelLibrary" class="model-library" role="listbox" aria-label="Available local chat models" aria-busy="true">
             <p class="model-library-empty">Discovering local GGUF models…</p>
+          </div>
+          <div id="modelLibraryTableWrap" class="model-table-wrap" hidden>
+            <table class="model-table" aria-label="Available local chat models">
+              <thead>
+                <tr>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="name">Name</button></th>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="architecture">Architecture</button></th>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="size_gb">Size</button></th>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="context_length">Context</button></th>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="reasoning">Thinking</button></th>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="vision">Vision</button></th>
+                  <th aria-sort="none"><button type="button" class="model-table-sort" data-sort="status">Status</button></th>
+                </tr>
+              </thead>
+              <tbody id="modelLibraryTableBody"></tbody>
+            </table>
           </div>
           <div class="model-library-foot">
             <label class="toggle-row model-show-unsupported">

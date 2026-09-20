@@ -187,6 +187,35 @@ func (m *VoxtralModel) Transcribe(ctx context.Context, pcm []float32) (string, e
 	return s.Flush(ctx)
 }
 
+// TranscribeOffline runs the same well-tested offline/batch encode-then-decode
+// algorithm as the standalone TranscribeVoxtralRealtime, reusing this model's
+// already-loaded weights instead of reopening the GGUF. Prefer this over
+// Transcribe: the incremental live-session decoder Transcribe uses can return
+// an empty transcript for some real speech inputs (see cmd/hestia's
+// SpeechHost, which avoids it for the same reason), while this path shares
+// the offline decoder's more thoroughly exercised behavior and, when the
+// model was opened with Metal enabled, still gets the fast decoder step.
+// Reserves and releases the model's single session slot, like Transcribe.
+func (m *VoxtralModel) TranscribeOffline(ctx context.Context, samples []float32, maxExtraSteps int, logw io.Writer) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	m.mu.Lock()
+	if m.closed || m.source == nil {
+		m.mu.Unlock()
+		return "", ErrVoxtralModelClosed
+	}
+	if m.active {
+		m.mu.Unlock()
+		return "", ErrVoxtralBusy
+	}
+	m.active = true
+	source := m.source
+	m.mu.Unlock()
+	defer func() { _ = m.releaseSession() }()
+	return decodeVoxtralRealtimeOffline(ctx, source.cfg, source.weights, source.tokenizer, source.tokenTypes, source.eosID, source.bosID, samples, maxExtraSteps, source.disableFast, logw)
+}
+
 // Flush finalizes the transcript without adding audio. Close is still required.
 func (s *VoxtralRealtimeSession) Flush(ctx context.Context) (string, error) {
 	return s.Push(ctx, nil, true)
