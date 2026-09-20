@@ -1,6 +1,10 @@
 package gopherllm
 
-import "testing"
+import (
+	"hash/fnv"
+	"strings"
+	"testing"
+)
 
 // newInstTestTokenizer builds a SentencePiece-style tokenizer whose vocabulary
 // is single characters plus the Mistral control tokens, so encoded content is a
@@ -150,12 +154,80 @@ func TestMistralInstRenderUsesSystemPromptTokens(t *testing.T) {
 	}
 }
 
-func TestMistralInstRenderRequiresControlTokens(t *testing.T) {
+// Real Mistral Small 3.x/Large/Pixtral-Large models accept more than one
+// image in a single turn. Each image is spliced in as its own independent
+// [IMG]...[IMG_END] block (encodeChatImage already treats every image as a
+// self-contained unit, memoized by content hash), so this only needs the
+// render loop itself to stop capping at one.
+func TestMistralInstRenderAcceptsMultipleImagesPerMessage(t *testing.T) {
 	tok := newInstTestTokenizer()
+	imgTok := addSpecial(tok, "[IMG]")
+	breakTok := addSpecial(tok, "[IMG_BREAK]")
+	endTok := addSpecial(tok, "[IMG_END]")
+	r := &Runner{tok: tok, arch: "ministral", vision: &PixtralVisionWeights{ImgBreak: []float32{0.5}}}
+
+	imgA := ImageContent{Bytes: []byte("image-a")}
+	imgB := ImageContent{Bytes: []byte("image-b")}
+	r.visionCachePut(fnvHash(imgA.Bytes), visionImageCacheEntry{embeds: fakeEmbeds(2), mergedRows: 1, mergedCols: 2})
+	r.visionCachePut(fnvHash(imgB.Bytes), visionImageCacheEntry{embeds: fakeEmbeds(3), mergedRows: 1, mergedCols: 3})
+
+	tokens, embeds, ok, err := r.renderMistralInstMessages(
+		[]ChatMessage{UserMessageWithImages("compare these", imgA, imgB)}, "", nil,
+	)
+	if err != nil || !ok {
+		t.Fatalf("multi-image render should succeed, got ok=%v err=%v", ok, err)
+	}
+	if got := countToken(tokens, imgTok); got != 5 {
+		t.Fatalf("[IMG] count = %d, want 5 (2 for image A + 3 for image B)", got)
+	}
+	if got := countToken(tokens, endTok); got != 2 {
+		t.Fatalf("[IMG_END] count = %d, want 2 (one per image)", got)
+	}
+	// Image A's single row has no internal [IMG_BREAK] (mergedRows==1); the
+	// two images are simply back to back with no separator of their own.
+	if got := countToken(tokens, breakTok); got != 0 {
+		t.Fatalf("[IMG_BREAK] count = %d, want 0 for two single-row images", got)
+	}
+	if len(embeds) != 5 {
+		t.Fatalf("imageEmbeds has %d entries, want 5 (one per [IMG] position)", len(embeds))
+	}
+}
+
+func fnvHash(b []byte) uint64 {
+	h := fnv.New64a()
+	h.Write(b)
+	return h.Sum64()
+}
+
+func fakeEmbeds(n int) [][]float32 {
+	out := make([][]float32, n)
+	for i := range out {
+		out[i] = []float32{float32(i)}
+	}
+	return out
+}
+
+// The original Mistral-7B-v0.1/v0.2 tokenizer never registered [INST]/[/INST]
+// as special tokens at all — its chat template spells them out as plain
+// bracket text. renderMistralInstMessages must still apply in that case
+// (falling back to literal-text encoding, like mistralMarker already does
+// for the optional tool-calling markers) rather than silently handing the
+// request to the generic plain-text renderer.
+func TestMistralInstRenderFallsBackToLiteralTextForMissingControlTokens(t *testing.T) {
+	tok := newInstTestTokenizer()
+	delete(tok.TokenToID, "[INST]")
 	delete(tok.TokenToID, "[/INST]")
 	r := &Runner{tok: tok, arch: "ministral"}
-	if _, _, ok, _ := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil); ok {
-		t.Fatal("render should fail when [/INST] is absent")
+	tokens, _, ok, err := r.renderMistralInstMessages([]ChatMessage{UserMessage("hi")}, "", nil)
+	if !ok || err != nil {
+		t.Fatalf("render should still apply via literal-text fallback, got ok=%v err=%v", ok, err)
+	}
+	var decoded strings.Builder
+	for _, id := range tokens {
+		decoded.WriteString(r.tok.DecodeToken(id))
+	}
+	if got := decoded.String(); !strings.Contains(got, "[INST]") || !strings.Contains(got, "[/INST]") {
+		t.Fatalf("decoded output %q missing literal [INST]/[/INST] brackets", got)
 	}
 }
 

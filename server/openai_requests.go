@@ -287,6 +287,14 @@ type OpenAICompletionRequest struct {
 	Seed                *uint64  `json:"seed"`
 	SystemPrompt        *string  `json:"system_prompt"`
 	Stop                any      `json:"stop"`
+	// Suffix requests a Codestral fill-in-the-middle completion instead of an
+	// ordinary continuation: Prompt is rendered as the FIM prefix and Suffix
+	// as the suffix, matching OpenAI's own legacy /v1/completions "suffix"
+	// field so existing FIM-aware editor plugins work unmodified. Only
+	// Codestral-family checkpoints (those whose vocabulary carries dedicated
+	// [PREFIX]/[SUFFIX]/[MIDDLE] control tokens) can honor it — see
+	// gopherllm.GenerationOptions.FIMSuffix.
+	Suffix *string `json:"suffix"`
 }
 
 func (o OpenAICompletionRequest) PromptString() string {
@@ -308,7 +316,11 @@ func (o OpenAICompletionRequest) Options(def gopherllm.GenerationOptions) gopher
 	if maxTokens == nil {
 		maxTokens = o.MaxCompletionTokens
 	}
-	return applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop, nil, "")
+	options := applyRequestOptions(def, maxTokens, o.Temperature, o.TopP, o.TopK, o.MinP, o.RepeatPenalty, o.Seed, o.SystemPrompt, o.Stop, nil, "")
+	if o.Suffix != nil {
+		options.FIMSuffix = *o.Suffix
+	}
+	return options
 }
 
 type EmbeddingsRequest struct {

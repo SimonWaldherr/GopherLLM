@@ -18,14 +18,19 @@ import (
 // tokenizer.chat_template of a real Ministral-3-3B-Instruct-2512 GGUF.
 // renderMistralInstMessages renders the [INST]/[/INST] Mistral-family
 // template. Its bool return follows the same "not applicable, try another
-// renderer" convention every renderMessages branch uses (true only for the
-// rare case of a vocabulary missing [INST]/[/INST]) — its error return is a
-// distinct signal: ok=true with a non-nil error means the template DID
-// apply but rendering a message's attached image failed (too many images,
-// no vision projector loaded, bad image bytes). Callers must treat that as
-// a real failure, not silently fall through to a different renderer, since
-// no other renderer understands ChatMessage.Images and would just drop the
-// image data instead of erroring.
+// renderer" convention every renderMessages branch uses; unlike those
+// branches it is always true here, since the literal-text fallback [INST]/
+// [/INST] share with the optional tool-calling markers (mistralMarker) means
+// there is no vocabulary this renderer cannot at least attempt — even the
+// original Mistral-7B-v0.1 tokenizer, which never registered [INST] as a
+// special token at all, still spells the brackets out correctly as ordinary
+// sub-word tokens. Its error return is a distinct signal: ok=true with a
+// non-nil error means the template DID apply but rendering a message's
+// attached image failed (no vision projector loaded, bad image bytes, or a
+// vocabulary missing the [IMG]/[IMG_BREAK]/[IMG_END] tokens image content
+// requires). Callers must treat that as a real failure, not silently fall
+// through to a different renderer, since no other renderer understands
+// ChatMessage.Images and would just drop the image data instead of erroring.
 func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, map[int][]float32, bool, error) {
 	// This renderer is also used by PrepareChatContext, which deliberately
 	// does not take genLock. Keep the whole image-rendering transaction under
@@ -33,11 +38,16 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 	// unmap a borrowed projector while EncodeImagePixtral is using it.
 	r.visionMu.RLock()
 	defer r.visionMu.RUnlock()
-	instTok, ok1 := r.tok.SpecialID("[INST]")
-	instEndTok, ok2 := r.tok.SpecialID("[/INST]")
-	if !(ok1 && ok2) {
-		return nil, nil, false, nil
-	}
+	// [INST]/[/INST] are dedicated control tokens on every Tekken and later
+	// SentencePiece-v2/v3 Mistral vocabulary, but the original Mistral-7B-v0.1
+	// tokenizer never registered them as special tokens at all — its chat
+	// template spells them out as plain bracket text. mistralMarker's fallback
+	// to literal-text encoding handles that vocabulary the same way it already
+	// does for the optional tool-calling markers below, so this renderer stays
+	// applicable across the model's entire history instead of silently losing
+	// v0.1/v0.2 chats to the plain-text renderer.
+	instTok := r.mistralMarker("[INST]")
+	instEndTok := r.mistralMarker("[/INST]")
 	sysStart, sysEnd, hasSysTokens := r.systemPromptTokens()
 	callTok := r.mistralMarker("[TOOL_CALLS]")
 	argsTok := r.mistralMarker("[ARGS]")
@@ -146,11 +156,8 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			if idx == lastUser && system != "" && !hasSysTokens {
 				content = system + "\n\n" + content
 			}
-			tokens = append(tokens, instTok)
+			tokens = append(tokens, instTok...)
 			if len(m.Images) > 0 {
-				if len(m.Images) > 1 {
-					return nil, nil, true, fmt.Errorf("rendering message %d: only one image per message is supported, got %d", idx, len(m.Images))
-				}
 				// We already hold visionMu; calling HasVision here would take a
 				// recursive RLock and can deadlock when Close is waiting for its
 				// exclusive lease.
@@ -163,27 +170,35 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 				if !(ok1 && ok2 && ok3) {
 					return nil, nil, true, fmt.Errorf("rendering message %d: this model's vocabulary is missing the [IMG]/[IMG_BREAK]/[IMG_END] special tokens image content requires", idx)
 				}
-				embeds, mergedRows, mergedCols, err := r.encodeChatImage(m.Images[0])
-				if err != nil {
-					return nil, nil, true, fmt.Errorf("rendering message %d: %w", idx, err)
-				}
-				if imageEmbeds == nil {
-					imageEmbeds = make(map[int][]float32, len(embeds)+mergedRows)
-				}
-				for row := 0; row < mergedRows; row++ {
-					for col := 0; col < mergedCols; col++ {
-						imageEmbeds[len(tokens)] = embeds[row*mergedCols+col]
-						tokens = append(tokens, imgTok)
+				// Mistral splices multiple images in one turn as independently
+				// encoded [IMG]...[IMG_END] blocks placed back to back (each image
+				// has its own [IMG_BREAK]-separated rows, but nothing separates one
+				// image's block from the next beyond that). encodeChatImage already
+				// treats every image as a self-contained unit, so looping here needs
+				// no change to the vision encoder itself.
+				for imgIdx, image := range m.Images {
+					embeds, mergedRows, mergedCols, err := r.encodeChatImage(image)
+					if err != nil {
+						return nil, nil, true, fmt.Errorf("rendering message %d image %d: %w", idx, imgIdx, err)
 					}
-					if row < mergedRows-1 {
-						imageEmbeds[len(tokens)] = r.vision.ImgBreak
-						tokens = append(tokens, breakTok)
+					if imageEmbeds == nil {
+						imageEmbeds = make(map[int][]float32, (len(embeds)+mergedRows)*len(m.Images))
 					}
+					for row := 0; row < mergedRows; row++ {
+						for col := 0; col < mergedCols; col++ {
+							imageEmbeds[len(tokens)] = embeds[row*mergedCols+col]
+							tokens = append(tokens, imgTok)
+						}
+						if row < mergedRows-1 {
+							imageEmbeds[len(tokens)] = r.vision.ImgBreak
+							tokens = append(tokens, breakTok)
+						}
+					}
+					tokens = append(tokens, endTok)
 				}
-				tokens = append(tokens, endTok)
 			}
 			tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
-			tokens = append(tokens, instEndTok)
+			tokens = append(tokens, instEndTok...)
 		}
 	}
 	return tokens, imageEmbeds, true, nil

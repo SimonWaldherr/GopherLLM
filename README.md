@@ -63,6 +63,8 @@ covers and how to turn things on.
 - [Performance Notes](#performance-notes)
 - [Supported Architectures](#supported-architectures)
 - [Development](#development)
+- [iOS / iPhone](#ios--iphone)
+- [Bindings for Rust, Python, and C](#bindings-for-rust-python-and-c)
 
 ## Features
 
@@ -1034,7 +1036,10 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   Q4_K/Q6_K/Q8_0 projections, FFN and vocabulary output share one command buffer.
   Independent projections run concurrently, and aligned F32 KV caches share
   pinned memory with Go instead of copying the prefix each token. This path
-  requires 128-dimensional heads and at most 4096 allocated KV slots. Unsupported
+  requires 128-dimensional heads and at most 16384 allocated KV slots, and
+  covers Ministral 8B's interleaved sliding-window/full-attention layer
+  pattern (each layer's window is bound individually, so a uniform window on
+  every layer and this interleaved pattern are equally supported). Unsupported
   configurations retain the selective path. Set `GOPHERLLM_METAL_DENSE_DECODE=0`
   to compare with that fallback. See the [matched llama.cpp comparisons](benchmarks/metal-dense/README.md).
   The selective
@@ -1613,3 +1618,33 @@ guidance, the included SwiftUI demo, and validation commands.
 
 GitHub Actions runs `go test`, `go vet`, and `go build` on Linux, macOS, and
 Windows, plus the `make cross-build` release matrix on Linux.
+
+## Bindings for Rust, Python, and C
+
+Swift/Obj-C embeds GopherLLM in-process via `gomobile` (above); Rust and
+Python do the same over a small C ABI built on top of the identical
+`mobile.Engine` surface, so all three languages get the same capabilities:
+load a GGUF, generate or stream a completion, read basic model info — no
+server process, no HTTP round trip.
+
+```sh
+make capi-build   # or: ./scripts/build-capi.sh
+```
+
+builds `build/capi/libgopherllm.{dylib,so,dll}` plus its headers. Then:
+
+```sh
+# Rust — bindings/rust/gopherllm (see its README for details)
+cd bindings/rust/gopherllm && cargo run --example generate -- model.gguf "Hello!"
+
+# Python — bindings/python (see its README for details)
+cd bindings/python && pip install -e . && python3 examples/generate.py model.gguf "Hello!"
+```
+
+`bindings/c/shim` is a thin, hand-written cgo layer (no new business logic —
+everything forwards to the already-tested `mobile.Engine`); it is kept
+behind a `capi` build tag so `go build ./...` never needs a C toolchain to
+find it, and CGO_ENABLED=1 with the tag is required to build it. If you only
+need to call GopherLLM's OpenAI-compatible HTTP API from Rust, Python, or
+anywhere else, the [Quickstart](#quickstart) server needs none of this —
+these bindings are specifically for embedding the engine in-process.

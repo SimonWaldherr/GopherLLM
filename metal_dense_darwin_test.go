@@ -171,8 +171,20 @@ func testMetalDenseDecodeParity(t *testing.T) {
 				}
 			}
 			// Sequential decode, multi-part attention, cache edits and rewinds.
+			// metalDenseFor's fast path must reuse the already-bound decoder
+			// across consecutive tokens of the same model/cache instead of
+			// re-deriving eligibility (and rebuilding) from scratch every
+			// time -- re-running metalDenseEligible's per-layer bias scan on
+			// every decoded token was a measured, real cost in profiling.
+			// Checked from the second iteration on (the first is what binds
+			// the decoder in the first place).
+			var reused *metalDenseState
 			for pos := 0; pos < 35; pos++ {
 				check(pos)
+				if pos > 0 && gpuBuf.metalDense != reused {
+					t.Fatalf("metalDenseFor rebuilt the decoder at pos %d although nothing eligibility-relevant changed", pos)
+				}
+				reused = gpuBuf.metalDense
 			}
 			for l := range w.Layers {
 				for i := 35 * 128; i < 160*128; i++ {
@@ -197,17 +209,53 @@ func testMetalDenseDecodeParity(t *testing.T) {
 			if metalDenseEligible(c, gpu, gpuCache) {
 				t.Fatal("nonzero bias must fall back")
 			}
-			if tryMetalDenseDecode(c, gpu, gpuCache, gpuBuf, 0, 0) || gpuBuf.metalDense != nil {
-				t.Fatal("unsupported configuration must release its device workspace")
+			// A never-yet-bound buffer must never acquire a device workspace
+			// for an ineligible configuration in the first place. This
+			// deliberately does not reuse gpuBuf (which already has a bound
+			// decoder from the check() calls above): metalDenseFor's fast
+			// path trusts that a model's structural eligibility cannot
+			// change while the same ModelWeights/KVCache identity is in use
+			// -- true everywhere in this runtime, which treats ModelWeights
+			// as immutable once loaded -- so re-mutating gpu's bias in place
+			// after gpuBuf's decoder is already bound to it is no longer a
+			// scenario the fast path re-checks (see metalDenseFor).
+			freshBuf := NewDecodeBuffer(c, 128, 1, 128)
+			defer func() {
+				if freshBuf.metalDense != nil {
+					freshBuf.metalDense.close()
+				}
+			}()
+			if tryMetalDenseDecode(c, gpu, gpuCache, freshBuf, 0, 0) || freshBuf.metalDense != nil {
+				t.Fatal("unsupported configuration must never acquire a device workspace")
 			}
 			gpu.Layers[0].BQ[0] = 0
+			// Ministral 8B's actual attention pattern: one layer windowed,
+			// the other full attention. layerUsesSWA resolves this per
+			// layer (see newMetalDenseState), so it must produce identical
+			// output to the CPU reference at a position well past the
+			// window, where the two layers diverge -- one truncates its
+			// attended range, the other still sees the whole prefix.
 			c.SWAPattern = []bool{true, false}
-			if metalDenseEligible(c, gpu, gpuCache) {
-				t.Fatal("mixed sliding-window patterns must fall back")
+			if !metalDenseEligible(c, gpu, gpuCache) {
+				t.Fatal("interleaved sliding-window patterns should be eligible")
+			}
+			if arch == "ministral" {
+				// Real Ministral 8B is the only supported family that ships
+				// this pattern (Qwen3 never sets SWAPattern; this synthetic
+				// combination with its QK-norm is not a shape any real
+				// checkpoint uses), so the full CPU/GPU parity check below
+				// only needs to run for it.
+				check(40)
 			}
 			c.SWAPattern = nil
 			if metalDenseEligible(c, gpu, NewKVCacheF16(2, 128, 128, maxlen)) {
 				t.Fatal("F16 cache must fall back")
+			}
+			if metalDenseEligible(c, gpu, NewKVCache(2, 128, 128, 16385)) {
+				t.Fatal("context beyond the Metal decoder's own buffer-sizing ceiling must fall back")
+			}
+			if !metalDenseEligible(c, gpu, NewKVCache(2, 128, 128, 16384)) {
+				t.Fatal("context at the Metal decoder's ceiling should still be eligible")
 			}
 		})
 	}

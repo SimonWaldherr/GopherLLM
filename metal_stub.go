@@ -89,3 +89,6 @@ func argmaxMetalGemmaOutput(w Weight, x []float32, recent []uint32, penalty floa
 
 func prepareMetalDenseBatch(Config, ModelWeights, *KVCache, *DecodeBuffer, int) bool    { return false }
 func metalDenseBatchProjection(*DecodeBuffer, int, int, []float32, []float32, int) bool { return false }
+func metalDenseBatchProjectionQKV(*DecodeBuffer, int, []float32, []float32, []float32, []float32, int) bool {
+	return false
+}

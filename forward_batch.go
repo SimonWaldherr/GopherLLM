@@ -592,8 +592,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				copy(V[t], QKV[t][qLen+kLen:qLen+kLen+vLen])
 			}
 		} else {
-			if !denseBatch || !metalDenseBatchProjection(buf, l, 0, b.XNFlat, b.QFlat, p) ||
-				!metalDenseBatchProjection(buf, l, 1, b.XNFlat, b.KFlat, p) || !metalDenseBatchProjection(buf, l, 2, b.XNFlat, b.VFlat, p) {
+			if !denseBatch || !metalDenseBatchProjectionQKV(buf, l, b.XNFlat, b.QFlat, b.KFlat, b.VFlat, p) {
 				matvecBatch3(layer.WQ, layer.WK, layer.WV, XN, Q, K, V)
 			}
 		}

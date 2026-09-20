@@ -5,17 +5,27 @@ import (
 	"hash/fnv"
 )
 
-// renderMessagesForGeneration is renderMessages plus image-embedding
-// support. When no message carries images it is exactly renderMessages
-// (nil map, nil error) — every existing caller (context_window.go's
-// token-budget calculations, tests) keeps calling the plain renderMessages
-// unchanged. Only the real generation entry point (GenerateChatStreamUntil)
-// calls this, since it's the one place that needs the embeddings to splice
-// into the forward pass. When a message does carry an image, only the
+// renderMessagesForGeneration is renderMessages plus image-embedding and FIM
+// support. When no message carries images and fimSuffix is empty it is
+// exactly renderMessages (nil map, nil error) — every existing caller
+// (context_window.go's token-budget calculations, tests) keeps calling the
+// plain renderMessages unchanged. Only the real generation entry point
+// (GenerateChatStreamUntil) calls this, since it's the one place that needs
+// the embeddings to splice into the forward pass, or a FIM-shaped token
+// stream instead of a chat one. When a message does carry an image, only the
 // Mistral-family template understands ChatMessage.Images, so this bypasses
 // renderMessages' generic multi-template dispatch entirely rather than
-// risking a silent fallback to a renderer that would just drop the image.
-func (r *Runner) renderMessagesForGeneration(messages []ChatMessage, systemPrompt string, tools []ToolDefinition) ([]uint32, map[int][]float32, error) {
+// risking a silent fallback to a renderer that would just drop the image;
+// fimSuffix bypasses it just as completely, since fill-in-the-middle is not a
+// chat turn at all and no chat template (Mistral's included) applies to it.
+func (r *Runner) renderMessagesForGeneration(messages []ChatMessage, systemPrompt string, tools []ToolDefinition, fimSuffix string) ([]uint32, map[int][]float32, error) {
+	if fimSuffix != "" {
+		if len(messages) != 1 || messages[0].Role != ChatRoleUser || len(messages[0].Images) > 0 || len(messages[0].ToolCalls) > 0 {
+			return nil, nil, fmt.Errorf("FIM completion takes exactly one plain user message (the prefix), got %d messages", len(messages))
+		}
+		tokens, err := r.renderCodestralFIM(messages[0].Content, fimSuffix)
+		return tokens, nil, err
+	}
 	hasImages := false
 	for i := range messages {
 		if len(messages[i].Images) > 0 {

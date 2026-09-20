@@ -14,3 +14,14 @@ GopherLLM.test
 
 # Local exports may contain private conversation or retrieval data.
 /rag/private/
+
+# Rust and Python bindings (bindings/rust, bindings/python) build artifacts.
+# Cargo.lock is intentionally not committed: this is a library crate (like
+# GopherLLM's own go.sum-less Go module), and downstream consumers pick
+# their own dependency versions.
+/bindings/rust/*/target/
+/bindings/rust/*/Cargo.lock
+/bindings/python/**/__pycache__/
+/bindings/python/*.egg-info/
+/bindings/python/**/*.egg-info/
+/bindings/python/.pytest_cache/

@@ -87,7 +87,7 @@ _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p 
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
-.PHONY: all build release build-metal cross-build wasm-build ios-tools ios-bind ios-clean ios-demo-build ios-check run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
+.PHONY: all build release build-metal cross-build wasm-build ios-tools ios-bind ios-clean ios-demo-build ios-check capi-build capi-clean run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -140,6 +140,15 @@ ios-demo-build: ios-bind
 	xcodebuild -project examples/ios/GopherLLMDemo/GopherLLMDemo.xcodeproj -scheme GopherLLMDemo -sdk iphonesimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build
 
 ios-check: test vet ios-bind ios-demo-build
+
+# capi-build produces the C ABI shared library (bindings/c/shim) the Rust
+# crate (bindings/rust) and Python package (bindings/python) both link
+# against; see bindings/c/README.md.
+capi-build:
+	@bash scripts/build-capi.sh
+
+capi-clean:
+	rm -rf build/capi
 
 run: release
 	@$(BIN) $(_RUN_ARGS)

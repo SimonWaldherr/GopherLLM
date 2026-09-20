@@ -43,9 +43,15 @@ func (s *metalDenseState) close() {
 }
 
 func metalDenseEligible(c Config, w ModelWeights, k *KVCache) bool {
-	if !metalDenseDecodeEnabled || k == nil || k.F16 || k.I8 || k.MaxLen > 4096 || k.MaxLen <= 0 ||
+	// k.MaxLen must not exceed metalbackend.NewDecoder's own buffer-sizing
+	// ceiling (its partial-attention and per-layer K/V buffers are allocated
+	// once, sized proportional to maxlen, up to that limit) -- keeping this
+	// check here (rather than only inside newMetalDenseState) avoids retrying
+	// a doomed, non-trivial device allocation on every single decoded token
+	// once a too-long context is configured.
+	if !metalDenseDecodeEnabled || k == nil || k.F16 || k.I8 || k.MaxLen > 16384 || k.MaxLen <= 0 ||
 		(c.Arch != "mistral3" && c.Arch != "ministral" && c.Arch != "qwen3" && c.Arch != "llama") ||
-		c.SWAPattern != nil || c.HeadDim != 128 || c.ValueDim != 128 || c.RopeDimensionCount != 128 || c.RopeThetaSWA != 0 ||
+		c.HeadDim != 128 || c.ValueDim != 128 || c.RopeDimensionCount != 128 || c.RopeThetaSWA != 0 ||
 		c.UseLayerNorm || c.ParallelResidual || c.UseGELU || c.UsesMLA || c.AttnLogitSoftcap != 0 ||
 		c.ResidualScale != 1 || c.usesAbsolutePositionEmbd() || c.usesALiBi() ||
 		c.NLayers <= 0 || len(w.Layers) != c.NLayers || len(w.OutputNorm) != c.Dim || !metalDenseZero(w.OutputNormBias) ||
@@ -125,6 +131,11 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache) *metalDenseState {
 			refs[j] = p
 			s.refs = append(s.refs, p)
 		}
+		// layerUsesSWA consults c.SWAPattern per layer when one is present
+		// (Ministral 8B's interleaved local/global attention), so this
+		// already binds the correct per-layer window regardless of whether
+		// the model uses a uniform window on every layer or an interleaved
+		// pattern -- metalDenseEligible no longer needs to reject the latter.
 		window := 0
 		if c.layerUsesSWA(i) {
 			window = c.SlidingWindow
@@ -273,9 +284,33 @@ func (s *metalDenseState) matchesCache(k *KVCache) bool {
 	return true
 }
 
+// valid reports whether s is still the correct bound decoder for c/w/k: the
+// same loaded model (owner is a pointer into that model's own layer slice),
+// the same (unresized, unreplaced) KV cache, and every config field the
+// decoder was actually built from. Once true, none of metalDenseEligible's
+// checks can have started failing, since nothing they inspect changes
+// without also changing one of these.
+func (s *metalDenseState) valid(c Config, w ModelWeights, k *KVCache) bool {
+	return s.matchesCache(k) && s.owner == &w.Layers[0] && s.cache == k && s.dim == c.Dim &&
+		s.hidden == c.HiddenDim && s.heads == c.NHeads && s.kvheads == c.NKVHeads &&
+		s.layers == c.NLayers && s.window == c.SlidingWindow && s.eps == c.RMSNormEps && s.scale == c.AttentionScale
+}
+
 func metalDenseFor(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) *metalDenseState {
 	if b == nil {
 		return nil
+	}
+	// Fast path: metalDenseEligible is a long per-layer scan (dozens of field
+	// comparisons plus a zero-check over every bias slice in every layer),
+	// re-run from scratch on every call by the code below -- profiling a real
+	// decode loop showed this costing a measurable slice of per-token CPU
+	// time despite deciding the same "yes" every single token. Once a decoder
+	// is already correctly bound for this exact model/cache/config, nothing
+	// eligibility would check can have changed without also changing one of
+	// the fields valid() compares, so re-deriving the same answer the
+	// expensive way is pure waste.
+	if s := b.metalDense; s != nil && s.valid(c, w, k) {
+		return s
 	}
 	if !metalDenseEligible(c, w, k) {
 		if b.metalDense != nil {
@@ -285,12 +320,7 @@ func metalDenseFor(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) *metal
 		return nil
 	}
 	s := b.metalDense
-	if s != nil && !s.matchesCache(k) {
-		s.close()
-		b.metalDense = nil
-		s = nil
-	}
-	if s != nil && (s.owner != &w.Layers[0] || s.cache != k || s.dim != c.Dim || s.hidden != c.HiddenDim || s.heads != c.NHeads || s.kvheads != c.NKVHeads || s.layers != c.NLayers || s.window != c.SlidingWindow || s.eps != c.RMSNormEps || s.scale != c.AttentionScale) {
+	if s != nil && !s.valid(c, w, k) {
 		s.close()
 		b.metalDense = nil
 		s = nil
@@ -314,6 +344,20 @@ func metalDenseBatchProjection(b *DecodeBuffer, layer, matrix int, x, out []floa
 	}
 	s := b.metalDense
 	ok := s.decoder.Project(layer, matrix, x, out, batch)
+	runtime.KeepAlive(s) // The state owns/pins the decoder's borrowed weights and KV.
+	return ok
+}
+
+// metalDenseBatchProjectionQKV is metalDenseBatchProjection for Q, K, and V
+// fused into one command buffer instead of three -- see
+// gllm_decode_project_qkv's doc comment for why that matters at realistic
+// prefill chunk sizes.
+func metalDenseBatchProjectionQKV(b *DecodeBuffer, layer int, x, qOut, kOut, vOut []float32, batch int) bool {
+	if b == nil || b.metalDense == nil {
+		return false
+	}
+	s := b.metalDense
+	ok := s.decoder.ProjectQKV(layer, x, qOut, kOut, vOut, batch)
 	runtime.KeepAlive(s) // The state owns/pins the decoder's borrowed weights and KV.
 	return ok
 }

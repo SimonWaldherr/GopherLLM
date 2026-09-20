@@ -29,6 +29,29 @@ func (r *Runner) GenerateStream(prompt string, options GenerationOptions, onToke
 	return r.GenerateChatStream([]ChatMessage{UserMessage(prompt)}, options, onToken)
 }
 
+// GenerateFIM completes prefix/suffix as a Codestral fill-in-the-middle
+// request instead of a chat turn — see GenerationOptions.FIMSuffix and
+// renderCodestralFIM for the exact wire protocol. It fails on any
+// non-Codestral-family checkpoint, since a model without dedicated infill
+// tokens cannot do this task at all.
+func (r *Runner) GenerateFIM(prefix, suffix string, options GenerationOptions) (GenerationResult, error) {
+	return r.GenerateFIMStream(prefix, suffix, options, func(string) {})
+}
+
+// GenerateFIMStream is GenerateFIM with incremental token callbacks; see
+// GenerateChatStream.
+func (r *Runner) GenerateFIMStream(prefix, suffix string, options GenerationOptions, onToken func(string)) (GenerationResult, error) {
+	options.FIMSuffix = suffix
+	return r.GenerateChatStream([]ChatMessage{UserMessage(prefix)}, options, onToken)
+}
+
+// GenerateFIMStreamUntil is GenerateFIM with cancelable streaming; see
+// GenerateChatStreamUntil.
+func (r *Runner) GenerateFIMStreamUntil(prefix, suffix string, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
+	options.FIMSuffix = suffix
+	return r.GenerateChatStreamUntil([]ChatMessage{UserMessage(prefix)}, options, onToken)
+}
+
 func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOptions, onToken func(string)) (GenerationResult, error) {
 	if onToken == nil {
 		return r.GenerateChatStreamUntil(messages, options, nil)
@@ -96,7 +119,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		messages = prepared
 		contextWindow = &info
 	}
-	tokens, imageEmbeds, err := r.renderMessagesForGeneration(messages, options.SystemPrompt, options.ActiveTools())
+	tokens, imageEmbeds, err := r.renderMessagesForGeneration(messages, options.SystemPrompt, options.ActiveTools(), options.FIMSuffix)
 	if err != nil {
 		return GenerationResult{}, err
 	}

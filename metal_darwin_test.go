@@ -514,6 +514,104 @@ func TestMetalMinistral3BFFNBatchDispatchMatchesCPU(t *testing.T) {
 	assertMetalMatvecClose(t, got, want)
 }
 
+// TestMetalMinistral3BQKVBatchDispatchMatchesCPU exercises the fused Q/K/V
+// prefill kernel (metalDenseBatchProjectionQKV / gllm_decode_project_qkv) at
+// real Ministral-3B GQA dimensions -- Q4_K query, Q4_K key, Q6_K value,
+// deliberately using different quant types per matrix since the fused path
+// (unlike the FFN's fixed pairings) dispatches each independently. This
+// drives the dense decoder's own bound weight handles (via metalDenseFor),
+// the same ones the single-token fused decode step uses, since those are
+// prepared unconditionally -- unlike the standalone per-weight preparation
+// path, which skips GQA-narrow attention projections at single-token batch
+// size (see TestMetalMinistralSelectivePreparationThresholds).
+func TestMetalMinistral3BQKVBatchDispatchMatchesCPU(t *testing.T) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const dim, hidden, headDim, nHeads, nKVHeads, batch = 3072, 9216, 128, 24, 8, 32
+	qRows, kvRows := nHeads*headDim, nKVHeads*headDim
+	rng := rand.New(rand.NewSource(211))
+	q4Row := func(cols int) []byte { return randomQ4KRow(rng, cols) }
+	repeatRow := func(row []byte, rows int) []byte {
+		data := make([]byte, rows*len(row))
+		for r := range rows {
+			copy(data[r*len(row):], row)
+		}
+		return data
+	}
+	qData := repeatRow(q4Row(dim), qRows)
+	kData := repeatRow(q4Row(dim), kvRows)
+	vData := repeatRow(randomQ6KRow(rng, dim), kvRows)
+	oData := repeatRow(q4Row(qRows), dim)
+	gateData := repeatRow(q4Row(dim), hidden)
+	upData := repeatRow(q4Row(dim), hidden)
+	downData := repeatRow(randomQ6KRow(rng, hidden), dim)
+
+	inputs := make([]float32, batch*dim)
+	for i := range inputs {
+		inputs[i] = float32((i*17)%71-35) / 23
+	}
+	wantQ := make([]float32, batch*qRows)
+	wantK := make([]float32, batch*kvRows)
+	wantV := make([]float32, batch*kvRows)
+	for token := 0; token < batch; token++ {
+		x := inputs[token*dim : (token+1)*dim]
+		outQ, outK, outV := wantQ[token*qRows:(token+1)*qRows], wantK[token*kvRows:(token+1)*kvRows], wantV[token*kvRows:(token+1)*kvRows]
+		MatvecQ4KInto(qData, x, qRows, dim, &outQ)
+		MatvecQ4KInto(kData, x, kvRows, dim, &outK)
+		MatvecQ6KInto(vData, x, kvRows, dim, &outV)
+	}
+
+	ones := make([]float32, dim)
+	for i := range ones {
+		ones[i] = 1
+	}
+	config := Config{
+		Arch: "ministral", Dim: dim, HiddenDim: hidden, NLayers: 1, NHeads: nHeads, NKVHeads: nKVHeads,
+		VocabSize: 4, HeadDim: headDim, ValueDim: headDim, KVDim: kvRows, KVMul: nHeads / nKVHeads,
+		RopeTheta: 10000, RopeDimensionCount: headDim, RMSNormEps: 1e-5,
+		EmbeddingScale: 1, ResidualScale: 1, LogitScale: 1,
+	}
+	layer := LayerWeights{
+		AttnNorm: ones, FFNNorm: ones,
+		WQ: Weight{Raw: qData, Type: GGMLTypeQ4_K, Rows: qRows, Cols: dim},
+		WK: Weight{Raw: kData, Type: GGMLTypeQ4_K, Rows: kvRows, Cols: dim},
+		WV: Weight{Raw: vData, Type: GGMLTypeQ6_K, Rows: kvRows, Cols: dim},
+		WO: Weight{Raw: oData, Type: GGMLTypeQ4_K, Rows: dim, Cols: qRows},
+		W1: Weight{Raw: gateData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
+		W3: Weight{Raw: upData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
+		W2: Weight{Raw: downData, Type: GGMLTypeQ6_K, Rows: dim, Cols: hidden},
+	}
+	layer.W1.Metal = prepareMetalWeight(gateData, GGMLTypeQ4_K, hidden, dim, false)
+	if layer.W1.Metal == nil {
+		t.Fatalf("prepare FFN gate Metal weight: %s", MetalError())
+	}
+	defer releaseMetalWeight(layer.W1.Metal)
+	weights := ModelWeights{OutputNorm: ones, Layers: []LayerWeights{layer}}
+
+	cache := NewKVCache(1, kvRows, kvRows, batch)
+	buf := NewDecodeBuffer(config, headDim, nKVHeads, headDim)
+	defer func() {
+		if buf.metalDense != nil {
+			buf.metalDense.close()
+		}
+	}()
+	if !prepareMetalDenseBatch(config, weights, cache, buf, batch) {
+		t.Fatalf("Ministral fixture not eligible for the dense batch path: %s", MetalError())
+	}
+
+	gotQ := make([]float32, batch*qRows)
+	gotK := make([]float32, batch*kvRows)
+	gotV := make([]float32, batch*kvRows)
+	if !metalDenseBatchProjectionQKV(buf, 0, inputs, gotQ, gotK, gotV, batch) {
+		t.Fatalf("Ministral QKV batch Metal dispatch: %s", MetalError())
+	}
+	assertMetalMatvecClose(t, gotQ, wantQ)
+	assertMetalMatvecClose(t, gotK, wantK)
+	assertMetalMatvecClose(t, gotV, wantV)
+}
+
 // TestMetalMinistral3BForwardBatchMatchesCPU exercises the production caller,
 // not only the backend kernel: Q/K/V and attention remain on the CPU while a
 // real-shape no-bias SwiGLU block takes the GPU-resident batch route. This
@@ -653,6 +751,13 @@ func testMetalMinistralForwardBatch(t *testing.T, downQ4 bool, batch int) {
 	ForwardBatchInto(config, metalWeights, metalCache, metalBuf, tokens, 0, true, &metalLogits)
 	assertMetalMatvecClose(t, metalLogits, cpuLogits)
 	assertMetalMatvecClose(t, metalBuf.XN, cpuBuf.XN)
+	// At a real prefill chunk size (>= 16 tokens), the fused Q/K/V batch
+	// projection (metalDenseBatchProjectionQKV) must actually have run, not
+	// silently fallen back to the per-token CPU path: prepareMetalDenseBatch
+	// binding a decoder is what metalBuf.metalDense != nil reports.
+	if batch >= 16 && metalBuf.metalDense == nil {
+		t.Fatal("expected the dense batch decoder (and fused Q/K/V projection) to be bound at this batch size")
+	}
 	// The direct batch kernel writes straight from GPU-resident FFN
 	// intermediates into Proj. Retaining the CPU gate/up/hidden slabs here
 	// would add three unused large allocations to every Metal prompt chunk.

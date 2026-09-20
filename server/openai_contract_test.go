@@ -12,6 +12,28 @@ import (
 	"testing"
 )
 
+// /v1/completions' "suffix" field (OpenAI's legacy fill-in-the-middle shape)
+// must reach GenerationOptions.FIMSuffix and fail with a clear, client-facing
+// error on a checkpoint whose vocabulary has no Codestral [PREFIX]/[SUFFIX]/
+// [MIDDLE] control tokens, rather than silently completing as if "suffix" had
+// been ignored.
+func TestCompletionsSuffixRequestsFIMAndFailsClearlyWithoutInfillTokens(t *testing.T) {
+	r, err := gopherllm.RunnerFromGGUFBytes(buildTinyLlamaGGUF())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	h := NewHandler(r, HandlerOptions{Defaults: gopherllm.DefaultGenerationOptions()})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/completions", strings.NewReader(`{"prompt":"def add(a, b):\n    ","suffix":"\n    return result\n"}`)))
+	if w.Code < 400 {
+		t.Fatalf("expected a client error, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "PREFIX") && !strings.Contains(w.Body.String(), "Codestral") {
+		t.Fatalf("expected the error to explain the missing FIM tokens, got %s", w.Body.String())
+	}
+}
+
 func TestOpenAIRejectsUnknownModelAndFormat(t *testing.T) {
 	r, err := gopherllm.RunnerFromGGUFBytes(buildTinyLlamaGGUF())
 	if err != nil {
@@ -53,7 +75,7 @@ func TestToolRoundtripContract(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
-	streamChatWithGenerator(w, req, io.Discard, "test", "llama", "test", options, true, func(func(string) bool, func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
+	streamChatWithGenerator(w, req, io.Discard, "test", "llama", "test", false, options, true, func(func(string) bool, func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
 		return result, nil
 	})
 	var reconstructed []gopherllm.ToolCall
@@ -90,12 +112,37 @@ func TestToolRoundtripContract(t *testing.T) {
 func TestSSEUnexpectedEmptyAndFailure(t *testing.T) {
 	for _, inferenceErr := range []error{nil, errors.New("failed")} {
 		w := httptest.NewRecorder()
-		streamChatWithGenerator(w, httptest.NewRequest("POST", "/", nil), io.Discard, "id", "llama", "model", gopherllm.DefaultGenerationOptions(), false, func(func(string) bool, func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
+		streamChatWithGenerator(w, httptest.NewRequest("POST", "/", nil), io.Discard, "id", "llama", "model", false, gopherllm.DefaultGenerationOptions(), false, func(func(string) bool, func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
 			return gopherllm.GenerationResult{}, inferenceErr
 		})
 		if !strings.Contains(w.Body.String(), `"error":`) || strings.Contains(w.Body.String(), `"finish_reason":"stop"`) {
 			t.Fatal(w.Body.String())
 		}
+	}
+}
+
+// The native [THINK]/[/THINK] streaming splitter must engage from the
+// mistralThink flag alone, not from the raw architecture string: GGUFs across
+// the mistral/mistral3/ministral/mixtral labels declare general.architecture
+// inconsistently, so a model resolved to plain "mistral" (not "mistral3")
+// that still emits the native protocol must not fall through to the generic
+// <think> splitter and leak "[THINK]"/"[/THINK]" as literal content.
+func TestStreamMistralThinkProtocolKeyedOnFlagNotArchString(t *testing.T) {
+	w := httptest.NewRecorder()
+	streamChatWithGenerator(w, httptest.NewRequest("POST", "/", nil), io.Discard, "id", "mistral", "model", true, gopherllm.DefaultGenerationOptions(), false,
+		func(onToken func(string) bool, observe func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
+			onToken("[THINK]reasoning[/THINK]answer")
+			return gopherllm.GenerationResult{FinishReason: "stop"}, nil
+		})
+	body := w.Body.String()
+	if !strings.Contains(body, `"reasoning_content":"reasoning"`) {
+		t.Fatalf("expected native [THINK] protocol to produce a reasoning_content delta, got %s", body)
+	}
+	if !strings.Contains(body, `"content":"answer"`) {
+		t.Fatalf("expected the post-[/THINK] text as a content delta, got %s", body)
+	}
+	if strings.Contains(body, "[THINK]") || strings.Contains(body, "[/THINK]") {
+		t.Fatalf("[THINK]/[/THINK] markers must not leak into any delta, got %s", body)
 	}
 }
 func TestAdmissionRejectsWithoutQueueAndReleases(t *testing.T) {

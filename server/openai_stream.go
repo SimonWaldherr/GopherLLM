@@ -27,14 +27,14 @@ type reasoningStreamSplitter interface {
 // arrive; the final gopherllm.GenerationResult remains authoritative for tool calls and
 // for the buffered agentic path.
 func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool, includeUsage bool) {
-	streamChatWithGenerator(w, req, logw, requestID, r.Architecture(), model, options, includeUsage, func(onToken func(string) bool, observe func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
+	streamChatWithGenerator(w, req, logw, requestID, r.Architecture(), model, r.UsesMistralThinkProtocol(), options, includeUsage, func(onToken func(string) bool, observe func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
 		return gopherllm.RunAgenticChatObserved(r, messages, options, skills, tools, onToken, observe)
 	})
 }
 
 type chatGenerator func(func(string) bool, func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error)
 
-func streamChatWithGenerator(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID, arch, model string, options gopherllm.GenerationOptions, includeUsage bool, generate chatGenerator) {
+func streamChatWithGenerator(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID, arch, model string, mistralThink bool, options gopherllm.GenerationOptions, includeUsage bool, generate chatGenerator) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -57,9 +57,13 @@ func streamChatWithGenerator(w http.ResponseWriter, req *http.Request, logw io.W
 	// marker received is the closing tag. Other models emit the opening marker
 	// themselves.
 	var thinkSplitter reasoningStreamSplitter
-	if arch == "mistral3" {
-		// Ministral-3-Reasoning uses the native [THINK] protocol recorded in
-		// its GGUF template, rather than the <think> protocol below.
+	if mistralThink {
+		// Magistral/Ministral-Reasoning use the native [THINK] protocol
+		// recorded in their GGUF chat template, rather than the <think>
+		// protocol below. Keyed on the resolved template kind, not the raw
+		// architecture string, since a GGUF may declare "mistral", "mixtral",
+		// or "ministral" just as validly as "mistral3" for a model that still
+		// emits this native protocol.
 		splitter := gopherllm.NewMistralThinkStreamSplitter()
 		thinkSplitter = &splitter
 	} else {

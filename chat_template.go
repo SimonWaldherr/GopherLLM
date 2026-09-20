@@ -68,6 +68,19 @@ func (r *Runner) isStopToken(token uint32) bool {
 	return token == r.tok.EOSID
 }
 
+// UsesMistralThinkProtocol reports whether generated reasoning should be
+// split on the native [THINK]/[/THINK] control tokens rather than the
+// generic <think></think> convention. This is keyed on chatTemplateKind
+// rather than the raw architecture string deliberately: GGUFs across the
+// "mistral"/"mistral3"/"ministral"/"mixtral" architecture labels declare
+// general.architecture inconsistently (see ResolveArchitecture), so any
+// exact match against one of those strings alone silently misses the others
+// — extractMistralThink/classifyOutput already branch on the template kind
+// for exactly this reason.
+func (r *Runner) UsesMistralThinkProtocol() bool {
+	return r.chatTemplateKind() == "mistral-inst"
+}
+
 func (r *Runner) chatTemplateKind() string {
 	if r == nil || r.tok == nil {
 		return ""

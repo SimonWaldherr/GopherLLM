@@ -24,8 +24,10 @@ type ChatMessage struct {
 	Role    ChatRole
 	Content string
 	// Images attaches image content to a user message for a model loaded
-	// with a vision projector (Runner.HasVision). Capped at one image per
-	// message for now — see ImageContent.
+	// with a vision projector (Runner.HasVision). Multiple images per message
+	// are supported by the Mistral/Pixtral renderer (each is spliced in as its
+	// own independent [IMG]...[IMG_END] block); other vision-capable renderers
+	// may still be limited to one — see ImageContent.
 	Images []ImageContent
 	// ToolCalls is set on an assistant message that is replaying a prior turn
 	// in which the model requested one or more tool calls.
@@ -47,10 +49,10 @@ func UserMessage(content string) ChatMessage {
 	return ChatMessage{Role: ChatRoleUser, Content: content}
 }
 
-// UserMessageWithImages is UserMessage plus one or more attached images.
-// Only the first image is used today — a message carrying more than one is
-// rejected at render time with a clear error rather than silently dropping
-// the extras.
+// UserMessageWithImages is UserMessage plus one or more attached images. The
+// Mistral/Pixtral renderer accepts all of them; other vision-capable
+// renderers may reject a message carrying more than one at render time
+// rather than silently dropping the extras.
 func UserMessageWithImages(content string, images ...ImageContent) ChatMessage {
 	return ChatMessage{Role: ChatRoleUser, Content: content, Images: images}
 }
@@ -78,6 +80,15 @@ type GenerationOptions struct {
 	// token; non-greedy sampling is rejected rather than silently changing its
 	// distribution.
 	MTPDraftTokens int
+	// FIMSuffix switches generation from ordinary chat completion to
+	// Mistral/Codestral fill-in-the-middle: the single message passed to
+	// GenerateChat (its Content, plain text, no chat template applied) is
+	// rendered as the FIM prefix and FIMSuffix as the suffix, in Codestral's
+	// native "[PREFIX]{prefix}[SUFFIX]{suffix}[MIDDLE]" control-token protocol
+	// (see renderCodestralFIM). Empty (the default) leaves ordinary chat
+	// rendering in effect. GenerateFIM/GenerateFIMStream set this for callers
+	// rather than requiring it to be threaded by hand.
+	FIMSuffix string
 	// ContextWindowMode controls whether an oversized chat history fails as it
 	// historically did (full, the zero-value behavior), is reduced to the
 	// newest complete turns before rendering (recent), or lexically condensed

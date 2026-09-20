@@ -66,6 +66,9 @@ typedef struct {
 	id<MTLBuffer> hidden;
 	id<MTLBuffer> out;
 	id<MTLBuffer> argmax;
+	id<MTLBuffer> q;
+	id<MTLBuffer> k;
+	id<MTLBuffer> v;
 } GLLMMetalBatchWorkspace;
 
 static id<MTLDevice> gllm_device = nil;
@@ -1315,6 +1318,110 @@ static void gllm_metal_release_weight(void* handle) {
 #include "q8_0.h"
 #include "decode.h"
 #include "geglu.h"
+
+// gllm_metal_ensure_batch_qkv_buffers sizes the shared workspace for a fused
+// Q/K/V prefill projection: one input slab (the post-attention-norm hidden
+// state, [batch][cols]) and three independently-sized output slabs -- Q, K,
+// and V can have different row counts under grouped-query attention.
+static bool gllm_metal_ensure_batch_qkv_buffers(GLLMMetalWeight* wq, GLLMMetalWeight* wk, GLLMMetalWeight* wv, int batch) {
+	if (wq == NULL || wk == NULL || wv == NULL || batch <= 0 || batch > GLLM_BATCH_FFN_MAX_TOKENS ||
+		wq->cols <= 0 || wq->rows <= 0 || wk->rows <= 0 || wv->rows <= 0 || wk->cols != wq->cols || wv->cols != wq->cols) {
+		return false;
+	}
+	NSUInteger count = (NSUInteger)batch;
+	if (count > NSUIntegerMax / sizeof(float) / (NSUInteger)wq->cols ||
+		count > NSUIntegerMax / sizeof(float) / (NSUInteger)wq->rows ||
+		count > NSUIntegerMax / sizeof(float) / (NSUInteger)wk->rows ||
+		count > NSUIntegerMax / sizeof(float) / (NSUInteger)wv->rows) {
+		strncpy(gllm_error, "Metal prefill QKV batch is too large", sizeof(gllm_error) - 1);
+		return false;
+	}
+	NSUInteger x_len = count * (NSUInteger)wq->cols * sizeof(float);
+	NSUInteger q_len = count * (NSUInteger)wq->rows * sizeof(float);
+	NSUInteger k_len = count * (NSUInteger)wk->rows * sizeof(float);
+	NSUInteger v_len = count * (NSUInteger)wv->rows * sizeof(float);
+	return gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x, x_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.q, q_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.k, k_len) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.v, v_len);
+}
+
+// gllm_metal_encode_quantized_to dispatches the batched matvec kernel
+// matching quant (4=Q4_K, 6=Q6_K, 8=Q8_0) onto an already-open encoder, so a
+// caller can chain several matrices into one command buffer instead of one
+// command buffer (and one CPU/GPU synchronization) per matrix.
+static void gllm_metal_encode_quantized_to(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, uint32_t quant, id<MTLBuffer> x, id<MTLBuffer> out, int batch, int rows_per_group) {
+	if (quant == 4) gllm_metal_encode_q4k_to(enc, w, x, out, batch, rows_per_group);
+	else if (quant == 6) gllm_metal_encode_q6k_to(enc, w, x, out, batch, rows_per_group);
+	else gllm_metal_encode_q8_0_to(enc, w, x, out, batch);
+}
+
+// gllm_decode_project_qkv fuses a prompt chunk's Q, K, and V projections --
+// they all read the same normalized input and are otherwise independent of
+// one another -- into one command buffer and one CPU/GPU synchronization
+// instead of three (gllm_decode_project called once per matrix). Prefill at
+// these token counts spends much of its wall time on per-command-buffer
+// submission/completion overhead rather than the matmuls themselves; this
+// banks the same win gllm_metal_q4k2_silu_batch already does for the FFN's
+// Gate/Up/Down, applied to the attention projections. It reuses the
+// decoder's already-bound weight handles (set once by gllm_decode_layer),
+// the same ones the single-token fused decode step uses -- those are
+// prepared unconditionally for any dense-eligible model, unlike the
+// standalone per-weight preparation path, which skips GQA-narrow attention
+// projections as not worth a standalone dispatch at single-token batch size.
+static int gllm_decode_project_qkv(void* ptr, int layer, const float* x, float* q_out, float* k_out, float* v_out, int batch) {
+	@autoreleasepool {
+		GLLMDecoder* d = ptr;
+		if (d == NULL || layer < 0 || layer >= d->layers || batch < 16 || batch > 256) return 0;
+		GLLMDecodeLayer* l = &d->layer[layer];
+		GLLMMetalWeight* wq = l->w[0];
+		GLLMMetalWeight* wk = l->w[1];
+		GLLMMetalWeight* wv = l->w[2];
+		uint32_t q_quant = l->quant[0], k_quant = l->quant[1], v_quant = l->quant[2];
+		if (wq == NULL || wk == NULL || wv == NULL || x == NULL || q_out == NULL || k_out == NULL || v_out == NULL ||
+			wq->weights == nil || wk->weights == nil || wv->weights == nil ||
+			(q_quant != 4 && q_quant != 6 && q_quant != 8) ||
+			(k_quant != 4 && k_quant != 6 && k_quant != 8) ||
+			(v_quant != 4 && v_quant != 6 && v_quant != 8) ||
+			!gllm_metal_init_q4k() || !gllm_metal_init_q6k() || !gllm_metal_init_q8_0()) {
+			return 0;
+		}
+		// gllm_queue is process-global. Locking its small reusable workspace
+		// here matches gllm_metal_q4k2_silu_batch: it avoids retaining Q/K/V
+		// scratch per layer and protects two concurrent runners from
+		// overlapping writes; the command buffer is already synchronous, so
+		// this does not add a GPU synchronization point of its own.
+		@synchronized(gllm_queue) {
+			if (!gllm_metal_ensure_batch_qkv_buffers(wq, wk, wv, batch)) {
+				return 0;
+			}
+			NSUInteger count = (NSUInteger)batch;
+			NSUInteger x_len = count * (NSUInteger)wq->cols * sizeof(float);
+			NSUInteger q_len = count * (NSUInteger)wq->rows * sizeof(float);
+			NSUInteger k_len = count * (NSUInteger)wk->rows * sizeof(float);
+			NSUInteger v_len = count * (NSUInteger)wv->rows * sizeof(float);
+			memcpy([gllm_batch_workspace.x contents], x, x_len);
+
+			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			gllm_metal_encode_quantized_to(enc, wq, q_quant, gllm_batch_workspace.x, gllm_batch_workspace.q, batch, 4);
+			gllm_metal_encode_quantized_to(enc, wk, k_quant, gllm_batch_workspace.x, gllm_batch_workspace.k, batch, 4);
+			gllm_metal_encode_quantized_to(enc, wv, v_quant, gllm_batch_workspace.x, gllm_batch_workspace.v, batch, 4);
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			int ok = [cb status] == MTLCommandBufferStatusCompleted;
+			if (ok) {
+				memcpy(q_out, [gllm_batch_workspace.q contents], q_len);
+				memcpy(k_out, [gllm_batch_workspace.k contents], k_len);
+				memcpy(v_out, [gllm_batch_workspace.v contents], v_len);
+			} else {
+				strncpy(gllm_error, "Metal batched fused QKV command buffer failed", sizeof(gllm_error) - 1);
+			}
+			return ok;
+		}
+	}
+}
 */
 import "C"
 
@@ -1801,4 +1908,22 @@ func (d *Decoder) Project(layer, matrix int, x, out []float32, batch int) bool {
 	ok := bool(C.gllm_decode_project(d.ptr, C.int(layer), C.int(matrix), (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])), C.int(batch)))
 	runtime.KeepAlive(d)
 	return ok
+}
+
+// ProjectQKV is Project for matrices 0, 1, and 2 (Q, K, V) fused into one
+// command buffer and one CPU/GPU synchronization instead of three separate
+// Project calls -- see gllm_decode_project_qkv's doc comment. qOut/kOut/vOut
+// are [batch][heads*128]/[batch][kvheads*128]/[batch][kvheads*128] slabs.
+func (d *Decoder) ProjectQKV(layer int, x, qOut, kOut, vOut []float32, batch int) bool {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || batch < 16 || batch > 256 {
+		return false
+	}
+	qRows, kvRows := d.heads*128, d.kvheads*128
+	if batch > len(x)/d.dim || batch > len(qOut)/qRows || batch > len(kOut)/kvRows || batch > len(vOut)/kvRows {
+		return false
+	}
+	ok := C.gllm_decode_project_qkv(d.ptr, C.int(layer), (*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&qOut[0])), (*C.float)(unsafe.Pointer(&kOut[0])), (*C.float)(unsafe.Pointer(&vOut[0])), C.int(batch))
+	runtime.KeepAlive(d)
+	return ok != 0
 }
