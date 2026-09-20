@@ -92,3 +92,6 @@ func metalDenseBatchProjection(*DecodeBuffer, int, int, []float32, []float32, in
 func metalDenseBatchProjectionQKV(*DecodeBuffer, int, []float32, []float32, []float32, []float32, int) bool {
 	return false
 }
+func metalDenseBatchAttention(*DecodeBuffer, int, *KVCache, []float32, int, int, []float32) bool {
+	return false
+}

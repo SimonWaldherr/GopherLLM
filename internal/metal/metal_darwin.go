@@ -69,6 +69,7 @@ typedef struct {
 	id<MTLBuffer> q;
 	id<MTLBuffer> k;
 	id<MTLBuffer> v;
+	id<MTLBuffer> attnOut;
 } GLLMMetalBatchWorkspace;
 
 static id<MTLDevice> gllm_device = nil;
@@ -1422,6 +1423,67 @@ static int gllm_decode_project_qkv(void* ptr, int layer, const float* x, float* 
 		}
 	}
 }
+
+// gllm_decode_batch_attention computes causal batched multi-head attention
+// for one layer over `batch` freshly-projected query positions
+// [start_pos, start_pos+batch), against that layer's persistent K/V buffers
+// (l->k/l->v -- the same ones the single-token fused decode step uses).
+// The caller must have already synced those buffers through position
+// start_pos+batch-1 (gllm_decode_cache's existing upload, a plain memcpy for
+// a non-shared-KV layer and a no-op when the layer already aliases the CPU
+// cache directly). q is a [batch][heads][128] slab, already RoPE-rotated and
+// temperature-scaled on the CPU exactly as the existing CPU batch path
+// does; out is the same shape, ready for the O projection.
+//
+// Each (token, head) pair gets its own 32-lane simdgroup, computing the same
+// two-pass (exact max, then exp-weighted V sum) softmax attention as the CPU
+// reference (onlineAttentionGroup) rather than the chunked partial/merge
+// split the single-token decode step uses -- with many independent
+// (token, head) work items to parallelize over instead of just one query,
+// a chunked merge buys nothing here and recomputing each score twice avoids
+// needing per-thread scratch sized to the (highly variable) attended range.
+static bool gllm_decode_batch_attention(void* ptr, int layer, const float* q, int start_pos, int batch, float* out) {
+	@autoreleasepool {
+		GLLMDecoder* d = ptr;
+		if (d == NULL || layer < 0 || layer >= d->layers || batch <= 0 || batch > GLLM_BATCH_FFN_MAX_TOKENS ||
+			start_pos < 0 || (NSUInteger)(start_pos + batch) > (NSUInteger)d->maxlen || q == NULL || out == NULL) {
+			return false;
+		}
+		GLLMDecodeLayer* l = &d->layer[layer];
+		@synchronized(gllm_queue) {
+			NSUInteger qLen = (NSUInteger)batch * (NSUInteger)d->heads * 128 * sizeof(float);
+			if (!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.q, qLen) ||
+				!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.attnOut, qLen)) {
+				return false;
+			}
+			memcpy([gllm_batch_workspace.q contents], q, qLen);
+
+			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			GLLMBatchAttnParams p = {
+				(uint32_t)d->heads, (uint32_t)d->kvheads, (uint32_t)(d->kvheads * 128),
+				(uint32_t)start_pos, (uint32_t)(l->window > 0 ? l->window : 0), d->scale,
+			};
+			[enc setComputePipelineState:gllm_dec_pipes[9]];
+			[enc setBuffer:gllm_batch_workspace.q offset:0 atIndex:0];
+			[enc setBuffer:l->k offset:0 atIndex:1];
+			[enc setBuffer:l->v offset:0 atIndex:2];
+			[enc setBuffer:gllm_batch_workspace.attnOut offset:0 atIndex:3];
+			[enc setBytes:&p length:sizeof(p) atIndex:4];
+			[enc dispatchThreadgroups:MTLSizeMake((NSUInteger)batch, (NSUInteger)d->heads, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			bool ok = [cb status] == MTLCommandBufferStatusCompleted;
+			if (ok) {
+				memcpy(out, [gllm_batch_workspace.attnOut contents], qLen);
+			} else {
+				strncpy(gllm_error, "Metal batch attention command buffer failed", sizeof(gllm_error) - 1);
+			}
+			return ok;
+		}
+	}
+}
 */
 import "C"
 
@@ -1797,6 +1859,25 @@ func (d *Decoder) Cache(layer, pos int, k, v []float32, upload bool) bool {
 	runtime.KeepAlive(d)
 	return true
 }
+
+// CacheAppend uploads only the [from,pos) suffix of the layer's K/V rows,
+// letting repeated chunked-prefill syncs avoid re-copying an already-resident
+// prefix. from is clamped to pos by the caller; from==pos is a no-op success.
+func (d *Decoder) CacheAppend(layer, from, pos int, k, v []float32) bool {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || from < 0 || pos < from || pos >= d.maxlen {
+		return false
+	}
+	n := d.kvheads * 128 * pos
+	if len(k) < n || len(v) < n {
+		return false
+	}
+	if pos == from {
+		return true
+	}
+	ok := bool(C.gllm_decode_cache_append(d.ptr, C.int(layer), C.int(from), C.int(pos), (*C.float)(unsafe.Pointer(&k[0])), (*C.float)(unsafe.Pointer(&v[0]))))
+	runtime.KeepAlive(d)
+	return ok
+}
 func (d *Decoder) Step(input, sn, cs []float32, pairs, pos int, interleaved bool, temperature float32, residual, output []float32, logits []float32, recent []uint32, penalty float32, next *uint32) bool {
 	if d == nil || d.ptr == nil || pos < 0 || pos >= d.maxlen || pairs != 64 || len(input) < d.dim || len(residual) < d.dim || len(output) < d.dim || len(sn) < pairs || len(cs) < pairs {
 		return false
@@ -1926,4 +2007,24 @@ func (d *Decoder) ProjectQKV(layer int, x, qOut, kOut, vOut []float32, batch int
 		(*C.float)(unsafe.Pointer(&qOut[0])), (*C.float)(unsafe.Pointer(&kOut[0])), (*C.float)(unsafe.Pointer(&vOut[0])), C.int(batch))
 	runtime.KeepAlive(d)
 	return ok != 0
+}
+
+// BatchAttention computes causal batched multi-head attention for one
+// layer over query positions [startPos, startPos+batch) against that
+// layer's persistent K/V buffers, honoring its configured sliding window
+// (bound once by BindLayer). The caller must sync those buffers through
+// position startPos+batch-1 first (see Cache) -- see
+// gllm_decode_batch_attention's doc comment for the full contract. q and
+// out are [batch][heads][128] slabs.
+func (d *Decoder) BatchAttention(layer int, q []float32, startPos, batch int, out []float32) bool {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || batch <= 0 || batch > 256 || startPos < 0 {
+		return false
+	}
+	width := d.heads * 128
+	if batch > len(q)/width || batch > len(out)/width {
+		return false
+	}
+	ok := C.gllm_decode_batch_attention(d.ptr, C.int(layer), (*C.float)(unsafe.Pointer(&q[0])), C.int(startPos), C.int(batch), (*C.float)(unsafe.Pointer(&out[0])))
+	runtime.KeepAlive(d)
+	return bool(ok)
 }

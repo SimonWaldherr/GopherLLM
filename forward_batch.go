@@ -625,21 +625,27 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			cache.storeKV(l, pos, K[t], V[t])
 		}
 
-		// Attention is independent per token, so spread the chunk across workers.
+		// Attention is independent per token, so spread the chunk across
+		// workers -- or, when eligible, run the whole chunk's causal
+		// attention on Metal instead: profiling a real prefill found this
+		// step, not the projections, dominates prefill wall time (see
+		// metalDenseBatchAttention's doc comment).
 		alibi := config.usesALiBi()
-		attendTask := batchAttentionTaskPool.Get().(*batchAttentionTask)
-		attendTask.cache, attendTask.q, attendTask.attnOut = cache, Q, AttnOut
-		attendTask.l, attendTask.startPos = l, startPos
-		attendTask.headDim, attendTask.valueDim = headDim, valueDim
-		attendTask.nHeads, attendTask.nKVHeads, attendTask.kvMul = config.NHeads, config.NKVHeads, kvMul
-		attendTask.slidingWindow = config.SlidingWindow
-		attendTask.scale, attendTask.softcap, attendTask.alibiMaxBias = scale, config.AttnLogitSoftcap, config.ALiBiMaxBias
-		attendTask.usesSWA = config.layerUsesSWA(l)
-		attendTask.groupedGQA = useGroupedGQAAttention && kvMul > 1 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !alibi
-		attendTask.alibi = alibi
-		parallelChunksTask(p, attendTask)
-		*attendTask = batchAttentionTask{}
-		batchAttentionTaskPool.Put(attendTask)
+		if !denseBatch || !metalDenseBatchAttention(buf, l, cache, b.QFlat, startPos, p, b.AttnOutFlat) {
+			attendTask := batchAttentionTaskPool.Get().(*batchAttentionTask)
+			attendTask.cache, attendTask.q, attendTask.attnOut = cache, Q, AttnOut
+			attendTask.l, attendTask.startPos = l, startPos
+			attendTask.headDim, attendTask.valueDim = headDim, valueDim
+			attendTask.nHeads, attendTask.nKVHeads, attendTask.kvMul = config.NHeads, config.NKVHeads, kvMul
+			attendTask.slidingWindow = config.SlidingWindow
+			attendTask.scale, attendTask.softcap, attendTask.alibiMaxBias = scale, config.AttnLogitSoftcap, config.ALiBiMaxBias
+			attendTask.usesSWA = config.layerUsesSWA(l)
+			attendTask.groupedGQA = useGroupedGQAAttention && kvMul > 1 && config.NKVHeads > 0 && len(layer.AttnSinks) == 0 && !alibi
+			attendTask.alibi = alibi
+			parallelChunksTask(p, attendTask)
+			*attendTask = batchAttentionTask{}
+			batchAttentionTaskPool.Put(attendTask)
+		}
 
 		if !denseBatch || !metalDenseBatchProjection(buf, l, 3, b.AttnOutFlat, b.ProjFlat, p) {
 			matvecBatch(layer.WO, AttnOut, Proj)

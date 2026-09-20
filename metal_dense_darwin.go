@@ -22,6 +22,13 @@ type metalDenseState struct {
 	dim, hidden, heads, kvheads, layers, window int
 	eps, scale                                  float32
 	refs, owned                                 []*metalbackend.Weight
+	// batchKVSynced[layer] is how far (position count) that layer's persistent
+	// Metal K/V buffer has been uploaded by metalDenseBatchAttention, letting
+	// each successive prefill chunk append only the new suffix instead of
+	// re-copying the whole prefix. It can only lag behind reality (e.g. after
+	// single-token decode's own full resync), never overstate it, so a stale
+	// value causes redundant-but-correct re-upload rather than stale data.
+	batchKVSynced []int
 }
 
 func (s *metalDenseState) close() {
@@ -77,7 +84,7 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache) *metalDenseState {
 	if scale == 0 {
 		scale = float32(1 / math.Sqrt(128))
 	}
-	s := &metalDenseState{sharedK: make([][]float32, c.NLayers), sharedV: make([][]float32, c.NLayers), owner: &w.Layers[0], cache: k, dim: c.Dim, hidden: c.HiddenDim, heads: c.NHeads, kvheads: c.NKVHeads, layers: c.NLayers, window: c.SlidingWindow, eps: c.RMSNormEps, scale: c.AttentionScale}
+	s := &metalDenseState{sharedK: make([][]float32, c.NLayers), sharedV: make([][]float32, c.NLayers), owner: &w.Layers[0], cache: k, dim: c.Dim, hidden: c.HiddenDim, heads: c.NHeads, kvheads: c.NKVHeads, layers: c.NLayers, window: c.SlidingWindow, eps: c.RMSNormEps, scale: c.AttentionScale, batchKVSynced: make([]int, c.NLayers)}
 	s.decoder = metalbackend.NewDecoder(c.Dim, c.HiddenDim, c.NHeads, c.NKVHeads, c.NLayers, k.MaxLen, c.RMSNormEps, scale, w.OutputNorm)
 	if s.decoder == nil {
 		return nil
@@ -358,6 +365,48 @@ func metalDenseBatchProjectionQKV(b *DecodeBuffer, layer int, x, qOut, kOut, vOu
 	}
 	s := b.metalDense
 	ok := s.decoder.ProjectQKV(layer, x, qOut, kOut, vOut, batch)
+	runtime.KeepAlive(s) // The state owns/pins the decoder's borrowed weights and KV.
+	return ok
+}
+
+var metalBatchAttentionEnabled = os.Getenv("GOPHERLLM_METAL_BATCH_ATTENTION") != "0"
+
+// metalDenseBatchAttention runs causal batched multi-head attention for one
+// layer's prompt chunk on Metal: gllm_decode_batch_attention's doc comment
+// has the full contract. q is [batch][heads*128], already RoPE-rotated and
+// temperature-scaled on the CPU exactly as the CPU attention path expects;
+// out is the same shape. It first syncs the decoder's persistent per-layer
+// K/V buffers (a plain memcpy, or a no-op when they already alias cache
+// directly) through the end of this chunk, since attendHeadGroup's CPU
+// counterpart reads the equivalent Go-side cache.K/cache.V slices, which
+// forward_batch.go's cache.storeKV calls have already updated by the time
+// attention runs.
+//
+// A profiled real prefill (long prompt, real Ministral-3B checkpoint) found
+// this CPU attention step -- not the projections -- was 93% of prefill wall
+// time: an O(n^2) computation the CPU path parallelizes only across
+// goroutines, where Metal parallelizes across thousands of independent
+// (token, head) GPU threads instead.
+func metalDenseBatchAttention(b *DecodeBuffer, layer int, cache *KVCache, q []float32, startPos, batch int, out []float32) bool {
+	if !metalBatchAttentionEnabled || b == nil || b.metalDense == nil || cache == nil {
+		return false
+	}
+	s := b.metalDense
+	pos := startPos + batch
+	from := 0
+	if layer < len(s.batchKVSynced) {
+		from = s.batchKVSynced[layer]
+		if from > pos {
+			from = 0
+		}
+	}
+	if !s.decoder.CacheAppend(layer, from, pos, cache.K[layer], cache.V[layer]) {
+		return false
+	}
+	if layer < len(s.batchKVSynced) {
+		s.batchKVSynced[layer] = pos
+	}
+	ok := s.decoder.BatchAttention(layer, q, startPos, batch, out)
 	runtime.KeepAlive(s) // The state owns/pins the decoder's borrowed weights and KV.
 	return ok
 }

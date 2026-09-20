@@ -612,6 +612,127 @@ func TestMetalMinistral3BQKVBatchDispatchMatchesCPU(t *testing.T) {
 	assertMetalMatvecClose(t, gotV, wantV)
 }
 
+// TestMetalMinistral3BBatchAttentionMatchesCPU exercises the batched Metal
+// attention kernel (gllm_decode_batch_attention) against the CPU reference
+// (KVCache.attendHeadGroup) at real Ministral-3B GQA dimensions, with a
+// prior turn's history already resident (priorLen positions, populated
+// independently of this chunk) -- once with no sliding window (plain causal
+// masking, e.g. Mistral NeMo/Large) and once with an active window narrower
+// than the total sequence length (e.g. Ministral 8B's windowed layers), so
+// both of the kernel's start-position branches are exercised.
+func TestMetalMinistral3BBatchAttentionMatchesCPU(t *testing.T) {
+	t.Run("no_window", func(t *testing.T) { testMetalMinistral3BBatchAttentionMatchesCPU(t, 0) })
+	t.Run("sliding_window", func(t *testing.T) { testMetalMinistral3BBatchAttentionMatchesCPU(t, 40) })
+}
+
+func testMetalMinistral3BBatchAttentionMatchesCPU(t *testing.T, window int) {
+	if !MetalAvailable() {
+		t.Skip(MetalError())
+	}
+	forceExactMetalReference(t)
+	const dim, hidden, headDim, nHeads, nKVHeads, batch, priorLen, maxlen = 3072, 9216, 128, 24, 8, 32, 64, 256
+	qRows, kvRows, kvMul := nHeads*headDim, nKVHeads*headDim, nHeads/nKVHeads
+	rng := rand.New(rand.NewSource(311))
+	q4Row := func(cols int) []byte { return randomQ4KRow(rng, cols) }
+	repeatRow := func(row []byte, rows int) []byte {
+		data := make([]byte, rows*len(row))
+		for r := range rows {
+			copy(data[r*len(row):], row)
+		}
+		return data
+	}
+	qData := repeatRow(q4Row(dim), qRows)
+	kData := repeatRow(q4Row(dim), kvRows)
+	vData := repeatRow(randomQ6KRow(rng, dim), kvRows)
+	oData := repeatRow(q4Row(qRows), dim)
+	gateData := repeatRow(q4Row(dim), hidden)
+	upData := repeatRow(q4Row(dim), hidden)
+	downData := repeatRow(randomQ6KRow(rng, hidden), dim)
+
+	ones := make([]float32, dim)
+	for i := range ones {
+		ones[i] = 1
+	}
+	config := Config{
+		Arch: "ministral", Dim: dim, HiddenDim: hidden, NLayers: 1, NHeads: nHeads, NKVHeads: nKVHeads,
+		VocabSize: 4, HeadDim: headDim, ValueDim: headDim, KVDim: kvRows, KVMul: kvMul,
+		RopeTheta: 10000, RopeDimensionCount: headDim, RMSNormEps: 1e-5,
+		EmbeddingScale: 1, ResidualScale: 1, LogitScale: 1,
+		SlidingWindow: window,
+	}
+	layer := LayerWeights{
+		AttnNorm: ones, FFNNorm: ones,
+		WQ: Weight{Raw: qData, Type: GGMLTypeQ4_K, Rows: qRows, Cols: dim},
+		WK: Weight{Raw: kData, Type: GGMLTypeQ4_K, Rows: kvRows, Cols: dim},
+		WV: Weight{Raw: vData, Type: GGMLTypeQ6_K, Rows: kvRows, Cols: dim},
+		WO: Weight{Raw: oData, Type: GGMLTypeQ4_K, Rows: dim, Cols: qRows},
+		W1: Weight{Raw: gateData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
+		W3: Weight{Raw: upData, Type: GGMLTypeQ4_K, Rows: hidden, Cols: dim},
+		W2: Weight{Raw: downData, Type: GGMLTypeQ6_K, Rows: dim, Cols: hidden},
+	}
+	layer.W1.Metal = prepareMetalWeight(gateData, GGMLTypeQ4_K, hidden, dim, false)
+	if layer.W1.Metal == nil {
+		t.Fatalf("prepare FFN gate Metal weight: %s", MetalError())
+	}
+	defer releaseMetalWeight(layer.W1.Metal)
+	weights := ModelWeights{OutputNorm: ones, Layers: []LayerWeights{layer}}
+
+	cache := NewKVCache(1, kvRows, kvRows, maxlen)
+	buf := NewDecodeBuffer(config, headDim, nKVHeads, headDim)
+	defer func() {
+		if buf.metalDense != nil {
+			buf.metalDense.close()
+		}
+	}()
+	if !prepareMetalDenseBatch(config, weights, cache, buf, batch) {
+		t.Fatalf("Ministral fixture not eligible for the dense batch path: %s", MetalError())
+	}
+
+	total := priorLen + batch
+	randRow := func(n int) []float32 {
+		row := make([]float32, n)
+		for i := range row {
+			row[i] = float32(rng.NormFloat64()) * 0.1
+		}
+		return row
+	}
+	for pos := 0; pos < total; pos++ {
+		cache.storeKV(0, pos, randRow(kvRows), randRow(kvRows))
+	}
+	q := randRow(batch * qRows)
+
+	// Sync the decoder's persistent per-layer K/V buffers through the end of
+	// this chunk -- the same upload gllm_decode_step already relies on for
+	// single-token decode, just called once per chunk instead of once per
+	// token.
+	if !buf.metalDense.decoder.Cache(0, total, cache.K[0], cache.V[0], true) {
+		t.Fatal("Cache upload failed")
+	}
+
+	got := make([]float32, batch*qRows)
+	if !buf.metalDense.decoder.BatchAttention(0, q, priorLen, batch, got) {
+		t.Fatalf("BatchAttention: %s", MetalError())
+	}
+
+	scale := float32(1 / math.Sqrt(float64(headDim)))
+	want := make([]float32, batch*qRows)
+	for token := 0; token < batch; token++ {
+		pos := priorLen + token
+		attnStart := 0
+		if window > 0 && pos > window {
+			attnStart = pos - window
+		}
+		qTok := q[token*qRows : (token+1)*qRows]
+		outTok := want[token*qRows : (token+1)*qRows]
+		for kv := 0; kv < nKVHeads; kv++ {
+			hStart := kv * kvMul
+			cache.attendHeadGroup(0, kv, qTok[hStart*headDim:(hStart+kvMul)*headDim], kvMul,
+				headDim, headDim, attnStart, pos, scale, 0, outTok[hStart*headDim:(hStart+kvMul)*headDim])
+		}
+	}
+	assertMetalFiniteClose(t, got, want)
+}
+
 // TestMetalMinistral3BForwardBatchMatchesCPU exercises the production caller,
 // not only the backend kernel: Q/K/V and attention remain on the CPU while a
 // real-shape no-bias SwiGLU block takes the GPU-resident batch route. This

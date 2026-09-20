@@ -111,10 +111,32 @@ static const char* gllm_decode_source =
 " }\n"
 " sum=simd_sum(sum);if(lane==0)y[row]=sum;\n"
 "}\n"
+"struct BAP { uint heads; uint kvheads; uint stride; uint start_pos; uint window; float scale; };\n"
+"kernel void dec_batch_attention(const device float* q [[buffer(0)]],const device float* k [[buffer(1)]],const device float* v [[buffer(2)]],device float* out [[buffer(3)]],constant BAP& p [[buffer(4)]],uint2 group [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" uint token=group.x,head=group.y;\n"
+" uint kv=head/(p.heads/p.kvheads),pos=p.start_pos+token;\n"
+" uint start=(p.window>0 && pos>p.window)?pos-p.window:0;\n"
+" ulong qo=ulong(token)*p.heads*128+ulong(head)*128;\n"
+" float4 query=float4(q[qo+lane],q[qo+lane+32],q[qo+lane+64],q[qo+lane+96]);\n"
+" float m=-INFINITY;float s=0;float4 acc=0;\n"
+" for(uint t=start;t<=pos;t++) {\n"
+"  ulong i=ulong(t)*p.stride+kv*128+lane;\n"
+"  float4 key=float4(k[i],k[i+32],k[i+64],k[i+96]);\n"
+"  float score=simd_sum(dot(query,key))*p.scale;\n"
+"  float nm=max(m,score);\n"
+"  float corr=exp(m-nm);\n"
+"  float w=exp(score-nm);\n"
+"  float4 value=float4(v[i],v[i+32],v[i+64],v[i+96]);\n"
+"  acc=acc*corr+w*value;s=s*corr+w;m=nm;\n"
+" }\n"
+" ulong o=qo+lane;\n"
+" out[o]=acc.x/s;out[o+32]=acc.y/s;out[o+64]=acc.z/s;out[o+96]=acc.w/s;\n"
+"}\n"
 ;
 typedef struct { uint32_t n; float eps; } GLLMNormParams;
 typedef struct { uint32_t heads,hd,pairs,pos,stride,interleaved;float temperature; } GLLMRopeParams;
 typedef struct { uint32_t heads,kvheads,hd,stride,pos,start,chunks;float scale; } GLLMAttentionParams;
+typedef struct { uint32_t heads,kvheads,stride,start_pos,window;float scale; } GLLMBatchAttnParams;
 typedef struct {
  GLLMMetalWeight* w[7]; uint32_t quant[7];
  id<MTLBuffer> norm,ffnNorm,qNorm,kNorm,k,v;
@@ -127,7 +149,7 @@ typedef struct {
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
-static id<MTLComputePipelineState> gllm_dec_pipes[9]={nil,nil,nil,nil,nil,nil,nil,nil,nil};
+static id<MTLComputePipelineState> gllm_dec_pipes[10]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
  @synchronized(gllm_queue) {
@@ -137,18 +159,18 @@ static bool gllm_decode_init(void) {
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_decode_source] options:nil error:&error];
   if(lib==nil){gllm_set_error(@"decode shader compilation failed",error);return false;}
-  NSString* names[9]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8"};
-  id<MTLComputePipelineState> pipes[9]={nil,nil,nil,nil,nil,nil,nil,nil,nil};
+  NSString* names[10]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention"};
+  id<MTLComputePipelineState> pipes[10]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
   bool ok=true;
-  for(int i=0;i<9;i++) {
+  for(int i=0;i<10;i++) {
    id<MTLFunction> fn=[lib newFunctionWithName:names[i]];
    pipes[i]=fn!=nil?[gllm_device newComputePipelineStateWithFunction:fn error:&error]:nil;
    [fn release];
    if(pipes[i]==nil || [pipes[i] threadExecutionWidth]!=32 || [pipes[i] maxTotalThreadsPerThreadgroup]<256)ok=false;
   }
   [lib release];
-  if(!ok){for(int i=0;i<9;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
-  for(int i=0;i<9;i++)gllm_dec_pipes[i]=pipes[i];
+  if(!ok){for(int i=0;i<10;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
+  for(int i=0;i<10;i++)gllm_dec_pipes[i]=pipes[i];
   return true;
  }
  return false;
@@ -226,6 +248,19 @@ static void gllm_decode_cache(void* ptr,int layer,int pos,float* k,float* v,bool
  if(l->sharedKV)return;
  if(upload){if(pos>0){memcpy([l->k contents],k,pos*stride);memcpy([l->v contents],v,pos*stride);}}
  else {memcpy(k,(char*)[l->k contents]+pos*stride,stride);memcpy(v,(char*)[l->v contents]+pos*stride,stride);}
+}
+// gllm_decode_cache_append uploads only the [from,pos) suffix instead of the
+// whole [0,pos) prefix, letting chunked prefill amortize to O(n) total bytes
+// copied per layer instead of O(n^2) when re-syncing every chunk boundary.
+static bool gllm_decode_cache_append(void* ptr,int layer,int from,int pos,const float* k,const float* v) {
+ GLLMDecoder* d=ptr;GLLMDecodeLayer* l=&d->layer[layer];NSUInteger stride=d->kvheads*128*sizeof(float);
+ if(l->sharedKV)return true;
+ if(pos>from){
+  NSUInteger off=(NSUInteger)from*stride,len=(NSUInteger)(pos-from)*stride;
+  memcpy((char*)[l->k contents]+off,(const char*)k+off,len);
+  memcpy((char*)[l->v contents]+off,(const char*)v+off,len);
+ }
+ return true;
 }
 static bool gllm_decode_shift_cache(void* ptr,int length,int drop) {
  GLLMDecoder* d=ptr;NSUInteger stride=d->kvheads*128*sizeof(float);
