@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hestia</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  input[type=text] { width: 100%; padding: .5rem; font-size: 1rem; box-sizing: border-box; }
+  button { padding: .5rem 1rem; font-size: 1rem; margin-top: .5rem; }
+  .turn { border: 1px solid #ccc; border-radius: 6px; padding: .75rem; margin-top: .75rem; }
+  .status { font-weight: 600; }
+  .candidates button { margin: .25rem .25rem 0 0; }
+  pre { white-space: pre-wrap; background: #f5f5f5; padding: .5rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>Hestia — Auftrag (Entwicklungsoberfläche)</h1>
+<p>Beispiele: „Schalte die Stehlampe im Wohnzimmer ein.“, „Mach die Lampe im Wohnzimmer an.“</p>
+<input id="text" type="text" placeholder="Auftrag eingeben…" autofocus>
+<button id="send">Senden</button>
+<button id="mic">🎤 Sprechen</button>
+<div id="micStatus" class="status"></div>
+<div id="turns"></div>
+
+<script>
+let conversationId = null;
+
+async function ensureConversation() {
+  if (conversationId) return conversationId;
+  const r = await fetch('/api/conversations', { method: 'POST' });
+  const j = await r.json();
+  conversationId = j.conversation_id;
+  return conversationId;
+}
+
+function renderTurn(t) {
+  const div = document.createElement('div');
+  div.className = 'turn';
+  const cands = (t.Candidates || []).map(d =>
+    `<button data-device="${d.ID}" data-turn="${t.ID}" class="pick">${d.Name} (${d.Room})</button>`
+  ).join(' ');
+  const confirmGroup = (t.Status === 'clarifying' && t.Proposal && t.Proposal.Scope === 'group')
+    ? `<button data-turn="${t.ID}" class="confirm-group">Bestätigen</button>` : '';
+  div.innerHTML = `
+    <div><b>„${t.InputText}“</b></div>
+    <div class="status">${t.Status}</div>
+    <div>${t.Result || ''}</div>
+    <div class="candidates">${cands}${confirmGroup}</div>
+  `;
+  document.getElementById('turns').prepend(div);
+}
+
+document.getElementById('send').addEventListener('click', async () => {
+  const text = document.getElementById('text').value.trim();
+  if (!text) return;
+  const conv = await ensureConversation();
+  const r = await fetch(`/api/conversations/${conv}/turns`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  });
+  const t = await r.json();
+  renderTurn(t);
+  document.getElementById('text').value = '';
+});
+
+document.getElementById('text').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('send').click();
+});
+
+document.getElementById('turns').addEventListener('click', async (e) => {
+  const target = e.target;
+  if (target.classList.contains('pick')) {
+    const r = await fetch(`/api/turns/${target.dataset.turn}/confirm`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: target.dataset.device })
+    });
+    renderTurn(await r.json());
+  } else if (target.classList.contains('confirm-group')) {
+    const r = await fetch(`/api/turns/${target.dataset.turn}/confirm`, { method: 'POST' });
+    renderTurn(await r.json());
+  }
+});
+
+// Voice capture: getUserMedia -> AudioWorklet (16kHz mono PCM16, see
+// /audio-worklet.js) -> sequential HTTP PCM chunks -> finish flushes the
+// decoder and runs the same interpret/resolve/execute chain as text
+// (CONCEPT.md section 15 step 3). "belegt" (busy) is a capacity limit, not
+// a shared conversation -- see CONCEPT.md section 3.
+(function () {
+  const micButton = document.getElementById('mic');
+  const micStatus = document.getElementById('micStatus');
+  let job = null; // {context, media, source, node, turnId, sending}
+
+  function setStatus(text) { micStatus.textContent = text; }
+
+  async function stopCapture(j) {
+    if (j.node) { j.node.disconnect(); j.node.port.onmessage = null; }
+    if (j.source) j.source.disconnect();
+    if (j.context) await j.context.close().catch(() => {});
+    if (j.media) j.media.getTracks().forEach((t) => t.stop());
+  }
+
+  async function start() {
+    if (job) return;
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext || !window.AudioWorkletNode) {
+      setStatus('Dieser Browser unterstützt keine Live-Aufnahme.');
+      return;
+    }
+    const conv = await ensureConversation();
+    micButton.textContent = '● bereit …';
+    setStatus('Mikrofon wird angefragt…');
+    const j = { sending: false };
+    try {
+      j.context = new AudioContext({ sampleRate: 16000 });
+      await j.context.resume();
+      j.media = await navigator.mediaDevices.getUserMedia({ audio: true });
+      await j.context.audioWorklet.addModule('/audio-worklet.js');
+
+      const r = await fetch(`/api/conversations/${conv}/turns/voice`, { method: 'POST' });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        if (r.status === 409) setStatus('Belegt: es läuft bereits eine Aufnahme.');
+        else setStatus('Sprachaufnahme nicht verfügbar: ' + (body.error || r.status));
+        await stopCapture(j);
+        return;
+      }
+      const turn = await r.json();
+      j.turnId = turn.ID;
+
+      j.source = j.context.createMediaStreamSource(j.media);
+      j.node = new AudioWorkletNode(j.context, 'voxtral-pcm');
+      j.node.port.onmessage = async (event) => {
+        if (job !== j) return;
+        if (event.data === 'stopped') {
+          await finish(j);
+          return;
+        }
+        if (j.sending) return; // simple backpressure: drop overlap, keep order
+        j.sending = true;
+        try {
+          const resp = await fetch(`/api/turns/${j.turnId}/audio`, {
+            method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: event.data,
+          });
+          if (resp.ok) {
+            const t = await resp.json();
+            setStatus('Höre zu… „' + (t.InputText || '') + '“');
+          }
+        } finally {
+          j.sending = false;
+        }
+      };
+      j.source.connect(j.node);
+      j.node.connect(j.context.destination);
+
+      job = j;
+      micButton.textContent = '■ Aufnahme beenden';
+      setStatus('Höre zu…');
+    } catch (err) {
+      await stopCapture(j);
+      setStatus(err.name === 'NotAllowedError' ? 'Mikrofonzugriff verweigert.' : err.message);
+      micButton.textContent = '🎤 Sprechen';
+    }
+  }
+
+  async function finish(j) {
+    await stopCapture(j);
+    if (job === j) job = null;
+    micButton.textContent = '🎤 Sprechen';
+    setStatus('Verarbeite…');
+    try {
+      const r = await fetch(`/api/turns/${j.turnId}/finish`, { method: 'POST' });
+      const t = await r.json();
+      renderTurn(t);
+      setStatus('');
+    } catch (err) {
+      setStatus('Fehler: ' + err.message);
+    }
+  }
+
+  micButton.addEventListener('click', () => {
+    if (!job) { start(); return; }
+    job.node.port.postMessage('stop'); // worklet flushes, then posts "stopped"
+  });
+})();
+</script>
+</body>
+</html>

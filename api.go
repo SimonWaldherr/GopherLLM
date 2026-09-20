@@ -174,6 +174,9 @@ func (m *Model) Name() string {
 	return name
 }
 
+// IsMapped reports whether the path-based model was loaded through mmap.
+func (m *Model) IsMapped() bool { return m != nil && m.r != nil && m.r.IsMapped() }
+
 // GenOption configures a single generation request on top of
 // DefaultGenerationOptions.
 type GenOption func(*GenerationOptions)

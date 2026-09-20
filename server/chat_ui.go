@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/SimonWaldherr/GopherLLM/voiceweb"
 )
 
 //go:embed web_ui/chat.html
@@ -24,8 +26,11 @@ var chatJS string
 //go:embed web_ui/audio.js
 var audioJS string
 
-//go:embed web_ui/audio-worklet.js
-var audioWorkletJS string
+// audioWorkletJS is the shared voiceweb.AudioWorkletJS, not a second copy
+// of the source -- see that package's doc comment for why only the
+// capture/resample worklet (not this page's own audio.js orchestration)
+// is factored out.
+var audioWorkletJS = voiceweb.AudioWorkletJS
 
 //go:embed web_ui/wasm-bridge.js
 var wasmBridgeJS string

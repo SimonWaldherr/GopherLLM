@@ -574,6 +574,12 @@ func (r *Runner) Config() Config            { return r.config }
 func (r *Runner) ModelName() (string, bool) { return r.gguf.GetString("general.name") }
 func (r *Runner) OutOfCore() bool           { return r != nil && r.outOfCore }
 
+// IsMapped reports whether the main GGUF was opened through the OS mapping
+// backend. It is informational only; mappings remain owned by Runner.Close.
+func (r *Runner) IsMapped() bool {
+	return r != nil && r.mappedFile != nil && r.mappedFile.IsMapped()
+}
+
 // VisionConfig returns the paired vision encoder's hyperparameters, if one
 // was loaded alongside this Runner's text decoder. ok is false for a
 // text-only model (see HasVision).

@@ -1,0 +1,33 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		A00000000000000000000001 = {isa = PBXFileReference; lastKnownFileType = wrapper.application; path = GopherLLMDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A00000000000000000000002 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = GopherLLM.xcframework; path = ../../../build/GopherLLM.xcframework; sourceTree = SOURCE_ROOT; };
+		A00000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GopherLLMDemoApp.swift; sourceTree = "<group>"; };
+		A00000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A00000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LLMViewModel.swift; sourceTree = "<group>"; };
+		A00000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelStore.swift; sourceTree = "<group>"; };
+		A00000000000000000000020 = {isa = PBXGroup; children = (A00000000000000000000010, A00000000000000000000011, A00000000000000000000012, A00000000000000000000013); path = GopherLLMDemo; sourceTree = "<group>"; };
+		A00000000000000000000021 = {isa = PBXGroup; children = (A00000000000000000000001); name = Products; sourceTree = "<group>"; };
+		A00000000000000000000022 = {isa = PBXGroup; children = (A00000000000000000000020, A00000000000000000000002, A00000000000000000000021); sourceTree = "<group>"; };
+		A00000000000000000000030 = {isa = PBXBuildFile; fileRef = A00000000000000000000002; };
+		A00000000000000000000033 = {isa = PBXBuildFile; fileRef = A00000000000000000000010; };
+		A00000000000000000000034 = {isa = PBXBuildFile; fileRef = A00000000000000000000011; };
+		A00000000000000000000035 = {isa = PBXBuildFile; fileRef = A00000000000000000000012; };
+		A00000000000000000000036 = {isa = PBXBuildFile; fileRef = A00000000000000000000013; };
+		A00000000000000000000031 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000030); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000032 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A00000000000000000000033, A00000000000000000000034, A00000000000000000000035, A00000000000000000000036); runOnlyForDeploymentPostprocessing = 0; };
+		A00000000000000000000040 = {isa = PBXNativeTarget; buildConfigurationList = A00000000000000000000041; buildPhases = (A00000000000000000000032, A00000000000000000000031); buildRules = (); dependencies = (); name = GopherLLMDemo; productName = GopherLLMDemo; productReference = A00000000000000000000001; productType = "com.apple.product-type.application"; };
+		A00000000000000000000041 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000042, A00000000000000000000043); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A00000000000000000000042 = {isa = XCBuildConfiguration; buildSettings = { GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.gopherllm.demo; PRODUCT_NAME = GopherLLMDemo; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; SWIFTUI_PREVIEWS = YES; }; name = Debug; };
+		A00000000000000000000043 = {isa = XCBuildConfiguration; buildSettings = { GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.gopherllm.demo; PRODUCT_NAME = GopherLLMDemo; SDKROOT = iphoneos; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		A00000000000000000000050 = {isa = PBXProject; attributes = { LastUpgradeCheck = 1600; }; buildConfigurationList = A00000000000000000000051; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A00000000000000000000022; productRefGroup = A00000000000000000000021; projectDirPath = ""; projectRoot = ""; targets = (A00000000000000000000040); };
+		A00000000000000000000051 = {isa = XCConfigurationList; buildConfigurations = (A00000000000000000000052, A00000000000000000000053); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A00000000000000000000052 = {isa = XCBuildConfiguration; buildSettings = { }; name = Debug; };
+		A00000000000000000000053 = {isa = XCBuildConfiguration; buildSettings = { }; name = Release; };
+	};
+	rootObject = A00000000000000000000050;
+}

@@ -1596,5 +1596,20 @@ bin/gopherllm /path/to/model.gguf --prompt "test" --max-tokens 128 \
 
 Local build artifacts are kept in `bin/` and `.cache/`, both ignored by git.
 
+## iOS / iPhone
+
+Build the native Swift/Objective-C binding XCFramework on macOS with Xcode and
+`gomobile`:
+
+```sh
+make ios-bind
+```
+
+This is a fully local ARM64/NEON integration with an opt-in Metal GPU path for
+eligible Qwen/Ministral layouts; it does not require a network runtime. Apple
+Neural Engine execution is not exposed for arbitrary GGUF weights.
+See [iOS integration](docs/ios.md) for installation, Xcode integration, memory
+guidance, the included SwiftUI demo, and validation commands.
+
 GitHub Actions runs `go test`, `go vet`, and `go build` on Linux, macOS, and
 Windows, plus the `make cross-build` release matrix on Linux.
