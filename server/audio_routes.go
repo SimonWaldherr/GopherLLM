@@ -79,20 +79,92 @@ func (c *voxtralModelCache) transcribe(ctx context.Context, path string, samples
 	return model.TranscribeOffline(ctx, samples, extraSteps, logw)
 }
 
-// newSession opens (or reuses) the cached model and starts a live session on
-// it. logw is accepted separately from realtimeFactory's signature so the
-// production wiring in server.go can still surface load progress on the
-// server's real log writer, matching the pre-caching behavior.
+// newSession opens (or reuses) the cached model and returns a reliable live
+// adapter. Voxtral's incremental decoder may emit an empty result for real
+// speech, so the adapter periodically re-decodes the audio accumulated so
+// far through TranscribeOffline rather than exposing that broken behavior to
+// the browser.
 func (c *voxtralModelCache) newSession(ctx context.Context, path string, logw io.Writer) (realtimeTranscriber, error) {
 	model, err := c.open(ctx, path, logw)
 	if err != nil {
 		return nil, err
 	}
-	session, err := model.NewSession(ctx)
-	if err != nil {
-		return nil, err
+	return &batchRealtimeTranscriber{model: model}, nil
+}
+
+// batchRealtimeTranscriber keeps a bounded recent-audio window for one
+// browser session and periodically re-decodes it in full through the
+// offline decoder (VoxtralModel.TranscribeOffline), instead of the
+// incremental live-session decoder, which can return an empty transcript for
+// real speech (see cmd/hestia's SpeechHost for the same tradeoff).
+//
+// TranscribeOffline has a large, roughly clip-length-independent fixed cost
+// -- encoder/decoder setup plus the fixed BOS+pad prefill -- on top of a
+// smaller marginal cost per second of audio. Measured against a real
+// Voxtral-Mini-4B-Realtime Q6_K checkpoint: ~2.9s fixed, ~0.4-0.6s marginal
+// per additional second decoded. Re-running it on the whole growing clip
+// every second (this type's original interval) pays that fixed cost far
+// more often than it can be amortized, and a growing, unbounded clip length
+// eventually exceeds any fixed interval -- which is exactly the "server
+// cannot keep up" queue overflow the browser reports within the first
+// several seconds of live use. realtimeDecodeIntervalSamples and
+// realtimeMaxWindowSamples below are chosen so a redecode's cost
+// (fixed + marginal*window) stays comfortably under the interval once the
+// window caps out, keeping a live session sustainable indefinitely; audio
+// older than the window is dropped from context (and so from the
+// transcript) for very long sessions, a real tradeoff against the
+// alternative of falling further behind forever. Tune both together for
+// different hardware: an interval too short, or a window too large, for
+// this fixed+marginal cost on the deployed hardware will still fall behind.
+type batchRealtimeTranscriber struct {
+	model       *gopherllm.VoxtralModel
+	pcm         []float32
+	text        string
+	lastDecoded int
+}
+
+const (
+	// realtimeDecodeIntervalSamples: how much new audio triggers a redecode.
+	realtimeDecodeIntervalSamples = 10 * 16000
+	// realtimeMaxWindowSamples bounds how much trailing audio is ever fed
+	// into one redecode, so a long-running session's per-call cost stays
+	// roughly constant instead of growing with total session length.
+	realtimeMaxWindowSamples = 10 * 16000
+)
+
+func (t *batchRealtimeTranscriber) Push(ctx context.Context, pcm []float32, final bool) (string, error) {
+	t.pcm = append(t.pcm, pcm...)
+	if len(t.pcm) == 0 {
+		if final {
+			return "", errors.New("audio is empty")
+		}
+		return t.text, nil
 	}
-	return session, nil
+	if !final && len(t.pcm)-t.lastDecoded < realtimeDecodeIntervalSamples {
+		return t.text, nil
+	}
+	if len(t.pcm) > realtimeMaxWindowSamples {
+		// Drop the discarded prefix rather than just slicing it off, so it
+		// isn't re-copied (and t.pcm's backing array re-grown) forever.
+		t.pcm = append([]float32(nil), t.pcm[len(t.pcm)-realtimeMaxWindowSamples:]...)
+	}
+	text, err := t.model.TranscribeOffline(ctx, t.pcm, 0, io.Discard)
+	if err != nil {
+		return "", err
+	}
+	t.lastDecoded = len(t.pcm)
+	if text != "" {
+		t.text = text
+	}
+	return t.text, nil
+}
+
+// The cache owns the model lifetime; closing an individual browser session
+// only releases its accumulated PCM and transcript.
+func (t *batchRealtimeTranscriber) Close() error {
+	t.pcm = nil
+	t.text = ""
+	return nil
 }
 
 // closeAll releases the cached model, if any. Call during server shutdown.
