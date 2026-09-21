@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	_ "embed"
 	"fmt"
 	"html/template"
@@ -36,6 +37,53 @@ var audioWorkletJS = voiceweb.AudioWorkletJS
 var wasmBridgeJS string
 
 var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
+
+// gzipBytes compresses a static asset once at process startup rather than on
+// every request. setChatUIHeaders below deliberately keeps Cache-Control at
+// no-store (so a local rebuild is always visible on the next reload without
+// a hard refresh), which means every request re-transfers the full asset --
+// script.js alone is ~340KB. Since it can't be cached, compressing it is the
+// next best thing, and these strings are immutable for the process lifetime
+// so compressing once up front costs nothing per request.
+func gzipBytes(s string) []byte {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, _ = io.WriteString(gz, s)
+	_ = gz.Close()
+	return buf.Bytes()
+}
+
+var (
+	chatCSSGZ        = gzipBytes(chatCSS)
+	chatJSGZ         = gzipBytes(chatJS)
+	audioJSGZ        = gzipBytes(audioJS)
+	audioWorkletJSGZ = gzipBytes(audioWorkletJS)
+	wasmBridgeJSGZ   = gzipBytes(wasmBridgeJS)
+)
+
+// acceptsGzip reports whether the client's Accept-Encoding header lists
+// gzip -- every browser that would load this chat UI does, but a curl/API
+// client asking for the raw asset should still get an uncompressed body.
+func acceptsGzip(req *http.Request) bool {
+	for _, part := range strings.Split(req.Header.Get("Accept-Encoding"), ",") {
+		if strings.EqualFold(strings.TrimSpace(strings.SplitN(part, ";", 2)[0]), "gzip") {
+			return true
+		}
+	}
+	return false
+}
+
+// writeStaticAsset serves a precompressed static asset, falling back to the
+// plain string for a client that didn't ask for gzip.
+func writeStaticAsset(w http.ResponseWriter, req *http.Request, plain string, gz []byte) {
+	if acceptsGzip(req) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Vary", "Accept-Encoding")
+		_, _ = w.Write(gz)
+		return
+	}
+	_, _ = io.WriteString(w, plain)
+}
 
 type chatTemplateData struct {
 	Title string
@@ -153,35 +201,52 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		// Rendered per request (model name, settings, feature flags), so
+		// unlike the static assets above this can't be gzipped once at
+		// startup -- still worth compressing on the fly since Cache-Control
+		// stays no-store and this is the single largest response most page
+		// loads make.
+		if acceptsGzip(req) {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Vary", "Accept-Encoding")
+			gz := gzip.NewWriter(w)
+			if _, err := gz.Write(page.Bytes()); err != nil {
+				fmt.Fprintf(logw, "Warning: write chat page: %v\n", err)
+			}
+			if err := gz.Close(); err != nil {
+				fmt.Fprintf(logw, "Warning: close chat page gzip writer: %v\n", err)
+			}
+			return
+		}
 		if _, err := w.Write(page.Bytes()); err != nil {
 			fmt.Fprintf(logw, "Warning: write chat page: %v\n", err)
 		}
 	})
-	mux.HandleFunc("/style.css", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/style.css", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/css; charset=utf-8")
-		fmt.Fprint(w, chatCSS)
+		writeStaticAsset(w, req, chatCSS, chatCSSGZ)
 	})
-	mux.HandleFunc("/audio.js", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/audio.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		fmt.Fprint(w, audioJS)
+		writeStaticAsset(w, req, audioJS, audioJSGZ)
 	})
-	mux.HandleFunc("/audio-worklet.js", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/audio-worklet.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		fmt.Fprint(w, audioWorkletJS)
+		writeStaticAsset(w, req, audioWorkletJS, audioWorkletJSGZ)
 	})
-	mux.HandleFunc("/script.js", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/script.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		fmt.Fprint(w, chatJS)
+		writeStaticAsset(w, req, chatJS, chatJSGZ)
 	})
 	if hasLocalRuntime {
-		mux.HandleFunc("/wasm-bridge.js", func(w http.ResponseWriter, _ *http.Request) {
+		mux.HandleFunc("/wasm-bridge.js", func(w http.ResponseWriter, req *http.Request) {
 			setChatUIHeaders(w, "", hasLocalRuntime)
 			w.Header().Set("content-type", "text/javascript; charset=utf-8")
-			fmt.Fprint(w, wasmBridgeJS)
+			writeStaticAsset(w, req, wasmBridgeJS, wasmBridgeJSGZ)
 		})
 	}
 }
