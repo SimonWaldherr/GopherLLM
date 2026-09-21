@@ -11,6 +11,8 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -123,14 +125,36 @@ type batchRealtimeTranscriber struct {
 	lastDecoded int
 }
 
-const (
-	// realtimeDecodeIntervalSamples: how much new audio triggers a redecode.
-	realtimeDecodeIntervalSamples = 10 * 16000
-	// realtimeMaxWindowSamples bounds how much trailing audio is ever fed
-	// into one redecode, so a long-running session's per-call cost stays
-	// roughly constant instead of growing with total session length.
-	realtimeMaxWindowSamples = 10 * 16000
+// realtimeDecodeIntervalSamples and realtimeMaxWindowSamples default to a
+// short-command-shaped 3s/8s (fast interim feedback; a several-second
+// utterance still decodes in one window) rather than a value sustainable for
+// indefinite continuous dictation -- at 3s/8s a redecode's measured cost
+// (~2.9s fixed + ~0.5*8s marginal =~ 6.9s) exceeds the 3s interval, so a
+// session left running continuously for a long time will eventually trip
+// the browser's "server cannot keep up" guard. That is an accepted tradeoff
+// for the target use (wake word, short spoken command, done), not a
+// regression: both values are overridable with
+// GOPHERLLM_VOXTRAL_REALTIME_INTERVAL_SECONDS /
+// GOPHERLLM_VOXTRAL_REALTIME_WINDOW_SECONDS for deployments that need
+// longer-running sessions (raise both until fixed + marginal*window <=
+// interval for the deployed hardware) or that have faster hardware and can
+// afford to lower the interval further for snappier interim updates.
+var (
+	realtimeDecodeIntervalSamples = realtimeSecondsEnv("GOPHERLLM_VOXTRAL_REALTIME_INTERVAL_SECONDS", 3)
+	realtimeMaxWindowSamples      = realtimeSecondsEnv("GOPHERLLM_VOXTRAL_REALTIME_WINDOW_SECONDS", 8)
 )
+
+func realtimeSecondsEnv(name string, defaultSeconds int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return defaultSeconds * 16000
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return defaultSeconds * 16000
+	}
+	return int(seconds * 16000)
+}
 
 func (t *batchRealtimeTranscriber) Push(ctx context.Context, pcm []float32, final bool) (string, error) {
 	t.pcm = append(t.pcm, pcm...)
