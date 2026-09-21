@@ -84,6 +84,39 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, !useMetal, logw)
 }
 
+// TranscribeVoxtralRealtimeFromSafetensors is TranscribeVoxtralRealtime's
+// counterpart for mistralai's official (non-GGUF) release -- see
+// LoadVoxtralRealtimeModelFromSafetensors's doc comment for the exact
+// directory contents expected. Shares the identical decode algorithm via
+// decodeVoxtralRealtimeOffline; only how the config/weights/tokenizer are
+// obtained differs.
+func TranscribeVoxtralRealtimeFromSafetensors(ctx context.Context, dir string, samples []float32, maxExtraSteps int, logw io.Writer) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if len(samples) == 0 {
+		return "", fmt.Errorf("audio is empty")
+	}
+	if maxExtraSteps < 0 || maxExtraSteps > 256 {
+		return "", fmt.Errorf("max extra steps must be between 0 and 256")
+	}
+	for _, sample := range samples {
+		if math.IsNaN(float64(sample)) || math.IsInf(float64(sample), 0) {
+			return "", fmt.Errorf("audio contains non-finite samples")
+		}
+	}
+	if logw == nil {
+		logw = io.Discard
+	}
+	useMetal := MetalAvailable()
+	cfg, w, tok, err := LoadVoxtralRealtimeModelFromSafetensors(dir, useMetal, logw)
+	defer releaseVoxtralRealtimeWeights(&w)
+	if err != nil {
+		return "", err
+	}
+	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, nil, int(tok.EOSID), int(tok.BOSID), samples, maxExtraSteps, !useMetal, logw)
+}
+
 // decodeVoxtralRealtimeOffline runs the offline/batch encode-then-decode
 // algorithm shared by TranscribeVoxtralRealtime (which always loads its own
 // weights and decodes on CPU) and VoxtralModel.TranscribeOffline (which

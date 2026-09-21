@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	modelPath := flag.String("model", "", "path to a Voxtral Realtime GGUF (general.architecture=voxtral_realtime)")
+	modelPath := flag.String("model", "", "path to a Voxtral Realtime GGUF (general.architecture=voxtral_realtime), or a directory containing the official release's consolidated.safetensors + params.json + tekken.json")
 	audioPath := flag.String("audio", "", "path to an audio file (any format if ffmpeg is on PATH; otherwise a 16-bit or float32 PCM WAV)")
 	maxExtraSteps := flag.Int("max-extra-steps", 0, "additional right-padding audio tokens for the model to finish emitting text")
 	verbose := flag.Bool("v", false, "print per-step decode progress to stderr")
@@ -45,7 +45,12 @@ func run(modelPath, audioPath string, maxExtraSteps int, verbose bool) error {
 	if verbose {
 		logw = os.Stderr
 	}
-	text, err := gopherllm.TranscribeVoxtralRealtime(context.Background(), modelPath, samples, maxExtraSteps, logw)
+	var text string
+	if info, statErr := os.Stat(modelPath); statErr == nil && info.IsDir() {
+		text, err = gopherllm.TranscribeVoxtralRealtimeFromSafetensors(context.Background(), modelPath, samples, maxExtraSteps, logw)
+	} else {
+		text, err = gopherllm.TranscribeVoxtralRealtime(context.Background(), modelPath, samples, maxExtraSteps, logw)
+	}
 	if err != nil {
 		return err
 	}
