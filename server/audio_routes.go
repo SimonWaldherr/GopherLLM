@@ -81,17 +81,39 @@ func (c *voxtralModelCache) transcribe(ctx context.Context, path string, samples
 	return model.TranscribeOffline(ctx, samples, extraSteps, logw)
 }
 
-// newSession opens (or reuses) the cached model and returns a reliable live
-// adapter. Voxtral's incremental decoder may emit an empty result for real
-// speech, so the adapter periodically re-decodes the audio accumulated so
-// far through TranscribeOffline rather than exposing that broken behavior to
-// the browser.
+// newSession opens (or reuses) the cached model and returns a live adapter.
+//
+// This defaults to Voxtral's own incremental live-session decoder
+// (VoxtralModel.NewSession), which keeps decoder/encoder state across pushes
+// and so has no per-push fixed re-decode cost. An earlier version of this
+// adapter avoided it, on record here that "the incremental decoder may
+// return an empty result for real speech" (also documented in cmd/hestia's
+// SpeechHost) via batchRealtimeTranscriber below, which sidesteps that by
+// periodically re-decoding the whole recording through the verified offline
+// path instead -- at the cost of a large fixed cost paid on every redecode,
+// which made sustained live sessions fall behind faster than real time (see
+// git history around the realtimeDecodeIntervalSamples tuning below).
+// Repeated testing (multiple synthesized German utterances, a silence probe,
+// leading silence before speech, and reusing one model across three
+// sequential sessions) did not reproduce an empty result for real speech;
+// the incremental decoder produced correct progressive partials and a
+// correct final transcript every time, and is both faster and lower-latency
+// than the batch path. If real microphone audio reproduces the empty-result
+// bug that path predates, set GOPHERLLM_VOXTRAL_REALTIME_BATCH=1 to fall
+// back to batchRealtimeTranscriber without a code change.
 func (c *voxtralModelCache) newSession(ctx context.Context, path string, logw io.Writer) (realtimeTranscriber, error) {
 	model, err := c.open(ctx, path, logw)
 	if err != nil {
 		return nil, err
 	}
-	return &batchRealtimeTranscriber{model: model}, nil
+	if os.Getenv("GOPHERLLM_VOXTRAL_REALTIME_BATCH") != "" {
+		return &batchRealtimeTranscriber{model: model}, nil
+	}
+	session, err := model.NewSession(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
 }
 
 // batchRealtimeTranscriber keeps a bounded recent-audio window for one
