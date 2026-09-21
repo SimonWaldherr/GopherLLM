@@ -64,6 +64,14 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 	if err != nil {
 		return "", fmt.Errorf("loading Voxtral Realtime model: %w", err)
 	}
+	// Expand the encoder's quantized weights to F32 once so blasMatvecBatch
+	// can use Accelerate's batched GEMM kernel instead of falling back to the
+	// scalar per-row dequant path -- the same preparation OpenVoxtral/
+	// VoxtralModel already does; skipping it here made this entry point's
+	// encoder several times slower for no benefit.
+	if err := prepareVoxtralStreamWeights(ctx, &w); err != nil {
+		return "", err
+	}
 
 	tok, err := TokenizerFromMetadata(gguf.Metadata)
 	if err != nil {
@@ -112,6 +120,11 @@ func TranscribeVoxtralRealtimeFromSafetensors(ctx context.Context, dir string, s
 	cfg, w, tok, err := LoadVoxtralRealtimeModelFromSafetensors(dir, useMetal, logw)
 	defer releaseVoxtralRealtimeWeights(&w)
 	if err != nil {
+		return "", err
+	}
+	// See the matching comment in TranscribeVoxtralRealtime: without this,
+	// the encoder's batched matvecs never get Accelerate's GEMM kernel.
+	if err := prepareVoxtralStreamWeights(ctx, &w); err != nil {
 		return "", err
 	}
 	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, nil, int(tok.EOSID), int(tok.BOSID), samples, maxExtraSteps, !useMetal, logw)

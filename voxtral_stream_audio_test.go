@@ -23,7 +23,7 @@ func TestVoxtralBatchedAttentionMatchesCausalReference(t *testing.T) {
 		v[i] = float32(math.Cos(float64(i) * .71))
 	}
 	scale := float32(1 / math.Sqrt(dim))
-	if !voxtralAttentionBatch(q, k, v, out, heads, dim, past, window, total, scale) {
+	if !blasAttentionBatch(q, k, v, out, heads, dim, past, window, total, scale) {
 		t.Skip("accelerated attention unavailable")
 	}
 	for row := range n {

@@ -12,6 +12,14 @@ import (
 // ==false in the checkpoint inspected -- no streaming/chunked masking is
 // implemented here).
 //
+// Every linear projection below batches all T timesteps into one
+// blasMatvecBatch call instead of looping Weight.MatvecInto per row: on
+// Darwin+cgo this reaches Accelerate's GEMM kernel (the same win
+// prepareVoxtralStreamWeights/blasMatvecBatch already give Voxtral's
+// encoder), and even on the portable fallback matvecBatch amortizes
+// dispatch overhead and parallelizes across the weight's rows. See
+// parakeet_bench_test.go for the before/after numbers.
+//
 // The relative-position attention (ESPnet/NeMo's RelPositionMultiHeadAttention,
 // itself Transformer-XL's formulation) is implemented via a direct index
 // derivation rather than PyTorch's pad/reshape/drop "rel_shift" trick:
@@ -22,28 +30,71 @@ import (
 // q=T-1,k=0 -> offset +(T-1), matching RelPositionalEncoding's own
 // descending-from-(T-1)-to-(T-1) position ordering) rather than mechanically
 // replicated, since an off-by-one here would misalign every attention score
-// silently rather than error.
+// silently rather than error. The per-head dot products and weighted sums
+// use DotF32/AxpyF32 (this codebase's SIMD kernels) instead of scalar Go
+// loops over headDim.
 
 func swish(x float32) float32 {
 	return x / (1 + float32(math.Exp(float64(-x))))
 }
 
-// parakeetFeedForward runs one macaron half-step FFN module: LayerNorm ->
-// Linear -> Swish -> Linear, residual added with a 0.5 scale (the
-// "half-step" in "Macaron-Net" -- Conformer's own term for this pattern).
-func parakeetFeedForward(x []float32, normW, normB []float32, lin1, lin2 Weight, eps float32) []float32 {
-	var normed []float32
-	layerNormInto(x, normW, normB, eps, &normed)
-	var hidden []float32
-	lin1.MatvecInto(normed, &hidden)
-	for i, v := range hidden {
-		hidden[i] = swish(v)
+// weightRows returns a Weight's output row count for a matvec over an input
+// of length cols. Rows/Cols are only populated on raw (quantized or lazy
+// scalar) weights; an owned F32 weight -- which is what every Parakeet
+// tensor loads as -- infers its row count from len(F32)/cols instead (see
+// Weight's doc comment), so batched callers that need to pre-size an output
+// buffer before calling blasMatvecBatch/matvecBatch must compute it the same
+// way MatvecInto does internally rather than reading w.Rows directly.
+func weightRows(w Weight, cols int) int {
+	if cols == 0 {
+		return 0
 	}
-	var out []float32
-	lin2.MatvecInto(hidden, &out)
-	result := make([]float32, len(x))
+	if w.F32 != nil {
+		return len(w.F32) / cols
+	}
+	return w.Rows
+}
+
+// parakeetFeedForwardBatch runs one macaron half-step FFN module over all T
+// timesteps at once: LayerNorm -> Linear -> Swish -> Linear, residual added
+// with a 0.5 scale (the "half-step" in "Macaron-Net" -- Conformer's own term
+// for this pattern).
+func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2 Weight, eps float32) [][]float32 {
+	t := len(xs)
+	result := make([][]float32, t)
+	if t == 0 {
+		return result
+	}
+	normed := make([][]float32, t)
+	for i := range xs {
+		layerNormInto(xs[i], normW, normB, eps, &normed[i])
+	}
+	dModel := len(xs[0])
+	hiddenDim := weightRows(lin1, dModel)
+	hidden := make([][]float32, t)
+	for i := range hidden {
+		hidden[i] = make([]float32, hiddenDim)
+	}
+	blasMatvecBatch(lin1, normed, hidden)
+	for i := range hidden {
+		row := hidden[i]
+		for j, v := range row {
+			row[j] = swish(v)
+		}
+	}
+	outDim := weightRows(lin2, hiddenDim)
+	out := make([][]float32, t)
+	for i := range out {
+		out[i] = make([]float32, outDim)
+	}
+	blasMatvecBatch(lin2, hidden, out)
 	for i := range result {
-		result[i] = x[i] + 0.5*out[i]
+		row := make([]float32, len(xs[i]))
+		oi := out[i]
+		for j := range row {
+			row[j] = xs[i][j] + 0.5*oi[j]
+		}
+		result[i] = row
 	}
 	return result
 }
@@ -52,24 +103,35 @@ func parakeetFeedForward(x []float32, normW, normB []float32, lin1, lin2 Weight,
 // sequence [T][DModel]: LayerNorm -> pointwise_conv1 (DModel->2*DModel) ->
 // GLU -> depthwise_conv (causal-free, same-padding, groups=DModel) ->
 // batch_norm (eval-mode: running stats, no batch statistics) -> Swish ->
-// pointwise_conv2 (DModel->DModel), residual added.
+// pointwise_conv2 (DModel->DModel), residual added. The two pointwise convs
+// are 1x1, i.e. per-timestep matvecs, so they batch across T the same way
+// the FFN's linear layers do.
 func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, normB []float32, dModel, kernel int, eps float32) [][]float32 {
 	t := len(xs)
+	out := make([][]float32, t)
+	if t == 0 {
+		return out
+	}
 	normed := make([][]float32, t)
 	for i := range xs {
 		layerNormInto(xs[i], normW, normB, eps, &normed[i])
 	}
 
-	// Pointwise conv1 + GLU: a 1x1 conv is just a per-timestep matvec.
+	expandedDim := weightRows(conv.PointwiseConv1, dModel)
+	expanded := make([][]float32, t)
+	for i := range expanded {
+		expanded[i] = make([]float32, expandedDim)
+	}
+	blasMatvecBatch(conv.PointwiseConv1, normed, expanded)
+
+	half := expandedDim / 2
 	glu := make([][]float32, t)
-	for i := range normed {
-		var expanded []float32
-		conv.PointwiseConv1.MatvecInto(normed[i], &expanded)
-		half := len(expanded) / 2
+	for i := range glu {
 		row := make([]float32, half)
+		ex := expanded[i]
 		for c := 0; c < half; c++ {
-			gate := 1 / (1 + float32(math.Exp(float64(-expanded[half+c]))))
-			row[c] = expanded[c] * gate
+			gate := 1 / (1 + float32(math.Exp(float64(-ex[half+c]))))
+			row[c] = ex[c] * gate
 		}
 		glu[i] = row
 	}
@@ -109,13 +171,18 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 		}
 	}
 
-	out := make([][]float32, t)
+	projDim := weightRows(conv.PointwiseConv2, dModel)
+	proj := make([][]float32, t)
+	for i := range proj {
+		proj[i] = make([]float32, projDim)
+	}
+	blasMatvecBatch(conv.PointwiseConv2, dwOut, proj)
+
 	for i := range out {
-		var proj []float32
-		conv.PointwiseConv2.MatvecInto(dwOut[i], &proj)
 		row := make([]float32, dModel)
+		pi := proj[i]
 		for c := range row {
-			row[c] = xs[i][c] + proj[c]
+			row[c] = xs[i][c] + pi[c]
 		}
 		out[i] = row
 	}
@@ -136,6 +203,10 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 		return nil, fmt.Errorf("parakeet attention: sequence length %d exceeds the positional encoding table's range (max relative position %d)", t, center)
 	}
 	dModel := nHeads * headDim
+	result := make([][]float32, t)
+	if t == 0 {
+		return result, nil
+	}
 
 	normed := make([][]float32, t)
 	for i := range xs {
@@ -145,22 +216,29 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 	q := make([][]float32, t)
 	k := make([][]float32, t)
 	v := make([][]float32, t)
-	for i := range normed {
-		attn.LinearQ.MatvecInto(normed[i], &q[i])
-		attn.LinearK.MatvecInto(normed[i], &k[i])
-		attn.LinearV.MatvecInto(normed[i], &v[i])
+	for i := range q {
+		q[i] = make([]float32, dModel)
+		k[i] = make([]float32, dModel)
+		v[i] = make([]float32, dModel)
 	}
+	blasMatvecBatch(attn.LinearQ, normed, q)
+	blasMatvecBatch(attn.LinearK, normed, k)
+	blasMatvecBatch(attn.LinearV, normed, v)
 
 	// Project the 2T-1 positional rows [center-(T-1) : center+(T-1)]
 	// (inclusive), i.e. relative positions from +(T-1) down to -(T-1),
 	// through linear_pos (no bias).
 	posStart := center - (t - 1)
 	posLen := 2*t - 1
-	posProj := make([][]float32, posLen)
+	posRows := make([][]float32, posLen)
 	for i := 0; i < posLen; i++ {
-		row := posEnc[(posStart+i)*dModel : (posStart+i+1)*dModel]
-		attn.LinearPos.MatvecInto(row, &posProj[i])
+		posRows[i] = posEnc[(posStart+i)*dModel : (posStart+i+1)*dModel]
 	}
+	posProj := make([][]float32, posLen)
+	for i := range posProj {
+		posProj[i] = make([]float32, dModel)
+	}
+	blasMatvecBatch(attn.LinearPos, posRows, posProj)
 
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 	out := make([][]float32, t)
@@ -168,34 +246,27 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 		out[i] = make([]float32, dModel)
 	}
 	scores := make([]float32, t)
+	qu := make([]float32, headDim)
+	qv := make([]float32, headDim)
 	for h := 0; h < nHeads; h++ {
 		off := h * headDim
 		uBias := attn.PosBiasU[off : off+headDim]
 		vBias := attn.PosBiasV[off : off+headDim]
 		for qi := 0; qi < t; qi++ {
 			qh := q[qi][off : off+headDim]
-			qu := make([]float32, headDim)
-			qv := make([]float32, headDim)
 			for d := 0; d < headDim; d++ {
 				qu[d] = qh[d] + uBias[d]
 				qv[d] = qh[d] + vBias[d]
 			}
-			var maxScore float32 = float32(math.Inf(-1))
+			maxScore := negMaxF32
 			for ki := 0; ki < t; ki++ {
 				kh := k[ki][off : off+headDim]
-				var ac float32
-				for d := 0; d < headDim; d++ {
-					ac += qu[d] * kh[d]
-				}
+				ac := DotF32(qu, kh)
 				// See this file's doc comment: rawPosScore index for
 				// (qi,ki) is (t-1)-qi+ki within the posProj rows this
 				// function already extracted (index 0 == relative
 				// position +(T-1)).
-				posRow := posProj[(t-1)-qi+ki]
-				var bd float32
-				for d := 0; d < headDim; d++ {
-					bd += qv[d] * posRow[d]
-				}
+				bd := DotF32(qv, posProj[(t-1)-qi+ki])
 				s := (ac + bd) * scale
 				scores[ki] = s
 				if s > maxScore {
@@ -204,7 +275,7 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 			}
 			var sum float32
 			for ki := 0; ki < t; ki++ {
-				e := float32(math.Exp(float64(scores[ki] - maxScore)))
+				e := fastExpF32(scores[ki] - maxScore)
 				scores[ki] = e
 				sum += e
 			}
@@ -218,21 +289,21 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 				if wgt == 0 {
 					continue
 				}
-				vh := v[ki][off : off+headDim]
-				for d := 0; d < headDim; d++ {
-					ctx[d] += wgt * vh[d]
-				}
+				AxpyF32(ctx, wgt, v[ki][off:off+headDim])
 			}
 		}
 	}
 
-	result := make([][]float32, t)
+	proj := make([][]float32, t)
+	for i := range proj {
+		proj[i] = make([]float32, dModel)
+	}
+	blasMatvecBatch(attn.LinearOut, out, proj)
 	for i := range result {
-		var proj []float32
-		attn.LinearOut.MatvecInto(out[i], &proj)
 		row := make([]float32, dModel)
+		pi := proj[i]
 		for c := range row {
-			row[c] = xs[i][c] + proj[c]
+			row[c] = xs[i][c] + pi[c]
 		}
 		result[i] = row
 	}
@@ -259,19 +330,13 @@ func ParakeetEncode(cfg ParakeetConfig, w ParakeetWeights, samples []float32) ([
 
 	for li := range w.Encoder.Layers {
 		layer := &w.Encoder.Layers[li]
-		xs2 := make([][]float32, outT)
-		for i := range xs {
-			xs2[i] = parakeetFeedForward(xs[i], layer.NormFeedForward1Weight, layer.NormFeedForward1Bias, layer.FeedForward1Linear1, layer.FeedForward1Linear2, cfg.Encoder.Epsilon)
-		}
+		xs2 := parakeetFeedForwardBatch(xs, layer.NormFeedForward1Weight, layer.NormFeedForward1Bias, layer.FeedForward1Linear1, layer.FeedForward1Linear2, cfg.Encoder.Epsilon)
 		xs3, err := parakeetRelPosSelfAttention(xs2, layer.SelfAttn, layer.NormSelfAttWeight, layer.NormSelfAttBias, cfg.Encoder.NHeads, cfg.Encoder.HeadDim, w.Encoder.PosEnc, w.Encoder.PosEncMaxLen, cfg.Encoder.Epsilon)
 		if err != nil {
 			return nil, fmt.Errorf("parakeet encode: layer %d: %w", li, err)
 		}
 		xs4 := parakeetConvModule(xs3, layer.Conv, layer.NormConvWeight, layer.NormConvBias, dModel, cfg.Encoder.ConvKernelSize, cfg.Encoder.Epsilon)
-		xs5 := make([][]float32, outT)
-		for i := range xs4 {
-			xs5[i] = parakeetFeedForward(xs4[i], layer.NormFeedForward2Weight, layer.NormFeedForward2Bias, layer.FeedForward2Linear1, layer.FeedForward2Linear2, cfg.Encoder.Epsilon)
-		}
+		xs5 := parakeetFeedForwardBatch(xs4, layer.NormFeedForward2Weight, layer.NormFeedForward2Bias, layer.FeedForward2Linear1, layer.FeedForward2Linear2, cfg.Encoder.Epsilon)
 		for i := range xs5 {
 			var normed []float32
 			layerNormInto(xs5[i], layer.NormOutWeight, layer.NormOutBias, cfg.Encoder.Epsilon, &normed)

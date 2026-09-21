@@ -153,7 +153,7 @@ func (s *voxtralStreamConv) push(ctx context.Context, w VoxtralRealtimeEncoderCo
 		}
 		out[t] = make([]float32, w.Out)
 	}
-	voxtralMatvecBatch(Weight{F32: w.Weight, Rows: w.Out, Cols: width}, patches, out)
+	blasMatvecBatch(Weight{F32: w.Weight, Rows: w.Out, Cols: width}, patches, out)
 	for t := range n {
 		for o := range w.Out {
 			v := out[t][o]

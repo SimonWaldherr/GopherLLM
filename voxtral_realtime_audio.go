@@ -441,9 +441,9 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			}
 			rmsNormInto(x[t], layer.AttnNorm, cfg.Encoder.Epsilon, &normed[t])
 		}
-		voxtralMatvecBatch(layer.Q, normed, q)
-		voxtralMatvecBatch(layer.K, normed, k)
-		voxtralMatvecBatch(layer.V, normed, v)
+		blasMatvecBatch(layer.Q, normed, q)
+		blasMatvecBatch(layer.K, normed, k)
+		blasMatvecBatch(layer.V, normed, v)
 		for t := range n {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -485,7 +485,7 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			}
 		}
 
-		if !voxtralAttentionBatch(q, kHead, vHead, attnOut, heads, headDim, past, window, stride, scale) {
+		if !blasAttentionBatch(q, kHead, vHead, attnOut, heads, headDim, past, window, stride, scale) {
 			ensureLenNoClear(&scores, total)
 			for t := range n {
 				if err := ctx.Err(); err != nil {
@@ -527,7 +527,7 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			evictVoxtralHeadBuffer(kHead, heads, headDim, stride, total, window)
 			evictVoxtralHeadBuffer(vHead, heads, headDim, stride, total, window)
 		}
-		voxtralMatvecBatch(layer.Out, attnOut, outProj)
+		blasMatvecBatch(layer.Out, attnOut, outProj)
 		for t := range n {
 			if err := ctx.Err(); err != nil {
 				return nil, err
@@ -544,15 +544,15 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			}
 			rmsNormInto(x[t], layer.FFNNorm, cfg.Encoder.Epsilon, &normed[t])
 		}
-		voxtralMatvecBatch(layer.FFNGate, normed, ffnGateOut)
-		voxtralMatvecBatch(layer.FFNUp, normed, ffnUpOut)
+		blasMatvecBatch(layer.FFNGate, normed, ffnGateOut)
+		blasMatvecBatch(layer.FFNUp, normed, ffnUpOut)
 		for t := range n {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			siluMulF32(ffnGateOut[t], ffnUpOut[t], ffnActOut[t])
 		}
-		voxtralMatvecBatch(layer.FFNDown, ffnActOut, ffnDownOut)
+		blasMatvecBatch(layer.FFNDown, ffnActOut, ffnDownOut)
 		for t := range n {
 			if err := ctx.Err(); err != nil {
 				return nil, err

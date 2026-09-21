@@ -9,9 +9,9 @@ import (
 	"github.com/SimonWaldherr/GopherLLM/internal/voxtralblas"
 )
 
-type voxtralBLASScratch struct{ input, output, scores []float32 }
+type blasScratchPool struct{ input, output, scores []float32 }
 
-var voxtralBLASPool = sync.Pool{New: func() any { return &voxtralBLASScratch{} }}
+var blasScratchBuf = sync.Pool{New: func() any { return &blasScratchPool{} }}
 
 // Small audio batches benefit from Accelerate's matrix-matrix kernel. Expand
 // the encoder once, rather than dequantizing every matrix for every chunk.
@@ -37,7 +37,7 @@ func prepareVoxtralStreamWeights(ctx context.Context, w *VoxtralRealtimeWeights)
 	return nil
 }
 
-func voxtralMatvecBatch(w Weight, xs, outs [][]float32) {
+func blasMatvecBatch(w Weight, xs, outs [][]float32) {
 	if len(xs) == 0 {
 		return
 	}
@@ -50,8 +50,8 @@ func voxtralMatvecBatch(w Weight, xs, outs [][]float32) {
 		matvecBatch(w, xs, outs)
 		return
 	}
-	b := voxtralBLASPool.Get().(*voxtralBLASScratch)
-	defer voxtralBLASPool.Put(b)
+	b := blasScratchBuf.Get().(*blasScratchPool)
+	defer blasScratchBuf.Put(b)
 	ensureLenNoClear(&b.input, len(xs)*cols)
 	ensureLenNoClear(&b.output, len(xs)*rows)
 	input, output := b.input, b.output
@@ -68,13 +68,13 @@ func voxtralMatvecBatch(w Weight, xs, outs [][]float32) {
 // allocated to a larger, stable per-head capacity across calls than the
 // current valid position count (past+len(q)) so a persistent streaming
 // cache can just write its new rows in, instead of repacking on every call.
-func voxtralAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, dim, past, window, stride int, scale float32) bool {
+func blasAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, dim, past, window, stride int, scale float32) bool {
 	n, total, width := len(q), past+len(q), heads*dim
 	if n == 0 {
 		return true
 	}
-	b := voxtralBLASPool.Get().(*voxtralBLASScratch)
-	defer voxtralBLASPool.Put(b)
+	b := blasScratchBuf.Get().(*blasScratchPool)
+	defer blasScratchBuf.Put(b)
 	ensureLenNoClear(&b.input, n*width)
 	ensureLenNoClear(&b.output, n*width)
 	ensureLenNoClear(&b.scores, n*total)
