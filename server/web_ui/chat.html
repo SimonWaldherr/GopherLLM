@@ -186,6 +186,12 @@
           <button id="audioLive" class="composer-button" type="button" aria-pressed="false" disabled>Start live transcription</button>
           <button id="audioCancel" class="composer-button" type="button" hidden>Cancel</button>
         </div>
+        <div id="audioLevelRow" class="audio-level-row" hidden>
+          <span class="audio-level-label">Mic level</span>
+          <div class="audio-level" role="meter" aria-label="Microphone input level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <span id="audioLevelFill" class="audio-level-fill"></span>
+          </div>
+        </div>
         <p id="audioStatus" class="settings-note" role="status" aria-live="polite">Choose a Voxtral model to transcribe audio. Microphone recording requires localhost or HTTPS.</p>
         <textarea id="audioResult" aria-label="Recognized transcript" rows="3" readonly hidden></textarea>
         <button id="audioInsert" class="composer-button" type="button" hidden>Use in message</button>

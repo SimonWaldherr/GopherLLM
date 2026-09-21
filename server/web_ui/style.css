@@ -1542,6 +1542,11 @@ body[data-ui-mode="simple"] [data-advanced] { display: none; }
 .audio-panel textarea { width: 100%; box-sizing: border-box; margin: 8px 0; resize: vertical; }
 #audioRecord[aria-pressed="true"], #audioStatus.is-error { color: var(--stop); }
 .audio-panel .composer-button { white-space: normal; }
+.audio-level-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.audio-level-label { flex: none; color: var(--muted); font-size: 12px; }
+.audio-level { flex: 1; height: 8px; overflow: hidden; border-radius: 999px; background: var(--line); }
+.audio-level-fill { display: block; height: 100%; width: 0%; border-radius: inherit; background: var(--ok, #2e9e5b); transition: width .1s linear; }
+.audio-level-fill.is-quiet { background: var(--stop); }
 
 /* Settings: preserve the inline search layout against generic label rules. */
 #settings .settings-search { display: flex; min-height: 42px; gap: 8px; }

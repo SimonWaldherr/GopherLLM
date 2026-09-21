@@ -62,6 +62,7 @@
     const model = $("audioModel"), refresh = $("audioRefresh"), upload = $("audioUpload");
     const file = $("audioFile"), record = $("audioRecord"), live = $("audioLive"), cancel = $("audioCancel");
     const status = $("audioStatus"), result = $("audioResult"), insert = $("audioInsert");
+    const levelRow = $("audioLevelRow"), levelFill = $("audioLevelFill");
     let available = true, working = false, recorder = null, stream = null;
     let abort = null, timer = null, ticker = null, sequence = 0;
     let catalogSequence = 0;
@@ -69,6 +70,18 @@
     const message = (text, error = false) => {
       status.textContent = text;
       status.classList.toggle("is-error", error);
+    };
+    // A silent or near-silent capture (wrong input device, muted mic,
+    // aggressive browser noise suppression) correctly transcribes to
+    // nothing, which otherwise looks identical to a real bug: "Listening…"
+    // shows, no error appears, but text never comes. Surfacing the
+    // worklet's own peak-level reports makes that failure mode visible.
+    const updateLevel = peak => {
+      if (!levelFill) return;
+      const pct = Math.max(0, Math.min(100, Math.round((peak || 0) * 140)));
+      levelFill.style.width = pct + "%";
+      levelFill.classList.toggle("is-quiet", pct < 4);
+      if (levelRow) levelRow.querySelector(".audio-level")?.setAttribute("aria-valuenow", String(pct));
     };
     function sync() {
       toggle.hidden = !available;
@@ -116,6 +129,8 @@
       if (job.context) job.context.close().catch(() => {});
       if (job.media) job.media.getTracks().forEach(track => track.stop());
       job.node = job.source = job.context = job.media = null;
+      if (levelRow) levelRow.hidden = true;
+      updateLevel(0);
     }
     function releaseLive(job) {
       stopLiveCapture(job);
@@ -205,11 +220,16 @@
           if (event.data === "stopped") {
             stopLiveCapture(job); job.final = true; flushLive(job); return;
           }
+          if (event.data && typeof event.data === "object" && "level" in event.data) {
+            updateLevel(event.data.level);
+            return;
+          }
           job.queue.push(event.data); job.queuedBytes += event.data.byteLength;
           if (job.queuedBytes > 320000) { finishLive(job, "Server cannot keep up: more than 10 seconds of audio queued. Try a faster inference backend."); return; }
           flushLive(job);
         };
         job.source.connect(job.node); job.node.connect(job.context.destination);
+        if (levelRow) levelRow.hidden = false;
         message("Listening… Text appears as you speak."); sync();
       } catch (error) {
         if (job === liveSession) finishLive(job, error.name === "NotAllowedError" ? "Microphone permission was denied." : error.message);
