@@ -4,6 +4,7 @@
   "use strict";
   const MAX_SECONDS = 30;
   const MAX_FILE_BYTES = 25 * 1024 * 1024;
+  const AUDIO_DEVICE_KEY = "gopherllm.audio-input-device";
 
   function encodeWAV(samples) {
     const bytes = new ArrayBuffer(44 + samples.length * 2);
@@ -63,6 +64,7 @@
     const file = $("audioFile"), record = $("audioRecord"), live = $("audioLive"), cancel = $("audioCancel");
     const status = $("audioStatus"), result = $("audioResult"), insert = $("audioInsert");
     const levelRow = $("audioLevelRow"), levelFill = $("audioLevelFill");
+    const inputDevice = $("audioInputDevice");
     let available = true, working = false, recorder = null, stream = null;
     let abort = null, timer = null, ticker = null, sequence = 0;
     let catalogSequence = 0;
@@ -83,11 +85,52 @@
       levelFill.classList.toggle("is-quiet", pct < 4);
       if (levelRow) levelRow.querySelector(".audio-level")?.setAttribute("aria-valuenow", String(pct));
     };
+    // Device labels are blank until the origin has been granted microphone
+    // access at least once (browsers hide them from unauthenticated callers
+    // as a fingerprinting/privacy guard), so the first listing before any
+    // permission grant falls back to generic "Microphone N" names; callers
+    // re-list after a successful getUserMedia to pick up the real labels.
+    async function loadInputDevices() {
+      if (!inputDevice || !navigator.mediaDevices?.enumerateDevices) return;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const inputs = devices.filter(d => d.kind === "audioinput");
+        const previous = inputDevice.value;
+        inputDevice.replaceChildren();
+        const def = document.createElement("option");
+        def.value = ""; def.textContent = "System default";
+        inputDevice.appendChild(def);
+        inputs.forEach((d, i) => {
+          const option = document.createElement("option");
+          option.value = d.deviceId;
+          option.textContent = d.label || "Microphone " + (i + 1);
+          inputDevice.appendChild(option);
+        });
+        const stored = previous || readStoredDevice();
+        if (stored && inputs.some(d => d.deviceId === stored)) inputDevice.value = stored;
+        inputDevice.hidden = inputs.length === 0;
+      } catch (_) {
+        // enumerateDevices needs a secure context; leave the default-only
+        // dropdown in place rather than surfacing an error for this.
+      }
+    }
+    function readStoredDevice() {
+      try {
+        return localStorage.getItem(AUDIO_DEVICE_KEY) || "";
+      } catch (_) {
+        return "";
+      }
+    }
+    function audioConstraints() {
+      const id = inputDevice && inputDevice.value;
+      return id ? { deviceId: { ideal: id } } : true;
+    }
     function sync() {
       toggle.hidden = !available;
       if (!available) panel.hidden = true;
       model.disabled = working;
       refresh.disabled = working;
+      if (inputDevice) inputDevice.disabled = working;
       upload.disabled = working || !model.value;
       record.disabled = (working && !recorder) || !model.value || !navigator.mediaDevices?.getUserMedia || !global.MediaRecorder;
       record.textContent = recorder ? "Stop & transcribe" : "Record microphone";
@@ -203,7 +246,8 @@
         job.context = new AudioContext({sampleRate:16000});
         await job.context.resume();
         if (job !== liveSession) return;
-        job.media = await navigator.mediaDevices.getUserMedia({audio:true});
+        job.media = await navigator.mediaDevices.getUserMedia({audio:audioConstraints()});
+        loadInputDevices();
         if (job !== liveSession) { releaseLive(job); return; }
         await job.context.audioWorklet.addModule("/audio-worklet.js");
         if (job !== liveSession) return;
@@ -289,10 +333,18 @@
     toggle.addEventListener("click", () => {
       panel.hidden = !panel.hidden;
       toggle.setAttribute("aria-expanded", String(!panel.hidden));
-      if (!panel.hidden && !working) loadModels();
+      if (!panel.hidden && !working) { loadModels(); loadInputDevices(); }
     });
     refresh.addEventListener("click", loadModels);
     model.addEventListener("change", sync);
+    if (inputDevice) {
+      inputDevice.addEventListener("change", () => {
+        try { localStorage.setItem(AUDIO_DEVICE_KEY, inputDevice.value); } catch (_) { /* per-tab only */ }
+      });
+    }
+    if (navigator.mediaDevices?.addEventListener) {
+      navigator.mediaDevices.addEventListener("devicechange", () => loadInputDevices());
+    }
     upload.addEventListener("click", () => file.click());
     file.addEventListener("change", () => {
       const blob = file.files[0]; file.value = "";
@@ -306,7 +358,8 @@
       working = true; const id = ++sequence; const selected = model.value;
       message("Waiting for microphone permission…"); sync();
       try {
-        const media = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const media = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
+        loadInputDevices();
         if (id !== sequence || !available) { media.getTracks().forEach(track => track.stop()); return; }
         stream = media;
         const chunks = [];
