@@ -26,9 +26,67 @@ const captureModal = document.getElementById("captureModal");
 const captureVideo = document.getElementById("captureVideo");
 const captureCancelButton = document.getElementById("captureCancelButton");
 const captureConfirmButton = document.getElementById("captureConfirmButton");
+const voxtralModelFile = document.getElementById("voxtralModelFile");
+const voxtralLoadButton = document.getElementById("voxtralLoadButton");
+const voxtralRecordButton = document.getElementById("voxtralRecordButton");
+const voxtralStatus = document.getElementById("voxtralStatus");
+const voxtralTranscript = document.getElementById("voxtralTranscript");
 
 let pendingImageDataURL = null; // data:image/...;base64,XXXX, or null
 let history = []; // [{role, content, imageDataURL?}]
+let voxtralCapture = null;
+
+function setVoxtralStatus(text, cls) {
+  voxtralStatus.textContent = text;
+  voxtralStatus.className = "status" + (cls ? " " + cls : "");
+}
+
+// Resample browser-rate mono audio to Voxtral's required 16 kHz. Keeping the
+// fractional source position across callbacks prevents gaps or duplicated
+// samples when a device uses 44.1/48 kHz instead of honoring AudioContext's
+// preferred sample rate.
+function resampleTo16k(input, sourceRate, state) {
+  const step = sourceRate / 16000;
+  const joined = new Float32Array(state.tail.length + input.length);
+  joined.set(state.tail); joined.set(input, state.tail.length);
+  const out = [];
+  for (let pos = state.pos; pos + 1 < joined.length; pos += step) {
+    const i = Math.floor(pos), fraction = pos - i;
+    out.push(joined[i] + (joined[i + 1] - joined[i]) * fraction);
+  }
+  const consumed = Math.floor(state.pos + Math.floor((joined.length - 1 - state.pos) / step) * step);
+  state.tail = joined.slice(Math.max(0, consumed));
+  state.pos = state.pos + Math.ceil(Math.max(0, joined.length - 1 - state.pos) / step) * step - consumed;
+  return new Float32Array(out);
+}
+
+async function drainVoxtral(capture) {
+  if (capture.sending) return;
+  capture.sending = true;
+  try {
+    while (voxtralCapture === capture && capture.queue.length) {
+      const pcm = capture.queue.shift();
+      const text = await window.gopherllm_pushVoxtralPCM(pcm);
+      if (text) voxtralTranscript.textContent = text;
+    }
+  } catch (err) {
+    setVoxtralStatus("transcription failed: " + (err.message || err), "error");
+  } finally { capture.sending = false; }
+}
+
+async function stopVoxtralCapture() {
+  const capture = voxtralCapture;
+  if (!capture) return;
+  capture.source.disconnect(); capture.processor.disconnect(); capture.silence.disconnect();
+  capture.media.getTracks().forEach((track) => track.stop());
+  while (capture.sending || capture.queue.length) await new Promise((resolve) => setTimeout(resolve, 25));
+  const text = await window.gopherllm_stopVoxtral();
+  if (text) voxtralTranscript.textContent = text;
+  await capture.context.close();
+  voxtralCapture = null;
+  voxtralRecordButton.textContent = "🎤 Start transcription";
+  setVoxtralStatus("stopped", "ok");
+}
 
 function setLoadStatus(text, cls) {
   loadStatus.textContent = text;
@@ -158,6 +216,57 @@ async function main() {
 
   textModelFile.addEventListener("change", () => {
     loadButton.disabled = !textModelFile.files.length;
+  });
+
+  voxtralModelFile.addEventListener("change", () => {
+    voxtralLoadButton.disabled = !voxtralModelFile.files.length;
+  });
+  voxtralLoadButton.addEventListener("click", async () => {
+    if (!voxtralModelFile.files.length) return;
+    voxtralLoadButton.disabled = true;
+    try {
+      setVoxtralStatus("reading speech model…");
+      const bytes = await readFileAsUint8Array(voxtralModelFile.files[0]);
+      setVoxtralStatus("loading Voxtral…");
+      await window.gopherllm_loadVoxtralModel(bytes);
+      voxtralRecordButton.disabled = false;
+      setVoxtralStatus("speech model loaded", "ok");
+    } catch (err) {
+      setVoxtralStatus("failed to load: " + (err.message || err), "error");
+      voxtralLoadButton.disabled = false;
+    }
+  });
+  voxtralRecordButton.addEventListener("click", async () => {
+    if (voxtralCapture) {
+      voxtralRecordButton.disabled = true;
+      try { await stopVoxtralCapture(); } catch (err) { setVoxtralStatus("stop failed: " + (err.message || err), "error"); }
+      voxtralRecordButton.disabled = false;
+      return;
+    }
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("microphone access requires HTTPS or localhost");
+      await window.gopherllm_startVoxtral();
+      const context = new (window.AudioContext || window.webkitAudioContext)();
+      const media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+      const source = context.createMediaStreamSource(media);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      // ScriptProcessor must be connected to run; a zero-gain sink avoids
+      // feeding the microphone back through the speakers.
+      const silence = context.createGain(); silence.gain.value = 0;
+      const capture = { context, media, source, processor, silence, queue: [], sending: false, resample: { tail: new Float32Array(0), pos: 0 } };
+      processor.onaudioprocess = (event) => {
+        const pcm = resampleTo16k(event.inputBuffer.getChannelData(0), context.sampleRate, capture.resample);
+        if (pcm.length) { capture.queue.push(pcm); void drainVoxtral(capture); }
+      };
+      source.connect(processor); processor.connect(silence); silence.connect(context.destination);
+      voxtralCapture = capture;
+      voxtralTranscript.textContent = "";
+      voxtralRecordButton.textContent = "■ Stop transcription";
+      setVoxtralStatus("listening…");
+    } catch (err) {
+      setVoxtralStatus("could not start: " + (err.message || err), "error");
+      try { await window.gopherllm_stopVoxtral(); } catch (_) {}
+    }
   });
 
   loadButton.addEventListener("click", async () => {

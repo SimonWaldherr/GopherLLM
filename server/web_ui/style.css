@@ -1228,6 +1228,11 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 .model-download-status.is-error { color: var(--stop); }
 .model-download-status.is-success { color: var(--ok); }
 .settings-actions { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.model-role-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.model-role-card { display: grid; gap: 3px; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--panel-2); }
+.model-role-card strong { color: var(--ink); font-size: var(--fs-xs); }
+.model-role-card span { overflow-wrap: anywhere; color: var(--muted); font-size: var(--fs-2xs); line-height: 1.4; }
+.model-role-card.is-ready { border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); }
 .settings-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 12px; }
 /* 6 fields (temperature/topP/topK/minP/repeatPenalty/seed), not 4 or 8: at
    the base 4-column grid the 5th and 6th field wrap alone onto a second row

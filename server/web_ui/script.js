@@ -1536,6 +1536,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const browserVisionModelNameEl = $("browserVisionModelName");
   const browserModelLoadEl = $("browserModelLoad");
   const browserModelStatusEl = $("browserModelStatus");
+  const modelRoleTextEl = $("modelRoleText");
+  const modelRoleVisionEl = $("modelRoleVision");
+  const modelRoleSpeechEl = $("modelRoleSpeech");
+  const modelRoleEmbeddingEl = $("modelRoleEmbedding");
   const promptWrapEl = $("promptWrap");
   const dropOverlayEl = $("dropOverlay");
   const exportChatsEl = $("exportChats");
@@ -1573,6 +1577,35 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   let modelLoadStartedAt = 0;
   let modelLoadProgressActive = false;
   let modelCatalog = [];
+
+  function renderModelRoles() {
+    const setRole = (element, text, ready) => {
+      if (!element) return;
+      element.querySelector("span").textContent = text;
+      element.classList.toggle("is-ready", ready);
+    };
+    const browser = browserOnlyDeployment || preferences.inferenceMode === "browser";
+    const chat = modelCatalog.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
+    const active = chat.find((model) => model.loaded);
+    const speech = modelCatalog.filter((model) => model.architecture === "voxtral_realtime");
+    const embeddings = modelCatalog.filter((model) => model.embedding === true);
+    setRole(modelRoleTextEl,
+      browser ? (browserModelSummaryEl.hidden ? "Choose a local text GGUF below." : "Loaded in this browser tab.")
+        : (active ? "Active server model: " + (active.name || active.id) : "No active server text model."),
+      browser ? !browserModelSummaryEl.hidden : Boolean(active));
+    setRole(modelRoleVisionEl,
+      browser ? (browserVisionModelFileEl.files.length ? "Vision projector selected; load it with the text model." : "Optional matching mmproj; not selected.")
+        : (active?.vision ? "Enabled by the active chat model." : "Requires a vision-capable chat model or its projector."),
+      browser ? browserVisionModelFileEl.files.length > 0 : Boolean(active?.vision));
+    setRole(modelRoleSpeechEl,
+      browser ? "Server transcription is unavailable in browser-only mode."
+        : (speech.length ? speech.length + " Voxtral model" + (speech.length === 1 ? " is" : "s are") + " available in Audio." : "No Voxtral Realtime model found."),
+      !browser && speech.length > 0);
+    setRole(modelRoleEmbeddingEl,
+      browser ? "Retrieval is unavailable in browser-only mode."
+        : (embeddings.length ? embeddings.length + " embedding model" + (embeddings.length === 1 ? " is" : "s are") + " available for retrieval." : "No embedding model found."),
+      !browser && embeddings.length > 0);
+  }
   // hasActiveModel drives the first-contact empty state and the idle status
   // text: it starts from the server-rendered truth (chat.html's
   // data-has-model, set from chatTemplateData.HasModel) so there is no flash
@@ -3915,6 +3948,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       modelCatalog = data.models.map((model) => Object.assign({}, model, {
         search: [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB", model.reasoning ? "thinking reasoning" : "no thinking", model.vision ? "vision" : "no vision"].filter(Boolean).join(" ").toLowerCase()
       }));
+      renderModelRoles();
       const placeholder = document.createElement("option");
       placeholder.value = "";
       placeholder.textContent = "Choose a local model";
@@ -3978,6 +4012,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       modelLibraryEl.appendChild(empty);
       modelResultCountEl.textContent = "Catalog unavailable";
       setStatus("Offline");
+      renderModelRoles();
     }
   }
 
@@ -6142,11 +6177,13 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const file = browserTextModelFileEl.files[0];
     browserTextModelNameEl.textContent = file ? file.name : "";
     browserModelLoadEl.disabled = !file;
+    renderModelRoles();
   });
   browserVisionModelPickEl.addEventListener("click", () => browserVisionModelFileEl.click());
   browserVisionModelFileEl.addEventListener("change", () => {
     const file = browserVisionModelFileEl.files[0];
     browserVisionModelNameEl.textContent = file ? file.name : "";
+    renderModelRoles();
   });
   browserModelLoadEl.addEventListener("click", loadBrowserModel);
 
@@ -6353,6 +6390,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         : "Server mode uses the model this GopherLLM server has loaded, with full access to tools and retrieval.");
     syncDeploymentControls();
     updateVisionAffordances();
+    renderModelRoles();
   }
 
   function changeInferenceMode(value) {
@@ -6441,6 +6479,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       setIdleStatus();
       updateComposer(false);
       updateVisionAffordances();
+      renderModelRoles();
       showToast("Model loaded in this browser tab.", "success");
     } catch (err) {
       browserModelStatusEl.textContent = "Failed to load: " + (err && err.message ? err.message : String(err));

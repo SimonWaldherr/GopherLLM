@@ -317,6 +317,22 @@
       <p id="settingsSearchEmpty" class="settings-search-empty" hidden>No matches in this section for “<span id="settingsSearchEmptyQuery"></span>”.<span id="settingsSearchEmptyHint"></span></p>
 
       <div id="settingsPageModel" class="settings-page" role="tabpanel" aria-labelledby="settingsTabModel" data-settings-page="model">
+        <section class="settings-section model-roles-section" aria-labelledby="modelRolesTitle">
+          <div class="settings-section-head">
+            <div>
+              <h3 id="modelRolesTitle">Model roles</h3>
+              <p>Models are configured by what they do. A text model can optionally be paired with vision; speech and embeddings are independent services.</p>
+            </div>
+          </div>
+          <div class="model-role-grid" aria-live="polite">
+            <article class="model-role-card" id="modelRoleText"><strong>Text &amp; chat</strong><span>Checking local models…</span></article>
+            <article class="model-role-card" id="modelRoleVision"><strong>Vision</strong><span>Checking local models…</span></article>
+            <article class="model-role-card" id="modelRoleSpeech"><strong>Speech to text</strong><span>Checking local models…</span></article>
+            <article class="model-role-card" id="modelRoleEmbedding"><strong>Embeddings &amp; retrieval</strong><span>Checking local models…</span></article>
+          </div>
+          <p class="settings-note">Text and vision are used for chat. Voxtral is used only for transcription. Embedding models power retrieval and never generate chat replies.</p>
+        </section>
+
         <section class="settings-section engine-overview" data-advanced aria-labelledby="engineOverviewTitle">
           <div class="settings-section-head">
             <div>

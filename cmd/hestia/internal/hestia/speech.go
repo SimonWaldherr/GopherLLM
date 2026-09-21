@@ -24,19 +24,10 @@ var ErrVoiceSessionBusy = errors.New("hestia: a voice recording is already in pr
 // SpeechHost configures Hestia's speech transcription and enforces
 // CONCEPT.md section 3's "genau eine aktive Sprachaufnahme" capacity limit.
 //
-// It deliberately calls gopherllm.TranscribeVoxtralRealtime -- the
-// verified, correctness-checked offline/batch decode path (see
-// voxtral_realtime.go and voxtral_transcribe.go in the module root) --
-// rather than gopherllm.VoxtralModel's incremental Push/PushPCM16 API. The
-// two use different decode schedules ("live decoder" vs. "legacy offline
-// decoder", per Transcribe's own doc comment); as of this writing the
-// incremental one returns empty transcripts on real speech that the batch
-// one transcribes correctly (verified against samples/jfk.wav from
-// antirez/voxtral.c). Buffering one turn's audio and transcribing it whole
-// at Finish trades away live partial transcripts for a decoder actually
-// known to work; CONCEPT.md section 4 already lists "kein geteilter
-// Modellhost" as a known gap this accepts for now. Re-evaluate this
-// tradeoff once the incremental path is fixed upstream.
+// The model's incremental decoder can return an empty transcript for real
+// speech. To keep live transcription reliable, VoiceSession periodically
+// re-decodes the recording accumulated so far through the verified batch
+// path. Partial text is advisory only and is never used to trigger an action.
 type SpeechHost struct {
 	ModelPath string
 
@@ -63,14 +54,16 @@ func OpenSpeechHost(ctx context.Context, modelPath string, logw io.Writer) (*Spe
 
 func (h *SpeechHost) Close() error { return nil }
 
-// VoiceSession accumulates one turn's raw PCM16 audio in memory.
-// Transcription happens once, at Finish -- see SpeechHost's doc comment.
+// VoiceSession accumulates one turn's raw PCM16 audio in memory and refreshes
+// a reliable partial transcript after each additional second of recording.
 type VoiceSession struct {
-	host    *SpeechHost
-	mu      sync.Mutex
-	pcm     []byte
-	partial string
-	done    bool
+	host     *SpeechHost
+	mu       sync.Mutex
+	pcm      []byte
+	partial  string
+	decoded  int
+	decoding bool
+	done     bool
 }
 
 // StartVoiceSession reserves the host's one recording slot.
@@ -90,25 +83,49 @@ func (h *SpeechHost) StartVoiceSession(ctx context.Context) (*VoiceSession, erro
 	return &VoiceSession{host: h}, nil
 }
 
-// PushPCM16 appends one chunk of little-endian 16-bit mono PCM at 16kHz.
-// It does not transcribe; the returned string is the same best-effort
-// placeholder ("… Aufnahme läuft …") every chunk returns, since there is
-// no incremental decoder in play -- callers should not treat this as a
-// live transcript (CONCEPT.md section 6: partial revisions update the UI
-// but never authorize an action; here there simply isn't one yet).
+// PushPCM16 appends one chunk of little-endian 16-bit mono PCM at 16kHz and
+// periodically refreshes its partial transcript using the known-good batch
+// decoder. Decoding happens outside the session lock so recording can keep
+// accepting audio while a previous partial is being rendered.
 func (vs *VoiceSession) PushPCM16(ctx context.Context, pcm []byte) (string, error) {
 	if len(pcm)%2 != 0 {
 		return "", fmt.Errorf("hestia: PCM16 chunk has an odd byte count")
 	}
 	vs.mu.Lock()
-	defer vs.mu.Unlock()
 	if vs.done {
+		vs.mu.Unlock()
 		return "", fmt.Errorf("hestia: voice session already finished")
 	}
 	vs.pcm = append(vs.pcm, pcm...)
 	seconds := float64(len(vs.pcm)) / 2 / 16000
 	vs.partial = fmt.Sprintf("… Aufnahme läuft (%.1fs) …", seconds)
-	return vs.partial, nil
+	if vs.decoding || len(vs.pcm)-vs.decoded < 16000*2 {
+		partial := vs.partial
+		vs.mu.Unlock()
+		return partial, nil
+	}
+	vs.decoding = true
+	snapshot := append([]byte(nil), vs.pcm...)
+	vs.mu.Unlock()
+	text, err := gopherllm.TranscribeVoxtralRealtime(ctx, vs.host.ModelPath, pcm16ToFloat32(snapshot), 0, io.Discard)
+	vs.mu.Lock()
+	vs.decoding = false
+	if err != nil {
+		// Keep capturing and preserve the last visible partial. A transient
+		// decode failure must not turn a microphone request into lost audio.
+		partial := vs.partial
+		vs.mu.Unlock()
+		return partial, nil
+	}
+	if !vs.done {
+		vs.decoded = len(snapshot)
+		if text != "" {
+			vs.partial = text
+		}
+	}
+	partial := vs.partial
+	vs.mu.Unlock()
+	return partial, nil
 }
 
 // Finish transcribes the whole buffered recording in one batch call and

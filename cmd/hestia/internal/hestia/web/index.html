@@ -102,6 +102,35 @@ document.getElementById('turns').addEventListener('click', async (e) => {
     if (j.media) j.media.getTracks().forEach((t) => t.stop());
   }
 
+  // Keep every worklet chunk in order while the server refreshes a partial
+  // transcript. Dropping a chunk merely because an HTTP request is still
+  // running corrupts the recording whenever inference takes longer than the
+  // capture interval.
+  async function drainAudio(j) {
+    if (j.sending) return;
+    j.sending = true;
+    try {
+      while (job === j && j.audioQueue.length) {
+        const pcm = j.audioQueue.shift();
+        const resp = await fetch(`/api/turns/${j.turnId}/audio`, {
+          method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: pcm,
+        });
+        if (resp.ok) {
+          const t = await resp.json();
+          setStatus('Höre zu… „' + (t.InputText || '') + '“');
+        }
+      }
+    } finally {
+      j.sending = false;
+    }
+  }
+
+  async function waitForAudio(j) {
+    while (j.sending || j.audioQueue.length) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   async function start() {
     if (job) return;
     const AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -112,7 +141,7 @@ document.getElementById('turns').addEventListener('click', async (e) => {
     const conv = await ensureConversation();
     micButton.textContent = '● bereit …';
     setStatus('Mikrofon wird angefragt…');
-    const j = { sending: false };
+    const j = { sending: false, audioQueue: [] };
     try {
       j.context = new AudioContext({ sampleRate: 16000 });
       await j.context.resume();
@@ -138,19 +167,8 @@ document.getElementById('turns').addEventListener('click', async (e) => {
           await finish(j);
           return;
         }
-        if (j.sending) return; // simple backpressure: drop overlap, keep order
-        j.sending = true;
-        try {
-          const resp = await fetch(`/api/turns/${j.turnId}/audio`, {
-            method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: event.data,
-          });
-          if (resp.ok) {
-            const t = await resp.json();
-            setStatus('Höre zu… „' + (t.InputText || '') + '“');
-          }
-        } finally {
-          j.sending = false;
-        }
+        j.audioQueue.push(event.data);
+        void drainAudio(j);
       };
       j.source.connect(j.node);
       j.node.connect(j.context.destination);
@@ -167,6 +185,7 @@ document.getElementById('turns').addEventListener('click', async (e) => {
 
   async function finish(j) {
     await stopCapture(j);
+    await waitForAudio(j);
     if (job === j) job = null;
     micButton.textContent = '🎤 Sprechen';
     setStatus('Verarbeite…');

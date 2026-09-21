@@ -59,15 +59,34 @@ func OpenVoxtral(ctx context.Context, path string, opts ...VoxtralOption) (*Voxt
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	mmap, err := OpenMmap(path)
+	if err != nil {
+		return nil, fmt.Errorf("opening Voxtral model: %w", err)
+	}
+	m, err := openVoxtralBytes(ctx, mmap.Bytes(), mmap, opts...)
+	if err != nil {
+		_ = mmap.Close()
+	}
+	return m, err
+}
+
+// OpenVoxtralFromGGUFBytes loads a self-contained Voxtral Realtime GGUF
+// already held in memory. It is intended for browser/WASM callers, where a
+// user-selected File cannot be memory-mapped. The caller must keep data alive
+// until Close returns when the supplied bytes are backed by external storage.
+func OpenVoxtralFromGGUFBytes(ctx context.Context, data []byte, opts ...VoxtralOption) (*VoxtralModel, error) {
+	return openVoxtralBytes(ctx, data, nil, opts...)
+}
+
+func openVoxtralBytes(ctx context.Context, data []byte, mmap *MmapFile, opts ...VoxtralOption) (*VoxtralModel, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	settings := voxtralLoadSettings{logw: io.Discard, metal: MetalAvailable()}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&settings)
 		}
-	}
-	mmap, err := OpenMmap(path)
-	if err != nil {
-		return nil, fmt.Errorf("opening Voxtral model: %w", err)
 	}
 	source := &VoxtralRealtimeSession{mmap: mmap, disableFast: !settings.metal}
 	success := false
@@ -76,11 +95,11 @@ func OpenVoxtral(ctx context.Context, path string, opts ...VoxtralOption) (*Voxt
 			_ = source.Close()
 		}
 	}()
-	gguf, err := ParseGGUF(mmap.Bytes())
+	gguf, err := ParseGGUF(data)
 	if err != nil {
 		return nil, fmt.Errorf("parsing Voxtral GGUF: %w", err)
 	}
-	source.cfg, source.weights, err = LoadVoxtralRealtimeModel(mmap.Bytes(), gguf, settings.metal, settings.logw)
+	source.cfg, source.weights, err = LoadVoxtralRealtimeModel(data, gguf, settings.metal, settings.logw)
 	if err != nil {
 		return nil, fmt.Errorf("loading Voxtral weights: %w", err)
 	}

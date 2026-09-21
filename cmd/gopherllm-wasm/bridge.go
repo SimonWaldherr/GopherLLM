@@ -15,8 +15,11 @@ import (
 )
 
 var (
-	runnerMu sync.Mutex
-	runner   *gopherllm.Runner
+	runnerMu       sync.Mutex
+	runner         *gopherllm.Runner
+	voxtralMu      sync.Mutex
+	voxtralModel   *gopherllm.VoxtralModel
+	voxtralSession *gopherllm.VoxtralRealtimeSession
 
 	// generating guards against two overlapping gopherllm_generate calls.
 	// Runner.GenerateChatStreamUntil already serializes on the Runner's own
@@ -48,6 +51,118 @@ func registerCallbacks() {
 	js.Global().Set("gopherllm_webgpuKernelTest", js.FuncOf(jsWebGPUKernelTest))
 	js.Global().Set("gopherllm_webgpuStatus", js.FuncOf(jsWebGPUStatus))
 	js.Global().Set("gopherllm_setWebGPUForceDisabled", js.FuncOf(jsSetWebGPUForceDisabled))
+	js.Global().Set("gopherllm_loadVoxtralModel", js.FuncOf(jsLoadVoxtralModel))
+	js.Global().Set("gopherllm_startVoxtral", js.FuncOf(jsStartVoxtral))
+	js.Global().Set("gopherllm_pushVoxtralPCM", js.FuncOf(jsPushVoxtralPCM))
+	js.Global().Set("gopherllm_stopVoxtral", js.FuncOf(jsStopVoxtral))
+}
+
+// jsLoadVoxtralModel(bytes: Uint8Array) loads a self-contained Voxtral
+// Realtime GGUF selected in the browser. It is deliberately separate from
+// the chat Runner: speech models have a different architecture and API.
+func jsLoadVoxtralModel(this js.Value, args []js.Value) any {
+	if len(args) < 1 || args[0].IsUndefined() || args[0].IsNull() {
+		return rejectPromise(fmt.Errorf("gopherllm_loadVoxtralModel: expected a Uint8Array argument"))
+	}
+	data := make([]byte, args[0].Get("length").Int())
+	js.CopyBytesToGo(data, args[0])
+	return newPromise(func(resolve, reject js.Value) {
+		m, err := gopherllm.OpenVoxtralFromGGUFBytes(context.Background(), data)
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		voxtralMu.Lock()
+		oldSession, oldModel := voxtralSession, voxtralModel
+		voxtralSession, voxtralModel = nil, m
+		voxtralMu.Unlock()
+		if oldSession != nil {
+			_ = oldSession.Close()
+		}
+		if oldModel != nil {
+			_ = oldModel.Close()
+		}
+		resolve.Invoke(true)
+	})
+}
+
+func jsStartVoxtral(this js.Value, args []js.Value) any {
+	return newPromise(func(resolve, reject js.Value) {
+		voxtralMu.Lock()
+		m := voxtralModel
+		active := voxtralSession != nil
+		voxtralMu.Unlock()
+		if m == nil {
+			reject.Invoke("gopherllm_startVoxtral: no Voxtral model loaded")
+			return
+		}
+		if active {
+			reject.Invoke("gopherllm_startVoxtral: transcription is already active")
+			return
+		}
+		s, err := m.NewSession(context.Background())
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		voxtralMu.Lock()
+		voxtralSession = s
+		voxtralMu.Unlock()
+		resolve.Invoke("")
+	})
+}
+
+// jsPushVoxtralPCM(pcm: Float32Array) => Promise<string>. The audio must be
+// mono 16 kHz normalized samples; the page's AudioWorklet performs that
+// conversion before calling us.
+func jsPushVoxtralPCM(this js.Value, args []js.Value) any {
+	if len(args) < 1 {
+		return rejectPromise(fmt.Errorf("gopherllm_pushVoxtralPCM: expected a Float32Array argument"))
+	}
+	src := args[0]
+	pcm := make([]float32, src.Get("length").Int())
+	for i := range pcm {
+		pcm[i] = float32(src.Index(i).Float())
+	}
+	return newPromise(func(resolve, reject js.Value) {
+		voxtralMu.Lock()
+		s := voxtralSession
+		voxtralMu.Unlock()
+		if s == nil {
+			reject.Invoke("gopherllm_pushVoxtralPCM: transcription is not active")
+			return
+		}
+		text, err := s.Push(context.Background(), pcm, false)
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		resolve.Invoke(text)
+	})
+}
+
+func jsStopVoxtral(this js.Value, args []js.Value) any {
+	return newPromise(func(resolve, reject js.Value) {
+		voxtralMu.Lock()
+		s := voxtralSession
+		voxtralSession = nil
+		voxtralMu.Unlock()
+		if s == nil {
+			resolve.Invoke("")
+			return
+		}
+		text, err := s.Flush(context.Background())
+		closeErr := s.Close()
+		if err != nil {
+			reject.Invoke(err.Error())
+			return
+		}
+		if closeErr != nil {
+			reject.Invoke(closeErr.Error())
+			return
+		}
+		resolve.Invoke(text)
+	})
 }
 
 // jsSetWebGPUForceDisabled(disabled: boolean) => undefined
