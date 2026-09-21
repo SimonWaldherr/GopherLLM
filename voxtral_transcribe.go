@@ -70,9 +70,16 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 		return "", fmt.Errorf("building tokenizer: %w", err)
 	}
 
+	// Read off the already-resolved Tokenizer rather than re-reading
+	// "tokenizer.ggml.*" metadata directly: those keys don't exist at all
+	// in the "voxtral.tokenizer.*" convention (see
+	// voxtralTokenizerFromMetadata), where BOS/EOS instead come from
+	// separate voxtral.token.bos/eos fields -- the 1/2 defaults below
+	// happen to be numerically right for this checkpoint either way, but
+	// reading a key that doesn't exist in that convention is fragile.
 	tokenTypes, _ := gguf.Metadata["tokenizer.ggml.token_type"].AsU32Array()
-	eosID := int(gguf.GetU32("tokenizer.ggml.eos_token_id", 2))
-	bosID := int(gguf.GetU32("tokenizer.ggml.bos_token_id", 1))
+	eosID := int(tok.EOSID)
+	bosID := int(tok.BOSID)
 
 	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, !useMetal, logw)
 }

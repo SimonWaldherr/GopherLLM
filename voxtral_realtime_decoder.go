@@ -180,8 +180,8 @@ func ForwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 			return nil, fmt.Errorf("decoder step: layer %d projected widths q=%d k=%d v=%d, want q=%d kv=%d", li, len(b.q), len(b.k), len(b.v), qDim, kvDim)
 		}
 		if nCache > 0 {
-			applyPreparedRope(b.q, dc.HeadDim, dc.NHeads, half, nCache, b.sin, b.cos, false)
-			applyPreparedRope(b.k, dc.HeadDim, dc.NKVHeads, half, nCache, b.sin, b.cos, false)
+			applyPreparedRope(b.q, dc.HeadDim, dc.NHeads, half, nCache, b.sin, b.cos, cfg.RopeInterleaved)
+			applyPreparedRope(b.k, dc.HeadDim, dc.NKVHeads, half, nCache, b.sin, b.cos, cfg.RopeInterleaved)
 		}
 
 		// Recycle the oldest row once the attention window is full. Keep

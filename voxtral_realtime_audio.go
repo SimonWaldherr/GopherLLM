@@ -457,9 +457,11 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 			if ropeHalf > 0 {
 				sin := ropeSin[t*ropeHalf : (t+1)*ropeHalf]
 				cos := ropeCos[t*ropeHalf : (t+1)*ropeHalf]
-				// GGUF Q/K (and Q bias) already use split-half row order.
-				applyPreparedRope(q[t], headDim, heads, ropeHalf, ropeHalf, sin, cos, false)
-				applyPreparedRope(k[t], headDim, heads, ropeHalf, ropeHalf, sin, cos, false)
+				// Row order (split-half vs. interleaved) depends on which
+				// GGUF conversion tool produced this file -- see
+				// VoxtralRealtimeConfig.RopeInterleaved's doc comment.
+				applyPreparedRope(q[t], headDim, heads, ropeHalf, ropeHalf, sin, cos, cfg.RopeInterleaved)
+				applyPreparedRope(k[t], headDim, heads, ropeHalf, ropeHalf, sin, cos, cfg.RopeInterleaved)
 			}
 		}
 

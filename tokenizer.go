@@ -69,6 +69,14 @@ type Tokenizer struct {
 func TokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
 	tokensValue, ok := metadata["tokenizer.ggml.tokens"]
 	if !ok {
+		// A second known GGUF convention for mistralai/Voxtral-Mini-4B-
+		// Realtime-2602 (see voxtralTensorNames' doc comment in
+		// voxtral_realtime.go) stores its vocabulary under
+		// "voxtral.tokenizer.*" instead of the standard "tokenizer.ggml.*"
+		// keys this function otherwise reads.
+		if _, ok := metadata["voxtral.tokenizer.vocab_token_bytes_b64"]; ok {
+			return voxtralTokenizerFromMetadata(metadata)
+		}
 		return nil, fmt.Errorf("missing tokenizer.ggml.tokens")
 	}
 	vocab, ok := tokensValue.AsStringArray()

@@ -110,9 +110,13 @@ func openVoxtralBytes(ctx context.Context, data []byte, mmap *MmapFile, opts ...
 	if source.cfg.Mel.SampleRate != VoxtralSampleRate {
 		return nil, fmt.Errorf("Voxtral requires a %d Hz frontend, got %d", VoxtralSampleRate, source.cfg.Mel.SampleRate)
 	}
+	// See the matching comment in voxtral_transcribe.go: read off the
+	// already-resolved Tokenizer rather than re-reading "tokenizer.ggml.*"
+	// metadata, which doesn't exist for the "voxtral.tokenizer.*"
+	// convention.
 	source.tokenTypes, _ = gguf.Metadata["tokenizer.ggml.token_type"].AsU32Array()
-	source.eosID = int(gguf.GetU32("tokenizer.ggml.eos_token_id", 2))
-	source.bosID = int(gguf.GetU32("tokenizer.ggml.bos_token_id", 1))
+	source.eosID = int(source.tokenizer.EOSID)
+	source.bosID = int(source.tokenizer.BOSID)
 	if err := prepareVoxtralStreamWeights(ctx, &source.weights); err != nil {
 		return nil, err
 	}
