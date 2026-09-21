@@ -454,11 +454,32 @@
     });
     global.addEventListener("pagehide", cancelJob);
     sync();
-    return { setAvailable(value) {
-      available = !!value;
-      if (!available) { catalogSequence++; if (working) cancelJob(); toggle.setAttribute("aria-expanded", "false"); }
-      sync();
-    } };
+    // Transcribes a file dropped/picked via the composer's main "+" attach
+    // button. Deliberately independent of the panel's own record/upload/live
+    // session state (working/sequence/result/message) so it can run even
+    // while that panel is closed, and so it never clobbers a transcript the
+    // user is actively reviewing there.
+    async function transcribeAttachment(file) {
+      if (!available) throw new Error("Voxtral audio transcription is not available.");
+      if (!model.value) await loadModels();
+      if (!model.value) throw new Error("No Voxtral model found. Place a Voxtral Realtime GGUF in the server's model directory.");
+      const wav = await toWAV(file, false);
+      const form = new FormData();
+      form.append("model", model.value);
+      form.append("file", wav, "audio.wav");
+      const response = await options.fetch("/v1/audio/transcriptions", { method: "POST", body: form });
+      if (!response.ok) throw new Error(await response.text() || "Transcription failed.");
+      const data = await response.json();
+      return String(data.text || "").trim();
+    }
+    return {
+      setAvailable(value) {
+        available = !!value;
+        if (!available) { catalogSequence++; if (working) cancelJob(); toggle.setAttribute("aria-expanded", "false"); }
+        sync();
+      },
+      transcribeAttachment
+    };
   }
   global.GopherLLMAudio = { init, encodeWAV, toWAV };
 })(globalThis);

@@ -221,3 +221,31 @@ test('system audio capture surfaces a clear error when no audio track is shared'
   assert.equal(videoStopped,2);
   assert.match(h.elements.audioStatus.textContent,/No audio was shared/);
 });
+
+test('transcribeAttachment transcribes a composer-attached file without opening the panel',async()=>{
+  const calls=[];
+  const h=harness(async(url,opts)=>{
+    calls.push(url);
+    if(url==='/models/audio')return {ok:true,json:async()=>({models:[{id:'voxtral',name:'Voxtral'}]})};
+    if(url==='/v1/audio/transcriptions')return {ok:true,json:async()=>({text:' Attached transcript '})};
+    throw new Error('unexpected fetch '+url);
+  });
+  const text=await h.controls.transcribeAttachment(new Blob(['audio']));
+  assert.equal(text,'Attached transcript');
+  assert.deepEqual(calls,['/models/audio','/v1/audio/transcriptions']);
+  // Never touched the panel's own review state -- an attachment transcript
+  // must not appear as if a manual recording/upload were pending review.
+  assert.equal(h.elements.audioResult.value,'');
+  assert.equal(h.elements.audioPanel.hidden,true);
+});
+
+test('transcribeAttachment rejects clearly when no Voxtral model is available',async()=>{
+  const h=harness(async(url)=>url==='/models/audio'?{ok:true,json:async()=>({models:[]})}:{ok:false,text:async()=>'unused'});
+  await assert.rejects(()=>h.controls.transcribeAttachment(new Blob(['audio'])),/No Voxtral model found/);
+});
+
+test('transcribeAttachment rejects when transcription is unavailable',async()=>{
+  const h=harness(async()=>({ok:true,json:async()=>({models:[]})}));
+  h.controls.setAvailable(false);
+  await assert.rejects(()=>h.controls.transcribeAttachment(new Blob(['audio'])),/not available/);
+});

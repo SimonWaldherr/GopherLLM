@@ -1006,7 +1006,7 @@ function cleanAttachment(value) {
     type: typeof value.type === "string" ? value.type.slice(0, 120) : "",
     size,
     kind,
-    text: (kind === "text" || kind === "document") && typeof value.text === "string" ? value.text.slice(0, 500000) : ""
+    text: (kind === "text" || kind === "document" || kind === "audio") && typeof value.text === "string" ? value.text.slice(0, 500000) : ""
   };
 }
 
@@ -1018,7 +1018,9 @@ function fileSizeLabel(size) {
 
 function attachmentSummary(attachment) {
   const type = attachment.type || attachment.kind;
-  return type + " · " + fileSizeLabel(attachment.size) + ((attachment.kind === "text" || attachment.kind === "document") && attachment.text ? " · text included" : " · metadata only");
+  const hasText = (attachment.kind === "text" || attachment.kind === "document" || attachment.kind === "audio") && attachment.text;
+  const label = attachment.kind === "audio" ? (hasText ? "transcribed" : "not transcribed") : (hasText ? "text included" : "metadata only");
+  return type + " · " + fileSizeLabel(attachment.size) + " · " + label;
 }
 
 function cleanMessage(value) {
@@ -2118,6 +2120,14 @@ function planSettingsSearch(pages, query, activeKey, simple) {
           showToast("Could not read " + file.name + " as text; it was attached as metadata only.", "error");
         }
       }
+      if (kind === "audio") {
+        try {
+          attachment.text = await audioControls?.transcribeAttachment(file);
+          if (!attachment.text) showToast(file.name + " had no recognizable speech; it was attached as metadata only.", "error");
+        } catch (error) {
+          showToast("Could not transcribe " + file.name + ": " + (error?.message || "unknown error") + ". It was attached as metadata only.", "error");
+        }
+      }
       if (kind === "document" && /\.(xlsx|ods)$/i.test(file.name)) {
         try {
           const response = await fetch("/batch/parse?filename=" + encodeURIComponent(file.name), {
@@ -2145,6 +2155,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
 
   function attachmentPrompt(attachment) {
     const label = attachment.name.replace(/[\[\]<>]/g, "_");
+    if (attachment.kind === "audio" && attachment.text) {
+      return "[Voxtral transcript of " + label + " · " + attachmentSummary(attachment) + "]\n\n```text\n" + attachment.text + "\n```";
+    }
     if ((attachment.kind === "text" || attachment.kind === "document") && attachment.text) {
       return "[Attached text file: " + label + " · " + attachmentSummary(attachment) + "]\n\n```text\n" + attachment.text + "\n```";
     }

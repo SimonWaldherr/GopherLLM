@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gopherllm-chat",
+      "runtimeExecutable": "make",
+      "runtimeArgs": ["serve", "CHAT=1", "ADDR=127.0.0.1:8090"],
+      "port": 8090
+    }
+  ]
+}
