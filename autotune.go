@@ -11,8 +11,23 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
+
+// tuningApplyMu serializes writes to the process-global kernel-selection
+// atomics (thread count, quantization mode, KV format, dispatch, prefill
+// chunk) across Runners. Runner.genLock already keeps one Runner's own writes
+// (e.g. a calibration sweep's many candidate apply() calls) from interleaving
+// with its own reads, but genLock is per-Runner: a second, independently
+// loaded Runner (for example a dedicated embedding model) has no lock over
+// these same globals, so its Apply() could otherwise interleave field-by-field
+// with a calibration running on the first Runner. This closes the writer-vs-
+// writer race; a concurrent request's mid-calibration READ of these globals
+// on the other Runner is a separate, narrower exposure that would need each
+// hot-path matvec to take a lock, which the process-wide design deliberately
+// avoids for performance.
+var tuningApplyMu sync.Mutex
 
 // Auto-tuning: measure this model on this machine and pick the fastest runtime
 // settings, instead of shipping one static guess for every combination of
@@ -186,6 +201,8 @@ func (r AutoTuneResult) PrefillSpeedup() float64 {
 // requests. Runner.AutoTune and Runner.AutoTuneOrCached hold the generation lock
 // and are safe to call at any time; prefer those.
 func (r AutoTuneResult) Apply() {
+	tuningApplyMu.Lock()
+	defer tuningApplyMu.Unlock()
 	if r.Threads > 0 {
 		SetNumThreads(r.Threads)
 		runtime.GOMAXPROCS(r.Threads)
@@ -288,6 +305,8 @@ func (c tunerConfig) resolvedPrefillChunk(config Config) int {
 }
 
 func (c tunerConfig) apply() {
+	tuningApplyMu.Lock()
+	defer tuningApplyMu.Unlock()
 	SetNumThreads(c.threads)
 	runtime.GOMAXPROCS(c.threads)
 	setQ8Activations(c.q8)

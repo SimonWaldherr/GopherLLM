@@ -40,8 +40,11 @@ type HandlerOptions struct {
 	// Defaults are the generation settings requests inherit unless they
 	// override individual fields.
 	Defaults gopherllm.GenerationOptions
-	// MaxConcurrentRequests bounds in-flight generation requests (default 8).
-	// Requests beyond the bound fail with HTTP 429; no unbounded HTTP queue.
+	// MaxConcurrentRequests bounds in-flight requests (default 8), applied as
+	// a SEPARATE pool per route category (chat/completions, audio, model
+	// management, autotune, agentOS, RAG) so a burst in one category cannot
+	// starve admission for another. Requests beyond a category's bound fail
+	// with HTTP 429; no unbounded HTTP queue.
 	MaxConcurrentRequests int
 	// ChatUI serves the embedded browser chat at /chat (plus its assets).
 	ChatUI bool

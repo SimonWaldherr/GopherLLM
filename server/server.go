@@ -294,7 +294,19 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	embedder := &embeddingState{}
 	history := newChatHistoryStore(opts.ChatHistoryPath)
 	remote := newRemoteState()
-	sem := make(chan struct{}, opts.MaxConcurrentRequests)
+	// One admission pool per route category rather than a single shared
+	// semaphore: chat/completions/embeddings, audio, model management,
+	// autotune, agentOS and RAG are otherwise-independent workloads, and a
+	// burst in one (e.g. a batch of RAG uploads) must not 429 an unrelated
+	// user's chat request just because they drew from the same pool. Audio,
+	// model downloads and Hugging Face search already followed this pattern
+	// (audioSem, hfSearchSem below) before the rest did.
+	chatSem := make(chan struct{}, opts.MaxConcurrentRequests)
+	audioAdmissionSem := make(chan struct{}, opts.MaxConcurrentRequests)
+	modelSem := make(chan struct{}, opts.MaxConcurrentRequests)
+	autotuneSem := make(chan struct{}, opts.MaxConcurrentRequests)
+	agentSem := make(chan struct{}, opts.MaxConcurrentRequests)
+	ragSem := make(chan struct{}, opts.MaxConcurrentRequests)
 	// Serializes replacement plus its host callback. This prevents two nearly
 	// simultaneous hot-swaps from recording the models out of their actual
 	// swap order (for example, in a host that persists the active model).
@@ -305,33 +317,33 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	// so a disabled one answers 404 rather than presenting a permission check.
 	registerSystemRoutes(mux, state, deployment, remote, history, opts.Features)
 	registerChatWorkspaceRoutes(mux, history)
-	registerOpenAIRoutes(mux, state, embedder, sem, opts, skills, skillsFor, agenticToolsFor, logw)
-	registerOllamaRoutes(mux, state, embedder, sem, opts, skills, agenticToolsFor, logw)
+	registerOpenAIRoutes(mux, state, embedder, chatSem, opts, skills, skillsFor, agenticToolsFor, logw)
+	registerOllamaRoutes(mux, state, embedder, chatSem, opts, skills, agenticToolsFor, logw)
 	// Shared across the one-shot and realtime audio routes below so a loaded
 	// Voxtral model survives between requests instead of every recording or
 	// live session reloading its encoder+decoder from the GGUF from scratch.
 	voxtralCache := &voxtralModelCache{}
-	routesClose := registerAudioRoutesWithRealtime(mux, sem, opts, voxtralCache.transcribe, func(ctx context.Context, path string) (realtimeTranscriber, error) {
+	routesClose := registerAudioRoutesWithRealtime(mux, audioAdmissionSem, opts, voxtralCache.transcribe, func(ctx context.Context, path string) (realtimeTranscriber, error) {
 		return voxtralCache.newSession(ctx, path, logw)
 	})
 	audioClose := func() {
 		routesClose()
 		voxtralCache.closeAll()
 	}
-	registerModelRoutes(mux, state, embedder, sem, opts, deployment, &modelLoadMu, logw)
+	registerModelRoutes(mux, state, embedder, modelSem, opts, deployment, &modelLoadMu, logw)
 	if opts.Features.AutoTune {
-		registerAutoTuneRoutes(mux, state, sem, logw)
+		registerAutoTuneRoutes(mux, state, autotuneSem, logw)
 	}
-	registerAgentOSRoutes(mux, state, sem, opts)
+	registerAgentOSRoutes(mux, state, agentSem, opts)
 	if opts.Features.RAG {
-		registerRAGRoutes(mux, ragState, sem)
+		registerRAGRoutes(mux, ragState, ragSem)
 	}
 	if opts.ChatUI {
 		registerChatUIRoutes(mux, state, opts, deployment, logw)
 	}
 
 	return &Handler{
-		next:       withInferenceDeadline(observeRequests(deployment.wrap(remoteOrLoadedModel(state, remote, mux)), opts.ObserveRequest), opts.RequestTimeout),
+		next:       withInferenceDeadline(observeRequests(deployment.wrap(remoteOrLoadedModel(state, remote, chatSem, mux)), opts.ObserveRequest), opts.RequestTimeout),
 		state:      state,
 		embedder:   embedder,
 		rag:        ragState,

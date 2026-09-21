@@ -96,10 +96,14 @@ func withRequestContext(options gopherllm.GenerationOptions, req *http.Request) 
 // requireLoadedModel keeps catalog, UI and model-loading routes available when
 // the server starts without weights. Generation-shaped routes return a clear
 // 503 until the user chooses a model instead of dereferencing a nil Runner.
-func remoteOrLoadedModel(state *runnerState, remote *remoteState, next http.Handler) http.Handler {
+func remoteOrLoadedModel(state *runnerState, remote *remoteState, sem chan struct{}, next http.Handler) http.Handler {
+	// Proxied chat intercepts the path before it reaches the mux below, so
+	// without its own withLimit it would bypass admission control entirely
+	// -- unlike every local-model route, which is capacity-bounded by sem.
+	proxyChat := withLimit(sem, func(w http.ResponseWriter, req *http.Request) { remote.proxyChat(w, req) })
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/v1/chat/completions" && remote.enabled() {
-			remote.proxyChat(w, req)
+			proxyChat(w, req)
 			return
 		}
 		loaded := false
