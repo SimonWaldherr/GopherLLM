@@ -20,11 +20,12 @@ const (
 // maxExtraSteps adds optional right-padding tokens (normally zero). Decoding
 // always stays within the encoded audio span, matching the reference schedule.
 //
-// This always decodes on CPU (disableFast=true below), matching its previous
-// behavior exactly: callers that already hold a loaded *VoxtralModel (which
-// may have prepared a Metal fast decoder) should use VoxtralModel.
-// TranscribeOffline instead, which shares this same decode algorithm but
-// skips the reload and can use that fast decoder.
+// Uses the Metal fast decoder when available (MetalAvailable()), same as
+// VoxtralModel/OpenVoxtral's own default; on a non-metal build or without a
+// usable GPU this is always false, so behavior there is unchanged. A caller
+// that already holds a loaded *VoxtralModel across multiple calls should
+// still prefer VoxtralModel.TranscribeOffline, which shares this same
+// decode algorithm but also skips the reload this function always pays.
 func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []float32, maxExtraSteps int, logw io.Writer) (string, error) {
 	// Cheap, load-independent checks first so an invalid request never pays
 	// for opening and mapping the (potentially multi-GB) GGUF at all.
@@ -57,7 +58,8 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 		return "", fmt.Errorf("parsing GGUF: %w", err)
 	}
 
-	cfg, w, err := LoadVoxtralRealtimeModel(data, gguf, false, logw)
+	useMetal := MetalAvailable()
+	cfg, w, err := LoadVoxtralRealtimeModel(data, gguf, useMetal, logw)
 	defer releaseVoxtralRealtimeWeights(&w)
 	if err != nil {
 		return "", fmt.Errorf("loading Voxtral Realtime model: %w", err)
@@ -72,7 +74,7 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 	eosID := int(gguf.GetU32("tokenizer.ggml.eos_token_id", 2))
 	bosID := int(gguf.GetU32("tokenizer.ggml.bos_token_id", 1))
 
-	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, true, logw)
+	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, !useMetal, logw)
 }
 
 // decodeVoxtralRealtimeOffline runs the offline/batch encode-then-decode
