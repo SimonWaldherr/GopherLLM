@@ -132,11 +132,57 @@ static const char* gllm_decode_source =
 " ulong o=qo+lane;\n"
 " out[o]=acc.x/s;out[o+32]=acc.y/s;out[o+64]=acc.z/s;out[o+96]=acc.w/s;\n"
 "}\n"
+"struct BAP2 { uint heads; uint kvheads; uint stride; uint start_pos; uint window; uint chunks; float scale; };\n"
+"kernel void dec_batch_attention_part(const device float* q [[buffer(0)]],const device float* k [[buffer(1)]],const device float* v [[buffer(2)]],device float* partial [[buffer(3)]],constant BAP2& p [[buffer(4)]],uint3 group [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" uint token=group.x,head=group.y,chunkIdx=group.z;\n"
+" uint kv=head/(p.heads/p.kvheads),pos=p.start_pos+token;\n"
+" uint lo=(p.window>0 && pos>p.window)?pos-p.window:0;\n"
+" uint start=lo+chunkIdx*32,end=min(start+32,pos+1);\n"
+" ulong po=((ulong(token)*p.heads+head)*p.chunks+chunkIdx)*130;\n"
+" if(start>=end) {\n"
+"  partial[po+lane]=0;partial[po+lane+32]=0;partial[po+lane+64]=0;partial[po+lane+96]=0;\n"
+"  if(lane==0){partial[po+128]=-INFINITY;partial[po+129]=0;}\n"
+"  return;\n"
+" }\n"
+" ulong qo=ulong(token)*p.heads*128+ulong(head)*128;\n"
+" float4 query=float4(q[qo+lane],q[qo+lane+32],q[qo+lane+64],q[qo+lane+96]);\n"
+" float m=-INFINITY;float s=0;float4 acc=0;\n"
+" for(uint t=start;t<end;t++) {\n"
+"  ulong i=ulong(t)*p.stride+kv*128+lane;\n"
+"  float4 key=float4(k[i],k[i+32],k[i+64],k[i+96]);\n"
+"  float score=simd_sum(dot(query,key))*p.scale;\n"
+"  float nm=max(m,score);\n"
+"  float corr=exp(m-nm);\n"
+"  float w=exp(score-nm);\n"
+"  float4 value=float4(v[i],v[i+32],v[i+64],v[i+96]);\n"
+"  acc=acc*corr+w*value;s=s*corr+w;m=nm;\n"
+" }\n"
+" partial[po+lane]=acc.x;partial[po+lane+32]=acc.y;partial[po+lane+64]=acc.z;partial[po+lane+96]=acc.w;\n"
+" if(lane==0){partial[po+128]=m;partial[po+129]=s;}\n"
+"}\n"
+"kernel void dec_batch_attention_merge(const device float* partial [[buffer(0)]],device float* out [[buffer(1)]],constant BAP2& p [[buffer(2)]],uint2 group [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" uint token=group.x,head=group.y;\n"
+" float m=-INFINITY;\n"
+" for(uint c=0;c<p.chunks;c++) {\n"
+"  ulong o=((ulong(token)*p.heads+head)*p.chunks+c)*130;\n"
+"  m=max(m,partial[o+128]);\n"
+" }\n"
+" float s=0;float4 acc=0;\n"
+" for(uint c=0;c<p.chunks;c++) {\n"
+"  ulong o=((ulong(token)*p.heads+head)*p.chunks+c)*130;\n"
+"  float a=exp(partial[o+128]-m);\n"
+"  s+=a*partial[o+129];\n"
+"  acc+=a*float4(partial[o+lane],partial[o+lane+32],partial[o+lane+64],partial[o+lane+96]);\n"
+" }\n"
+" ulong oo=ulong(token)*p.heads*128+ulong(head)*128+lane;\n"
+" out[oo]=acc.x/s;out[oo+32]=acc.y/s;out[oo+64]=acc.z/s;out[oo+96]=acc.w/s;\n"
+"}\n"
 ;
 typedef struct { uint32_t n; float eps; } GLLMNormParams;
 typedef struct { uint32_t heads,hd,pairs,pos,stride,interleaved;float temperature; } GLLMRopeParams;
 typedef struct { uint32_t heads,kvheads,hd,stride,pos,start,chunks;float scale; } GLLMAttentionParams;
 typedef struct { uint32_t heads,kvheads,stride,start_pos,window;float scale; } GLLMBatchAttnParams;
+typedef struct { uint32_t heads,kvheads,stride,start_pos,window,chunks;float scale; } GLLMBatchAttnParams2;
 typedef struct {
  GLLMMetalWeight* w[7]; uint32_t quant[7];
  id<MTLBuffer> norm,ffnNorm,qNorm,kNorm,k,v;
@@ -149,7 +195,7 @@ typedef struct {
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
-static id<MTLComputePipelineState> gllm_dec_pipes[10]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
+static id<MTLComputePipelineState> gllm_dec_pipes[12]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
  @synchronized(gllm_queue) {
@@ -159,18 +205,18 @@ static bool gllm_decode_init(void) {
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_decode_source] options:nil error:&error];
   if(lib==nil){gllm_set_error(@"decode shader compilation failed",error);return false;}
-  NSString* names[10]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention"};
-  id<MTLComputePipelineState> pipes[10]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
+  NSString* names[12]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge"};
+  id<MTLComputePipelineState> pipes[12]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
   bool ok=true;
-  for(int i=0;i<10;i++) {
+  for(int i=0;i<12;i++) {
    id<MTLFunction> fn=[lib newFunctionWithName:names[i]];
    pipes[i]=fn!=nil?[gllm_device newComputePipelineStateWithFunction:fn error:&error]:nil;
    [fn release];
    if(pipes[i]==nil || [pipes[i] threadExecutionWidth]!=32 || [pipes[i] maxTotalThreadsPerThreadgroup]<256)ok=false;
   }
   [lib release];
-  if(!ok){for(int i=0;i<10;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
-  for(int i=0;i<10;i++)gllm_dec_pipes[i]=pipes[i];
+  if(!ok){for(int i=0;i<12;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
+  for(int i=0;i<12;i++)gllm_dec_pipes[i]=pipes[i];
   return true;
  }
  return false;

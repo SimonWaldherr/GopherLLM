@@ -713,6 +713,10 @@ func testMetalMinistral3BBatchAttentionMatchesCPU(t *testing.T, window int) {
 	if !buf.metalDense.decoder.BatchAttention(0, q, priorLen, batch, got) {
 		t.Fatalf("BatchAttention: %s", MetalError())
 	}
+	gotTiled := make([]float32, batch*qRows)
+	if !buf.metalDense.decoder.BatchAttentionTiled(0, q, priorLen, batch, gotTiled) {
+		t.Fatalf("BatchAttentionTiled: %s", MetalError())
+	}
 
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 	want := make([]float32, batch*qRows)
@@ -730,7 +734,8 @@ func testMetalMinistral3BBatchAttentionMatchesCPU(t *testing.T, window int) {
 				headDim, headDim, attnStart, pos, scale, 0, outTok[hStart*headDim:(hStart+kvMul)*headDim])
 		}
 	}
-	assertMetalFiniteClose(t, got, want)
+	t.Run("untiled", func(t *testing.T) { assertMetalFiniteClose(t, got, want) })
+	t.Run("tiled", func(t *testing.T) { assertMetalFiniteClose(t, gotTiled, want) })
 }
 
 // TestMetalMinistral3BForwardBatchMatchesCPU exercises the production caller,

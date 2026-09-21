@@ -371,6 +371,18 @@ func metalDenseBatchProjectionQKV(b *DecodeBuffer, layer int, x, qOut, kOut, vOu
 
 var metalBatchAttentionEnabled = os.Getenv("GOPHERLLM_METAL_BATCH_ATTENTION") != "0"
 
+// metalBatchAttentionTiled selects BatchAttentionTiled (independent
+// 32-position chunks per (token,head), matching the single-token decode
+// path's dec_attention_part/dec_attention_merge design) over BatchAttention
+// (one simdgroup per (token,head) serially walking that token's whole
+// causal range). Default on: for a model with no sliding window, a long
+// prefill's per-token attended range varies from 1 to the whole prompt
+// within the same dispatch, so the untiled kernel's total time is set by
+// its single longest chain while most (token,head) pairs sit essentially
+// idle once done -- tiling gives the GPU scheduler many more, evenly-sized
+// independent items to fill cores with instead.
+var metalBatchAttentionTiled = os.Getenv("GOPHERLLM_METAL_BATCH_ATTENTION_TILED") != "0"
+
 // metalDenseBatchAttention runs causal batched multi-head attention for one
 // layer's prompt chunk on Metal: gllm_decode_batch_attention's doc comment
 // has the full contract. q is [batch][heads*128], already RoPE-rotated and
@@ -406,7 +418,12 @@ func metalDenseBatchAttention(b *DecodeBuffer, layer int, cache *KVCache, q []fl
 	if layer < len(s.batchKVSynced) {
 		s.batchKVSynced[layer] = pos
 	}
-	ok := s.decoder.BatchAttention(layer, q, startPos, batch, out)
+	var ok bool
+	if metalBatchAttentionTiled {
+		ok = s.decoder.BatchAttentionTiled(layer, q, startPos, batch, out)
+	} else {
+		ok = s.decoder.BatchAttention(layer, q, startPos, batch, out)
+	}
 	runtime.KeepAlive(s) // The state owns/pins the decoder's borrowed weights and KV.
 	return ok
 }

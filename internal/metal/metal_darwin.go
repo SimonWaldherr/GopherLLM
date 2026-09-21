@@ -70,6 +70,7 @@ typedef struct {
 	id<MTLBuffer> k;
 	id<MTLBuffer> v;
 	id<MTLBuffer> attnOut;
+	id<MTLBuffer> attnPartial;
 } GLLMMetalBatchWorkspace;
 
 static id<MTLDevice> gllm_device = nil;
@@ -1484,6 +1485,79 @@ static bool gllm_decode_batch_attention(void* ptr, int layer, const float* q, in
 		}
 	}
 }
+
+// gllm_decode_batch_attention_tiled is gllm_decode_batch_attention's causal
+// range split into independent 32-position chunks (a two-pass part/merge,
+// mirroring dec_attention_part/dec_attention_merge's single-token design)
+// instead of one simdgroup serially walking a token's whole causal range.
+// For a model with no sliding window (a full prefill's last token attends
+// to everything before it, its first token to just itself), that serial
+// design means a dispatch's total time is set by its single longest chain
+// even though the vast majority of (token, head) pairs finish almost
+// immediately -- exactly the shape a long, un-windowed prompt prefill has.
+// Splitting the range into chunks gives the GPU scheduler many more,
+// evenly-sized independent items to fill idle cores with as short chains
+// retire, at the cost of the partial-result scratch buffer's memory and a
+// second (merge) dispatch.
+static bool gllm_decode_batch_attention_tiled(void* ptr, int layer, const float* q, int start_pos, int batch, float* out) {
+	@autoreleasepool {
+		GLLMDecoder* d = ptr;
+		if (d == NULL || layer < 0 || layer >= d->layers || batch <= 0 || batch > GLLM_BATCH_FFN_MAX_TOKENS ||
+			start_pos < 0 || (NSUInteger)(start_pos + batch) > (NSUInteger)d->maxlen || q == NULL || out == NULL) {
+			return false;
+		}
+		GLLMDecodeLayer* l = &d->layer[layer];
+		@synchronized(gllm_queue) {
+			NSUInteger qLen = (NSUInteger)batch * (NSUInteger)d->heads * 128 * sizeof(float);
+			uint32_t window = (uint32_t)(l->window > 0 ? l->window : 0);
+			uint32_t lastPos = (uint32_t)(start_pos + batch - 1);
+			// Matches dec_batch_attention_part's lo formula exactly: when
+			// windowed and lastPos>window, the widest per-token range is
+			// [lastPos-window, lastPos], i.e. window+1 positions, not window.
+			uint32_t span = (window > 0 && lastPos > window) ? window + 1 : lastPos + 1;
+			uint32_t chunks = (span + 31) / 32;
+			if (chunks < 1) chunks = 1;
+			NSUInteger partialLen = (NSUInteger)batch * (NSUInteger)d->heads * (NSUInteger)chunks * 130 * sizeof(float);
+			if (!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.q, qLen) ||
+				!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.attnOut, qLen) ||
+				!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.attnPartial, partialLen)) {
+				return false;
+			}
+			memcpy([gllm_batch_workspace.q contents], q, qLen);
+
+			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			GLLMBatchAttnParams2 p = {
+				(uint32_t)d->heads, (uint32_t)d->kvheads, (uint32_t)(d->kvheads * 128),
+				(uint32_t)start_pos, window, chunks, d->scale,
+			};
+			[enc setComputePipelineState:gllm_dec_pipes[10]];
+			[enc setBuffer:gllm_batch_workspace.q offset:0 atIndex:0];
+			[enc setBuffer:l->k offset:0 atIndex:1];
+			[enc setBuffer:l->v offset:0 atIndex:2];
+			[enc setBuffer:gllm_batch_workspace.attnPartial offset:0 atIndex:3];
+			[enc setBytes:&p length:sizeof(p) atIndex:4];
+			[enc dispatchThreadgroups:MTLSizeMake((NSUInteger)batch, (NSUInteger)d->heads, (NSUInteger)chunks) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+			[enc setComputePipelineState:gllm_dec_pipes[11]];
+			[enc setBuffer:gllm_batch_workspace.attnPartial offset:0 atIndex:0];
+			[enc setBuffer:gllm_batch_workspace.attnOut offset:0 atIndex:1];
+			[enc setBytes:&p length:sizeof(p) atIndex:2];
+			[enc dispatchThreadgroups:MTLSizeMake((NSUInteger)batch, (NSUInteger)d->heads, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			bool ok = [cb status] == MTLCommandBufferStatusCompleted;
+			if (ok) {
+				memcpy(out, [gllm_batch_workspace.attnOut contents], qLen);
+			} else {
+				strncpy(gllm_error, "Metal tiled batch attention command buffer failed", sizeof(gllm_error) - 1);
+			}
+			return ok;
+		}
+	}
+}
 */
 import "C"
 
@@ -2025,6 +2099,23 @@ func (d *Decoder) BatchAttention(layer int, q []float32, startPos, batch int, ou
 		return false
 	}
 	ok := C.gllm_decode_batch_attention(d.ptr, C.int(layer), (*C.float)(unsafe.Pointer(&q[0])), C.int(startPos), C.int(batch), (*C.float)(unsafe.Pointer(&out[0])))
+	runtime.KeepAlive(d)
+	return bool(ok)
+}
+
+// BatchAttentionTiled is BatchAttention split into independent 32-position
+// chunks per (token, head) instead of one simdgroup serially walking a
+// token's whole causal range -- see gllm_decode_batch_attention_tiled's doc
+// comment. Same contract and shapes as BatchAttention.
+func (d *Decoder) BatchAttentionTiled(layer int, q []float32, startPos, batch int, out []float32) bool {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || batch <= 0 || batch > 256 || startPos < 0 {
+		return false
+	}
+	width := d.heads * 128
+	if batch > len(q)/width || batch > len(out)/width {
+		return false
+	}
+	ok := C.gllm_decode_batch_attention_tiled(d.ptr, C.int(layer), (*C.float)(unsafe.Pointer(&q[0])), C.int(startPos), C.int(batch), (*C.float)(unsafe.Pointer(&out[0])))
 	runtime.KeepAlive(d)
 	return bool(ok)
 }
