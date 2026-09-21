@@ -105,14 +105,22 @@ build-metal:
 	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE) $(TMP_DIR)
 	@TMPDIR="$(TMP_DIR)/" GOTMPDIR="$(TMP_DIR)" CC="$(METAL_CC)" CXX="$(METAL_CXX)" CGO_CFLAGS="$(CGO_CFLAGS) $(METAL_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS) $(METAL_LDFLAGS)" CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags "$(METAL_TAGS)" -trimpath -ldflags="-s -w" -o $(METAL_BIN) ./cmd/gopherllm
 
+# The six targets are fully independent (different GOOS/GOARCH, disjoint
+# output files) and Go's build cache is safe for concurrent invocations, so
+# they run in parallel instead of one after another -- a plain `wait` with no
+# arguments would discard which, if any, of them failed, so each PID is
+# tracked and waited on individually.
 cross-build:
 	@mkdir -p $(BUILD_DIR) $(GOCACHE) $(GOMODCACHE)
-	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=darwin GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-amd64 ./cmd/gopherllm
-	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=darwin GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-arm64 ./cmd/gopherllm
-	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-amd64 ./cmd/gopherllm
-	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-arm64 ./cmd/gopherllm
-	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-amd64.exe ./cmd/gopherllm
-	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-arm64.exe ./cmd/gopherllm
+	@pids=""; fail=0; \
+	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=darwin  GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-amd64      ./cmd/gopherllm & pids="$$pids $$!"; \
+	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=darwin  GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-darwin-arm64      ./cmd/gopherllm & pids="$$pids $$!"; \
+	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=linux   GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-amd64       ./cmd/gopherllm & pids="$$pids $$!"; \
+	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=linux   GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-linux-arm64       ./cmd/gopherllm & pids="$$pids $$!"; \
+	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=amd64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-amd64.exe ./cmd/gopherllm & pids="$$pids $$!"; \
+	CGO_ENABLED=$(CROSS_CGO_ENABLED) GOOS=windows GOARCH=arm64 $(GO) build $(GOFLAGS) -trimpath -ldflags="-s -w" -o $(BUILD_DIR)/$(BINARY)-windows-arm64.exe ./cmd/gopherllm & pids="$$pids $$!"; \
+	for pid in $$pids; do wait "$$pid" || fail=1; done; \
+	exit $$fail
 
 # wasm-build refreshes the native server first, then compiles the in-browser
 # entry point (cmd/gopherllm-wasm, see its README) and stages Go's own
