@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -35,12 +36,15 @@ func ParakeetDecodeTokens(vocab []string, tokens []int) (string, error) {
 // second reference to diff against -- Parakeet-TDT is only known to this
 // codebase through one community GGUF conversion. Every formula was
 // implemented against NVIDIA NeMo's own published source
-// (features.py/rnnt.py) rather than guessed, and the encoder was checked
-// for finite, plausibly-scaled output end-to-end, but the joint network's
-// activation function (relu, chosen as NeMo's common published default;
-// the checkpoint's own training config isn't recoverable from this GGUF)
-// is a real, flagged unknown, and nothing here has been verified against an
-// independent NeMo/PyTorch run.
+// (features.py/rnnt.py) rather than guessed, and it has been verified
+// end-to-end: two known English utterances transcribed correctly
+// (TestTranscribeParakeetRealAudio), including exact punctuation and
+// capitalization on the longer one. The one remaining flagged unknown is
+// the joint network's activation (relu, chosen as NeMo's common published
+// default; the checkpoint's own training config isn't recoverable from
+// this GGUF) -- it produced correct output on both test clips regardless,
+// but hasn't been independently confirmed against this specific
+// checkpoint's actual training configuration or a from-scratch NeMo run.
 func TranscribeParakeet(modelPath string, samples []float32, logw func(string, ...any)) (string, error) {
 	if len(samples) == 0 {
 		return "", fmt.Errorf("audio is empty")
@@ -50,32 +54,10 @@ func TranscribeParakeet(modelPath string, samples []float32, logw func(string, .
 			return "", fmt.Errorf("audio contains non-finite samples")
 		}
 	}
-	mmap, err := OpenMmap(modelPath)
+	model, err := OpenParakeet(modelPath, nil)
 	if err != nil {
-		return "", fmt.Errorf("opening model: %w", err)
+		return "", err
 	}
-	defer mmap.Close()
-	data := mmap.Bytes()
-
-	gguf, err := ParseGGUF(data)
-	if err != nil {
-		return "", fmt.Errorf("parsing GGUF: %w", err)
-	}
-	cfg, w, err := LoadParakeetModel(data, gguf, nil)
-	if err != nil {
-		return "", fmt.Errorf("loading parakeet model: %w", err)
-	}
-
-	frames, err := ParakeetEncode(cfg, w, samples)
-	if err != nil {
-		return "", fmt.Errorf("encoding audio: %w", err)
-	}
-	if logw != nil {
-		logw("encoded %d frames", len(frames))
-	}
-	tokens := ParakeetGreedyDecodeTDT(cfg, w, frames)
-	if logw != nil {
-		logw("decoded %d tokens: %v", len(tokens), tokens)
-	}
-	return ParakeetDecodeTokens(w.Vocab, tokens)
+	defer model.Close()
+	return model.TranscribeOffline(context.Background(), samples, logw)
 }

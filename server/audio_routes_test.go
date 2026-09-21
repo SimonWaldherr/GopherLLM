@@ -130,7 +130,7 @@ func TestAudioRoutesCatalogAndTranscription(t *testing.T) {
 			t.Fatal("wrong transcription inputs")
 		}
 		return "Hallo Welt", nil
-	})
+	}, nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/models/audio", nil))
 	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"voxtral"`) || strings.Contains(rec.Body.String(), "chat") || strings.Contains(rec.Body.String(), dir) {
@@ -191,7 +191,7 @@ func TestAudioRoutesDeploymentAndCancellation(t *testing.T) {
 	registerAudioRoutes(mux, sem, HandlerOptions{Features: Features{ModelCatalog: true}}, func(context.Context, string, []float32, int, io.Writer) (string, error) {
 		t.Fatal("cancelled request reached inference")
 		return "", nil
-	})
+	}, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/v1/audio/transcriptions", nil).WithContext(ctx))
@@ -300,7 +300,7 @@ func TestRealtimeAudioSessionRoutes(t *testing.T) {
 	dir := audioCatalogFixture(t)
 	mux := http.NewServeMux()
 	var spy *realtimeAudioSpy
-	closeRoutes := registerAudioRoutesWithRealtime(mux, make(chan struct{}, 1), HandlerOptions{ModelDir: dir, Features: Features{ModelCatalog: true}}, func(context.Context, string, []float32, int, io.Writer) (string, error) { return "", nil }, func(_ context.Context, path string) (realtimeTranscriber, error) {
+	closeRoutes := registerAudioRoutesWithRealtime(mux, make(chan struct{}, 1), HandlerOptions{ModelDir: dir, Features: Features{ModelCatalog: true}}, func(context.Context, string, []float32, int, io.Writer) (string, error) { return "", nil }, nil, func(_ context.Context, path string) (realtimeTranscriber, error) {
 		if path != filepath.Join(dir, "voxtral.gguf") {
 			t.Fatalf("unexpected model path %q", path)
 		}

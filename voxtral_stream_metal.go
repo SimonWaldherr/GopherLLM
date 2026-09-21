@@ -14,6 +14,7 @@ type voxtralMetalDecoder struct {
 	owned                           []*metalbackend.Weight
 	refs                            []*metalbackend.Weight
 	physical, capacity, window      int
+	interleaved                     bool
 	inv, sin, cos, residual, normed []float32
 }
 
@@ -22,7 +23,7 @@ func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, 
 	if !MetalAvailable() || dc.HeadDim != 128 || dc.SlidingWindow <= 1 || dc.SlidingWindow > 8192 {
 		return nil
 	}
-	s := &voxtralMetalDecoder{capacity: dc.SlidingWindow + 256, window: dc.SlidingWindow, inv: standardRopeInvFreqSlice(128, dc.RopeTheta), residual: make([]float32, dc.HiddenSize), normed: make([]float32, dc.HiddenSize)}
+	s := &voxtralMetalDecoder{capacity: dc.SlidingWindow + 256, window: dc.SlidingWindow, interleaved: cfg.RopeInterleaved, inv: standardRopeInvFreqSlice(128, dc.RopeTheta), residual: make([]float32, dc.HiddenSize), normed: make([]float32, dc.HiddenSize)}
 	s.decoder = metalbackend.NewDecoder(dc.HiddenSize, dc.IntermediateSize, dc.NHeads, dc.NKVHeads, len(w.Decoder.Layers), s.capacity, dc.Epsilon, float32(1/math.Sqrt(128)), w.Decoder.OutputNorm)
 	if s.decoder == nil {
 		return nil
@@ -106,7 +107,7 @@ func (s *voxtralMetalDecoder) Step(input []float32, pos int, generate bool) (int
 	if generate {
 		next = &token
 	}
-	if !s.decoder.Step(input, s.sin, s.cos, pairs, s.physical, false, 1, s.residual, s.normed, nil, nil, 1, next) {
+	if !s.decoder.Step(input, s.sin, s.cos, pairs, s.physical, s.interleaved, 1, s.residual, s.normed, nil, nil, 1, next) {
 		return 0, fmt.Errorf("Voxtral GPU decoder failed")
 	}
 	s.physical++

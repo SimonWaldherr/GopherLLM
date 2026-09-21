@@ -322,13 +322,17 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	// Shared across the one-shot and realtime audio routes below so a loaded
 	// Voxtral model survives between requests instead of every recording or
 	// live session reloading its encoder+decoder from the GGUF from scratch.
+	// parakeetCache is the same idea for Parakeet-TDT models, offline-only
+	// (see registerAudioRoutesWithRealtime's doc comment).
 	voxtralCache := &voxtralModelCache{}
-	routesClose := registerAudioRoutesWithRealtime(mux, audioAdmissionSem, opts, voxtralCache.transcribe, func(ctx context.Context, path string) (realtimeTranscriber, error) {
+	parakeetCache := &parakeetModelCache{}
+	routesClose := registerAudioRoutesWithRealtime(mux, audioAdmissionSem, opts, voxtralCache.transcribe, parakeetCache.transcribe, func(ctx context.Context, path string) (realtimeTranscriber, error) {
 		return voxtralCache.newSession(ctx, path, logw)
 	})
 	audioClose := func() {
 		routesClose()
 		voxtralCache.closeAll()
+		parakeetCache.closeAll()
 	}
 	registerModelRoutes(mux, state, embedder, modelSem, opts, deployment, &modelLoadMu, logw)
 	if opts.Features.AutoTune {

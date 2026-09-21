@@ -223,16 +223,79 @@ func (c *voxtralModelCache) closeAll() {
 	}
 }
 
+// parakeetModelCache is voxtralModelCache's counterpart for Parakeet-TDT
+// (general.architecture=="asr"): same "keep the most recently used model
+// resident, evict on a different path" shape, simplified because Parakeet
+// has no realtime/streaming session to also cache (see parakeet.go's doc
+// comment -- offline transcription only, for now).
+type parakeetModelCache struct {
+	mu    sync.Mutex
+	path  string
+	model *gopherllm.ParakeetModel
+}
+
+func (c *parakeetModelCache) open(path string, logw io.Writer) (*gopherllm.ParakeetModel, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.model != nil && c.path == path {
+		return c.model, nil
+	}
+	stale := c.model
+	c.model, c.path = nil, ""
+	if stale != nil {
+		_ = stale.Close()
+	}
+	model, err := gopherllm.OpenParakeet(path, logw)
+	if err != nil {
+		return nil, err
+	}
+	c.model, c.path = model, path
+	return model, nil
+}
+
+// transcribe adapts the cache to transcriptionFunc for the one-shot
+// endpoint. extraSteps is accepted for interface compatibility only --
+// Parakeet's TDT decode has no equivalent knob.
+func (c *parakeetModelCache) transcribe(ctx context.Context, path string, samples []float32, _ int, logw io.Writer) (string, error) {
+	model, err := c.open(path, logw)
+	if err != nil {
+		return "", err
+	}
+	logf := func(format string, args ...any) { fmt.Fprintf(logw, format+"\n", args...) }
+	return model.TranscribeOffline(ctx, samples, logf)
+}
+
+func (c *parakeetModelCache) closeAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.model != nil {
+		_ = c.model.Close()
+		c.model, c.path = nil, ""
+	}
+}
+
+// audioArchitectures lists every general.architecture value the audio
+// catalog and one-shot transcription endpoint accept. Realtime/streaming
+// sessions remain Voxtral-only (see registerRealtimeAudioRoutes) --
+// Parakeet has no live decode implementation yet.
+var audioArchitectures = map[string]bool{"voxtral_realtime": true, "asr": true}
+
 // Audio uses a separate catalog selection and never replaces the chat runner.
 // One transcription at a time bounds the offline encoder's working memory.
 // The request owns its model mapping; cancellation/return releases it.
-func registerAudioRoutes(mux *http.ServeMux, sem chan struct{}, opts HandlerOptions, transcribe transcriptionFunc) {
-	_ = registerAudioRoutesWithRealtime(mux, sem, opts, transcribe, func(context.Context, string) (realtimeTranscriber, error) {
+func registerAudioRoutes(mux *http.ServeMux, sem chan struct{}, opts HandlerOptions, transcribe, transcribeParakeet transcriptionFunc) {
+	_ = registerAudioRoutesWithRealtime(mux, sem, opts, transcribe, transcribeParakeet, func(context.Context, string) (realtimeTranscriber, error) {
 		return nil, fmt.Errorf("realtime transcriber is not configured")
 	})
 }
 
-func registerAudioRoutesWithRealtime(mux *http.ServeMux, sem chan struct{}, opts HandlerOptions, transcribe transcriptionFunc, newRealtime realtimeFactory) func() {
+// registerAudioRoutesWithRealtime wires the audio catalog and transcription
+// routes. transcribe handles "voxtral_realtime" models; transcribeParakeet
+// handles "asr" (Parakeet-TDT) models and may be nil (a request naming a
+// Parakeet-catalog model then fails clearly instead of dispatching to the
+// wrong backend) -- every existing caller/test that only cares about
+// Voxtral can pass nil unchanged.
+func registerAudioRoutesWithRealtime(mux *http.ServeMux, sem chan struct{}, opts HandlerOptions, transcribe, transcribeParakeet transcriptionFunc, newRealtime realtimeFactory) func() {
 	if !opts.Features.ModelCatalog {
 		return func() {}
 	}
@@ -248,14 +311,14 @@ func registerAudioRoutesWithRealtime(mux *http.ServeMux, sem chan struct{}, opts
 		}
 		models := []map[string]string{}
 		for _, entry := range entries {
-			if entry.Architecture != "voxtral_realtime" {
+			if !audioArchitectures[entry.Architecture] {
 				continue
 			}
 			name := entry.ModelName
 			if name == "" {
 				name = entry.FileName
 			}
-			models = append(models, map[string]string{"id": entry.ID, "name": name})
+			models = append(models, map[string]string{"id": entry.ID, "name": name, "architecture": entry.Architecture})
 		}
 		writeJSON(w, map[string]any{"models": models, "max_seconds": transcriptionMaxSeconds, "max_bytes": transcriptionMaxBytes})
 	})
@@ -297,16 +360,24 @@ func registerAudioRoutesWithRealtime(mux *http.ServeMux, sem chan struct{}, opts
 		}
 		// Only exact catalog IDs are accepted. Never treat a supplied selector as
 		// a filesystem path or a chat-model load request.
-		path := ""
+		path, arch := "", ""
 		for _, entry := range entries {
-			if entry.ID == selector && entry.Architecture == "voxtral_realtime" {
-				path = entry.Path
+			if entry.ID == selector && audioArchitectures[entry.Architecture] {
+				path, arch = entry.Path, entry.Architecture
 				break
 			}
 		}
 		if path == "" {
-			http.Error(w, "Voxtral model not found in the configured model directory", http.StatusBadRequest)
+			http.Error(w, "audio model not found in the configured model directory", http.StatusBadRequest)
 			return
+		}
+		selectedTranscribe := transcribe
+		if arch == "asr" {
+			if transcribeParakeet == nil {
+				http.Error(w, "Parakeet transcription is not configured on this server", http.StatusServiceUnavailable)
+				return
+			}
+			selectedTranscribe = transcribeParakeet
 		}
 		file, _, err := req.FormFile("file")
 		if err != nil {
@@ -324,7 +395,7 @@ func registerAudioRoutesWithRealtime(mux *http.ServeMux, sem chan struct{}, opts
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		text, err := transcribe(req.Context(), path, samples, 0, io.Discard)
+		text, err := selectedTranscribe(req.Context(), path, samples, 0, io.Discard)
 		if req.Context().Err() != nil {
 			return
 		}
