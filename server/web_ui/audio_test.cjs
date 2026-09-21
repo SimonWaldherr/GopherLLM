@@ -14,7 +14,7 @@ function harness(fetch) {
     click() { return this.listeners.click?.(); }
   }
   const elements = {};
-  for(const id of ['audioToggle','audioPanel','audioModel','audioRefresh','audioUpload','audioFile','audioRecord','audioLive','audioCancel','audioStatus','audioResult','audioInsert']) elements[id]=new Element();
+  for(const id of ['audioToggle','audioPanel','audioModel','audioRefresh','audioUpload','audioFile','audioRecord','audioLive','audioCancel','audioStatus','audioResult','audioInsert','audioInputDevice']) elements[id]=new Element();
   elements.audioPanel.hidden = true;
   let closed=0, stopped=0, inserted='';
   const decoded={duration:1,length:16000,sampleRate:16000,numberOfChannels:1,getChannelData(){return new Float32Array(16000);}};
@@ -24,9 +24,11 @@ function harness(fetch) {
     createBufferSource(){return {connect(){},start(){}};}
     async startRendering(){return decoded;}
   }
-  const media={getTracks(){return [{stop(){stopped++;}}];}};
+  const mockTrack=()=>({stop(){stopped++;},addEventListener(){},removeEventListener(){}});
+  const media={getTracks(){return [mockTrack()];}};
+  class MediaStream { constructor(tracks){this._tracks=tracks||[];} getTracks(){return this._tracks;} }
   const context=vm.createContext({Blob,FormData,AbortController,DataView,ArrayBuffer,Float32Array,setTimeout,clearTimeout,setInterval,clearInterval,
-    AudioContext,OfflineAudioContext,MediaRecorder:class {}, navigator:{mediaDevices:{getUserMedia:async()=>media}},
+    AudioContext,OfflineAudioContext,MediaRecorder:class {},MediaStream, navigator:{mediaDevices:{getUserMedia:async()=>media}},
     document:{getElementById:id=>elements[id],createElement:()=>new Element()},addEventListener(){}});
   vm.runInContext(source,context);
   const controls=context.GopherLLMAudio.init({fetch:fetch || (async()=>({ok:true,json:async()=>({models:[{id:'voxtral',name:'Voxtral'}]})})),insert(text){inserted=text;return true;}});
@@ -170,4 +172,52 @@ test('stopping a microphone recording transcribes and releases tracks',async()=>
   await h.elements.audioRecord.click();await settle();
   assert.equal(h.stopped,1);assert.equal(h.elements.audioResult.value,'Recorded speech');
   assert.equal(h.elements.audioCancel.hidden,true);
+});
+
+test('system audio capture shares tab/screen audio, drops the video track, and transcribes only the audio track',async()=>{
+  const h=harness(async url=>url==='/models/audio'
+    ? {ok:true,json:async()=>({models:[{id:'v'}]})}
+    : {ok:true,json:async()=>({text:'Shared audio text'})});
+  let videoStopped=0,audioStopped=0,displayMediaCall=null,recordedMedia=null;
+  const videoTrack={kind:'video',stop(){videoStopped++;}};
+  const audioTrack={kind:'audio',stop(){audioStopped++;},addEventListener(){},removeEventListener(){}};
+  h.context.navigator.mediaDevices.getDisplayMedia=async constraints=>{
+    displayMediaCall=constraints;
+    return {getVideoTracks(){return [videoTrack];},getAudioTracks(){return [audioTrack];},getTracks(){return [videoTrack,audioTrack];}};
+  };
+  h.context.navigator.mediaDevices.enumerateDevices=async()=>[];
+  h.context.MediaRecorder=class {
+    constructor(media){this.listeners={};this.state='inactive';this.mimeType='audio/webm';recordedMedia=media;}
+    addEventListener(name,fn){this.listeners[name]=fn;}
+    start(){this.state='recording';}
+    stop(){this.state='inactive';this.listeners.dataavailable({data:new Blob(['audio'])});this.listeners.stop();}
+  };
+  h.elements.audioToggle.click();await settle();
+  assert.equal(h.elements.audioInputDevice.options.some(o=>o.value==='__system_audio__'),true);
+  h.elements.audioInputDevice.value='__system_audio__';
+  await h.elements.audioRecord.click();await settle();
+  assert.ok(displayMediaCall);assert.equal(displayMediaCall.video,true);
+  assert.equal(videoStopped,1,'the discarded video track must be stopped immediately');
+  assert.deepEqual(recordedMedia.getTracks(),[audioTrack]);
+  await h.elements.audioRecord.click();await settle();
+  assert.equal(audioStopped,1);
+  assert.equal(h.elements.audioResult.value,'Shared audio text');
+});
+
+test('system audio capture surfaces a clear error when no audio track is shared',async()=>{
+  const h=harness(async()=>({ok:true,json:async()=>({models:[{id:'v'}]})}));
+  let videoStopped=0;
+  const videoTrack={kind:'video',stop(){videoStopped++;}};
+  h.context.navigator.mediaDevices.getDisplayMedia=async()=>({
+    getVideoTracks(){return [videoTrack];},getAudioTracks(){return [];},getTracks(){return [videoTrack];},
+  });
+  h.context.navigator.mediaDevices.enumerateDevices=async()=>[];
+  h.elements.audioToggle.click();await settle();
+  h.elements.audioInputDevice.value='__system_audio__';
+  await h.elements.audioRecord.click();await settle();
+  // Stopped twice: once immediately after capture, once more by the
+  // no-audio-track cleanup path that stops every remaining track -- both
+  // calls target the same track and stop() is idempotent on a real one.
+  assert.equal(videoStopped,2);
+  assert.match(h.elements.audioStatus.textContent,/No audio was shared/);
 });

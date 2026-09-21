@@ -5,6 +5,34 @@
   const MAX_SECONDS = 30;
   const MAX_FILE_BYTES = 25 * 1024 * 1024;
   const AUDIO_DEVICE_KEY = "gopherllm.audio-input-device";
+  const SYSTEM_AUDIO_VALUE = "__system_audio__";
+
+  // System/tab audio has no dedicated capture API: getDisplayMedia() is the
+  // Screen Capture API repurposed for it, requires a video track even though
+  // only audio is wanted (the spec makes user agents reject audio-only
+  // requests), and only Chromium (Chrome/Edge/Opera) actually delivers an
+  // audio track from it -- Firefox has never implemented the audio option
+  // and Safari silently ignores it, both resolving with zero audio tracks
+  // and no error rather than throwing. echoCancellation/noiseSuppression/
+  // autoGainControl default on and are tuned for a voice mic, not arbitrary
+  // system audio (music, a video's mixed track), so they're turned off here.
+  async function captureSystemAudio() {
+    const GetDisplayMedia = navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia;
+    if (!GetDisplayMedia) throw new Error("This browser cannot share system or tab audio.");
+    const display = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: { systemAudio: "include", echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    // Never rendered; discard immediately so it's never attached to a sink
+    // and stops counting toward the browser's active-share indicator early.
+    display.getVideoTracks().forEach(t => t.stop());
+    const audioTracks = display.getAudioTracks();
+    if (!audioTracks.length) {
+      display.getTracks().forEach(t => t.stop());
+      throw new Error('No audio was shared. Enable "Share audio" / "Share tab audio" in the picker, and share a tab or screen that\'s playing sound. System audio capture only works in Chrome, Edge, or Opera today.');
+    }
+    return new MediaStream(audioTracks);
+  }
 
   function encodeWAV(samples) {
     const bytes = new ArrayBuffer(44 + samples.length * 2);
@@ -98,8 +126,18 @@
         const previous = inputDevice.value;
         inputDevice.replaceChildren();
         const def = document.createElement("option");
-        def.value = ""; def.textContent = "System default";
+        def.value = ""; def.textContent = "Default microphone";
         inputDevice.appendChild(def);
+        // Offered whenever getDisplayMedia exists at all, even though only
+        // Chromium browsers actually deliver an audio track from it --
+        // there's no reliable capability check short of trying the capture,
+        // so unsupported browsers are caught by captureSystemAudio's own
+        // zero-audio-track error instead of being guessed at here.
+        if (navigator.mediaDevices.getDisplayMedia) {
+          const sys = document.createElement("option");
+          sys.value = SYSTEM_AUDIO_VALUE; sys.textContent = "System audio (share a tab or screen)";
+          inputDevice.appendChild(sys);
+        }
         inputs.forEach((d, i) => {
           const option = document.createElement("option");
           option.value = d.deviceId;
@@ -107,8 +145,9 @@
           inputDevice.appendChild(option);
         });
         const stored = previous || readStoredDevice();
-        if (stored && inputs.some(d => d.deviceId === stored)) inputDevice.value = stored;
-        inputDevice.hidden = inputs.length === 0;
+        const validStored = stored === SYSTEM_AUDIO_VALUE ? !!navigator.mediaDevices.getDisplayMedia : inputs.some(d => d.deviceId === stored);
+        if (stored && validStored) inputDevice.value = stored;
+        inputDevice.hidden = inputs.length === 0 && !navigator.mediaDevices.getDisplayMedia;
       } catch (_) {
         // enumerateDevices needs a secure context; leave the default-only
         // dropdown in place rather than surfacing an error for this.
@@ -236,19 +275,23 @@
       if (working || !model.value || !available) return;
       const AudioContext = global.AudioContext || global.webkitAudioContext;
       if (!AudioContext || !global.AudioWorkletNode) { message("Live capture requires a browser with AudioWorklet support.", true); return; }
+      const usingSystemAudio = inputDevice && inputDevice.value === SYSTEM_AUDIO_VALUE;
       const job = {id:"", abort:new AbortController(), queue:[], queuedBytes:0, sending:false, final:false, stopping:false};
       liveSession = job; working = true; ++sequence;
       result.value = ""; result.hidden = true; insert.hidden = true;
-      message("Preparing microphone and loading Voxtral…"); sync();
+      message(usingSystemAudio ? "Waiting for you to pick what to share, then loading Voxtral…" : "Preparing microphone and loading Voxtral…"); sync();
       try {
         // Create/resume during the user gesture so autoplay policy cannot
         // suspend the audio graph while model loading takes place.
         job.context = new AudioContext({sampleRate:16000});
         await job.context.resume();
         if (job !== liveSession) return;
-        job.media = await navigator.mediaDevices.getUserMedia({audio:audioConstraints()});
-        loadInputDevices();
+        job.media = usingSystemAudio ? await captureSystemAudio() : await navigator.mediaDevices.getUserMedia({audio:audioConstraints()});
+        if (!usingSystemAudio) loadInputDevices();
         if (job !== liveSession) { releaseLive(job); return; }
+        // Covers both the browser's native "Stop sharing" control (system
+        // audio) and a microphone track ending unexpectedly (device removed).
+        job.media.getTracks().forEach(t => t.addEventListener("ended", () => endLive(job)));
         await job.context.audioWorklet.addModule("/audio-worklet.js");
         if (job !== liveSession) return;
         const response = await options.fetch("/v1/audio/realtime/sessions", {
@@ -274,10 +317,13 @@
         };
         job.source.connect(job.node); job.node.connect(job.context.destination);
         if (levelRow) levelRow.hidden = false;
-        message("Listening… Text appears as you speak."); sync();
+        message(usingSystemAudio ? "Listening to shared audio… Text appears as it plays." : "Listening… Text appears as you speak."); sync();
       } catch (error) {
-        if (job === liveSession) finishLive(job, error.name === "NotAllowedError" ? "Microphone permission was denied." : error.message);
-        else releaseLive(job);
+        if (job === liveSession) {
+          finishLive(job, error.name === "NotAllowedError"
+            ? (usingSystemAudio ? "Screen/audio sharing was cancelled or denied." : "Microphone permission was denied.")
+            : error.message);
+        } else releaseLive(job);
       }
     }
     async function loadModels() {
@@ -355,20 +401,27 @@
     record.addEventListener("click", async () => {
       if (recorder) { if (recorder.state !== "inactive") recorder.stop(); return; }
       if (working || !available || !model.value) return;
+      const usingSystemAudio = inputDevice && inputDevice.value === SYSTEM_AUDIO_VALUE;
       working = true; const id = ++sequence; const selected = model.value;
-      message("Waiting for microphone permission…"); sync();
+      message(usingSystemAudio ? "Waiting for you to pick what to share…" : "Waiting for microphone permission…"); sync();
       try {
-        const media = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
-        loadInputDevices();
+        const media = usingSystemAudio ? await captureSystemAudio() : await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
+        if (!usingSystemAudio) loadInputDevices();
         if (id !== sequence || !available) { media.getTracks().forEach(track => track.stop()); return; }
         stream = media;
+        // Covers the browser's native "Stop sharing" control (system audio)
+        // or a microphone device disappearing mid-recording.
+        media.getTracks().forEach(t => t.addEventListener("ended", () => {
+          if (id !== sequence || recorder?.state === "inactive") return;
+          if (recorder) recorder.stop();
+        }));
         const chunks = [];
         const capture = new MediaRecorder(media);
         recorder = capture;
         capture.addEventListener("dataavailable", event => { if (event.data.size) chunks.push(event.data); });
         capture.addEventListener("error", () => {
           if (id !== sequence) return;
-          cancelJob(); message("Microphone recording failed. Try uploading an audio file.", true);
+          cancelJob(); message((usingSystemAudio ? "Audio sharing" : "Microphone recording") + " failed. Try uploading an audio file.", true);
         });
         capture.addEventListener("stop", () => {
           if (id !== sequence) return;
@@ -384,7 +437,9 @@
       } catch (error) {
         if (id !== sequence) return;
         stopTracks(); recorder = null; working = false;
-        message(error.name === "NotAllowedError" ? "Microphone permission was denied. Allow access or upload an audio file." : error.message, true);
+        message(error.name === "NotAllowedError"
+          ? (usingSystemAudio ? "Screen/audio sharing was cancelled or denied." : "Microphone permission was denied. Allow access or upload an audio file.")
+          : error.message, true);
         sync();
       }
     });
