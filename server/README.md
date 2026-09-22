@@ -369,6 +369,24 @@ curl http://127.0.0.1:8080/v1/vision/detections \
 #                 "box":{"x_min":104,"y_min":91,"x_max":249,"y_max":464}}, …]}
 ```
 
+In the chat UI, the same detector is used three ways:
+
+- **Object detection** (the viewfinder button in the composer) opens a
+  workbench that runs YOLO alone, with no language model involved. It works
+  with a text-only chat model or with none loaded. It detects on an image
+  (chosen or dropped) or live on the camera or a screen share, and filters
+  by label and confidence. It shows counts per label, a box table, and for
+  live feeds a log of objects appearing and leaving, with an optional beep.
+  Results export as JSON or as an annotated PNG. If a vision chat model is
+  loaded, the image or the selected regions can be handed to the chat.
+- **Find objects** on an attached image lets you click boxes. Only those
+  regions, or a numbered collage of up to four of them, are sent to the
+  vision model, together with what the detector saw.
+- **Detector gate** in live camera mode runs YOLO on every frame. It asks
+  the vision model only when a watched label is in view and the detections
+  changed since its last answer (or that answer is older than 15 s), and
+  then sends just the crops.
+
 Boxes are in source-image pixels. Loaded networks stay cached (two at a time),
 and at most two detections run concurrently. Like the audio routes, these
 routes are part of the model catalog feature and are disabled in the browser

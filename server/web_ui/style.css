@@ -777,7 +777,8 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
 /* Object detection: the attached image at a readable size with YOLO boxes
    as toggle buttons. Boxes are positioned in percentages of the image, so
    they stay aligned at any panel width without re-measuring. */
-.detect-panel { --detect-pick: #f5a524; display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 12px 8px 14px; padding: var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel-2); }
+.detect-panel, .yolo-panel { --detect-pick: #f5a524; }
+.detect-panel { display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 12px 8px 14px; padding: var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel-2); }
 .detect-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
 .detect-model-label { display: flex; align-items: center; gap: var(--sp-1h); color: var(--muted); font-size: var(--fs-xs); }
 .detect-model-label select { min-width: 120px; font-size: var(--fs-xs); }
@@ -786,14 +787,45 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
 .detect-stage { position: relative; align-self: center; max-width: 100%; line-height: 0; }
 .detect-image { display: block; max-width: 100%; max-height: 360px; border-radius: var(--r-sm); }
 .detect-boxes { position: absolute; inset: 0; }
-.detect-box { position: absolute; padding: 0; border: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); border-radius: 2px; background: transparent; cursor: pointer; }
-.detect-box:hover, .detect-box:focus-visible { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); outline: none; }
+.detect-box { position: absolute; padding: 0; border: 2px solid color-mix(in srgb, var(--detect-color, var(--accent)) 80%, transparent); border-radius: 2px; background: transparent; cursor: pointer; }
+.detect-box:hover, .detect-box:focus-visible { border-color: var(--detect-color, var(--accent)); background: color-mix(in srgb, var(--detect-color, var(--accent)) 14%, transparent); outline: none; }
 .detect-box.is-selected { z-index: 1; border: 3px solid var(--detect-pick); background: color-mix(in srgb, var(--detect-pick) 22%, transparent); box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
-.detect-boxes.has-selection .detect-box:not(.is-selected) { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.detect-boxes.has-selection .detect-box:not(.is-selected) { border-color: color-mix(in srgb, var(--detect-color, var(--accent)) 40%, transparent); }
 .detect-boxes.is-crowded .detect-box:not(.is-selected):not(:hover):not(:focus-visible) .detect-box-label { display: none; }
-.detect-box-label { position: absolute; left: -2px; bottom: 100%; max-width: 160px; overflow: hidden; padding: 1px 5px; border-radius: 2px 2px 0 0; background: var(--accent); color: var(--accent-ink); font: 700 var(--fs-3xs)/1.4 var(--mono); white-space: nowrap; text-overflow: ellipsis; }
+.detect-box-label { position: absolute; left: -2px; bottom: 100%; max-width: 160px; overflow: hidden; padding: 1px 5px; border-radius: 2px 2px 0 0; background: var(--detect-color, var(--accent)); color: #fff; font: 700 var(--fs-3xs)/1.4 var(--mono); white-space: nowrap; text-overflow: ellipsis; }
 .detect-box.is-selected .detect-box-label { background: var(--detect-pick); color: #1a1300; }
 .detect-actions { display: flex; justify-content: flex-end; gap: var(--sp-3); }
+/* The detection workbench: YOLO without a language model. */
+.settings-panel.yolo-panel { width: min(1180px, 100%); max-height: min(92vh, 920px); }
+.yolo-body { display: flex; flex-direction: column; gap: var(--sp-3); min-height: 0; overflow: auto; }
+.yolo-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-4); }
+.yolo-field { display: flex; align-items: center; gap: var(--sp-1h); color: var(--muted); font-size: var(--fs-xs); }
+.yolo-field b { min-width: 3ch; color: var(--ink); font: 700 var(--fs-2xs)/1 var(--mono); }
+.yolo-field input[type="range"] { width: 110px; accent-color: var(--accent); }
+.yolo-field-grow { flex: 1 1 200px; }
+.yolo-field-grow input { flex: 1; min-width: 0; }
+.yolo-sources { display: flex; flex-wrap: wrap; gap: var(--sp-3); }
+.yolo-main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--sp-3); min-height: 0; }
+.yolo-stage { display: grid; place-items: center; min-height: 300px; padding: var(--sp-2); border: 1px dashed var(--line-strong); border-radius: var(--r-md); background: var(--panel-2); }
+.yolo-stage.is-drop { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--panel-2)); }
+.yolo-empty { max-width: 34ch; margin: 0; color: var(--muted); font-size: var(--fs-sm); text-align: center; }
+.yolo-frame { position: relative; max-width: 100%; line-height: 0; }
+.yolo-media { display: block; max-width: 100%; max-height: 62vh; border-radius: var(--r-sm); background: #000; }
+.yolo-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.yolo-results { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; max-height: 70vh; overflow: auto; }
+.yolo-stats { margin: 0; color: var(--muted); font: var(--fs-2xs)/1.3 var(--mono); }
+.yolo-counts { display: flex; flex-wrap: wrap; gap: var(--sp-1h); }
+.yolo-count { padding: 2px 8px; border: 1px solid var(--detect-color, var(--line-strong)); border-radius: var(--r-pill); background: color-mix(in srgb, var(--detect-color, var(--accent)) 14%, transparent); color: var(--ink); font: 700 var(--fs-2xs)/1.5 var(--mono); cursor: pointer; }
+.yolo-table { width: 100%; border-collapse: collapse; font: var(--fs-2xs)/1.4 var(--mono); }
+.yolo-table th, .yolo-table td { padding: 3px 6px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+.yolo-table th { color: var(--muted); font-weight: 700; }
+.yolo-table tbody tr { cursor: pointer; }
+.yolo-table tbody tr:hover, .yolo-table tbody tr:focus-visible { background: var(--panel-2); outline: none; }
+.yolo-table tbody tr.is-selected { background: color-mix(in srgb, var(--detect-pick) 24%, transparent); }
+.yolo-alert { display: flex; align-items: center; gap: var(--sp-1h); color: var(--muted); font-size: var(--fs-xs); }
+.yolo-events { max-height: 260px; margin: 0; padding: 0 0 0 var(--sp-4); overflow: auto; color: var(--ink); font: var(--fs-2xs)/1.5 var(--mono); }
+.yolo-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2) var(--sp-3); }
+@media (max-width: 820px) { .yolo-main { grid-template-columns: minmax(0, 1fr); } }
 /* ── Capture modal (snapshot + live vision) ──────────────────────────
    The live layout is modelled on the "output stream" pattern seen in
    on-device webcam-captioning demos: a full-bleed camera feed with

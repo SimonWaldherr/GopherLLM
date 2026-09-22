@@ -1687,12 +1687,45 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       setComposerImage(dataURL || pendingImageOriginal, dataURL ? context : "");
     }
   });
+  const yoloButtonEl = document.getElementById("yoloButton");
+  const yoloModalEl = document.getElementById("yoloModal");
+  // The standalone detection workbench (vision.js): YOLO without any
+  // language model, so it is offered whenever the server can detect, even
+  // with a text-only chat model or none at all.
+  const yoloWorkbench = window.GopherLLMVision?.initWorkbench({
+    fetch: adminFetch,
+    canSendToChat: () => !attachImageEl.hidden && Boolean(activeChat()),
+    sendToChat(originalURL, imageURL, context) {
+      closeYoloWorkbench();
+      acceptCapturedImage(originalURL);
+      setComposerImage(imageURL, context);
+      promptEl.focus();
+      showToast("The image and the detector's findings are attached to your next message.", "success");
+    },
+    alert() {
+      ensureLiveAlertAudio();
+      playLiveAlertTone();
+    }
+  });
+  function openYoloWorkbench() {
+    if (!yoloWorkbench) return;
+    openDialog(yoloModalEl, yoloButtonEl, document.getElementById("yoloPickImage"));
+    yoloWorkbench.open();
+  }
+  function closeYoloWorkbench() {
+    yoloWorkbench?.close();
+    closeDialog(yoloModalEl);
+  }
+  yoloButtonEl?.addEventListener("click", openYoloWorkbench);
+  document.getElementById("yoloClose")?.addEventListener("click", closeYoloWorkbench);
+  yoloModalEl?.addEventListener("click", (event) => { if (event.target === yoloModalEl) closeYoloWorkbench(); });
   function serverDetectionAvailable() {
     return !browserOnlyDeployment && preferences.inferenceMode !== "browser" && serverFeatureSet().has("model-catalog");
   }
   function syncAudioAvailability() {
     audioControls?.setAvailable(!browserOnlyDeployment && preferences.inferenceMode !== "browser" && serverFeatureSet().has("model-catalog"));
     visionControls?.setAvailable(serverDetectionAvailable());
+    if (yoloButtonEl) yoloButtonEl.hidden = !yoloWorkbench || !serverDetectionAvailable();
   }
   syncAudioAvailability();
   let loadingEmbeddingModel = false;
@@ -1883,6 +1916,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     else if (activeDialog.root === batchEl) closeBatch();
     else if (activeDialog.root === agentosEl) closeAgentOS();
     else if (activeDialog.root === captureModalEl) closeCaptureModal();
+    else if (activeDialog.root === yoloModalEl) closeYoloWorkbench();
     else if (activeDialog.root === archViewerEl) closeArchViewer();
   }
 
@@ -7377,34 +7411,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     ctx.clearRect(0, 0, liveDetectCanvasEl.width, liveDetectCanvasEl.height);
   }
 
-  // Draws detector boxes over the video. The video is shown with
-  // object-fit: cover, so frame coordinates go through the same scale and
-  // centred crop the browser applied.
+  // Draws detector boxes over the video, which is shown with
+  // object-fit: cover, so frame coordinates go through the same centred crop.
   function drawLiveDetections(dets, frameWidth, frameHeight) {
-    const ratio = window.devicePixelRatio || 1;
-    const cw = Math.round(liveDetectCanvasEl.clientWidth * ratio), ch = Math.round(liveDetectCanvasEl.clientHeight * ratio);
-    if (liveDetectCanvasEl.width !== cw) liveDetectCanvasEl.width = cw;
-    if (liveDetectCanvasEl.height !== ch) liveDetectCanvasEl.height = ch;
-    const ctx = liveDetectCanvasEl.getContext("2d");
-    ctx.clearRect(0, 0, cw, ch);
-    const scale = Math.max(cw / frameWidth, ch / frameHeight);
-    const ox = (cw - frameWidth * scale) / 2, oy = (ch - frameHeight * scale) / 2;
-    const accent = getComputedStyle(document.body).getPropertyValue("--accent").trim() || "#2f6fed";
-    ctx.lineWidth = 2 * ratio;
-    ctx.font = "700 " + Math.round(11 * ratio) + "px ui-monospace, monospace";
-    ctx.textBaseline = "bottom";
-    dets.forEach((d) => {
-      const x = ox + d.box.x_min * scale, y = oy + d.box.y_min * scale;
-      const w = (d.box.x_max - d.box.x_min) * scale, h = (d.box.y_max - d.box.y_min) * scale;
-      ctx.strokeStyle = accent;
-      ctx.strokeRect(x, y, w, h);
-      const label = (d.label || "class " + d.class_id) + " " + Math.round(d.confidence * 100) + "%";
-      const tw = ctx.measureText(label).width + 8 * ratio;
-      ctx.fillStyle = accent;
-      ctx.fillRect(x - ctx.lineWidth / 2, y - 16 * ratio, tw, 16 * ratio);
-      ctx.fillStyle = "#fff";
-      ctx.fillText(label, x + 3 * ratio, y - 2 * ratio);
-    });
+    window.GopherLLMVision.drawOverlay(liveDetectCanvasEl, dets, frameWidth, frameHeight, "cover");
   }
 
   // One detector pass over the current frame. Returns { ask: false, status }

@@ -32,6 +32,7 @@
   <symbol id="i-check" viewBox="0 0 24 24"><polyline points="4,12 9,17 20,6"/></symbol>
   <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="1.6"/><circle cx="9" cy="10" r="1.8" fill="currentColor" stroke="none"/><path d="M4 17l5-5 3.5 3.5L16 12l4 5"/></symbol>
   <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8h3l1.6-2.2A2 2 0 0 1 10.2 5h3.6a2 2 0 0 1 1.6.8L17 8h3a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z"/><circle cx="12" cy="14" r="3.6"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><rect x="8" y="8" width="8" height="8" rx="1"/></symbol>
   <symbol id="i-screen" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1.6"/><line x1="8" y1="20" x2="16" y2="20"/><line x1="12" y1="17" x2="12" y2="20"/></symbol>
   <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="21"/><line x1="8" y1="21" x2="16" y2="21"/></symbol>
   <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></symbol>
@@ -176,6 +177,7 @@
                   <button id="liveScreenButton" class="capture-menu-item" type="button" role="menuitem">Start live screen</button>
                 </div>
               </div>
+              <button id="yoloButton" class="composer-icon-button" type="button" aria-label="Object detection" title="Object detection (YOLO, no language model)" aria-haspopup="dialog" hidden><svg class="icon" aria-hidden="true"><use href="#i-scan"/></svg></button>
               <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
             </div>
             <div class="prompt-footer-end">
@@ -936,6 +938,57 @@
         <div id="agentosResult" class="agentos-result"></div>
       </section>
       <p class="settings-note">The model proposes a command; its own claim of being "safe" never decides whether it runs. That is always the server's configured policy, plus your approval when the policy asks for it.</p>
+    </div>
+  </div>
+</div>
+
+<div id="yoloModal" class="settings" hidden>
+  <div class="settings-panel yolo-panel" role="dialog" aria-modal="true" aria-labelledby="yoloTitle">
+    <div class="settings-panel-head">
+      <h2 id="yoloTitle">Object detection</h2>
+      <button id="yoloClose" class="icon-button" type="button" aria-label="Close object detection"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button>
+    </div>
+    <div class="settings-panel-body yolo-body">
+      <div class="yolo-toolbar">
+        <label class="yolo-field">Model <select id="yoloModel" aria-label="YOLO detection model"></select></label>
+        <button id="yoloDownload" class="text-button" type="button" hidden>Download yolo11n</button>
+        <label class="yolo-field">Min. confidence <b id="yoloConfValue">25%</b><input id="yoloConf" type="range" min="5" max="90" step="5" value="25" aria-label="Minimum confidence"></label>
+        <label class="yolo-field yolo-field-grow">Only <input id="yoloClasses" type="text" placeholder="all labels (e.g. person, car)" maxlength="200" aria-label="Detector labels to keep"></label>
+        <div class="yolo-sources">
+          <button id="yoloPickImage" class="text-button" type="button">Image…</button>
+          <input id="yoloFileInput" type="file" accept="image/*" hidden>
+          <button id="yoloCamera" class="text-button" type="button">Live camera</button>
+          <button id="yoloScreen" class="text-button" type="button">Live screen</button>
+          <button id="yoloStop" class="text-button" type="button" hidden>Stop</button>
+        </div>
+      </div>
+      <div class="yolo-main">
+        <div id="yoloStage" class="yolo-stage">
+          <p id="yoloEmpty" class="yolo-empty">Choose or drop an image, or start the camera. Detection runs on this server with a YOLO model; no language model is involved.</p>
+          <div id="yoloFrame" class="yolo-frame" hidden>
+            <img id="yoloImage" class="yolo-media" alt="Image with detected objects" hidden>
+            <div id="yoloBoxes" class="detect-boxes" hidden></div>
+            <video id="yoloVideo" class="yolo-media" autoplay playsinline muted hidden></video>
+            <canvas id="yoloOverlay" class="yolo-overlay" aria-hidden="true" hidden></canvas>
+          </div>
+        </div>
+        <aside class="yolo-results" aria-label="Detection results">
+          <p id="yoloStatus" class="detect-status" aria-live="polite"></p>
+          <p id="yoloStats" class="yolo-stats"></p>
+          <div id="yoloCounts" class="yolo-counts"></div>
+          <div class="yolo-actions">
+            <button id="yoloCopyJSON" class="text-button" type="button" disabled>Copy JSON</button>
+            <button id="yoloSaveImage" class="text-button" type="button" disabled>Save annotated image</button>
+            <button id="yoloSendToChat" class="text-button" type="button" hidden>Ask the chat model about this image</button>
+          </div>
+          <table id="yoloTable" class="yolo-table" hidden>
+            <thead><tr><th>#</th><th>Label</th><th>Conf.</th><th>Box (x,y w×h)</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <label class="yolo-alert"><input id="yoloAlert" type="checkbox"> Beep when an object appears</label>
+          <ol id="yoloEvents" class="yolo-events" aria-label="Live detection log" hidden></ol>
+        </aside>
+      </div>
     </div>
   </div>
 </div>

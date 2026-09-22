@@ -82,3 +82,28 @@ test('detect posts the model, image and class filter', async () => {
   const failing = async () => ({ok: false, text: async () => 'stock model is not downloaded\n'});
   await assert.rejects(V.detect(failing, 'yolo11n', {}), /not downloaded/);
 });
+
+const plain = (x) => JSON.parse(JSON.stringify(x));
+
+test('countByLabel and summarizeDetections', () => {
+  const dets = [det('person', 0.9, 0, 0, 1, 1), det('bicycle', 0.5, 0, 0, 1, 1), det('person', 0.4, 0, 0, 1, 1)];
+  assert.deepEqual(plain(V.countByLabel(dets)), [['person', 2], ['bicycle', 1]]);
+  assert.match(V.summarizeDetections(dets), /found in the attached image: 2 × person, 1 × bicycle\./);
+  assert.match(V.summarizeDetections([]), /found no objects/);
+});
+
+test('createCountTracker reports only changes confirmed over consecutive frames', () => {
+  const track = V.createCountTracker(2);
+  const person = det('person', 0.9, 0, 0, 1, 1), dog = det('dog', 0.9, 0, 0, 1, 1);
+  assert.deepEqual(plain(track([person])), [], 'first sighting is not yet confirmed');
+  assert.deepEqual(plain(track([person])), [{label: 'person', from: 0, to: 1}]);
+  assert.deepEqual(plain(track([person])), [], 'no change');
+  assert.deepEqual(plain(track([person, dog])), [], 'one-frame flicker');
+  assert.deepEqual(plain(track([person])), [], 'flicker gone again');
+  assert.deepEqual(plain(track([person, person])), []);
+  const events = track([person, person]);
+  assert.deepEqual(plain(events.map(V.describeEvent)), ['person: 1 → 2']);
+  track([]);
+  assert.deepEqual(plain(track([])).map(V.describeEvent), ['person left']);
+  assert.equal(V.describeEvent({label: 'car', from: 0, to: 3}), 'car appeared (3)');
+});
