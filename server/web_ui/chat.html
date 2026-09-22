@@ -137,7 +137,23 @@
           <div id="attachmentTray" class="attachment-tray" aria-live="polite" hidden></div>
           <div id="imagePreviewRow" class="image-preview-row" hidden>
             <img id="imagePreview" class="image-preview-thumb" alt="Attached image preview">
+            <button id="detectObjectsButton" class="text-button" type="button" aria-controls="detectPanel" aria-expanded="false" title="Find objects with a local YOLO detector and send only the regions you pick" hidden>Find objects</button>
             <button id="clearImageButton" class="text-button" type="button">Remove image</button>
+          </div>
+          <div id="detectPanel" class="detect-panel" role="group" aria-label="Object detection" hidden>
+            <div class="detect-toolbar">
+              <label class="detect-model-label">Detector <select id="detectModel" aria-label="YOLO detection model"></select></label>
+              <button id="detectDownload" class="text-button" type="button" hidden>Download yolo11n</button>
+              <p id="detectStatus" class="detect-status" aria-live="polite"></p>
+            </div>
+            <div id="detectStage" class="detect-stage">
+              <img id="detectImage" class="detect-image" alt="Attached image with detected objects">
+              <div id="detectBoxes" class="detect-boxes"></div>
+            </div>
+            <div class="detect-actions">
+              <button id="detectUseWhole" class="text-button" type="button">Send whole image</button>
+              <button id="detectDone" class="text-button" type="button">Done</button>
+            </div>
           </div>
           <p id="captureError" class="settings-note model-download-status is-error" hidden></p>
           <div class="prompt-footer">
@@ -933,6 +949,7 @@
     <div class="settings-panel-body capture-body">
       <div class="capture-stage">
         <video id="captureVideo" class="capture-video" autoplay playsinline muted></video>
+        <canvas id="liveDetectCanvas" class="live-detect-canvas" aria-hidden="true"></canvas>
 
         <div id="liveOverlay" class="live-overlay" hidden>
           <div class="live-topbar">
@@ -952,6 +969,10 @@
                 <span class="live-size-label">Input <b id="liveSizeValue">384px</b></span>
                 <input id="liveSizeRange" type="range" min="256" max="960" step="32" value="384" aria-label="Live frame resolution">
               </label>
+              <label id="liveDetectGroup" class="live-context" title="Run a local YOLO detector on every frame and ask the vision model only when a watched object appears or changes, sending just its crop" hidden>
+                <span class="live-size-label">Detector gate</span>
+                <select id="liveDetectModel" aria-label="Live detector gate model"></select>
+              </label>
               <label class="live-context">
                 <span class="live-size-label">Context</span>
                 <select id="liveContextMode" aria-label="Live vision frame context">
@@ -970,6 +991,7 @@
             <div class="live-prompt-panel">
               <span class="live-panel-label">Prompt</span>
               <textarea id="livePromptInput" rows="1" placeholder="Describe what you see in one sentence."></textarea>
+              <input id="liveDetectClasses" class="live-detect-classes" type="text" placeholder="Watch for (detector labels, e.g. person, dog) — empty: any object" maxlength="200" aria-label="Detector labels that trigger the vision model" hidden>
               <details id="liveAlertsDisclosure" class="live-alerts">
                 <summary class="live-alerts-summary">
                   <span>Alerts <span id="liveAlertsSummaryNote" class="field-note" hidden></span></span>
@@ -1008,6 +1030,7 @@
               <div class="live-output-foot">
                 <span id="liveStatTTFT">ttft --</span>
                 <span id="liveStatTPS">tok/s --</span>
+                <span id="liveStatGate" hidden>gate --</span>
                 <span id="liveStatElapsed">0:00</span>
               </div>
             </div>
@@ -1077,6 +1100,7 @@
 
 {{if .MermaidScript}}<script src="{{.MermaidScript}}"></script>{{end}}
 <script src="/audio.js"></script>
+<script src="/vision.js"></script>
 <script src="/script.js"></script>
 </body>
 </html>

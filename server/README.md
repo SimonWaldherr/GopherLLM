@@ -338,6 +338,42 @@ The standalone CLI uses the same model loading and decode schedule:
 go run ./cmd/voxtral-transcribe --model /path/to/voxtral.gguf --audio clip.wav
 ```
 
+### Object detection
+
+`GET /models/detection` lists YOLOv8/YOLO11 checkpoints (`.safetensors` or
+Ultralytics `.pt`) found under `--model-dir`, plus the stock models
+`yolo11n` … `yolo11x` and `yolov8n` … `yolov8x`. A stock entry reports `"available": false` until it is
+in the Hugging Face cache. It is never downloaded implicitly: fetch it through
+the admin-controlled `POST /models/download` with the entry's `download_ref`
+and `download_file`:
+
+```sh
+curl http://127.0.0.1:8080/models/download \
+  -d '{"ref":"Ultralytics/YOLO11@8b8ac7d1fae7468f85dbf89670dd66f41f485aab","files":["yolo11n.pt"]}'
+```
+
+`POST /v1/vision/detections` takes multipart `model` (an `id` from the
+listing) and `file` (JPEG or PNG, at most 16 MiB and 40 megapixels). Optional
+fields:
+
+- `conf`: score threshold, default 0.25
+- `iou`: NMS threshold, default 0.45
+- `size`: square input size, a multiple of 32, default 640
+- `classes`: comma-separated labels to keep
+
+```sh
+curl http://127.0.0.1:8080/v1/vision/detections \
+  -F model=yolo11n -F file=@street.jpg -F classes=person,car
+# {"model":"yolo11n","version":"yolo11","width":800,"height":556,
+#  "detections":[{"class_id":0,"label":"person","confidence":0.89,
+#                 "box":{"x_min":104,"y_min":91,"x_max":249,"y_max":464}}, …]}
+```
+
+Boxes are in source-image pixels. Loaded networks stay cached (two at a time),
+and at most two detections run concurrently. Like the audio routes, these
+routes are part of the model catalog feature and are disabled in the browser
+deployment profile.
+
 It optionally uses ffmpeg for broader file support. Its `--max-extra-steps`
 flag adds encoded silence on the right (default zero); decoding never repeats
 the final embedding beyond the encoded audio span. GGUF Q/K projections use
@@ -429,6 +465,8 @@ Set `"stream": true` for SSE streaming. The handler exposes:
 | GET / PUT / DELETE | `/chat/workspace` | Read, replace, or clear server workspace |
 | GET | `/models/audio` | List local Voxtral Realtime models |
 | POST | `/v1/audio/transcriptions` | Transcribe mono 16 kHz WAV (multipart `model`, `file`) |
+| GET | `/models/detection` | List YOLO checkpoints under `--model-dir` and stock YOLO models |
+| POST | `/v1/vision/detections` | Detect objects in a JPEG/PNG (multipart `model`, `file`) |
 | POST | `/batch/parse` | Parse local `.xlsx`/`.ods` batch data |
 | GET | `/rag/status` | Document/chunk counts for the knowledge base |
 | GET / POST / DELETE | `/rag/documents` | List, add, or remove an indexed document |

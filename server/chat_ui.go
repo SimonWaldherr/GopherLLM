@@ -27,6 +27,9 @@ var chatJS string
 //go:embed web_ui/audio.js
 var audioJS string
 
+//go:embed web_ui/vision.js
+var visionJS string
+
 // audioWorkletJS is the shared voiceweb.AudioWorkletJS, not a second copy
 // of the source -- see that package's doc comment for why only the
 // capture/resample worklet (not this page's own audio.js orchestration)
@@ -57,6 +60,7 @@ var (
 	chatCSSGZ        = gzipBytes(chatCSS)
 	chatJSGZ         = gzipBytes(chatJS)
 	audioJSGZ        = gzipBytes(audioJS)
+	visionJSGZ       = gzipBytes(visionJS)
 	audioWorkletJSGZ = gzipBytes(audioWorkletJS)
 	wasmBridgeJSGZ   = gzipBytes(wasmBridgeJS)
 )
@@ -231,6 +235,11 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
 		writeStaticAsset(w, req, audioJS, audioJSGZ)
+	})
+	mux.HandleFunc("/vision.js", func(w http.ResponseWriter, req *http.Request) {
+		setChatUIHeaders(w, "", hasLocalRuntime)
+		w.Header().Set("content-type", "text/javascript; charset=utf-8")
+		writeStaticAsset(w, req, visionJS, visionJSGZ)
 	})
 	mux.HandleFunc("/audio-worklet.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)

@@ -334,6 +334,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		voxtralCache.closeAll()
 		parakeetCache.closeAll()
 	}
+	registerVisionRoutes(mux, audioAdmissionSem, opts, &yoloModelCache{})
 	registerModelRoutes(mux, state, embedder, modelSem, opts, deployment, &modelLoadMu, logw)
 	if opts.Features.AutoTune {
 		registerAutoTuneRoutes(mux, state, autotuneSem, logw)

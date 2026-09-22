@@ -27,12 +27,22 @@ static void voxtral_attention(int n,int total,int heads,int dim,int past,int win
   cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasNoTrans,n,dim,total,1,scores,total,vh,dim,0,out+h*dim,width);
  }
 }
+static void voxtral_gemm_nn(int m, int n, int k, const float *a, const float *b, float *c) {
+ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, n, k, 1, a, k, b, n, 0, c, n);
+}
 */
 import "C"
 import "unsafe"
 
 func Mul(n, rows, cols int, w, x, out []float32) {
 	C.voxtral_sgemm(C.int(n), C.int(rows), C.int(cols), (*C.float)(unsafe.Pointer(&w[0])), (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])))
+}
+
+// GemmNN computes c[m×n] = a[m×k] · b[k×n], all row-major. It is the plain
+// matrix product the YOLO convolution path needs after im2col (weights times
+// patch columns), as opposed to Mul's weight-transposed layout.
+func GemmNN(m, n, k int, a, b, c []float32) {
+	C.voxtral_gemm_nn(C.int(m), C.int(n), C.int(k), (*C.float)(unsafe.Pointer(&a[0])), (*C.float)(unsafe.Pointer(&b[0])), (*C.float)(unsafe.Pointer(&c[0])))
 }
 
 // stride is the per-head element stride within k/v (>= total); it lets a

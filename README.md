@@ -93,8 +93,9 @@ covers and how to turn things on.
 - `--compress`: requantize any GGUF to Q8_0/Q4_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
-- Native YOLOv8 image preparation and detection-head decoding (bounding-box
-  remapping and class-aware NMS), without an ONNX or other third-party runtime.
+- Native YOLOv8 and YOLO11 object detection from safetensors or Ultralytics
+  `.pt` files, without an ONNX, PyTorch or Python runtime (see
+  [Object detection (YOLO)](#object-detection-yolo)).
 
 ## Requirements
 
@@ -310,6 +311,67 @@ The integration belongs in GopherLLM's opt-in `huggingface` package so tinyRAG
 and other applications can reuse it without implementing another downloader.
 The root inference package continues to have no HTTP dependency.
 Hub task/filter semantics follow the [Hugging Face API documentation](https://huggingface.co/docs/hub/api).
+
+### Object detection (YOLO)
+
+GopherLLM runs Ultralytics **YOLOv8** and **YOLO11** detection networks
+natively in Go (Accelerate BLAS on macOS), with no ONNX, PyTorch or Python.
+No weights are bundled. They come from one of three places:
+
+- A **stock name** is fetched once from Hugging Face and then reused from the
+  HF cache, including offline. `yolo11n` … `yolo11x` come from Ultralytics'
+  own [`Ultralytics/YOLO11`](https://huggingface.co/Ultralytics/YOLO11), and
+  `yolov8n` … `yolov8x` from
+  [`lmz/candle-yolo-v8`](https://huggingface.co/lmz/candle-yolo-v8). Both are
+  pinned to a fixed commit.
+- An **Ultralytics `.pt` file** (`yolo11n.pt`, `yolov8s.pt`, or your own
+  `best.pt` from training) loads directly.
+- A **safetensors file** loads directly, in candle or Ultralytics tensor
+  naming, as F32, F16 or BF16.
+
+```sh
+go run ./cmd/yolo-detect --image street.jpg --out boxes.png    # yolo11n, the default
+go run ./cmd/yolo-detect --model yolov8s --image street.jpg --json
+go run ./cmd/yolo-detect --model runs/detect/train/weights/best.pt --image part.jpg
+go run ./cmd/yolo-detect --model hf:owner/repo:best.safetensors --image x.jpg --offline
+```
+
+The generation, model size, class count and head layout are read from the
+checkpoint itself. A custom-trained model therefore loads the same way as a
+stock one, and a `.pt` file brings its own class names. For safetensors
+files, pass `--labels` with one name per line; 80-class models default to the
+COCO names.
+
+Images are letterboxed with the same bilinear resize and 114-grey padding
+Ultralytics uses, so confidences match the reference implementation. On an
+M-series Mac, one 640×640 image takes about 60 ms with `yolov8n` or `yolo11n`
+using Accelerate, and about 150 ms in pure Go (`CGO_ENABLED=0`).
+
+**`.pt` safety.** A `.pt` file is a Python pickle, and `pickle.load` on an
+untrusted file is remote code execution. GopherLLM never runs pickle code. It
+interprets the opcodes as data and rebuilds only tensors, dicts and lists;
+every class or function the file names stays an inert value. See
+`torch_checkpoint.go`.
+
+From Go, the root package stays offline. `YOLOCheckpointReference` only builds
+the pinned `hf:` reference for a stock name; downloading is left to the
+`huggingface` package, as `cmd/yolo-detect` shows:
+
+```go
+model, err := gopherllm.LoadYOLO("yolo11n.pt") // or a .safetensors file
+if err != nil { return err }
+dets, err := model.Detect(img, gopherllm.DefaultYOLOConfig())
+// dets[i].Label, .Confidence, .Box (source-image pixels); model.Version
+```
+
+A loaded model is safe for concurrent `Detect` calls. The server exposes the
+same detector as `GET /models/detection` and `POST /v1/vision/detections`
+(see [server/README.md](server/README.md)). Pose, segmentation, OBB and
+YOLO26 are not supported yet.
+
+**License:** the Ultralytics weights (including the `lmz/candle-yolo-v8`
+copies) are licensed AGPL-3.0. GopherLLM does not redistribute them; whoever
+downloads and uses them is bound by that license.
 
 ## Use as a Go Library
 

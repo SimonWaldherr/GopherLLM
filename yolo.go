@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"fmt"
 	"image"
+	"image/draw"
 	"math"
 	"sort"
 )
@@ -41,7 +42,11 @@ type YOLOImage struct {
 
 // PrepareYOLOImage letterboxes img to cfg's model size using the standard
 // YOLO pad colour (114), producing CHW RGB float32 pixels without third-party
-// image or tensor dependencies.
+// image or tensor dependencies. The resize is bilinear with OpenCV's
+// INTER_LINEAR pixel-centre convention and 8-bit rounding, which is what
+// Ultralytics' own preprocessing feeds its models, so confidences match the
+// reference implementation rather than drifting with nearest-neighbour
+// aliasing.
 func PrepareYOLOImage(img image.Image, cfg YOLOConfig) (YOLOImage, error) {
 	if cfg.InputWidth <= 0 || cfg.InputHeight <= 0 {
 		return YOLOImage{}, fmt.Errorf("preparing YOLO image: input dimensions must be positive, got %dx%d", cfg.InputWidth, cfg.InputHeight)
@@ -59,29 +64,67 @@ func PrepareYOLOImage(img image.Image, cfg YOLOConfig) (YOLOImage, error) {
 	for i := range out.Pixels {
 		out.Pixels[i] = 114.0 / 255.0
 	}
-	for y := 0; y < rh; y++ {
-		sy := min(sh-1, int(float32(y)/scale))
-		for x := 0; x < rw; x++ {
-			sx := min(sw-1, int(float32(x)/scale))
-			r, g, bl, _ := img.At(b.Min.X+sx, b.Min.Y+sy).RGBA()
-			dst := (padY+y)*cfg.InputWidth + padX + x
-			out.Pixels[dst] = float32(r>>8) / 255
-			out.Pixels[plane+dst] = float32(g>>8) / 255
-			out.Pixels[2*plane+dst] = float32(bl>>8) / 255
+	src := yoloRGBA(img)
+	// Per-axis source taps and weights, shared by every row/column.
+	xs0, xs1, xw := yoloBilinearTaps(sw, rw)
+	ys0, ys1, yw := yoloBilinearTaps(sh, rh)
+	for y := range rh {
+		r0, r1, fy := src.Pix[ys0[y]*src.Stride:], src.Pix[ys1[y]*src.Stride:], yw[y]
+		dst := (padY+y)*cfg.InputWidth + padX
+		for x := range rw {
+			i0, i1, fx := 4*xs0[x], 4*xs1[x], xw[x]
+			for c := range 3 {
+				top := float32(r0[i0+c]) + (float32(r0[i1+c])-float32(r0[i0+c]))*fx
+				bottom := float32(r1[i0+c]) + (float32(r1[i1+c])-float32(r1[i0+c]))*fx
+				v := top + (bottom-top)*fy
+				out.Pixels[c*plane+dst+x] = float32(math.Round(float64(v))) / 255
+			}
 		}
 	}
 	return out, nil
 }
 
+// yoloBilinearTaps returns, for each of dstLen output positions, the two
+// source indices and the weight of the second, using OpenCV's
+// (dst+0.5)*ratio-0.5 centre mapping clamped at the borders.
+func yoloBilinearTaps(srcLen, dstLen int) (i0, i1 []int, w []float32) {
+	i0, i1, w = make([]int, dstLen), make([]int, dstLen), make([]float32, dstLen)
+	ratio := float64(srcLen) / float64(dstLen)
+	for d := range dstLen {
+		f := max(0, (float64(d)+0.5)*ratio-0.5)
+		base := min(int(f), srcLen-1)
+		i0[d], i1[d], w[d] = base, min(base+1, srcLen-1), float32(f-float64(base))
+	}
+	return i0, i1, w
+}
+
+// yoloRGBA returns img as a zero-origin *image.RGBA, converting through
+// image/draw's fast paths (notably JPEG's YCbCr) instead of per-pixel At
+// calls when it is anything else.
+func yoloRGBA(img image.Image) *image.RGBA {
+	if rgba, ok := img.(*image.RGBA); ok && rgba.Rect.Min == (image.Point{}) {
+		return rgba
+	}
+	b := img.Bounds()
+	rgba := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(rgba, rgba.Rect, img, b.Min, draw.Src)
+	return rgba
+}
+
 // BoundingBox uses source-image pixel coordinates, with Max values exclusive.
-type BoundingBox struct{ XMin, YMin, XMax, YMax float32 }
+type BoundingBox struct {
+	XMin float32 `json:"x_min"`
+	YMin float32 `json:"y_min"`
+	XMax float32 `json:"x_max"`
+	YMax float32 `json:"y_max"`
+}
 
 // Detection is one class-specific, non-max-suppressed result.
 type Detection struct {
-	ClassID    int
-	Label      string
-	Confidence float32
-	Box        BoundingBox
+	ClassID    int         `json:"class_id"`
+	Label      string      `json:"label,omitempty"`
+	Confidence float32     `json:"confidence"`
+	Box        BoundingBox `json:"box"`
 }
 
 // DecodeYOLOv8 converts a standard YOLOv8 detection head into source-image
@@ -96,6 +139,17 @@ func DecodeYOLOv8(output []float32, rows, cols int, input YOLOImage, cfg YOLOCon
 	if input.Width <= 0 || input.Height <= 0 || input.SourceWidth <= 0 || input.SourceHeight <= 0 || input.Scale <= 0 {
 		return nil, fmt.Errorf("decoding YOLOv8: invalid prepared image")
 	}
+	// Normal exports are [features, anchors] (for example [84,8400]);
+	// transposed exports are [anchors, features]. A one-anchor fixture also
+	// needs the latter rule even though its row count is not greater than cols.
+	transposed := cols >= 5 && (rows < 5 || rows > cols)
+	return decodeYOLOv8(output, rows, cols, transposed, input, cfg)
+}
+
+// decodeYOLOv8 is DecodeYOLOv8 with the output layout stated rather than
+// guessed; YOLOv8.Forward always produces [features, anchors], which the
+// shape heuristic would misread for a small input with many classes.
+func decodeYOLOv8(output []float32, rows, cols int, transposed bool, input YOLOImage, cfg YOLOConfig) ([]Detection, error) {
 	if cfg.ScoreThreshold <= 0 {
 		cfg.ScoreThreshold = 0.25
 	}
@@ -105,13 +159,9 @@ func DecodeYOLOv8(output []float32, rows, cols int, input YOLOImage, cfg YOLOCon
 	if cfg.MaxDetections <= 0 {
 		cfg.MaxDetections = 300
 	}
-
-	features, anchors, transposed := rows, cols, false
-	// Normal exports are [features, anchors] (for example [84,8400]);
-	// transposed exports are [anchors, features]. A one-anchor fixture also
-	// needs the latter rule even though its row count is not greater than cols.
-	if cols >= 5 && (rows < 5 || rows > cols) {
-		features, anchors, transposed = cols, rows, true
+	features, anchors := rows, cols
+	if transposed {
+		features, anchors = cols, rows
 	}
 	if features < 5 {
 		return nil, fmt.Errorf("decoding YOLOv8: need at least 5 features (4 box + 1 class), got %d", features)

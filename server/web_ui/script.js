@@ -1037,7 +1037,10 @@ function cleanMessage(value) {
     attachments: Array.isArray(value.attachments) ? value.attachments.map(cleanAttachment).filter(Boolean).slice(0, 8) : [],
     // Capped at one: the vision pipeline (browser and server) only supports
     // a single image per message in v1 -- see runtime.go's renderMistralInstMessages.
-    images: Array.isArray(value.images) ? value.images.filter((s) => typeof s === "string" && s.startsWith("data:image/")).slice(0, 1) : []
+    images: Array.isArray(value.images) ? value.images.filter((s) => typeof s === "string" && s.startsWith("data:image/")).slice(0, 1) : [],
+    // What the local object detector said about a cropped image (see
+    // vision.js). Sent to the model with the message, never shown as text.
+    visionContext: typeof value.visionContext === "string" ? value.visionContext.slice(0, 4000) : ""
   };
 }
 
@@ -1518,6 +1521,11 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const liveHistoryListEl = $("liveHistoryList");
   const liveStatTTFTEl = $("liveStatTTFT");
   const liveStatTPSEl = $("liveStatTPS");
+  const liveStatGateEl = $("liveStatGate");
+  const liveDetectGroupEl = $("liveDetectGroup");
+  const liveDetectModelEl = $("liveDetectModel");
+  const liveDetectClassesEl = $("liveDetectClasses");
+  const liveDetectCanvasEl = $("liveDetectCanvas");
   const liveStatElapsedEl = $("liveStatElapsed");
   const inferenceModeEl = $("inferenceMode");
   const inferenceModeSectionEl = $("inferenceModeSection");
@@ -1668,8 +1676,23 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       return true;
     }
   });
+  // The image the user attached, kept while the composer holds a detector
+  // crop of it instead (pendingImage), so deselecting every box restores it.
+  let pendingImageOriginal = null;
+  let pendingVisionContext = "";
+  const visionControls = window.GopherLLMVision?.init({
+    fetch: adminFetch,
+    onSelection(dataURL, context) {
+      if (!pendingImageOriginal) return;
+      setComposerImage(dataURL || pendingImageOriginal, dataURL ? context : "");
+    }
+  });
+  function serverDetectionAvailable() {
+    return !browserOnlyDeployment && preferences.inferenceMode !== "browser" && serverFeatureSet().has("model-catalog");
+  }
   function syncAudioAvailability() {
     audioControls?.setAvailable(!browserOnlyDeployment && preferences.inferenceMode !== "browser" && serverFeatureSet().has("model-catalog"));
+    visionControls?.setAvailable(serverDetectionAvailable());
   }
   syncAudioAvailability();
   let loadingEmbeddingModel = false;
@@ -1710,6 +1733,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   // The temporal profiles sample the actual media stream independently of inference:
   // it is never assembled from earlier model requests or answers.
   let liveContextMode = "current";
+  // The live detector gate (see runLiveDetectorGate): what the vision model
+  // last answered about and when, plus how often it was asked or spared.
+  let liveGate = { lastSent: null, lastSentAt: 0, asked: 0, idle: 0 };
   const liveTimelineFrames = [];
   let liveTimelineTimer = null;
   let liveTimelineCapturePending = false;
@@ -2166,8 +2192,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
 
   function messageContentForModel(message) {
     const attachments = Array.isArray(message.attachments) ? message.attachments : [];
-    if (!attachments.length) return message.content;
-    return [message.content.trim(), ...attachments.map(attachmentPrompt)].filter(Boolean).join("\n\n");
+    const visionContext = typeof message.visionContext === "string" ? message.visionContext.trim() : "";
+    if (!attachments.length && !visionContext) return message.content;
+    return [visionContext, message.content.trim(), ...attachments.map(attachmentPrompt)].filter(Boolean).join("\n\n");
   }
 
   function renderMessageAttachments(el, attachments) {
@@ -2439,7 +2466,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     else setIdleStatus();
   }
 
-  function addMessage(role, text, attachments, images) {
+  function addMessage(role, text, attachments, images, visionContext) {
     emptyEl.hidden = true;
     const el = document.createElement("article");
     el.className = "msg " + role;
@@ -2456,7 +2483,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       images.forEach((dataURL) => {
         const img = document.createElement("img");
         img.src = dataURL;
-        img.alt = "Attached image";
+        img.alt = visionContext ? "Detector crop sent to the model" : "Attached image";
+        if (visionContext) img.title = visionContext;
         list.appendChild(img);
       });
       el.appendChild(list);
@@ -2690,7 +2718,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     messagesEl.querySelectorAll(".msg").forEach((el) => el.remove());
     emptyEl.hidden = chat.messages.length > 0;
     chat.messages.forEach((message, index) => {
-      const el = addMessage(message.role, message.content, message.attachments, message.images);
+      const el = addMessage(message.role, message.content, message.attachments, message.images, message.visionContext);
       if (message.role === "assistant") {
         finalizeAssistant(el, {
           answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
@@ -2720,7 +2748,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const index = chat.messages.length - 1;
     const message = chat.messages[index];
     emptyEl.hidden = true;
-    const el = addMessage(message.role, message.content, message.attachments, message.images);
+    const el = addMessage(message.role, message.content, message.attachments, message.images, message.visionContext);
     if (message.role === "assistant") {
       finalizeAssistant(el, {
         answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
@@ -3456,6 +3484,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const text = promptEl.value.trim();
     const attachments = pendingAttachments;
     const images = pendingImage ? [pendingImage] : [];
+    const visionContext = pendingImage ? pendingVisionContext : "";
     let chat = activeChat();
     if ((!text && !attachments.length && !images.length) || !chat) return;
     closeCommandMenu();
@@ -3475,7 +3504,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       showToast("Created an edit branch. The original chat is unchanged.", "success");
     }
     const ragContext = text ? await buildRagContext(chat, text) : "";
-    chat.messages.push({ role: "user", content: text, reasoning: "", tool_calls: null, usage: null, finishReason: "", attachments, images });
+    chat.messages.push({ role: "user", content: text, reasoning: "", tool_calls: null, usage: null, finishReason: "", attachments, images, visionContext });
     if (!chat.titleManual && chat.messages.filter((message) => message.role === "user").length === 1) {
       chat.title = titleFor(text || (attachments[0] && attachments[0].name) || (images.length && "Image"));
       chatTitleEl.textContent = chat.title;
@@ -6304,6 +6333,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     liveFrameSize = boundedNumber(liveSizeRangeEl.value, 384, 256, 960, true);
     liveSizeValueEl.textContent = liveFrameSize + "px";
   });
+  liveDetectModelEl.addEventListener("change", syncLiveDetectControls);
   liveContextModeEl.addEventListener("change", () => {
     liveContextMode = liveContextModeEl.value;
     if (liveVisionRunning) restartLiveTimelineSampler();
@@ -6538,15 +6568,28 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   }
 
   function acceptCapturedImage(dataURL) {
-    pendingImage = dataURL;
-    imagePreviewEl.src = dataURL;
+    pendingImageOriginal = dataURL;
+    visionControls?.setSource(dataURL);
+    setComposerImage(dataURL, "");
     imagePreviewRowEl.hidden = false;
     clearCaptureError();
+  }
+
+  // Swaps the image the next message sends without forgetting the original
+  // attachment: vision.js calls this with a detector crop and its context.
+  function setComposerImage(dataURL, visionContext) {
+    pendingImage = dataURL;
+    pendingVisionContext = visionContext || "";
+    imagePreviewEl.src = dataURL;
+    imagePreviewEl.alt = pendingVisionContext ? "Detector crop that will be sent" : "Attached image preview";
     updateComposer(false);
   }
 
   function clearPendingImage() {
     pendingImage = null;
+    pendingImageOriginal = null;
+    pendingVisionContext = "";
+    visionControls?.setSource(null);
     imagePreviewRowEl.hidden = true;
     updateComposer(false);
   }
@@ -7196,7 +7239,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     }
   }
 
-  async function completeLiveVision(chat, prompt, image, signal, onToken, timeline) {
+  async function completeLiveVision(chat, prompt, image, signal, onToken, timeline, detectorContext) {
     // Live frames are a perception task, not an open-ended chat turn. Short,
     // low-temperature answers keep the output grounded in what is actually
     // visible instead of letting a small vision model elaborate a speculative
@@ -7210,7 +7253,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     // runs at whatever rate the main thread allows, so a hardcoded "sampled
     // one second apart" was frequently a false statement about the very image
     // being shown, and a model told the spacing wrongly reads motion wrongly.
-    const frameContext = timeline
+    const frameContext = detectorContext
+      ? "You are seeing only the regions a local object detector found in one freshly captured live " + source +
+        " frame, not the whole view. " + detectorContext
+      : timeline
       ? "You are seeing a collage of " + timeline.frameCount + " real frames from the same live " + source +
         " feed, captured over the last " + timeline.spanSeconds.toFixed(1) + " seconds and arranged oldest first, " +
         "left to right then top to bottom. Each panel is labelled with its age at capture. Panels that looked " +
@@ -7281,6 +7327,114 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     ], liveSettings, liveSystemPrompt, signal, onToken, false);
   }
 
+  /* The live detector gate. With a YOLO model selected, every loop turn
+     first runs the detector on the current frame (tens of milliseconds) and
+     asks the vision LLM only when a watched object is in view and the set of
+     detections changed since its last answer (or that answer is older than
+     LIVE_GATE_REFRESH_MS). The LLM then sees crops of those objects rather
+     than the whole frame. Most frames of a quiet camera therefore cost one
+     detector pass instead of a full vision-LLM turn. */
+  const LIVE_GATE_REFRESH_MS = 15000;
+  const LIVE_GATE_IDLE_MS = 250;
+
+  function liveGateModel() {
+    return !liveDetectGroupEl.hidden && liveDetectModelEl.value ? liveDetectModelEl.value : "";
+  }
+
+  function syncLiveDetectControls() {
+    const on = Boolean(liveGateModel());
+    liveDetectClassesEl.hidden = !on;
+    liveStatGateEl.hidden = !on;
+    liveContextModeEl.disabled = on;
+    liveContextModeEl.title = on ? "The detector gate sends crops of the current frame" : "";
+    if (!on) clearLiveDetections();
+    updateLiveGateStats();
+  }
+
+  async function refreshLiveDetectModels() {
+    const vision = window.GopherLLMVision;
+    if (!vision || !serverDetectionAvailable()) {
+      liveDetectGroupEl.hidden = true;
+      syncLiveDetectControls();
+      return;
+    }
+    try {
+      const models = await vision.listModels(adminFetch);
+      vision.fillModelSelect(liveDetectModelEl, models, "Off");
+      liveDetectGroupEl.hidden = !models.some((m) => m.available);
+    } catch (_) {
+      liveDetectGroupEl.hidden = true;
+    }
+    syncLiveDetectControls();
+  }
+
+  function updateLiveGateStats() {
+    liveStatGateEl.textContent = "gate asked " + liveGate.asked + " · idle " + liveGate.idle;
+  }
+
+  function clearLiveDetections() {
+    const ctx = liveDetectCanvasEl.getContext("2d");
+    ctx.clearRect(0, 0, liveDetectCanvasEl.width, liveDetectCanvasEl.height);
+  }
+
+  // Draws detector boxes over the video. The video is shown with
+  // object-fit: cover, so frame coordinates go through the same scale and
+  // centred crop the browser applied.
+  function drawLiveDetections(dets, frameWidth, frameHeight) {
+    const ratio = window.devicePixelRatio || 1;
+    const cw = Math.round(liveDetectCanvasEl.clientWidth * ratio), ch = Math.round(liveDetectCanvasEl.clientHeight * ratio);
+    if (liveDetectCanvasEl.width !== cw) liveDetectCanvasEl.width = cw;
+    if (liveDetectCanvasEl.height !== ch) liveDetectCanvasEl.height = ch;
+    const ctx = liveDetectCanvasEl.getContext("2d");
+    ctx.clearRect(0, 0, cw, ch);
+    const scale = Math.max(cw / frameWidth, ch / frameHeight);
+    const ox = (cw - frameWidth * scale) / 2, oy = (ch - frameHeight * scale) / 2;
+    const accent = getComputedStyle(document.body).getPropertyValue("--accent").trim() || "#2f6fed";
+    ctx.lineWidth = 2 * ratio;
+    ctx.font = "700 " + Math.round(11 * ratio) + "px ui-monospace, monospace";
+    ctx.textBaseline = "bottom";
+    dets.forEach((d) => {
+      const x = ox + d.box.x_min * scale, y = oy + d.box.y_min * scale;
+      const w = (d.box.x_max - d.box.x_min) * scale, h = (d.box.y_max - d.box.y_min) * scale;
+      ctx.strokeStyle = accent;
+      ctx.strokeRect(x, y, w, h);
+      const label = (d.label || "class " + d.class_id) + " " + Math.round(d.confidence * 100) + "%";
+      const tw = ctx.measureText(label).width + 8 * ratio;
+      ctx.fillStyle = accent;
+      ctx.fillRect(x - ctx.lineWidth / 2, y - 16 * ratio, tw, 16 * ratio);
+      ctx.fillStyle = "#fff";
+      ctx.fillText(label, x + 3 * ratio, y - 2 * ratio);
+    });
+  }
+
+  // One detector pass over the current frame. Returns { ask: false, status }
+  // when the vision model can stay idle, or { ask: true, image, context,
+  // picked } with the crop to send.
+  async function runLiveDetectorGate(model, signal) {
+    const vision = window.GopherLLMVision;
+    const canvas = vision.toCanvas(captureVideoEl, captureVideoEl.videoWidth, captureVideoEl.videoHeight, vision.DETECT_EDGE);
+    const classes = vision.parseClassList(liveDetectClassesEl.value);
+    const dets = await vision.detect(adminFetch, model, await vision.canvasBlob(canvas, "image/jpeg", 0.85), { classes, signal });
+    drawLiveDetections(dets, canvas.width, canvas.height);
+    const watched = classes.size ? Array.from(classes).join(", ") : "any object";
+    if (!dets.length) {
+      // Forget the last answer's objects, so the next appearance counts as
+      // a change even if it looks exactly like the previous one.
+      liveGate.lastSent = null;
+      return { ask: false, status: "Watching for " + watched + " — nothing in view. The vision model is idle.", health: "detector: nothing in view" };
+    }
+    const picked = vision.strongest(dets);
+    const fresh = Date.now() - liveGate.lastSentAt < LIVE_GATE_REFRESH_MS;
+    if (fresh && !vision.sceneChanged(liveGate.lastSent, picked)) {
+      return { ask: false, status: "No change in the detected objects. The vision model is idle.", health: "detector: " + dets.length + " unchanged" };
+    }
+    return {
+      ask: true, picked,
+      image: vision.selectionDataURL(canvas, picked),
+      context: vision.describeSelection(picked, canvas.width, canvas.height, "live")
+    };
+  }
+
   function setLiveCaptureButtonState(running, mode) {
     const buttons = [
       { button: liveVisionButtonEl, kind: "camera", label: "camera" },
@@ -7318,6 +7472,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     if (liveActionsArmed.notify) ensureNotifyPermission();
     liveHistory = [];
     liveHistoryShown = false;
+    liveGate = { lastSent: null, lastSentAt: 0, asked: 0, idle: 0 };
+    syncLiveDetectControls();
     renderLiveHistory();
     liveHistoryToggleEl.setAttribute("aria-expanded", "false");
     liveHistoryToggleEl.textContent = "History";
@@ -7358,16 +7514,32 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         setLiveOutputStatus(liveCaptureMode === "screen" ? "Waiting for a screen frame…" : "Waiting for a camera frame…", false);
         await waitForLiveVideoFrame(requestController.signal);
         setLiveHealth("live", "capturing frame");
-        const timeline = liveContextMode === "current" ? null : await buildLiveTimelineCollage(requestController.signal);
-        const image = timeline ? timeline.image : await captureLiveFrame();
-        // Say which of the two it actually became. The timeline modes fall
-        // back to a single frame whenever the buffer holds only one distinct
-        // moment (a still scene, or a starved sampler), and that used to be
-        // invisible -- the overlay kept claiming "analysing timeline" while a
-        // plain current frame was on its way to the model.
-        setLiveHealth("live", timeline
-          ? "analysing " + timeline.frameCount + " moments over " + timeline.spanSeconds.toFixed(1) + "s"
-          : (liveContextMode === "current" ? "analysing current frame" : "analysing current frame (no motion to compare)"));
+        const gateModel = liveGateModel();
+        let timeline = null, image, gate = null;
+        if (gateModel) {
+          gate = await runLiveDetectorGate(gateModel, requestController.signal);
+          if (!gate.ask) {
+            liveGate.idle++;
+            updateLiveGateStats();
+            setLiveOutputStatus(gate.status, false);
+            setLiveHealth("live", gate.health);
+            await sleep(LIVE_GATE_IDLE_MS);
+            continue;
+          }
+          image = gate.image;
+          setLiveHealth("live", "analysing " + gate.picked.length + " detected region" + (gate.picked.length === 1 ? "" : "s"));
+        } else {
+          timeline = liveContextMode === "current" ? null : await buildLiveTimelineCollage(requestController.signal);
+          image = timeline ? timeline.image : await captureLiveFrame();
+          // Say which of the two it actually became. The timeline modes fall
+          // back to a single frame whenever the buffer holds only one distinct
+          // moment (a still scene, or a starved sampler), and that used to be
+          // invisible -- the overlay kept claiming "analysing timeline" while a
+          // plain current frame was on its way to the model.
+          setLiveHealth("live", timeline
+            ? "analysing " + timeline.frameCount + " moments over " + timeline.spanSeconds.toFixed(1) + "s"
+            : (liveContextMode === "current" ? "analysing current frame" : "analysing current frame (no motion to compare)"));
+        }
         startLiveFrameProgress();
         const answer = await completeLiveVision(chat, prompt, image, requestController.signal, (partial) => {
           stopLiveFrameProgress();
@@ -7381,7 +7553,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
           const statusLabel = describeLiveActionStatus(frameActionsTriggered);
           setLiveOutputStatus((statusLabel ? statusLabel + " — generating response…" : "Generating response…"), false);
           setLiveOutputText(parsed.text || (statusLabel ? "Flagged…" : partial), true);
-        }, timeline);
+        }, timeline, gate ? gate.context : "");
         stopLiveFrameProgress();
         const parsedAnswer = parseLiveActions(answer);
         parsedAnswer.actions.forEach((key) => {
@@ -7391,6 +7563,12 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         const generatedAnswer = parsedAnswer.text;
         liveLastAnswer = generatedAnswer || "The model returned no text for this frame.";
         liveLastSuccessAt = Date.now();
+        if (gate) {
+          liveGate.lastSent = gate.picked;
+          liveGate.lastSentAt = Date.now();
+          liveGate.asked++;
+          updateLiveGateStats();
+        }
         setLiveHealth("live", "last success just now");
         setLiveOutputText(liveLastAnswer, false);
         const finalStatusLabel = describeLiveActionStatus(frameActionsTriggered);
@@ -7407,6 +7585,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
           setLiveOutputStatus("Error: " + (error && error.message ? error.message : String(error)), true);
           if (previousAnswer) setLiveOutputText(previousAnswer, false);
           else setLiveOutputText("No response was generated for this frame.", false, true);
+          // A failing detector (model removed, server busy) would otherwise
+          // retry every 200 ms.
+          if (liveGateModel()) await sleep(800);
         }
       } finally {
         liveVisionController = null;
@@ -7426,6 +7607,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     stopLiveFrameProgress();
     stopLiveElapsedTimer();
     stopLiveTimelineSampler();
+    clearLiveDetections();
     setLiveHealth("stopped", liveLastSuccessAt ? "last success recorded" : "not run");
     // Force deliberate re-arming on the next session rather than leaving a
     // watch condition silently active in the background once the camera or
@@ -7467,6 +7649,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     captureLiveButtonEl.textContent = captureMode === "screen" ? "Start live screen" : "Start live";
     liveSizeRangeEl.value = String(liveFrameSize);
     liveSizeValueEl.textContent = liveFrameSize + "px";
+    refreshLiveDetectModels();
     openDialog(captureModalEl, opener, captureConfirmButtonEl);
   }
 

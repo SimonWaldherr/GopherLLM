@@ -774,6 +774,26 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
 .attachment-tray { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 8px 14px; }
 .image-preview-row { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px 14px; }
 .image-preview-thumb { max-height: 54px; max-width: 96px; border: 1px solid var(--line-strong); border-radius: var(--r-sm); object-fit: cover; }
+/* Object detection: the attached image at a readable size with YOLO boxes
+   as toggle buttons. Boxes are positioned in percentages of the image, so
+   they stay aligned at any panel width without re-measuring. */
+.detect-panel { --detect-pick: #f5a524; display: flex; flex-direction: column; gap: var(--sp-2); margin: 0 12px 8px 14px; padding: var(--sp-2h); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel-2); }
+.detect-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
+.detect-model-label { display: flex; align-items: center; gap: var(--sp-1h); color: var(--muted); font-size: var(--fs-xs); }
+.detect-model-label select { min-width: 120px; font-size: var(--fs-xs); }
+.detect-status { flex: 1 1 220px; margin: 0; color: var(--muted); font-size: var(--fs-xs); }
+.detect-status.is-error { color: var(--stop); }
+.detect-stage { position: relative; align-self: center; max-width: 100%; line-height: 0; }
+.detect-image { display: block; max-width: 100%; max-height: 360px; border-radius: var(--r-sm); }
+.detect-boxes { position: absolute; inset: 0; }
+.detect-box { position: absolute; padding: 0; border: 2px solid color-mix(in srgb, var(--accent) 70%, transparent); border-radius: 2px; background: transparent; cursor: pointer; }
+.detect-box:hover, .detect-box:focus-visible { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); outline: none; }
+.detect-box.is-selected { z-index: 1; border: 3px solid var(--detect-pick); background: color-mix(in srgb, var(--detect-pick) 22%, transparent); box-shadow: 0 0 0 1px rgba(0,0,0,.55); }
+.detect-boxes.has-selection .detect-box:not(.is-selected) { border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.detect-boxes.is-crowded .detect-box:not(.is-selected):not(:hover):not(:focus-visible) .detect-box-label { display: none; }
+.detect-box-label { position: absolute; left: -2px; bottom: 100%; max-width: 160px; overflow: hidden; padding: 1px 5px; border-radius: 2px 2px 0 0; background: var(--accent); color: var(--accent-ink); font: 700 var(--fs-3xs)/1.4 var(--mono); white-space: nowrap; text-overflow: ellipsis; }
+.detect-box.is-selected .detect-box-label { background: var(--detect-pick); color: #1a1300; }
+.detect-actions { display: flex; justify-content: flex-end; gap: var(--sp-3); }
 /* ── Capture modal (snapshot + live vision) ──────────────────────────
    The live layout is modelled on the "output stream" pattern seen in
    on-device webcam-captioning demos: a full-bleed camera feed with
@@ -801,6 +821,15 @@ body.chat #prompt { display: block; width: 100%; min-height: 48px; max-height: 2
    nothing for scroll-into-view to move. */
 .capture-stage { position: relative; flex: 1; min-height: 0; overflow: clip; background: #000; }
 .capture-video { display: block; width: 100%; height: 100%; object-fit: cover; background: #000; }
+/* The live detector gate draws its boxes here, over the video and under the
+   overlay controls. script.js maps box coordinates through the video's
+   object-fit: cover crop. */
+.live-detect-canvas { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; pointer-events: none; }
+#captureModal .live-detect-classes {
+  display: block; width: 100%; height: 24px; margin-top: var(--sp-1h); padding: 0 8px; border: 1px solid var(--line); border-radius: var(--r-pill);
+  background: var(--panel-2); color: var(--ink); font: var(--fs-2xs)/1 var(--mono); outline: none; pointer-events: auto;
+}
+#captureModal .live-detect-classes:focus { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 
 .live-overlay { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; justify-content: space-between; padding: var(--sp-4); pointer-events: none; }
 .live-overlay > * { pointer-events: auto; }

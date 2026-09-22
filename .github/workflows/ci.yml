@@ -20,7 +20,8 @@ jobs:
       - name: Check JavaScript and streaming behavior
         run: |
           node --check server/web_ui/script.js
-          node --test server/web_ui/stream_test.cjs
+          node --check server/web_ui/vision.js
+          node --test server/web_ui/stream_test.cjs server/web_ui/vision_test.cjs
 
   test:
     name: Test (${{ matrix.os }})
