@@ -505,6 +505,7 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		fmt.Fprintf(logw, "Vision: loaded Pixtral-style encoder (%d layers, %d-dim, %dx merge)\n", vc.BlockCount, vc.EmbeddingLength, vc.SpatialMergeSize)
 	}
 
+	r.warmupMetalPipelines(options.UseMetal)
 	return r, nil
 }
 
