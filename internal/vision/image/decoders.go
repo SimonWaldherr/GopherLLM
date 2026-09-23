@@ -1,6 +1,6 @@
 //go:build !noimagedecoders
 
-package gopherllm
+package image
 
 // These two blank imports are the default half of the noimagedecoders split,
 // and they are the reason this file exists at all: they are the single

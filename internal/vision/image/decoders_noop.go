@@ -1,6 +1,6 @@
 //go:build noimagedecoders
 
-package gopherllm
+package image
 
 // This file is the opt-out half of the split described in image_decoders.go:
 // under -tags noimagedecoders neither image/jpeg nor image/png is imported,
