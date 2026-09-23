@@ -20,11 +20,11 @@ package gopherllm
 // removing the offset handling from the inner loop.
 
 import (
-	"math"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 	"github.com/SimonWaldherr/GopherLLM/internal/threads"
 )
 
@@ -69,50 +69,21 @@ func numThreads() int {
 	return max(1, runtime.GOMAXPROCS(0))
 }
 
-// f16LUT maps every possible f16 bit pattern to its float32 value (256 KB,
-// built once at startup). Block scales in every quant format are f16, so this
-// lookup sits on the innermost dequant loops; a table beats bit manipulation
-// there.
-var f16LUT []float32
+// f16LUT shares the numeric package's conversion table with Go and assembly
+// paths, avoiding a second 256 KB copy.
+var f16LUT = numeric.F16Table()
 var int8ToFloat32LUT [256]float32
 var byteToFloat32LUT [256]float32
 
 func init() {
-	f16LUT = make([]float32, 65536)
-	for i := 0; i < 65536; i++ {
-		f16LUT[i] = f16ToF32Soft(uint16(i))
-	}
 	for i := 0; i < 256; i++ {
 		int8ToFloat32LUT[i] = float32(int8(byte(i)))
 		byteToFloat32LUT[i] = float32(i)
 	}
 }
 
-func f16ToF32Soft(h uint16) float32 {
-	sign := uint32(h>>15) & 1
-	exp := uint32(h>>10) & 0x1f
-	mant := uint32(h & 0x3ff)
-	if exp == 0 {
-		if mant == 0 {
-			return math.Float32frombits(sign << 31)
-		}
-		var e uint32
-		m := mant
-		for (m & 0x400) == 0 {
-			m <<= 1
-			e++
-		}
-		m &= 0x3ff
-		return math.Float32frombits((sign << 31) | ((127 - 15 + 1 - e) << 23) | (m << 13))
-	}
-	if exp == 31 {
-		return math.Float32frombits((sign << 31) | (0xff << 23) | (mant << 13))
-	}
-	return math.Float32frombits((sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13))
-}
-
 func F16ToF32(h uint16) float32 {
-	return f16LUT[h]
+	return numeric.F16ToF32(h)
 }
 
 func DotF32(a, b []float32) float32 {

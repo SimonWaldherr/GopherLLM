@@ -15,6 +15,10 @@ var halfToFloat32 = func() [1 << 16]float32 {
 // F16ToF32 converts an IEEE 754 binary16 bit pattern to binary32.
 func F16ToF32(h uint16) float32 { return halfToFloat32[h] }
 
+// F16Table exposes the lookup table to internal SIMD assembly call sites.
+// Callers must treat the returned slice as read-only.
+func F16Table() []float32 { return halfToFloat32[:] }
+
 func convertHalf(h uint16) float32 {
 	sign := uint32(h>>15) & 1
 	exp := uint32(h>>10) & 0x1f
