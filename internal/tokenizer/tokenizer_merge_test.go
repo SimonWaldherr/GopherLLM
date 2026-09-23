@@ -1,4 +1,4 @@
-package gopherllm
+package tokenizer
 
 import (
 	"math"

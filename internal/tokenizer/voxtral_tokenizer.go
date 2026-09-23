@@ -1,10 +1,12 @@
-package gopherllm
+package tokenizer
 
 import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	gguf "github.com/SimonWaldherr/GopherLLM/internal/formats/gguf"
 )
 
 // voxtralBuildBPEVocab builds the shared vocabulary/merge-rank structures
@@ -111,7 +113,7 @@ func voxtralBuildBPEVocab(specialStrings []string, rawByteVocab [][]byte) (vocab
 // not one needing an offset). 1000 (specials) + 130072 (byte vocab) =
 // 131072 = voxtral.vocab_size, confirming voxtralBuildBPEVocab's two-block
 // layout is the whole vocabulary here, not a subset missing something else.
-func voxtralTokenizerFromMetadata(metadata map[string]MetaValue) (*Tokenizer, error) {
+func voxtralTokenizerFromMetadata(metadata map[string]gguf.MetaValue) (*Tokenizer, error) {
 	vocabB64Value, ok := metadata["voxtral.tokenizer.vocab_token_bytes_b64"]
 	if !ok {
 		return nil, fmt.Errorf("missing tokenizer.ggml.tokens")
