@@ -1,4 +1,4 @@
-package gopherllm
+package yolo
 
 import (
 	"image"
@@ -131,10 +131,7 @@ func TestYOLOConvMatchesDirectConvolution(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want, oh, ow := parakeetConv2D(x.data, tc.in, tc.h, tc.w, ParakeetSubsamplingConv{
-			OutChannels: tc.out, InPerGroup: tc.in, KH: tc.k, KW: tc.k,
-			StrideH: tc.stride, StrideW: tc.stride, PadH: tc.k / 2, PadW: tc.k / 2, Weight: cv.w, Bias: cv.b,
-		})
+		want, oh, ow := referenceYOLOConv(x, cv)
 		if got.h != oh || got.w != ow {
 			t.Fatalf("%+v: output %dx%d, want %dx%d", tc, got.w, got.h, ow, oh)
 		}
@@ -145,6 +142,34 @@ func TestYOLOConvMatchesDirectConvolution(t *testing.T) {
 			}
 		}
 	}
+}
+
+func referenceYOLOConv(x yoloTensor, cv yoloConv) ([]float32, int, int) {
+	pad := cv.k / 2
+	oh := (x.h+2*pad-cv.k)/cv.stride + 1
+	ow := (x.w+2*pad-cv.k)/cv.stride + 1
+	out := make([]float32, cv.out*oh*ow)
+	for o := range cv.out {
+		for y := range oh {
+			for xout := range ow {
+				var sum float32
+				for c := range cv.in {
+					for ky := range cv.k {
+						for kx := range cv.k {
+							sy, sx := y*cv.stride+ky-pad, xout*cv.stride+kx-pad
+							if sy < 0 || sy >= x.h || sx < 0 || sx >= x.w {
+								continue
+							}
+							wi := ((o*cv.in+c)*cv.k+ky)*cv.k + kx
+							sum += cv.w[wi] * x.data[c*x.h*x.w+sy*x.w+sx]
+						}
+					}
+				}
+				out[o*oh*ow+y*ow+xout] = sum + cv.b[o]
+			}
+		}
+	}
+	return out, oh, ow
 }
 
 func TestYOLOPortableGEMMMatchesReference(t *testing.T) {

@@ -1,4 +1,4 @@
-package gopherllm
+package yolo
 
 import (
 	"bytes"
@@ -8,6 +8,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // This file reads PyTorch's torch.save checkpoint format (a zip archive
@@ -860,7 +862,7 @@ func (c *torchCheckpoint) tensorF32(t *pickleTensor) ([]float32, error) {
 		case "FloatStorage":
 			out[i] = math.Float32frombits(binary.LittleEndian.Uint32(b))
 		case "HalfStorage":
-			out[i] = F16ToF32(binary.LittleEndian.Uint16(b))
+			out[i] = numeric.F16ToF32(binary.LittleEndian.Uint16(b))
 		case "BFloat16Storage":
 			out[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(b)) << 16)
 		case "DoubleStorage":

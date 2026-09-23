@@ -1,4 +1,4 @@
-package gopherllm
+package yolo
 
 import (
 	"image"

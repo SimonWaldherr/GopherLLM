@@ -351,7 +351,7 @@ using Accelerate, and about 150 ms in pure Go (`CGO_ENABLED=0`).
 untrusted file is remote code execution. GopherLLM never runs pickle code. It
 interprets the opcodes as data and rebuilds only tensors, dicts and lists;
 every class or function the file names stays an inert value. See
-`torch_checkpoint.go`.
+`internal/vision/yolo/torch_checkpoint.go`.
 
 From Go, the root package stays offline. `YOLOCheckpointReference` only builds
 the pinned `hf:` reference for a stock name; downloading is left to the

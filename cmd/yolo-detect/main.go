@@ -1,6 +1,5 @@
 // Command yolo-detect runs GopherLLM's native YOLO object detector (YOLOv8
-// and YOLO11; see yolo.go and yolo_model.go in the module root) over one
-// image.
+// and YOLO11; see internal/vision/yolo) over one image.
 //
 // GopherLLM does not ship YOLO weights. --model accepts a stock name, which
 // is downloaded once from Hugging Face into the standard HF cache and reused

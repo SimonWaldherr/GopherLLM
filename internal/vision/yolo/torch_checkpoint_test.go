@@ -1,4 +1,4 @@
-package gopherllm
+package yolo
 
 import (
 	"encoding/binary"
@@ -94,7 +94,8 @@ func TestTorchTensorHonoursStridesAndHalfPrecision(t *testing.T) {
 	// offset 1 into a 7-element storage.
 	var raw []byte
 	for i := range 7 {
-		raw = binary.LittleEndian.AppendUint16(raw, F32ToF16(float32(i)))
+		half := [...]uint16{0x0000, 0x3c00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600}[i]
+		raw = binary.LittleEndian.AppendUint16(raw, half)
 	}
 	c := &torchCheckpoint{storages: map[string][]byte{"0": raw}}
 	st := &pickleStorage{dtype: "HalfStorage", key: "0", numel: 7}

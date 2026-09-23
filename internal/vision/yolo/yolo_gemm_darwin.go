@@ -1,6 +1,6 @@
 //go:build darwin && cgo
 
-package gopherllm
+package yolo
 
 import "github.com/SimonWaldherr/GopherLLM/internal/voxtralblas"
 

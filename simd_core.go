@@ -24,6 +24,8 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/threads"
 )
 
 // oversubscribeDispatch issues more matvec chunks than workers so faster
@@ -57,6 +59,7 @@ func SetNumThreads(n int) {
 		n = 1
 	}
 	configuredThreads.Store(int64(n))
+	threads.Set(n)
 }
 
 func numThreads() int {

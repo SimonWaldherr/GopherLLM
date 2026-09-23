@@ -1,4 +1,4 @@
-package gopherllm
+package gguf
 
 // GGUF container writing — the inverse of gguf.go's ParseGGUF. A GGUF file's
 // tensor offsets are cumulative and computed from every earlier tensor's

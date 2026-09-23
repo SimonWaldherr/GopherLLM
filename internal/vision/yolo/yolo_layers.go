@@ -1,4 +1,4 @@
-package gopherllm
+package yolo
 
 import (
 	"fmt"
@@ -81,7 +81,7 @@ func (cv *yoloConv) forward(x yoloTensor) (yoloTensor, error) {
 			if cv.act {
 				for i, v := range row {
 					v += bias
-					row[i] = v * fastSigmoidF32(v)
+					row[i] = v * yoloFastSigmoid(v)
 				}
 			} else {
 				for i := range row {
@@ -155,8 +155,7 @@ func yoloIm2col(x yoloTensor, k, stride, pad, oh, ow int) []float32 {
 
 // yoloGEMMPortable is the pure-Go c = a·b used when Accelerate is not
 // available. It walks b in column tiles that stay cache-resident and
-// updates four output rows per pass over each tile row via axpyF32x4, which
-// is NEON- or AVX2-backed on the platforms that have one.
+// updates four output rows together per pass over each tile row.
 func yoloGEMMPortable(m, n, k int, a, b, c []float32) {
 	const tile = 512
 	clear(c[:m*n])
@@ -167,16 +166,23 @@ func yoloGEMMPortable(m, n, k int, a, b, c []float32) {
 			w := min(n, j0+tile) - j0
 			i := 0
 			for ; i+4 <= m; i += 4 {
-				c0, c1, c2, c3 := &c[i*n+j0], &c[(i+1)*n+j0], &c[(i+2)*n+j0], &c[(i+3)*n+j0]
+				c0, c1, c2, c3 := c[i*n+j0:i*n+j0+w], c[(i+1)*n+j0:(i+1)*n+j0+w], c[(i+2)*n+j0:(i+2)*n+j0+w], c[(i+3)*n+j0:(i+3)*n+j0+w]
 				a0, a1, a2, a3 := a[i*k:], a[(i+1)*k:], a[(i+2)*k:], a[(i+3)*k:]
 				for p := range k {
-					axpyF32x4(c0, c1, c2, c3, a0[p], a1[p], a2[p], a3[p], &b[p*n+j0], w)
+					row := b[p*n+j0 : p*n+j0+w]
+					v0, v1, v2, v3 := a0[p], a1[p], a2[p], a3[p]
+					for j, x := range row {
+						c0[j] += v0 * x
+						c1[j] += v1 * x
+						c2[j] += v2 * x
+						c3[j] += v3 * x
+					}
 				}
 			}
 			for ; i < m; i++ {
 				row := c[i*n+j0 : i*n+j0+w]
 				for p := range k {
-					AxpyF32(row, a[i*k+p], b[p*n+j0:p*n+j0+w])
+					yoloAxpy(row, a[i*k+p], b[p*n+j0:p*n+j0+w])
 				}
 			}
 		}
@@ -382,7 +388,7 @@ func (a *yoloAttention) forward(x yoloTensor) (yoloTensor, error) {
 			}
 			var sum float32
 			for j, s := range scores {
-				scores[j] = fastExpF32(s - largest)
+				scores[j] = yoloFastExp(s - largest)
 				sum += scores[j]
 			}
 			inv := 1 / sum
