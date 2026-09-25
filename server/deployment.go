@@ -284,7 +284,7 @@ func browserDisabledPath(path string) bool {
 		return true
 	}
 	switch path {
-	case "/v1/audio/transcriptions", "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/skills", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/api/tags", "/api/ps", "/api/show":
+	case "/classify", "/v1/systemone/csv", "/v1/systemone", "/v1/audio/transcriptions", "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/skills", "/api/generate", "/api/chat", "/api/embeddings", "/api/embed", "/api/tags", "/api/ps", "/api/show":
 		return true
 	default:
 		return false

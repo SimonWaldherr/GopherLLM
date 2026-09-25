@@ -28,7 +28,7 @@ type PrivacyNetworkUse struct {
 // HTTP server. Normal model loading and inference are local and telemetry-free.
 func DefaultPrivacyReport() PrivacyReport {
 	return PrivacyReport{
-		Inference:      "local GGUF inference; prompts and generated text stay in-process",
+		Inference:      "local GGUF and Laya decision inference; prompts, state and results stay in-process",
 		Telemetry:      false,
 		DefaultNetwork: "none",
 		LocalStorage: []string{
@@ -36,7 +36,7 @@ func DefaultPrivacyReport() PrivacyReport {
 			"Hugging Face model cache only when an hf: selector is explicitly used",
 		},
 		OptInFeatures: []PrivacyNetworkUse{
-			{Feature: "Hugging Face import", Destinations: []string{"huggingface.co or HF_ENDPOINT"}, Data: "requested repository, revision, GGUF filenames, and HF_TOKEN when configured"},
+			{Feature: "Hugging Face import", Destinations: []string{"huggingface.co or HF_ENDPOINT"}, Data: "requested repository, revision, selected model and companion filenames, and HF_TOKEN when configured"},
 			{Feature: "Wikipedia and Wikidata research tools", Destinations: []string{"Wikipedia", "Wikidata", "Wikidata Query Service"}, Data: "only tool arguments selected by the model; never the full chat transcript"},
 			{Feature: "OpenStreetMap place search", Destinations: []string{"Nominatim endpoint selected by the operator"}, Data: "only the place-search query selected by the model; do not submit personal or confidential data"},
 			{Feature: "remote model proxy", Destinations: []string{"operator-configured remote endpoint"}, Data: "request content sent to that endpoint"},

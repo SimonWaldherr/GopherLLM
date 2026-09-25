@@ -1,0 +1,13 @@
+{
+  "question": {
+    "type": "choice",
+    "instructions": "Welcher Bereich soll diese Anfrage bearbeiten?",
+    "criteria": {
+      "Abrechnung": "Rechnungen, Zahlungen und Erstattungen",
+      "Technik": "Softwarefehler und technische Probleme",
+      "Vertrieb": "Preise, Angebote und neue Verträge"
+    }
+  },
+  "input_column": "text",
+  "result_column": "category"
+}

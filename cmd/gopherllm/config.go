@@ -23,6 +23,7 @@ const (
 // intentional zero or false, so defaults can evolve without changing an old
 // config file's meaning.
 type fileConfig struct {
+	Laya        *fileLayaConfig        `json:"laya,omitempty"`
 	Version     int                    `json:"version"`
 	Preset      string                 `json:"preset,omitempty"`
 	Model       string                 `json:"model,omitempty"`
@@ -31,6 +32,11 @@ type fileConfig struct {
 	Runtime     *fileRuntimeConfig     `json:"runtime,omitempty"`
 	Server      *fileServerConfig      `json:"server,omitempty"`
 	HuggingFace *fileHuggingFaceConfig `json:"huggingface,omitempty"`
+}
+
+type fileLayaConfig struct {
+	Model     string `json:"model"`
+	Subfolder string `json:"subfolder,omitempty"`
 }
 
 type fileGenerationConfig struct {
@@ -98,6 +104,16 @@ var cliOptionalValueOptions = map[string]bool{
 // second flag. The early config/preset scan uses it so a system prompt such as
 // "--preset" cannot accidentally be interpreted as an option.
 var cliValueOptions = map[string]bool{
+	"--classify-csv":       true,
+	"--instruction":        true,
+	"--decision-type":      true,
+	"--criteria":           true,
+	"--csv-column":         true,
+	"--result-column":      true,
+	"--csv-delimiter":      true,
+	"--laya-model":         true,
+	"--laya-subfolder":     true,
+	"--classify":           true,
 	"--config":             true,
 	"--preset":             true,
 	"--model":              true,
@@ -209,6 +225,13 @@ func loadFileConfig(path string) (fileConfig, error) {
 func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("apply config: nil CLI configuration")
+	}
+	if raw.Laya != nil {
+		if strings.TrimSpace(raw.Laya.Model) == "" {
+			return fmt.Errorf("laya.model must name a checkpoint directory or hf: repository")
+		}
+		cfg.layaModel = raw.Laya.Model
+		cfg.layaSubfolder = raw.Laya.Subfolder
 	}
 	if raw.Preset != "" {
 		if err := applyPreset(cfg, raw.Preset); err != nil {
@@ -462,6 +485,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		OSCommandsAllow string   `json:"os_commands_allow,omitempty"`
 	}
 	type effectiveConfig struct {
+		Laya        *fileLayaConfig           `json:"laya,omitempty"`
 		Version     int                       `json:"version"`
 		Preset      string                    `json:"preset"`
 		Model       string                    `json:"model,omitempty"`
@@ -471,7 +495,12 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		Server      *effectiveServerConfig    `json:"server,omitempty"`
 		HuggingFace *fileHuggingFaceConfig    `json:"huggingface,omitempty"`
 	}
+	var laya *fileLayaConfig
+	if cfg.layaModel != "" {
+		laya = &fileLayaConfig{Model: cfg.layaModel, Subfolder: cfg.layaSubfolder}
+	}
 	result := effectiveConfig{
+		Laya:     laya,
 		Version:  configVersion,
 		Preset:   cfg.preset,
 		ModelDir: cfg.modelDir,

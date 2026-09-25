@@ -60,7 +60,7 @@ func observeRequests(next http.Handler, observe func(RequestObservation)) http.H
 			}
 			endpoint := r.URL.Path
 			switch endpoint {
-			case "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models", "/generate":
+			case "/v1/systemone/csv", "/v1/systemone", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models", "/generate":
 			default:
 				endpoint = "other"
 			}
@@ -80,7 +80,7 @@ func withInferenceDeadline(next http.Handler, timeout time.Duration) http.Handle
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/api/generate", "/api/chat", "/api/embed", "/api/embeddings":
+		case "/v1/systemone/csv", "/v1/systemone", "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/api/generate", "/api/chat", "/api/embed", "/api/embeddings":
 			ctx, cancel := context.WithTimeout(r.Context(), timeout)
 			defer cancel()
 			r = r.WithContext(ctx)

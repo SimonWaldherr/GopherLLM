@@ -679,3 +679,16 @@ curl http://127.0.0.1:8080/privacy
 The report names every opt-in feature that can send data externally, its
 destination, and the limited data it may send. Hugging Face imports, remote
 proxies, and factual research sources remain opt-in.
+
+## Native typed decisions
+
+To serve Laya classification, start `gopherllm --laya-model hf:convaiinnovations/laya
+--laya-subfolder multilingual --serve` (on one line). `POST /v1/systemone` accepts
+state and typed questions; `GET /v1/models` lists the configured classifier.
+See [native Laya classification](../docs/laya.md) for complete CLI, API and Go examples.
+The model executes locally. API requests cannot download or select filesystem paths.
+
+For record-by-record file processing, open `/classify` in the browser or send
+`file` and `options` multipart fields to `POST /v1/systemone/csv`. The returned
+CSV has one extra result column. See the [CSV workflow](../docs/laya.md#csv-as-a-unix-filter)
+for upload limits, options, pipes and examples.

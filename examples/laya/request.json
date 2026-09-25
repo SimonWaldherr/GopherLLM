@@ -1,0 +1,23 @@
+{
+  "state": "Mir wurde der Betrag zweimal abgebucht. Bitte erstatten Sie die doppelte Zahlung.",
+  "questions": {
+    "department": {
+      "type": "choice",
+      "instructions": "Welcher Bereich soll die Anfrage bearbeiten?",
+      "criteria": {
+        "Abrechnung": "Rechnungen, Zahlungen, Erstattungen",
+        "Technik": "Softwarefehler, Ausfälle, technische Probleme",
+        "Vertrieb": "Preise und neue Verträge"
+      }
+    },
+    "refund": {
+      "type": "noul",
+      "instructions": "Bittet der Kunde um eine Erstattung?"
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "Wie dringend ist die Anfrage?",
+      "criteria": ["nicht dringend", "bald bearbeiten", "kritisch"]
+    }
+  }
+}

@@ -252,6 +252,15 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 		}
 		state.withRunner(add)
 		embedder.withRunner(add)
+		if opts.DecisionModel != nil && opts.DeploymentMode != DeploymentBrowser {
+			id := opts.DecisionModelID
+			if id == "" {
+				id = "laya-rl-agent"
+			}
+			if !seen[id] {
+				models = append(models, map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "gopherllm", "capabilities": []string{"classification"}})
+			}
+		}
 		writeJSON(w, map[string]any{"object": "list", "data": models})
 	})
 	mux.HandleFunc("/v1/skills", func(w http.ResponseWriter, _ *http.Request) {

@@ -25,3 +25,6 @@ GopherLLM.test
 /bindings/python/*.egg-info/
 /bindings/python/**/*.egg-info/
 /bindings/python/.pytest_cache/
+
+# Locally generated Laya model and reference fixture.
+/testdata/laya-tiny/

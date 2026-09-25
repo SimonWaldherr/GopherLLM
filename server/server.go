@@ -71,7 +71,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		opts.Addr = DefaultAddr
 	}
 	networkExposed := !isLoopbackListenAddress(opts.Addr)
-	if mode == DeploymentBrowser && initialRunner != nil {
+	if mode == DeploymentBrowser && (initialRunner != nil || opts.DecisionModel != nil) {
 		return errors.New("browser deployment must not be started with a server-side model runner")
 	}
 	logw := opts.LogWriter
@@ -79,6 +79,8 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		logw = os.Stderr
 	}
 	handler := NewHandler(initialRunner, HandlerOptions{
+		DecisionModel:         opts.DecisionModel,
+		DecisionModelID:       opts.DecisionModelID,
 		RequestTimeout:        opts.RequestTimeout,
 		ObserveRequest:        opts.ObserveRequest,
 		Features:              opts.Features,
@@ -121,7 +123,10 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 	if enabled := opts.Features.EnabledNames(); len(enabled) > 0 {
 		fmt.Fprintf(logw, "Optional features: %s\n", strings.Join(enabled, ", "))
 	} else {
-		fmt.Fprintln(logw, "Optional features: none (chat and completions only; see --enable)")
+		fmt.Fprintln(logw, "Optional features: none (see --enable)")
+	}
+	if opts.DecisionModel != nil {
+		fmt.Fprintln(logw, "Native classification: POST /v1/systemone; CSV upload: /classify (API: POST /v1/systemone/csv)")
 	}
 	if warning := NetworkExposureWarning(mode, opts.Addr, opts.AdminToken); warning != "" {
 		fmt.Fprint(logw, warning)
@@ -184,6 +189,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		opts.ChatHistoryPath = ""
 	}
 	if deployment.mode.browserOnly() {
+		// This model is caller-owned. Drop the handler reference without closing
+		// it, including when the caller used an alias such as "wasm".
+		opts.DecisionModel = nil
+		opts.DecisionModelID = ""
 		// Browser deployment is an on-device inference profile, not a thin UI
 		// in front of an accidentally resident server model. The route policy
 		// below blocks server inference too; clearing the catalog prevents the
@@ -317,6 +326,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	// so a disabled one answers 404 rather than presenting a permission check.
 	registerSystemRoutes(mux, state, deployment, remote, history, opts.Features)
 	registerChatWorkspaceRoutes(mux, history)
+	registerDecisionRoutes(mux, opts)
 	registerOpenAIRoutes(mux, state, embedder, chatSem, opts, skills, skillsFor, agenticToolsFor, logw)
 	registerOllamaRoutes(mux, state, embedder, chatSem, opts, skills, agenticToolsFor, logw)
 	// Shared across the one-shot and realtime audio routes below so a loaded

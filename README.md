@@ -48,6 +48,7 @@ covers and how to turn things on.
 
 - [Try it in five minutes](#try-it-in-five-minutes)
 - [Features](#features)
+- [Native Laya classification](docs/laya.md)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
@@ -93,6 +94,9 @@ covers and how to turn things on.
 - `--compress`: requantize any GGUF to Q8_0/Q4_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, writing
   a smaller, independently loadable file (see
   [Model Compression](#model-compression)).
+- Native Laya and compatible ModernBERT/mmBERT decision checkpoints: Hugging
+  Face downloads, `choice`/`score`/`noul` classification, and a Jev-style
+  `/v1/systemone` API, CSV stdin/stdout filters and browser uploads, with no Python runtime ([workflow and examples](docs/laya.md)).
 - Native YOLOv8 and YOLO11 object detection from safetensors or Ultralytics
   `.pt` files, without an ONNX, PyTorch or Python runtime (see
   [Object detection (YOLO)](#object-detection-yolo)).

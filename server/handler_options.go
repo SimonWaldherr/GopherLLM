@@ -12,6 +12,11 @@ import (
 
 // HandlerOptions configures the mountable HTTP API handler.
 type HandlerOptions struct {
+	// DecisionModel enables native POST /v1/systemone classification. The caller
+	// owns the model and must close it after the handler/server stops.
+	DecisionModel *gopherllm.LayaModel
+	// DecisionModelID is the optional public identifier accepted in requests.
+	DecisionModelID string
 	// RequestTimeout bounds each inference request; default two minutes.
 	RequestTimeout time.Duration
 	// ObserveRequest is called once per HTTP request, including admission errors.
@@ -132,6 +137,8 @@ type HandlerOptions struct {
 // convenience wrapper (used by the CLI). ChatHistoryLock remains for source
 // compatibility with older hosts; the handler serializes its own file access.
 type ServeOptions struct {
+	DecisionModel   *gopherllm.LayaModel
+	DecisionModelID string
 	// ObserveRequest forwards transport observations to the embedding host.
 	ObserveRequest func(RequestObservation)
 	RequestTimeout time.Duration

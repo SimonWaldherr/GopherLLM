@@ -1,0 +1,322 @@
+# Native Laya classification
+
+GopherLLM downloads and runs [Laya](https://huggingface.co/convaiinnovations/laya)
+decision checkpoints in-process. Inference is Go code using GopherLLM's matrix
+kernels, with the existing Accelerate batch path on supported macOS builds.
+No Python, PyTorch, ONNX runtime, remote inference service or generated chat
+answer is involved. The question describes what to classify in the supplied
+state, and the criteria define the possible answers at request time.
+
+## Download and classify
+
+Build the usual CLI, then run the supplied German example:
+
+```sh
+go build -o bin/gopherllm ./cmd/gopherllm
+bin/gopherllm --laya-model hf:convaiinnovations/laya \
+  --laya-subfolder multilingual --classify examples/laya/request.json
+```
+
+The first run downloads only the selected checkpoint's five required files
+into the normal Hugging Face snapshot cache. Subsequent runs reuse those files.
+`HF_HOME`, `HF_HUB_CACHE`, `HF_ENDPOINT`, `HF_TOKEN`, revision selection and
+`--hf-offline` work through the existing Hub client. Model loading never runs
+code from a repository. A local directory works without network access:
+
+```sh
+# Download without loading or executing the model; prints the local directory.
+bin/gopherllm --laya-model hf:convaiinnovations/laya \
+  --laya-subfolder multilingual --laya-download-only
+
+# The same request from stdin, using only an already populated cache.
+bin/gopherllm --laya-model hf:convaiinnovations/laya \
+  --laya-subfolder multilingual --hf-offline --classify - \
+  < examples/laya/request.json
+
+# Alternatively use the directory printed by --laya-download-only.
+bin/gopherllm --laya-model /path/to/checkpoint --classify request.json
+```
+
+Use `hf:owner/repository@commit` to pin a revision. Omit `--laya-subfolder` for
+the English root checkpoint, or choose `typed-decisions` for that bundled
+fine-tune. The standalone multilingual and typed-decisions repositories can
+also be used with their root layout. German and other non-English input should
+use the multilingual checkpoint. Native GopherLLM selects the checkpoint
+explicitly; it does not reproduce Laya's Python language router.
+
+`--threads N` sets CPU parallelism. `--timeout 30s` bounds a one-shot command,
+including download and loading. Cancellation is checked between tensor loads,
+transformer stages and attention rows; an active matrix kernel finishes first.
+
+## CSV as a Unix filter
+
+Apply one question to every CSV record and append the answer as its last column:
+
+```sh
+cat examples/laya/tickets.csv | bin/gopherllm \
+  --laya-model hf:convaiinnovations/laya --laya-subfolder multilingual \
+  --classify-csv - --csv-column text \
+  --instruction 'Welcher Bereich soll diese Anfrage bearbeiten?' \
+  --criteria '["Abrechnung", "Technik", "Vertrieb"]' \
+  --result-column category > classified.csv
+```
+
+`--classify-csv input.csv` also accepts a file path or named pipe. `-` means
+stdin; stdout contains **only CSV**, while diagnostics go to stderr. The model
+is loaded once, records are processed in order, and each output record is
+flushed immediately. Memory usage does not grow with the number of records.
+Use a different output filename from the input when redirecting stdout.
+
+The first record is a header by default. `--csv-column text` selects the named
+column as the model's state. Without it, the entire record is supplied as a JSON
+object whose keys and order come from the headers. Headers must be nonempty and
+unique; an already existing result-column name is rejected. The appended header
+defaults to `result`. Original column values and order are retained; CSV quoting
+and line endings are normalized by Go's CSV reader/writer. Quoted commas,
+embedded newlines, CRLF input and a UTF-8 BOM are supported. Blank physical
+lines are skipped according to standard CSV parsing; a quoted multiline field
+is one logical record, not several classification jobs.
+
+Additional options:
+
+| Flag | Behavior |
+| --- | --- |
+| `--instruction 'Question?'` | Required question applied to every record |
+| `--criteria '["a","b"]'` | Categories; also accepts a label → description JSON object |
+| `--decision-type choice` | Category; default when criteria are supplied |
+| `--decision-type noul` | Yes/no probability; default when criteria are absent |
+| `--decision-type score --criteria '["low","medium","high"]'` | Expected zero-based scale value |
+| `--csv-delimiter ';'` | Same separator for input and output; `\t` selects TSV |
+| `--csv-no-header` | Every record is data; `--csv-column 2` selects the second column |
+| `--csv-result-json` | Full answer, including probabilities, in the final CSV cell |
+| `--result-column category` | Name of the appended header |
+
+Without a header or selected input column, state is an array of field values.
+The command stops at the first malformed record, prediction error or output
+failure and exits nonzero. Records already written to stdout remain there;
+error messages identify the failing **data record number**, excluding the header.
+`--timeout` and interruption cancel the job. This is a model instruction,
+not an executable shell command or arbitrary text-generation operation.
+
+### Browser upload and CSV API
+
+Start the classifier with `--serve 127.0.0.1:8080` as described below, then open
+[the CSV upload page](http://127.0.0.1:8080/classify). Select a file, enter the
+question and categories, choose an input column if needed, and download the
+CSV with the appended result. The page also offers cancellation, TSV/semicolon
+separators, headerless input and full-JSON result cells.
+
+The same operation is available as multipart `POST /v1/systemone/csv`:
+
+```sh
+curl --fail-with-body http://127.0.0.1:8080/v1/systemone/csv \
+  -F 'file=@examples/laya/tickets.csv' \
+  -F 'options=<examples/laya/csv-options.json' \
+  -o classified.csv
+```
+
+The `options` field is one JSON object:
+
+```json
+{
+  "question": {
+    "type": "choice",
+    "instructions": "Welcher Bereich soll diese Anfrage bearbeiten?",
+    "criteria": ["Abrechnung", "Technik", "Vertrieb"]
+  },
+  "input_column": "text",
+  "result_column": "category",
+  "delimiter": ",",
+  "no_header": false,
+  "result_json": false
+}
+```
+
+Optional `max_len` and `head_max_len` select the same per-question budgets as
+ordinary decision requests. Exactly one `file` and one `options` field are
+required, in either order. The HTTP upload is bounded to 64 MiB including
+multipart overhead; output is bounded to 128 MiB. Larger jobs can use the CLI
+filter, which imposes no whole-file size limit. Per-record model limits still
+apply. The server uses temporary files and removes them after the request,
+including on errors and cancellation. It never uses the uploaded filename as
+a local path.
+
+Inference is still performed one record at a time. The HTTP result is spooled
+until the job succeeds so a late error returns an error response instead of a
+partial CSV download. A successful response has `Content-Type: text/csv`,
+`Content-Disposition: attachment` and `X-Processed-Rows`. CSV validation errors
+return 422, invalid multipart/options return 400, size limits return 413, and
+the existing inference deadline applies to the entire upload job (default two
+minutes; increase `--request-timeout` for longer jobs). Admission limits and
+browser-only deployment restrictions also apply.
+
+### Go streaming interface
+
+```go
+stats, err := model.ClassifyCSV(ctx, inputReader, outputWriter,
+    gopherllm.DecisionCSVOptions{
+        Question: gopherllm.DecisionQuestion{
+            Type: "noul",
+            Instructions: "Does this message ask for a refund?",
+        },
+        InputColumn: "text",
+        ResultColumn: "refund_probability",
+    })
+```
+
+The caller owns the streams and model. `gopherllm.ClassifyCSV` also accepts a
+`DecisionPredictor` interface for other implementations of the typed decision
+API. Returned stats count successfully written records and input tokens.
+
+## Questions and answers
+
+A request contains `state` (text, JSON object or array) and a `questions` object.
+Each question has `type`, `instructions` and, when needed, `criteria`:
+
+| Type | Criteria | Answer |
+| --- | --- | --- |
+| `choice` | Label → description object, or list of string labels | `choice` label and `probabilities` |
+| `score` | Ordered list of level descriptions | `score`, the expected zero-based level, plus probabilities and legend |
+| `noul` | Optional `false`/`true` descriptions | `noul`, the probability that the statement holds |
+
+`noul` also accepts optional `labels: {"false": "...", "true": "..."}`. Both
+labels must be distinct, nonempty strings. Structured criterion descriptions
+are serialized as JSON. JSON criterion order is retained because changing
+option order can affect the model. Go maps use deterministic sorted key order;
+use `json.RawMessage` for an explicitly ordered criterion object.
+
+Every answer includes `answer_confidence` (maximum option probability),
+`confidence` (normalized entropy for choice/score, maximum probability for
+noul), and `action.act_probability`. Temperatures come from the checkpoint,
+including option-count buckets, with the reference runtime's [0.5, 5] clamp.
+These values retain Laya's semantics; the action head is not an independently
+validated safety signal.
+
+The English root defaults to 512 tokens per question; the supplied multilingual
+checkpoint defaults to 1024. Optional request fields `max_len` and
+`head_max_len` override the state/prompt budgets, up to 8192 total tokens and
+the encoder's configured context limit. Input state is truncated at the token
+budget. Oversized question prompts are rejected rather than silently dropping
+answer markers. Questions execute sequentially on CPU. Usage reports the sum
+of input tokens across questions and zero output tokens.
+
+Limits: 64 questions, 100 options per question, 256 KiB serialized state,
+256 KiB criteria per question, and 32 KiB instructions. The HTTP body limit is
+2 MiB. An empty question object returns empty answers without inference.
+
+## Web API
+
+```sh
+bin/gopherllm --laya-model hf:convaiinnovations/laya \
+  --laya-subfolder multilingual --serve 127.0.0.1:8080
+
+curl http://127.0.0.1:8080/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @examples/laya/request.json
+```
+
+`POST /v1/systemone` uses the Jev-style typed decision request/response shape.
+The optional `model` field must match the preloaded model ID returned by
+`GET /v1/models`; omit it when using the single configured classifier. It never
+names a filesystem path to load or initiates a download. The server applies
+its request deadline, admission limit, observations and cross-site protection.
+`--request-timeout` and `--max-connections` configure the existing controls.
+Malformed JSON is 400, invalid question/budget input is 422, oversized bodies
+are 413 and unknown model IDs are 404. Browser-only deployment cannot execute
+this endpoint.
+
+The CLI's Laya mode is dedicated to classification. To host chat and decision
+inference together, pass an existing chat runner plus `DecisionModel` and
+`DecisionModelID` in `server.HandlerOptions`/`ServeOptions`. The host owns the
+Laya model and closes it after shutting down the handler/server.
+
+A persistent configuration may contain:
+
+```json
+{
+  "version": 1,
+  "laya": {"model": "hf:convaiinnovations/laya", "subfolder": "multilingual"}
+}
+```
+
+Use it with `--config config.json --serve` or `--classify request.json`.
+
+## Go library
+
+```go
+ctx := context.Background()
+dir, err := huggingface.DownloadLaya(ctx,
+    "convaiinnovations/laya", "multilingual", os.Stderr,
+    huggingface.DefaultOptions())
+if err != nil { return err }
+model, err := gopherllm.OpenLaya(ctx, dir)
+if err != nil { return err }
+defer model.Close()
+
+result, err := model.Predict(ctx, gopherllm.DecisionRequest{
+    State: "Mir wurde der Betrag zweimal abgebucht.",
+    Questions: map[string]gopherllm.DecisionQuestion{
+        "department": {
+            Type: "choice",
+            Instructions: "Welcher Bereich soll die Anfrage bearbeiten?",
+            Criteria: map[string]string{
+                "Abrechnung": "Rechnungen, Zahlungen und Erstattungen",
+                "Technik": "Softwarefehler und technische Probleme",
+            },
+        },
+    },
+})
+if err != nil { return err }
+fmt.Println(*result.Answers["department"].Choice)
+```
+
+Imports are the root `github.com/SimonWaldherr/GopherLLM` package (aliased
+`gopherllm`) and its `huggingface` package, plus the standard library packages
+used above. Network dependencies remain outside the root inference package.
+`Predict` serializes concurrent calls, supports contexts and returns
+`ErrInvalidDecision` for caller input errors. `Close` is idempotent and waits
+for active inference.
+
+## Supported checkpoints and validation
+
+The loader supports ModernBERT/mmBERT encoders with alternating global/local
+bidirectional RoPE, GeGLU feed-forward layers, Laya's pre-norm ReLU transformer
+head, type embeddings, option-marker scorer and act/escalate head. It accepts
+F32, F16 and BF16 Safetensors weights. Embeddings remain memory-mapped;
+projection weights are expanded to F32 for CPU kernels. Allow roughly twice
+the half-precision parameter size in RAM, plus activations. This initial path
+does not use Metal, GGUF quantization or out-of-core projections.
+
+Laya-family fine-tunes in this same layout work through `OpenLaya` and
+`DownloadLaya`, independent of the repository owner. Other Jev-like models
+with different architectures or tokenizer pipelines are rejected with an
+explicit error; sharing an HTTP protocol does not imply compatible weights.
+Expected files:
+
+```text
+rl_agent_config.json
+encoder/config.json
+tokenizer/tokenizer.json
+tokenizer/tokenizer_config.json
+model.safetensors
+```
+
+Automated tests compare a small synthetic checkpoint against outputs produced
+by upstream Laya with PyTorch, including biased encoder layers, alternating
+attention windows, both decision head layers, all three question types,
+single-option choice, temperatures, token counts and action probabilities.
+The fixture has random weights and contains no pretrained model data. Regenerate
+it with `scripts/generate_laya_fixture.py` in a separate Python test environment;
+Python is never a runtime dependency. Server and CLI tests cover input errors,
+lifecycle, deployment restrictions and deadlines.
+
+During implementation the English and multilingual public checkpoints were
+also run directly, with tokenizer and decision-output comparisons against the
+upstream CPU reference. The full multilingual download → native execution
+workflow was exercised on a German refund request, including offline cache
+reuse. These are correctness checks, not a claim of task accuracy or calibrated
+probabilities on a new application domain.
+
+Reference implementations:
+[Laya](https://github.com/NandhaKishorM/laya) and
+[Transformers ModernBERT](https://github.com/huggingface/transformers/tree/main/src/transformers/models/modernbert).

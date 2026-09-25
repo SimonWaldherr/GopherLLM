@@ -30,6 +30,19 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "Hugging Face: hf:owner/repo:Q4_K_M[@revision] downloads and reuses GGUFs from the HF cache.")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Options:")
+	fmt.Fprintln(os.Stderr, "  --laya-model <dir|hf:repo> Native Laya classifier (downloads an HF checkpoint on first use)")
+	fmt.Fprintln(os.Stderr, "  --laya-subfolder <name>    Bundled checkpoint, e.g. multilingual or typed-decisions")
+	fmt.Fprintln(os.Stderr, "  --classify <request.json|-> Classify a JSON request from a file or stdin")
+	fmt.Fprintln(os.Stderr, "  --classify-csv <file|->   Stream CSV records to stdout, appending one result column")
+	fmt.Fprintln(os.Stderr, "  --instruction <text>     Question to apply to each CSV record")
+	fmt.Fprintln(os.Stderr, "  --criteria <JSON>        Choice labels/descriptions or score levels")
+	fmt.Fprintln(os.Stderr, "  --decision-type <type>   choice | score | noul (default: choice with criteria, else noul)")
+	fmt.Fprintln(os.Stderr, "  --csv-column <name>      Input column (default: whole record; 1-based index without header)")
+	fmt.Fprintln(os.Stderr, "  --result-column <name>   Appended header (default: result)")
+	fmt.Fprintln(os.Stderr, "  --csv-delimiter <char>   Separator for input/output (default: comma; \\t for TSV)")
+	fmt.Fprintln(os.Stderr, "  --csv-no-header          Process every record as data")
+	fmt.Fprintln(os.Stderr, "  --csv-result-json        Append full answer JSON including probabilities")
+	fmt.Fprintln(os.Stderr, "  --laya-download-only      Download the classifier and print its cache directory")
 	fmt.Fprintln(os.Stderr, "  --model <name>           Select a GGUF from --model-dir by repo, file, or metadata name")
 	fmt.Fprintln(os.Stderr, "  --model-dir <path>       Directory to recursively scan for GGUF files")
 	fmt.Fprintln(os.Stderr, "                           Passing a directory as model selector opens an interactive model picker")
@@ -113,31 +126,38 @@ func printUsage(name string) {
 }
 
 type cliConfig struct {
-	requestTimeout          time.Duration
-	minimal                 bool
-	modelSelector           *string
-	modelSelectorFromConfig bool
-	modelDir                string
-	preset                  string
-	prompt                  string
-	options                 gopherllm.GenerationOptions
-	threads                 int
-	threadsSet              bool
-	printConfig             bool
-	listModels              bool
-	hfList                  string
-	hfOffline               bool
-	privacyReport           bool
-	listTensors             bool
-	repl                    bool
-	serveAddr               string
-	features                server.Features
-	featuresSet             bool
-	deploymentMode          server.DeploymentMode
-	adminToken              string
-	adminTokenFile          string
-	chatUI                  bool
-	chatHistoryPath         string
+	classifyCSV                                                                    string
+	csvInstruction, csvType, csvCriteria, csvColumn, csvResultColumn, csvDelimiter string
+	csvNoHeader, csvResultJSON                                                     bool
+	layaModel                                                                      string
+	layaSubfolder                                                                  string
+	classifyPath                                                                   string
+	layaDownloadOnly                                                               bool
+	requestTimeout                                                                 time.Duration
+	minimal                                                                        bool
+	modelSelector                                                                  *string
+	modelSelectorFromConfig                                                        bool
+	modelDir                                                                       string
+	preset                                                                         string
+	prompt                                                                         string
+	options                                                                        gopherllm.GenerationOptions
+	threads                                                                        int
+	threadsSet                                                                     bool
+	printConfig                                                                    bool
+	listModels                                                                     bool
+	hfList                                                                         string
+	hfOffline                                                                      bool
+	privacyReport                                                                  bool
+	listTensors                                                                    bool
+	repl                                                                           bool
+	serveAddr                                                                      string
+	features                                                                       server.Features
+	featuresSet                                                                    bool
+	deploymentMode                                                                 server.DeploymentMode
+	adminToken                                                                     string
+	adminTokenFile                                                                 string
+	chatUI                                                                         bool
+	chatHistoryPath                                                                string
 	// wasmDir points at a directory containing gopherllm.wasm + wasm_exec.js
 	// (see `make wasm-build`), enabling the chat UI's local-browser-inference
 	// mode. Empty disables it; resolveWasmDir applies the "bin" auto-detect
@@ -261,6 +281,9 @@ func run() error {
 			return err
 		}
 		cfg.adminToken = adminToken
+	}
+	if cfg.layaModel != "" || cfg.classifyPath != "" || cfg.layaSubfolder != "" || cfg.layaDownloadOnly || cfg.hasCSVFlags() {
+		return runLayaCommand(commandCtx, cfg)
 	}
 	if cfg.deploymentMode == server.DeploymentBrowser {
 		if cfg.modelSelector != nil || cfg.mmprojPathSet || cfg.imagePath != "" || cfg.repl || cfg.prompt != "" || cfg.embed || cfg.bench || cfg.kernelBench || cfg.autoTune || cfg.compress {
@@ -745,6 +768,52 @@ func parseCLI(args []string) (cliConfig, error) {
 			return args[i], nil
 		}
 		switch arg {
+		case "--classify-csv", "--instruction", "--decision-type", "--criteria", "--csv-column", "--result-column", "--csv-delimiter":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			if v == "" {
+				return cfg, fmt.Errorf("%s requires a nonempty value", arg)
+			}
+			switch arg {
+			case "--classify-csv":
+				cfg.classifyCSV = v
+			case "--instruction":
+				cfg.csvInstruction = v
+			case "--decision-type":
+				cfg.csvType = v
+			case "--criteria":
+				cfg.csvCriteria = v
+			case "--csv-column":
+				cfg.csvColumn = v
+			case "--result-column":
+				cfg.csvResultColumn = v
+			case "--csv-delimiter":
+				cfg.csvDelimiter = v
+			}
+		case "--csv-no-header":
+			cfg.csvNoHeader = true
+		case "--csv-result-json":
+			cfg.csvResultJSON = true
+		case "--laya-model", "--laya-subfolder", "--classify":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			if v == "" {
+				return cfg, fmt.Errorf("%s requires a nonempty value", arg)
+			}
+			switch arg {
+			case "--laya-model":
+				cfg.layaModel = v
+			case "--laya-subfolder":
+				cfg.layaSubfolder = v
+			case "--classify":
+				cfg.classifyPath = v
+			}
+		case "--laya-download-only":
+			cfg.layaDownloadOnly = true
 		case "--config":
 			if _, err := next(arg); err != nil {
 				return cfg, err
