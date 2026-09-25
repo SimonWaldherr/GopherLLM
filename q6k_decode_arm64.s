@@ -89,21 +89,14 @@ rowhalf:
 	ROWQ6HILAST(V3, V5)
 	ROWQ6EMIT(13, 28, V28)
 
-	VADDV V14.S4, V14
-	VADDV V15.S4, V15
-	VADDV V18.S4, V18
-	VADDV V19.S4, V19
-	VADDV V24.S4, V24
-	VADDV V25.S4, V25
-	VADDV V27.S4, V27
-	VADDV V28.S4, V28
-	VMOV V15.S[0], V14.S[1]
-	VMOV V18.S[0], V14.S[2]
-	VMOV V19.S[0], V14.S[3]
-	VMOV V24.S[0], V15.S[0]
-	VMOV V25.S[0], V15.S[1]
-	VMOV V27.S[0], V15.S[2]
-	VMOV V28.S[0], V15.S[3]
+	// Pairwise integer reductions pack four sub-block dots directly. Integer
+	// addition is exact here; the offset FMA and float row reduction stay ordered.
+	VADDP V15.S4, V14.S4, V14.S4
+	VADDP V19.S4, V18.S4, V18.S4
+	VADDP V18.S4, V14.S4, V14.S4
+	VADDP V25.S4, V24.S4, V24.S4
+	VADDP V28.S4, V27.S4, V27.S4
+	VADDP V27.S4, V24.S4, V15.S4
 	// Eight signed sub-scales, widened to int32 and multiplied by the dots.
 	VLD1.P 8(R3), [V24.B8]
 	WORD $0x0f08a718 // sshll  v24.8h, v24.8b, #0

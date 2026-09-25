@@ -1,4 +1,6 @@
-// Quantized 32x32 prefill tiles, with float32 SIMD-group matrix accumulation.
+// Quantized 32x32 output tiles, with float32 SIMD-group matrix accumulation.
+// The two 16-wide input tiles share 4 KiB of threadgroup memory. After the
+// reduction, the same storage holds the 32x32 output tile.
 static const char* gllm_matrix_source =
 "#include <metal_stdlib>\n"
 "#include <metal_simdgroup_matrix>\n"
@@ -34,24 +36,25 @@ static const char* gllm_matrix_source =
 " const device float* x [[buffer(1)]], device float* out [[buffer(2)]],\n"
 " constant Params& p [[buffer(3)]], uint2 group [[threadgroup_position_in_grid]],\n"
 " uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {\n"
-" threadgroup float tileA[1024];\n"
-" threadgroup float tileB[1024];\n"
+" threadgroup float tiles[1024];\n"
+" threadgroup float* tileA=tiles;\n"
+" threadgroup float* tileB=tiles+512;\n"
 " uint row0=group.x*32,token0=group.y*32;\n"
 " uint mr=(sg/2)*16,mc=(sg%2)*16;\n"
 " simdgroup_float8x8 c00(0.0f),c01(0.0f),c10(0.0f),c11(0.0f);\n"
-" for(uint k0=0;k0<p.cols;k0+=32) {\n"
-"  for(uint i=tid;i<1024;i+=128) {\n"
-"   uint r=i/32,k=i%32;\n"
+" for(uint k0=0;k0<p.cols;k0+=16) {\n"
+"  for(uint i=tid;i<512;i+=128) {\n"
+"   uint r=i/16,k=i%16;\n"
 "   tileA[i]=row0+r<p.rows?weight_at(weights+ulong(row0+r)*p.row_bytes,k0+k):0.0f;\n"
 "   // Each lane loads adjacent columns from a token, then transposes in shared memory.\n"
-"   uint t=i/32;\n"
+"   uint t=i/16;\n"
 "   tileB[k*32+t]=token0+t<p.batch?x[ulong(token0+t)*p.cols+k0+k]:0.0f;\n"
 "  }\n"
 "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-"  for(uint k=0;k<32;k+=8) {\n"
+"  for(uint k=0;k<16;k+=8) {\n"
 "   simdgroup_float8x8 a0,a1,b0,b1;\n"
-"   simdgroup_load(a0,tileA+mr*32+k,32);\n"
-"   simdgroup_load(a1,tileA+(mr+8)*32+k,32);\n"
+"   simdgroup_load(a0,tileA+mr*16+k,16);\n"
+"   simdgroup_load(a1,tileA+(mr+8)*16+k,16);\n"
 "   simdgroup_load(b0,tileB+k*32+mc,32);\n"
 "   simdgroup_load(b1,tileB+k*32+mc+8,32);\n"
 "   simdgroup_multiply_accumulate(c00,a0,b0,c00);\n"
@@ -61,6 +64,8 @@ static const char* gllm_matrix_source =
 "  }\n"
 "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
 " }\n"
+// The final loop barrier ends every input-tile read before the output reuses
+// both halves of tiles. The store barrier below makes that output visible.
 " simdgroup_store(c00,tileA+mr*32+mc,32);\n"
 " simdgroup_store(c01,tileA+mr*32+mc+8,32);\n"
 " simdgroup_store(c10,tileA+(mr+8)*32+mc,32);\n"

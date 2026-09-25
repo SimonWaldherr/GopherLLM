@@ -41,7 +41,10 @@ func (b *layaBuffer) resize(n, d int, zero bool) [][]float32 {
 	return b.rows
 }
 
-type layaWorkspace struct{ norm, qkv, attention, projection, hidden layaBuffer }
+type layaWorkspace struct {
+	norm, qkv, attention, projection, hidden layaBuffer
+	scores                                   []float32
+}
 
 func (n layaNorm) into(x [][]float32, b *layaBuffer) [][]float32 {
 	if len(n.weight) == 0 {
@@ -53,9 +56,11 @@ func (n layaNorm) into(x [][]float32, b *layaBuffer) [][]float32 {
 	}
 	return out
 }
-func (l layaLinear) into(x [][]float32, b *layaBuffer) [][]float32 {
+func (l layaLinear) into(x [][]float32, b *layaBuffer, stride int) [][]float32 {
 	out := b.resize(len(x), l.weight.Rows, false)
-	blasMatvecBatch(l.weight, x, out)
+	if !layaProjectAccelerated(l.weight, x, b, stride) {
+		blasMatvecBatch(l.weight, x, out)
+	}
 	if l.bias != nil {
 		for _, r := range out {
 			for j, v := range l.bias {
@@ -114,7 +119,7 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspa
 	}
 	n, d := len(x), len(x[0])
 	hd := d / l.heads
-	qkv := l.qkv.into(l.norm1.into(x, &work.norm), &work.qkv)
+	qkv := l.qkv.into(l.norm1.into(x, &work.norm), &work.qkv, d)
 	if l.theta > 0 {
 		// Frequencies depend on the dimension; rotations on position, not head.
 		for j := 0; j < hd/2; j++ {
@@ -134,37 +139,43 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspa
 	}
 	attended := work.attention.resize(n, d, true)
 	scale := float32(1 / math.Sqrt(float64(hd)))
-	// Only one score row per worker: memory is O(sequence*hidden), not O(n²*heads).
-	parallelChunks(n*l.heads, func(start, end int) {
-		scores := make([]float32, n)
-		for job := start; job < end; job++ {
-			if ctx.Err() != nil {
-				return
-			}
-			p, h := job/l.heads, job%l.heads
-			lo, hi := 0, n
-			if l.window >= 0 {
-				lo = max(0, p-l.window)
-				hi = min(n, p+l.window+1)
-			}
-			q := qkv[p][h*hd : (h+1)*hd]
-			for j := lo; j < hi; j++ {
-				scores[j-lo] = DotF32(q, qkv[j][d+h*hd:d+(h+1)*hd]) * scale
-			}
-			row := scores[:hi-lo]
-			layaSoftmax(row)
-			dest := attended[p][h*hd : (h+1)*hd]
-			for j := lo; j < hi; j++ {
-				v := qkv[j][2*d+h*hd : 2*d+(h+1)*hd]
-				AxpyF32(dest, row[j-lo], v)
-			}
+	if accelerated, err := layaAttentionAccelerated(ctx, n, l.heads, hd, l.window, scale, work); accelerated {
+		if err != nil {
+			return err
 		}
-	})
+	} else {
+		// Only one score row per worker: memory is O(sequence*hidden), not O(n²*heads).
+		parallelChunks(n*l.heads, func(start, end int) {
+			scores := make([]float32, n)
+			for job := start; job < end; job++ {
+				if ctx.Err() != nil {
+					return
+				}
+				p, h := job/l.heads, job%l.heads
+				lo, hi := 0, n
+				if l.window >= 0 {
+					lo = max(0, p-l.window)
+					hi = min(n, p+l.window+1)
+				}
+				q := qkv[p][h*hd : (h+1)*hd]
+				for j := lo; j < hi; j++ {
+					scores[j-lo] = DotF32(q, qkv[j][d+h*hd:d+(h+1)*hd]) * scale
+				}
+				row := scores[:hi-lo]
+				layaSoftmax(row)
+				dest := attended[p][h*hd : (h+1)*hd]
+				for j := lo; j < hi; j++ {
+					v := qkv[j][2*d+h*hd : 2*d+(h+1)*hd]
+					AxpyF32(dest, row[j-lo], v)
+				}
+			}
+		})
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	layaResidual(x, l.output.into(attended, &work.projection))
-	hidden := l.up.into(l.norm2.into(x, &work.norm), &work.hidden)
+	layaResidual(x, l.output.into(attended, &work.projection, d))
+	hidden := l.up.into(l.norm2.into(x, &work.norm), &work.hidden, d)
 	activate := func(start, end int) {
 		for i := start; i < end; i++ {
 			row := hidden[i]
@@ -187,7 +198,7 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspa
 	} else {
 		activate(0, n)
 	}
-	layaResidual(x, l.down.into(hidden, &work.projection))
+	layaResidual(x, l.down.into(hidden, &work.projection, l.up.weight.Rows))
 	return ctx.Err()
 }
 func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, kind int) ([]float32, float32, error) {

@@ -2,10 +2,11 @@ package laya_test
 
 import (
 	"context"
-	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"os"
 	"strings"
 	"testing"
+
+	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
 // GOPHERLLM_LAYA_BENCH_MODEL selects real weights; loading is outside timing.

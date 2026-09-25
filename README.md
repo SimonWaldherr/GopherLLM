@@ -1162,6 +1162,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - Prefill batches of at least 16 tokens use 32×32 tiled Q4_K/Q6_K/Q8_0
   matrix kernels with Metal SIMD-group matrix multiply-accumulate and float32
   operands. Weights are decoded into shared tiles without expanding the model.
+  Sixteen-wide reduction tiles reuse their storage for the output tile, cutting
+  threadgroup memory from 8 to 4 KiB. See [Metal prefill performance](docs/metal-performance.md)
+  for measured gains and the reproducible comparison.
   Smaller batches and unavailable pipelines retain the previous kernels.
   See [matrix-prefill measurements](benchmarks/metal-matrix/README.md), which document the earlier prefill-focused optimization round.
   Contracting Q4_K down projections now also participate in the complete
@@ -1245,6 +1248,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   These paths preserve the existing ARM64 arithmetic and have startup checks
   and fallbacks. See the [Ministral/Qwen measurements with cooling intervals](benchmarks/cooled-inference/README.md)
   for results, baseline definitions and limitations.
+  Q6_K decode and four-token prefill use pairwise integer reductions to pack
+  SDOT results without separate lane moves. See [Mistral CPU performance](docs/mistral-performance.md)
+  for the kernel measurements and a reproducible CLI comparison.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
   spread across the worker pool at longer contexts, and single-token matvec work
   is split into eight ranges per worker so performance cores absorb

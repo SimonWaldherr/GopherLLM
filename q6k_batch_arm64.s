@@ -22,8 +22,8 @@
 	VORR V17.B16, V16.B16, V16.B16
 
 // The same 16 quants in V16 feed four independent token dots. Pack their
-// reductions into four lanes, then apply the shared signed scale. Neither
-// the int32 dots nor their signed scale products can overflow int32.
+// pairwise integer reductions into four lanes, then apply the shared signed
+// scale. Neither the int32 dots nor their signed scale products overflow int32.
 // V26 holds four offsets; each lane follows the original 16-step FMA order.
 #define BATCHQ6DOTS() \
 	VLD1.P 16(R1), [V6.B16] \
@@ -38,13 +38,9 @@
 	SDOT(23, 16, 7) \
 	SDOT(24, 16, 8) \
 	SDOT(25, 16, 9) \
-	VADDV V22.S4, V22 \
-	VADDV V23.S4, V23 \
-	VADDV V24.S4, V24 \
-	VADDV V25.S4, V25 \
-	VZIP1 V23.S4, V22.S4, V22.S4 \
-	VZIP1 V25.S4, V24.S4, V24.S4 \
-	VZIP1 V24.D2, V22.D2, V22.D2 \
+	VADDP V23.S4, V22.S4, V22.S4 \
+	VADDP V25.S4, V24.S4, V24.S4 \
+	VADDP V24.S4, V22.S4, V22.S4 \
 	MOVB.P 1(R16), R17 \
 	FMOVS R17, F27 \
 	VDUP V27.S[0], V27.S4 \

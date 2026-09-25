@@ -79,6 +79,32 @@ static const char* gllm_decode_source =
 " }\n"
 " sum=simd_sum(sum);if(lane==0)y[row]=sum;\n"
 "}\n"
+"inline void dec_q4_accumulate(const device uchar* v,float d,float dm,uint step,uint sub,float4 a,float4 z,thread float& sum) {\n"
+" const device uchar* sc=v+4;uint j=step*2,s0,m0,s1,m1;\n"
+" if(j<4){s0=sc[j]&63;m0=sc[j+4]&63;s1=sc[j+1]&63;m1=sc[j+5]&63;}\n"
+" else{s0=(sc[j+4]&15)|((sc[j-4]>>6)<<4);m0=(sc[j+4]>>4)|((sc[j]>>6)<<4);s1=(sc[j+5]&15)|((sc[j-3]>>6)<<4);m1=(sc[j+5]>>4)|((sc[j+1]>>6)<<4);}\n"
+" uchar4 packed=*((const device uchar4*)(v+16+step*32+sub*4));\n"
+" sum+=dot(d*float(s0)*float4(packed&uchar4(15))-dm*float(m0),a);\n"
+" sum+=dot(d*float(s1)*float4(packed>>uchar4(4))-dm*float(m1),z);\n"
+"}\n"
+"kernel void dec_q4_gate_up(const device uchar* gate [[buffer(0)]],const device uchar* up [[buffer(1)]],const device float* x [[buffer(2)]],device float* hidden [[buffer(3)]],constant MV& p [[buffer(4)]],uint group [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" uint row=group*4+sg;if(row>=p.rows)return;\n"
+" float g=0,u=0;uint sub=lane%8;\n"
+" for(uint b=lane/8;b<p.cols/256;b+=4) {\n"
+"  const device uchar* gv=gate+ulong(row)*p.row_bytes+b*144;\n"
+"  const device uchar* uv=up+ulong(row)*p.row_bytes+b*144;\n"
+"  float gd=float(*((const device half*)gv)),gm=float(*((const device half*)(gv+2)));\n"
+"  float ud=float(*((const device half*)uv)),um=float(*((const device half*)(uv+2)));\n"
+"  for(uint step=0;step<4;step++) {\n"
+"   float4 a=*((const device float4*)(x+b*256+step*64+sub*4));\n"
+"   float4 z=*((const device float4*)(x+b*256+step*64+sub*4+32));\n"
+"   dec_q4_accumulate(gv,gd,gm,step,sub,a,z,g);\n"
+"   dec_q4_accumulate(uv,ud,um,step,sub,a,z,u);\n"
+"  }\n"
+" }\n"
+" g=simd_sum(g);u=simd_sum(u);\n"
+" if(lane==0)hidden[row]=(g/(1.0f+precise::exp(-g)))*u;\n"
+"}\n"
 "kernel void dec_q6(const device uchar* data [[buffer(0)]],const device float* x [[buffer(1)]],device float* y [[buffer(2)]],constant MV& p [[buffer(3)]],uint group [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
 " uint row=group*4+sg;if(row>=p.rows)return;\n"
 " float sum=0;uint sub=lane%8;\n"
@@ -195,7 +221,7 @@ typedef struct {
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
-static id<MTLComputePipelineState> gllm_dec_pipes[12]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
+static id<MTLComputePipelineState> gllm_dec_pipes[13]={nil};
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
  @synchronized(gllm_queue) {
@@ -205,18 +231,18 @@ static bool gllm_decode_init(void) {
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_decode_source] options:nil error:&error];
   if(lib==nil){gllm_set_error(@"decode shader compilation failed",error);return false;}
-  NSString* names[12]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge"};
-  id<MTLComputePipelineState> pipes[12]={nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil,nil};
+  NSString* names[13]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up"};
+  id<MTLComputePipelineState> pipes[13]={nil};
   bool ok=true;
-  for(int i=0;i<12;i++) {
+  for(int i=0;i<13;i++) {
    id<MTLFunction> fn=[lib newFunctionWithName:names[i]];
    pipes[i]=fn!=nil?[gllm_device newComputePipelineStateWithFunction:fn error:&error]:nil;
    [fn release];
    if(pipes[i]==nil || [pipes[i] threadExecutionWidth]!=32 || [pipes[i] maxTotalThreadsPerThreadgroup]<256)ok=false;
   }
   [lib release];
-  if(!ok){for(int i=0;i<12;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
-  for(int i=0;i<12;i++)gllm_dec_pipes[i]=pipes[i];
+  if(!ok){for(int i=0;i<13;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
+  for(int i=0;i<13;i++)gllm_dec_pipes[i]=pipes[i];
   return true;
  }
  return false;
@@ -354,6 +380,10 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
  memcpy([d->x contents],input,d->dim*sizeof(float));memcpy([d->sn contents],sn,pairs*sizeof(float));memcpy([d->cs contents],cs,pairs*sizeof(float));
  const char* setting=getenv("GOPHERLLM_METAL_DENSE_CONCURRENT");
  bool concurrent=setting==NULL || strcmp(setting,"0")!=0;
+ setting=getenv("GOPHERLLM_METAL_DENSE_FUSED_GATE");
+ bool fused_gate=setting==NULL || strcmp(setting,"0")!=0;
+ setting=getenv("GOPHERLLM_METAL_DENSE_VECTOR");
+ fused_gate=fused_gate && (setting==NULL || strcmp(setting,"0")!=0);
  id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();
  id<MTLComputeCommandEncoder> e=[cb computeCommandEncoderWithDispatchType:concurrent?MTLDispatchTypeConcurrent:MTLDispatchTypeSerial];
  for(int layer=0;layer<d->layers;layer++) {
@@ -395,9 +425,18 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
   gllm_decode_barrier(e,concurrent);
   gllm_decode_norm(e,d->x,l->ffnNorm,d->xn,d->dim,1,d->eps);
   gllm_decode_barrier(e,concurrent);
-  gllm_decode_matvec(e,l,4,d->xn,d->gate);gllm_decode_matvec(e,l,5,d->xn,d->up);
-  gllm_decode_barrier(e,concurrent);
-  gllm_metal_encode_silu(e,d->gate,d->up,d->hid,d->hidden);
+  if(fused_gate && l->quant[4]==4 && l->quant[5]==4) {
+   GLLMMetalWeight* gate=l->w[4];GLLMMetalWeight* up=l->w[5];
+   [e setComputePipelineState:gllm_dec_pipes[12]];
+   [e setBuffer:gate->weights offset:gate->weight_offset atIndex:0];[e setBuffer:up->weights offset:up->weight_offset atIndex:1];
+   [e setBuffer:d->xn offset:0 atIndex:2];[e setBuffer:d->hid offset:0 atIndex:3];
+   uint32_t p[3]={(uint32_t)gate->rows,(uint32_t)gate->cols,(uint32_t)gate->row_bytes};[e setBytes:p length:sizeof(p) atIndex:4];
+   [e dispatchThreadgroups:MTLSizeMake((gate->rows+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+  } else {
+   gllm_decode_matvec(e,l,4,d->xn,d->gate);gllm_decode_matvec(e,l,5,d->xn,d->up);
+   gllm_decode_barrier(e,concurrent);
+   gllm_metal_encode_silu(e,d->gate,d->up,d->hid,d->hidden);
+  }
   gllm_decode_barrier(e,concurrent);
   gllm_decode_matvec(e,l,6,d->hid,d->proj);
   gllm_decode_barrier(e,concurrent);

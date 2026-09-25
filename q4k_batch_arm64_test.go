@@ -71,3 +71,28 @@ func TestQ4KBatch4DeclinesUnsupportedInputs(t *testing.T) {
 		t.Fatal("Q6_K accepted")
 	}
 }
+
+// Track the Q4_K projections alongside Q6_K when tuning mixed-quant Mistral
+// models; improvements to one format must not hide regressions in the other.
+func BenchmarkQ4KBatch4Row(b *testing.B) {
+	if !q4kBatchAsmOK {
+		b.Skip("SDOT unavailable")
+	}
+	for _, cols := range []int{3072, 9216} {
+		b.Run(fmt.Sprint(cols), func(b *testing.B) {
+			blocks := cols / 256
+			row := randomQ4KRow(rand.New(rand.NewSource(44)), cols)
+			q8, scales, sums := make([]int8, 4*cols), make([]float32, 4*blocks), make([]float32, 32*blocks)
+			for i := range q8 {
+				q8[i] = int8(i * 17)
+			}
+			for i := range scales {
+				scales[i] = .017
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				q4kRowBatch4(row, q8, scales, sums, cols, blocks)
+			}
+		})
+	}
+}
