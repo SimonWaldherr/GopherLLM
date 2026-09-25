@@ -13,6 +13,58 @@ func layaRows(n, d int) [][]float32 {
 	}
 	return rows
 }
+
+// Layer workspaces are reused within one forward pass, then released. They are
+// never shared across requests or retained after a long-context request.
+type layaBuffer struct {
+	data []float32
+	rows [][]float32
+}
+
+func (b *layaBuffer) resize(n, d int, zero bool) [][]float32 {
+	if cap(b.data) < n*d {
+		b.data = make([]float32, n*d)
+	} else {
+		b.data = b.data[:n*d]
+		if zero {
+			clear(b.data)
+		}
+	}
+	if cap(b.rows) < n {
+		b.rows = make([][]float32, n)
+	} else {
+		b.rows = b.rows[:n]
+	}
+	for i := range b.rows {
+		b.rows[i] = b.data[i*d : (i+1)*d]
+	}
+	return b.rows
+}
+
+type layaWorkspace struct{ norm, qkv, attention, projection, hidden layaBuffer }
+
+func (n layaNorm) into(x [][]float32, b *layaBuffer) [][]float32 {
+	if len(n.weight) == 0 {
+		return x
+	}
+	out := b.resize(len(x), len(x[0]), false)
+	for i := range x {
+		layerNormInto(x[i], n.weight, n.bias, n.epsilon, &out[i])
+	}
+	return out
+}
+func (l layaLinear) into(x [][]float32, b *layaBuffer) [][]float32 {
+	out := b.resize(len(x), l.weight.Rows, false)
+	blasMatvecBatch(l.weight, x, out)
+	if l.bias != nil {
+		for _, r := range out {
+			for j, v := range l.bias {
+				r[j] += v
+			}
+		}
+	}
+	return out
+}
 func (n layaNorm) apply(x [][]float32) [][]float32 {
 	if len(n.weight) == 0 {
 		return x
@@ -56,19 +108,21 @@ func layaSoftmax(x []float32) {
 		x[i] /= float32(sum)
 	}
 }
-func (l layaLayer) forward(ctx context.Context, x [][]float32) error {
+func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspace) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	n, d := len(x), len(x[0])
 	hd := d / l.heads
-	qkv := l.qkv.apply(l.norm1.apply(x))
+	qkv := l.qkv.into(l.norm1.into(x, &work.norm), &work.qkv)
 	if l.theta > 0 {
-		for p, row := range qkv {
-			for h := 0; h < l.heads; h++ {
-				for j := 0; j < hd/2; j++ {
-					angle := float64(p) * math.Pow(l.theta, -float64(2*j)/float64(hd))
-					s, c := float32(math.Sin(angle)), float32(math.Cos(angle))
+		// Frequencies depend on the dimension; rotations on position, not head.
+		for j := 0; j < hd/2; j++ {
+			frequency := math.Pow(l.theta, -float64(2*j)/float64(hd))
+			for p, row := range qkv {
+				angle := float64(p) * frequency
+				s, c := float32(math.Sin(angle)), float32(math.Cos(angle))
+				for h := 0; h < l.heads; h++ {
 					for _, base := range []int{h * hd, d + h*hd} {
 						a, b := row[base+j], row[base+j+hd/2]
 						row[base+j] = a*c - b*s
@@ -78,7 +132,7 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32) error {
 			}
 		}
 	}
-	attended := layaRows(n, d)
+	attended := work.attention.resize(n, d, true)
 	scale := float32(1 / math.Sqrt(float64(hd)))
 	// Only one score row per worker: memory is O(sequence*hidden), not O(n²*heads).
 	parallelChunks(n*l.heads, func(start, end int) {
@@ -102,33 +156,38 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32) error {
 			dest := attended[p][h*hd : (h+1)*hd]
 			for j := lo; j < hi; j++ {
 				v := qkv[j][2*d+h*hd : 2*d+(h+1)*hd]
-				for k := range dest {
-					dest[k] += row[j-lo] * v[k]
-				}
+				AxpyF32(dest, row[j-lo], v)
 			}
 		}
 	})
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	layaResidual(x, l.output.apply(attended))
-	hidden := l.up.apply(l.norm2.apply(x))
-	if l.gated {
-		for i, row := range hidden {
-			half := len(row) / 2
-			for j := 0; j < half; j++ {
-				row[j] = geluExact(row[j]) * row[j+half]
+	layaResidual(x, l.output.into(attended, &work.projection))
+	hidden := l.up.into(l.norm2.into(x, &work.norm), &work.hidden)
+	activate := func(start, end int) {
+		for i := start; i < end; i++ {
+			row := hidden[i]
+			if l.gated {
+				half := len(row) / 2
+				for j := 0; j < half; j++ {
+					row[j] = geluExact(row[j]) * row[j+half]
+				}
+				hidden[i] = row[:half]
+			} else {
+				// PyTorch TransformerEncoderLayer defaults to ReLU.
+				for j := range row {
+					row[j] = max(0, row[j])
+				}
 			}
-			hidden[i] = row[:half]
 		}
+	}
+	if n >= 8 && len(hidden[0]) >= 256 {
+		parallelChunks(n, activate)
 	} else {
-		for _, row := range hidden {
-			for j := range row {
-				row[j] = max(0, row[j])
-			}
-		}
-	} // PyTorch TransformerEncoderLayer defaults to ReLU.
-	layaResidual(x, l.down.apply(hidden))
+		activate(0, n)
+	}
+	layaResidual(x, l.down.into(hidden, &work.projection))
 	return ctx.Err()
 }
 func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, kind int) ([]float32, float32, error) {
@@ -137,9 +196,10 @@ func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, ki
 	for i, id := range ids {
 		m.embedding.RowInto(int(id), d, &x[i])
 	}
+	var work layaWorkspace
 	x = m.embNorm.apply(x)
 	for _, l := range m.layers {
-		if err := l.forward(ctx, x); err != nil {
+		if err := l.forward(ctx, x, &work); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -150,7 +210,7 @@ func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, ki
 		}
 	}
 	for _, l := range m.head {
-		if err := l.forward(ctx, x); err != nil {
+		if err := l.forward(ctx, x, &work); err != nil {
 			return nil, 0, err
 		}
 	}

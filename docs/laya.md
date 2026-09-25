@@ -378,3 +378,39 @@ three runs; each operation processes the complete 1,000-record fixture):
 The optimization caches serialized header keys and reuses output-row storage.
 Input state remains separate from the output buffer; record order, JSON
 escaping and immediate flushing are unchanged.
+
+## Inference performance
+
+Laya attention uses the existing SIMD vector-accumulation kernels. Rotary
+frequencies are computed once per dimension and each position's rotation is
+shared across attention heads. Large feed-forward activations run across the
+worker pool using exact GELU. Tensor workspaces are reused across encoder and
+decision-head layers within a forward pass, then released; an unusually long
+request does not permanently enlarge the model's scratch storage.
+
+Reproduce the native-inference benchmark using downloaded weights:
+
+```sh
+GOPHERLLM_LAYA_BENCH_MODEL=/path/to/checkpoint \
+  go test ./integration/laya -run '^$' -bench BenchmarkLayaPredict \
+  -benchtime=3x -count=3 -benchmem
+```
+
+Loading and a warm-up prediction are excluded. The benchmark uses four GopherLLM
+workers, one three-category question, and short/long English states. Without
+the environment variable it uses the small synthetic test fixture, which is
+useful for development but does not represent real-model speed.
+
+Example on Apple M2 Max, darwin/arm64 with Accelerate enabled, English root
+checkpoint, median of three runs (three predictions per run):
+
+| Input | Before | After | Allocated bytes per prediction, before → after |
+| --- | ---: | ---: | ---: |
+| Short | 138 ms | 91 ms | 54.4 MB → 2.2 MB |
+| Long | 1,421 ms | 758 ms | 584.1 MB → 28.2 MB |
+
+These are warm inference measurements on one machine, not a throughput guarantee.
+Allocated bytes measure Go allocation traffic, not peak RSS or model-weight
+memory. Quantization, token budgets and output formats are unchanged. SIMD
+floating-point rounding can differ slightly; the PyTorch golden-reference
+checks retain their existing tolerance.
