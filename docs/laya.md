@@ -7,6 +7,18 @@ No Python, PyTorch, ONNX runtime, remote inference service or generated chat
 answer is involved. The question describes what to classify in the supplied
 state, and the criteria define the possible answers at request time.
 
+## Choose a workflow
+
+| Input | Command / endpoint | Output |
+| --- | --- | --- |
+| CSV file or Unix pipe | `--classify-csv file.csv` or `--classify-csv -` | CSV on stdout, one appended result per record |
+| Browser upload | `/classify` on the running Laya server | Downloadable result CSV |
+| HTTP file upload | `POST /v1/systemone/csv` | CSV attachment after the full job succeeds |
+| One structured request | `--classify request.json` or `POST /v1/systemone` | Typed JSON answers |
+
+[CSV quickstart](#csv-as-a-unix-filter) · [Browser and upload API](#browser-upload-and-csv-api) ·
+[Answer types](#questions-and-answers) · [Troubleshooting](#troubleshooting)
+
 ## Download and classify
 
 Build the usual CLI, then run the supplied German example:
@@ -61,10 +73,15 @@ cat examples/laya/tickets.csv | bin/gopherllm \
   --result-column category > classified.csv
 ```
 
+For example, an input record `1,"Bitte meine Rechnung korrigieren"` can become
+`1,"Bitte meine Rechnung korrigieren",Abrechnung`. This is an illustrative model
+answer; the actual classification depends on the checkpoint, question and criteria.
+
 `--classify-csv input.csv` also accepts a file path or named pipe. `-` means
 stdin; stdout contains **only CSV**, while diagnostics go to stderr. The model
 is loaded once, records are processed in order, and each output record is
-flushed immediately. Memory usage does not grow with the number of records.
+flushed immediately. Memory usage depends on the model and largest record, not the total record count.
+CSV header keys are encoded once and output row storage is reused across records.
 Use a different output filename from the input when redirecting stdout.
 
 The first record is a header by default. `--csv-column text` selects the named
@@ -320,3 +337,44 @@ probabilities on a new application domain.
 Reference implementations:
 [Laya](https://github.com/NandhaKishorM/laya) and
 [Transformers ModernBERT](https://github.com/huggingface/transformers/tree/main/src/transformers/models/modernbert).
+
+## Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| `input column ... not found` | Match the header exactly, or omit `--csv-column` to classify the complete record. |
+| `result column ... already exists` | Select a new name with `--result-column`. |
+| `wrong number of fields` | Check the delimiter and quoting. The error identifies the data record, excluding the header. |
+| Empty/truncated output after a CLI error | Check the exit status and stderr. Streaming output contains only the records completed before the error. |
+| HTTP 413 | Use the CLI for files larger than the upload/output limits. |
+| HTTP timeout | Increase `--request-timeout` when starting the server. The deadline covers the whole job. |
+| Unexpected categories | Use the multilingual model for German and describe categories with a JSON label-to-description object. Evaluate accuracy on representative data. |
+
+A Go context is checked between reads and inference stages; it cannot interrupt
+an arbitrary blocked `io.Reader` or `io.Writer`. Callers using pipes or network
+streams should close them or apply their own I/O deadlines when cancelling.
+
+### Measuring CSV overhead
+
+The benchmark below uses a fixed predictor and 1,000 six-column records. It
+measures parsing, state construction and CSV output, excluding model inference:
+
+```sh
+go test ./integration/laya -run '^$' -bench BenchmarkCSVWholeRecords -benchmem -count=3
+```
+
+Compare results on the same machine/build. This benchmark does not measure Laya
+inference throughput or imply a corresponding end-to-end speedup.
+
+Example comparison on Apple M2 Max, darwin/arm64, `CGO_ENABLED=0` (median of
+three runs; each operation processes the complete 1,000-record fixture):
+
+| CSV processing | Before | After |
+| --- | ---: | ---: |
+| Time per operation | 1.82 ms | 1.09 ms |
+| Allocations per operation | 46,044 | 27,063 |
+| Allocated bytes per operation | 1,269,439 | 820,934 |
+
+The optimization caches serialized header keys and reuses output-row storage.
+Input state remains separate from the output buffer; record order, JSON
+escaping and immediate flushing are unchanged.

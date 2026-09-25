@@ -109,6 +109,7 @@ func ClassifyCSV(ctx context.Context, model DecisionPredictor, in io.Reader, out
 	}
 	invalid := func(err error) error { return fmt.Errorf("%w: %v", ErrInvalidDecision, err) }
 	var header []string
+	var headerKeys [][]byte
 	column := -1
 	if opts.NoHeader {
 		if opts.InputColumn != "" {
@@ -145,10 +146,17 @@ func ClassifyCSV(ctx context.Context, model DecisionPredictor, in io.Reader, out
 		if opts.InputColumn != "" && column < 0 {
 			return stats, invalid(fmt.Errorf("input column %q not found", opts.InputColumn))
 		}
+		if column < 0 {
+			headerKeys = make([][]byte, len(header))
+			for i, key := range header {
+				headerKeys[i], _ = json.Marshal(key)
+			}
+		}
 		if err := write(append(append([]string(nil), header...), name)); err != nil {
 			return stats, err
 		}
 	}
+	var outputRow []string // Reuse output storage without mutating the predictor's state.
 	request := DecisionRequest{Questions: map[string]DecisionQuestion{"result": opts.Question}, MaxLen: opts.MaxLen, HeadMaxLen: opts.HeadMaxLen}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -174,13 +182,12 @@ func ClassifyCSV(ctx context.Context, model DecisionPredictor, in io.Reader, out
 			// Preserve the original column order in the prompt, including numeric labels.
 			var b strings.Builder
 			b.WriteByte('{')
-			for i, key := range header {
+			for i, key := range headerKeys {
 				if i > 0 {
 					b.WriteByte(',')
 				}
-				k, _ := json.Marshal(key)
 				v, _ := json.Marshal(row[i])
-				b.Write(k)
+				b.Write(key)
 				b.WriteByte(':')
 				b.Write(v)
 			}
@@ -202,7 +209,13 @@ func ClassifyCSV(ctx context.Context, model DecisionPredictor, in io.Reader, out
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
-		if err := write(append(row, value)); err != nil {
+		if cap(outputRow) < len(row)+1 {
+			outputRow = make([]string, len(row)+1)
+		}
+		outputRow = outputRow[:len(row)+1]
+		copy(outputRow, row)
+		outputRow[len(row)] = value
+		if err := write(outputRow); err != nil {
 			return stats, fmt.Errorf("CSV data record %d output: %w", record, err)
 		}
 		stats.Rows++

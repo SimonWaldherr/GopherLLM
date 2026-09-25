@@ -237,3 +237,21 @@ func TestNativeCSVMatchesSinglePredictions(t *testing.T) {
 		}
 	}
 }
+
+// Measures CSV overhead only; inference speed depends on the checkpoint/hardware.
+func BenchmarkCSVWholeRecords(b *testing.B) {
+	input := "id,text,language,source,priority,status\n" + strings.Repeat("1,please refund my payment,de,email,normal,open\n", 1000)
+	result := fixedDecision("yes")
+	model := decisionFunc(func(context.Context, gopherllm.DecisionRequest) (gopherllm.DecisionResult, error) {
+		return result, nil
+	})
+	opts := csvOptions()
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := gopherllm.ClassifyCSV(context.Background(), model, strings.NewReader(input), io.Discard, opts); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

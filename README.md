@@ -44,9 +44,28 @@ of the model path downloads one into the shared HF cache. See
 [Serving and safety defaults](#serving-and-safety-defaults) for what "optional"
 covers and how to turn things on.
 
+## Classify a CSV with Laya
+
+Ask one question for every record; receive the original CSV with one extra column.
+GopherLLM downloads the weights, loads the model once, and writes each result to stdout:
+
+```sh
+bin/gopherllm --laya-model hf:convaiinnovations/laya \
+  --laya-subfolder multilingual --classify-csv examples/laya/tickets.csv \
+  --csv-column text --instruction 'Welcher Bereich ist zuständig?' \
+  --criteria '["Abrechnung","Technik","Vertrieb"]' \
+  --result-column category > classified.csv
+```
+
+Use `--classify-csv -` for stdin and Unix pipes. For a browser upload, start the
+same model with `--serve 127.0.0.1:8080` instead of the CSV options, then open
+[CSV classification](http://127.0.0.1:8080/classify).
+[Full guide: downloads, CSV/TSV, Go integration and HTTP API](docs/laya.md).
+
 ## Contents
 
 - [Try it in five minutes](#try-it-in-five-minutes)
+- [Classify a CSV with Laya](#classify-a-csv-with-laya)
 - [Features](#features)
 - [Native Laya classification](docs/laya.md)
 - [Requirements](#requirements)
