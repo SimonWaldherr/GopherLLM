@@ -26,9 +26,6 @@ The same reasoning has its own Rust sibling in
 **[Go package documentation](https://pkg.go.dev/github.com/SimonWaldherr/GopherLLM)** ·
 **[Demo application documentation](server/README.md)**
 
-For strict embedding/server behavior, see the [inference contracts and compatibility matrix](docs/inference-contract.md)
-and [reproducible validation and evaluation runner](docs/inference-validation.md).
-
 ## Try it in five minutes
 
 ```sh
@@ -148,13 +145,14 @@ enforces that policy.
 
 The module-root Go files form the public `gopherllm` package, so core package
 sources remain there to preserve the stable import path
-`github.com/SimonWaldherr/GopherLLM`. Architecture-specific kernel dispatch and
-assembly are consolidated into `kernels_<arch>.go` / `kernels_<arch>.s`
-instead of being spread across one file per operation. Executable entry points
-live in `cmd/`, generated tables and other implementation details in `internal/`,
-and test-only fixtures—including preserved profiling captures—in `testdata/`.
-Public-boundary and opt-in local model tests live in `integration/`. Build output
-and local model/RAG data are ignored and are not part of the repository.
+`github.com/SimonWaldherr/GopherLLM`. Architecture-specific kernel dispatch
+lives in `kernels_<arch>.go`, with assembly in `*_<arch>.s` files. Executable
+entry points live in `cmd/`, the embedding surface for other languages in
+`mobile/` and `bindings/`, implementation details in `internal/`, and
+test-only fixtures in `testdata/`. Public-boundary and opt-in local model tests
+live in `integration/`. Build output and local model/RAG data are ignored and
+are not part of the repository. [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)
+has the full directory map.
 
 The optional demo application is documented separately in
 [server/README.md](server/README.md).
@@ -398,9 +396,6 @@ downloads and uses them is bound by that license.
 
 ## Use as a Go Library
 
-See the [Go embedding guide](docs/embedding-go.md) for model ownership,
-streaming, cancellation, reusable Voxtral sessions and application shutdown.
-
 GopherLLM is an importable module — inference runs in-process, with no child
 process and no HTTP round-trips:
 
@@ -553,8 +548,7 @@ runner.SetConversationCacheLimit(0)       // disable history; keep live prefix r
 runner.ClearConversationCache()          // clear history and resident reuse metadata
 ```
 
-The history budget is additional to the live workspace. See
-[prefill and conversation measurements](benchmarks/prefill-cache/README.md).
+The history budget is additional to the live workspace.
 
 ### Package layout
 
@@ -1126,7 +1120,7 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   pattern (each layer's window is bound individually, so a uniform window on
   every layer and this interleaved pattern are equally supported). Unsupported
   configurations retain the selective path. Set `GOPHERLLM_METAL_DENSE_DECODE=0`
-  to compare with that fallback. See the [matched llama.cpp comparisons](benchmarks/metal-dense/README.md).
+  to compare with that fallback.
   The selective
   path fuses sufficiently large mixed Q4_K/Q4_K/Q6_K Q/K/V projections into
   one command buffer and offloads large Q4_K projections, Q4_K gate/up + SiLU
@@ -1150,23 +1144,18 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   Q4_K/Q6_K prefill uses four-token kernels with adjacent SIMD lanes reading
   adjacent quantized values; the selective single-token fallback retains its previous kernels.
   Metal uses float activations and can produce different text from the CPU
-  int8-activation path. See the [cooled Metal comparisons](benchmarks/metal-inference/README.md)
-  for numerical checks, measurements and rejected experiments.
+  int8-activation path.
 - Dense Gemma uses fused quantized Gate/Up → tanh-GELU → Down on Metal,
   including the narrower FFNs in Gemma 4 E2B. Native Gemma 4 supports batched
   Metal FFNs during prefill; attention, shared KV and per-layer embeddings keep
   their existing semantics. Q4_K/Q6_K/Q8_0 vocabulary projections use vectorized
   Metal kernels. Set `GOPHERLLM_METAL_GEMMA=0` to compare the previous path.
-  See the [cooled Gemma measurements](benchmarks/metal-gemma/README.md) for
-  tested checkpoints and numerical validation.
 - Prefill batches of at least 16 tokens use 32×32 tiled Q4_K/Q6_K/Q8_0
   matrix kernels with Metal SIMD-group matrix multiply-accumulate and float32
   operands. Weights are decoded into shared tiles without expanding the model.
   Sixteen-wide reduction tiles reuse their storage for the output tile, cutting
-  threadgroup memory from 8 to 4 KiB. See [Metal prefill performance](docs/metal-performance.md)
-  for measured gains and the reproducible comparison.
+  threadgroup memory from 8 to 4 KiB.
   Smaller batches and unavailable pipelines retain the previous kernels.
-  See [matrix-prefill measurements](benchmarks/metal-matrix/README.md), which document the earlier prefill-focused optimization round.
   Contracting Q4_K down projections now also participate in the complete
   GPU-resident FFN. This covers the half of Ministral Q4_K_M layers that
   previously missed FFN fusion because their down projection was not Q6_K.
@@ -1174,16 +1163,14 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   existing Q8 arithmetic. Native dense Gemma 4 uses layer-wise prompt batches,
   including its token-dependent per-layer projections. On the measured M2 Max,
   these additional changes reduced TTFT by 58–59% for Qwen 4B Q8_0 and 24–26%
-  for Gemma 4 E2B Q4_K_M, with identical text in the comparison runs. See the
-  [prefill measurements and limits](benchmarks/prefill-cache/README.md).
+  for Gemma 4 E2B Q4_K_M, with identical text in the comparison runs.
 - Q8_0 Q/K/V and gate/up projection groups share activation quantization and
   dispatch through the existing int8 kernels. Native Gemma also groups compatible
   CPU Q4_K/Q6_K attention and dense FFN projections, preserving its shared-KV
   behavior. On the measured M2 Max, Qwen 4B Q8_0 decode improved by 2.3–2.4×;
   Gemma 4 E2B Q4_K_M decode improved by 5–6% and TTFT fell by 7%. Qwen output
   can change because more projections now use Q8 activation approximation;
-  `GOPHERLLM_Q8_ACTIVATIONS=0` retains float fusion. See the
-  [measurements and limitations](benchmarks/qwen-gemma/README.md).
+  `GOPHERLLM_Q8_ACTIVATIONS=0` retains float fusion.
 - On x86-64 (AVX2 + FMA + F16C, auto-detected via CPUID), Q4_K, Q5_K, Q6_K,
   Q8_0, Q4_0, Q4_1, MXFP4, Q2_K, and Q3_K matvecs default to int8-activation full-row kernels: the activation
   vector is quantized once per matvec to int8 with one scale per 256-element
@@ -1246,11 +1233,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   once per batch for four-token SIMD dot products. Decode workers claim fine
   row partitions through a shared cursor, reducing channel dispatch overhead.
   These paths preserve the existing ARM64 arithmetic and have startup checks
-  and fallbacks. See the [Ministral/Qwen measurements with cooling intervals](benchmarks/cooled-inference/README.md)
-  for results, baseline definitions and limitations.
+  and fallbacks.
   Q6_K decode and four-token prefill use pairwise integer reductions to pack
-  SDOT results without separate lane moves. See [Mistral CPU performance](docs/mistral-performance.md)
-  for the kernel measurements and a reproducible CLI comparison.
+  SDOT results without separate lane moves.
 - On ARM64, Q4_K and Q6_K matvecs use NEON block kernels, attention heads are
   spread across the worker pool at longer contexts, and single-token matvec work
   is split into eight ranges per worker so performance cores absorb
@@ -1613,34 +1598,23 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 
 | Area | Files |
 |---|---|
-| GGUF parsing + file mapping | `gguf.go`; public facade in `mmap.go`, platform backends in `internal/mmapfile/` |
-| Model loading + forward pass | `model.go`, `forward_batch.go` (batched prefill) |
-| Compute kernels + worker pool | `simd.go`; platform dispatch and assembly grouped in `kernels_*.go` / `kernels_*.s` |
-| Generated inference tables | `internal/iqcodebook/` |
-| Tokenizer normalization tables | `internal/wordpiece/` |
-| Tokenizers | `tokenizer.go` (SentencePiece + GPT-2/Tekken BPE + BERT WordPiece) |
+| Public API | `api.go` (Model, options), `doc.go` (package overview and version) |
+| GGUF parsing + file mapping | `gguf.go` over `internal/formats/gguf/`; `mmap.go` over `internal/mmapfile/` |
+| Model loading + forward pass | `runner.go`, `model_*.go`, per-family files (`gemma4.go`, `qwen35.go`, `moe.go`, …), `forward_batch.go` (batched prefill) |
+| Compute kernels + worker pool | `simd_*.go`, `quant_*.go`; platform dispatch and assembly in `kernels_*.go` / `kernels_*.s` |
+| Tokenizers | `internal/tokenizer/` (SentencePiece, GPT-2/Tekken BPE, WordPiece), tables in `internal/wordpiece/` |
 | Sampling | `sampling.go` |
-| Generation orchestration + chat templates | `runtime.go` |
-| Tool calling / reasoning / skills | `agent.go`, `extract.go`, `skills.go`; wire types and helpers in `internal/tooling/` |
-| Model discovery + selection | `catalog.go` |
-| CLI | `cmd/gopherllm/main.go`, `lib.go` (package doc + version), `kernel_bench.go` |
+| Generation orchestration + chat templates | `runtime.go`, `chat_render_*.go` |
+| Tool calling / reasoning / skills | `agent.go`, `extract.go`, `skills.go`; wire types in `internal/tooling/` |
+| Model discovery + selection | `catalog.go`, `catalog_ollama.go` |
+| Embedding from other languages | `mobile/`, `bindings/` (C ABI, Swift, Rust, Python) |
+| CLI | `cmd/gopherllm/`, `kernel_bench.go` |
 
-A full architecture walkthrough — load path, inference data flow, kernel
-dispatch tiers, and how to add a quant kernel or architecture — is
-in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-For a concise directory map and guidance on where new code belongs, see
-[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
-
-For a concise directory map and guidance on where new code belongs, see
-[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
-
-The same map, with more detail, is in the package comment in `doc.go`. Every
-SIMD kernel has a portable Go scalar reference implementation, and
-differential tests assert they agree — when touching a kernel, run the `Q4K`/
-`Q6K`/`DotF32`/`VectorOps` test groups first. Model-behavior research notes
-(Gemma 4 / QAT specifics, per-family sampling recommendations) live in
-[docs/INFERENCE_NOTES.md](docs/INFERENCE_NOTES.md).
+[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) maps every directory,
+shows how the language bindings layer on each other, and says where new code
+belongs. Every SIMD kernel has a portable Go scalar reference implementation,
+and differential tests assert they agree — when touching a kernel, run the
+`Q4K`/`Q6K`/`DotF32`/`VectorOps` test groups first.
 
 Run the full local check:
 
@@ -1694,35 +1668,39 @@ Local build artifacts are kept in `bin/` and `.cache/`, both ignored by git.
 
 ## iOS / iPhone
 
-Build the native Swift/Objective-C binding XCFramework on macOS with Xcode and
-`gomobile`:
+GopherLLM runs in iOS and macOS apps through a Swift package
+(`bindings/swift`) with an async/await API: load a GGUF, stream or await chat
+replies, cancel, count tokens, and inspect a model file before loading it.
+Its binary part is an XCFramework built from the C ABI with only Go and Xcode:
 
 ```sh
-make ios-bind
+make xcframework    # bindings/swift/GopherLLMCore.xcframework
+make swift-test     # the package's tests against a synthetic model
 ```
 
-This is a fully local ARM64/NEON integration with an opt-in Metal GPU path for
-eligible Qwen/Ministral layouts; it does not require a network runtime. Apple
-Neural Engine execution is not exposed for arbitrary GGUF weights.
-See [iOS integration](docs/ios.md) for installation, Xcode integration, memory
-guidance, the included SwiftUI demo, and validation commands.
+Inference runs on the device with ARM64/NEON kernels and an opt-in Metal GPU
+path; nothing goes over the network. [iOS integration](docs/ios.md) covers
+adding the package to an app, getting models onto the device, memory
+planning and entitlements, and the SwiftUI demo in `examples/ios`.
 
 GitHub Actions runs `go test`, `go vet`, and `go build` on Linux, macOS, and
-Windows, plus the `make cross-build` release matrix on Linux.
+Windows, the `make cross-build` release matrix, the C ABI test on Linux and
+macOS, and the XCFramework, Swift tests and iOS demo build on macOS.
 
 ## Bindings for Rust, Python, and C
 
-Swift/Obj-C embeds GopherLLM in-process via `gomobile` (above); Rust and
-Python do the same over a small C ABI built on top of the identical
-`mobile.Engine` surface, so all three languages get the same capabilities:
-load a GGUF, generate or stream a completion, read basic model info — no
-server process, no HTTP round trip.
+Swift (above), Rust and Python all embed GopherLLM in-process through one
+small C ABI (`bindings/c/include/gopherllm.h`) over the `mobile.Engine`
+surface — no server process, no HTTP round trip. The C ABI loads a GGUF,
+generates, chats or streams a completion, counts tokens and inspects models;
+the Rust and Python packages currently wrap its load, generate, stream and
+model-info calls.
 
 ```sh
 make capi-build   # or: ./scripts/build-capi.sh
 ```
 
-builds `build/capi/libgopherllm.{dylib,so,dll}` plus its headers. Then:
+builds `build/capi/libgopherllm.{dylib,so,dll}` plus `gopherllm.h`. Then:
 
 ```sh
 # Rust — bindings/rust/gopherllm (see its README for details)

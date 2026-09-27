@@ -109,3 +109,44 @@ jobs:
 
       - name: Build the browser wasm module
         run: make wasm-build
+
+  c-abi:
+    # bindings/c/test drives the C ABI end to end through the static library
+    # the XCFramework is made of, against a synthetic model.
+    name: C ABI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: End-to-end C ABI test
+        run: make capi-test
+
+  apple:
+    name: Apple (XCFramework, Swift package, iOS demo)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: End-to-end C ABI test
+        run: make capi-test
+
+      - name: Build the XCFramework
+        run: make xcframework
+
+      - name: Swift package tests (macOS)
+        run: make swift-test
+
+      - name: Build the iOS demo for simulator and device
+        run: make ios-demo-build

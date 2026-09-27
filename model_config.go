@@ -63,8 +63,7 @@ type Config struct {
 	// and FFN from the same input before adding both residuals.
 	UseLayerNorm     bool
 	ParallelResidual bool
-	// Gemma-family mechanics (all inert at their zero values; see
-	// docs/INFERENCE_NOTES.md for the researched semantics):
+	// Gemma-family mechanics (all inert at their zero values):
 	// UseGELU switches the FFN activation from SiLU to GELU. Gemma uses the
 	// tanh approximation in its gated MLP; Phi-2 uses exact GELU in a
 	// sequential, ungated MLP selected by its architecture.

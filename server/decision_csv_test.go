@@ -42,7 +42,7 @@ const csvTestOptions = `{"question":{"type":"choice","instructions":"Route this?
 func TestDecisionCSVUpload(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp)
-	model, err := gopherllm.OpenLaya(context.Background(), "../testdata/laya-tiny")
+	model, err := gopherllm.OpenLaya(context.Background(), layaTinyFixture(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestDecisionCSVUpload(t *testing.T) {
 	}
 }
 func TestDecisionCSVDeploymentAndDeadline(t *testing.T) {
-	model, e := gopherllm.OpenLaya(context.Background(), "../testdata/laya-tiny")
+	model, e := gopherllm.OpenLaya(context.Background(), layaTinyFixture(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -146,7 +146,7 @@ func TestDecisionCSVOutputCap(t *testing.T) {
 	}
 }
 func TestDecisionCSVRejectsInvalidMultipart(t *testing.T) {
-	model, e := gopherllm.OpenLaya(context.Background(), "../testdata/laya-tiny")
+	model, e := gopherllm.OpenLaya(context.Background(), layaTinyFixture(t))
 	if e != nil {
 		t.Fatal(e)
 	}

@@ -27,10 +27,6 @@ func newToolCallID(rng *Rng) string { return tooling.NewCallID(rng.NextF32) }
 
 func validToolCallID(id string) bool { return tooling.ValidCallID(id) }
 
-func findTool(tools []ToolDefinition, name string) (ToolFunctionDef, bool) {
-	return tooling.Find(tools, name)
-}
-
 func toolNames(tools []ToolDefinition) []string { return tooling.Names(tools) }
 
 const (

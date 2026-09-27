@@ -69,7 +69,7 @@ func reflectPad(samples []float32, pad int) ([]float32, error) {
 	return out, nil
 }
 
-// computeVoxtralRealtimeMelSpectrogram implements the exact frontend from
+// computeVoxtralRealtimeMelSpectrogramContext implements the exact frontend from
 // mistralai's reference feature extractor (verified against
 // antirez/voxtral.c's python_simple_implementation.py, which is
 // byte-for-byte OpenAI Whisper's log_mel_spectrogram with the one
@@ -85,11 +85,8 @@ func reflectPad(samples []float32, pad int) ([]float32, error) {
 //	logmel = (logmel + 4.0) / 4.0
 //
 // Returns channel-major [NumMels][nFrames] flattened as mel[c*nFrames+t], the
-// layout the causal conv stem consumes directly.
-func computeVoxtralRealtimeMelSpectrogram(cfg VoxtralRealtimeMelConfig, window []float32, filterbank Weight, samples []float32) (mel []float32, nFrames int, err error) {
-	return computeVoxtralRealtimeMelSpectrogramContext(context.Background(), cfg, window, filterbank, samples)
-}
-
+// layout the causal conv stem consumes directly. ctx is checked between
+// frames.
 func computeVoxtralRealtimeMelSpectrogramContext(ctx context.Context, cfg VoxtralRealtimeMelConfig, window []float32, filterbank Weight, samples []float32) (mel []float32, nFrames int, err error) {
 	if len(window) != cfg.WinLength {
 		return nil, 0, fmt.Errorf("mel spectrogram: window length %d, want win_length=%d", len(window), cfg.WinLength)
@@ -179,16 +176,12 @@ func causalConv1dOutputLen(length, kernel, stride int) (padLeft, padRight, outLe
 	return
 }
 
-// applyCausalConv1d runs one of the encoder's two conv-stem layers. x is
+// applyCausalConv1dContext runs one of the encoder's two conv-stem layers. x is
 // channel-major [In][Length] flattened as x[i*length+t]; the result is
 // channel-major [Out][outLen], GELU-activated with the tanh approximation
 // (verified against antirez/voxtral.c's vox_gelu, not PyTorch's default
 // exact/erf GELU -- every GELU site in this file and voxtral_realtime_decoder.go
 // uses the same tanh approximation for this reason).
-func applyCausalConv1d(x []float32, in, length int, conv VoxtralRealtimeEncoderConv) (out []float32, outLen int, err error) {
-	return applyCausalConv1dContext(context.Background(), x, in, length, conv)
-}
-
 func applyCausalConv1dContext(ctx context.Context, x []float32, in, length int, conv VoxtralRealtimeEncoderConv) (out []float32, outLen int, err error) {
 	if conv.In != in {
 		return nil, 0, fmt.Errorf("causal conv1d: input has %d channels, weight expects %d", in, conv.In)

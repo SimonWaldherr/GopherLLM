@@ -28,3 +28,10 @@ GopherLLM.test
 
 # Locally generated Laya model and reference fixture.
 /testdata/laya-tiny/
+
+# Apple builds (scripts/build-xcframework.sh, the Swift package, Xcode).
+/bindings/swift/GopherLLMCore.xcframework/
+/bindings/swift/.build/
+/bindings/swift/.swiftpm/
+xcuserdata/
+DerivedData/

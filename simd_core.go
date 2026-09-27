@@ -192,22 +192,9 @@ var xsumsScratchPool = sync.Pool{New: func() any {
 	return &s
 }}
 
-// ensureLen resizes *s to length n, reusing capacity when possible, and
-// zeroes the contents. ensureLenNoClear is the same without the zeroing, for
-// buffers that are fully overwritten anyway — it is the standard idiom for
-// every scratch buffer on the decode path.
-func ensureLen[T any](s *[]T, n int) {
-	if cap(*s) < n {
-		*s = make([]T, n)
-		return
-	}
-	*s = (*s)[:n]
-	var zero T
-	for i := range *s {
-		(*s)[i] = zero
-	}
-}
-
+// ensureLenNoClear resizes *s to length n, reusing capacity when possible,
+// without zeroing it: the standard idiom for scratch buffers on the decode
+// path that are fully overwritten anyway.
 func ensureLenNoClear[T any](s *[]T, n int) {
 	if cap(*s) < n {
 		*s = make([]T, n)

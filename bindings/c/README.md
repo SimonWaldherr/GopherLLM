@@ -1,47 +1,51 @@
 # GopherLLM C ABI
 
-A small, stable C ABI over `mobile.Engine` — the same gomobile-friendly
-surface the Swift/Obj-C binding uses — for embedding GopherLLM in-process
-from any language with a C FFI. The Rust crate (`bindings/rust`) and Python
-package (`bindings/python`) are both built directly on top of this.
+A small, stable C ABI over `mobile.Engine` for embedding GopherLLM in-process
+from any language with a C FFI. The Swift package (`bindings/swift`), the Rust
+crate (`bindings/rust`) and the Python package (`bindings/python`) are all
+built on it.
+
+- `include/gopherllm.h` — the public header and the contract of every
+  function: ownership, the `error_out` convention, threading, and the JSON
+  shapes of options, messages and results.
+- `shim/` — the cgo implementation. It only converts types and forwards to
+  `mobile.Engine`; behavior and its tests live in `mobile/`.
+- `test/engine_test.c` — an end-to-end test through the header against the
+  static library and a synthetic model.
 
 ## Build
 
-```sh
-../../scripts/build-capi.sh
-```
-
-produces, per platform, into `build/capi/` at the repo root:
-
-- `libgopherllm.dylib` / `libgopherllm.so` / `gopherllm.dll`
-- `libgopherllm.h` — the generated header (includes `callbacks.h`)
-- `callbacks.h` — the streaming callback typedefs, needed alongside the
-  generated header at compile time
-
-Building directly with `go build` needs the `capi` tag (kept out of the
-module's default `go build ./...` deliberately — see `shim/main.go`'s doc
-comment for why):
+From the repository root:
 
 ```sh
-go build -tags capi -buildmode=c-shared -o libgopherllm.dylib ./shim
+make capi-build     # build/capi/libgopherllm.{dylib,so,dll} + gopherllm.h
+make capi-test      # build the static library and run test/engine_test.c
+make xcframework    # static libraries for iOS/macOS, packed for Swift
 ```
 
-## API
+Building directly needs cgo and the `capi` tag, which keeps this package out
+of the module's default `go build ./...` (CI's Windows runner has no C
+toolchain):
 
-See `shim/main.go`'s doc comments for the authoritative contract of each
-function (ownership, NULL conventions, threading). In short:
+```sh
+go build -tags capi -buildmode=c-shared  -o libgopherllm.so ./bindings/c/shim
+go build -tags capi -buildmode=c-archive -o libgopherllm.a  ./bindings/c/shim
+```
 
-- `gopherllm_engine_new` / `gopherllm_engine_free` — one opaque handle per
-  model.
+Include `gopherllm.h`. Go also writes a `libgopherllm.h` next to the library,
+which declares the same functions with Go's type names.
+
+## API in short
+
+- `gopherllm_engine_new` / `gopherllm_engine_free` — one handle per model.
 - `gopherllm_load` / `gopherllm_unload` / `gopherllm_is_loaded` /
-  `gopherllm_model_name` / `gopherllm_info_json`.
-- `gopherllm_generate` — blocking, returns text or an error.
-- `gopherllm_generate_stream` — blocking, invokes `onDelta` per increment
-  then exactly one of `onComplete`/`onError`.
-- `gopherllm_cancel` — interrupts an in-flight call from another thread.
-- `gopherllm_free_string` — every `char*` this API returns must be freed
-  exactly once with this.
-
-Every returned `char*` is heap-allocated by Go (`C.CString`) and must be
-freed with `gopherllm_free_string`, not libc `free` directly (they happen to
-be compatible today, but treat the allocator as GopherLLM's, not libc's).
+  `gopherllm_model_name` / `gopherllm_info_json` / `gopherllm_count_tokens`.
+- `gopherllm_generate` (one prompt) and `gopherllm_chat` (a message history),
+  blocking; `gopherllm_generate_stream` / `gopherllm_chat_stream` call
+  `on_delta` per piece of text, then exactly one of `on_complete` /
+  `on_error`.
+- `gopherllm_cancel` — interrupts a running call from another thread.
+- `gopherllm_inspect_model` (header only, no weights loaded),
+  `gopherllm_runtime_info_json`, `gopherllm_version`.
+- `gopherllm_free_string` — every returned `char *` is freed exactly once
+  with this, not with libc `free`.

@@ -1,18 +1,14 @@
 # GopherLLM bindings
 
-In-process embedding of GopherLLM from languages other than Go, all built on
-the same small surface (`mobile.Engine`): load a GGUF, generate or stream a
-completion, read basic model info.
+In-process embedding of GopherLLM from languages other than Go. All of them
+sit on one C ABI over `mobile.Engine` (see
+[docs/PROJECT_STRUCTURE.md](../docs/PROJECT_STRUCTURE.md#embedding-layers)):
 
-- **Swift / Objective-C** — via `gomobile` directly against `mobile/` at the
-  repo root (no C ABI involved). See the top-level README's
-  [iOS / iPhone](../README.md#ios--iphone) section and `docs/ios.md`.
-- **[c](c/)** — the C ABI (`libgopherllm` + headers) everything below is
-  built on. Build with `../scripts/build-capi.sh`.
-- **[rust](rust/gopherllm/)** — a safe Rust crate over the C ABI.
-- **[python](python/)** — a `ctypes`-based Python package over the C ABI.
-
-See the top-level README's
-[Bindings for Rust, Python, and C](../README.md#bindings-for-rust-python-and-c)
-section for the quickest way to get started, or each subdirectory's own
-README for details.
+- **[c](c/)** — the C ABI itself: `include/gopherllm.h`, the cgo shim, and an
+  end-to-end test (`make capi-test`).
+- **[swift](swift/)** — a Swift package for iOS and macOS apps, over an
+  XCFramework built with `make xcframework`. See [docs/ios.md](../docs/ios.md).
+- **[rust](rust/gopherllm/)** — a safe Rust crate over the shared library
+  (`make capi-build`).
+- **[python](python/)** — a `ctypes`-based Python package over the shared
+  library.

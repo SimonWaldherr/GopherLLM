@@ -33,6 +33,8 @@
 //   - agent (agent/, a separate package): composes a Model, a rag.Index and a
 //     tool set into Ask/Chat with citations. Neither subpackage is imported
 //     by this one.
+//   - mobile (mobile/, a separate package): the JSON-in, JSON-out surface
+//     behind the C ABI (bindings/c) and the Swift, Rust and Python packages.
 //
 // The library never writes to stdout/stderr on its own; pass WithLogWriter
 // (or HandlerOptions.LogWriter) to opt into diagnostics.
@@ -45,7 +47,8 @@
 //   - forward_batch.go  batched prefill (prompt tokens processed per chunk)
 //   - simd_*.go, quant_extra.go  matvec/dot kernels + dequantization + pool
 //   - *_amd64.s / *_arm64.s  hand-written SIMD kernels behind runtime dispatch
-//   - tokenizer.go, tokenizer_merge.go  SentencePiece and GPT-2/Tekken BPE
+//   - tokenizer.go  facade over internal/tokenizer (SentencePiece, GPT-2/Tekken
+//     BPE, WordPiece)
 //   - sampling.go   temperature/top-k/top-p/min-p sampling
 //   - runtime.go    Runner: generation loop, chat templates per model family
 //   - agent.go, tool_schema.go, extract.go, skills.go  tool calling

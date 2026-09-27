@@ -24,15 +24,6 @@ func newParakeetLSTMState(layers []ParakeetLSTMLayer, hidden int) *parakeetLSTMS
 	return s
 }
 
-func (s *parakeetLSTMState) clone() *parakeetLSTMState {
-	out := &parakeetLSTMState{H: make([][]float32, len(s.H)), C: make([][]float32, len(s.C))}
-	for i := range s.H {
-		out.H[i] = append([]float32(nil), s.H[i]...)
-		out.C[i] = append([]float32(nil), s.C[i]...)
-	}
-	return out
-}
-
 func sigmoid(x float32) float32 { return 1 / (1 + float32(math.Exp(float64(-x)))) }
 
 // parakeetLSTMStep runs one input through every LSTM layer, updating state

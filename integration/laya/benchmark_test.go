@@ -13,7 +13,7 @@ import (
 func BenchmarkLayaPredict(b *testing.B) {
 	dir := os.Getenv("GOPHERLLM_LAYA_BENCH_MODEL")
 	if dir == "" {
-		dir = "../../testdata/laya-tiny"
+		dir = layaTinyFixture(b)
 	}
 	m, err := gopherllm.OpenLaya(context.Background(), dir)
 	if err != nil {

@@ -3,16 +3,18 @@ package tokenizer
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
 
 func TestLayaTokenizerReference(t *testing.T) {
-	b, e := os.ReadFile("../../testdata/laya-tiny/tokenizer/tokenizer.json")
+	dir := layaTinyFixture(t)
+	b, e := os.ReadFile(filepath.Join(dir, "tokenizer/tokenizer.json"))
 	if e != nil {
 		t.Fatal(e)
 	}
-	c, e := os.ReadFile("../../testdata/laya-tiny/tokenizer/tokenizer_config.json")
+	c, e := os.ReadFile(filepath.Join(dir, "tokenizer/tokenizer_config.json"))
 	if e != nil {
 		t.Fatal(e)
 	}

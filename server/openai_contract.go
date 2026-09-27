@@ -90,7 +90,7 @@ type ResponseFormat struct {
 	JSONSchema *JSONSchemaFormat `json:"json_schema,omitempty"`
 }
 
-// JSONSchemaFormat supports the subset documented in docs/inference-contract.md.
+// JSONSchemaFormat supports a subset of OpenAI's json_schema response format.
 // Strict must be true. Schema validation happens after JSON-constrained decoding.
 type JSONSchemaFormat struct {
 	Name        string          `json:"name"`

@@ -2,9 +2,9 @@
 
 Safe Rust bindings for [GopherLLM](https://github.com/SimonWaldherr/GopherLLM),
 a pure-Go GGUF inference engine, over its C ABI (`bindings/c/shim` in the
-GopherLLM repo). Mirrors the same small surface the Swift/Obj-C binding
-(`mobile.Engine`) uses: load a GGUF, generate or stream a completion, read
-basic model info — all in-process, no server to run.
+GopherLLM repo). Wraps the C ABI's load, generate, stream and model-info
+calls (the same `mobile.Engine` the Swift package uses) — all in-process, no
+server to run.
 
 ## Setup
 

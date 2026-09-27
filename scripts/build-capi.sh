@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Builds GopherLLM's C ABI shared library (bindings/c/shim) for the host
-# platform: libgopherllm.{dylib,so} plus its headers (libgopherllm.h,
-# callbacks.h) into build/capi/. The Rust crate (bindings/rust) and Python
-# package (bindings/python) both link against this output -- see their
-# READMEs for how each locates it.
+# platform into build/capi/: libgopherllm.{dylib,so} and the public header
+# gopherllm.h (bindings/c/include). The Rust crate (bindings/rust) and Python
+# package (bindings/python) both load this library -- see their READMEs for
+# how each locates it. Apple apps use scripts/build-xcframework.sh instead.
 set -euo pipefail
 
 root=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -28,9 +28,10 @@ esac
 
 echo "Building $lib ..."
 (cd "$root" && GO111MODULE=on CGO_ENABLED=1 go build -tags capi -buildmode=c-shared ${ldflags:+"$ldflags"} -o "$out/$lib" ./bindings/c/shim)
-cp "$root/bindings/c/shim/callbacks.h" "$out/callbacks.h"
+# Go also writes its own libgopherllm.h, which includes gopherllm.h for the
+# callback typedefs; C callers should include gopherllm.h.
+cp "$root/bindings/c/include/gopherllm.h" "$out/gopherllm.h"
 
 echo "Built:"
 echo "  $out/$lib"
-echo "  $out/libgopherllm.h"
-echo "  $out/callbacks.h"
+echo "  $out/gopherllm.h"
