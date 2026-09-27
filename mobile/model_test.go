@@ -90,7 +90,7 @@ func TestEngineGeneratesDeterministically(t *testing.T) {
 		t.Errorf("Chat result is HTML-escaped: %s", raw)
 	}
 	r := decode[chatResult](t, raw)
-	if r.Text != expectedText || r.FinishReason != "length" || r.GeneratedTokens != 24 || r.PromptTokens == 0 || r.TotalMS <= 0 {
+	if r.Text != expectedText || r.FinishReason != "length" || r.GeneratedTokens != 24 || r.PromptTokens == 0 || r.TotalMS < 0 { // Windows timers can round a tiny run down to 0
 		t.Fatalf("Chat = %+v", r)
 	}
 
