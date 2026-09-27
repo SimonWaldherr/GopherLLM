@@ -464,20 +464,12 @@ func attentionWeightsInPlace(scores []float32, softcap float32) float32 {
 	return denom
 }
 
-// weightedVSum finishes attention pass 2 shared by the f32, f16, and int8
-// K-row variants: optional softcap, max-stabilized softmax weights in place,
-// then out += sum(w_i * V_row_i) / denom. values16/values8 are used when
-// values is nil.
-func weightedVSum(scores []float32, values []float32, valueStride, valueHeadDim, startT int, softcap float32, out []float32) {
-	weightedVSumWithSink(scores, values, valueStride, valueHeadDim, startT, softcap, 0, false, out)
-}
-
+// weightedVSumWithSink finishes attention pass 2 shared by the f32, f16, and
+// int8 K-row variants: optional softcap, max-stabilized softmax weights in
+// place, then out += sum(w_i * V_row_i) / denom. values16/values8 are used
+// when values is nil.
 func weightedVSumWithSink(scores []float32, values []float32, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {
 	weightedVSumEitherWithSink(scores, values, nil, nil, valueStride, valueHeadDim, startT, softcap, sink, hasSink, out)
-}
-
-func weightedVSumEither(scores []float32, values []float32, values16 []uint16, valueStride, valueHeadDim, startT int, softcap float32, out []float32) {
-	weightedVSumEitherWithSink(scores, values, values16, nil, valueStride, valueHeadDim, startT, softcap, 0, false, out)
 }
 
 func weightedVSumEitherWithSink(scores []float32, values []float32, values16 []uint16, values8 []byte, valueStride, valueHeadDim, startT int, softcap, sink float32, hasSink bool, out []float32) {

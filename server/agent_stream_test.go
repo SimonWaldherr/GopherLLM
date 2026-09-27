@@ -11,37 +11,6 @@ import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
-// agentChunks pulls the gopherllm_agent payloads out of an SSE body.
-func agentChunks(t *testing.T, body string) []map[string]any {
-	t.Helper()
-	var events []map[string]any
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
-		var chunk struct {
-			Choices []struct {
-				Agent map[string]any `json:"gopherllm_agent"`
-			} `json:"choices"`
-		}
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			continue
-		}
-		for _, choice := range chunk.Choices {
-			if choice.Agent != nil {
-				events = append(events, choice.Agent)
-			}
-		}
-	}
-	return events
-}
-
-// The observer exists so a caller can see what ran. Verify the events survive
-// the trip through the SSE encoding rather than only testing the Go hook.
 func TestAgentEventsSerializeIntoTheStream(t *testing.T) {
 	// Shape check on the JSON contract the browser parses: field names here
 	// must match what mergeAgentEvent in script.js reads.

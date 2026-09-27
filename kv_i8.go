@@ -90,17 +90,6 @@ func axpyQ8Row(out []float32, alpha float32, row []byte) {
 // amd64, so this stays an explicit opt-in rather than a measured default.
 var useI8KVCache = newAtomicBool(os.Getenv("GOPHERLLM_KV_I8") == "1")
 
-// kvI8Available reports whether the int8 KV cache is implemented on this
-// build. Always true — there is no hardware dependency to gate on (matches
-// q8ActivationsAvailable's "available means correct and selectable"
-// convention); eligibility per-model is a separate, dimension-based check
-// (kvI8Eligible), not a platform capability.
-func kvI8Available() bool { return true }
-
-func kvI8Enabled() bool { return useI8KVCache.Load() }
-
-func setKVI8(on bool) { useI8KVCache.Store(on) }
-
 // onlineAttentionI8WithSink is the int8-KV-cache counterpart of
 // onlineAttentionF16WithSink. keys8/values8 must already be sliced to the
 // correct KV head's byte offset (q8RowBytes(kvH*keyHeadDim), see
