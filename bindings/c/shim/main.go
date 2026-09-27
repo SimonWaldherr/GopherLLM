@@ -41,16 +41,22 @@ func main() {}
 
 var errInvalidHandle = errors.New("invalid engine handle")
 
-// cResult applies the error_out convention: the value on success, otherwise
-// NULL with the error stored in *errorOut when the caller asked for it.
-func cResult(value string, err error, errorOut **C.char) *C.char {
-	if errorOut != nil {
-		*errorOut = nil
+// setError applies the error_out convention: when the caller asked for it,
+// *errorOut becomes the error message, or NULL on success.
+func setError(err error, errorOut **C.char) {
+	if errorOut == nil {
+		return
 	}
+	*errorOut = nil
 	if err != nil {
-		if errorOut != nil {
-			*errorOut = C.CString(err.Error())
-		}
+		*errorOut = C.CString(err.Error())
+	}
+}
+
+// cResult returns value as a new C string, or NULL with the error set.
+func cResult(value string, err error, errorOut **C.char) *C.char {
+	setError(err, errorOut)
+	if err != nil {
 		return nil
 	}
 	return C.CString(value)
@@ -142,11 +148,12 @@ func gopherllm_info_json(handle uintptr) *C.char {
 func gopherllm_count_tokens(handle uintptr, text *C.char, errorOut **C.char) C.int {
 	e, ok := engineFromHandle(handle)
 	if !ok {
-		cResult("", errInvalidHandle, errorOut)
+		setError(errInvalidHandle, errorOut)
 		return -1
 	}
 	n, err := e.CountTokens(C.GoString(text))
-	if cResult("", err, errorOut); err != nil {
+	setError(err, errorOut)
+	if err != nil {
 		return -1
 	}
 	return C.int(n)

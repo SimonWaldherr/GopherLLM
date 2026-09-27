@@ -68,8 +68,16 @@ func (e *Engine) Load(path string, optionsJSON string) (err error) {
 	if opts.Metal && !gopherllm.MetalAvailable() {
 		return fmt.Errorf("Metal is not available in this build: %s", gopherllm.MetalError())
 	}
-	defer recoverError("failed to load GGUF", &err)
-	m, err := gopherllm.Open(context.Background(), path, opts.coreOptions()...)
+	var m *gopherllm.Model
+	defer func() {
+		if r := recover(); r != nil {
+			if m != nil {
+				m.Close()
+			}
+			err = fmt.Errorf("failed to load GGUF: %v", r)
+		}
+	}()
+	m, err = gopherllm.Open(context.Background(), path, opts.coreOptions()...)
 	if err != nil {
 		return fmt.Errorf("failed to load GGUF: %w", err)
 	}
