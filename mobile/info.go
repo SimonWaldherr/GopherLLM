@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
@@ -140,11 +141,14 @@ func resultJSON(r gopherllm.GenerationResult) string {
 
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
-// marshal encodes values that are always representable as JSON.
+// marshal encodes values that are always representable as JSON, without
+// json.Marshal's HTML escaping: model output is shown as is, never in HTML.
 func marshal(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		panic(err)
 	}
-	return string(b)
+	return strings.TrimSuffix(b.String(), "\n")
 }

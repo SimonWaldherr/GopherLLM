@@ -1,9 +1,9 @@
-//! Raw FFI declarations mirroring bindings/c/shim's generated header
-//! (build/capi/libgopherllm.h and callbacks.h). Hand-written rather than
-//! bindgen-generated: the C surface is small (13 functions) and changes
-//! rarely, and hand-written bindings need no libclang at build time. See
-//! bindings/c/shim/main.go for the authoritative doc comments on each
-//! function's contract (ownership, NULL conventions, threading).
+//! Raw FFI declarations mirroring the C ABI's public header,
+//! bindings/c/include/gopherllm.h, which documents each function's contract
+//! (ownership, NULL conventions, threading). Hand-written rather than
+//! bindgen-generated: the C surface is small and changes rarely, and
+//! hand-written bindings need no libclang at build time. This crate declares
+//! the subset it uses.
 
 use std::os::raw::{c_char, c_int, c_void};
 

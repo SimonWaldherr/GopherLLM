@@ -86,6 +86,9 @@ func TestEngineGeneratesDeterministically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(raw, "`>i") {
+		t.Errorf("Chat result is HTML-escaped: %s", raw)
+	}
 	r := decode[chatResult](t, raw)
 	if r.Text != expectedText || r.FinishReason != "length" || r.GeneratedTokens != 24 || r.PromptTokens == 0 || r.TotalMS <= 0 {
 		t.Fatalf("Chat = %+v", r)

@@ -4,7 +4,8 @@ package main
 
 /*
 #include <stdlib.h>
-#include "callbacks.h"
+#define GOPHERLLM_CGO_EXPORTS
+#include "gopherllm.h"
 
 // Go cannot call a C function pointer directly; each of these thin trampolines
 // gives cgo a concrete call site to generate. They must live in a file with no
