@@ -87,7 +87,7 @@ _SAMPLER_ARGS  = --temp "$(TEMP)" --top-p "$(TOP_P)" --top-k "$(TOP_K)" --min-p 
 _BASE_RUN_ARGS = $(if $(ARGS),$(ARGS),--model-dir "$(MODEL_DIR)" $(_MODEL_ARG) $(_SKILLS_FLAG) $(_THREADS_FLAG) --prompt "$(PROMPT)" --max-tokens "$(MAX_TOKENS)" $(_SAMPLER_ARGS))
 _RUN_ARGS      = $(_METAL_FLAG) $(PREPARE_FLAG) $(_AUTO_ARGS) $(_BASE_RUN_ARGS)
 
-.PHONY: all build release build-metal cross-build wasm-build ios-tools ios-bind ios-clean ios-demo-build ios-check capi-build capi-test capi-clean run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
+.PHONY: all build release build-metal cross-build wasm-build xcframework swift-test ios-demo-build ios-check ios-clean capi-build capi-test capi-clean run run-normal run-prep run-metal run-auto run-auto-metal run-full run-full-prep run-full-metal run-full-metal-prep compare-run compare-run-metal repl serve serve-metal serve-auto serve-auto-metal autotune autotune-metal https list-models inspect list-tensors compress bench bench-model bench-model-prep bench-model-metal compare-bench synonym-bench nato-bench kernel-bench kernel-bench-prep kernel-bench-metal compare-kernel-bench compare-kernel-bench-metal fmt fmt-check deps-check test test-race test-small-models vet check coverage coverage-html clean help
 
 all: check release
 
@@ -135,19 +135,31 @@ wasm-build: build
 	cp "$$($(GO) env GOROOT)/lib/wasm/wasm_exec.js" $(BUILD_DIR)/wasm_exec.js 2>/dev/null || \
 		cp "$$($(GO) env GOROOT)/misc/wasm/wasm_exec.js" $(BUILD_DIR)/wasm_exec.js
 
-ios-tools:
-	@xcrun --sdk iphoneos --show-sdk-path >/dev/null || { echo "Xcode command-line tools are required."; exit 1; }
+# Apple platforms: GopherLLMCore.xcframework packs the C ABI as a static
+# library for iOS, the iOS simulator and macOS; bindings/swift wraps it in a
+# Swift package that apps depend on (docs/ios.md). `make xcframework` always
+# rebuilds it; the targets below build it only when it is missing.
+XCFRAMEWORK := bindings/swift/GopherLLMCore.xcframework
+IOS_DEMO    := examples/ios/GopherLLMDemo/GopherLLMDemo.xcodeproj
 
-ios-bind: ios-tools
-	@bash scripts/build-ios.sh
+xcframework:
+	@bash scripts/build-xcframework.sh
+
+$(XCFRAMEWORK):
+	@bash scripts/build-xcframework.sh
+
+swift-test: | $(XCFRAMEWORK)
+	@model="$$(mktemp -d)/tiny.gguf" && $(GO) run ./cmd/gopherllm-synth-testmodel -out "$$model" && \
+		cd bindings/swift && GOPHERLLM_TEST_MODEL="$$model" swift test
+
+ios-demo-build: | $(XCFRAMEWORK)
+	xcodebuild -project $(IOS_DEMO) -scheme GopherLLMDemo -destination 'generic/platform=iOS Simulator' -configuration Debug CODE_SIGNING_ALLOWED=NO build
+	xcodebuild -project $(IOS_DEMO) -scheme GopherLLMDemo -destination 'generic/platform=iOS' -configuration Release CODE_SIGNING_ALLOWED=NO build
+
+ios-check: test vet capi-test xcframework swift-test ios-demo-build
 
 ios-clean:
-	rm -rf build/GopherLLM.xcframework
-
-ios-demo-build: ios-bind
-	xcodebuild -project examples/ios/GopherLLMDemo/GopherLLMDemo.xcodeproj -scheme GopherLLMDemo -sdk iphonesimulator -configuration Debug CODE_SIGNING_ALLOWED=NO build
-
-ios-check: test vet ios-bind ios-demo-build
+	rm -rf $(XCFRAMEWORK) bindings/swift/.build
 
 # capi-build produces the C ABI shared library (bindings/c/shim) the Rust
 # crate (bindings/rust) and Python package (bindings/python) both link
@@ -413,6 +425,11 @@ help:
 	@printf "  make coverage                        Run tests and print per-function coverage\n"
 	@printf "  make coverage-html                   Run tests and open an HTML coverage report\n"
 	@printf "  make test-small-models               Run local <5GB model prompt sweep\n"
+	@printf "  make capi-build / capi-test          Build the C ABI shared library / run its end-to-end test\n"
+	@printf "  make xcframework                     Build bindings/swift/GopherLLMCore.xcframework (macOS + Xcode)\n"
+	@printf "  make swift-test                      Run the Swift package tests against a synthetic model\n"
+	@printf "  make ios-demo-build                  Build the SwiftUI demo for the iOS simulator and devices\n"
+	@printf "  make ios-check                       Go checks, C ABI test, XCFramework, Swift tests, demo build\n"
 	@printf "  make clean                           Remove build artifacts\n"
 	@printf "\nVariables:\n"
 	@printf "  MODEL_DIR=%s\n" "$(MODEL_DIR)"

@@ -1,57 +1,126 @@
 import Foundation
-import SwiftUI
 import GopherLLM
 
 @MainActor
 final class LLMViewModel: ObservableObject {
-    enum Status: String { case noModel = "No model", copying = "Copying", loading = "Loading", ready = "Ready", generating = "Generating", error = "Error" }
+    enum Status: String {
+        case noModel = "No model", copying = "Copying", loading = "Loading", ready = "Ready", generating = "Generating", error = "Error"
+    }
+
     @Published var status: Status = .noModel
     @Published var models = ModelStore.listModels()
-    @Published var selected: StoredModel?
-    @Published var transcript = ""
+    @Published var selected: StoredModel? { didSet { inspectSelected() } }
+    @Published var selectedInfo: ModelInfo?
+    @Published var messages: [ChatMessage] = []
+    @Published var streamingReply = ""
+    @Published var lastStats = ""
     @Published var prompt = ""
     @Published var errorMessage = ""
-    @Published var maxTokens = 128
+    @Published var maxTokens = 256
     @Published var temperature = 0.7
     @Published var topP = 0.9
     @Published var topK = 40
     @Published var repeatPenalty = 1.1
     @Published var threads = 0
     @Published var useMetal = false
-    private let engine = MobileNewEngine()!
-    private var task: Task<Void, Never>?
+
+    let metalAvailable = (try? GopherLLMEngine.runtimeInfo().metalAvailable) ?? false
+    private let engine = GopherLLMEngine()
+    private var generation: Task<Void, Never>?
 
     func importModel(_ result: Result<[URL], Error>) {
         guard case let .success(urls) = result, let url = urls.first else { return }
         status = .copying
-        Task.detached { [weak self] in
-            do { let model = try ModelStore.importModel(url); await MainActor.run { self?.models = ModelStore.listModels(); self?.selected = model; self?.status = .noModel } }
-            catch { await MainActor.run { self?.fail(error) } }
+        Task {
+            do {
+                // Copying a multi-GB file must not block the main thread.
+                let model = try await Task.detached { try ModelStore.importModel(url) }.value
+                models = ModelStore.listModels()
+                selected = model
+                status = .noModel
+            } catch {
+                fail(error)
+            }
         }
     }
-    func load() { guard let selected else { return }; status = .loading; let path = selected.url.path
-        let engine = engine; let options = loadJSON()
-        task = Task.detached { [weak self] in do { try engine.load(path, optionsJSON: options); await MainActor.run { self?.status = .ready } } catch { await MainActor.run { self?.fail(error) } } }
-    }
-    func unload() { engine.cancel(); task?.cancel(); Task.detached { [weak self] in _ = try? self?.engine.unload(); await MainActor.run { self?.status = .noModel } } }
-    func send() { guard !prompt.isEmpty, status == .ready else { return }; let input = prompt; prompt = ""; transcript += "\n\nYou: \(input)\nAssistant: "; status = .generating
-        let sink = DemoSink { [weak self] delta in Task { @MainActor in self?.transcript += delta } } complete: { [weak self] _ in Task { @MainActor in self?.status = .ready } } failure: { [weak self] message in Task { @MainActor in self?.failMessage(message) } }
-        let engine = engine; let options = generationJSON()
-        task = Task.detached { _ = try? engine.generateStream(input, optionsJSON: options, sink: sink) }
-    }
-    func stop() { engine.cancel() }
-    func clear() { transcript = "" }
-    private func loadJSON() -> String { json(["threads": threads, "prepare_quantized": false, "out_of_core": false, "prefault": "none", "metal": useMetal]) }
-    private func generationJSON() -> String { json(["max_tokens": maxTokens, "temperature": temperature, "top_p": topP, "top_k": topK, "repeat_penalty": repeatPenalty, "min_p": 0]) }
-    private func json(_ value: [String: Any]) -> String { String(data: try! JSONSerialization.data(withJSONObject: value), encoding: .utf8)! }
-    private func fail(_ error: Error) { failMessage(error.localizedDescription) }
-    private func failMessage(_ message: String) { errorMessage = message; status = .error }
-}
 
-final class DemoSink: NSObject, MobileStreamSinkProtocol {
-    let delta: (String) -> Void; let complete: (String) -> Void; let failure: (String) -> Void
-    init(delta: @escaping (String) -> Void, complete: @escaping (String) -> Void, failure: @escaping (String) -> Void) { self.delta = delta; self.complete = complete; self.failure = failure }
-    func onDelta(_ text: String?) { delta(text ?? "") }
-    func onComplete(_ resultJSON: String?) { complete(resultJSON ?? "") }
-    func onError(_ message: String?) { failure(message ?? "Unknown stream error") }
+    func load() {
+        guard let selected else { return }
+        errorMessage = ""
+        status = .loading
+        let options = LoadOptions(threads: threads, metal: useMetal)
+        Task {
+            do {
+                if engine.isLoaded { try await engine.unload() }
+                try await engine.load(modelAt: selected.url, options: options)
+                status = .ready
+            } catch {
+                fail(error)
+            }
+        }
+    }
+
+    func unload() {
+        generation?.cancel()
+        Task {
+            try? await engine.unload()
+            status = .noModel
+        }
+    }
+
+    /// iOS terminates apps that keep growing under memory pressure; releasing
+    /// the model is the one large allocation the app can give back.
+    func handleMemoryWarning() {
+        guard engine.isLoaded else { return }
+        unload()
+        errorMessage = "The model was unloaded because the system is low on memory."
+    }
+
+    func send() {
+        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, status == .ready else { return }
+        prompt = ""
+        errorMessage = ""
+        messages.append(.user(text))
+        status = .generating
+        let history = messages
+        // "recent" drops the oldest turns once the chat outgrows the context.
+        let options = GenerationOptions(maxTokens: maxTokens, temperature: Float(temperature), topP: Float(topP),
+                                        topK: topK, repeatPenalty: Float(repeatPenalty), contextWindowMode: .recent)
+        generation = Task {
+            do {
+                for try await event in engine.stream(history, options: options) {
+                    switch event {
+                    case .delta(let piece):
+                        streamingReply += piece
+                    case .completed(let result):
+                        lastStats = String(format: "%d tokens, %.1f tokens/s", result.generatedTokens, result.tokensPerSecond)
+                    }
+                }
+            } catch {
+                if !Task.isCancelled { errorMessage = error.localizedDescription }
+            }
+            if !streamingReply.isEmpty { messages.append(.assistant(streamingReply)) }
+            streamingReply = ""
+            status = .ready
+        }
+    }
+
+    func stop() { generation?.cancel() }
+
+    func clear() {
+        messages.removeAll()
+        lastStats = ""
+    }
+
+    private func inspectSelected() {
+        selectedInfo = nil
+        guard let url = selected?.url else { return }
+        Task { selectedInfo = try? await GopherLLMEngine.inspectModel(at: url) }
+    }
+
+    private func fail(_ error: Error) {
+        errorMessage = error.localizedDescription
+        status = .error
+    }
 }
