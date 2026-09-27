@@ -55,7 +55,7 @@ type SamplerConfig struct {
 
 // DefaultSamplerConfig is a generic chat baseline. Model vendors publish
 // family-specific recommendations that override these (e.g. Gemma wants
-// temp 1.0 / top-p 0.95 / top-k 64 — see docs/INFERENCE_NOTES.md).
+// temp 1.0 / top-p 0.95 / top-k 64).
 func DefaultSamplerConfig() SamplerConfig {
 	return SamplerConfig{Temperature: 0.7, TopP: 0.9, TopK: 40, MinP: 0, RepeatPenalty: 1.1}
 }

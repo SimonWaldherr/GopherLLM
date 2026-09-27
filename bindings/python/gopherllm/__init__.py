@@ -1,8 +1,7 @@
 """Safe Python bindings for GopherLLM (https://github.com/SimonWaldherr/GopherLLM),
 a pure-Go GGUF inference engine, over its C ABI (bindings/c/shim in the
-GopherLLM repo). Mirrors the same small surface the Swift/Obj-C binding
-(mobile.Engine) uses: load a GGUF, generate or stream a completion, read
-basic model info.
+GopherLLM repo). Wraps the C ABI's load, generate, stream and model-info
+calls (the same mobile.Engine the Swift package uses).
 
     from gopherllm import Engine, GenerationOptions
 
@@ -99,8 +98,7 @@ _STREAM_DONE = object()
 
 
 class Engine:
-    """One loaded (or loadable) model. Mirrors mobile.Engine, the same
-    gomobile-friendly API the Swift/Obj-C binding uses: independent
+    """One loaded (or loadable) model. Mirrors mobile.Engine: independent
     instances are unrelated, and calls that touch model memory are
     serialized on the Go side, so it is safe (if pointless) to call an
     Engine from multiple threads concurrently -- they simply queue.
