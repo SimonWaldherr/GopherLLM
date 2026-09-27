@@ -19,7 +19,7 @@ func fixture(t *testing.T) (*gopherllm.LayaModel, gopherllm.DecisionRequest, map
 	IDs             []uint32
 }) {
 	t.Helper()
-	dir := "../../testdata/laya-tiny"
+	dir := layaTinyFixture(t)
 	m, e := gopherllm.OpenLaya(context.Background(), dir)
 	if e != nil {
 		t.Fatal(e)
@@ -156,7 +156,7 @@ func TestLayaRealCheckpoint(t *testing.T) {
 	}
 }
 func TestLayaRejectsIncompatibleCheckpoint(t *testing.T) {
-	original := "../../testdata/laya-tiny"
+	original := layaTinyFixture(t)
 	tmp := t.TempDir()
 	for _, name := range []string{"rl_agent_config.json", "encoder/config.json", "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json", "model.safetensors"} {
 		b, e := os.ReadFile(filepath.Join(original, name))

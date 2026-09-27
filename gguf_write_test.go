@@ -14,26 +14,26 @@ import (
 // new writer against the exact reader real users hit.
 func TestGGUFWriterRoundTrip(t *testing.T) {
 	metadata := map[string]MetaValue{
-		"a.u8":     {"u8", uint8(200)},
-		"a.i8":     {"i8", int8(-100)},
-		"a.u16":    {"u16", uint16(60000)},
-		"a.i16":    {"i16", int16(-30000)},
-		"a.u32":    {"u32", uint32(4000000000)},
-		"a.i32":    {"i32", int32(-2000000000)},
-		"a.f32":    {"f32", float32(3.5)},
-		"a.bool_t": {"bool", true},
-		"a.bool_f": {"bool", false},
-		"a.str":    {"str", "hello gguf"},
-		"a.u64":    {"u64", uint64(18000000000000000000)},
-		"a.i64":    {"i64", int64(-9000000000000000000)},
-		"a.f64":    {"f64", float64(2.718281828)},
+		"a.u8":     {Kind: "u8", Value: uint8(200)},
+		"a.i8":     {Kind: "i8", Value: int8(-100)},
+		"a.u16":    {Kind: "u16", Value: uint16(60000)},
+		"a.i16":    {Kind: "i16", Value: int16(-30000)},
+		"a.u32":    {Kind: "u32", Value: uint32(4000000000)},
+		"a.i32":    {Kind: "i32", Value: int32(-2000000000)},
+		"a.f32":    {Kind: "f32", Value: float32(3.5)},
+		"a.bool_t": {Kind: "bool", Value: true},
+		"a.bool_f": {Kind: "bool", Value: false},
+		"a.str":    {Kind: "str", Value: "hello gguf"},
+		"a.u64":    {Kind: "u64", Value: uint64(18000000000000000000)},
+		"a.i64":    {Kind: "i64", Value: int64(-9000000000000000000)},
+		"a.f64":    {Kind: "f64", Value: float64(2.718281828)},
 		// Typed fast-path arrays.
-		"arr.str":   {"array", []string{"alpha", "beta", "gamma"}},
-		"arr.f32":   {"array", []float32{1, 2.5, -3.25}},
-		"arr.bool":  {"array", []bool{true, false, true}},
-		"arr.empty": {"array", []string{}},
+		"arr.str":   {Kind: "array", Value: []string{"alpha", "beta", "gamma"}},
+		"arr.f32":   {Kind: "array", Value: []float32{1, 2.5, -3.25}},
+		"arr.bool":  {Kind: "array", Value: []bool{true, false, true}},
+		"arr.empty": {Kind: "array", Value: []string{}},
 		// Generic []MetaValue array path (element type not str/f32/bool).
-		"arr.u32": {"array", []MetaValue{{"u32", uint32(10)}, {"u32", uint32(20)}, {"u32", uint32(30)}}},
+		"arr.u32": {Kind: "array", Value: []MetaValue{{Kind: "u32", Value: uint32(10)}, {Kind: "u32", Value: uint32(20)}, {Kind: "u32", Value: uint32(30)}}},
 	}
 
 	f32Data := make([]byte, 4*8)
@@ -172,7 +172,7 @@ func TestGGUFWriterRoundTrip(t *testing.T) {
 func TestGGUFWriterAlignment(t *testing.T) {
 	planned := []PlannedTensor{{Name: "t", Dims: []uint64{32}, DType: GGMLTypeQ8_0}}
 	var buf bytes.Buffer
-	gw, err := NewGGUFWriter(&buf, map[string]MetaValue{"k": {"str", "v"}}, planned, 64)
+	gw, err := NewGGUFWriter(&buf, map[string]MetaValue{"k": {Kind: "str", Value: "v"}}, planned, 64)
 	if err != nil {
 		t.Fatalf("NewGGUFWriter: %v", err)
 	}

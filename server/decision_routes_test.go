@@ -13,7 +13,7 @@ import (
 )
 
 func TestDecisionRoutes(t *testing.T) {
-	model, e := gopherllm.OpenLaya(context.Background(), "../testdata/laya-tiny")
+	model, e := gopherllm.OpenLaya(context.Background(), layaTinyFixture(t))
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -72,7 +72,7 @@ func TestDecisionRoutes(t *testing.T) {
 	}
 }
 func TestDecisionDeadlineAndCrossSite(t *testing.T) {
-	model, e := gopherllm.OpenLaya(context.Background(), "../testdata/laya-tiny")
+	model, e := gopherllm.OpenLaya(context.Background(), layaTinyFixture(t))
 	if e != nil {
 		t.Fatal(e)
 	}

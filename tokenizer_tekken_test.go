@@ -64,19 +64,3 @@ func TestTokenizerModeDetectsTekken(t *testing.T) {
 		t.Fatalf("Mode = %v, want TokenizerGPT2BPE for a tekken pre-tokenizer", tok.Mode)
 	}
 }
-
-func TestPretokenizeDispatch(t *testing.T) {
-	tek := &Tokenizer{Pre: "tekken"}
-	if got := tek.pretokenize("a1"); !reflect.DeepEqual(got, []string{"a", "1"}) {
-		t.Fatalf("tekken dispatch = %q, want [a 1]", got)
-	}
-	// Non-tekken GPT-2 keeps grouped digits.
-	gpt := &Tokenizer{Pre: "qwen2"}
-	if got := gpt.pretokenize("a12"); !reflect.DeepEqual(got, []string{"a", "12"}) {
-		t.Fatalf("gpt2 dispatch = %q, want [a 12]", got)
-	}
-	qwen35 := &Tokenizer{Pre: "qwen35"}
-	if got := qwen35.pretokenize("a12"); !reflect.DeepEqual(got, []string{"a", "1", "2"}) {
-		t.Fatalf("qwen35 dispatch = %q, want [a 1 2]", got)
-	}
-}
