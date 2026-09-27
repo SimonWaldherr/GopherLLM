@@ -15,7 +15,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"maps"
 	"math"
+	"slices"
 )
 
 // kindToWireType maps a MetaValue.Kind string to the GGUF wire-format value
@@ -337,11 +339,13 @@ func NewGGUFWriter(w io.Writer, metadata map[string]MetaValue, planned []Planned
 	if err := cw.u64(uint64(len(metadata))); err != nil {
 		return nil, err
 	}
-	for key, val := range metadata {
+	// Sorted so the same model always produces the same bytes (map order is
+	// random); readers look keys up by name, so the order carries no meaning.
+	for _, key := range slices.Sorted(maps.Keys(metadata)) {
 		if err := cw.str(key); err != nil {
 			return nil, err
 		}
-		if err := writeMetaValue(cw, val); err != nil {
+		if err := writeMetaValue(cw, metadata[key]); err != nil {
 			return nil, fmt.Errorf("metadata %q: %w", key, err)
 		}
 	}

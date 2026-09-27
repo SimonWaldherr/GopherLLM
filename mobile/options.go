@@ -1,5 +1,3 @@
-// Package mobile is the deliberately small, gomobile-friendly public surface
-// for using GopherLLM from Swift and Objective-C.
 package mobile
 
 import (
@@ -20,6 +18,9 @@ type loadOptions struct {
 	Metal            bool   `json:"metal"`
 }
 
+// defaultLoadOptions pages weights in on demand ("none") rather than reading
+// the whole file up front: mobile apps care more about launch latency and
+// memory pressure than the first token's speed.
 func defaultLoadOptions() loadOptions { return loadOptions{Prefault: "none"} }
 
 func parseLoadOptions(raw string) (loadOptions, error) {
@@ -42,18 +43,16 @@ func parseLoadOptions(raw string) (loadOptions, error) {
 	return o, nil
 }
 
-func (o loadOptions) coreOptions() ([]gopherllm.Option, error) {
-	prefault, err := prefaultMode(o.Prefault)
-	if err != nil {
-		return nil, err
-	}
+// coreOptions converts options parseLoadOptions has already validated.
+func (o loadOptions) coreOptions() []gopherllm.Option {
+	prefault, _ := prefaultMode(o.Prefault)
 	return []gopherllm.Option{
 		gopherllm.WithThreads(o.Threads),
 		gopherllm.WithPrepareQuantized(o.PrepareQuantized),
 		gopherllm.WithOutOfCore(o.OutOfCore),
 		gopherllm.WithMmapPrefault(prefault),
 		gopherllm.WithMetal(o.Metal),
-	}, nil
+	}
 }
 
 func prefaultMode(value string) (gopherllm.MmapPrefaultMode, error) {
@@ -79,29 +78,45 @@ type generationOptions struct {
 	Seed          uint64   `json:"seed"`
 	SystemPrompt  string   `json:"system_prompt"`
 	Stop          []string `json:"stop"`
+	// ContextWindowMode is "full" (default: an over-long history is an
+	// error), "recent" (drop the oldest complete turns until it fits) or
+	// "autoCompress" (condense old turns first, then drop).
+	ContextWindowMode string `json:"context_window_mode"`
+	// JSONObject constrains the reply to a single JSON object.
+	JSONObject bool `json:"json_object"`
 }
 
-func defaultGenerationOptions() generationOptions {
-	o := gopherllm.DefaultGenerationOptions()
-	return generationOptions{MaxTokens: o.MaxTokens, Temperature: o.Sampler.Temperature, TopP: o.Sampler.TopP, TopK: o.Sampler.TopK, MinP: o.Sampler.MinP, RepeatPenalty: o.Sampler.RepeatPenalty, SystemPrompt: o.SystemPrompt}
-}
-
-func parseGenerationOptions(raw string) (generationOptions, error) {
-	o := defaultGenerationOptions()
+func parseGenerationOptions(raw string) (gopherllm.GenerationOptions, error) {
+	d := gopherllm.DefaultGenerationOptions()
+	o := generationOptions{
+		MaxTokens:     d.MaxTokens,
+		Temperature:   d.Sampler.Temperature,
+		TopP:          d.Sampler.TopP,
+		TopK:          d.Sampler.TopK,
+		MinP:          d.Sampler.MinP,
+		RepeatPenalty: d.Sampler.RepeatPenalty,
+		SystemPrompt:  d.SystemPrompt,
+	}
 	if strings.TrimSpace(raw) != "" {
 		if err := decodeStrictJSON(raw, &o); err != nil {
-			return o, fmt.Errorf("invalid generation options: %w", err)
+			return d, fmt.Errorf("invalid generation options: %w", err)
 		}
 	}
-	core := gopherllm.ApplyGenOptions(nil, o.coreOptions()...)
-	if err := core.Validate(); err != nil {
-		return o, fmt.Errorf("invalid generation options: %w", err)
+	d.MaxTokens = o.MaxTokens
+	d.Sampler.Temperature = o.Temperature
+	d.Sampler.TopP = o.TopP
+	d.Sampler.TopK = o.TopK
+	d.Sampler.MinP = o.MinP
+	d.Sampler.RepeatPenalty = o.RepeatPenalty
+	d.Seed = o.Seed
+	d.SystemPrompt = o.SystemPrompt
+	d.StopSequences = o.Stop
+	d.ContextWindowMode = gopherllm.ContextWindowMode(o.ContextWindowMode)
+	d.JSONObject = o.JSONObject
+	if err := d.Validate(); err != nil {
+		return d, fmt.Errorf("invalid generation options: %w", err)
 	}
-	return o, nil
-}
-
-func (o generationOptions) coreOptions() []gopherllm.GenOption {
-	return []gopherllm.GenOption{gopherllm.WithMaxTokens(o.MaxTokens), gopherllm.WithTemperature(o.Temperature), gopherllm.WithTopP(o.TopP), gopherllm.WithTopK(o.TopK), gopherllm.WithMinP(o.MinP), gopherllm.WithRepeatPenalty(o.RepeatPenalty), gopherllm.WithSeed(o.Seed), gopherllm.WithSystemPrompt(o.SystemPrompt), gopherllm.WithStop(o.Stop...)}
+	return d, nil
 }
 
 func decodeStrictJSON(raw string, target any) error {
@@ -112,7 +127,7 @@ func decodeStrictJSON(raw string, target any) error {
 	}
 	if err := d.Decode(&struct{}{}); err != io.EOF {
 		if err == nil {
-			return fmt.Errorf("expected one JSON object")
+			return fmt.Errorf("expected one JSON value")
 		}
 		return err
 	}

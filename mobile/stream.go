@@ -1,54 +1,58 @@
 package mobile
 
 import (
-	"encoding/json"
-	"fmt"
+	"errors"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
 
-// StreamSink is implemented by Swift/Objective-C. Callbacks happen on a Go
-// worker thread; UI clients must hop to the main actor/queue before mutation.
+// StreamSink receives a streamed generation: OnDelta once per new piece of
+// text, in order, then exactly one of OnComplete (with the result JSON Chat
+// returns) or OnError. Calls arrive on the generating thread before the
+// streaming method returns; UI code must hop to its main thread itself.
+//
+// Every outcome, including invalid input, is reported through the sink as
+// well as the streaming method's return value, so callers may rely on either.
+// A callback may call the Engine's Cancel, IsLoaded, ModelName and InfoJSON;
+// any other Engine method called from inside a callback can deadlock.
 type StreamSink interface {
 	OnDelta(string)
 	OnComplete(string)
 	OnError(string)
 }
 
-func (e *Engine) GenerateStream(prompt, optionsJSON string, sink StreamSink) (err error) {
+var errNilSink = errors.New("stream sink is nil")
+
+// GenerateStream is Generate with incremental delivery to sink.
+func (e *Engine) GenerateStream(prompt, optionsJSON string, sink StreamSink) error {
 	if sink == nil {
-		return fmt.Errorf("stream sink is nil")
+		return errNilSink
 	}
-	o, err := parseGenerationOptions(optionsJSON)
+	return e.stream(singlePrompt(prompt), optionsJSON, sink)
+}
+
+// ChatStream is Chat with incremental delivery to sink.
+func (e *Engine) ChatStream(messagesJSON, optionsJSON string, sink StreamSink) error {
+	if sink == nil {
+		return errNilSink
+	}
+	messages, err := parseMessages(messagesJSON)
 	if err != nil {
 		sink.OnError(err.Error())
 		return err
 	}
-	e.opMu.Lock()
-	defer e.opMu.Unlock()
-	m, ctx, done, err := e.startGeneration()
+	return e.stream(messages, optionsJSON, sink)
+}
+
+func (e *Engine) stream(messages []gopherllm.ChatMessage, optionsJSON string, sink StreamSink) error {
+	result, err := e.run(messages, optionsJSON, func(delta string) error {
+		sink.OnDelta(delta)
+		return nil
+	})
 	if err != nil {
 		sink.OnError(err.Error())
 		return err
 	}
-	defer done()
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("generation failed: %v", r)
-			sink.OnError(err.Error())
-		}
-	}()
-	result, err := m.Stream(ctx, []gopherllm.ChatMessage{gopherllm.UserMessage(prompt)}, func(delta string) error { sink.OnDelta(delta); return nil }, o.coreOptions()...)
-	if err != nil {
-		err = fmt.Errorf("generation failed: %w", err)
-		sink.OnError(err.Error())
-		return err
-	}
-	b, _ := json.Marshal(struct {
-		Text            string `json:"text"`
-		FinishReason    string `json:"finish_reason"`
-		GeneratedTokens int    `json:"generated_tokens"`
-	}{result.Text, result.FinishReason, result.Stats.GeneratedTokens})
-	sink.OnComplete(string(b))
+	sink.OnComplete(resultJSON(result))
 	return nil
 }
