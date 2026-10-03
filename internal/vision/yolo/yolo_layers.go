@@ -3,6 +3,7 @@ package yolo
 import (
 	"fmt"
 	"math"
+	"sync"
 )
 
 // This file holds the building blocks of the native YOLO executor in
@@ -55,7 +56,10 @@ type yoloConv struct {
 	b                  []float32
 	in, out, k, stride int
 	depthwise, act     bool
+	scratch            *sync.Pool // shared by a loaded model's convolutions
 }
+
+type yoloConvScratch struct{ cols []float32 }
 
 func (cv *yoloConv) forward(x yoloTensor) (yoloTensor, error) {
 	if x.c != cv.in {
@@ -70,10 +74,31 @@ func (cv *yoloConv) forward(x yoloTensor) (yoloTensor, error) {
 		yoloDepthwise(x, cv, pad, out)
 	} else {
 		cols := x.data
+		var scratch *yoloConvScratch
 		if cv.k != 1 || cv.stride != 1 {
-			cols = yoloIm2col(x, cv.k, cv.stride, pad, oh, ow)
+			if cv.scratch == nil {
+				cols = yoloIm2col(x, cv.k, cv.stride, pad, oh, ow)
+			} else {
+				scratch, _ = cv.scratch.Get().(*yoloConvScratch)
+				if scratch == nil {
+					scratch = &yoloConvScratch{}
+				}
+				size := cv.in * cv.k * cv.k * n
+				if cap(scratch.cols) < size {
+					scratch.cols = make([]float32, size)
+				} else {
+					scratch.cols = scratch.cols[:size]
+				}
+				cols = scratch.cols
+				yoloIm2colInto(cols, x, cv.k, cv.stride, pad, oh, ow)
+			}
 		}
 		yoloGEMM(cv.out, n, cv.in*cv.k*cv.k, cv.w, cols, out.data)
+		if scratch != nil {
+			// GEMM has finished reading cols; activations never alias it.
+			// One pool for the whole model avoids retaining a matrix per layer.
+			cv.scratch.Put(scratch)
+		}
 	}
 	parallelChunks(cv.out, func(start, end int) {
 		for o := start; o < end; o++ {
@@ -101,17 +126,17 @@ func yoloDepthwise(x yoloTensor, cv *yoloConv, pad int, out yoloTensor) {
 		for c := start; c < end; c++ {
 			src, dst, w := x.data[c*x.plane():(c+1)*x.plane()], out.data[c*out.plane():(c+1)*out.plane()], cv.w[c*k*k:(c+1)*k*k]
 			for oy := range out.h {
+				sy := oy*s - pad
+				ky0, ky1 := max(0, -sy), min(k, x.h-sy)
 				for ox := range out.w {
+					sx := ox*s - pad
+					kx0, kx1 := max(0, -sx), min(k, x.w-sx)
 					var sum float32
-					for ky := range k {
-						iy := oy*s - pad + ky
-						if iy < 0 || iy >= x.h {
-							continue
-						}
-						for kx := range k {
-							if ix := ox*s - pad + kx; ix >= 0 && ix < x.w {
-								sum += src[iy*x.w+ix] * w[ky*k+kx]
-							}
+					for ky := ky0; ky < ky1; ky++ {
+						srow := src[(sy+ky)*x.w : (sy+ky+1)*x.w]
+						wrow := w[ky*k : (ky+1)*k]
+						for kx := kx0; kx < kx1; kx++ {
+							sum += srow[sx+kx] * wrow[kx]
 						}
 					}
 					dst[oy*out.w+ox] = sum
@@ -125,32 +150,55 @@ func yoloDepthwise(x yoloTensor, cv *yoloConv, pad int, out yoloTensor) {
 // [in*k*k][oh*ow] matrix, zero-padded at the borders, so the convolution
 // becomes a single weights × columns product.
 func yoloIm2col(x yoloTensor, k, stride, pad, oh, ow int) []float32 {
+	cols := make([]float32, x.c*k*k*oh*ow)
+	yoloFillIm2col(cols, x, k, stride, pad, oh, ow)
+	return cols
+}
+
+// yoloIm2colInto overwrites cols, including every padded value. This also
+// permits a forward pass to reuse a previous layer's transient matrix.
+func yoloIm2colInto(cols []float32, x yoloTensor, k, stride, pad, oh, ow int) {
+	clear(cols)
+	yoloFillIm2col(cols, x, k, stride, pad, oh, ow)
+}
+
+// cols must be zeroed before filling the non-padding positions. A single
+// bulk clear is cheaper than clearing short border slices on every row.
+func yoloFillIm2col(cols []float32, x yoloTensor, k, stride, pad, oh, ow int) {
 	n := oh * ow
-	cols := make([]float32, x.c*k*k*n)
 	parallelChunks(x.c, func(start, end int) {
 		for c := start; c < end; c++ {
 			src := x.data[c*x.plane() : (c+1)*x.plane()]
 			for ky := range k {
+				oy0 := min(oh, max(0, (pad-ky+stride-1)/stride))
+				oy1 := max(oy0, min(oh, (x.h+pad-ky+stride-1)/stride))
 				for kx := range k {
 					dst := cols[((c*k+ky)*k+kx)*n:][:n]
-					for oy := range oh {
+					// Each kernel offset has one contiguous interval of valid
+					// source columns. Resolve its padding once, not per pixel.
+					ox0 := min(ow, max(0, (pad-kx+stride-1)/stride))
+					ox1 := max(ox0, min(ow, (x.w+pad-kx+stride-1)/stride))
+					if ox0 == ox1 {
+						continue
+					}
+					for oy := oy0; oy < oy1; oy++ {
 						iy := oy*stride - pad + ky
 						row := dst[oy*ow : (oy+1)*ow]
-						if iy < 0 || iy >= x.h {
-							continue // already zero
-						}
 						srow := src[iy*x.w : (iy+1)*x.w]
-						for ox := range ow {
-							if ix := ox*stride - pad + kx; ix >= 0 && ix < x.w {
-								row[ox] = srow[ix]
-							}
+						ix := ox0*stride - pad + kx
+						if stride == 1 {
+							copy(row[ox0:ox1], srow[ix:ix+ox1-ox0])
+							continue
+						}
+						for ox := ox0; ox < ox1; ox++ {
+							row[ox] = srow[ix]
+							ix += stride
 						}
 					}
 				}
 			}
 		}
 	})
-	return cols
 }
 
 // yoloGEMMPortable is the pure-Go c = a·b used when Accelerate is not
@@ -333,11 +381,12 @@ func yoloUpsample2x(x yoloTensor) yoloTensor {
 	parallelChunks(x.c, func(start, end int) {
 		for c := start; c < end; c++ {
 			src, dst := x.data[c*x.plane():], out.data[c*out.plane():]
-			for y := range out.h {
-				srow, drow := src[(y/2)*x.w:], dst[y*out.w:(y+1)*out.w]
-				for xx := range drow {
-					drow[xx] = srow[xx/2]
+			for y := range x.h {
+				srow, drow := src[y*x.w:(y+1)*x.w], dst[2*y*out.w:(2*y+1)*out.w]
+				for xx, v := range srow {
+					drow[2*xx], drow[2*xx+1] = v, v
 				}
+				copy(dst[(2*y+1)*out.w:(2*y+2)*out.w], drow)
 			}
 		}
 	})
@@ -376,16 +425,7 @@ func (a *yoloAttention) forward(x yoloTensor) (yoloTensor, error) {
 			q := qkv.data[h*per*n:]
 			k := qkv.data[(h*per+a.keyDim)*n:]
 			v := values.data[h*a.headDim*n:]
-			largest := float32(math.Inf(-1))
-			for j := range n {
-				var s float32
-				for d := range a.keyDim {
-					s += q[d*n+i] * k[d*n+j]
-				}
-				s *= scale
-				scores[j] = s
-				largest = max(largest, s)
-			}
+			largest := yoloAttentionScores(scores, q, k, a.keyDim, n, i, scale)
 			var sum float32
 			for j, s := range scores {
 				scores[j] = yoloFastExp(s - largest)
@@ -409,6 +449,22 @@ func (a *yoloAttention) forward(x yoloTensor) (yoloTensor, error) {
 	}
 	yoloAddInPlace(attended.data, pe.data)
 	return a.proj.forward(attended)
+}
+
+// Accumulate each query's scores along contiguous key rows. Every score
+// retains the original channel order, while each pass reads the keys once.
+func yoloAttentionScores(scores, q, k []float32, keyDim, n, query int, scale float32) float32 {
+	clear(scores)
+	for d := range keyDim {
+		yoloAxpy(scores, q[d*n+query], k[d*n:(d+1)*n])
+	}
+	largest := float32(math.Inf(-1))
+	for j, s := range scores {
+		s *= scale
+		scores[j] = s
+		largest = max(largest, s)
+	}
+	return largest
 }
 
 type yoloPSABlock struct {

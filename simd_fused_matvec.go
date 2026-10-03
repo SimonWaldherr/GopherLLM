@@ -57,27 +57,21 @@ func MatvecQ4K2IntoWithXSums(aData []byte, aRows, aCols int, bData []byte, bRows
 	ensureLenNoClear(bOut, bRows)
 	xs := fillQ4KXSums(x, aCols, xSums)
 	totalRows := aRows + bRows
+	task := q4K2Q6KRowsTaskPool.Get().(*q4K2Q6KRowsTask)
+	task.aData, task.bData, task.x = aData, bData, x
+	task.q4xs, task.aOut, task.bOut = xs, *aOut, *bOut
+	task.aRows, task.abRows, task.totalRows = aRows, totalRows, totalRows
+	task.cols, task.q4RowBytes = aCols, rowBytes
 	if useQ8Activations.Load() {
 		q8, xsc, lease := acquireQ8(x, aCols)
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ4KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
-				dotQ4KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-			}
-		})
+		task.q8, task.xscale, task.useQ8 = q8, xsc, true
+		parallelRowsTask(totalRows, task)
 		releaseQ8(q8, xsc, lease)
-		return true
+	} else {
+		parallelRowsTask(totalRows, task)
 	}
-	parallelRows(totalRows, func(start, end int) {
-		if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-			dotQ4KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
-		}
-		if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
-			dotQ4KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-		}
-	})
+	*task = q4K2Q6KRowsTask{}
+	q4K2Q6KRowsTaskPool.Put(task)
 	return true
 }
 
@@ -133,28 +127,7 @@ func MatvecQ6K2Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	scratch := xsumsScratchPool.Get().(*[]float32)
 	xs := fillQ6KXSums16(x, aCols, scratch)
 	ScaleF32(xs, 32)
-	totalRows := aRows + bRows
-	if useQ8Activations.Load() {
-		q8, xsc, lease := acquireQ8(x, aCols)
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ6KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
-				dotQ6KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-			}
-		})
-		releaseQ8(q8, xsc, lease)
-	} else {
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, totalRows); bs < be {
-				dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-			}
-		})
-	}
+	dispatchQ6KMatvecRows(aData, bData, nil, x, xs, aRows, bRows, 0, aCols, *aOut, *bOut, nil)
 	*scratch = xs
 	xsumsScratchPool.Put(scratch)
 	return true
@@ -174,35 +147,7 @@ func MatvecQ6K3Into(aData []byte, aRows, aCols int, bData []byte, bRows, bCols i
 	scratch := xsumsScratchPool.Get().(*[]float32)
 	xs := fillQ6KXSums16(x, aCols, scratch)
 	ScaleF32(xs, 32)
-	abRows := aRows + bRows
-	totalRows := abRows + cRows
-	if useQ8Activations.Load() {
-		q8, xsc, lease := acquireQ8(x, aCols)
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ6KRowsQ8(aData, q8, xsc, xs, aCols, rowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-				dotQ6KRowsQ8(bData, q8, xsc, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-			}
-			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-				dotQ6KRowsQ8(cData, q8, xsc, xs, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
-			}
-		})
-		releaseQ8(q8, xsc, lease)
-	} else {
-		parallelRows(totalRows, func(start, end int) {
-			if as, ae := clippedRange(start, end, 0, aRows); as < ae {
-				dotQ6KRowsWithXSums(aData, x, xs, aCols, rowBytes, as, ae, *aOut)
-			}
-			if bs, be := clippedRange(start, end, aRows, abRows); bs < be {
-				dotQ6KRowsWithXSums(bData, x, xs, bCols, rowBytes, bs-aRows, be-aRows, *bOut)
-			}
-			if cs, ce := clippedRange(start, end, abRows, totalRows); cs < ce {
-				dotQ6KRowsWithXSums(cData, x, xs, cCols, rowBytes, cs-abRows, ce-abRows, *cOut)
-			}
-		})
-	}
+	dispatchQ6KMatvecRows(aData, bData, cData, x, xs, aRows, bRows, cRows, aCols, *aOut, *bOut, *cOut)
 	*scratch = xs
 	xsumsScratchPool.Put(scratch)
 	return true

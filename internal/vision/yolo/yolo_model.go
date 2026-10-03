@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/SimonWaldherr/GopherLLM/internal/formats/safetensors"
 )
@@ -325,7 +326,7 @@ func loadYOLO(src yoloWeightSource) (*YOLOModel, error) {
 	default:
 		return nil, fmt.Errorf("loading YOLO: unrecognised layer layout (supported: YOLOv8 and YOLO11 detection checkpoints)")
 	}
-	l := yoloLoader{src: src}
+	l := yoloLoader{src: src, scratch: &sync.Pool{}}
 	for i, spec := range specs {
 		name := strconv.Itoa(i)
 		layer := yoloLayer{spec: spec}
@@ -433,8 +434,9 @@ func (s yoloWeightSource) tensor(name string) ([]float32, []int, error) {
 // yoloLoader accumulates the first error so LoadYOLOSafetensors can read as
 // a plain walk over the layer list.
 type yoloLoader struct {
-	src yoloWeightSource
-	err error
+	src     yoloWeightSource
+	err     error
+	scratch *sync.Pool
 }
 
 // conv loads a Conv2d (name+".conv.weight", or name+".weight" for the
@@ -458,7 +460,7 @@ func (l *yoloLoader) conv(name string, stride int, act, depthwise bool) yoloConv
 		l.err = fmt.Errorf("tensor %s has shape %v, want [out,in,k,k] with odd k (in=1 for depthwise)", l.src.resolve(base+".weight"), shape)
 		return yoloConv{}
 	}
-	c := yoloConv{w: w, b: make([]float32, shape[0]), out: shape[0], in: shape[1], k: shape[2], stride: stride, act: act, depthwise: depthwise}
+	c := yoloConv{w: w, b: make([]float32, shape[0]), out: shape[0], in: shape[1], k: shape[2], stride: stride, act: act, depthwise: depthwise, scratch: l.scratch}
 	if depthwise {
 		c.in = c.out
 	}
@@ -612,7 +614,9 @@ func (m *YOLOModel) Forward(input YOLOImage) (output []float32, rows, cols int, 
 func (m *YOLOModel) features(x yoloTensor) ([3]yoloTensor, error) {
 	var levels [3]yoloTensor
 	lastUse := make([]int, len(m.layers))
+	maxInputs := 0
 	for i, layer := range m.layers {
+		maxInputs = max(maxInputs, len(layer.spec.from))
 		for _, f := range layer.spec.from {
 			if f < 0 {
 				f += i
@@ -623,8 +627,9 @@ func (m *YOLOModel) features(x yoloTensor) ([3]yoloTensor, error) {
 		}
 	}
 	outputs := make([]yoloTensor, len(m.layers))
+	inputStorage := make([]yoloTensor, maxInputs)
 	for i, layer := range m.layers {
-		inputs := make([]yoloTensor, len(layer.spec.from))
+		inputs := inputStorage[:len(layer.spec.from)]
 		for j, f := range layer.spec.from {
 			if f < 0 {
 				f += i
@@ -653,6 +658,7 @@ func (m *YOLOModel) features(x yoloTensor) ([3]yoloTensor, error) {
 		if err != nil {
 			return levels, fmt.Errorf("layer %d: %w", i, err)
 		}
+		clear(inputStorage)
 		outputs[i] = out
 		for f := range i {
 			if lastUse[f] == i {

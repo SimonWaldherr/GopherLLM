@@ -13,9 +13,10 @@ func MatvecQ8_0Into(data []byte, x []float32, rows, cols int, out *[]float32) {
 	// already matches the int8-activation path's 8-block-per-256 grouping.
 	if useQ8Activations.Load() && cols > 0 && cols%256 == 0 && len(data) >= rows*rowBytes && len(x) >= cols {
 		q8, xsc, lease := acquireQ8(x, cols)
-		parallelRows(rows, func(start, end int) {
-			dotQ8_0RowsQ8(data, q8, xsc, cols, rowBytes, start, end, *out)
-		})
+		task := acquireQ8_0RowsTask(1, cols, q8, xsc)
+		task.projections[0] = q8_0Projection{data: data, out: *out, rows: rows}
+		parallelRowsTask(rows, task)
+		releaseQ8_0RowsTask(task)
 		releaseQ8(q8, xsc, lease)
 		return
 	}

@@ -141,6 +141,30 @@ func parakeetConv2D(x []float32, inChannels, h, w int, conv ParakeetSubsamplingC
 	groups := inChannels / conv.InPerGroup
 	outPerGroup := conv.OutChannels / groups
 	out = make([]float32, conv.OutChannels*outH*outW)
+	if groups == 1 && h > 0 && w > 0 && conv.KH == 1 && conv.KW == 1 && conv.StrideH == 1 && conv.StrideW == 1 && conv.PadH == 0 && conv.PadW == 0 {
+		plane := h * w
+		if !blasGemmNN(conv.OutChannels, plane, inChannels, conv.Weight, x, out) {
+			parallelRows(conv.OutChannels, func(start, end int) {
+				for oc := start; oc < end; oc++ {
+					dst := out[oc*plane : (oc+1)*plane]
+					weights := conv.Weight[oc*inChannels : (oc+1)*inChannels]
+					for ic, weight := range weights {
+						src := x[ic*plane : (ic+1)*plane]
+						for i, value := range src {
+							dst[i] += value * weight
+						}
+					}
+				}
+			})
+		}
+		for oc := range conv.OutChannels {
+			bias := float32At(conv.Bias, oc)
+			for i := range plane {
+				out[oc*plane+i] += bias
+			}
+		}
+		return out, outH, outW
+	}
 	for oc := 0; oc < conv.OutChannels; oc++ {
 		g := oc / outPerGroup
 		bias := float32(0)

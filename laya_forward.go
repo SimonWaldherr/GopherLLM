@@ -5,17 +5,8 @@ import (
 	"math"
 )
 
-func layaRows(n, d int) [][]float32 {
-	flat := make([]float32, n*d)
-	rows := make([][]float32, n)
-	for i := range rows {
-		rows[i] = flat[i*d : (i+1)*d]
-	}
-	return rows
-}
-
-// Layer workspaces are reused within one forward pass, then released. They are
-// never shared across requests or retained after a long-context request.
+// Layer workspaces are reused across the sequential questions in one request,
+// then released. Long-context buffers are never retained across requests.
 type layaBuffer struct {
 	data []float32
 	rows [][]float32
@@ -42,8 +33,71 @@ func (b *layaBuffer) resize(n, d int, zero bool) [][]float32 {
 }
 
 type layaWorkspace struct {
-	norm, qkv, attention, projection, hidden layaBuffer
-	scores                                   []float32
+	input, norm, qkv, attention, projection, hidden layaBuffer
+	scores                                          []float32
+	rotary                                          [2]layaRotary
+}
+
+type layaRotary struct {
+	theta float64
+	dim   int
+	data  []float32
+}
+
+// ModernBERT has global and local RoPE parameters. Cache both sets of rotations
+// in the request workspace; positions are shared across heads and layers. Each
+// row stores cosines followed by sines, retaining the original float32 rounding.
+func (w *layaWorkspace) rotations(n, dim int, theta float64) []float32 {
+	table := &w.rotary[0]
+	for i := range w.rotary {
+		t := &w.rotary[i]
+		if t.dim == dim && t.theta == theta {
+			table = t
+			break
+		}
+		if t.dim == 0 {
+			table = t
+		}
+	}
+	if table.dim != dim || table.theta != theta {
+		*table = layaRotary{theta: theta, dim: dim}
+	}
+	previous := len(table.data) / dim
+	if previous < n {
+		table.data = append(table.data, make([]float32, (n-previous)*dim)...)
+		for j := 0; j < dim/2; j++ {
+			frequency := math.Pow(theta, -float64(2*j)/float64(dim))
+			for p := previous; p < n; p++ {
+				angle := float64(p) * frequency
+				table.data[p*dim+j] = float32(math.Cos(angle))
+				table.data[p*dim+j+dim/2] = float32(math.Sin(angle))
+			}
+		}
+	}
+	return table.data[:n*dim]
+}
+
+func layaRotate(qkv [][]float32, heads int, theta float64, work *layaWorkspace) {
+	d := len(qkv[0]) / 3
+	hd := d / heads
+	half := hd / 2
+	rotations := work.rotations(len(qkv), hd, theta)
+	for p, row := range qkv {
+		cosines := rotations[p*hd : p*hd+half]
+		sines := rotations[p*hd+half : (p+1)*hd]
+		for h := 0; h < heads; h++ {
+			q, k := row[h*hd:(h+1)*hd], row[d+h*hd:d+(h+1)*hd]
+			for j, c := range cosines {
+				s := sines[j]
+				a, b := q[j], q[j+half]
+				q[j] = a*c - b*s
+				q[j+half] = b*c + a*s
+				a, b = k[j], k[j+half]
+				k[j] = a*c - b*s
+				k[j+half] = b*c + a*s
+			}
+		}
+	}
 }
 
 func (n layaNorm) into(x [][]float32, b *layaBuffer) [][]float32 {
@@ -70,27 +124,14 @@ func (l layaLinear) into(x [][]float32, b *layaBuffer, stride int) [][]float32 {
 	}
 	return out
 }
-func (n layaNorm) apply(x [][]float32) [][]float32 {
+func (n layaNorm) inPlace(x [][]float32) {
 	if len(n.weight) == 0 {
-		return x
+		return
 	}
-	out := layaRows(len(x), len(x[0]))
+	// LayerNorm reads the complete row for mean/variance before writing values.
 	for i := range x {
-		layerNormInto(x[i], n.weight, n.bias, n.epsilon, &out[i])
+		layerNormInto(x[i], n.weight, n.bias, n.epsilon, &x[i])
 	}
-	return out
-}
-func (l layaLinear) apply(x [][]float32) [][]float32 {
-	out := layaRows(len(x), l.weight.Rows)
-	blasMatvecBatch(l.weight, x, out)
-	if l.bias != nil {
-		for _, r := range out {
-			for j, b := range l.bias {
-				r[j] += b
-			}
-		}
-	}
-	return out
 }
 func layaResidual(x, y [][]float32) {
 	for i := range x {
@@ -121,21 +162,7 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspa
 	hd := d / l.heads
 	qkv := l.qkv.into(l.norm1.into(x, &work.norm), &work.qkv, d)
 	if l.theta > 0 {
-		// Frequencies depend on the dimension; rotations on position, not head.
-		for j := 0; j < hd/2; j++ {
-			frequency := math.Pow(l.theta, -float64(2*j)/float64(hd))
-			for p, row := range qkv {
-				angle := float64(p) * frequency
-				s, c := float32(math.Sin(angle)), float32(math.Cos(angle))
-				for h := 0; h < l.heads; h++ {
-					for _, base := range []int{h * hd, d + h*hd} {
-						a, b := row[base+j], row[base+j+hd/2]
-						row[base+j] = a*c - b*s
-						row[base+j+hd/2] = b*c + a*s
-					}
-				}
-			}
-		}
+		layaRotate(qkv, l.heads, l.theta, work)
 	}
 	attended := work.attention.resize(n, d, true)
 	scale := float32(1 / math.Sqrt(float64(hd)))
@@ -201,27 +228,26 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspa
 	layaResidual(x, l.down.into(hidden, &work.projection, l.up.weight.Rows))
 	return ctx.Err()
 }
-func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, kind int) ([]float32, float32, error) {
+func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, kind int, work *layaWorkspace) ([]float32, float32, error) {
 	d := m.enc.Dim
-	x := layaRows(len(ids), d)
+	x := work.input.resize(len(ids), d, false)
 	for i, id := range ids {
 		m.embedding.RowInto(int(id), d, &x[i])
 	}
-	var work layaWorkspace
-	x = m.embNorm.apply(x)
+	m.embNorm.inPlace(x)
 	for _, l := range m.layers {
-		if err := l.forward(ctx, x, &work); err != nil {
+		if err := l.forward(ctx, x, work); err != nil {
 			return nil, 0, err
 		}
 	}
-	x = m.finalNorm.apply(x)
+	m.finalNorm.inPlace(x)
 	for _, r := range x {
 		for j := range r {
 			r[j] += m.typeEmb[kind*d+j]
 		}
 	}
 	for _, l := range m.head {
-		if err := l.forward(ctx, x, &work); err != nil {
+		if err := l.forward(ctx, x, work); err != nil {
 			return nil, 0, err
 		}
 	}
@@ -229,13 +255,13 @@ func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, ki
 	for i, p := range markers {
 		selected[i] = x[p]
 	}
-	hidden := m.score1.apply(m.scoreNorm.apply(selected))
+	hidden := m.score1.into(m.scoreNorm.into(selected, &work.norm), &work.hidden, d)
 	for _, r := range hidden {
 		for i := range r {
 			r[i] = geluExact(r[i])
 		}
 	}
-	scores := m.score2.apply(hidden)
+	scores := m.score2.into(hidden, &work.projection, m.score1.weight.Rows)
 	logits := make([]float32, len(scores))
 	for i := range scores {
 		logits[i] = scores[i][0]
@@ -253,11 +279,11 @@ func (m *LayaModel) forward(ctx context.Context, ids []uint32, markers []int, ki
 		entropy -= v * float32(math.Log(float64(max(v, 1e-9))))
 	}
 	features := append(append([]float32(nil), x[0]...), top, top-second, entropy/float32(math.Log(float64(max(2, len(p))))), float32(max(2, len(p)))/255)
-	act := m.act1.apply([][]float32{features})
+	act := m.act1.into([][]float32{features}, &work.hidden, len(features))
 	for i := range act[0] {
 		act[0][i] = geluExact(act[0][i])
 	}
-	act = m.act2.apply(act)
+	act = m.act2.into(act, &work.projection, m.act1.weight.Rows)
 	layaSoftmax(act[0])
 	return logits, act[0][0], ctx.Err()
 }

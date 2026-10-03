@@ -314,6 +314,18 @@ func evictVoxtralHeadBuffer(buf []float32, heads, headDim, stride, total, window
 	}
 }
 
+// audioMatrixRows stores an audio batch in one backing allocation. Keeping
+// each row's remaining capacity lets the BLAS path recognize and use the
+// contiguous matrix directly, while portable kernels still consume rows.
+func audioMatrixRows(rows, cols int) [][]float32 {
+	result := make([][]float32, rows)
+	data := make([]float32, rows*cols)
+	for i := range result {
+		result[i] = data[i*cols : (i+1)*cols]
+	}
+	return result
+}
+
 func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, h []float32, hLen int, state *voxtralEncoderState) ([][]float32, error) {
 	startPos := 0
 	if state != nil {
@@ -342,14 +354,12 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 	// h is channel-major [DModel][n]; the transformer blocks below want
 	// time-major [n][DModel] rows (matching EncodeImagePixtral's convention,
 	// so the same rmsNormInto/matvecBatch/DotF32/AxpyF32 helpers apply).
-	x := make([][]float32, n)
+	x := audioMatrixRows(n, dim)
 	{
-		flat := make([]float32, n*dim)
 		for t := range n {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			x[t] = flat[t*dim : (t+1)*dim : (t+1)*dim]
 			for c := range dim {
 				x[t][c] = h[c*n+t]
 			}
@@ -359,28 +369,16 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 	invFreq := standardRopeInvFreqSlice(headDim, cfg.Encoder.RopeTheta)
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 
-	q := make([][]float32, n)
-	k := make([][]float32, n)
-	v := make([][]float32, n)
-	attnOut := make([][]float32, n)
-	outProj := make([][]float32, n)
-	normed := make([][]float32, n)
-	ffnGateOut := make([][]float32, n)
-	ffnUpOut := make([][]float32, n)
-	ffnActOut := make([][]float32, n)
-	ffnDownOut := make([][]float32, n)
-	for t := range n {
-		q[t] = make([]float32, qkvDim)
-		k[t] = make([]float32, qkvDim)
-		v[t] = make([]float32, qkvDim)
-		attnOut[t] = make([]float32, qkvDim)
-		outProj[t] = make([]float32, dim)
-		normed[t] = make([]float32, dim)
-		ffnGateOut[t] = make([]float32, cfg.Encoder.FFNDim)
-		ffnUpOut[t] = make([]float32, cfg.Encoder.FFNDim)
-		ffnActOut[t] = make([]float32, cfg.Encoder.FFNDim)
-		ffnDownOut[t] = make([]float32, dim)
-	}
+	q := audioMatrixRows(n, qkvDim)
+	k := audioMatrixRows(n, qkvDim)
+	v := audioMatrixRows(n, qkvDim)
+	attnOut := audioMatrixRows(n, qkvDim)
+	outProj := audioMatrixRows(n, dim)
+	normed := audioMatrixRows(n, dim)
+	ffnGateOut := audioMatrixRows(n, cfg.Encoder.FFNDim)
+	ffnUpOut := audioMatrixRows(n, cfg.Encoder.FFNDim)
+	ffnActOut := audioMatrixRows(n, cfg.Encoder.FFNDim)
+	ffnDownOut := audioMatrixRows(n, dim)
 
 	var sinScratch, cosScratch []float32
 	ropeSin := make([]float32, n*(headDim/2))
@@ -583,20 +581,21 @@ func projectAudioVoxtralRealtime(cfg VoxtralRealtimeConfig, weights VoxtralRealt
 	if groups == 0 {
 		return nil, fmt.Errorf("projecting audio: only %d encoder frames, need at least %d for one downsample group", len(encoderOut), ds)
 	}
-	grouped := make([][]float32, groups)
-	concatBuf := make([]float32, cfg.Projector.InputDim)
-	var hidden []float32 // sized by MatvecInto from Linear1.Rows
+	concat := audioMatrixRows(groups, cfg.Projector.InputDim)
 	for g := range groups {
 		for j := range ds {
-			copy(concatBuf[j*dim:(j+1)*dim], encoderOut[g*ds+j])
+			copy(concat[g][j*dim:(j+1)*dim], encoderOut[g*ds+j])
 		}
-		weights.Projector.Linear1.MatvecInto(concatBuf, &hidden)
-		for i, v := range hidden {
-			hidden[i] = geluTanh(v)
-		}
-		out := make([]float32, cfg.Decoder.HiddenSize)
-		weights.Projector.Linear2.MatvecInto(hidden, &out)
-		grouped[g] = out
 	}
+	hiddenDim := weightRows(weights.Projector.Linear1, cfg.Projector.InputDim)
+	hidden := audioMatrixRows(groups, hiddenDim)
+	blasMatvecBatch(weights.Projector.Linear1, concat, hidden)
+	for g := range hidden {
+		for i, v := range hidden[g] {
+			hidden[g][i] = geluTanh(v)
+		}
+	}
+	grouped := audioMatrixRows(groups, weightRows(weights.Projector.Linear2, hiddenDim))
+	blasMatvecBatch(weights.Projector.Linear2, hidden, grouped)
 	return grouped, nil
 }

@@ -65,16 +65,13 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 	if t == 0 {
 		return result
 	}
-	normed := make([][]float32, t)
+	dModel := len(xs[0])
+	normed := audioMatrixRows(t, dModel)
 	for i := range xs {
 		layerNormInto(xs[i], normW, normB, eps, &normed[i])
 	}
-	dModel := len(xs[0])
 	hiddenDim := weightRows(lin1, dModel)
-	hidden := make([][]float32, t)
-	for i := range hidden {
-		hidden[i] = make([]float32, hiddenDim)
-	}
+	hidden := audioMatrixRows(t, hiddenDim)
 	blasMatvecBatch(lin1, normed, hidden)
 	for i := range hidden {
 		row := hidden[i]
@@ -83,13 +80,10 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 		}
 	}
 	outDim := weightRows(lin2, hiddenDim)
-	out := make([][]float32, t)
-	for i := range out {
-		out[i] = make([]float32, outDim)
-	}
+	out := audioMatrixRows(t, outDim)
 	blasMatvecBatch(lin2, hidden, out)
 	for i := range result {
-		row := make([]float32, len(xs[i]))
+		row := out[i][:len(xs[i])]
 		oi := out[i]
 		for j := range row {
 			row[j] = xs[i][j] + 0.5*oi[j]
@@ -112,22 +106,19 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 	if t == 0 {
 		return out
 	}
-	normed := make([][]float32, t)
+	normed := audioMatrixRows(t, dModel)
 	for i := range xs {
 		layerNormInto(xs[i], normW, normB, eps, &normed[i])
 	}
 
 	expandedDim := weightRows(conv.PointwiseConv1, dModel)
-	expanded := make([][]float32, t)
-	for i := range expanded {
-		expanded[i] = make([]float32, expandedDim)
-	}
+	expanded := audioMatrixRows(t, expandedDim)
 	blasMatvecBatch(conv.PointwiseConv1, normed, expanded)
 
 	half := expandedDim / 2
-	glu := make([][]float32, t)
+	glu := audioMatrixRows(t, half)
 	for i := range glu {
-		row := make([]float32, half)
+		row := glu[i]
 		ex := expanded[i]
 		for c := 0; c < half; c++ {
 			gate := 1 / (1 + float32(math.Exp(float64(-ex[half+c]))))
@@ -141,10 +132,7 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 	// channel (groups==DModel), no bias (none shipped -- batch_norm
 	// supplies the additive term instead).
 	pad := (kernel - 1) / 2
-	dwOut := make([][]float32, t)
-	for i := range dwOut {
-		dwOut[i] = make([]float32, dModel)
-	}
+	dwOut := audioMatrixRows(t, dModel)
 	for c := 0; c < dModel; c++ {
 		k := conv.DepthwiseConv[c*kernel : (c+1)*kernel]
 		for ti := 0; ti < t; ti++ {
@@ -163,23 +151,24 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 	// Batch norm in eval mode: normalize with the checkpoint's running
 	// mean/var (never batch statistics -- there is no "batch" at
 	// inference), then affine scale/shift, then Swish.
+	std := make([]float32, dModel)
+	for c := range std {
+		std[c] = float32(math.Sqrt(float64(conv.BatchNormVar[c]) + 1e-5))
+	}
 	for i := range dwOut {
 		row := dwOut[i]
 		for c := range row {
-			normed := (row[c] - conv.BatchNormMean[c]) / float32(math.Sqrt(float64(conv.BatchNormVar[c])+1e-5))
+			normed := (row[c] - conv.BatchNormMean[c]) / std[c]
 			row[c] = swish(normed*conv.BatchNormWeight[c] + conv.BatchNormBias[c])
 		}
 	}
 
 	projDim := weightRows(conv.PointwiseConv2, dModel)
-	proj := make([][]float32, t)
-	for i := range proj {
-		proj[i] = make([]float32, projDim)
-	}
+	proj := audioMatrixRows(t, projDim)
 	blasMatvecBatch(conv.PointwiseConv2, dwOut, proj)
 
 	for i := range out {
-		row := make([]float32, dModel)
+		row := proj[i][:dModel]
 		pi := proj[i]
 		for c := range row {
 			row[c] = xs[i][c] + pi[c]
@@ -208,19 +197,14 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 		return result, nil
 	}
 
-	normed := make([][]float32, t)
+	normed := audioMatrixRows(t, len(xs[0]))
 	for i := range xs {
 		layerNormInto(xs[i], normW, normB, eps, &normed[i])
 	}
 
-	q := make([][]float32, t)
-	k := make([][]float32, t)
-	v := make([][]float32, t)
-	for i := range q {
-		q[i] = make([]float32, dModel)
-		k[i] = make([]float32, dModel)
-		v[i] = make([]float32, dModel)
-	}
+	q := audioMatrixRows(t, dModel)
+	k := audioMatrixRows(t, dModel)
+	v := audioMatrixRows(t, dModel)
 	blasMatvecBatch(attn.LinearQ, normed, q)
 	blasMatvecBatch(attn.LinearK, normed, k)
 	blasMatvecBatch(attn.LinearV, normed, v)
@@ -234,17 +218,11 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 	for i := 0; i < posLen; i++ {
 		posRows[i] = posEnc[(posStart+i)*dModel : (posStart+i+1)*dModel]
 	}
-	posProj := make([][]float32, posLen)
-	for i := range posProj {
-		posProj[i] = make([]float32, dModel)
-	}
+	posProj := audioMatrixRows(posLen, dModel)
 	blasMatvecBatch(attn.LinearPos, posRows, posProj)
 
 	scale := float32(1 / math.Sqrt(float64(headDim)))
-	out := make([][]float32, t)
-	for i := range out {
-		out[i] = make([]float32, dModel)
-	}
+	out := audioMatrixRows(t, dModel)
 	scores := make([]float32, t)
 	qu := make([]float32, headDim)
 	qv := make([]float32, headDim)
@@ -266,7 +244,8 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 				// (qi,ki) is (t-1)-qi+ki within the posProj rows this
 				// function already extracted (index 0 == relative
 				// position +(T-1)).
-				bd := DotF32(qv, posProj[(t-1)-qi+ki])
+				ph := posProj[(t-1)-qi+ki][off : off+headDim]
+				bd := DotF32(qv, ph)
 				s := (ac + bd) * scale
 				scores[ki] = s
 				if s > maxScore {
@@ -294,13 +273,10 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 		}
 	}
 
-	proj := make([][]float32, t)
-	for i := range proj {
-		proj[i] = make([]float32, dModel)
-	}
+	proj := audioMatrixRows(t, dModel)
 	blasMatvecBatch(attn.LinearOut, out, proj)
 	for i := range result {
-		row := make([]float32, dModel)
+		row := proj[i]
 		pi := proj[i]
 		for c := range row {
 			row[c] = xs[i][c] + pi[c]
@@ -338,9 +314,7 @@ func ParakeetEncode(cfg ParakeetConfig, w ParakeetWeights, samples []float32) ([
 		xs4 := parakeetConvModule(xs3, layer.Conv, layer.NormConvWeight, layer.NormConvBias, dModel, cfg.Encoder.ConvKernelSize, cfg.Encoder.Epsilon)
 		xs5 := parakeetFeedForwardBatch(xs4, layer.NormFeedForward2Weight, layer.NormFeedForward2Bias, layer.FeedForward2Linear1, layer.FeedForward2Linear2, cfg.Encoder.Epsilon)
 		for i := range xs5 {
-			var normed []float32
-			layerNormInto(xs5[i], layer.NormOutWeight, layer.NormOutBias, cfg.Encoder.Epsilon, &normed)
-			xs5[i] = normed
+			layerNormInto(xs5[i], layer.NormOutWeight, layer.NormOutBias, cfg.Encoder.Epsilon, &xs5[i])
 		}
 		xs = xs5
 	}

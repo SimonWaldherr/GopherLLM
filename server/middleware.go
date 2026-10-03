@@ -106,12 +106,19 @@ func remoteOrLoadedModel(state *runnerState, remote *remoteState, sem chan struc
 			proxyChat(w, req)
 			return
 		}
+		// Static assets and management routes do not require a loaded model.
+		// Avoid waiting for a model replacement or calibration's writer lock
+		// before serving UI code, health checks, or request-local status.
+		if !needsLoadedModel(req.URL.Path) {
+			next.ServeHTTP(w, req)
+			return
+		}
 		loaded := false
 		if err := state.withRunnerContext(req.Context(), func(r *gopherllm.Runner) { loaded = r != nil }); err != nil {
 			inferenceAPIError(w, err)
 			return
 		}
-		if !loaded && needsLoadedModel(req.URL.Path) {
+		if !loaded {
 			writeAPIError(w, 503, "model_unavailable", "model", "no model is loaded")
 			return
 		}

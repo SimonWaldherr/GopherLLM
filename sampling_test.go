@@ -1,7 +1,10 @@
 package gopherllm
 
 import (
+	"fmt"
 	"math"
+	"math/rand"
+	"slices"
 	"testing"
 )
 
@@ -102,6 +105,84 @@ func TestMinPExcludesLowProbabilityTokens(t *testing.T) {
 	}
 }
 
+func TestMinPFullVocabMatchesFullSort(t *testing.T) {
+	profiles := [][]float32{
+		{1},
+		{1, 1, 1, 1},
+		{1, 0.05, math.Nextafter32(0.05, 0), math.Nextafter32(0.05, 1), 0},
+		{0, 2, 0.6, 2, 0.000001, 0.1},
+	}
+	r := rand.New(rand.NewSource(42))
+	for _, vocab := range []int{19, 1024} {
+		weights := make([]float32, vocab)
+		for i := range weights {
+			weights[i] = float32(math.Exp(r.NormFloat64() * 2))
+		}
+		profiles = append(profiles, weights)
+	}
+	for profile, weights := range profiles {
+		for _, minP := range []float32{1e-5, 0.05, 0.3, 1} {
+			for _, topP := range []float32{0.1, 0.5, 0.9, 1} {
+				t.Run(fmt.Sprintf("profile=%d/minP=%g/topP=%g", profile, minP, topP), func(t *testing.T) {
+					// Independent reference: sort every token, then apply min-p
+					// and nucleus cutoffs. No early candidate pruning is used.
+					reference := make([]TokenProb, len(weights))
+					var total float32
+					for i, weight := range weights {
+						reference[i] = TokenProb{i, weight}
+						total += weight
+					}
+					slices.SortFunc(reference, func(a, b TokenProb) int {
+						if a.Prob > b.Prob || a.Prob == b.Prob && a.Token < b.Token {
+							return -1
+						}
+						if a == b {
+							return 0
+						}
+						return 1
+					})
+					cutoff := 1
+					threshold := minP * reference[0].Prob
+					for cutoff < len(reference) && reference[cutoff].Prob >= threshold {
+						cutoff++
+					}
+					reference = reference[:cutoff]
+					var mass float32
+					for _, item := range reference {
+						mass += item.Prob
+					}
+					var kept float32
+					for i, item := range reference {
+						kept += item.Prob
+						if kept > topP*mass {
+							reference = reference[:i+1]
+							break
+						}
+					}
+					scratch := make([]TokenProb, 3, len(weights)+3)
+					wantRng, rng := NewRng(42), NewRng(42)
+					for drawIndex := 0; drawIndex < 128; drawIndex++ {
+						draw := wantRng.NextF32() * kept
+						want := uint32(reference[len(reference)-1].Token)
+						var cumulative float32
+						for _, item := range reference {
+							cumulative += item.Prob
+							if cumulative > draw {
+								want = uint32(item.Token)
+								break
+							}
+						}
+						got := sampleTopPFromWeights(weights, total, topP, minP, rng, &scratch)
+						if got != want || rng.state != wantRng.state {
+							t.Fatalf("draw %d: token/state = %d/%x, want %d/%x", drawIndex, got, rng.state, want, wantRng.state)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestSampleFullDistributionPath(t *testing.T) {
 	// TopK=0, TopP=1, MinP=0 routes through the normalize + sampleFromProbs path.
 	cfg := SamplerConfig{Temperature: 1, TopP: 1, TopK: 0, MinP: 0, RepeatPenalty: 1}
@@ -196,5 +277,26 @@ func BenchmarkSampleTopKOneWithScratch(b *testing.B) {
 	for b.Loop() {
 		copy(logits, base)
 		_ = SampleWithScratch(logits, config, rng, nil, &scratch)
+	}
+}
+
+func BenchmarkSampleMinPFullVocabWithScratch(b *testing.B) {
+	for _, vocab := range []int{32000, 131072} {
+		b.Run(fmt.Sprintf("vocab=%d", vocab), func(b *testing.B) {
+			config := SamplerConfig{Temperature: 1, TopP: 0.9, MinP: 0.05, RepeatPenalty: 1}
+			base := make([]float32, vocab)
+			r := rand.New(rand.NewSource(42))
+			for i := range base {
+				base[i] = float32(r.NormFloat64() * 2)
+			}
+			logits := make([]float32, len(base))
+			scratch := make([]TokenProb, 0, len(base))
+			rng := NewRng(1)
+			b.ReportAllocs()
+			for b.Loop() {
+				copy(logits, base)
+				SampleWithScratch(logits, config, rng, nil, &scratch)
+			}
+		})
 	}
 }

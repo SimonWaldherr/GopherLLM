@@ -13,6 +13,16 @@ type blasScratchPool struct{ input, output, scores []float32 }
 
 var blasScratchBuf = sync.Pool{New: func() any { return &blasScratchPool{} }}
 
+// Channel-major pointwise convolutions already have the layout W * X.
+// Accelerate can consume it directly without an im2col or transpose buffer.
+func blasGemmNN(m, n, k int, a, b, out []float32) bool {
+	if m <= 0 || n <= 0 || k <= 0 || m > len(a)/k || k > len(b)/n || m > len(out)/n || batchSlicesOverlap(out, a) || batchSlicesOverlap(out, b) {
+		return false
+	}
+	voxtralblas.GemmNN(m, n, k, a, b, out)
+	return true
+}
+
 // Small audio batches benefit from Accelerate's matrix-matrix kernel. Expand
 // the encoder once, rather than dequantizing every matrix for every chunk.
 func prepareVoxtralStreamWeights(ctx context.Context, w *VoxtralRealtimeWeights) error {
@@ -52,15 +62,25 @@ func blasMatvecBatch(w Weight, xs, outs [][]float32) {
 	}
 	b := blasScratchBuf.Get().(*blasScratchPool)
 	defer blasScratchBuf.Put(b)
-	ensureLenNoClear(&b.input, len(xs)*cols)
-	ensureLenNoClear(&b.output, len(xs)*rows)
-	input, output := b.input, b.output
-	for i, x := range xs {
-		copy(input[i*cols:], x)
+	input, directInput := contiguousBatchRows(xs, cols)
+	output, directOutput := contiguousBatchRows(outs, rows)
+	directOutput = directOutput && len(outs) == len(xs) && !batchSlicesOverlap(output, w.F32)
+	if !directInput || directOutput && batchSlicesOverlap(input, output) {
+		ensureLenNoClear(&b.input, len(xs)*cols)
+		input = b.input
+		for i, x := range xs {
+			copy(input[i*cols:], x)
+		}
+	}
+	if !directOutput {
+		ensureLenNoClear(&b.output, len(xs)*rows)
+		output = b.output
 	}
 	voxtralblas.Mul(len(xs), rows, cols, w.F32, input, output)
-	for i := range outs {
-		copy(outs[i], output[i*rows:(i+1)*rows])
+	if !directOutput {
+		for i := range outs {
+			copy(outs[i], output[i*rows:(i+1)*rows])
+		}
 	}
 }
 
@@ -75,16 +95,26 @@ func blasAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, d
 	}
 	b := blasScratchBuf.Get().(*blasScratchPool)
 	defer blasScratchBuf.Put(b)
-	ensureLenNoClear(&b.input, n*width)
-	ensureLenNoClear(&b.output, n*width)
 	ensureLenNoClear(&b.scores, n*total)
-	queries, output := b.input, b.output
-	for t := range q {
-		copy(queries[t*width:], q[t])
+	queries, directQueries := contiguousBatchRows(q, width)
+	output, directOutput := contiguousBatchRows(out, width)
+	directOutput = directOutput && len(out) == n && !batchSlicesOverlap(output, k) && !batchSlicesOverlap(output, v)
+	if !directQueries || directOutput && batchSlicesOverlap(queries, output) {
+		ensureLenNoClear(&b.input, n*width)
+		queries = b.input
+		for t := range q {
+			copy(queries[t*width:], q[t])
+		}
+	}
+	if !directOutput {
+		ensureLenNoClear(&b.output, n*width)
+		output = b.output
 	}
 	voxtralblas.Attention(n, total, heads, dim, past, window, stride, scale, queries, k, v, b.scores, output)
-	for t := range out {
-		copy(out[t], output[t*width:(t+1)*width])
+	if !directOutput {
+		for t := range out {
+			copy(out[t], output[t*width:(t+1)*width])
+		}
 	}
 	return true
 }

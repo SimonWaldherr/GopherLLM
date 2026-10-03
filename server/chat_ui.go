@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	_ "embed"
 	"fmt"
 	"html/template"
@@ -10,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/SimonWaldherr/GopherLLM/voiceweb"
 )
@@ -41,13 +44,7 @@ var wasmBridgeJS string
 
 var chatTemplate = template.Must(template.New("chat").Parse(chatHTMLTmpl))
 
-// gzipBytes compresses a static asset once at process startup rather than on
-// every request. setChatUIHeaders below deliberately keeps Cache-Control at
-// no-store (so a local rebuild is always visible on the next reload without
-// a hard refresh), which means every request re-transfers the full asset --
-// script.js alone is ~340KB. Since it can't be cached, compressing it is the
-// next best thing, and these strings are immutable for the process lifetime
-// so compressing once up front costs nothing per request.
+// gzipBytes compresses immutable content once, rather than on every request.
 func gzipBytes(s string) []byte {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -56,37 +53,163 @@ func gzipBytes(s string) []byte {
 	return buf.Bytes()
 }
 
+type chatStaticAsset struct {
+	plain, plainETag, plainLength string
+	gzip                          []byte
+	gzipETag, gzipLength          string
+}
+
+func newChatStaticAsset(plain string) chatStaticAsset {
+	gz := gzipBytes(plain)
+	return chatStaticAsset{
+		plain: plain, plainETag: fmt.Sprintf(`"%x"`, sha256.Sum256([]byte(plain))),
+		plainLength: strconv.Itoa(len(plain)), gzip: gz,
+		gzipETag: fmt.Sprintf(`"%x"`, sha256.Sum256(gz)), gzipLength: strconv.Itoa(len(gz)),
+	}
+}
+
 var (
-	chatCSSGZ        = gzipBytes(chatCSS)
-	chatJSGZ         = gzipBytes(chatJS)
-	audioJSGZ        = gzipBytes(audioJS)
-	visionJSGZ       = gzipBytes(visionJS)
-	audioWorkletJSGZ = gzipBytes(audioWorkletJS)
-	wasmBridgeJSGZ   = gzipBytes(wasmBridgeJS)
+	chatCSSAsset        = newChatStaticAsset(chatCSS)
+	chatJSAsset         = newChatStaticAsset(chatJS)
+	audioJSAsset        = newChatStaticAsset(audioJS)
+	visionJSAsset       = newChatStaticAsset(visionJS)
+	audioWorkletJSAsset = newChatStaticAsset(audioWorkletJS)
+	wasmBridgeJSAsset   = newChatStaticAsset(wasmBridgeJS)
 )
 
 // acceptsGzip reports whether the client's Accept-Encoding header lists
-// gzip -- every browser that would load this chat UI does, but a curl/API
-// client asking for the raw asset should still get an uncompressed body.
+// gzip with a non-zero quality; a client explicitly refusing gzip must still
+// receive the uncompressed representation.
 func acceptsGzip(req *http.Request) bool {
-	for _, part := range strings.Split(req.Header.Get("Accept-Encoding"), ",") {
-		if strings.EqualFold(strings.TrimSpace(strings.SplitN(part, ";", 2)[0]), "gzip") {
-			return true
+	for _, header := range req.Header.Values("Accept-Encoding") {
+		for header != "" {
+			part, rest, _ := strings.Cut(header, ",")
+			header = rest
+			encoding, params, _ := strings.Cut(part, ";")
+			if !strings.EqualFold(strings.TrimSpace(encoding), "gzip") {
+				continue
+			}
+			quality := 1.0
+			for params != "" {
+				param, rest, _ := strings.Cut(params, ";")
+				params = rest
+				name, value, ok := strings.Cut(strings.TrimSpace(param), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(name), "q") {
+					parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+					if err != nil || parsed < 0 || parsed > 1 {
+						quality = 0
+					} else {
+						quality = parsed
+					}
+				}
+			}
+			if quality > 0 {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// writeStaticAsset serves a precompressed static asset, falling back to the
-// plain string for a client that didn't ask for gzip.
-func writeStaticAsset(w http.ResponseWriter, req *http.Request, plain string, gz []byte) {
-	if acceptsGzip(req) {
+// writeStaticAsset lets the browser retain public application code while
+// checking its content hash on every reload, so local rebuilds remain visible.
+// The HTML containing model and authorization state still uses no-store.
+func writeStaticAsset(w http.ResponseWriter, req *http.Request, asset chatStaticAsset) {
+	w.Header().Set("Cache-Control", "private, max-age=0, must-revalidate")
+	w.Header().Del("Pragma")
+	w.Header().Set("Vary", "Accept-Encoding")
+	etag, length := asset.plainETag, asset.plainLength
+	compressed := acceptsGzip(req)
+	if compressed {
+		etag, length = asset.gzipETag, asset.gzipLength
 		w.Header().Set("Content-Encoding", "gzip")
-		w.Header().Set("Vary", "Accept-Encoding")
-		_, _ = w.Write(gz)
+	}
+	w.Header().Set("ETag", etag)
+	if (req.Method == http.MethodGet || req.Method == http.MethodHead) && matchesChatAssetETag(req, etag) {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	_, _ = io.WriteString(w, plain)
+	w.Header().Set("Content-Length", length)
+	if req.Method == http.MethodHead {
+		return
+	}
+	if compressed {
+		_, _ = w.Write(asset.gzip)
+		return
+	}
+	_, _ = io.WriteString(w, asset.plain)
+}
+
+func matchesChatAssetETag(req *http.Request, etag string) bool {
+	for _, header := range req.Header.Values("If-None-Match") {
+		for header != "" {
+			candidate, rest, _ := strings.Cut(header, ",")
+			header = rest
+			candidate = strings.TrimSpace(candidate)
+			if candidate == "*" || strings.TrimPrefix(candidate, "W/") == etag {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type cachedChatPage struct {
+	plain, gzip             []byte
+	plainLength, gzipLength string
+}
+
+// A handler's template depends only on its fixed options plus model name,
+// diagram choice and authorization. Keying by the complete data prevents a
+// model swap or an administrator request from reusing another page variant.
+// A fixed bound also prevents repeated model changes from retaining old pages.
+type chatPageCache struct {
+	mu    sync.RWMutex
+	pages map[chatTemplateData]*cachedChatPage
+}
+
+func (c *chatPageCache) render(data chatTemplateData) (*cachedChatPage, error) {
+	c.mu.RLock()
+	page := c.pages[data]
+	c.mu.RUnlock()
+	if page != nil {
+		return page, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if page, ok := c.pages[data]; ok {
+		return page, nil
+	}
+	var buf bytes.Buffer
+	if err := chatTemplate.Execute(&buf, data); err != nil {
+		return nil, err
+	}
+	page = &cachedChatPage{plain: buf.Bytes(), gzip: gzipBytes(buf.String())}
+	page.plainLength, page.gzipLength = strconv.Itoa(len(page.plain)), strconv.Itoa(len(page.gzip))
+	if c.pages == nil || len(c.pages) >= 16 {
+		c.pages = make(map[chatTemplateData]*cachedChatPage)
+	}
+	c.pages[data] = page
+	return page, nil
+}
+
+func writeChatPage(w http.ResponseWriter, req *http.Request, page *cachedChatPage) error {
+	w.Header().Set("Vary", "Accept-Encoding")
+	if acceptsGzip(req) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Length", page.gzipLength)
+		if req.Method != http.MethodHead {
+			_, err := w.Write(page.gzip)
+			return err
+		}
+	} else {
+		w.Header().Set("Content-Length", page.plainLength)
+		if req.Method != http.MethodHead {
+			_, err := w.Write(page.plain)
+			return err
+		}
+	}
+	return nil
 }
 
 type chatTemplateData struct {
@@ -134,6 +257,8 @@ type chatTemplateData struct {
 // given local wasm runtime assets) the /wasm/ routes that let the browser run
 // inference on-device. Extracted from NewHandler's opts.ChatUI block.
 func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOptions, deployment deploymentAccess, logw io.Writer) {
+	var pages chatPageCache
+	features := strings.Join(opts.Features.EnabledNames(), " ")
 	// wasmPath/wasmExecPath point at fixed filenames under opts.WasmDir
 	// (never request-derived), so serving them directly is not a path-
 	// traversal risk. hasLocalRuntime gates both the /wasm/ routes below
@@ -190,7 +315,7 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 			RepeatPenalty:   opts.Defaults.Sampler.RepeatPenalty,
 			MermaidCDN:      mermaid,
 			HasLocalRuntime: hasLocalRuntime,
-			Features:        strings.Join(opts.Features.EnabledNames(), " "),
+			Features:        features,
 			NetworkExposed:  opts.NetworkExposed,
 			DeploymentMode:  string(deployment.mode),
 			BrowserOnly:     deployment.mode.browserOnly(),
@@ -200,68 +325,51 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 		if cdn, ok := mermaidCDNs[mermaid]; ok {
 			data.MermaidScript = cdn.Script
 		}
-		var page bytes.Buffer
-		if err := chatTemplate.Execute(&page, data); err != nil {
+		page, err := pages.render(data)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Rendered per request (model name, settings, feature flags), so
-		// unlike the static assets above this can't be gzipped once at
-		// startup -- still worth compressing on the fly since Cache-Control
-		// stays no-store and this is the single largest response most page
-		// loads make.
-		if acceptsGzip(req) {
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Set("Vary", "Accept-Encoding")
-			gz := gzip.NewWriter(w)
-			if _, err := gz.Write(page.Bytes()); err != nil {
-				fmt.Fprintf(logw, "Warning: write chat page: %v\n", err)
-			}
-			if err := gz.Close(); err != nil {
-				fmt.Fprintf(logw, "Warning: close chat page gzip writer: %v\n", err)
-			}
-			return
-		}
-		if _, err := w.Write(page.Bytes()); err != nil {
+		if err := writeChatPage(w, req, page); err != nil {
 			fmt.Fprintf(logw, "Warning: write chat page: %v\n", err)
 		}
 	})
 	mux.HandleFunc("/style.css", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/css; charset=utf-8")
-		writeStaticAsset(w, req, chatCSS, chatCSSGZ)
+		writeStaticAsset(w, req, chatCSSAsset)
 	})
 	mux.HandleFunc("/audio.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		writeStaticAsset(w, req, audioJS, audioJSGZ)
+		writeStaticAsset(w, req, audioJSAsset)
 	})
 	mux.HandleFunc("/vision.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		writeStaticAsset(w, req, visionJS, visionJSGZ)
+		writeStaticAsset(w, req, visionJSAsset)
 	})
 	mux.HandleFunc("/audio-worklet.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		writeStaticAsset(w, req, audioWorkletJS, audioWorkletJSGZ)
+		writeStaticAsset(w, req, audioWorkletJSAsset)
 	})
 	mux.HandleFunc("/script.js", func(w http.ResponseWriter, req *http.Request) {
 		setChatUIHeaders(w, "", hasLocalRuntime)
 		w.Header().Set("content-type", "text/javascript; charset=utf-8")
-		writeStaticAsset(w, req, chatJS, chatJSGZ)
+		writeStaticAsset(w, req, chatJSAsset)
 	})
 	if hasLocalRuntime {
 		mux.HandleFunc("/wasm-bridge.js", func(w http.ResponseWriter, req *http.Request) {
 			setChatUIHeaders(w, "", hasLocalRuntime)
 			w.Header().Set("content-type", "text/javascript; charset=utf-8")
-			writeStaticAsset(w, req, wasmBridgeJS, wasmBridgeJSGZ)
+			writeStaticAsset(w, req, wasmBridgeJSAsset)
 		})
 	}
 }
 
 // setChatUIHeaders keeps the local browser workspace private to this origin:
-// chat HTML and its assets are never cached and cannot load third-party code.
+// chat HTML is never cached; public assets revalidate their content hashes.
 // mermaidCDNs are the only origins the chat page may load a diagram renderer
 // from. Mermaid is ~2.8 MB, so embedding it would inflate every binary for a
 // feature most sessions never use; loading it from a CDN is the alternative,

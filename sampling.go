@@ -176,6 +176,13 @@ func sampleTopPFromWeights(weights []float32, total, topP, minP float32, rng *Rn
 		}
 	}
 	threshold := maxProb * 1e-5
+	// Min-p will discard these tokens before nucleus sampling. Apply its
+	// threshold while collecting candidates so only survivors need sorting.
+	// Smaller thresholds keep the existing tail-pruning/fallback behavior.
+	prefilterMinP := minP >= 1e-5 && minP <= 1
+	if prefilterMinP {
+		threshold = maxProb * minP
+	}
 	*candidates = (*candidates)[:0]
 	var keptSum float32
 	for i, w := range weights {
@@ -184,7 +191,7 @@ func sampleTopPFromWeights(weights []float32, total, topP, minP float32, rng *Rn
 			keptSum += w
 		}
 	}
-	if keptSum < topP*total {
+	if !prefilterMinP && keptSum < topP*total {
 		ensureLenNoClear(candidates, len(weights))
 		for i, w := range weights {
 			(*candidates)[i] = TokenProb{i, w}

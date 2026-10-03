@@ -22,15 +22,12 @@ func matvecQ8_0GroupInto(weights []Weight, x []float32, outputs []*[]float32) bo
 		ensureLenNoClear(outputs[i], w.Rows)
 	}
 	q8, scales, lease := acquireQ8(x, cols)
-	parallelRows(total, func(start, end int) {
-		base := 0
-		for i, w := range weights {
-			if s, e := clippedRange(start, end, base, base+w.Rows); s < e {
-				dotQ8_0RowsQ8(w.Raw, q8, scales, cols, rowBytes, s-base, e-base, *outputs[i])
-			}
-			base += w.Rows
-		}
-	})
+	task := acquireQ8_0RowsTask(len(weights), cols, q8, scales)
+	for i, w := range weights {
+		task.projections[i] = q8_0Projection{data: w.Raw, out: *outputs[i], rows: w.Rows}
+	}
+	parallelRowsTask(total, task)
+	releaseQ8_0RowsTask(task)
 	releaseQ8(q8, scales, lease)
 	return true
 }

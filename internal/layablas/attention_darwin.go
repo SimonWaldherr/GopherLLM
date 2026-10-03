@@ -57,7 +57,8 @@ const attentionBlock = 128
 // Attention reads interleaved [sequence][Q,K,V][head][dim] data and overwrites
 // out[sequence][head][dim]. A negative window means full bidirectional attention;
 // otherwise each position sees its inclusive +/- window. Scratch is at most
-// 128*sequence floats, shared across heads and reused by the caller across layers.
+// 128*sequence floats (or 128*(128+2*window) for local attention), shared across
+// heads and reused by the caller across layers.
 // Context cancellation is checked between query blocks. No Go pointers are retained.
 func Attention(ctx context.Context, n, heads, dim, window int, scale float32, qkv, out []float32, scratch *[]float32) error {
 	if n < 1 || n > 8192 || heads < 1 || dim < 1 || len(out)/n/heads != dim || len(out)%n != 0 || (len(out)/n)%heads != 0 || len(qkv) != 3*len(out) {
@@ -68,7 +69,11 @@ func Attention(ctx context.Context, n, heads, dim, window int, scale float32, qk
 	}
 	window = min(window, n)
 	const block = attentionBlock
-	size := min(n, block) * n
+	keys := n
+	if window >= 0 {
+		keys = min(n, block+2*window)
+	}
+	size := min(n, block) * keys
 	if cap(*scratch) < size {
 		*scratch = make([]float32, size)
 	} else {

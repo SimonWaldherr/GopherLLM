@@ -92,7 +92,11 @@ func TestChatUIAssetsArePrivateAndSelfContained(t *testing.T) {
 		if !strings.HasPrefix(resp.Header.Get("Content-Type"), want.contentType) {
 			t.Fatalf("GET %s content-type = %q", want.path, resp.Header.Get("Content-Type"))
 		}
-		if resp.Header.Get("Cache-Control") != "no-store" {
+		wantCacheControl := "private, max-age=0, must-revalidate"
+		if want.path == "/chat" {
+			wantCacheControl = "no-store"
+		}
+		if resp.Header.Get("Cache-Control") != wantCacheControl {
 			t.Fatalf("GET %s cache-control = %q", want.path, resp.Header.Get("Cache-Control"))
 		}
 		if !strings.Contains(resp.Header.Get("Content-Security-Policy"), "default-src 'self'") {

@@ -436,8 +436,9 @@ func (m *LayaModel) Predict(ctx context.Context, req DecisionRequest) (DecisionR
 		}
 		items[i] = item{q, ids, markers}
 	}
+	var work layaWorkspace
 	for i, it := range items {
-		logits, act, err := m.forward(ctx, it.ids, it.markers, it.q.kind)
+		logits, act, err := m.forward(ctx, it.ids, it.markers, it.q.kind, &work)
 		if err != nil {
 			return DecisionResult{}, err
 		}

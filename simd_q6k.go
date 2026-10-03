@@ -1,5 +1,65 @@
 package gopherllm
 
+import "sync"
+
+// A task carries up to three projections through the existing worker pool.
+// Reusing it avoids an escaping callback allocation on every decode step.
+type q6KRowsTask struct {
+	aData, bData, cData      []byte
+	x                        []float32
+	q8                       []int8
+	xscale, xsums            []float32
+	aOut, bOut, cOut         []float32
+	aRows, abRows, totalRows int
+	cols, rowBytes           int
+	useQ8                    bool
+}
+
+func (t *q6KRowsTask) runRows(start, end int) {
+	if as, ae := clippedRange(start, end, 0, t.aRows); as < ae {
+		if t.useQ8 {
+			dotQ6KRowsQ8(t.aData, t.q8, t.xscale, t.xsums, t.cols, t.rowBytes, as, ae, t.aOut)
+		} else {
+			dotQ6KRowsWithXSums(t.aData, t.x, t.xsums, t.cols, t.rowBytes, as, ae, t.aOut)
+		}
+	}
+	if bs, be := clippedRange(start, end, t.aRows, t.abRows); bs < be {
+		if t.useQ8 {
+			dotQ6KRowsQ8(t.bData, t.q8, t.xscale, t.xsums, t.cols, t.rowBytes, bs-t.aRows, be-t.aRows, t.bOut)
+		} else {
+			dotQ6KRowsWithXSums(t.bData, t.x, t.xsums, t.cols, t.rowBytes, bs-t.aRows, be-t.aRows, t.bOut)
+		}
+	}
+	if cs, ce := clippedRange(start, end, t.abRows, t.totalRows); cs < ce {
+		if t.useQ8 {
+			dotQ6KRowsQ8(t.cData, t.q8, t.xscale, t.xsums, t.cols, t.rowBytes, cs-t.abRows, ce-t.abRows, t.cOut)
+		} else {
+			dotQ6KRowsWithXSums(t.cData, t.x, t.xsums, t.cols, t.rowBytes, cs-t.abRows, ce-t.abRows, t.cOut)
+		}
+	}
+}
+
+var q6KRowsTaskPool = sync.Pool{New: func() any { return new(q6KRowsTask) }}
+
+func dispatchQ6KMatvecRows(aData, bData, cData []byte, x, xsums []float32, aRows, bRows, cRows, cols int, aOut, bOut, cOut []float32) {
+	task := q6KRowsTaskPool.Get().(*q6KRowsTask)
+	task.aData, task.bData, task.cData, task.x = aData, bData, cData, x
+	task.xsums = xsums
+	task.aOut, task.bOut, task.cOut = aOut, bOut, cOut
+	task.aRows, task.abRows, task.totalRows = aRows, aRows+bRows, aRows+bRows+cRows
+	task.cols, task.rowBytes = cols, (cols/256)*210
+	if useQ8Activations.Load() {
+		q8, scales, lease := acquireQ8(x, cols)
+		task.q8, task.xscale, task.useQ8 = q8, scales, true
+		parallelRowsTask(task.totalRows, task)
+		releaseQ8(q8, scales, lease)
+	} else {
+		parallelRowsTask(task.totalRows, task)
+	}
+	*task = q6KRowsTask{}
+	q6KRowsTaskPool.Put(task)
+}
+
 func MatvecQ6KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 	rowBytes := (cols / 256) * 210
 	ensureLenNoClear(out, rows)
@@ -7,17 +67,7 @@ func MatvecQ6KInto(data []byte, x []float32, rows, cols int, out *[]float32) {
 		scratch := xsumsScratchPool.Get().(*[]float32)
 		xs := fillQ6KXSums16(x, cols, scratch)
 		ScaleF32(xs, 32)
-		if useQ8Activations.Load() {
-			q8, xsc, lease := acquireQ8(x, cols)
-			parallelRows(rows, func(start, end int) {
-				dotQ6KRowsQ8(data, q8, xsc, xs, cols, rowBytes, start, end, *out)
-			})
-			releaseQ8(q8, xsc, lease)
-		} else {
-			parallelRows(rows, func(start, end int) {
-				dotQ6KRowsWithXSums(data, x, xs, cols, rowBytes, start, end, *out)
-			})
-		}
+		dispatchQ6KMatvecRows(data, nil, nil, x, xs, rows, 0, 0, cols, *out, nil, nil)
 		*scratch = xs
 		xsumsScratchPool.Put(scratch)
 		return

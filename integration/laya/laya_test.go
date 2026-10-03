@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -129,6 +130,29 @@ func TestLayaValidationAndLifecycle(t *testing.T) {
 	}
 	if _, e = m.Predict(context.Background(), req); e == nil {
 		t.Fatal("closed model accepted inference")
+	}
+}
+
+func TestLayaQuestionWorkspaceReuse(t *testing.T) {
+	m, req, _ := fixture(t)
+	combined, err := m.Predict(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Different question lengths, head types and option counts must not observe
+	// prior workspace contents. Repeat to cover a fresh request after reuse.
+	for range 2 {
+		for name, q := range req.Questions {
+			single := req
+			single.Questions = map[string]gopherllm.DecisionQuestion{name: q}
+			result, err := m.Predict(context.Background(), single)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(result.Answers[name], combined.Answers[name]) {
+				t.Fatalf("question %s changed when sharing workspace: got %+v want %+v", name, result.Answers[name], combined.Answers[name])
+			}
+		}
 	}
 }
 func TestLayaRealCheckpoint(t *testing.T) {

@@ -26,7 +26,7 @@ func TestAttentionMatchesScalar(t *testing.T) {
 				for i := range out {
 					out[i] = 123
 				} // Backend must overwrite, not accumulate.
-				scratch := make([]float32, attentionBlock*n)
+				var scratch []float32
 				scale := float32(1 / math.Sqrt(dim))
 				if err := Attention(context.Background(), n, heads, dim, window, scale, qkv, out, &scratch); err != nil {
 					t.Fatal(err)
@@ -64,8 +64,12 @@ func TestAttentionMatchesScalar(t *testing.T) {
 						}
 					}
 				}
-				if len(scratch) > attentionBlock*n {
-					t.Fatalf("unbounded scratch: %d", len(scratch))
+				keys := n
+				if window >= 0 {
+					keys = min(n, attentionBlock+2*window)
+				}
+				if want := min(n, attentionBlock) * keys; len(scratch) != want {
+					t.Fatalf("scratch: got %d floats, want %d", len(scratch), want)
 				}
 			})
 		}

@@ -4,6 +4,8 @@ package gopherllm
 
 import "context"
 
+func blasGemmNN(m, n, k int, a, b, out []float32) bool { return false }
+
 func prepareVoxtralStreamWeights(ctx context.Context, w *VoxtralRealtimeWeights) error {
 	return ctx.Err()
 }

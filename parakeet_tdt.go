@@ -12,14 +12,17 @@ import "math"
 // Hidden; i,f,o gates use sigmoid, the cell candidate g uses tanh.
 
 type parakeetLSTMState struct {
-	H, C [][]float32 // [layer][Hidden]
+	H, C           [][]float32 // [layer][Hidden]
+	gatesI, gatesH [][]float32
 }
 
 func newParakeetLSTMState(layers []ParakeetLSTMLayer, hidden int) *parakeetLSTMState {
-	s := &parakeetLSTMState{H: make([][]float32, len(layers)), C: make([][]float32, len(layers))}
+	s := &parakeetLSTMState{H: make([][]float32, len(layers)), C: make([][]float32, len(layers)), gatesI: make([][]float32, len(layers)), gatesH: make([][]float32, len(layers))}
 	for i := range layers {
 		s.H[i] = make([]float32, hidden)
 		s.C[i] = make([]float32, hidden)
+		s.gatesI[i] = make([]float32, 4*hidden)
+		s.gatesH[i] = make([]float32, 4*hidden)
 	}
 	return s
 }
@@ -28,16 +31,18 @@ func sigmoid(x float32) float32 { return 1 / (1 + float32(math.Exp(float64(-x)))
 
 // parakeetLSTMStep runs one input through every LSTM layer, updating state
 // in place, and returns the top layer's hidden state (the prediction
-// network's output for this step).
+// network's output for this step). The returned slice belongs to state and
+// is overwritten by the next step.
 func parakeetLSTMStep(layers []ParakeetLSTMLayer, state *parakeetLSTMState, input []float32) []float32 {
 	x := input
 	for li, layer := range layers {
 		hidden := len(state.H[li])
-		var gatesI, gatesH []float32
-		layer.WeightIH.MatvecInto(x, &gatesI)
-		layer.WeightHH.MatvecInto(state.H[li], &gatesH)
-		newH := make([]float32, hidden)
-		newC := make([]float32, hidden)
+		layer.WeightIH.MatvecInto(x, &state.gatesI[li])
+		layer.WeightHH.MatvecInto(state.H[li], &state.gatesH[li])
+		gatesI, gatesH := state.gatesI[li], state.gatesH[li]
+		// Both projections consumed the previous state before any element is
+		// updated. H/C can therefore be reused without changing the recurrence.
+		newH, newC := state.H[li], state.C[li]
 		for j := 0; j < hidden; j++ {
 			gi := gatesI[j] + gatesH[j] + layer.BiasIH[j] + layer.BiasHH[j]
 			gf := gatesI[hidden+j] + gatesH[hidden+j] + layer.BiasIH[hidden+j] + layer.BiasHH[hidden+j]
@@ -88,6 +93,29 @@ func parakeetJoint(cfg ParakeetRNNTConfig, jw ParakeetJointWeights, encFrame, pr
 	return out
 }
 
+// The two input projections remain valid until their own inputs change:
+// a zero-duration symbol keeps the encoder frame, and blank spans keep the
+// prediction state. Scratch belongs to one decode, never to shared weights.
+type parakeetJointScratch struct {
+	enc, pred, combined, logits []float32
+}
+
+func parakeetJointProjectedInto(jw ParakeetJointWeights, scratch *parakeetJointScratch) []float32 {
+	ensureLenNoClear(&scratch.combined, len(scratch.enc))
+	for i := range scratch.combined {
+		v := scratch.enc[i] + float32At(jw.EncBias, i) + scratch.pred[i] + float32At(jw.PredBias, i)
+		if v < 0 {
+			v = 0
+		}
+		scratch.combined[i] = v
+	}
+	jw.Out.MatvecInto(scratch.combined, &scratch.logits)
+	for i := range scratch.logits {
+		scratch.logits[i] += float32At(jw.OutBias, i)
+	}
+	return scratch.logits
+}
+
 func float32At(s []float32, i int) float32 {
 	if i < len(s) {
 		return s[i]
@@ -120,10 +148,22 @@ func ParakeetGreedyDecodeTDT(cfg ParakeetConfig, w ParakeetWeights, encoderFrame
 	predOut := parakeetLSTMStep(w.Decoder.LSTM, state, prevEmbed)
 
 	var tokens []int
+	var scratch parakeetJointScratch
+	var embedRow []float32
+	projectedFrame := -1
+	predDirty := true
 	t := 0
 	symbolsThisFrame := 0
 	for t < len(encoderFrames) {
-		logits := parakeetJoint(cfg.RNNT, w.Joint, encoderFrames[t], predOut)
+		if projectedFrame != t {
+			w.Joint.Enc.MatvecInto(encoderFrames[t], &scratch.enc)
+			projectedFrame = t
+		}
+		if predDirty {
+			w.Joint.Pred.MatvecInto(predOut, &scratch.pred)
+			predDirty = false
+		}
+		logits := parakeetJointProjectedInto(w.Joint, &scratch)
 		tokenLogits := logits[:cfg.RNNT.VocabSize+1]
 		durLogits := logits[cfg.RNNT.VocabSize+1:]
 		tokenID, _ := argmaxF32(tokenLogits)
@@ -132,9 +172,9 @@ func ParakeetGreedyDecodeTDT(cfg ParakeetConfig, w ParakeetWeights, encoderFrame
 
 		if tokenID != cfg.RNNT.BlankID {
 			tokens = append(tokens, tokenID)
-			var embedRow []float32
 			w.Decoder.Embed.RowInto(tokenID, cfg.RNNT.PredEmbedDim, &embedRow)
 			predOut = parakeetLSTMStep(w.Decoder.LSTM, state, embedRow)
+			predDirty = true
 		}
 
 		symbolsThisFrame++
