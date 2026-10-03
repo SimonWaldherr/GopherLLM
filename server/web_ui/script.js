@@ -604,32 +604,86 @@ function splitThinkText(raw) {
   return { answer: result.answer.trim(), reasoning: result.reasoning.trim(), hasThink: result.hasThink, isThinking: result.isThinking };
 }
 
-/* Streaming call sites (generate()'s onToken, completeOnce()'s stream
-   callback) feed splitThinkText the whole answer-so-far on every token, so a
-   naive splitThinkText(answer) call re-scans the entire buffer from the
-   start each time -- O(length) work per token, O(length^2) over a full
-   answer. Once past any think block, a newly arrived chunk containing no "<"
-   cannot contain (or start) a tag, so it can be appended to the previous
-   result directly instead of re-parsed; this makes a call returned by this
-   factory O(1) amortized once the (typically short, front-loaded) think
-   block has closed. Falls back to a full splitThinkTextRaw() rescan whenever
-   that can't be guaranteed, so output always matches splitThinkText(next)
-   exactly. One splitter per stream -- state does not reset itself. */
+/* Parse only new tokens and a bounded tag suffix, including during long
+   reasoning blocks. Partial tags stay visible until complete, just like
+   splitThinkText(), but are retained so tags split across packets still work.
+   append() is for known token deltas; the callable snapshot form also accepts
+   corrected output and resets the parser when a stream replaces its prefix. */
 function createThinkSplitter() {
+  const openTag = "<think>";
+  const closeTag = "</think>";
   let lastRaw = "";
-  let state = splitThinkTextRaw("");
-  return function split(next) {
-    next = next || "";
-    const grew = next.length >= lastRaw.length && next.startsWith(lastRaw);
-    const appended = grew ? next.slice(lastRaw.length) : "";
-    if (grew && !state.isThinking && !appended.includes("<")) {
-      state = { answer: state.answer + appended, reasoning: state.reasoning, hasThink: state.hasThink, isThinking: false };
-    } else {
-      state = splitThinkTextRaw(next);
-    }
-    lastRaw = next;
-    return { answer: state.answer.trim(), reasoning: state.reasoning.trim(), hasThink: state.hasThink, isThinking: state.isThinking };
+  const emptyText = () => ({ value: "", trailing: "" });
+  let answer = emptyText(), reasoning = emptyText(), pending = "";
+  let mode = "initial", blocks = 0, hasThink = false;
+  // Trim only incoming text. Repeatedly trimming the accumulated answer or
+  // reasoning would flatten/copy its full string for each token again.
+  const appendText = (target, text) => {
+    if (!target.value) text = text.trimStart();
+    if (!text) return;
+    const body = text.trimEnd();
+    if (body) {
+      target.value += target.trailing + body;
+      target.trailing = text.slice(body.length);
+    } else target.trailing += text;
   };
+  const displayed = (target, suffix) => suffix ? target.value + target.trailing + suffix : target.value;
+  const result = () => ({
+    answer: displayed(answer, mode === "thinking" ? "" : pending),
+    reasoning: displayed(reasoning, mode === "thinking" ? pending : ""),
+    hasThink, isThinking: mode === "thinking"
+  });
+  const commit = (text) => {
+    appendText(mode === "thinking" ? reasoning : answer, text);
+  };
+  const append = (chunk) => {
+    chunk = chunk || "";
+    lastRaw += chunk;
+    let rest = pending + chunk;
+    pending = "";
+    while (rest) {
+      const markers = mode === "initial" ? [openTag, closeTag] : [mode === "thinking" ? closeTag : openTag];
+      let at = -1, marker = "";
+      for (const tag of markers) {
+        const found = rest.indexOf(tag);
+        if (found >= 0 && (at < 0 || found < at)) { at = found; marker = tag; }
+      }
+      if (at >= 0) {
+        commit(rest.slice(0, at));
+        hasThink = true;
+        if (marker === openTag) {
+          if (blocks++) appendText(reasoning, "\n\n");
+          mode = "thinking";
+        } else {
+          // Some models omit the opening tag for their first reasoning block.
+          if (mode === "initial") { reasoning = answer; answer = emptyText(); blocks = 1; }
+          mode = "answer";
+        }
+        rest = rest.slice(at + marker.length);
+        continue;
+      }
+      let held = 0;
+      for (const tag of markers) {
+        for (let length = Math.min(tag.length - 1, rest.length); length > held; length--) {
+          if (rest.endsWith(tag.slice(0, length))) { held = length; break; }
+        }
+      }
+      commit(held ? rest.slice(0, -held) : rest);
+      pending = held ? rest.slice(-held) : "";
+      break;
+    }
+    return result();
+  };
+  const split = (next) => {
+    next = next || "";
+    if (next.startsWith(lastRaw)) return append(next.slice(lastRaw.length));
+    lastRaw = pending = "";
+    answer = emptyText(); reasoning = emptyText();
+    mode = "initial"; blocks = 0; hasThink = false;
+    return append(next);
+  };
+  split.append = append;
+  return split;
 }
 
 /* IndexedDB is the primary local workspace store. localStorage is a fallback
@@ -1260,6 +1314,46 @@ function toMarkdown(chat) {
     for (const attachment of message.attachments || []) lines.push("Attachment: " + attachment.name + " · " + attachmentSummary(attachment), "");
   }
   return lines.join("\n");
+}
+
+// Recent chat content can be large. Build its case-folded search text only
+// when a title, instruction, or one of the eight searchable messages changes.
+// Weak keys let deleted/imported chats release their index without cleanup.
+function createChatFilter() {
+  const index = new WeakMap();
+  return (chats, query) => {
+    const needle = query.trim().toLowerCase();
+    const visible = needle ? chats.filter((chat) => {
+      const recent = chat.messages.slice(-8).map((message) => message.content);
+      let cached = index.get(chat);
+      if (!cached || cached.title !== chat.title || cached.systemPrompt !== chat.systemPrompt
+        || cached.recent.length !== recent.length || recent.some((text, i) => text !== cached.recent[i])) {
+        cached = { title: chat.title, systemPrompt: chat.systemPrompt, recent,
+          text: (chat.title + "\n" + chat.systemPrompt + "\n" + recent.join("\n")).toLowerCase() };
+        index.set(chat, cached);
+      }
+      return cached.text.includes(needle);
+    }) : chats.slice();
+    return visible.sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return b.updatedAt - a.updatedAt;
+    });
+  };
+}
+
+// Reuse unchanged rows and their event listeners. Avoid detaching an already
+// ordered row, which also keeps keyboard focus intact during status updates.
+function reconcileChildren(parent, children) {
+  let next = parent.firstChild;
+  for (const child of children) {
+    if (child === next) next = next.nextSibling;
+    else parent.insertBefore(child, next);
+  }
+  while (next) {
+    const removed = next;
+    next = next.nextSibling;
+    parent.removeChild(removed);
+  }
 }
 
 // Search only controls the presentation of settings. Hidden capabilities and
@@ -2044,67 +2138,82 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     return dateFormat.format(date);
   }
 
+  const filterChats = createChatFilter();
+  const chatRows = new Map();
+  const chatListEmpty = document.createElement("p");
+  chatListEmpty.className = "chat-empty";
+
+  function createChatRow(id) {
+    const row = document.createElement("div");
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "chat-select";
+    const title = document.createElement("span");
+    title.className = "chat-row-title";
+    const meta = document.createElement("span");
+    meta.className = "chat-row-meta";
+    select.append(title, meta);
+    select.addEventListener("click", () => openChat(id));
+    const pin = document.createElement("button");
+    pin.type = "button";
+    pin.className = "chat-pin";
+    pin.addEventListener("click", () => togglePinChat(id));
+    const menu = document.createElement("button");
+    menu.type = "button";
+    menu.className = "chat-menu";
+    menu.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg>';
+    menu.title = "Rename chat";
+    menu.addEventListener("click", () => manageChat(id));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "chat-delete";
+    remove.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>';
+    remove.title = "Delete chat";
+    remove.addEventListener("click", () => deleteChat(id));
+    row.append(select, pin, menu, remove);
+    return { row, select, title, meta, pin, menu, remove, active: null, pinned: null, label: null, metadata: null };
+  }
+
   function renderChatList() {
     const needle = chatSearchEl.value.trim().toLowerCase();
-    const visible = chats.slice().sort((a, b) => {
-      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-      return b.updatedAt - a.updatedAt;
-    }).filter((chat) => {
-      if (!needle) return true;
-      const text = chat.title + "\n" + chat.systemPrompt + "\n" + chat.messages.slice(-8).map((message) => message.content).join("\n");
-      return text.toLowerCase().includes(needle);
-    });
-    chatListEl.replaceChildren();
+    const visible = filterChats(chats, needle);
+    const retained = new Set(chats.map((chat) => chat.id));
+    for (const id of chatRows.keys()) if (!retained.has(id)) chatRows.delete(id);
     if (!visible.length) {
-      const empty = document.createElement("p");
-      empty.className = "chat-empty";
-      empty.textContent = needle ? "No chats match your search." : "No saved chats yet.";
-      chatListEl.appendChild(empty);
+      chatListEmpty.textContent = needle ? "No chats match your search." : "No saved chats yet.";
+      reconcileChildren(chatListEl, [chatListEmpty]);
       return;
     }
+    const rows = [];
     for (const chat of visible) {
-      const row = document.createElement("div");
-      row.className = "chat-row" + (chat.id === activeID ? " active" : "") + (chat.pinned ? " pinned" : "");
-      const select = document.createElement("button");
-      select.type = "button";
-      select.className = "chat-select";
-      select.setAttribute("aria-current", chat.id === activeID ? "page" : "false");
-      const title = document.createElement("span");
-      title.className = "chat-row-title";
-      title.textContent = chat.title;
-      const meta = document.createElement("span");
-      meta.className = "chat-row-meta";
-      meta.textContent = (chat.messages.length ? chat.messages.length + " messages" : "Empty chat") + " · " + stamp(chat.updatedAt);
-      select.append(title, meta);
-      select.addEventListener("click", () => openChat(chat.id));
-      const pin = document.createElement("button");
-      pin.type = "button";
-      pin.className = "chat-pin";
-      // Filled vs outline star, not two different glyphs: one <symbol>,
-      // toggled with .icon-fill so a pinned row's star matches the same
-      // vector weight as every other icon on the page.
-      pin.innerHTML = '<svg class="icon' + (chat.pinned ? " icon-fill" : "") + '" aria-hidden="true"><use href="#i-star"/></svg>';
-      pin.title = chat.pinned ? "Unpin chat" : "Pin chat";
-      pin.setAttribute("aria-label", (chat.pinned ? "Unpin " : "Pin ") + chat.title);
-      pin.setAttribute("aria-pressed", chat.pinned ? "true" : "false");
-      pin.addEventListener("click", () => togglePinChat(chat.id));
-      const menu = document.createElement("button");
-      menu.type = "button";
-      menu.className = "chat-menu";
-      menu.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg>';
-      menu.title = "Rename chat";
-      menu.setAttribute("aria-label", "Rename " + chat.title);
-      menu.addEventListener("click", () => manageChat(chat.id));
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "chat-delete";
-      remove.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg>';
-      remove.title = "Delete chat";
-      remove.setAttribute("aria-label", "Delete " + chat.title);
-      remove.addEventListener("click", () => deleteChat(chat.id));
-      row.append(select, pin, menu, remove);
-      chatListEl.appendChild(row);
+      let cached = chatRows.get(chat.id);
+      if (!cached) { cached = createChatRow(chat.id); chatRows.set(chat.id, cached); }
+      const active = chat.id === activeID;
+      const pinChanged = cached.pinned !== chat.pinned;
+      const labelChanged = cached.label !== chat.title;
+      if (cached.active !== active || pinChanged) {
+        cached.row.className = "chat-row" + (active ? " active" : "") + (chat.pinned ? " pinned" : "");
+        cached.select.setAttribute("aria-current", active ? "page" : "false");
+        cached.active = active;
+      }
+      if (labelChanged) {
+        cached.title.textContent = chat.title;
+        cached.menu.setAttribute("aria-label", "Rename " + chat.title);
+        cached.remove.setAttribute("aria-label", "Delete " + chat.title);
+        cached.label = chat.title;
+      }
+      if (pinChanged) {
+        cached.pin.innerHTML = '<svg class="icon' + (chat.pinned ? " icon-fill" : "") + '" aria-hidden="true"><use href="#i-star"/></svg>';
+        cached.pin.title = chat.pinned ? "Unpin chat" : "Pin chat";
+        cached.pin.setAttribute("aria-pressed", chat.pinned ? "true" : "false");
+        cached.pinned = chat.pinned;
+      }
+      if (pinChanged || labelChanged) cached.pin.setAttribute("aria-label", (chat.pinned ? "Unpin " : "Pin ") + chat.title);
+      const metadata = (chat.messages.length ? chat.messages.length + " messages" : "Empty chat") + " · " + stamp(chat.updatedAt);
+      if (cached.metadata !== metadata) { cached.meta.textContent = metadata; cached.metadata = metadata; }
+      rows.push(cached.row);
     }
+    reconcileChildren(chatListEl, rows);
   }
 
   function resizePrompt() {
@@ -3000,12 +3109,12 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       const delta = choice.delta || {};
       if (delta.reasoning_content) {
         out.reasoning += delta.reasoning_content;
-        onToken(out.answer, out.reasoning, true);
+        onToken(out.answer, out.reasoning, true, "");
       }
       if (delta.tool_calls) out.toolCalls = (out.toolCalls || []).concat(delta.tool_calls);
       if (delta.content) {
         out.answer += delta.content;
-        onToken(out.answer, out.reasoning, false);
+        onToken(out.answer, out.reasoning, false, delta.content);
       }
     };
     await readSSE(response, applyChunk);
@@ -3169,7 +3278,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       return splitThinkText((choice.message || {}).content || "").answer;
     }
     const split = createThinkSplitter();
-    const out = await readStream(response, (answer) => { if (onToken) onToken(split(answer).answer); });
+    const out = await readStream(response, (answer, nextReasoning, thinking, appended) => {
+      if (onToken) onToken(split.append(appended).answer);
+    });
     return splitThinkText(out.answer || "").answer;
   }
 
@@ -3346,7 +3457,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     let answer = "";
     const text = await window.GopherLLMBrowser.generate(wireMessages, wireOptions, (token) => {
       answer += token;
-      onToken(answer, "", false);
+      onToken(answer, "", false, token);
       return true;
     });
     return { answer: text, reasoning: "", toolCalls: null, usage: null, finishReason: "stop", contextWindow: null, promptCache: null };
@@ -3402,8 +3513,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       thinking: () => thinkingNow
     });
     const splitStream = createThinkSplitter();
-    const onToken = (answer, nextReasoning, thinking) => {
-      const parsed = splitStream(answer);
+    const onToken = (answer, nextReasoning, thinking, appended) => {
+      const parsed = appended === undefined ? splitStream(answer) : splitStream.append(appended);
       latest = parsed.answer;
       reasoning = nextReasoning || parsed.reasoning;
       tokenCount++;

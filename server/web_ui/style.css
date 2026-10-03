@@ -348,6 +348,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
 }
+.skip-link { position: fixed; z-index: 100; top: var(--sp-2); left: var(--sp-2); transform: translateY(calc(-100% - var(--sp-4))); padding: var(--sp-2) var(--sp-4); border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--panel); color: var(--accent); font-weight: 700; }
+.skip-link:focus { transform: translateY(0); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
@@ -496,8 +498,7 @@ header {
   gap: var(--sp-2h) var(--sp-4);
   padding: var(--sp-2h) clamp(var(--sp-4), 3vw, 32px);
   border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 88%, transparent);
-  backdrop-filter: blur(10px);
+  background: var(--panel);
 }
 .header-left, .brand, .top { display: flex; align-items: center; min-width: 0; }
 .header-left { flex: 1 1 auto; gap: 10px; }
@@ -533,6 +534,10 @@ h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
 .header-brief .icon, .header-share .icon { width: 17px; height: 17px; }
 .header-brief > span, .header-share > span { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .header-brief:hover:not(:disabled), .header-share:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); }
+@media (min-width: 1100px) {
+  .header-brief, .header-share { display: inline-flex; gap: var(--sp-1h); width: auto; padding-inline: var(--sp-2h); }
+  .header-brief > span, .header-share > span { position: static; width: auto; height: auto; padding: 0; margin: 0; overflow: visible; clip: auto; }
+}
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: var(--fs-sm); white-space: nowrap; }
 .status-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ok); }
 .status.busy .status-dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
@@ -553,7 +558,7 @@ h1 { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; 
    ════════════════════════════════ */
 body.chat main { position: relative; overflow-y: auto; overflow-x: hidden; padding: var(--sp-6) clamp(var(--sp-3), 3vw, var(--sp-7)); scrollbar-gutter: stable; background: radial-gradient(circle at 50% 12%, color-mix(in srgb, var(--accent) 4%, transparent), transparent min(42vw, 520px)); }
 body.chat .messages { width: min(880px, 100%); margin: 0 auto; display: flex; flex-direction: column; gap: var(--sp-5); }
-body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; color: var(--muted); text-align: center; }
+body.chat .empty { width: min(560px, 100%); margin: min(12vh, 110px) auto 0; color: var(--muted); text-align: center; }
 .empty-mark {
   display: grid; place-items: center; width: 52px; height: 52px; margin: 0 auto var(--sp-4);
   border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--line));
@@ -564,7 +569,7 @@ body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; col
 .empty-title { margin-bottom: var(--sp-1h); color: var(--ink); font-size: var(--fs-4xl); font-weight: 750; letter-spacing: -.025em; line-height: 1.2; }
 .empty p { max-width: 440px; margin: 0 auto; }
 .empty .hint { font-size: var(--fs-sm); }
-.suggestions { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--sp-2); margin: var(--sp-5) 0 var(--sp-4); }
+.suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-2h); margin: var(--sp-6) 0 var(--sp-4); }
 /* Both the "ready to chat" and "no model loaded" variants stay in the DOM
    at all times (see chat.html) so the suggestion buttons' click handlers,
    wired once at page init, never get destroyed by rebuilding this markup —
@@ -578,10 +583,15 @@ body.chat .empty { width: min(520px, 100%); margin: min(14vh, 130px) auto 0; col
 }
 .empty-cta:hover { filter: brightness(1.06); transform: translateY(-1px); }
 .suggestion {
-  min-width: 0; min-height: 36px; padding: 0 var(--sp-3); border: 1px solid var(--line-strong); border-radius: var(--r-pill);
+  display: flex; align-items: flex-start; gap: var(--sp-3); text-align: left;
+  min-width: 0; min-height: 76px; padding: var(--sp-4); border: 1px solid var(--line-strong); border-radius: var(--r-lg);
   background: var(--panel); color: var(--ink); box-shadow: var(--shadow); font-size: var(--fs-sm); font-weight: 600;
   transition: border-color .15s, color .15s, transform .15s;
 }
+.suggestion > .icon { margin-top: var(--sp-0h); color: var(--accent); }
+.suggestion-content { min-width: 0; display: grid; gap: var(--sp-1); }
+.suggestion strong { font-size: var(--fs-sm); font-weight: 700; }
+.suggestion small { color: var(--muted); font-size: var(--fs-xs); font-weight: 400; line-height: 1.4; }
 .suggestion:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent); transform: translateY(-1px); }
 .suggestion:active:not(:disabled) { transform: translateY(0); }
 kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: var(--r-xs); background: var(--panel); color: var(--ink); font: var(--fs-xs)/1.4 var(--mono); }
@@ -741,7 +751,7 @@ kbd { padding: 0 5px; border: 1px solid var(--line); border-bottom-width: 2px; b
    ════════════════════════════════ */
 /* The composer is the one surface that must never be mistaken for content, so
    it sits on --panel above a hairline and lifts the prompt box off it. */
-body.chat form { position: relative; border-top: 1px solid var(--line); background: var(--panel); padding: var(--sp-3) clamp(var(--sp-3), 3vw, var(--sp-7)) var(--sp-2h); }
+body.chat form { position: relative; border-top: 1px solid var(--line); background: var(--panel); padding: var(--sp-3) max(env(safe-area-inset-right), clamp(var(--sp-3), 3vw, var(--sp-7))) max(var(--sp-2h), env(safe-area-inset-bottom)) max(env(safe-area-inset-left), clamp(var(--sp-3), 3vw, var(--sp-7))); }
 body.chat .composer { width: min(880px, 100%); min-width: 0; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-2); align-items: end; }
 .prompt-wrap { position: relative; min-width: 0; border: 1px solid var(--line-strong); border-radius: var(--r-xl); background: var(--bg); box-shadow: var(--shadow); transition: border-color .15s, box-shadow .15s; }
 .prompt-wrap:hover:not(:focus-within) { border-color: color-mix(in srgb, var(--accent) 30%, var(--line)); }
@@ -1485,7 +1495,15 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
 /* ════════════════════════════════
    Responsive layout
    ════════════════════════════════ */
-@media (hover: none) { .message-controls, .code-copy, .chat-pin, .chat-menu { opacity: .78; } }
+@media (hover: none) {
+  .message-controls, .code-copy, .chat-pin, .chat-menu, .chat-delete { opacity: 1; }
+  .chat-pin, .chat-menu, .chat-delete { width: 36px; height: 36px; }
+  .chat-pin { right: 76px; }
+  .chat-menu { right: 40px; }
+  .chat-select { min-height: 52px; padding-right: 116px; }
+  .message-action, .code-copy, .capture-menu-item { min-height: 40px; }
+  body.chat .composer-icon-button, body.chat .mic-button { width: 44px; height: 44px; min-width: 44px; min-height: 44px; }
+}
 @media (max-width: 900px) {
   body.chat .app { grid-template-columns: 232px minmax(0, 1fr); }
   :root { --sidebar: 232px; }
@@ -1526,7 +1544,10 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .live-context { display: none; }
 }
 @media (max-width: 520px) {
-  .header-logo, .model-name { display: none; }
+  .header-logo { display: none; }
+  .brand { flex: 1; }
+  .titles { width: 100%; }
+  .model-name { max-width: 100%; font-size: var(--fs-3xs); }
   .rename-chat, .delete-chat { display: none; }
   /* No max-width here: h1 already shrinks via the nowrap header above, and a
      vw cap would strand empty space next to a short title. */
@@ -1536,7 +1557,7 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   header .icon-button { width: 36px; height: 36px; }
   .status-dot { width: 9px; height: 9px; }
   .suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-inline: 0; }
-  .suggestion { width: 100%; padding-inline: var(--sp-2); }
+  .suggestion { width: 100%; gap: var(--sp-2); padding: var(--sp-3); }
   body.chat .composer { gap: 6px; }
   body.chat #send { width: 44px; min-width: 44px; padding: 0; }
   body.chat #send.editing { width: auto; min-width: 104px; padding: 0 10px; }
@@ -1578,6 +1599,15 @@ body.chat #send.stop > span:first-child::after { content: ""; width: 7px; height
   .live-suggestions { display: none; }
   .live-output-panel { height: 108px; }
   #captureModal .live-prompt-panel textarea { min-height: 30px; }
+}
+@media (max-width: 360px) {
+  header { padding-inline: var(--sp-2); gap: var(--sp-1h); }
+  .top { gap: var(--sp-1); }
+  .suggestion > .icon { display: none; }
+}
+@media (max-height: 560px) {
+  body.chat .empty { margin-top: var(--sp-4); }
+  .empty-mark { width: 36px; height: 36px; margin-bottom: var(--sp-2); }
 }
 
 /* ── Simple / Advanced settings ───────────────────────────────────────────

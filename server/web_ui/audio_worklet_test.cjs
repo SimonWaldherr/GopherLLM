@@ -2,7 +2,7 @@ const {test}=require('node:test');
 const assert=require('node:assert/strict');
 const vm=require('node:vm');
 const fs=require('node:fs');
-const source=fs.readFileSync(__dirname+'/audio-worklet.js','utf8');
+const source=fs.readFileSync(__dirname+'/../../voiceweb/audio-worklet.js','utf8');
 
 function capture(rate, block) {
   const messages=[];let Processor;
@@ -16,8 +16,12 @@ function capture(rate, block) {
   processor.port.onmessage({data:'stop'});
   assert.equal(messages.pop(),'stopped');
   assert.equal(processor.process([[samples]]),false);
-  assert.ok(messages.slice(0,-1).every(buffer=>buffer.byteLength===6400));
-  return Buffer.concat(messages.map(buffer=>Buffer.from(buffer)));
+  const pcm=messages.filter(message=>message instanceof ArrayBuffer);
+  const levels=messages.filter(message=>!(message instanceof ArrayBuffer));
+  assert.ok(levels.length>0);
+  assert.ok(levels.every(message=>Number.isFinite(message.level)&&message.level>=0&&message.level<=1));
+  assert.ok(pcm.slice(0,-1).every(buffer=>buffer.byteLength===6400));
+  return Buffer.concat(pcm.map(buffer=>Buffer.from(buffer)));
 }
 for(const rate of [16000,44100,48000])test(`worklet ${rate} Hz preserves sample count and phase across render quanta`,()=>{
   const want=capture(rate,128);

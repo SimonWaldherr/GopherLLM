@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body class="chat" data-mermaid-cdn="{{.MermaidCDN}}" data-local-runtime="{{.HasLocalRuntime}}" data-deployment-mode="{{.DeploymentMode}}" data-browser-only="{{.BrowserOnly}}" data-admin-required="{{.AdminRequired}}" data-admin-authorized="{{.AdminAuthorized}}" data-features="{{.Features}}" data-network-exposed="{{.NetworkExposed}}" data-ui-mode="simple">
+<a class="skip-link" href="#prompt">Skip to message input</a>
 
 <!-- Icon sprite: plain geometric outlines, hand-drawn for this page, so every
      chrome icon renders from one same-origin vector source at a consistent
@@ -103,10 +104,10 @@
             <div class="empty-title">{{if .BrowserOnly}}Your on-device workspace{{else if .AdminRequired}}Your GopherLLM workspace{{else}}Your private local workspace{{end}}</div>
             <p>{{if .BrowserOnly}}The selected model runs in this browser tab. Your chat history stays in this browser.{{else if .AdminRequired}}Prompts are sent to this GopherLLM server. Your chat history stays in this browser.{{else}}Prompts are sent only to this GopherLLM server. Your chat history stays in this browser.{{end}}</p>
             <div class="suggestions" aria-label="Try a prompt">
-              <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms.">Explain a concept</button>
-              <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email.">Draft an email</button>
-              <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n">Review code</button>
-              <button type="button" class="suggestion" data-prompt="Classify this support request, ask for the missing order details, and draft a short customer reply with first troubleshooting steps.">Support ticket</button>
+              <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms."><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span class="suggestion-content"><strong>Explain a concept</strong><small>Make a complex idea clear</small></span></button>
+              <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email."><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg><span class="suggestion-content"><strong>Draft an email</strong><small>Find the right words</small></span></button>
+              <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n"><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span class="suggestion-content"><strong>Review code</strong><small>Spot bugs and improvements</small></span></button>
+              <button type="button" class="suggestion" data-prompt="Classify this support request, ask for the missing order details, and draft a short customer reply with first troubleshooting steps."><svg class="icon" aria-hidden="true"><use href="#i-brief"/></svg><span class="suggestion-content"><strong>Support ticket</strong><small>Turn a request into next steps</small></span></button>
             </div>
             <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
           </div>
@@ -128,6 +129,7 @@
           <textarea
             id="prompt"
             name="prompt"
+            aria-label="Message GopherLLM"
             rows="1"
             placeholder="Message GopherLLM…"
             autofocus

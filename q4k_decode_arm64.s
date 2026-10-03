@@ -27,10 +27,8 @@
 #define ROWQ4LOW(S, ACC) \
 	VADDV ACC.S4, V10 \
 	FMOVS F10, R8 \
-	MOVBU (4+S)(R0), R10 \
-	MOVBU (8+S)(R0), R11 \
-	AND $63, R10 \
-	AND $63, R11 \
+	UBFX $(8*S), R14, $6, R10 \
+	UBFX $(8*S), R15, $6, R11 \
 	MADDW R10, R7, R8, R7 \
 	SCVTFWS R11, F10 \
 	FMOVS.P 4(R3), F11 \
@@ -41,13 +39,10 @@
 #define ROWQ4HIGH(S, ACC) \
 	VADDV ACC.S4, V10 \
 	FMOVS F10, R8 \
-	MOVBU (4+S)(R0), R10 \
-	MOVBU (8+S)(R0), R11 \
-	MOVBU (12+S)(R0), R12 \
-	LSR $6, R10 \
-	LSR $6, R11 \
-	AND $15, R12, R13 \
-	LSR $4, R12 \
+	UBFX $(8*S+6), R14, $2, R10 \
+	UBFX $(8*S+6), R15, $2, R11 \
+	UBFX $(8*S), R16, $4, R13 \
+	UBFX $(8*S+4), R16, $4, R12 \
 	ORR R10<<4, R13, R10 \
 	ORR R11<<4, R12, R11 \
 	MADDW R10, R7, R8, R7 \
@@ -73,6 +68,11 @@ rowblock:
 	ADD $16, R0, R6
 	MOVD ZR, R7
 	FMOVS ZR, F24
+	// Load all packed scales once. The fixed bitfields preserve the exact
+	// sub-block reduction order while avoiding repeated byte loads/masks.
+	MOVWU 4(R0), R14
+	MOVWU 8(R0), R15
+	MOVWU 12(R0), R16
 	ROWQ4DOTS(V16, 16, V17, 17)
 	ROWQ4DOTS(V18, 18, V19, 19)
 	ROWQ4DOTS(V20, 20, V21, 21)
