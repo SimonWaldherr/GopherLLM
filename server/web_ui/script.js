@@ -1955,6 +1955,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
 
   function openDialog(root, opener, initialFocus) {
     if (activeDialog && activeDialog.root !== root) return;
+    const menu = opener && opener.closest(".action-menu");
+    if (menu) opener = document.querySelector('[aria-controls="' + menu.id + '"]');
+    closeActionMenus();
     root.hidden = false;
     activeDialog = { root, opener };
     setAppInert(true);
@@ -2121,11 +2124,76 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   }
 
   function setSidebar(open) {
+    if (open) closeActionMenus();
+    sidebarEl.inert = !open;
     sidebarEl.classList.toggle("is-open", open);
     sidebarScrimEl.hidden = !open;
     sidebarToggleEl.setAttribute("aria-expanded", String(open));
     sidebarToggleEl.setAttribute("aria-label", open ? "Close chat history" : "Open chat history");
+    if (open) newChatEl.focus();
+    if (!open && sidebarEl.contains(document.activeElement)) sidebarToggleEl.focus();
   }
+
+  const actionMenus = [
+    { trigger: $("workspaceMenuToggle"), menu: $("workspaceMenu") },
+    { trigger: $("toolsMenuToggle"), menu: $("toolsMenu") }
+  ];
+  function closeActionMenus(restoreFocus = false) {
+    for (const { trigger, menu } of actionMenus) {
+      if (restoreFocus && !menu.hidden && menu.contains(document.activeElement)) trigger.focus();
+      menu.hidden = true;
+      trigger.setAttribute("aria-expanded", "false");
+    }
+    closeCaptureMenus();
+  }
+  for (const { trigger, menu } of actionMenus) {
+    menu.querySelectorAll("button").forEach(button => button.setAttribute("role", "menuitem"));
+    const items = () => Array.from(menu.querySelectorAll('button:not([disabled])'))
+      .filter(button => !button.closest("[hidden]") && button.getClientRects().length);
+    const open = (last = false) => {
+      closeActionMenus();
+      setSidebar(false);
+      menu.hidden = false;
+      trigger.setAttribute("aria-expanded", "true");
+      const available = items();
+      const target = last ? available.at(-1) : available[0];
+      if (target) target.focus();
+    };
+    trigger.addEventListener("click", () => menu.hidden ? open() : closeActionMenus(true));
+    trigger.addEventListener("keydown", event => {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        open(event.key === "ArrowUp");
+      }
+    });
+    menu.addEventListener("keydown", event => {
+      if (event.key === "Tab") { closeActionMenus(true); return; }
+      if (event.key === "Escape") {
+        event.preventDefault(); event.stopPropagation(); closeActionMenus(true); return;
+      }
+      const available = items();
+      let index = available.indexOf(document.activeElement);
+      if (event.key === "ArrowDown") index = (index + 1) % available.length;
+      else if (event.key === "ArrowUp") index = (index - 1 + available.length) % available.length;
+      else if (event.key === "Home") index = 0;
+      else if (event.key === "End") index = available.length - 1;
+      else return;
+      event.preventDefault();
+      if (available[index]) available[index].focus();
+    });
+    // Let the action run before hiding its item. Dialogs restore focus to the
+    // visible menu trigger; inline tools can keep the focus they requested.
+    menu.addEventListener("click", event => {
+      const button = event.target.closest("button");
+      if (button && !button.disabled && button.getAttribute("aria-haspopup") !== "menu") closeActionMenus(true);
+    });
+  }
+  document.addEventListener("click", event => {
+    if (!event.target.closest(".action-menu-anchor")) closeActionMenus(true);
+  });
+  document.addEventListener("focusin", event => {
+    if (!event.target.closest(".action-menu-anchor")) closeActionMenus();
+  });
 
   const timeFormat = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
   const weekdayFormat = new Intl.DateTimeFormat(undefined, { weekday: "short" });

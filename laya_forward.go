@@ -3,6 +3,7 @@ package gopherllm
 import (
 	"context"
 	"math"
+	"sync"
 )
 
 // Layer workspaces are reused across the sequential questions in one request,
@@ -36,6 +37,7 @@ type layaWorkspace struct {
 	input, norm, qkv, attention, projection, hidden layaBuffer
 	scores                                          []float32
 	rotary                                          [2]layaRotary
+	attentionTask                                   layaAttentionTask
 }
 
 type layaRotary struct {
@@ -154,6 +156,71 @@ func layaSoftmax(x []float32) {
 		x[i] /= float32(sum)
 	}
 }
+
+// A request-local pool reuses one score row per active worker, retaining the
+// worker pool's fine-grained scheduling on CPUs with unequal core speeds.
+type layaAttentionTask struct {
+	ctx                               context.Context
+	n, heads, dim, window, scoreWidth int
+	scale                             float32
+	qkv, out                          [][]float32
+	scorePool                         sync.Pool
+}
+
+func layaAttentionPortable(ctx context.Context, n, heads, dim, window int, scale float32, work *layaWorkspace) error {
+	task := &work.attentionTask
+	task.ctx, task.n, task.heads, task.dim, task.window, task.scale = ctx, n, heads, dim, window, scale
+	task.qkv, task.out = work.qkv.rows, work.attention.rows
+	task.scoreWidth = n
+	if window >= 0 {
+		task.scoreWidth = min(n, 2*min(window, n)+1)
+	}
+	parallelChunksTask(n*heads, task)
+	task.ctx, task.qkv, task.out = nil, nil, nil
+	return ctx.Err()
+}
+
+func (t *layaAttentionTask) runRows(start, end int) {
+	slot := t.scorePool.Get()
+	var scratch *[]float32
+	if slot == nil {
+		scratch = new([]float32)
+	} else {
+		scratch = slot.(*[]float32)
+	}
+	if cap(*scratch) < t.scoreWidth {
+		*scratch = make([]float32, t.scoreWidth)
+	} else {
+		*scratch = (*scratch)[:t.scoreWidth]
+	}
+	defer t.scorePool.Put(scratch)
+	scores := *scratch
+	width := t.heads * t.dim
+	for job := start; job < end; job++ {
+		if t.ctx.Err() != nil {
+			return
+		}
+		p, h := job/t.heads, job%t.heads
+		lo, hi := 0, t.n
+		if t.window >= 0 {
+			lo = max(0, p-t.window)
+			hi = min(t.n, p+t.window+1)
+		}
+		off := h * t.dim
+		q := t.qkv[p][off : off+t.dim]
+		for j := lo; j < hi; j++ {
+			scores[j-lo] = DotF32(q, t.qkv[j][width+off:width+off+t.dim]) * t.scale
+		}
+		row := scores[:hi-lo]
+		layaSoftmax(row)
+		dest := t.out[p][off : off+t.dim]
+		clear(dest)
+		for j := lo; j < hi; j++ {
+			AxpyF32(dest, row[j-lo], t.qkv[j][2*width+off:2*width+off+t.dim])
+		}
+	}
+}
+
 func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspace) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -164,39 +231,16 @@ func (l layaLayer) forward(ctx context.Context, x [][]float32, work *layaWorkspa
 	if l.theta > 0 {
 		layaRotate(qkv, l.heads, l.theta, work)
 	}
-	attended := work.attention.resize(n, d, true)
+	attended := work.attention.resize(n, d, false)
 	scale := float32(1 / math.Sqrt(float64(hd)))
 	if accelerated, err := layaAttentionAccelerated(ctx, n, l.heads, hd, l.window, scale, work); accelerated {
 		if err != nil {
 			return err
 		}
 	} else {
-		// Only one score row per worker: memory is O(sequence*hidden), not O(n²*heads).
-		parallelChunks(n*l.heads, func(start, end int) {
-			scores := make([]float32, n)
-			for job := start; job < end; job++ {
-				if ctx.Err() != nil {
-					return
-				}
-				p, h := job/l.heads, job%l.heads
-				lo, hi := 0, n
-				if l.window >= 0 {
-					lo = max(0, p-l.window)
-					hi = min(n, p+l.window+1)
-				}
-				q := qkv[p][h*hd : (h+1)*hd]
-				for j := lo; j < hi; j++ {
-					scores[j-lo] = DotF32(q, qkv[j][d+h*hd:d+(h+1)*hd]) * scale
-				}
-				row := scores[:hi-lo]
-				layaSoftmax(row)
-				dest := attended[p][h*hd : (h+1)*hd]
-				for j := lo; j < hi; j++ {
-					v := qkv[j][2*d+h*hd : 2*d+(h+1)*hd]
-					AxpyF32(dest, row[j-lo], v)
-				}
-			}
-		})
+		if err := layaAttentionPortable(ctx, n, l.heads, hd, l.window, scale, work); err != nil {
+			return err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err

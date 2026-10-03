@@ -8,6 +8,9 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"reflect"
+	"runtime"
+	"sync"
 	"testing"
 )
 
@@ -68,7 +71,15 @@ func TestAttentionMatchesScalar(t *testing.T) {
 				if window >= 0 {
 					keys = min(n, attentionBlock+2*window)
 				}
-				if want := min(n, attentionBlock) * keys; len(scratch) != want {
+				workers := min(heads, runtime.GOMAXPROCS(0))
+				perQuery := n
+				if window >= 0 {
+					perQuery = min(n, 2*window+1)
+				}
+				if n < 64 || n*heads*perQuery < 32768 {
+					workers = 1
+				}
+				if want := workers * min(n, attentionBlock) * keys; len(scratch) != want {
 					t.Fatalf("scratch: got %d floats, want %d", len(scratch), want)
 				}
 			})
@@ -133,6 +144,75 @@ func TestStridedProjection(t *testing.T) {
 			if math.Abs(float64(out[i*rows+j])-want) > 3e-6 {
 				t.Fatalf("row%d col%d", i, j)
 			}
+		}
+	}
+}
+
+func BenchmarkAttentionParallel(b *testing.B) {
+	for _, n := range []int{128, 512, 2048} {
+		for _, window := range []int{-1, 64} {
+			for _, threads := range []int{1, 12} {
+				b.Run(fmt.Sprintf("n%d/window%d/threads%d", n, window, threads), func(b *testing.B) {
+					const heads, dim = 12, 64
+					qkv := make([]float32, 3*n*heads*dim)
+					for i := range qkv {
+						qkv[i] = float32(math.Sin(float64(i) * .07))
+					}
+					out := make([]float32, n*heads*dim)
+					var scratch []float32
+					ctx := context.Background()
+					if err := AttentionWithThreads(ctx, n, heads, dim, window, .125, qkv, out, &scratch, threads); err != nil {
+						b.Fatal(err)
+					}
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						if err := AttentionWithThreads(ctx, n, heads, dim, window, .125, qkv, out, &scratch, threads); err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestAttentionParallelExactlyMatchesSerial(t *testing.T) {
+	for _, shape := range [][3]int{{259, 7, 17}, {512, 12, 64}} {
+		for _, window := range []int{-1, 0, 1, 64, 512} {
+			n, heads, dim := shape[0], shape[1], shape[2]
+			qkv := make([]float32, 3*n*heads*dim)
+			rng := rand.New(rand.NewSource(91))
+			for i := range qkv {
+				qkv[i] = float32(rng.NormFloat64())
+			}
+			want := make([]float32, n*heads*dim)
+			var scratch []float32
+			if err := AttentionWithThreads(context.Background(), n, heads, dim, window, .2, qkv, want, &scratch, 1); err != nil {
+				t.Fatal(err)
+			}
+			// Concurrent requests must have disjoint scratch and outputs. Uneven head
+			// counts exercise workers processing more than one head and partial blocks.
+			var wg sync.WaitGroup
+			for _, threads := range []int{2, 3, 7, 12} {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					got := make([]float32, len(want))
+					var work []float32
+					for range 2 {
+						if err := AttentionWithThreads(context.Background(), n, heads, dim, window, .2, qkv, got, &work, threads); err != nil {
+							t.Error(err)
+							return
+						}
+						if !reflect.DeepEqual(got, want) {
+							t.Errorf("window%d threads%d differs from serial", window, threads)
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
 		}
 	}
 }

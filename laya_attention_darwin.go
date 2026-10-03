@@ -10,7 +10,7 @@ import (
 )
 
 func layaAttentionAccelerated(ctx context.Context, n, heads, dim, window int, scale float32, work *layaWorkspace) (bool, error) {
-	return true, layablas.Attention(ctx, n, heads, dim, window, scale, work.qkv.data, work.attention.data, &work.scores)
+	return true, layablas.AttentionWithThreads(ctx, n, heads, dim, window, scale, work.qkv.data, work.attention.data, &work.scores, numThreads())
 }
 
 // Only the layer workspace path uses this helper. Verify the strided layout

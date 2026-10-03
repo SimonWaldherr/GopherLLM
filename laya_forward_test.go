@@ -1,8 +1,12 @@
 package gopherllm
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -129,6 +133,135 @@ func BenchmarkLayaRotary(b *testing.B) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// Preserve the previous algorithm, including its per-chunk score allocation,
+// as a bit-exact reference and a reproducible allocation benchmark.
+func layaAttentionReference(ctx context.Context, n, heads, dim, window int, scale float32, work *layaWorkspace) {
+	width := heads * dim
+	clear(work.attention.data)
+	parallelChunks(n*heads, func(start, end int) {
+		scores := make([]float32, n)
+		for job := start; job < end; job++ {
+			if ctx.Err() != nil {
+				return
+			}
+			p, h := job/heads, job%heads
+			lo, hi := 0, n
+			if window >= 0 {
+				lo = max(0, p-window)
+				hi = min(n, p+window+1)
+			}
+			q := work.qkv.rows[p][h*dim : (h+1)*dim]
+			for j := lo; j < hi; j++ {
+				scores[j-lo] = DotF32(q, work.qkv.rows[j][width+h*dim:width+(h+1)*dim]) * scale
+			}
+			row := scores[:hi-lo]
+			layaSoftmax(row)
+			dest := work.attention.rows[p][h*dim : (h+1)*dim]
+			for j := lo; j < hi; j++ {
+				AxpyF32(dest, row[j-lo], work.qkv.rows[j][2*width+h*dim:2*width+(h+1)*dim])
+			}
+		}
+	})
+}
+
+func TestLayaPortableAttentionMatchesReference(t *testing.T) {
+	previous := numThreads()
+	defer SetNumThreads(previous)
+	previousOversubscribe := oversubscribeDispatch.Load()
+	defer oversubscribeDispatch.Store(previousOversubscribe)
+	SetNumThreads(3)
+	oversubscribeDispatch.Store(true)
+	for _, n := range []int{1, 7, 64, 129, 257} {
+		for _, window := range []int{-1, 0, 1, 64, 512} {
+			const heads, dim = 5, 7
+			var work layaWorkspace
+			work.qkv.resize(n, 3*heads*dim, false)
+			work.attention.resize(n, heads*dim, false)
+			for i := range work.qkv.data {
+				work.qkv.data[i] = float32(math.Sin(float64(i) * .31))
+			}
+			layaAttentionReference(context.Background(), n, heads, dim, window, .37, &work)
+			want := append([]float32(nil), work.attention.data...)
+			for range 2 {
+				for i := range work.attention.data {
+					work.attention.data[i] = 123
+				}
+				if err := layaAttentionPortable(context.Background(), n, heads, dim, window, .37, &work); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(work.attention.data, want) {
+					t.Fatalf("n%d window%d changed", n, window)
+				}
+			}
+		}
+	}
+}
+
+func TestLayaPortableAttentionConcurrentAndCanceled(t *testing.T) {
+	const n, heads, dim = 129, 3, 5
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var work layaWorkspace
+			work.qkv.resize(n, 3*heads*dim, false)
+			work.attention.resize(n, heads*dim, false)
+			for i := range work.qkv.data {
+				work.qkv.data[i] = float32(math.Sin(float64(i) * .19))
+			}
+			layaAttentionReference(context.Background(), n, heads, dim, 8, .4, &work)
+			want := append([]float32(nil), work.attention.data...)
+			if err := layaAttentionPortable(context.Background(), n, heads, dim, 8, .4, &work); err != nil {
+				t.Error(err)
+			}
+			if !reflect.DeepEqual(work.attention.data, want) {
+				t.Error("concurrent output changed")
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if err := layaAttentionPortable(ctx, n, heads, dim, 8, .4, &work); !errors.Is(err, context.Canceled) {
+				t.Errorf("cancel: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkLayaPortableAttention(b *testing.B) {
+	for _, n := range []int{128, 512} {
+		for _, window := range []int{-1, 64} {
+			for _, reuse := range []bool{false, true} {
+				b.Run(fmt.Sprintf("n%d/window%d/reuse%t", n, window, reuse), func(b *testing.B) {
+					const heads, dim = 12, 64
+					var work layaWorkspace
+					work.qkv.resize(n, 3*heads*dim, false)
+					work.attention.resize(n, heads*dim, false)
+					for i := range work.qkv.data {
+						work.qkv.data[i] = float32(math.Sin(float64(i) * .07))
+					}
+					ctx := context.Background()
+					run := func() {
+						if reuse {
+							if err := layaAttentionPortable(ctx, n, heads, dim, window, .125, &work); err != nil {
+								b.Fatal(err)
+							}
+						} else {
+							layaAttentionReference(ctx, n, heads, dim, window, .125, &work)
+						}
+					}
+					run()
+					b.ReportAllocs()
+					b.ResetTimer()
+					for range b.N {
+						run()
+					}
+				})
+			}
 		}
 	}
 }

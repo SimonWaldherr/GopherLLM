@@ -22,6 +22,7 @@
   <symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
   <symbol id="i-menu" viewBox="0 0 24 24"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.5" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-settings" viewBox="0 0 24 24"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="14" cy="6" r="1.8" fill="currentColor" stroke="none"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="8" cy="12" r="1.8" fill="currentColor" stroke="none"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="16" cy="18" r="1.8" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3L8 19l-4 1z"/><path d="M14 6l4 4"/></symbol>
   <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/><path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"/></symbol>
@@ -47,7 +48,7 @@
 </svg>
 
 <div class="app">
-  <aside id="sidebar" class="sidebar" aria-label="Saved conversations">
+  <aside id="sidebar" inert class="sidebar" aria-label="Saved conversations">
     <div class="sidebar-brand">
       <span class="logo" aria-hidden="true">G</span>
       <span>GopherLLM</span>
@@ -77,8 +78,6 @@
           <div class="titles">
             <div class="chat-heading">
               <h1 id="chatTitle">New chat</h1>
-              <button id="renameChat" class="rename-chat" type="button" aria-label="Rename this chat" title="Rename chat"><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg></button>
-              <button id="deleteChat" class="delete-chat" type="button" aria-label="Delete this chat" title="Delete chat"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg></button>
             </div>
             <button id="modelName" class="model-name" type="button" title="{{.Model}}" aria-label="Change active model">{{.Model}}</button>
           </div>
@@ -89,10 +88,17 @@
           <span class="status-dot" aria-hidden="true"></span>
           <span id="statusText">Ready</span>
         </div>
-        <button id="briefChat" class="header-brief" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="briefing" title="Create chat briefing"><svg class="icon" aria-hidden="true"><use href="#i-brief"/></svg><span>Briefing</span></button>
-        <button id="shareChat" class="header-share" type="button" title="Share chat"><svg class="icon" aria-hidden="true"><use href="#i-share"/></svg><span>Share</span></button>
-        <button id="archToggle" class="icon-button" type="button" aria-label="Model architecture" title="Model architecture" aria-haspopup="dialog" aria-expanded="false" aria-controls="archViewer"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg></button>
-        <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg></button>
+        <div class="action-menu-anchor">
+          <button id="workspaceMenuToggle" class="icon-button menu-toggle" type="button" aria-label="Chat actions and settings" title="Chat actions and settings" aria-haspopup="menu" aria-expanded="false" aria-controls="workspaceMenu"><svg class="icon" aria-hidden="true"><use href="#i-more"/></svg></button>
+          <div id="workspaceMenu" class="action-menu workspace-menu" role="menu" aria-label="Chat actions and settings" hidden>
+            <button id="briefChat" class="header-brief" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="briefing" title="Create chat briefing"><svg class="icon" aria-hidden="true"><use href="#i-brief"/></svg><span>Briefing</span></button>
+            <button id="shareChat" class="header-share" type="button" title="Share chat"><svg class="icon" aria-hidden="true"><use href="#i-share"/></svg><span>Share</span></button>
+            <button id="archToggle" class="icon-button" type="button" aria-label="Model architecture" title="Model architecture" aria-haspopup="dialog" aria-expanded="false" aria-controls="archViewer"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg><span>Model architecture</span></button>
+            <button id="settingsToggle" class="icon-button" type="button" aria-label="Settings" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings"><svg class="icon" aria-hidden="true"><use href="#i-settings"/></svg><span>Settings</span></button>
+            <button id="renameChat" class="rename-chat" type="button" aria-label="Rename this chat" title="Rename chat"><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg><span>Rename chat</span></button>
+            <button id="deleteChat" class="delete-chat" type="button" aria-label="Delete this chat" title="Delete chat"><svg class="icon" aria-hidden="true"><use href="#i-trash"/></svg><span>Delete chat</span></button>
+          </div>
+        </div>
       </div>
     </header>
 
@@ -103,12 +109,14 @@
           <div class="empty-ready">
             <div class="empty-title">{{if .BrowserOnly}}Your on-device workspace{{else if .AdminRequired}}Your GopherLLM workspace{{else}}Your private local workspace{{end}}</div>
             <p>{{if .BrowserOnly}}The selected model runs in this browser tab. Your chat history stays in this browser.{{else if .AdminRequired}}Prompts are sent to this GopherLLM server. Your chat history stays in this browser.{{else}}Prompts are sent only to this GopherLLM server. Your chat history stays in this browser.{{end}}</p>
+            <details class="prompt-starters"><summary>Try a prompt</summary>
             <div class="suggestions" aria-label="Try a prompt">
               <button type="button" class="suggestion" data-prompt="Explain the key idea in simple terms."><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg><span class="suggestion-content"><strong>Explain a concept</strong><small>Make a complex idea clear</small></span></button>
               <button type="button" class="suggestion" data-prompt="Help me draft a concise, friendly email."><svg class="icon" aria-hidden="true"><use href="#i-pencil"/></svg><span class="suggestion-content"><strong>Draft an email</strong><small>Find the right words</small></span></button>
               <button type="button" class="suggestion" data-prompt="Review this code and suggest improvements:\n\n"><svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span class="suggestion-content"><strong>Review code</strong><small>Spot bugs and improvements</small></span></button>
               <button type="button" class="suggestion" data-prompt="Classify this support request, ask for the missing order details, and draft a short customer reply with first troubleshooting steps."><svg class="icon" aria-hidden="true"><use href="#i-brief"/></svg><span class="suggestion-content"><strong>Support ticket</strong><small>Turn a request into next steps</small></span></button>
             </div>
+            </details>
             <p class="hint"><kbd>Enter</kbd> to send <span aria-hidden="true">·</span> <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</p>
           </div>
           <div class="empty-no-model">
@@ -161,35 +169,38 @@
           <p id="captureError" class="settings-note model-download-status is-error" hidden></p>
           <div class="prompt-footer">
             <div class="prompt-footer-start">
-              <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
-              <input id="fileInput" type="file" multiple hidden>
-              <button id="attachImage" class="composer-icon-button" type="button" aria-label="Attach an image" title="Attach an image" hidden><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg></button>
-              <input id="imageFileInput" type="file" accept="image/*" hidden>
-              <div id="cameraCaptureGroup" class="capture-action-group" hidden>
-                <button id="webcamButton" class="composer-icon-button capture-group-trigger" type="button" aria-label="Camera capture options" title="Camera: capture or live" aria-haspopup="menu" aria-expanded="false" aria-controls="cameraCaptureMenu"><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg><span class="capture-group-trigger-label">Camera</span><svg class="capture-group-chevron" aria-hidden="true"><use href="#i-chevron"/></svg></button>
-                <div id="cameraCaptureMenu" class="capture-action-menu" role="menu" aria-label="Camera actions" hidden>
-                  <button id="cameraCaptureSnapshot" class="capture-menu-item" type="button" role="menuitem">Capture image</button>
-                  <button id="liveVisionButton" class="capture-menu-item" type="button" role="menuitem">Start live camera</button>
+              <div class="action-menu-anchor">
+                <button id="toolsMenuToggle" class="composer-icon-button menu-toggle" type="button" aria-label="Attachments and tools" title="Attachments and tools" aria-haspopup="menu" aria-expanded="false" aria-controls="toolsMenu"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg></button>
+                <div id="toolsMenu" class="action-menu tools-menu" role="menu" aria-label="Attachments and tools" hidden>
+                  <button id="attachFile" class="composer-icon-button" type="button" aria-label="Attach files" title="Attach files"><svg class="icon" aria-hidden="true"><use href="#i-plus"/></svg><span>Attach files</span></button>
+                  <input id="fileInput" type="file" multiple hidden>
+                  <button id="attachImage" class="composer-icon-button" type="button" aria-label="Attach an image" title="Attach an image" hidden><svg class="icon" aria-hidden="true"><use href="#i-image"/></svg><span>Attach image</span></button>
+                  <input id="imageFileInput" type="file" accept="image/*" hidden>
+                  <div id="cameraCaptureGroup" class="capture-action-group" hidden>
+                    <button id="webcamButton" class="composer-icon-button capture-group-trigger" type="button" aria-label="Camera capture options" title="Camera: capture or live" aria-haspopup="menu" aria-expanded="false" aria-controls="cameraCaptureMenu"><svg class="icon" aria-hidden="true"><use href="#i-camera"/></svg><span class="capture-group-trigger-label">Camera</span><svg class="capture-group-chevron" aria-hidden="true"><use href="#i-chevron"/></svg></button>
+                    <div id="cameraCaptureMenu" class="capture-action-menu" role="menu" aria-label="Camera actions" hidden>
+                      <button id="cameraCaptureSnapshot" class="capture-menu-item" type="button" role="menuitem">Capture image</button>
+                      <button id="liveVisionButton" class="capture-menu-item" type="button" role="menuitem">Start live camera</button>
+                    </div>
+                  </div>
+                  <div id="screenCaptureGroup" class="capture-action-group" hidden>
+                    <button id="screenButton" class="composer-icon-button capture-group-trigger" type="button" aria-label="Screen capture options" title="Screen: capture or live" aria-haspopup="menu" aria-expanded="false" aria-controls="screenCaptureMenu"><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg><span class="capture-group-trigger-label">Screen</span><svg class="capture-group-chevron" aria-hidden="true"><use href="#i-chevron"/></svg></button>
+                    <div id="screenCaptureMenu" class="capture-action-menu" role="menu" aria-label="Screen actions" hidden>
+                      <button id="screenCaptureSnapshot" class="capture-menu-item" type="button" role="menuitem">Capture screen</button>
+                      <button id="liveScreenButton" class="capture-menu-item" type="button" role="menuitem">Start live screen</button>
+                    </div>
+                  </div>
+                  <button id="yoloButton" class="composer-icon-button" type="button" aria-label="Object detection" title="Object detection (YOLO, no language model)" aria-haspopup="dialog" hidden><svg class="icon" aria-hidden="true"><use href="#i-scan"/></svg><span>Object detection</span></button>
+                  <button id="audioToggle" class="mic-button" type="button" data-feature="model-catalog" aria-expanded="false" aria-controls="audioPanel" aria-label="Voice input (Voxtral transcription)" title="Voice input"><svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg><span>Voice input</span></button>
+                  <button id="composerProToggle" class="composer-button composer-options-toggle" type="button" aria-expanded="false" aria-controls="composerProPanel">Controls <span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></span></button>
                 </div>
               </div>
-              <div id="screenCaptureGroup" class="capture-action-group" hidden>
-                <button id="screenButton" class="composer-icon-button capture-group-trigger" type="button" aria-label="Screen capture options" title="Screen: capture or live" aria-haspopup="menu" aria-expanded="false" aria-controls="screenCaptureMenu"><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg><span class="capture-group-trigger-label">Screen</span><svg class="capture-group-chevron" aria-hidden="true"><use href="#i-chevron"/></svg></button>
-                <div id="screenCaptureMenu" class="capture-action-menu" role="menu" aria-label="Screen actions" hidden>
-                  <button id="screenCaptureSnapshot" class="capture-menu-item" type="button" role="menuitem">Capture screen</button>
-                  <button id="liveScreenButton" class="capture-menu-item" type="button" role="menuitem">Start live screen</button>
-                </div>
-              </div>
-              <button id="yoloButton" class="composer-icon-button" type="button" aria-label="Object detection" title="Object detection (YOLO, no language model)" aria-haspopup="dialog" hidden><svg class="icon" aria-hidden="true"><use href="#i-scan"/></svg></button>
               <span id="promptHint" class="sr-only">Press Enter to send. Press Shift+Enter for a new line.</span>
-            </div>
-            <div class="prompt-footer-end">
-              <button id="composerProToggle" class="composer-button composer-options-toggle" type="button" aria-expanded="false" aria-controls="composerProPanel">Controls <span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg></span></button>
             </div>
           </div>
           <span id="promptCacheStatus" class="sr-only" aria-live="polite" hidden></span>
         </div>
         <div class="actions">
-          <button id="audioToggle" class="mic-button" type="button" data-feature="model-catalog" aria-expanded="false" aria-controls="audioPanel" aria-label="Voice input (Voxtral transcription)" title="Voice input"><svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg></button>
           <button id="send" type="submit" aria-label="Send message" title="Send message" disabled><span aria-hidden="true"><svg class="icon" aria-hidden="true"><use href="#i-send"/></svg></span><span class="send-label">Send</span></button>
         </div>
       </div>

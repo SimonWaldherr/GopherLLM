@@ -8,16 +8,28 @@ package layablas
 #cgo LDFLAGS: -framework Accelerate
 #include <Accelerate/Accelerate.h>
 #include <math.h>
+#include <dispatch/dispatch.h>
 
 static void laya_project(int n, int rows, int cols, int stride, const float *w, const float *x, float *out) {
  cblas_sgemm(CblasRowMajor,CblasNoTrans,CblasTrans,n,rows,cols,1,x,stride,w,cols,0,out,rows);
 }
 
-static void laya_attention_block(int n, int heads, int dim, int window,
- int start, int count, int lo, int hi, float scale,
- const float *qkv, float *scores, float *out) {
+typedef struct {
+ int heads, dim, window, start, count, lo, hi, workers;
+ float scale;
+ const float *qkv;
+ float *scores, *out;
+} laya_attention_job;
+
+static void laya_attention_worker(void *context, size_t worker) {
+ laya_attention_job *job = (laya_attention_job *)context;
+ int heads=job->heads, dim=job->dim, window=job->window;
+ int start=job->start, count=job->count, lo=job->lo, hi=job->hi;
+ float scale=job->scale;
+ const float *qkv=job->qkv;
+ float *scores=job->scores + worker*count*(hi-lo), *out=job->out;
  int width = heads*dim, stride = 3*width, keys = hi-lo;
- for (int h=0; h<heads; h++) {
+ for (int h=(int)worker; h<heads; h+=job->workers) {
   const float *q = qkv + start*stride + h*dim;
   const float *k = qkv + lo*stride + width + h*dim;
   const float *v = qkv + lo*stride + 2*width + h*dim;
@@ -43,12 +55,25 @@ static void laya_attention_block(int n, int heads, int dim, int window,
    1,scores,keys,v,stride,0,out+start*width+h*dim,width);
  }
 }
+
+static void laya_attention_block(int heads, int dim, int window,
+ int start, int count, int lo, int hi, float scale,
+ const float *qkv, float *scores, float *out, int workers) {
+ laya_attention_job job = {heads, dim, window, start, count, lo, hi, workers, scale, qkv, scores, out};
+ // dispatch_apply_f waits for every worker before the Go buffers are reused.
+ if (workers>1) {
+  dispatch_apply_f(workers, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), &job, laya_attention_worker);
+ } else {
+  laya_attention_worker(&job,0);
+ }
+}
 */
 import "C"
 
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"unsafe"
 )
 
@@ -56,24 +81,38 @@ const attentionBlock = 128
 
 // Attention reads interleaved [sequence][Q,K,V][head][dim] data and overwrites
 // out[sequence][head][dim]. A negative window means full bidirectional attention;
-// otherwise each position sees its inclusive +/- window. Scratch is at most
-// 128*sequence floats (or 128*(128+2*window) for local attention), shared across
-// heads and reused by the caller across layers.
+// otherwise each position sees its inclusive +/- window. Workers have independent
+// score blocks, each at most 128*sequence floats (128*(128+2*window) locally).
+// Scratch is reused across layers and bounded by the configured worker count.
 // Context cancellation is checked between query blocks. No Go pointers are retained.
 func Attention(ctx context.Context, n, heads, dim, window int, scale float32, qkv, out []float32, scratch *[]float32) error {
+	return AttentionWithThreads(ctx, n, heads, dim, window, scale, qkv, out, scratch, runtime.GOMAXPROCS(0))
+}
+
+// AttentionWithThreads caps parallel head processing at the caller's thread limit.
+// Small workloads stay serial to avoid dispatch overhead.
+func AttentionWithThreads(ctx context.Context, n, heads, dim, window int, scale float32, qkv, out []float32, scratch *[]float32, threads int) error {
 	if n < 1 || n > 8192 || heads < 1 || dim < 1 || len(out)/n/heads != dim || len(out)%n != 0 || (len(out)/n)%heads != 0 || len(qkv) != 3*len(out) {
 		return fmt.Errorf("laya attention: invalid dimensions")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	window = min(window, n)
 	const block = attentionBlock
+	window = min(window, n)
+	keysPerQuery := n
+	if window >= 0 {
+		keysPerQuery = min(n, 2*window+1)
+	}
+	workers := min(heads, max(1, threads))
+	if n < 64 || n*heads*keysPerQuery < 32768 {
+		workers = 1
+	}
 	keys := n
 	if window >= 0 {
 		keys = min(n, block+2*window)
 	}
-	size := min(n, block) * keys
+	size := workers * min(n, block) * keys
 	if cap(*scratch) < size {
 		*scratch = make([]float32, size)
 	} else {
@@ -89,7 +128,7 @@ func Attention(ctx context.Context, n, heads, dim, window int, scale float32, qk
 			lo = max(0, start-window)
 			hi = min(n, start+count+window)
 		}
-		C.laya_attention_block(C.int(n), C.int(heads), C.int(dim), C.int(window), C.int(start), C.int(count), C.int(lo), C.int(hi), C.float(scale), (*C.float)(unsafe.Pointer(&qkv[0])), (*C.float)(unsafe.Pointer(&(*scratch)[0])), (*C.float)(unsafe.Pointer(&out[0])))
+		C.laya_attention_block(C.int(heads), C.int(dim), C.int(window), C.int(start), C.int(count), C.int(lo), C.int(hi), C.float(scale), (*C.float)(unsafe.Pointer(&qkv[0])), (*C.float)(unsafe.Pointer(&(*scratch)[0])), (*C.float)(unsafe.Pointer(&out[0])), C.int(workers))
 	}
 	return ctx.Err()
 }

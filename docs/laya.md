@@ -381,12 +381,34 @@ escaping and immediate flushing are unchanged.
 
 ## Inference performance
 
-Laya attention uses the existing SIMD vector-accumulation kernels. Rotary
-frequencies are computed once per dimension and each position's rotation is
-shared across attention heads. Large feed-forward activations run across the
-worker pool using exact GELU. Tensor workspaces are reused across encoder and
-decision-head layers within a forward pass, then released; an unusually long
-request does not permanently enlarge the model's scratch storage.
+Portable Laya attention reuses request-local score rows and its task descriptor
+across layers. Local attention allocates rows only as wide as its window;
+fine-grained worker scheduling still balances performance and efficiency cores.
+After warm-up, the attention benchmark drops from 97 allocations per layer to
+zero, while preserving the previous float32 output exactly.
+
+On macOS with cgo, Accelerate attention processes independent heads in parallel,
+capped by `--threads`. Sequences shorter than 64 tokens and small local workloads
+stay serial to avoid dispatch overhead. Each worker
+owns a score block of at most `128 * sequence` float32 values, or
+`128 * (128 + 2 * window)` for local attention, reused across layers and questions.
+For 512 tokens, 12 heads of width 64 and 12 workers, three benchmark runs on an
+Apple M2 Max measured median global attention of 28.98 ms before and 5.06 ms
+after; local attention with a +/-64 window improved from 8.18 ms to 1.84 ms.
+These are attention-stage measurements with synthetic tensors, not complete
+classification timings. Parallel scratch scales with the number of workers
+(3 MiB rather than 256 KiB for that global case). Tests compare parallel and
+serial results exactly, including concurrent requests and partial blocks.
+
+Rotary tables are cached in each request and shared across layers and heads.
+Large feed-forward activations use the worker pool with exact GELU. Tensor
+workspaces are reused across encoder layers, decision heads and questions,
+then released with the request.
+
+```sh
+CGO_ENABLED=0 go test . -run '^$' -bench BenchmarkLayaPortableAttention -benchmem
+CGO_ENABLED=1 go test ./internal/layablas -run '^$' -bench BenchmarkAttentionParallel -benchmem
+```
 
 Reproduce the native-inference benchmark using downloaded weights:
 
