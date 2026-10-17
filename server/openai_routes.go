@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/chatmemory"
 )
 
 // registerOpenAIRoutes registers the OpenAI-compatible endpoints: /generate
@@ -52,6 +53,10 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 			writeAPIError(w, 400, "invalid_request", "", err.Error())
 			return
 		}
+		if body.GopherLLMContextRAG && contextMode == gopherllm.ContextWindowFull {
+			writeAPIError(w, 400, "invalid_parameter", "gopherllm_context_rag", "context retrieval requires recent or autoCompress context mode")
+			return
+		}
 		options := body.Options(opts.Defaults)
 		options.ContextWindowMode = contextMode
 		if body.ResponseFormat != nil && body.ResponseFormat.Type == "text" {
@@ -81,6 +86,20 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 			if !validateModel(w, body.Model, model) {
 				return
 			}
+			tools := agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG)
+			generate := gopherllm.ChatGenerator(r.GenerateChatStreamUntil)
+			var memory *chatmemory.Session
+			if body.GopherLLMContextRAG {
+				var err error
+				memory, err = chatmemory.New(req.Context(), r, chatmemory.Options{})
+				if err != nil {
+					inferenceAPIError(w, err)
+					return
+				}
+				// This wrapper prepares each effective agent-loop prompt, after
+				// new tool results and the current tool schemas have been added.
+				generate = memory.Wrap(generate)
+			}
 			// Only a stream needs this pre-flight. Headers are committed with an
 			// SSE stream's first chunk, so a context error discovered during
 			// generation could no longer be reported as a 4xx — it has to be
@@ -96,8 +115,13 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 			// token. Dropping the duplicate cut a non-streaming request's
 			// allocations by 48%.
 			if body.Stream && contextMode != gopherllm.ContextWindowFull {
-				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, selectedSkills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG))
-				_, _, err := r.PrepareChatContext(messages, effectiveOptions)
+				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, selectedSkills, tools)
+				var err error
+				if memory != nil {
+					_, _, err = memory.Prepare(messages, effectiveOptions)
+				} else {
+					_, _, err = r.PrepareChatContext(messages, effectiveOptions)
+				}
 				if err != nil {
 					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, gopherllm.GenerationResult{}, err)
 					writeAPIError(w, 400, "invalid_request", "", err.Error())
@@ -106,12 +130,12 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 			}
 			if body.Stream && !structured {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage
-				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, selectedSkills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), includeUsage)
+				streamOpenAIChat(w, req, logw, requestID, r, model, messages, options, selectedSkills, tools, includeUsage, generate)
 				return
 			}
 			var timeline []gopherllm.AgentEvent
 			observe := func(e gopherllm.AgentEvent) { timeline = append(timeline, e) }
-			result, err := gopherllm.RunAgenticChatObserved(r, messages, options, selectedSkills, agenticToolsFor(body.Wikimedia, body.OpenStreetMap, body.RAG), alwaysContinue, observe)
+			result, err := gopherllm.RunAgenticChatWithGenerator(generate, messages, options, selectedSkills, tools, alwaysContinue, observe)
 			if err == nil {
 				if e := validateChatResult(result, options); e != nil {
 					err = fmt.Errorf("%w: %v", errOutputContract, e)

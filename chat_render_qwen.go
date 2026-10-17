@@ -22,7 +22,18 @@ func (r *Runner) renderQwen35Messages(messages []ChatMessage, systemPrompt strin
 	if len(toolSets) > 0 {
 		tools = toolSets[0]
 	}
-	tokens := make([]uint32, 0)
+	// Reserve a bounded hint for role/control framing. Content can grow this
+	// owned output normally; long histories avoid the first small reallocations.
+	tokens := make([]uint32, 0, 16+min(len(messages), 4096)*8)
+	var newline []uint32
+	newlineReady := false
+	appendNewline := func() {
+		if !newlineReady {
+			newline = r.tok.EncodeWithoutBOS("\n")
+			newlineReady = true
+		}
+		tokens = append(tokens, newline...)
+	}
 	appendText := func(text string) {
 		tokens = append(tokens, r.tok.EncodeWithoutBOS(text)...)
 	}
@@ -30,8 +41,10 @@ func (r *Runner) renderQwen35Messages(messages []ChatMessage, systemPrompt strin
 		tokens = append(tokens, imStart)
 		appendText(role + "\n" + strings.TrimSpace(content))
 		tokens = append(tokens, imEnd)
-		appendText("\n")
+		appendNewline()
 	}
+	var toolResponsePrefix, toolResponseSuffix []uint32
+	toolResponseReady := false
 
 	hasSystem := false
 	var systemParts []string
@@ -75,16 +88,23 @@ func (r *Runner) renderQwen35Messages(messages []ChatMessage, systemPrompt strin
 			appendTurn("assistant", content)
 		case ChatRoleTool:
 			// Qwen groups consecutive tool results into one user turn.
+			// Reuse only the already separate literal fragments; encoding a
+			// result together with its framing could change BPE merge boundaries.
+			if !toolResponseReady {
+				toolResponsePrefix = r.tok.EncodeWithoutBOS("\n<tool_response>\n")
+				toolResponseSuffix = r.tok.EncodeWithoutBOS("\n</tool_response>")
+				toolResponseReady = true
+			}
 			if i == 0 || messages[i-1].Role != ChatRoleTool {
 				tokens = append(tokens, imStart)
 				appendText("user")
 			}
-			appendText("\n<tool_response>\n")
+			tokens = append(tokens, toolResponsePrefix...)
 			appendText(strings.TrimSpace(message.Content))
-			appendText("\n</tool_response>")
+			tokens = append(tokens, toolResponseSuffix...)
 			if i == len(messages)-1 || messages[i+1].Role != ChatRoleTool {
 				tokens = append(tokens, imEnd)
-				appendText("\n")
+				appendNewline()
 			}
 		default:
 			appendTurn("user", message.Content)

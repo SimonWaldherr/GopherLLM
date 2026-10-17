@@ -226,8 +226,11 @@ type OpenAIChatRequest struct {
 	// GopherLLMContextMode is an opt-in extension for local clients. Omitting
 	// it preserves normal OpenAI-compatible full-history semantics.
 	GopherLLMContextMode string `json:"gopherllm_context_mode"`
-	Wikimedia            bool   `json:"gopherllm_wikimedia"`
-	OpenStreetMap        bool   `json:"gopherllm_openstreetmap"`
+	// GopherLLMContextRAG recalls complete older text turns from this request's
+	// branch only. It requires recent or autoCompress context and no embeddings.
+	GopherLLMContextRAG bool `json:"gopherllm_context_rag,omitempty"`
+	Wikimedia           bool `json:"gopherllm_wikimedia"`
+	OpenStreetMap       bool `json:"gopherllm_openstreetmap"`
 	// RAG requests the search_documents tool, offered only when
 	// Features.RAG is enabled and the server's knowledge base is non-empty.
 	RAG bool `json:"gopherllm_rag"`

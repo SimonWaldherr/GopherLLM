@@ -600,6 +600,10 @@
             <span>Optional guidance that applies only to this chat.</span>
             <textarea id="systemPrompt" rows="3" placeholder="How should the assistant behave in this chat?"></textarea>
           </label>
+          <label class="toggle-row settings-option">
+            <input id="contextRAG" type="checkbox" disabled>
+            <span><strong>Recall relevant earlier turns</strong><span class="field-note">BM25 searches only this chat branch. Adds complete older text turns within the token budget; no embedding model is needed. Available with Smart or Auto-compress context on a local server model.</span></span>
+          </label>
           <p id="contextWindowStatus" class="settings-note" aria-live="polite"></p>
         </section>
       </div>

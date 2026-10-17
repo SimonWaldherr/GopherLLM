@@ -230,8 +230,10 @@ never prints `HF_TOKEN` or a transient user prompt.
 
 `context_window_mode` (or `--context-window`) is `full` by default, which
 returns a context-limit error instead of dropping history. Choose `recent` to
-retain complete recent turns, or `autoCompress` to compact ordinary prose
-before applying the same turn-preserving selection.
+retain complete recent turns, or `autoCompress` to conservatively shorten older
+plain assistant prose only when the original prompt does not fit. Compression
+preserves user/system messages, the newest complete turn, tool/image payloads
+and formatted content; the same turn-preserving selection follows if needed.
 
 ### Hugging Face imports
 
@@ -536,6 +538,11 @@ runner.ClearMistralPromptPrefixCache()
 It retains only tokenized BOS/system/tool-prefix text; message content, image
 embeddings, logits, and KV state are not stored by this cache. The normal
 generation KV-prefix cache remains independent.
+
+The separate opt-in `EnableMistralKVPrefixCache` snapshot cache does not trigger
+another static-prefix render while disabled. Its invalidation epoch is captured
+before prompt rendering, so a concurrent clear cannot be undone by that
+request's later snapshot store.
 
 ### Reusing conversations
 
@@ -1046,6 +1053,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
 - Prefer `--auto` over hand-tuning the flags below: it measures them on the
   actual machine and caches the result. See
   [Auto Mode](#auto-mode-hardware-autotuning).
+- Qwen ChatML and hybrid renderers tokenize fixed separators once per render,
+  preserving the existing tokenization boundaries. On the M2 Max, preparing a
+  hybrid prompt with 32 tool results fell from 358 to 238 microseconds with 44%
+  fewer allocations. A Qwen3 history with 65 input messages used 20% fewer
+  allocations with approximately unchanged render time. These are prompt-preparation
+  measurements, not transformer-prefill speedups.
 - **Decode is at the memory-bandwidth roofline, and that bounds what any further
   kernel work can achieve.** Measured on the dev laptop (i7-10850H, DDR4-2933
   dual channel) with Ministral-3 3B Q4_K_M, which streams ~2.2 GB of weights per

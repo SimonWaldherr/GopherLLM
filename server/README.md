@@ -406,11 +406,13 @@ loaded model's actual template and token budget. Leading system instructions
 stay pinned, tool calls stay with the originating user turn, and the latest
 turn is never cut mid-message.
 
-**Auto-compress — dense technical context** conservatively shortens ordinary
-prose only when the active tokenizer confirms a smaller result. Tool payloads
-and fenced code remain unchanged. **Full history — stop when full** preserves
-the strict behaviour used by normal API clients. The API can opt into the
-local modes with:
+**Auto-compress — dense technical context** acts only when the original prompt
+does not fit. It conservatively shortens older plain assistant prose only when
+the active tokenizer confirms fewer tokens, then selects complete recent turns
+if needed. Compression preserves user/system messages, the newest complete turn,
+tool/image payloads and formatted content. **Full history — stop when full**
+preserves the strict behaviour used by normal API clients. The API can opt into
+the local modes with:
 
 ```json
 {"gopherllm_context_mode":"autoCompress"}
@@ -419,6 +421,29 @@ local modes with:
 Allowed values are `recent`, `autoCompress`, and `full`. Non-streaming replies
 include `X-GopherLLM-Context-*` headers and a `gopherllm_context` object;
 streaming replies carry the final data in the terminal SSE choice.
+
+**Recall relevant earlier turns** is a separate, off-by-default checkbox for
+local server models using Smart or Auto-compress context. When older history
+has been dropped, BM25 can add up to three complete earlier text turns as
+quoted reference data. The real model template and tokenizer limit the extra
+prompt tokens to 512 or one eighth of the prompt budget, whichever is smaller.
+Tool/image turns are excluded; past tool actions are never replayed. This uses
+only the history supplied in the current request, with no persistent index or
+embedding model. Edits, branches, deletions and resets therefore search only
+their own submitted history. It is independent of the document search tool and
+saved-chat embedding search, and unavailable with Full history, browser
+inference or a remote API. API callers enable it with:
+
+```json
+{"gopherllm_context_mode":"recent","gopherllm_context_rag":true}
+```
+
+When turns are added, `gopherllm_context.recall` reports `mode` (`bm25`),
+`indexed_turns`, `token_budget`, `added_tokens`, and `sources`. Each source has
+an `id`, one-based `turn`, zero-based `start_message`, exclusive `end_message`,
+a non-cryptographic 32-hex-character `hash` checksum and BM25 `score`. The UI
+shows the recalled turn count and added prompt tokens. This metadata is also
+included in the terminal SSE choice for structured JSON replies.
 
 While a local server runs, it retains one bounded KV prefix cache for the most
 recent rendered prompt. Follow-up turns can process only the changed suffix;

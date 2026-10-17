@@ -219,18 +219,20 @@ func TestPrepareChatContextRecentRejectsTooLargeLatestTurn(t *testing.T) {
 
 func TestAutoCompressUsesTechnicalAbbreviationsWithoutTouchingOpaquePayloads(t *testing.T) {
 	messages := []ChatMessage{
-		UserMessage("Please explain the application programming interface, for example its context window."),
+		UserMessage("Translate exactly: large language model"),
+		AssistantMessage("Please explain the application programming interface, for example its context window."),
 		ToolResultMessage("call-1", "lookup", `{"kind":"application programming interface"}`),
 		AssistantMessage("```text\napplication programming interface\n```"),
+		UserMessage("Translate exactly: large language model"),
 	}
 	got, changed := autoCompressChatMessages(messages)
 	if changed != 1 {
 		t.Fatalf("compressed messages = %d, want 1", changed)
 	}
-	if got[0].Content != "explain the API, e.g. its ctx window." {
-		t.Fatalf("compressed user message = %q", got[0].Content)
+	if got[1].Content != "explain the API, e.g. its ctx window." {
+		t.Fatalf("compressed historical assistant message = %q", got[1].Content)
 	}
-	if got[1].Content != messages[1].Content || got[2].Content != messages[2].Content {
+	if got[0].Content != messages[0].Content || got[2].Content != messages[2].Content || got[3].Content != messages[3].Content || got[4].Content != messages[4].Content {
 		t.Fatalf("opaque payload was rewritten: %#v", got)
 	}
 }
@@ -238,7 +240,11 @@ func TestAutoCompressUsesTechnicalAbbreviationsWithoutTouchingOpaquePayloads(t *
 func TestPrepareChatContextAutoCompressUsesCompressedHistory(t *testing.T) {
 	r := newContextWindowTestRunner(t)
 	opts := autoCompressContextWindowOptions()
-	messages := []ChatMessage{UserMessage("please " + strings.Repeat("application programming interface ", 64) + "implementation details")}
+	messages := []ChatMessage{
+		UserMessage("abc"),
+		AssistantMessage("please " + strings.Repeat("application programming interface ", 64) + "implementation details"),
+		UserMessage("dddd"),
+	}
 	compressed, changed := autoCompressChatMessages(messages)
 	if changed != 1 {
 		t.Fatalf("compressed messages = %d, want 1", changed)

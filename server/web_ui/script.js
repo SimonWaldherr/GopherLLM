@@ -1029,12 +1029,29 @@ function cleanSettings(value, defaults) {
     // remains available per chat, and external OpenAI-compatible callers are
     // unaffected unless they send GopherLLM's extension explicitly.
     contextWindowMode: value.contextWindowMode === "full" || value.contextWindowMode === "autoCompress" ? value.contextWindowMode : "recent",
+    contextRAG: value.contextRAG === true && value.contextWindowMode !== "full",
     ragMode: value.ragMode === true,
     wikimediaTools: value.wikimediaTools === true,
     openStreetMapTools: value.openStreetMapTools === true,
     documentSearch: value.documentSearch === true,
     skillsTools: value.skillsTools !== false
   };
+}
+
+// Conversation recall is independent of cross-chat embedding search and tools.
+function contextRAGRequested(settings) {
+  return Boolean(settings && settings.contextRAG === true && (settings.contextWindowMode === "recent" || settings.contextWindowMode === "autoCompress"));
+}
+
+function contextRAGEnabled(settings, available, inferenceMode) {
+  return contextRAGRequested(settings) && available === true && inferenceMode !== "browser";
+}
+
+function cleanContextRecall(value) {
+  if (!value || value.mode !== "bm25" || !Array.isArray(value.sources)) return null;
+  const counts = [value.indexed_turns, value.token_budget, value.added_tokens];
+  if (counts.some((n) => !Number.isInteger(n) || n < 0 || n > 10000000) || value.sources.length > 64 || value.sources.length > counts[0] || counts[2] > counts[1]) return null;
+  return { indexedTurns: counts[0], tokenBudget: counts[1], addedTokens: counts[2], turns: value.sources.length };
 }
 
 function cleanPromptCache(value) {
@@ -1399,6 +1416,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const seedEl = $("seed");
   const stopSequencesEl = $("stopSequences");
   const contextWindowModeEl = $("contextWindowMode");
+  const contextRAGEl = $("contextRAG");
+  let contextRAGAvailable = false;
+  let contextRAGCheck = 0;
   const ragModeEl = $("ragMode");
   const wikimediaToolsEl = $("wikimediaTools");
   const openStreetMapToolsEl = $("openStreetMapTools");
@@ -2450,10 +2470,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
 
   function currentContextWindow(chat) {
     if (!lastContextWindow || !chat || lastContextWindow.chatID !== chat.id) return null;
-    // The server sees the user's new message but not the assistant message it
-    // is about to produce. After a reply we therefore accept exactly either
-    // that input count or one additional stored assistant message.
-    if (chat.messages.length !== lastContextWindow.inputMessages && chat.messages.length !== lastContextWindow.inputMessages + 1) return null;
+    // Internal agent rounds add messages that are not stored as browser
+    // transcript rows. Bind telemetry to the local history at receipt instead.
+    if (chat.messages.length !== lastContextWindow.historyMessages) return null;
     return lastContextWindow;
   }
 
@@ -2494,6 +2513,32 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     promptCacheStatusEl.hidden = !text;
   }
 
+  function syncContextRAGControls() {
+    if (!contextRAGEl) return;
+    const chat = activeChat();
+    const settings = chat ? chat.settings : {};
+    contextRAGEl.disabled = !contextRAGAvailable || browserOnlyDeployment || preferences.inferenceMode === "browser" || settings.contextWindowMode === "full";
+    contextRAGEl.checked = !contextRAGEl.disabled && settings.contextRAG === true;
+  }
+
+  async function refreshContextRAGAvailability(signal) {
+    const check = ++contextRAGCheck;
+    let available = false;
+    if (!browserOnlyDeployment && preferences.inferenceMode !== "browser") {
+      try {
+        const response = await fetch("/health", { cache: "no-store", signal });
+        const status = response.ok ? await response.json() : null;
+        available = Boolean(status && status.ok === true && status.remote === false);
+      } catch (error) {
+        if (signal && (signal.aborted || error.name === "AbortError")) throw error;
+      }
+    }
+    if (check !== contextRAGCheck) return;
+    contextRAGAvailable = available;
+    syncContextRAGControls();
+    updateContextWindowStatus();
+  }
+
   function updateContextWindowStatus() {
     const chat = activeChat();
     if (!chat) return;
@@ -2503,12 +2548,14 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     }
     const info = currentContextWindow(chat);
     if (!info) {
-      contextWindowStatusEl.textContent = chat.settings.contextWindowMode === "autoCompress" ? "Auto-compress keeps the full chat locally, condenses ordinary messages into denser technical wording, then keeps complete recent turns if needed." : "Smart context keeps the complete chat in this browser and sends the newest complete turns when the history gets too large.";
+      contextWindowStatusEl.textContent = chat.settings.contextWindowMode === "autoCompress" ? "Auto-compress keeps the full chat locally. Only when the original prompt does not fit, it conservatively shortens older plain assistant prose, then keeps complete recent turns if needed. Compression preserves user/system messages, the newest complete turn, tool/image payloads and formatted content." : "Smart context keeps the complete chat in this browser and sends the newest complete turns when the history gets too large.";
+      if (contextRAGEnabled(chat.settings, contextRAGAvailable, preferences.inferenceMode)) contextWindowStatusEl.textContent += " BM25 may recall relevant older complete text turns from this branch within the prompt budget.";
       return;
     }
     const retained = info.retainedMessages + " of " + info.inputMessages + " message" + (info.inputMessages === 1 ? "" : "s");
     let text = "Last reply sent " + retained + " (" + info.promptTokens + "/" + info.promptBudget + " exact prompt tokens).";
     if (info.compressedMessages > 0) text += " Auto-compressed " + info.compressedMessages + " message" + (info.compressedMessages === 1 ? "" : "s") + ".";
+    if (info.recall) text += info.recall.turns ? " BM25 recalled " + info.recall.turns + " earlier complete turn" + (info.recall.turns === 1 ? "" : "s") + " (" + info.recall.addedTokens + " added prompt tokens)." : " BM25 added no earlier turns.";
     if (info.droppedMessages > 0) text += " " + info.droppedMessages + " earlier message" + (info.droppedMessages === 1 ? " remains" : "s remain") + " saved locally.";
     contextWindowStatusEl.textContent = text;
   }
@@ -2527,7 +2574,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const droppedMessages = number("dropped_messages");
     const compressedMessages = number("compressed_messages");
     if ([contextLength, promptBudget, promptTokens, inputMessages, retainedMessages, droppedMessages, compressedMessages].some((value) => value === null)) return null;
-    return { chatID: chat.id, contextLength, promptBudget, promptTokens, inputMessages, retainedMessages, droppedMessages, compressedMessages };
+    return { chatID: chat.id, historyMessages: chat.messages.length, contextLength, promptBudget, promptTokens, inputMessages, retainedMessages, droppedMessages, compressedMessages, recall: cleanContextRecall(value.recall) };
   }
 
   function updateComposer(storeDraft) {
@@ -2630,6 +2677,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     composerContextWindowEl.value = chat.settings.contextWindowMode;
     composerMaxTokensEl.value = chat.settings.maxTokens;
     composerPowerCommandsEl.checked = preferences.power;
+    syncContextRAGControls();
     ragModeEl.checked = chat.settings.ragMode;
     wikimediaToolsEl.checked = chat.settings.wikimediaTools;
     openStreetMapToolsEl.checked = chat.settings.openStreetMapTools === true;
@@ -3300,6 +3348,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       stream: true,
       stream_options: { include_usage: true },
       gopherllm_context_mode: chat.settings.contextWindowMode,
+      gopherllm_context_rag: contextRAGEnabled(chat.settings, contextRAGAvailable, preferences.inferenceMode) || undefined,
       gopherllm_wikimedia: chat.settings.wikimediaTools === true,
       gopherllm_openstreetmap: chat.settings.openStreetMapTools === true,
       gopherllm_rag: chat.settings.documentSearch === true,
@@ -3610,6 +3659,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       if (browserMode) {
         result = await generateBrowserTurn(chat, ragContext, onToken);
       } else {
+        if (contextRAGRequested(chat.settings)) await refreshContextRAGAvailability(controller.signal);
         const response = await fetch("/v1/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3765,7 +3815,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     chat.settings = cleanSettings({
       maxTokens: maxTokensEl.value, temperature: temperatureEl.value, topP: topPEl.value,
       topK: topKEl.value, minP: minPEl.value, repeatPenalty: repeatPenaltyEl.value, seed: seedEl.value.trim(),
-      stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, ragMode: ragModeEl.checked,
+      stopSequences: stopSequencesEl.value, contextWindowMode: contextWindowModeEl.value, contextRAG: contextRAGEl.checked, ragMode: ragModeEl.checked,
       wikimediaTools: wikimediaToolsEl.checked,
       openStreetMapTools: openStreetMapToolsEl.checked,
       documentSearch: documentSearchToolsEl.checked,
@@ -3783,6 +3833,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     composerContextWindowEl.value = chat.settings.contextWindowMode;
     composerMaxTokensEl.value = chat.settings.maxTokens;
     composerWikimediaToolsEl.checked = chat.settings.wikimediaTools;
+    syncContextRAGControls();
     touch(chat);
     updateComposer(false);
     saveSoon();
@@ -6081,6 +6132,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   });
 
   function openSettings(initialFocus, opener) {
+    refreshContextRAGAvailability();
     settingsToggleEl.setAttribute("aria-expanded", "true");
     // A stale filter from the last visit would silently hide sections the
     // user never searched for this time -- start every visit unfiltered.
@@ -6161,7 +6213,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const emptyChooseModelEl = $("emptyChooseModel");
   if (emptyChooseModelEl) emptyChooseModelEl.addEventListener("click", (event) => openModelPicker(event.currentTarget));
   workflowSelectEl.addEventListener("change", () => applyWorkflow(workflowSelectEl.value));
-  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, documentSearchToolsEl, skillsToolsEl].forEach((control) => {
+  [maxTokensEl, temperatureEl, topPEl, topKEl, minPEl, repeatPenaltyEl, seedEl, stopSequencesEl, contextWindowModeEl, contextRAGEl, ragModeEl, wikimediaToolsEl, openStreetMapToolsEl, documentSearchToolsEl, skillsToolsEl].forEach((control) => {
     control.addEventListener("input", updateSettings);
     control.addEventListener("change", updateSettings);
   });
@@ -6645,6 +6697,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         ? "This managed server uses the model selected by its administrator."
         : "Server mode uses the model this GopherLLM server has loaded, with full access to tools and retrieval.");
     syncDeploymentControls();
+    syncContextRAGControls();
     updateVisionAffordances();
     renderModelRoles();
   }
@@ -8059,6 +8112,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   setupUIMode();
   setupModelView();
   renderWorkspace(true);
+  refreshContextRAGAvailability();
 	if (!browserOnlyDeployment) {
 		loadModels();
 		loadSkills();

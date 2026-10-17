@@ -72,16 +72,33 @@ func (r *Runner) retainDisplacedConversation(tokens []uint32) {
 	if limit == 0 {
 		limit = DefaultConversationCacheBytes
 	}
-	n := len(state.tokens)
-	bytes := kvCacheBytes(state.cache.layerCount(), state.cache.PerPosKDim, state.cache.PerPosVDim, n, state.cache.kvFormat()) + int64(n)*4
-	if bytes > limit {
+	// A long conversation can still contribute its exact initial KV rows.
+	// Bound the snapshot before allocating, rather than dropping all reuse as
+	// soon as the complete history exceeds the budget.
+	rowBytes := kvCacheBytes(state.cache.layerCount(), state.cache.PerPosKDim, state.cache.PerPosVDim, 1, state.cache.kvFormat()) + 4
+	if state.cache.layerCount() <= 0 || rowBytes <= 0 {
 		return
+	}
+	n := int(min(int64(len(state.tokens)), limit/rowBytes))
+	if n < conversationCacheMinTokens {
+		return
+	}
+	keptTokens := state.tokens[:n]
+	bytes := int64(n) * rowBytes
+	// An immutable longer snapshot already owns these same rows. Retaining it
+	// avoids re-copying identical prompts and budget-truncated long histories.
+	for i := len(c.entries) - 1; i >= 0; i-- {
+		e := c.entries[i]
+		if kvPrefixSnapshotCompatible(state.cache, e.cache, n) && sharedTokenPrefix(e.tokens, keptTokens) == n {
+			c.touch(i)
+			return
+		}
 	}
 	// A newer longer snapshot subsumes an older branch only when all of the
 	// older tokens match. Divergent branches retain their own state.
 	for i := len(c.entries) - 1; i >= 0; i-- {
 		e := c.entries[i]
-		if sharedTokenPrefix(e.tokens, state.tokens) == len(e.tokens) {
+		if len(e.tokens) <= n && kvPrefixSnapshotCompatible(state.cache, e.cache, len(e.tokens)) && sharedTokenPrefix(e.tokens, keptTokens) == len(e.tokens) {
 			c.bytes -= e.bytes
 			c.remove(i)
 		}
@@ -94,7 +111,7 @@ func (r *Runner) retainDisplacedConversation(tokens []uint32) {
 	if snapshot == nil {
 		return
 	}
-	c.entries = append(c.entries, conversationSnapshot{tokens: append([]uint32(nil), state.tokens...), cache: snapshot, bytes: bytes})
+	c.entries = append(c.entries, conversationSnapshot{tokens: append([]uint32(nil), keptTokens...), cache: snapshot, bytes: bytes})
 	c.bytes += bytes
 }
 
@@ -107,10 +124,16 @@ func (r *Runner) reuseConversation(cache *KVCache, tokens []uint32, resident int
 	}
 	c := &r.conversations
 	best, index := resident, -1
-	for i, e := range c.entries {
+	// Prefer the most recent source when several snapshots cover the same
+	// prefix, and stop once no snapshot can improve the match further.
+	for i := len(c.entries) - 1; i >= 0; i-- {
+		e := c.entries[i]
 		n := min(sharedTokenPrefix(tokens, e.tokens), len(tokens)-1)
 		if n >= conversationCacheMinTokens && n > best && kvPrefixSnapshotCompatible(cache, e.cache, n) {
 			best, index = n, i
+			if best == len(tokens)-1 {
+				break
+			}
 		}
 	}
 	// Pin the candidate before retaining the displaced workspace: even if
@@ -118,15 +141,26 @@ func (r *Runner) reuseConversation(cache *KVCache, tokens []uint32, resident int
 	var entry conversationSnapshot
 	if index >= 0 {
 		entry = c.entries[index]
-		copy(c.entries[index:], c.entries[index+1:])
-		c.entries[len(c.entries)-1] = entry
+		c.touch(index)
+	}
+	// Only skip rows whose token IDs are verified in this exact workspace.
+	// A caller's match against another cache must not leave stale rows behind.
+	copyStart := 0
+	if index >= 0 && r.prefixCache.cache == cache {
+		copyStart = min(max(0, resident), best, sharedTokenPrefix(tokens, r.prefixCache.tokens))
 	}
 	r.retainDisplacedConversation(tokens)
-	if index < 0 || copyKVPrefix(cache, entry.cache, best) != best {
+	if index < 0 || copyConversationKVRange(cache, entry.cache, copyStart, best) != best {
 		return resident
 	}
 
 	return best
+}
+
+func (c *conversationCache) touch(i int) {
+	entry := c.entries[i]
+	copy(c.entries[i:], c.entries[i+1:])
+	c.entries[len(c.entries)-1] = entry
 }
 
 func (c *conversationCache) remove(i int) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/chatmemory"
 	"github.com/SimonWaldherr/GopherLLM/rag"
 )
 
@@ -182,6 +183,21 @@ func WithStepObserver(fn func(Step)) Option {
 func WithRetrieval(mode RetrievalMode) Option {
 	return func(ctx context.Context, a *Agent) error {
 		a.retrieval = mode
+		return nil
+	}
+}
+
+// WithContextRecall enables BM25 recall from older turns in each Chat call's
+// supplied history. Chat must use recent or autoCompress context mode; enabling
+// recall with full or the default mode returns an error. Each Chat builds a
+// new session, so conversations and edited branches never share remembered turns.
+// The original latest user message supplies the query, including when document
+// retrieval also prefixes reference passages. Limits use chatmemory defaults
+// when zero. Answer.ContextWindow.Recall reports the final prompt's sources.
+func WithContextRecall(options chatmemory.Options) Option {
+	return func(ctx context.Context, a *Agent) error {
+		copy := options
+		a.contextRecall = &copy
 		return nil
 	}
 }

@@ -49,14 +49,11 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 	instTok := r.mistralMarker("[INST]")
 	instEndTok := r.mistralMarker("[/INST]")
 	sysStart, sysEnd, hasSysTokens := r.systemPromptTokens()
-	callTok := r.mistralMarker("[TOOL_CALLS]")
-	argsTok := r.mistralMarker("[ARGS]")
-	resultsStart := r.mistralMarker("[TOOL_RESULTS]")
-	resultsEnd := r.mistralMarker("[/TOOL_RESULTS]")
 
 	system := strings.TrimSpace(systemPrompt)
 	lastUser := -1
 	lastNonSystem := -1
+	hasCalls, hasResults := false, false
 	for i, m := range messages {
 		if m.Role == ChatRoleSystem {
 			if s := strings.TrimSpace(m.Content); s != "" {
@@ -67,7 +64,20 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 		lastNonSystem = i
 		if m.Role == ChatRoleUser {
 			lastUser = i
+		} else if m.Role == ChatRoleAssistant && len(m.ToolCalls) > 0 {
+			hasCalls = true
+		} else if m.Role == ChatRoleTool {
+			hasResults = true
 		}
+	}
+	// Old vocabularies spell missing tool markers as ordinary text. Avoid
+	// tokenizing those literals in chats that never emit them.
+	var callTok, argsTok, resultsStart, resultsEnd mistralControlMarker
+	if hasCalls {
+		callTok, argsTok = r.mistralMarker("[TOOL_CALLS]"), r.mistralMarker("[ARGS]")
+	}
+	if hasResults {
+		resultsStart, resultsEnd = r.mistralMarker("[TOOL_RESULTS]"), r.mistralMarker("[/TOOL_RESULTS]")
 	}
 	toolsJSON := ""
 	if len(tools) > 0 {
@@ -90,7 +100,7 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 	if toolsJSON != "" {
 		tokenCap += 32 + len(toolsJSON)/4
 	}
-	tokens := make([]uint32, 0, tokenCap)
+	var tokens []uint32
 
 	// This cache key covers only text emitted before every chat turn. It is
 	// therefore safe to use even when a later user message has image content:
@@ -100,9 +110,10 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 		cacheKey.system = system
 	}
 	var cacheEpoch uint64
-	if cached, epoch, hit := r.appendMistralPromptPrefix(tokens, cacheKey); hit {
+	if cached, epoch, hit := r.appendMistralPromptPrefixWithSpare(tokens, cacheKey, 128+len(messages)*16); hit {
 		tokens = cached
 	} else {
+		tokens = make([]uint32, 0, tokenCap)
 		cacheEpoch = epoch
 		prefixStart := len(tokens)
 		if r.tok.AddBOS {
@@ -114,9 +125,9 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			tokens = append(tokens, sysEnd)
 		}
 		if toolsJSON != "" {
-			tokens = append(tokens, r.mistralMarker("[AVAILABLE_TOOLS]")...)
+			tokens = r.mistralMarker("[AVAILABLE_TOOLS]").appendTo(tokens)
 			tokens = append(tokens, r.tok.EncodeWithoutBOS(toolsJSON)...)
-			tokens = append(tokens, r.mistralMarker("[/AVAILABLE_TOOLS]")...)
+			tokens = r.mistralMarker("[/AVAILABLE_TOOLS]").appendTo(tokens)
 		}
 		r.putMistralPromptPrefix(cacheKey, tokens[prefixStart:], cacheEpoch)
 	}
@@ -135,9 +146,9 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 				if args == "" {
 					args = "{}"
 				}
-				tokens = append(tokens, callTok...)
+				tokens = callTok.appendTo(tokens)
 				tokens = append(tokens, r.tok.EncodeWithoutBOS(call.Function.Name)...)
-				tokens = append(tokens, argsTok...)
+				tokens = argsTok.appendTo(tokens)
 				tokens = append(tokens, r.tok.EncodeWithoutBOS(args)...)
 			}
 			// A trailing assistant message is a prefill continuation: leave
@@ -148,15 +159,15 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 			}
 			tokens = append(tokens, r.tok.EOSID)
 		case ChatRoleTool:
-			tokens = append(tokens, resultsStart...)
+			tokens = resultsStart.appendTo(tokens)
 			tokens = append(tokens, r.tok.EncodeWithoutBOS(m.Content)...)
-			tokens = append(tokens, resultsEnd...)
+			tokens = resultsEnd.appendTo(tokens)
 		default:
 			content := strings.TrimSpace(m.Content)
 			if idx == lastUser && system != "" && !hasSysTokens {
 				content = system + "\n\n" + content
 			}
-			tokens = append(tokens, instTok...)
+			tokens = instTok.appendTo(tokens)
 			if len(m.Images) > 0 {
 				// We already hold visionMu; calling HasVision here would take a
 				// recursive RLock and can deadlock when Close is waiting for its
@@ -198,7 +209,7 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 				}
 			}
 			tokens = append(tokens, r.tok.EncodeWithoutBOS(content)...)
-			tokens = append(tokens, instEndTok...)
+			tokens = instEndTok.appendTo(tokens)
 		}
 	}
 	return tokens, imageEmbeds, true, nil
@@ -216,7 +227,16 @@ func (r *Runner) renderMistralInstMessages(messages []ChatMessage, systemPrompt 
 // turn, malformed tool definitions, and any future template variation which
 // changes the relative layout.
 func (r *Runner) mistralStaticPromptPrefix(messages []ChatMessage, systemPrompt string, tools []ToolDefinition, fullTokens []uint32) []uint32 {
-	if r == nil || r.kind != loadedStandard || r.chatTemplateKind() != "mistral-inst" || len(fullTokens) <= 1 {
+	if r == nil || r.kind != loadedStandard || len(fullTokens) <= 1 {
+		return nil
+	}
+	// Generation calls this before looking up a snapshot. When the opt-in
+	// cache is disabled, a second system/tools render would be discarded
+	// immediately, including all its tokenization and JSON allocation work.
+	if _, enabled := r.mistralKVPrefixCacheEpoch(); !enabled {
+		return nil
+	}
+	if r.chatTemplateKind() != "mistral-inst" {
 		return nil
 	}
 	var systems []ChatMessage
@@ -235,16 +255,28 @@ func (r *Runner) mistralStaticPromptPrefix(messages []ChatMessage, systemPrompt 
 	return prefix
 }
 
-// mistralMarker returns literal as a single control token when the vocabulary
-// defines one (true for every marker on real Mistral/Ministral Tekken
-// tokenizers, verified directly against a Ministral-3-3B-Instruct-2512 GGUF),
-// falling back to plain-text encoding so rendering degrades rather than fails
-// outright on a hypothetical vocabulary that lacks it.
-func (r *Runner) mistralMarker(literal string) []uint32 {
-	if id, ok := r.tok.SpecialID(literal); ok {
-		return []uint32{id}
+// Native control markers carry their ID directly instead of allocating a
+// one-element token slice for every marker on every candidate render.
+type mistralControlMarker struct {
+	token    uint32
+	native   bool
+	fallback []uint32
+}
+
+func (m mistralControlMarker) appendTo(tokens []uint32) []uint32 {
+	if m.native {
+		return append(tokens, m.token)
 	}
-	return r.tok.EncodeWithoutBOS(literal)
+	return append(tokens, m.fallback...)
+}
+
+// mistralMarker retains literal-text encoding for vocabularies without a
+// dedicated control token, including the original Mistral-7B vocabulary.
+func (r *Runner) mistralMarker(literal string) mistralControlMarker {
+	if id, ok := r.tok.SpecialID(literal); ok {
+		return mistralControlMarker{token: id, native: true}
+	}
+	return mistralControlMarker{fallback: r.tok.EncodeWithoutBOS(literal)}
 }
 
 func (r *Runner) systemPromptTokens() (start, end uint32, ok bool) {

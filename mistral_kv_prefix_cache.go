@@ -202,7 +202,8 @@ func (r *Runner) mistralKVPrefixCacheReuse(dst *KVCache, tokens []uint32) (int, 
 // the epoch recheck at insertion makes an Enable/Clear/Disable racing that
 // copy an explicit invalidation boundary rather than a stale repopulation.
 func (r *Runner) putMistralKVPrefixSnapshot(src *KVCache, tokens []uint32, epoch uint64) {
-	if r == nil || src == nil || len(tokens) == 0 {
+	if r == nil || src == nil || len(tokens) == 0 || len(tokens) > src.MaxLen ||
+		src.layerCount() <= 0 || len(tokens) > int(^uint(0)>>1)/4 {
 		return
 	}
 	r.mistralKVPrefixCacheMu.Lock()
@@ -211,7 +212,15 @@ func (r *Runner) putMistralKVPrefixSnapshot(src *KVCache, tokens []uint32, epoch
 		r.mistralKVPrefixCacheMu.Unlock()
 		return
 	}
-	maxBytes := cache.maxBytes
+	// Both the exact-length KV rows and the raw-token string consume this
+	// budget. Reject before allocating either. Dividing the bounded budget by
+	// one position's cost also avoids overflowing a full-prefix size product.
+	rowBytes := kvCacheBytes(src.layerCount(), src.PerPosKDim, src.PerPosVDim, 1, src.kvFormat()) + 4
+	if rowBytes <= 0 || int64(len(tokens)) > cache.maxBytes/rowBytes {
+		r.mistralKVPrefixCacheMu.Unlock()
+		return
+	}
+	entryBytes := int64(len(tokens)) * rowBytes
 	key := mistralKVPrefixTokenKey(tokens)
 	// A resident entry represents precisely the same deterministic prefix. It
 	// is immutable, so avoid duplicating an expensive snapshot on every hit.
@@ -226,15 +235,6 @@ func (r *Runner) putMistralKVPrefixSnapshot(src *KVCache, tokens []uint32, epoch
 	if snapshot == nil {
 		return
 	}
-	// The raw-token string is the map key retained by the entry. Account for
-	// it explicitly; keeping a second []uint32 copy solely for bookkeeping
-	// would both duplicate this memory and make the advertised cache budget
-	// misleading.
-	entryBytes := kvCacheStorageBytes(snapshot) + int64(len(key))
-	if entryBytes <= 0 || entryBytes > maxBytes {
-		return
-	}
-
 	r.mistralKVPrefixCacheMu.Lock()
 	cache = &r.mistralKVPrefixCache
 	if !cache.enabled || cache.epoch != epoch || entryBytes > cache.maxBytes {

@@ -92,12 +92,19 @@ func (s *remoteState) proxyChat(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if configuredModel != "" {
-		var payload map[string]any
-		if err := json.Unmarshal(body, &payload); err != nil {
-			http.Error(w, "invalid chat request: "+err.Error(), http.StatusBadRequest)
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		writeAPIError(w, 400, "invalid_request", "", "chat request must be a JSON object")
+		return
+	}
+	if raw, present := payload["gopherllm_context_rag"]; present {
+		enabled, valid := raw.(bool)
+		if !valid || enabled {
+			writeAPIError(w, 400, "unsupported_request", "gopherllm_context_rag", "context retrieval requires local server inference and is unavailable through a remote API")
 			return
 		}
+	}
+	if configuredModel != "" {
 		if model, _ := payload["model"].(string); strings.TrimSpace(model) == "" {
 			payload["model"] = configuredModel
 			body, err = json.Marshal(payload)

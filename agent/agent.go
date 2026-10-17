@@ -24,6 +24,7 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/chatmemory"
 	"github.com/SimonWaldherr/GopherLLM/rag"
 )
 
@@ -35,8 +36,8 @@ const (
 	// decide whether to search at all. The default.
 	RetrieveByTool RetrievalMode = iota
 	// RetrievePrefix always searches once, using the conversation's most
-	// recent user message as the query, and prepends the results to the
-	// system prompt.
+	// recent user message as the query, and prepends the results as reference
+	// data to a copy of that message. System instructions stay unchanged.
 	RetrievePrefix
 	// RetrieveOff never touches the index during Chat, even if one is
 	// configured — useful for a conversation turn that should answer from
@@ -63,12 +64,20 @@ type Agent struct {
 	query     rag.Query
 	maxRounds int
 	observer  func(Step)
+	// contextPlanner supplies exact, model-specific prompt accounting. Tests
+	// using a scripted generator may supply a planner without model weights.
+	contextPlanner chatContextPlanner
+	contextRecall  *chatmemory.Options
 
 	// pending accumulates every index-affecting Option (WithDocuments,
 	// WithIndex, WithEmbedder, WithSelfEmbedding, WithChunker, WithRanking)
 	// until resolveIndex builds or loads the real *rag.Index once, after
 	// every Option has run. See options.go.
 	pending pendingIndexFields
+}
+
+type chatContextPlanner interface {
+	PrepareChatContext([]gopherllm.ChatMessage, gopherllm.GenerationOptions) ([]gopherllm.ChatMessage, gopherllm.ContextWindowInfo, error)
 }
 
 // Open loads a GGUF and returns a ready Agent; Close releases the model.
@@ -110,6 +119,9 @@ func newAgentWithGenerator(ctx context.Context, generate gopherllm.ChatGenerator
 
 func buildAgent(ctx context.Context, m *gopherllm.Model, generate gopherllm.ChatGenerator, ownsModel bool, opts []Option) (*Agent, error) {
 	a := &Agent{model: m, generate: generate, ownsModel: ownsModel, tools: &ToolSet{names: map[string]bool{}}}
+	if m != nil {
+		a.contextPlanner = m.Runner()
+	}
 	for _, opt := range opts {
 		if err := opt(ctx, a); err != nil {
 			return nil, err
@@ -189,6 +201,15 @@ func (a *Agent) Ask(ctx context.Context, question string, opts ...gopherllm.GenO
 func (a *Agent) Chat(ctx context.Context, messages []gopherllm.ChatMessage, opts ...gopherllm.GenOption) (Answer, error) {
 	options := a.buildOptions(opts)
 	tools := a.tools.AgenticTools()
+	if a.contextRecall != nil && (options.ContextWindowMode == "" || options.ContextWindowMode == gopherllm.ContextWindowFull) {
+		return Answer{}, fmt.Errorf("agent: context recall requires recent or autoCompress context mode")
+	}
+	// Document-prefix retrieval augments this message below. Conversation
+	// recall must keep querying the caller's original request in every round.
+	recallQuery := ""
+	if user := lastUserMessageIndex(messages); user >= 0 {
+		recallQuery = messages[user].Content
+	}
 
 	searched := false
 	var sources []Source
@@ -197,16 +218,37 @@ func (a *Agent) Chat(ctx context.Context, messages []gopherllm.ChatMessage, opts
 		tools = append(tools, gopherllm.AgenticTool(SearchDocumentsTool(a.index, a.query)))
 		ctx = withSourceCollector(ctx, &sources)
 	case a.retrieval == RetrievePrefix && a.index.Len() > 0:
-		hits, err := a.index.Search(ctx, lastUserText(messages), a.query)
+		user := lastUserMessageIndex(messages)
+		if user < 0 {
+			break
+		}
+		hits, err := a.index.Search(ctx, messages[user].Content, a.query)
 		if err == nil && len(hits) > 0 {
 			for _, h := range hits {
 				sources = append(sources, sourceFromHit(h))
 			}
-			options.SystemPrompt = prependContext(options.SystemPrompt, hits)
+			// Explicit system messages override options.SystemPrompt in several
+			// renderers. Keep reference data with the current user turn so every
+			// renderer includes it and bounded context cannot drop it separately.
+			messages = append([]gopherllm.ChatMessage(nil), messages...)
+			messages[user].Content = prependContext(messages[user].Content, hits)
 			searched = true
 		}
 	}
 	options = options.WithContext(ctx)
+	generate := a.generate
+	if a.contextRecall != nil {
+		if a.contextPlanner == nil {
+			return Answer{}, fmt.Errorf("agent: context recall requires a chat context planner")
+		}
+		recallOptions := *a.contextRecall
+		recallOptions.Query = recallQuery
+		memory, err := chatmemory.New(ctx, a.contextPlanner, recallOptions)
+		if err != nil {
+			return Answer{}, fmt.Errorf("agent: context recall: %w", err)
+		}
+		generate = memory.Wrap(generate)
+	}
 
 	var steps []Step
 	observe := func(e gopherllm.AgentEvent) {
@@ -220,7 +262,7 @@ func (a *Agent) Chat(ctx context.Context, messages []gopherllm.ChatMessage, opts
 		}
 	}
 
-	result, err := gopherllm.RunAgenticChatWithGenerator(a.generate,
+	result, err := gopherllm.RunAgenticChatWithGenerator(generate,
 		messages, options, a.skills, tools, func(string) bool { return true }, observe)
 	if err != nil {
 		return Answer{}, err
@@ -229,6 +271,7 @@ func (a *Agent) Chat(ctx context.Context, messages []gopherllm.ChatMessage, opts
 		Text: result.Text, Reasoning: result.ReasoningText,
 		Sources: dedupeSources(sources), Steps: steps,
 		Retrieved: searched, FinishReason: result.FinishReason, Stats: result.Stats,
+		ContextWindow: result.ContextWindow,
 	}, nil
 }
 
@@ -271,6 +314,10 @@ type Answer struct {
 	Retrieved    bool
 	FinishReason string
 	Stats        gopherllm.GenerationStats
+	// ContextWindow describes the final model call, including only recall
+	// sources actually injected for that call. Conversation recall is separate
+	// from document Sources and does not change Retrieved's meaning.
+	ContextWindow *gopherllm.ContextWindowInfo
 }
 
 // Source is one citation: a chunk a search actually returned this turn.

@@ -26,9 +26,9 @@ type reasoningStreamSplitter interface {
 // reasoning is separated into reasoning_content deltas as soon as its tokens
 // arrive; the final gopherllm.GenerationResult remains authoritative for tool calls and
 // for the buffered agentic path.
-func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool, includeUsage bool) {
+func streamOpenAIChat(w http.ResponseWriter, req *http.Request, logw io.Writer, requestID string, r *gopherllm.Runner, model string, messages []gopherllm.ChatMessage, options gopherllm.GenerationOptions, skills []gopherllm.Skill, tools []gopherllm.AgenticTool, includeUsage bool, generate gopherllm.ChatGenerator) {
 	streamChatWithGenerator(w, req, logw, requestID, r.Architecture(), model, r.UsesMistralThinkProtocol(), options, includeUsage, func(onToken func(string) bool, observe func(gopherllm.AgentEvent)) (gopherllm.GenerationResult, error) {
-		return gopherllm.RunAgenticChatObserved(r, messages, options, skills, tools, onToken, observe)
+		return gopherllm.RunAgenticChatWithGenerator(generate, messages, options, skills, tools, onToken, observe)
 	})
 }
 
@@ -139,18 +139,11 @@ func streamChatWithGenerator(w http.ResponseWriter, req *http.Request, logw io.W
 		}
 		finalDelta["tool_calls"] = calls
 	}
-	extra := map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason)}
 	// Headers are already committed once an SSE stream begins. Put the final
 	// loop iteration's context accounting in the terminal choice instead, so a
 	// skill/tool loop cannot leave the UI reporting the initial prompt as if it
 	// were the final one.
-	if result.ContextWindow != nil {
-		extra["gopherllm_context"] = result.ContextWindow
-	}
-	if result.PromptCache != nil {
-		extra["gopherllm_cache"] = result.PromptCache
-	}
-	if writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, extra) != nil {
+	if writeOpenAIStreamChunk(w, flusher, id, model, created, finalDelta, chatStreamFinalExtra(result)) != nil {
 		return
 	}
 	if includeUsage {
@@ -160,6 +153,17 @@ func streamChatWithGenerator(w http.ResponseWriter, req *http.Request, logw io.W
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+func chatStreamFinalExtra(result gopherllm.GenerationResult) map[string]any {
+	extra := map[string]any{"finish_reason": finishReasonOrDefault(result.FinishReason)}
+	if result.ContextWindow != nil {
+		extra["gopherllm_context"] = result.ContextWindow
+	}
+	if result.PromptCache != nil {
+		extra["gopherllm_cache"] = result.PromptCache
+	}
+	return extra
 }
 
 // systemFingerprint is a static stand-in for OpenAI's build-identifying
@@ -235,7 +239,7 @@ func streamValidatedChat(w http.ResponseWriter, req *http.Request, model string,
 	if writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{"role": "assistant", "content": result.Text}, nil) != nil {
 		return
 	}
-	if writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{}, map[string]any{"finish_reason": result.FinishReason}) != nil {
+	if writeOpenAIStreamChunk(w, flusher, id, model, created, map[string]any{}, chatStreamFinalExtra(result)) != nil {
 		return
 	}
 	if includeUsage && writeOpenAIUsageChunk(w, flusher, id, model, created, usage(result)) != nil {

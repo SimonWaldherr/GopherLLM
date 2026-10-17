@@ -100,13 +100,24 @@ func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt strin
 	if !(ok1 && ok2) {
 		return nil, false
 	}
-	tokens := []uint32{}
+	tokens := make([]uint32, 0, 16+min(len(messages), 4096)*8)
+	// Only the already separate newline encoding is shared. Role headers and
+	// content stay in one tokenizer call so BPE merge boundaries do not change.
+	var newline []uint32
+	newlineReady := false
+	appendNewline := func() {
+		if !newlineReady {
+			newline = r.tok.EncodeWithoutBOS("\n")
+			newlineReady = true
+		}
+		tokens = append(tokens, newline...)
+	}
 	appendTurn := func(role, content string, close bool) {
 		tokens = append(tokens, imStart)
 		tokens = append(tokens, r.tok.EncodeWithoutBOS(role+"\n"+strings.TrimSpace(content))...)
 		if close {
 			tokens = append(tokens, imEnd)
-			tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+			appendNewline()
 		}
 	}
 	hasSystem := false
@@ -135,7 +146,7 @@ func (r *Runner) renderChatMLMessages(messages []ChatMessage, systemPrompt strin
 	// whose own chat_template actually does this by default.
 	if think, ok := r.tok.SpecialID("<think>"); ok && r.chatMLOpensThinkTagByDefault() {
 		tokens = append(tokens, think)
-		tokens = append(tokens, r.tok.EncodeWithoutBOS("\n")...)
+		appendNewline()
 	}
 	return tokens, true
 }

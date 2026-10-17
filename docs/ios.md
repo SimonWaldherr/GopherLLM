@@ -87,9 +87,11 @@ let result = try await engine.chat(history + [.user("Shorter, please.")])
 
 - **Conversations.** Pass the whole history each time. With
   `contextWindowMode: .recent` the oldest complete turns are dropped once the
-  conversation outgrows the model's context (`.autoCompress` condenses them
-  first); `result.contextWindow` reports what was dropped. The default,
-  `.full`, fails instead.
+  conversation outgrows the model's context. `.autoCompress` first tries
+  conservatively shortening older plain assistant prose, only if the original
+  prompt does not fit. Compression preserves user/system messages, the newest
+  complete turn, tool/image payloads and formatted content. `result.contextWindow`
+  reports what was dropped. The default, `.full`, fails instead.
 - **Cancellation.** Cancelling the Swift task, or breaking out of the stream
   loop, stops generation. `engine.cancel()` stops the running request
   directly.

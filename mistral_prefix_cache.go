@@ -142,6 +142,13 @@ func (r *Runner) MistralPromptPrefixCacheStats() MistralPromptPrefixCacheStats {
 // from ever receiving the cache's backing slice, so later render appends
 // cannot corrupt a resident entry.
 func (r *Runner) appendMistralPromptPrefix(dst []uint32, key mistralPromptPrefixCacheKey) ([]uint32, uint64, bool) {
+	return r.appendMistralPromptPrefixWithSpare(dst, key, 0)
+}
+
+// Reserve dynamic-turn space only after an exact cached prefix is found. The
+// renderer otherwise allocates an estimated prefix-sized buffer before lookup,
+// then replaces it when the cached token count exceeds that estimate.
+func (r *Runner) appendMistralPromptPrefixWithSpare(dst []uint32, key mistralPromptPrefixCacheKey, spare int) ([]uint32, uint64, bool) {
 	if r == nil || !key.cacheable() {
 		return dst, 0, false
 	}
@@ -160,6 +167,14 @@ func (r *Runner) appendMistralPromptPrefix(dst []uint32, key mistralPromptPrefix
 	}
 	cache.hits++
 	cache.touch(key)
+	if spare > 0 && spare <= int(^uint(0)>>1)-len(dst)-len(entry.tokens) {
+		required := len(dst) + len(entry.tokens) + spare
+		if cap(dst) < required {
+			expanded := make([]uint32, len(dst), required)
+			copy(expanded, dst)
+			dst = expanded
+		}
+	}
 	dst = append(dst, entry.tokens...)
 	r.mistralPrefixCacheMu.Unlock()
 	return dst, epoch, true

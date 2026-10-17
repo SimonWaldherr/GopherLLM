@@ -106,22 +106,34 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		return GenerationResult{}, fmt.Errorf("no prompt provided")
 	}
 	totalStart := time.Now()
+	// Capture the opt-in snapshot fence before any prompt rendering. Clear or
+	// Disable during tokenization must prevent this already-running request
+	// from repopulating the cache after its prefill completes.
+	var mistralKVPrefixEpoch uint64
+	mistralKVPrefixEnabled := false
+	if r.kind == loadedStandard {
+		mistralKVPrefixEpoch, mistralKVPrefixEnabled = r.mistralKVPrefixCacheEpoch()
+	}
 	var contextWindow *ContextWindowInfo
+	var tokens []uint32
 	// Do this at the shared generation entry point rather than only in the
 	// HTTP handler. Agentic requests append assistant tool calls and tool
 	// results between iterations; each subsequent model call must be budgeted
 	// against those effective messages and active tools as well.
 	if normalizedContextWindowMode(options.ContextWindowMode) != ContextWindowFull {
-		prepared, info, err := r.PrepareChatContext(messages, options)
+		prepared, info, err := r.prepareChatContext(messages, options, &tokens)
 		if err != nil {
 			return GenerationResult{}, err
 		}
 		messages = prepared
 		contextWindow = &info
 	}
-	tokens, imageEmbeds, err := r.renderMessagesForGeneration(messages, options.SystemPrompt, options.ActiveTools(), options.FIMSuffix)
-	if err != nil {
-		return GenerationResult{}, err
+	var imageEmbeds map[int][]float32
+	if tokens == nil {
+		tokens, imageEmbeds, err = r.renderMessagesForGeneration(messages, options.SystemPrompt, options.ActiveTools(), options.FIMSuffix)
+		if err != nil {
+			return GenerationResult{}, err
+		}
 	}
 	if len(tokens) == 0 {
 		return GenerationResult{}, fmt.Errorf("prompt rendered to zero tokens")
@@ -135,6 +147,10 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// instead of failing here with a clear error.
 	if len(tokens) >= r.config.MaxSeqLen {
 		return GenerationResult{}, fmt.Errorf("prompt (%d tokens) leaves no room to generate within the model's context length (%d)", len(tokens), r.config.MaxSeqLen)
+	}
+	ctx := options.generationContext()
+	if err := ctx.Err(); err != nil {
+		return GenerationResult{}, err
 	}
 	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
 	cache, buf := r.generationWorkspace(cacheLen, mtpDraftTokens > 0)
@@ -176,16 +192,8 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// against the already-rendered token stream; images always opt out because
 	// token IDs alone cannot identify their substituted embeddings.
 	var mistralStaticPrefix []uint32
-	var mistralKVPrefixEpoch uint64
-	if cacheEligible {
+	if cacheEligible && mistralKVPrefixEnabled {
 		mistralStaticPrefix = r.mistralStaticPromptPrefix(messages, options.SystemPrompt, options.ActiveTools(), tokens)
-		if len(mistralStaticPrefix) > 0 {
-			if epoch, enabled := r.mistralKVPrefixCacheEpoch(); enabled {
-				mistralKVPrefixEpoch = epoch
-			} else {
-				mistralStaticPrefix = nil
-			}
-		}
 	}
 	cachedResidentTokens := r.prefixCache.tokens
 	cachedPromptTokens := r.prefixCache.promptTokens
@@ -196,7 +204,13 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	if cacheEligible {
 		cacheInfo.Mode = "prefix"
 		reusedTokens = r.prefixReuseWithMTP(cache, tokens, mtpDraftTokens > 0)
+		residentReuse := reusedTokens
 		reusedTokens = r.reuseConversation(cache, tokens, reusedTokens)
+		if reusedTokens > residentReuse {
+			// The immutable snapshot has overwritten the prior workspace. An
+			// intervening cancellation must not leave its old token metadata valid.
+			r.clearPrefixCache()
+		}
 		// Prefer the full, most-recent prompt cache when it has a longer match.
 		// The static Mistral snapshot is only a proper token prefix, so it cannot
 		// supply final-prompt logits and never takes the identical-prompt fast
@@ -204,6 +218,7 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		if len(mistralStaticPrefix) > reusedTokens {
 			if copied, hit := r.mistralKVPrefixCacheReuse(cache, mistralStaticPrefix); hit && copied > reusedTokens {
 				reusedTokens = copied
+				r.clearPrefixCache()
 			}
 		}
 		cacheInfo.Hit = reusedTokens > 0
@@ -214,7 +229,6 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		seed = uint64(time.Now().UnixNano())
 	}
 	rng := NewRng(seed)
-	ctx := options.generationContext()
 	if err := ctx.Err(); err != nil {
 		return GenerationResult{}, err
 	}
