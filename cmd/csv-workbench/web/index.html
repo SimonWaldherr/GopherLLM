@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>CSV-Arbeitsplatz · GopherLLM</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <div>
+        <span class="eyebrow">GopherLLM</span>
+        <h1>CSV-Arbeitsplatz</h1>
+      </div>
+      <span id="models">Modelle werden geprüft …</span>
+    </header>
+    <main>
+      <section class="model-panel" aria-label="Modellwahl">
+        <div class="model-heading">
+          <div>
+            <h2>Modelle wählen</h2>
+            <p>
+              Laya klassifiziert. Der optionale Textassistent formuliert
+              Vorschläge und Erläuterungen.
+            </p>
+          </div>
+          <button id="refreshModels" class="secondary">
+            Status aktualisieren
+          </button>
+        </div>
+        <div class="model-grid">
+          <div>
+            <label for="layaModel">Laya-Modell</label
+            ><select id="layaModel">
+              <option value="">Kein Modell geladen</option></select
+            ><button id="loadLaya">Laya laden</button>
+          </div>
+          <div>
+            <label for="assistantModel">Ministral / Textassistent (GGUF)</label
+            ><select id="assistantModel">
+              <option value="">Ohne Textassistent</option></select
+            ><button id="loadAssistant">Textassistent laden</button>
+          </div>
+        </div>
+        <button id="modelCancel" class="secondary" hidden>
+          Modellwechsel abbrechen
+        </button>
+        <p id="modelStatus" role="status" aria-live="polite">
+          Modellkatalog wird geladen …
+        </p>
+        <small id="modelHint"
+          >Hugging-Face-Modelle werden beim Laden heruntergeladen, falls sie
+          nicht im Cache liegen. Weitere lokale Modelle werden über -model-dir
+          angeboten. Bei einem Laya-Wechsel werden bestehende Ergebnisse
+          zurückgesetzt; die CSV bleibt geladen.</small
+        >
+      </section>
+      <section class="setup" aria-label="Datei und Aufgabe">
+        <h2>1. Datei und Aufgabe</h2>
+        <label
+          >CSV-Datei<input
+            id="file"
+            type="file"
+            accept=".csv,.tsv,text/csv,text/tab-separated-values"
+        /></label>
+        <div class="pair">
+          <label
+            >Trennzeichen<select id="delimiter">
+              <option value=",">Komma</option>
+              <option value=";">Semikolon</option>
+              <option value="tab">Tabulator</option>
+            </select></label
+          ><label class="check"
+            ><input id="noHeader" type="checkbox" />Ohne Kopfzeile</label
+          >
+        </div>
+        <button id="import">Datei laden</button
+        ><small
+          >Bis 32 MiB und 10.000 Datensätze. CSV und TSV in UTF-8 werden
+          unterstützt.</small
+        >
+        <hr />
+        <label
+          >Eingabespalte<select id="column">
+            <option value="">Kompletter Datensatz</option>
+          </select></label
+        >
+        <label
+          >Frage / Aufgabe<textarea
+            id="task"
+            rows="3"
+            placeholder="Welcher Bereich soll diese Anfrage bearbeiten?"
+          >
+Welcher Bereich soll diese Anfrage bearbeiten?</textarea>
+        </label>
+        <button id="suggest" class="secondary" disabled>
+          Aufgabe mit Ministral vorschlagen
+        </button>
+        <label
+          >Ergebnistyp<select id="type">
+            <option value="choice">Kategorie</option>
+            <option value="noul">Ja/Nein-Wahrscheinlichkeit</option>
+            <option value="score">Bewertung auf einer Skala</option>
+          </select></label
+        >
+        <label id="criteriaLabel"
+          >Kategorien / Skalenstufen als JSON<textarea id="criteria" rows="3">
+["Abrechnung", "Technik", "Vertrieb"]</textarea
+          ><small
+            >Liste; bei Kategorien auch ein Objekt mit Beschreibungen. Skalen
+            beginnen bei 0.</small
+          ></label
+        >
+        <label
+          >Neue Ergebnisspalte<input id="resultColumn" value="kategorie"
+        /></label>
+        <div class="pair">
+          <button id="preview">5 Zeilen testen</button
+          ><button id="run">Alle verarbeiten</button>
+        </div>
+        <button id="cancel" class="secondary" hidden>Abbrechen</button>
+        <progress
+          id="progress"
+          value="0"
+          max="1"
+          aria-label="Verarbeitungsfortschritt"
+        ></progress>
+        <p id="status" role="status" aria-live="polite">
+          Lade eine Datei, um zu beginnen.
+        </p>
+        <small
+          >Laya ordnet zu; Ministral macht Vorschläge. Wahrscheinlichkeiten sind
+          keine garantierte Trefferquote. Lange Eingaben können am Kontextlimit
+          des Checkpoints gekürzt werden.</small
+        >
+      </section>
+      <section class="workspace" aria-label="Ergebnisse">
+        <div class="toolbar">
+          <div>
+            <h2>2. Ergebnisse prüfen</h2>
+            <p id="summary">Noch keine Datei geladen.</p>
+          </div>
+          <button id="export" disabled>CSV exportieren</button>
+        </div>
+        <div class="filters">
+          <label
+            >Ansicht<select id="filter">
+              <option value="all">Alle Datensätze</option>
+              <option value="uncertain">Uneindeutig</option>
+              <option value="corrected">Manuell korrigiert</option>
+              <option value="pending">Noch offen</option>
+            </select></label
+          ><label
+            >Uneindeutig unter<input
+              id="threshold"
+              type="number"
+              min="0"
+              max="100"
+              value="75"
+            />
+            % Modellwahrscheinlichkeit</label
+          >
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead id="thead"></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <button id="prev" class="secondary">Zurück</button
+          ><span id="page">0 Datensätze</span
+          ><button id="next" class="secondary">Weiter</button>
+        </div>
+        <section id="detail" hidden>
+          <h2 id="detailTitle">Datensatz</h2>
+          <pre id="original"></pre>
+          <div class="pair">
+            <div>
+              <h3>Laya-Modellantwort</h3>
+              <p id="modelAnswer"></p>
+              <ul id="probabilities"></ul>
+            </div>
+            <div>
+              <label>Ergebnis korrigieren<input id="correction" /></label>
+              <div class="pair">
+                <button id="saveCorrection">Übernehmen</button
+                ><button id="resetCorrection" class="secondary">
+                  Zurücksetzen
+                </button>
+              </div>
+            </div>
+          </div>
+          <button id="explain" class="secondary" disabled>
+            Mit Ministral erläutern
+          </button>
+          <p id="explanation" aria-live="polite"></p>
+          <small
+            >Eine generierte Erläuterung ist eine zusätzliche Interpretation,
+            keine interne Begründung von Laya.</small
+          >
+        </section>
+      </section>
+    </main>
+    <footer>
+      Lokale Inferenz · Dateien und Ergebnisse bleiben nur für diese Sitzung im
+      Browser. Export enthält Modellantwort, Modellwahrscheinlichkeit und
+      Korrekturstatus.
+    </footer>
+  </body>
+</html>

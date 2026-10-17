@@ -59,6 +59,10 @@ same model with `--serve 127.0.0.1:8080` instead of the CSV options, then open
 [CSV classification](http://127.0.0.1:8080/classify).
 [Full guide: downloads, CSV/TSV, Go integration and HTTP API](docs/laya.md).
 
+For previews, editable results, uncertainty filters and CSV export, use the
+standalone [CSV Workbench](cmd/csv-workbench/README.md). It embeds its browser UI
+and optionally runs Ministral for task suggestions and row explanations.
+
 ## Contents
 
 - [Try it in five minutes](#try-it-in-five-minutes)

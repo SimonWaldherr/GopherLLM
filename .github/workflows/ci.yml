@@ -6,7 +6,7 @@ on:
 
 jobs:
   ui:
-    name: UI streaming tests
+    name: UI tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,11 +17,12 @@ jobs:
         with:
           node-version: 22
 
-      - name: Check JavaScript and streaming behavior
+      - name: Check JavaScript and browser behavior
         run: |
           node --check server/web_ui/script.js
           node --check server/web_ui/vision.js
-          node --test server/web_ui/stream_test.cjs server/web_ui/vision_test.cjs
+          node --check cmd/csv-workbench/web/app.js
+          node --test server/web_ui/*test.cjs cmd/csv-workbench/frontend.test.cjs
 
   test:
     name: Test (${{ matrix.os }})
