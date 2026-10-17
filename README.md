@@ -89,7 +89,7 @@ and optionally runs Ministral for task suggestions and row explanations.
 
 ## Features
 
-- Pure Go runtime with optional ARM64 (NEON) and x86-64 (AVX2 + FMA) assembly kernels.
+- Pure Go runtime with optional ARM64 (NEON) and x86-64 (SSE2, AVX2 + FMA) assembly kernels.
 - Memory-mapped GGUF loading for fast startup and lower copy pressure, on
   every platform (Unix `mmap`, Windows `CreateFileMapping`/`MapViewOfFile`):
   weights page in on demand and quantized tensors borrow the mapping
@@ -1232,6 +1232,29 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   size on the deployment machine.
 - SwiGLU's `x*sigmoid(x)*up` runs through an AVX2 kernel with a Cephes-style
   expf polynomial (~1e-7 relative error) instead of per-element `math.Exp`.
+- ARM64 SwiGLU evaluates four elements together using baseline NEON, with the
+  scalar path's float64 range reduction, float32 polynomial and saturation
+  bounds. Finite results match the scalar path bit for bit; short tails stay
+  scalar, unequal slice lengths use their common prefix, and either input may
+  be reused as the output. On an M2 Max, repeated single-thread kernel
+  benchmarks measured 9,216 elements at 41.1 → 8.4 µs and 16,384 elements at
+  72.8 → 14.6 µs (about 5× faster), with zero heap allocations. A three-round
+  Ministral 3B CPU comparison retained identical greedy output. These timings
+  measure the activation kernel; full-model timings varied too much to assign
+  an end-to-end speedup.
+- Float32 dot products on x86-64 CPUs without AVX2 use an SSE2 kernel with
+  unaligned loads and the portable kernel's four-lane accumulation order.
+  `GOPHERLLM_DISABLE_SIMD=1` also disables this fallback. Regression tests cover
+  exact finite-result bits, unequal lengths, tails, unaligned slices and local
+  stack arrays. The fallback has been exercised under Rosetta; native Intel/AMD
+  performance has not been measured.
+- ARM64 float32/float16 dot products and their four-head GQA variants reduce
+  vectors with pairwise NEON additions while preserving the existing addition
+  tree. On an M2 Max, controlled before/after benchmarks at 128 elements showed
+  10–15% lower dot-kernel time and single-thread attention benchmarks showed
+  1–8% lower time. These are kernel measurements, not end-to-end model gains.
+  Audited `noescape` declarations also keep local caller arrays on the stack
+  for these float operations on ARM64 and dot products on x86-64.
 - ARM64 CPUs with SDOT use full-row Q4_K, Q6_K and Q8_0 decode kernels.
   Prefill shares Q6_K unpacking across four tokens and packs Q8_0 activations
   once per batch for four-token SIMD dot products. Decode workers claim fine
@@ -1260,8 +1283,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   parallelism and uses grouped GQA directly. Set `GOPHERLLM_NO_GROUPED_GQA=1`
   for an A/B rollback.
   Non-ARM64 targets (amd64 included) run the same grouped-GQA decode
-  algorithm: the shared-row dot/AXPY step is composed from the portable,
-  AVX2-backed `DotF32`/`AxpyF32` kernels instead of a hand-fused NEON kernel,
+  algorithm: the shared-row dot/AXPY step is composed from portable or x86-64
+  SIMD `DotF32`/`AxpyF32` kernels instead of a hand-fused NEON kernel,
   but each K/V row is still read from the cache once per query-head group
   rather than once per head, so the same bandwidth saving applies. It reuses
   the 4k decode threshold above rather than a value re-tuned for amd64.
@@ -1346,6 +1369,56 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   multi-second page-in tax. Set `GOPHERLLM_NO_PREFAULT=1` to restore pure lazy
   paging.
 
+### M4 and M4 Pro Macs
+
+The CPU mix and memory interface differ substantially between these chips:
+
+| Mac chip variant | Performance + efficiency cores | GPU cores | Peak memory bandwidth |
+|---|---|---|---|
+| M4, 10-core CPU | 4 + 6 | 10 in Mac mini | 120 GB/s |
+| M4 Pro, 12-core CPU | 8 + 4 | 16 | 273 GB/s |
+| M4 Pro, 14-core CPU | 10 + 4 | 20 | 273 GB/s |
+
+Sources: [Apple's Mac mini specifications](https://support.apple.com/en-us/121555)
+and [M4 Pro announcement](https://www.apple.com/newsroom/2024/10/apple-introduces-m4-pro-and-m4-max/).
+The [two-port M4 iMac](https://support.apple.com/en-us/121556) instead has four
+performance and four efficiency cores, an eight-core GPU and 120 GB/s bandwidth.
+
+M4 adds SME/SME2 matrix acceleration with 512-bit streaming vectors
+([primary research](https://arxiv.org/abs/2409.18779)). GopherLLM sends suitable
+F32 prefill matrices to [Accelerate](https://developer.apple.com/documentation/accelerate),
+which selects its matrix implementation for the available CPU at runtime.
+
+- Auto mode measures the P-core count and a mixed count halfway toward all
+  cores, alongside the existing generic candidates. M4 Pro's 12-core variant
+  now includes 8 and 10 threads; the 14-core variant includes 10 and 12.
+  These counts do not pin goroutines to particular cores; the tuner selects
+  settings only after its timing and final-validation checks.
+- Auto-tuning and Metal-probe caches include chip name, Mac model, CPU family,
+  P/E counts, exposed SME features and the availability of the CGO prefill
+  backend. A result for a twelve-core M2 Max is no longer reused for a
+  twelve-core M4 Pro. The Mac model also separates different chassis using
+  the same chip. Unavailable queries fall back to the remaining platform
+  information.
+- With CGO, F32 prefill batches of at least 32 tokens use larger GEMMs instead
+  of capping every call at 128 rows. Proven contiguous, disjoint input/output
+  slabs can bypass activation copies. Other layouts retain input snapshots
+  and the previous output-copy order. Quantized weight-expansion tiles keep
+  their four-MiB limit; Go-side packed input and output each remain bounded
+  by eight MiB. Short batches retain their previous compute tile size.
+
+On the M2 Max validation host, three alternating A/B rounds for a
+3,072-row × 768-column F32 projection with 64 tokens measured about **1.5×**
+speedup for bounded per-token views and **2.4×** for contiguous slabs, with
+zero steady-state heap allocations. These are projection measurements on
+M2 Max; M4/M4 Pro timings have not been measured here. To measure the local
+Mac and choose model-specific settings:
+
+```sh
+make run-auto MODEL="your-model.gguf" AUTO_EFFORT=balanced
+CGO_ENABLED=1 go test -run '^$' -bench '^BenchmarkApplePrefillMatrixLayout$' -benchmem -count=5
+```
+
 ### Environment variables
 
 Quick reference for the runtime toggles described above (unset by default;
@@ -1354,7 +1427,7 @@ details in the bullets they annotate):
 | Variable | Effect |
 |---|---|
 | `GOPHERLLM_MODEL_DIR` | Default model directory when `--model-dir` is not given (`RUSTY_LLM_MODEL_DIR` remains a deprecated fallback) |
-| `GOPHERLLM_DISABLE_SIMD` | Force portable scalar kernels (skip AVX2 detection on x86-64, `FEAT_DotProd` detection on arm64) |
+| `GOPHERLLM_DISABLE_SIMD` | Disable SSE2/AVX2 kernels on x86-64 and `FEAT_DotProd` detection on arm64 |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
 | `GOPHERLLM_NO_GROUPED_GQA` | Disable the grouped-GQA/MQA decode path (any ratio, any KV cache format) (A/B benchmarking and debugging) |

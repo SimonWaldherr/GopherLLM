@@ -4,10 +4,12 @@ import (
 	"context"
 	"math"
 	"sync"
+	"unsafe"
 )
 
-// Layer workspaces are reused across the sequential questions in one request,
-// then released. Long-context buffers are never retained across requests.
+// Tensor scratch and RoPE tables are reused across questions and requests.
+// A model retains at most 32 MiB; unusually long contexts are released after
+// their request. No token-dependent activations or K/V rows are reused as input.
 type layaBuffer struct {
 	data []float32
 	rows [][]float32
@@ -15,6 +17,10 @@ type layaBuffer struct {
 
 func (b *layaBuffer) resize(n, d int, zero bool) [][]float32 {
 	if cap(b.data) < n*d {
+		// A narrower row count with wider rows can grow data while reusing
+		// the header array. Clear inactive headers as well, so none retains
+		// an older backing store outside the workspace's byte accounting.
+		clear(b.rows[:cap(b.rows)])
 		b.data = make([]float32, n*d)
 	} else {
 		b.data = b.data[:n*d]
@@ -37,7 +43,33 @@ type layaWorkspace struct {
 	input, norm, qkv, attention, projection, hidden layaBuffer
 	scores                                          []float32
 	rotary                                          [2]layaRotary
-	attentionTask                                   layaAttentionTask
+	attentionTask                                   *layaAttentionTask
+}
+
+const layaWorkspaceRetentionBytes int64 = 32 << 20
+
+// Predict holds the model mutex until this deferred cleanup completes. Every
+// forward overwrites its active tensor rows; only allocation capacity and
+// position-only RoPE tables survive. Worker score pools stay request-local.
+func (m *LayaModel) retainWorkspace(work *layaWorkspace) {
+	work.attentionTask = nil
+	if work.retainedBytes() <= layaWorkspaceRetentionBytes {
+		m.workspace = work
+	} else {
+		m.workspace = nil
+	}
+}
+
+func (w *layaWorkspace) retainedBytes() int64 {
+	bytes := int64(unsafe.Sizeof(*w))
+	for _, b := range []*layaBuffer{&w.input, &w.norm, &w.qkv, &w.attention, &w.projection, &w.hidden} {
+		bytes += int64(cap(b.data))*4 + int64(cap(b.rows))*int64(unsafe.Sizeof([]float32(nil)))
+	}
+	bytes += int64(cap(w.scores)) * 4
+	for i := range w.rotary {
+		bytes += int64(cap(w.rotary[i].data)) * 4
+	}
+	return bytes
 }
 
 type layaRotary struct {
@@ -168,7 +200,10 @@ type layaAttentionTask struct {
 }
 
 func layaAttentionPortable(ctx context.Context, n, heads, dim, window int, scale float32, work *layaWorkspace) error {
-	task := &work.attentionTask
+	if work.attentionTask == nil {
+		work.attentionTask = &layaAttentionTask{}
+	}
+	task := work.attentionTask
 	task.ctx, task.n, task.heads, task.dim, task.window, task.scale = ctx, n, heads, dim, window, scale
 	task.qkv, task.out = work.qkv.rows, work.attention.rows
 	task.scoreWidth = n

@@ -2,10 +2,15 @@
 
 package gopherllm
 
+import "math"
+
 //go:noescape
 func q4kQ8Dots8x4Asm(q *byte, q8 *int8, stride int, out *int32)
 
-var q4kBatchAsmOK = hasDotProd && validateQ4KBatchAsm()
+//go:noescape
+func q4kRows4Asm(row *byte, q8 *int8, scales, sums, lut *float32, cols, blocks int, out *float32)
+
+var q4kBatchAsmOK = hasDotProd && validateQ4KBatchAsm() && validateQ4KRows4Asm()
 
 func validateQ4KBatchAsm() bool {
 	q := q8kSelfCheckBytes(128, 7, 0)
@@ -54,47 +59,60 @@ func batchQ4KRows4(w Weight, outs [][]float32, q8 []int8, scales, sums []float32
 }
 
 func q4kRowBatch4(row []byte, q8 []int8, scales, sums []float32, cols, blocks int) (result [4]float32) {
-	var dots [4][8]int32
-	for block := range blocks {
-		weights := row[block*144 : (block+1)*144]
-		q4kQ8Dots8x4Asm(&weights[16], &q8[block*256], cols, &dots[0][0])
-		d, dmin := F16ToF32(binaryLE16(weights)), F16ToF32(binaryLE16(weights[2:]))
-		packed := weights[4:16]
-		s0, m0 := int32(packed[0]&63), int32(packed[4]&63)
-		s1, m1 := int32(packed[1]&63), int32(packed[5]&63)
-		s2, m2 := int32(packed[2]&63), int32(packed[6]&63)
-		s3, m3 := int32(packed[3]&63), int32(packed[7]&63)
-		s4 := int32((packed[8] & 0x0f) | ((packed[0] >> 6) << 4))
-		m4 := int32((packed[8] >> 4) | ((packed[4] >> 6) << 4))
-		s5 := int32((packed[9] & 0x0f) | ((packed[1] >> 6) << 4))
-		m5 := int32((packed[9] >> 4) | ((packed[5] >> 6) << 4))
-		s6 := int32((packed[10] & 0x0f) | ((packed[2] >> 6) << 4))
-		m6 := int32((packed[10] >> 4) | ((packed[6] >> 6) << 4))
-		s7 := int32((packed[11] & 0x0f) | ((packed[3] >> 6) << 4))
-		m7 := int32((packed[11] >> 4) | ((packed[7] >> 6) << 4))
+	if blocks <= 0 {
+		return
+	}
+	// Check all four token ranges before entering assembly. Division keeps
+	// malformed block/stride counts from overflowing an index calculation.
+	if cols <= 0 || cols%256 != 0 || blocks != cols/256 || blocks > len(row)/144 ||
+		len(q8)/cols < 4 || blocks > len(scales)/4 || blocks > len(sums)/32 {
+		panic("gopherllm: short Q4_K batch buffers")
+	}
+	q4kRows4Asm(&row[0], &q8[0], &scales[0], &sums[0], &f16LUT[0], cols, blocks, &result[0])
+	return
+}
+
+func validateQ4KRows4Asm() bool {
+	const blocks, cols = 3, 3 * 256
+	row := q8kSelfCheckBytes(blocks*144, 37, 11)
+	// Package variables initialize before f16LUT is populated. A local table
+	// exercises positive, negative and zero block multipliers independently.
+	lut := [...]float32{0.25, -0.125, 0, 0.03125}
+	var q8 [4 * cols]int8
+	var scales [4 * blocks]float32
+	var sums [4 * blocks * 8]float32
+	for i := range q8 {
+		q8[i] = int8(i*17 + i/cols*13)
+	}
+	for i := range scales {
+		scales[i] = float32(i+1) * 0.017
+	}
+	for i := range sums {
+		sums[i] = float32((i*17)%29-14) * 0.117
+	}
+	var got, want [4]float32
+	for b := range blocks {
+		block := row[b*144 : (b+1)*144]
+		block[0], block[1] = byte(b), 0
+		block[2], block[3] = byte(b+1), 0
 		for token := range 4 {
-			xsums := sums[(token*blocks+block)*8:]
-			_ = xsums[7]
-			var blockInt int32
-			blockInt += s0 * dots[token][0]
-			blockInt += s1 * dots[token][1]
-			blockInt += s2 * dots[token][2]
-			blockInt += s3 * dots[token][3]
-			blockInt += s4 * dots[token][4]
-			blockInt += s5 * dots[token][5]
-			blockInt += s6 * dots[token][6]
-			blockInt += s7 * dots[token][7]
-			var minTerm float32
-			minTerm += float32(m0) * xsums[0]
-			minTerm += float32(m1) * xsums[1]
-			minTerm += float32(m2) * xsums[2]
-			minTerm += float32(m3) * xsums[3]
-			minTerm += float32(m4) * xsums[4]
-			minTerm += float32(m5) * xsums[5]
-			minTerm += float32(m6) * xsums[6]
-			minTerm += float32(m7) * xsums[7]
-			result[token] += d*scales[token*blocks+block]*float32(blockInt) - dmin*minTerm
+			// Compute every integer dot independently of the assembly kernels.
+			var dots [8]int32
+			for group := range 4 {
+				for i := range 32 {
+					v := block[16+group*32+i]
+					dots[2*group] += int32(v&15) * int32(q8[token*cols+b*256+group*64+i])
+					dots[2*group+1] += int32(v>>4) * int32(q8[token*cols+b*256+group*64+32+i])
+				}
+			}
+			want[token] += combineQ4KStyle(block[4:16], &dots, sums[(token*blocks+b)*8:], lut[b], lut[b+1], scales[token*blocks+b])
 		}
 	}
-	return
+	q4kRows4Asm(&row[0], &q8[0], &scales[0], &sums[0], &lut[0], cols, blocks, &got[0])
+	var gotBits, wantBits [4]int32
+	for token := range 4 {
+		gotBits[token] = int32(math.Float32bits(got[token]))
+		wantBits[token] = int32(math.Float32bits(want[token]))
+	}
+	return q8kSelfCheck("Q4_K full row batch4", gotBits[:], wantBits[:])
 }

@@ -8,15 +8,19 @@ import (
 )
 
 // hasAVX2 reports whether the CPU (and OS) support the AVX2 + FMA instructions
-// used by the hand-written amd64 kernels. It is set once at startup; every SIMD
-// entry point falls back to the portable scalar path when it is false. Set
-// GOPHERLLM_DISABLE_SIMD to force the scalar path (useful for A/B benchmarking).
+// used by the hand-written amd64 kernels. It is set once at startup; kernels
+// fall back to SSE2 dot products or portable scalar operations when it is false.
+// Set GOPHERLLM_DISABLE_SIMD to force the scalar path for A/B benchmarking.
 var hasAVX2 = detectAVX2()
 
 // hasF16C reports CPUID F16C support (VCVTPH2PS), required by the int8
 // activation kernels that convert f16 block scales in-register. Every
 // AVX2+FMA CPU in practice also has F16C, but the check is cheap.
 var hasF16C = detectF16C()
+
+// SSE2 is part of the amd64 baseline. Keep its dot dispatch independently
+// gated so disabling SIMD also disables this fallback on non-AVX2 CPUs.
+var useSSE2Dot = os.Getenv("GOPHERLLM_DISABLE_SIMD") == ""
 
 func cpuid(eaxArg, ecxArg uint32) (eax, ebx, ecx, edx uint32)
 func xgetbv() uint32
@@ -54,11 +58,21 @@ func detectAVX2() bool {
 
 // dotF32AVX2 computes the dot product of the overlapping prefix of a and b
 // using AVX2 + FMA. Implemented in kernels_amd64.s.
+//
+//go:noescape
 func dotF32AVX2(a, b []float32) float32
+
+// dotF32SSE2 preserves the portable four-lane, non-fused accumulation order.
+//
+//go:noescape
+func dotF32SSE2(a, b []float32) float32
 
 func dotF32(a, b []float32) float32 {
 	if hasAVX2 {
 		return dotF32AVX2(a, b)
+	}
+	if useSSE2Dot {
+		return dotF32SSE2(a, b)
 	}
 	return dotF32Scalar(a, b)
 }

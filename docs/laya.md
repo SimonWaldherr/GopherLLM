@@ -400,10 +400,11 @@ classification timings. Parallel scratch scales with the number of workers
 (3 MiB rather than 256 KiB for that global case). Tests compare parallel and
 serial results exactly, including concurrent requests and partial blocks.
 
-Rotary tables are cached in each request and shared across layers and heads.
-Large feed-forward activations use the worker pool with exact GELU. Tensor
-workspaces are reused across encoder layers, decision heads and questions,
-then released with the request.
+Tensor slabs and rotary tables are reused across encoder layers, decision heads,
+questions and consecutive requests on the same model, with at most 32 MiB retained.
+Each request overwrites its active activations; large one-off workspaces are
+released afterward. Attention tasks and worker score pools remain request-local.
+Large feed-forward activations use the worker pool with exact GELU.
 
 ```sh
 CGO_ENABLED=0 go test . -run '^$' -bench BenchmarkLayaPortableAttention -benchmem

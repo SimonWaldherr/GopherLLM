@@ -45,17 +45,9 @@ reduce:
 	VFMLA V9.S4, V31.S4, V0.S4
 	VFMLA V10.S4, V31.S4, V0.S4
 	VFMLA V11.S4, V31.S4, V0.S4
-	VMOV V0.S[0], R4
-	VMOV V0.S[1], R5
-	VMOV V0.S[2], R6
-	VMOV V0.S[3], R7
-	FMOVS R4, F0
-	FMOVS R5, F1
-	FMOVS R6, F2
-	FMOVS R7, F3
-	FADDS F1, F0
-	FADDS F3, F2
-	FADDS F2, F0
+	// Preserve (lane0+lane1)+(lane2+lane3), without SIMD/GPR transfers.
+	VFADDP V0.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
 	CBZ R2, done
 
 tail:

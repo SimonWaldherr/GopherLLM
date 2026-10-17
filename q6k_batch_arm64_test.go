@@ -16,9 +16,9 @@ func TestQ6KBatch4BitExact(t *testing.T) {
 		t.Fatal("Q6_K batch startup self-check failed")
 	}
 	rng := rand.New(rand.NewSource(6401))
-	for _, cols := range []int{256, 512, 3072, 9216} {
+	for _, cols := range []int{256, 512, 768, 2048, 3072, 9216, 16384} {
 		blocks := cols / 256
-		for trial := range 32 {
+		for trial := range 64 {
 			row := randomQ6KRow(rng, cols)
 			q8 := make([]int8, 4*cols)
 			scales := make([]float32, 4*blocks)
@@ -31,9 +31,21 @@ func TestQ6KBatch4BitExact(t *testing.T) {
 			}
 			for i := range scales {
 				scales[i] = float32(rng.NormFloat64() * 0.03)
+				if trial >= 10 && trial < 16 {
+					// Signed zeros and both ends of the float32 subnormal
+					// range expose changes in the two fused block operations.
+					bits := [...]uint32{0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x807fffff}
+					scales[i] = math.Float32frombits(bits[trial-10])
+				}
 			}
 			for i := range sums {
 				sums[i] = float32(rng.NormFloat64() * 17)
+				if trial == 10 || trial == 11 {
+					// Alternate signs independently in every lane/sub-block.
+					sums[i] = math.Float32frombits(uint32(i&1) << 31)
+				} else if trial >= 12 && trial < 16 {
+					sums[i] = math.Float32frombits(uint32(i%31+1) | uint32(i&1)<<31)
+				}
 			}
 			for b := range blocks {
 				h := uint16(rng.Intn(0x6000)) | uint16(rng.Intn(2))<<15

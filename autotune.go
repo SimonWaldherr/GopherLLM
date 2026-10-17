@@ -767,18 +767,22 @@ func (t *autoTuner) tuneThreads() {
 // plausibly sits: all logical CPUs, the physical-core count (hyperthread
 // siblings often add contention, not bandwidth), and half of that.
 //
-// It also offers the performance-core count on asymmetric machines, which the
-// fractions above can miss entirely. An M2 Max reports 12 logical CPUs with 8
-// performance cores, and {12, 9, 6, 3} never proposes 8 — so the one candidate
-// most likely to win on that machine was the one the search could not reach.
-// performanceCores returns 0 on symmetric systems, leaving the set unchanged.
+// Asymmetric machines also try the performance cores alone and a mixed count
+// halfway to all cores. This includes 8/10 threads on a 12-core M4 Pro and
+// 10/12 threads on its 14-core variant, rather than skipping those layouts.
+// These are measured candidates, not assumptions about which cores macOS
+// assigns to the workers. A zero performance-core count keeps the generic set.
 func threadCandidates(nproc int) []int {
+	return threadCandidatesForTopology(nproc, performanceCores())
+}
+
+func threadCandidatesForTopology(nproc, performance int) []int {
 	if nproc <= 1 {
 		return []int{1}
 	}
 	cands := []int{nproc, nproc / 2, nproc * 3 / 4, max(1, nproc/4)}
-	if p := performanceCores(); p > 1 && p < nproc {
-		cands = append(cands, p)
+	if performance > 1 && performance < nproc {
+		cands = append(cands, performance, performance+(nproc-performance)/2)
 	}
 	seen := map[int]bool{}
 	var out []int
@@ -935,7 +939,14 @@ func quantMixFingerprint(r *Runner) string {
 }
 
 func hostFingerprint() string {
-	return fmt.Sprintf("%s/%s/%s/cpu%d", runtime.GOOS, runtime.GOARCH, cpuFeatureString(), runtime.NumCPU())
+	host := fmt.Sprintf("%s/%s/%s/cpu%d", runtime.GOOS, runtime.GOARCH, cpuFeatureString(), runtime.NumCPU())
+	if hardware := hostHardwareFingerprint(); hardware != "" {
+		host += "/" + hardware
+	}
+	if hasApplePrefillBLAS {
+		host += "/accelerate"
+	}
+	return host
 }
 
 func autoTuneCachePath(key string) (string, error) {

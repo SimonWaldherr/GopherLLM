@@ -92,22 +92,16 @@ func (s *voxtralStreamAudio) push(ctx context.Context, w VoxtralRealtimeWeights,
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	// The shared batched transformer consumes channel-major convolution output.
-	n, dim := len(rows), s.cfg.Encoder.DModel
-	h := make([]float32, n*dim)
-	for t, row := range rows {
-		for c, v := range row {
-			h[c*n+t] = v
-		}
-	}
-	encoded, err := forwardVoxtralEncoderChunk(ctx, s.cfg, w, h, n, &s.encoder)
+	// Conv output rows are owned by this push; the encoder can use them as
+	// its residual stream without a channel-major round trip.
+	encoded, err := forwardVoxtralEncoderRowsChunk(ctx, s.cfg, w, rows, &s.encoder)
 	if err != nil {
 		return nil, err
 	}
 	all := append(s.residual, encoded...)
 	ds := s.cfg.Projector.DownsampleFactor
 	usable := len(all) / ds * ds
-	s.residual = append([][]float32(nil), all[usable:]...)
+	s.residual = cloneVoxtralAudioTail(all[usable:])
 	if usable == 0 {
 		return nil, nil
 	}
@@ -117,6 +111,19 @@ func (s *voxtralStreamAudio) push(ctx context.Context, w VoxtralRealtimeWeights,
 type voxtralStreamConv struct {
 	initialized bool
 	rows        [][]float32
+}
+
+// Surviving convolution/adapter rows must not pin a whole previous chunk's
+// contiguous matrix. Copy only the small tail into its own compact slab.
+func cloneVoxtralAudioTail(rows [][]float32) [][]float32 {
+	if len(rows) == 0 {
+		return nil
+	}
+	cloned := audioMatrixRows(len(rows), len(rows[0]))
+	for i := range rows {
+		copy(cloned[i], rows[i])
+	}
+	return cloned
 }
 
 // Stride alignment is carried across calls: no right padding is inserted at
@@ -137,7 +144,7 @@ func (s *voxtralStreamConv) push(ctx context.Context, w VoxtralRealtimeEncoderCo
 	if len(s.rows) >= w.Kernel {
 		n = (len(s.rows)-w.Kernel)/w.Stride + 1
 	}
-	out := make([][]float32, n)
+	out := audioMatrixRows(n, w.Out)
 	patches := make([][]float32, n)
 	width := w.In * w.Kernel
 	flat := make([]float32, n*width)
@@ -151,7 +158,6 @@ func (s *voxtralStreamConv) push(ctx context.Context, w VoxtralRealtimeEncoderCo
 				patches[t][c*w.Kernel+k] = s.rows[t*w.Stride+k][c]
 			}
 		}
-		out[t] = make([]float32, w.Out)
 	}
 	blasMatvecBatch(Weight{F32: w.Weight, Rows: w.Out, Cols: width}, patches, out)
 	for t := range n {
@@ -163,6 +169,6 @@ func (s *voxtralStreamConv) push(ctx context.Context, w VoxtralRealtimeEncoderCo
 			out[t][o] = geluTanh(v)
 		}
 	}
-	s.rows = append([][]float32(nil), s.rows[n*w.Stride:]...)
+	s.rows = cloneVoxtralAudioTail(s.rows[n*w.Stride:])
 	return out, nil
 }

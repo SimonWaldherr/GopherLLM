@@ -38,6 +38,12 @@ func TestQ8_0DecodeTaskReuseConcurrent(t *testing.T) {
 	configuredThreads.Store(2)
 	oversubscribeDispatch.Store(true)
 	withQ8Activations(true, func() {
+		if !useQ8Activations.Load() {
+			// The internal grouped callback assumes the caller has selected
+			// Q8 activations. The public single-matrix entry point correctly
+			// uses float activations when this backend is unavailable.
+			t.Skip("Q8 activation backend unavailable")
+		}
 		const cols = 512
 		rng := rand.New(rand.NewSource(8401))
 		weights := make([]Weight, 4)
@@ -76,6 +82,46 @@ func TestQ8_0DecodeTaskReuseConcurrent(t *testing.T) {
 					}
 					MatvecQ8_0Into(weights[0].Raw, x, weights[0].Rows, cols, &got[0])
 					checkDecodeTaskRows(t, worker, got[:1], want[:1])
+				}
+			}()
+		}
+		workers.Wait()
+	})
+}
+
+func TestQ8_0DecodeFloatFallbackConcurrent(t *testing.T) {
+	previousThreads := configuredThreads.Load()
+	previousOversubscribe := oversubscribeDispatch.Load()
+	t.Cleanup(func() {
+		configuredThreads.Store(previousThreads)
+		oversubscribeDispatch.Store(previousOversubscribe)
+	})
+	configuredThreads.Store(2)
+	oversubscribeDispatch.Store(true)
+	withQ8Activations(false, func() {
+		// A Q8-compatible shape ensures that the activation-mode gate, not
+		// an unsupported dimension, selects the unquantized float fallback.
+		const rows, cols = 257, 512
+		const rowBytes = cols / 32 * 34
+		rng := rand.New(rand.NewSource(8401))
+		data := make([]byte, 0, rows*rowBytes)
+		for range rows {
+			data = append(data, randomQ8_0Row(rng, cols)...)
+		}
+		var workers sync.WaitGroup
+		for worker := range 4 {
+			x := randomVec(rng, cols)
+			want := make([]float32, rows)
+			for row := range rows {
+				want[row] = DotQ8_0F32(data[row*rowBytes:(row+1)*rowBytes], x, cols)
+			}
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				var got []float32
+				for range 6 {
+					MatvecQ8_0Into(data, x, rows, cols, &got)
+					checkDecodeTaskRows(t, worker, [][]float32{got}, [][]float32{want})
 				}
 			}()
 		}

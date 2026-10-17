@@ -280,6 +280,61 @@ type voxtralEncoderState struct {
 	pos          int
 	kHead, vHead [][]float32
 	stride       int
+	scratch      voxtralEncoderScratch
+}
+
+// Transformer intermediates belong to one stream and can be overwritten by
+// its next chunk. The residual stream and returned encoder rows deliberately
+// live outside this workspace: adapter downsampling can retain some of them
+// until a later push.
+type voxtralEncoderScratch struct {
+	q, k, v, attnOut                    voxtralAudioMatrix
+	outProj, normed                     voxtralAudioMatrix
+	ffnGate, ffnUp, ffnAct, ffnDown     voxtralAudioMatrix
+	ropeSin, ropeCos, sin, cos, invFreq []float32
+	scores, offlineKHead, offlineVHead  []float32
+	ropeHeadDim                         int
+	ropeTheta                           float32
+}
+
+const voxtralEncoderScratchRetentionBytes = 64 << 20
+
+func (s *voxtralEncoderScratch) retainedBytes() uint64 {
+	var size uint64
+	for _, m := range []*voxtralAudioMatrix{&s.q, &s.k, &s.v, &s.attnOut, &s.outProj, &s.normed, &s.ffnGate, &s.ffnUp, &s.ffnAct, &s.ffnDown} {
+		// A row header occupies at most 24 bytes on supported platforms.
+		size += uint64(cap(m.data))*4 + uint64(cap(m.rows))*24
+	}
+	for _, data := range [][]float32{s.ropeSin, s.ropeCos, s.sin, s.cos, s.invFreq, s.scores, s.offlineKHead, s.offlineVHead} {
+		size += uint64(cap(data)) * 4
+	}
+	return size
+}
+
+func (s *voxtralEncoderScratch) releaseIfOversized(limit uint64) {
+	if s.retainedBytes() > limit {
+		*s = voxtralEncoderScratch{}
+	}
+}
+
+type voxtralAudioMatrix struct {
+	rows [][]float32
+	data []float32
+}
+
+func (b *voxtralAudioMatrix) resize(rows, cols int) [][]float32 {
+	if cap(b.data) < rows*cols {
+		// Reused inactive headers must not keep a replaced slab alive.
+		clear(b.rows[:cap(b.rows)])
+	}
+	ensureLenNoClear(&b.rows, rows)
+	ensureLenNoClear(&b.data, rows*cols)
+	for i := range b.rows {
+		// Preserve the remaining backing capacity so Accelerate can recognize
+		// this as one contiguous matrix without packing it again.
+		b.rows[i] = b.data[i*cols : (i+1)*cols]
+	}
+	return b.rows
 }
 
 // growVoxtralHeadBuffer enlarges a per-layer head-major K/V buffer from
@@ -327,9 +382,38 @@ func audioMatrixRows(rows, cols int) [][]float32 {
 }
 
 func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, h []float32, hLen int, state *voxtralEncoderState) ([][]float32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Offline convolution produces channel-major [DModel][n]. Streaming
+	// convolution already produces time-major rows and bypasses this copy.
+	x := audioMatrixRows(hLen, cfg.Encoder.DModel)
+	for t := range hLen {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for c := range cfg.Encoder.DModel {
+			x[t][c] = h[c*hLen+t]
+		}
+	}
+	return forwardVoxtralEncoderRowsChunk(ctx, cfg, weights, x, state)
+}
+
+// forwardVoxtralEncoderRowsChunk consumes owned time-major convolution rows
+// in place. Neither its result nor those rows alias the reusable scratch.
+func forwardVoxtralEncoderRowsChunk(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, x [][]float32, state *voxtralEncoderState) ([][]float32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	startPos := 0
+	var localScratch voxtralEncoderScratch
+	scratch := &localScratch
 	if state != nil {
 		startPos = state.pos
+		scratch = &state.scratch
+		// A large one-off audio burst can use temporary workspace without
+		// keeping its largest intermediates resident for the whole session.
+		defer scratch.releaseIfOversized(voxtralEncoderScratchRetentionBytes)
 		if state.kHead == nil {
 			state.kHead = make([][]float32, len(weights.Encoder.Layers))
 			state.vHead = make([][]float32, len(weights.Encoder.Layers))
@@ -349,53 +433,39 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 	if qkvDim <= 0 {
 		return nil, fmt.Errorf("encoding audio: invalid encoder heads=%d headDim=%d", heads, headDim)
 	}
-	n := hLen
+	n := len(x)
 
-	// h is channel-major [DModel][n]; the transformer blocks below want
-	// time-major [n][DModel] rows (matching EncodeImagePixtral's convention,
-	// so the same rmsNormInto/matvecBatch/DotF32/AxpyF32 helpers apply).
-	x := audioMatrixRows(n, dim)
-	{
-		for t := range n {
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			for c := range dim {
-				x[t][c] = h[c*n+t]
-			}
-		}
+	if scratch.ropeHeadDim != headDim || scratch.ropeTheta != cfg.Encoder.RopeTheta {
+		scratch.invFreq = standardRopeInvFreqSlice(headDim, cfg.Encoder.RopeTheta)
+		scratch.ropeHeadDim, scratch.ropeTheta = headDim, cfg.Encoder.RopeTheta
 	}
-
-	invFreq := standardRopeInvFreqSlice(headDim, cfg.Encoder.RopeTheta)
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 
-	q := audioMatrixRows(n, qkvDim)
-	k := audioMatrixRows(n, qkvDim)
-	v := audioMatrixRows(n, qkvDim)
-	attnOut := audioMatrixRows(n, qkvDim)
-	outProj := audioMatrixRows(n, dim)
-	normed := audioMatrixRows(n, dim)
-	ffnGateOut := audioMatrixRows(n, cfg.Encoder.FFNDim)
-	ffnUpOut := audioMatrixRows(n, cfg.Encoder.FFNDim)
-	ffnActOut := audioMatrixRows(n, cfg.Encoder.FFNDim)
-	ffnDownOut := audioMatrixRows(n, dim)
+	q := scratch.q.resize(n, qkvDim)
+	k := scratch.k.resize(n, qkvDim)
+	v := scratch.v.resize(n, qkvDim)
+	attnOut := scratch.attnOut.resize(n, qkvDim)
+	outProj := scratch.outProj.resize(n, dim)
+	normed := scratch.normed.resize(n, dim)
+	ffnGateOut := scratch.ffnGate.resize(n, cfg.Encoder.FFNDim)
+	ffnUpOut := scratch.ffnUp.resize(n, cfg.Encoder.FFNDim)
+	ffnActOut := scratch.ffnAct.resize(n, cfg.Encoder.FFNDim)
+	ffnDownOut := scratch.ffnDown.resize(n, dim)
 
-	var sinScratch, cosScratch []float32
-	ropeSin := make([]float32, n*(headDim/2))
-	ropeCos := make([]float32, n*(headDim/2))
+	ensureLenNoClear(&scratch.ropeSin, n*(headDim/2))
+	ensureLenNoClear(&scratch.ropeCos, n*(headDim/2))
+	ropeSin, ropeCos := scratch.ropeSin, scratch.ropeCos
 	ropeHalf := 0
 	for t := range n {
-		half, nCache := prepareRopeScratch(startPos+t, headDim, headDim, invFreq, 1, &sinScratch, &cosScratch)
+		half, nCache := prepareRopeScratch(startPos+t, headDim, headDim, scratch.invFreq, 1, &scratch.sin, &scratch.cos)
 		ropeHalf = half
 		if nCache > 0 {
-			copy(ropeSin[t*half:t*half+nCache], sinScratch[:nCache])
-			copy(ropeCos[t*half:t*half+nCache], cosScratch[:nCache])
+			copy(ropeSin[t*half:t*half+nCache], scratch.sin[:nCache])
+			copy(ropeCos[t*half:t*half+nCache], scratch.cos[:nCache])
 		}
 	}
 
 	window := cfg.Encoder.SlidingWindow
-	var scores []float32
-	var kHeadScratch, vHeadScratch []float32 // offline (state == nil) path only
 
 	// past/total/stride are identical for every layer (all layers see the
 	// same new frames and the same window), so resolve and, rarely, grow
@@ -460,9 +530,9 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 		if state != nil {
 			kHead, vHead = state.kHead[li], state.vHead[li]
 		} else {
-			ensureLenNoClear(&kHeadScratch, heads*total*headDim)
-			ensureLenNoClear(&vHeadScratch, heads*total*headDim)
-			kHead, vHead = kHeadScratch, vHeadScratch
+			ensureLenNoClear(&scratch.offlineKHead, heads*total*headDim)
+			ensureLenNoClear(&scratch.offlineVHead, heads*total*headDim)
+			kHead, vHead = scratch.offlineKHead, scratch.offlineVHead
 		}
 		// Only the new n rows need writing: any earlier [0,past) positions
 		// are already in place from a previous push (or, offline, past==0).
@@ -477,7 +547,8 @@ func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, 
 		}
 
 		if !blasAttentionBatch(q, kHead, vHead, attnOut, heads, headDim, past, window, stride, scale) {
-			ensureLenNoClear(&scores, total)
+			ensureLenNoClear(&scratch.scores, total)
+			scores := scratch.scores
 			for t := range n {
 				if err := ctx.Err(); err != nil {
 					return nil, err

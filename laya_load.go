@@ -78,6 +78,7 @@ type LayaModel struct {
 	layers, head                  []layaLayer
 	typeEmb                       []float32
 	score1, score2, act1, act2    layaLinear
+	workspace                     *layaWorkspace
 }
 
 // OpenLaya loads a local checkpoint directory containing rl_agent_config.json,
@@ -317,6 +318,7 @@ func (m *LayaModel) Close() error {
 	m.act1 = layaLinear{}
 	m.act2 = layaLinear{}
 	m.tok = nil
+	m.workspace = nil
 	if m.mapping != nil {
 		return m.mapping.Close()
 	}

@@ -2,6 +2,9 @@
 
 package gopherllm
 
+import "unsafe"
+
+//go:noescape
 func dotF32(a, b []float32) float32
 
 const hasQuantSIMD = true
@@ -39,13 +42,30 @@ func sumF32Groups32(x *float32, out *float32, groups int)
 //go:noescape
 func sumF32Groups16(x *float32, out *float32, groups int)
 
+//go:noescape
 func axpyF32(out []float32, alpha float32, x []float32)
+
+//go:noescape
 func scaleF32(out []float32, alpha float32)
+
+//go:noescape
 func scaleAddF32(out []float32, alpha float32, x []float32)
+
+//go:noescape
 func mulScaleF32(x []float32, weight []float32, scale float32, out []float32)
 
-// siluMulF32 computes out[i] = silu(gate[i]) * up[i] (SwiGLU). Scalar on
-// arm64 (the decode budget there is dominated by the NEON matvec kernels).
+// siluMulF32NEON evaluates four SwiGLU elements per iteration. n must be a
+// positive multiple of four; the caller handles short inputs and the tail.
+//
+//go:noescape
+func siluMulF32NEON(gate, up, out *float32, n int)
+
+// siluMulF32 computes out[i] = silu(gate[i]) * up[i] (SwiGLU).
 func siluMulF32(gate, up, out []float32) {
-	siluMulF32Scalar(gate, up, out, 0, min(len(gate), len(up), len(out)))
+	n := min(len(gate), len(up), len(out))
+	n4 := n &^ 3
+	if n4 > 0 {
+		siluMulF32NEON(unsafe.SliceData(gate), unsafe.SliceData(up), unsafe.SliceData(out), n4)
+	}
+	siluMulF32Scalar(gate, up, out, n4, n)
 }

@@ -44,17 +44,9 @@ dot_reduce:
 	FMOVS $(1.0), F31
 	VDUP V31.S[0], V31.S4
 	VFMLA V9.S4, V31.S4, V0.S4
-	VMOV V0.S[0], R4
-	VMOV V0.S[1], R5
-	VMOV V0.S[2], R6
-	VMOV V0.S[3], R7
-	FMOVS R4, F0
-	FMOVS R5, F1
-	FMOVS R6, F2
-	FMOVS R7, F3
-	FADDS F1, F0
-	FADDS F3, F2
-	FADDS F2, F0
+	// The scalar result keeps the original pairwise reduction tree.
+	VFADDP V0.S4, V0.S4, V0.S4
+	VFADDP V0.S4, V0.S4, V0.S4
 	FMOVS F0, ret+48(FP)
 	RET
 

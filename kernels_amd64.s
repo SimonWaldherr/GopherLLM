@@ -23,6 +23,78 @@ TEXT ·xgetbv(SB), NOSPLIT, $0-4
 	RET
 
 // Float32 dot product
+// func dotF32SSE2(a, b []float32) float32
+// SSE2 is guaranteed on amd64. Each vector lane is one of dotF32Scalar's
+// s0..s3 accumulators; even the unrolled loop retains their update order.
+// MULPS and ADDPS deliberately stay separate, with no FMA or SSE3 reduction.
+TEXT ·dotF32SSE2(SB), NOSPLIT, $0-52
+	MOVQ a_base+0(FP), SI
+	MOVQ a_len+8(FP), AX
+	MOVQ b_base+24(FP), DI
+	MOVQ b_len+32(FP), BX
+	CMPQ BX, AX
+	CMOVQLT BX, AX
+	XORPS X0, X0
+	XORQ CX, CX
+	MOVQ AX, DX
+	ANDQ $-16, DX
+
+dsse2_loop16:
+	CMPQ CX, DX
+	JGE  dsse2_after16
+	MOVUPS (SI)(CX*4), X1
+	MOVUPS (DI)(CX*4), X2
+	MULPS X2, X1
+	ADDPS X1, X0
+	MOVUPS 16(SI)(CX*4), X1
+	MOVUPS 16(DI)(CX*4), X2
+	MULPS X2, X1
+	ADDPS X1, X0
+	MOVUPS 32(SI)(CX*4), X1
+	MOVUPS 32(DI)(CX*4), X2
+	MULPS X2, X1
+	ADDPS X1, X0
+	MOVUPS 48(SI)(CX*4), X1
+	MOVUPS 48(DI)(CX*4), X2
+	MULPS X2, X1
+	ADDPS X1, X0
+	ADDQ $16, CX
+	JMP  dsse2_loop16
+
+dsse2_after16:
+	MOVQ AX, DX
+	ANDQ $-4, DX
+dsse2_loop4:
+	CMPQ CX, DX
+	JGE  dsse2_reduce
+	MOVUPS (SI)(CX*4), X1
+	MOVUPS (DI)(CX*4), X2
+	MULPS X2, X1
+	ADDPS X1, X0
+	ADDQ $4, CX
+	JMP  dsse2_loop4
+
+dsse2_reduce:
+	// X0[0] = (s0+s1)+(s2+s3), exactly as in dotF32Scalar.
+	// PSHUFL is the SSE2 PSHUFD mnemonic in Go's assembler.
+	PSHUFL $0x55, X0, X1
+	ADDSS X1, X0
+	PSHUFL $0xaa, X0, X1
+	PSHUFL $0xff, X0, X2
+	ADDSS X2, X1
+	ADDSS X1, X0
+dsse2_tail:
+	CMPQ CX, AX
+	JGE  dsse2_done
+	MOVSS (SI)(CX*4), X1
+	MULSS (DI)(CX*4), X1
+	ADDSS X1, X0
+	INCQ CX
+	JMP  dsse2_tail
+dsse2_done:
+	MOVSS X0, ret+48(FP)
+	RET
+
 // func dotF32AVX2(a, b []float32) float32
 // Computes sum(a[i]*b[i]) over i in [0, min(len(a), len(b))).
 TEXT ·dotF32AVX2(SB), NOSPLIT, $0-52

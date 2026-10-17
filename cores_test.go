@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"reflect"
 	"runtime"
 	"testing"
 )
@@ -20,6 +21,28 @@ func TestPerformanceCoresIsSaneOrZero(t *testing.T) {
 		t.Fatalf("performanceCores = %d on %s, want 0", p, runtime.GOOS)
 	}
 	t.Logf("GOOS=%s NumCPU=%d performanceCores=%d", runtime.GOOS, runtime.NumCPU(), p)
+}
+
+func TestThreadCandidatesAppleTopologies(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		logical, performance int
+		want                 []int
+	}{
+		{"M4 8-core", 8, 4, []int{8, 6, 4, 2}},
+		{"M4 10-core", 10, 4, []int{10, 7, 5, 4, 2}},
+		{"M4 Pro 12-core", 12, 8, []int{12, 10, 9, 8, 6, 3}},
+		{"M4 Pro 14-core", 14, 10, []int{14, 12, 10, 7, 3}},
+		{"unknown 14-core", 14, 0, []int{14, 10, 7, 3}},
+		{"invalid P count", 8, 10, []int{8, 6, 4, 2}},
+		{"symmetric", 8, 8, []int{8, 6, 4, 2}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := threadCandidatesForTopology(tc.logical, tc.performance); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("candidates = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // The candidate set must stay sorted descending, deduplicated, and in range no

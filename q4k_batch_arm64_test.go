@@ -3,6 +3,7 @@
 package gopherllm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"math/rand"
@@ -58,6 +59,87 @@ func TestQ4KBatch4MatchesSingleToken(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// The earlier single-token block kernel remains an independent oracle for
+// signed/subnormal scales and cancellation-sensitive float reductions.
+func TestQ4KBatch4BitExact(t *testing.T) {
+	requireDotProd(t)
+	if !q4kBatchAsmOK {
+		t.Fatal("batch kernel startup check failed")
+	}
+	rng := rand.New(rand.NewSource(4405))
+	for _, blocks := range []int{1, 2, 3, 8, 12, 16, 36, 64} {
+		cols := blocks * 256
+		row := make([]byte, blocks*144)
+		q8 := make([]int8, 4*cols)
+		scales := make([]float32, 4*blocks)
+		sums := make([]float32, 32*blocks)
+		for iter := range 100 {
+			rng.Read(row)
+			for b := range blocks {
+				for _, offset := range []int{0, 2} {
+					h := uint16(rng.Intn(0x6000)) | uint16(rng.Intn(2))<<15
+					if iter%17 == 0 {
+						h &= 0x8000
+					}
+					binary.LittleEndian.PutUint16(row[b*144+offset:], h)
+				}
+			}
+			for i := range q8 {
+				q8[i] = int8(rng.Intn(256) - 128)
+			}
+			for i := range scales {
+				scales[i] = float32(rng.NormFloat64() * .17)
+				if iter%19 == 0 {
+					scales[i] = math.Float32frombits(uint32(i&1) << 31)
+				}
+			}
+			for i := range sums {
+				sums[i] = float32(rng.NormFloat64() * 17)
+				if iter%23 == 0 {
+					sums[i] = math.Float32frombits(uint32(i&1) << 31)
+				}
+			}
+			got := q4kRowBatch4(row, q8, scales, sums, cols, blocks)
+			for token := range 4 {
+				want := q4kDecodePriorRow(row, q8[token*cols:], scales[token*blocks:], sums[token*blocks*8:], blocks)
+				if math.Float32bits(got[token]) != math.Float32bits(want) {
+					t.Fatalf("blocks=%d iter=%d token=%d: got %g (%08x), want %g (%08x)", blocks, iter, token,
+						got[token], math.Float32bits(got[token]), want, math.Float32bits(want))
+				}
+			}
+		}
+	}
+}
+
+func TestQ4KBatch4InputBounds(t *testing.T) {
+	if got := q4kRowBatch4(nil, nil, nil, nil, 0, 0); got != [4]float32{} {
+		t.Fatalf("empty batch = %v", got)
+	}
+	for _, tc := range []struct {
+		name                                string
+		row, q8, scales, sums, cols, blocks int
+	}{
+		{"weights", 143, 1024, 4, 32, 256, 1},
+		{"activations", 144, 1023, 4, 32, 256, 1},
+		{"scales", 144, 1024, 3, 32, 256, 1},
+		{"sums", 144, 1024, 4, 31, 256, 1},
+		{"stride", 144, 1024, 4, 32, 257, 1},
+		{"zero stride", 144, 1024, 4, 32, 0, 1},
+		{"mismatched count", 144, 1024, 4, 32, 512, 1},
+		{"overflow", 144, 1024, 4, 32, 256, int(^uint(0) >> 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("invalid buffers reached assembly")
+				}
+			}()
+			q4kRowBatch4(make([]byte, tc.row), make([]int8, tc.q8), make([]float32, tc.scales),
+				make([]float32, tc.sums), tc.cols, tc.blocks)
+		})
 	}
 }
 

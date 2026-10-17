@@ -59,38 +59,50 @@ type batchAttentionTask struct {
 }
 
 func (t *batchAttentionTask) runRows(start, end int) {
-	for token := start; token < end; token++ {
-		pos := t.startPos + token
-		attnStart := 0
-		if t.usesSWA {
-			attnStart = max(0, pos-t.slidingWindow)
+	// Causal work grows with the token position. Pair the first and last
+	// tokens, then the second and penultimate, so each worker's contiguous
+	// range contains both short and long attention spans. This only changes
+	// scheduling: every token retains its original position and arithmetic.
+	for row := start; row < end; row++ {
+		token := row / 2
+		if row&1 != 0 {
+			token = len(t.q) - 1 - token
 		}
-		clear(t.attnOut[token])
-		if t.groupedGQA {
-			for kvH := 0; kvH < t.nKVHeads; kvH++ {
-				hStart := kvH * t.kvMul
-				hEnd := min(hStart+t.kvMul, t.nHeads)
-				if hStart >= hEnd {
-					break
-				}
-				t.cache.attendHeadGroup(t.l, kvH,
-					t.q[token][hStart*t.headDim:hEnd*t.headDim], hEnd-hStart,
-					t.headDim, t.valueDim, attnStart, pos, t.scale, t.softcap,
-					t.attnOut[token][hStart*t.valueDim:hEnd*t.valueDim])
+		t.runToken(token)
+	}
+}
+
+func (t *batchAttentionTask) runToken(token int) {
+	pos := t.startPos + token
+	attnStart := 0
+	if t.usesSWA {
+		attnStart = max(0, pos-t.slidingWindow)
+	}
+	clear(t.attnOut[token])
+	if t.groupedGQA {
+		for kvH := 0; kvH < t.nKVHeads; kvH++ {
+			hStart := kvH * t.kvMul
+			hEnd := min(hStart+t.kvMul, t.nHeads)
+			if hStart >= hEnd {
+				break
 			}
-			continue
-		}
-		for h := 0; h < t.nHeads; h++ {
-			kvH := h / t.kvMul
-			var alibiSlope float32
-			if t.alibi {
-				alibiSlope = aLiBiSlope(h, t.nHeads, t.alibiMaxBias)
-			}
-			t.cache.attendHeadWithSink(t.l, kvH, t.q[token][h*t.headDim:h*t.headDim+t.headDim],
+			t.cache.attendHeadGroup(t.l, kvH,
+				t.q[token][hStart*t.headDim:hEnd*t.headDim], hEnd-hStart,
 				t.headDim, t.valueDim, attnStart, pos, t.scale, t.softcap,
-				alibiSlope, 0, false,
-				t.attnOut[token][h*t.valueDim:h*t.valueDim+t.valueDim])
+				t.attnOut[token][hStart*t.valueDim:hEnd*t.valueDim])
 		}
+		return
+	}
+	for h := 0; h < t.nHeads; h++ {
+		kvH := h / t.kvMul
+		var alibiSlope float32
+		if t.alibi {
+			alibiSlope = aLiBiSlope(h, t.nHeads, t.alibiMaxBias)
+		}
+		t.cache.attendHeadWithSink(t.l, kvH, t.q[token][h*t.headDim:h*t.headDim+t.headDim],
+			t.headDim, t.valueDim, attnStart, pos, t.scale, t.softcap,
+			alibiSlope, 0, false,
+			t.attnOut[token][h*t.valueDim:h*t.valueDim+t.valueDim])
 	}
 }
 
@@ -272,6 +284,9 @@ func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
 	}
 	cols := len(xs[0])
 	if cols == 0 {
+		return
+	}
+	if matvecBatchBLAS(w, xs, outs, useQ8) {
 		return
 	}
 

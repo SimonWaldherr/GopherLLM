@@ -42,30 +42,27 @@
 	VADDP V25.S4, V24.S4, V24.S4 \
 	VADDP V24.S4, V22.S4, V22.S4 \
 	MOVB.P 1(R16), R17 \
-	FMOVS R17, F27 \
-	VDUP V27.S[0], V27.S4 \
-	WORD $(0x4ea09c00 | (27<<16) | (22<<5) | 22) \
-	VADD V22.S4, V30.S4, V30.S4 \
+	VDUP R17, V27.S4 \
+	VMLA V27.S4, V22.S4, V30.S4 \
 	WORD $(0x4e21d800 | (27<<5) | 27) \
-	FMOVS.P 4(R5), F6 \
-	FMOVS.P 4(R6), F7 \
-	FMOVS.P 4(R7), F8 \
-	FMOVS.P 4(R8), F9 \
-	VZIP1 V7.S4, V6.S4, V6.S4 \
-	VZIP1 V9.S4, V8.S4, V8.S4 \
-	VZIP1 V8.D2, V6.D2, V6.D2 \
+	VLD1.P 4(R5), V6.S[0] \
+	VLD1.P 4(R6), V6.S[1] \
+	VLD1.P 4(R7), V6.S[2] \
+	VLD1.P 4(R8), V6.S[3] \
 	VFMLA V27.S4, V6.S4, V26.S4
 
-// Preserve the existing scalar FNMSUBS + FMADDS combination, including
-// signed-zero behavior, independently for each token lane.
-#define BATCHQ6FINISH(SCALES, LANE) \
-	FMOVS.P 4(SCALES), F22 \
-	VMOV V30.S[LANE], V23.S[0] \
-	VMOV V26.S[LANE], V24.S[0] \
-	FNMSUBS F23, F24, F22, F22 \
-	VMOV V31.S[LANE], V27.S[0] \
-	FMADDS F22, F27, F25, F27 \
-	VMOV V27.S[0], V31.S[LANE]
+// Negate the offset before the first FMA, matching the scalar FNMSUBS.
+// The second FMA accumulates d*blockValue into the row sum independently in
+// each token lane; neither reduction is reassociated.
+#define BATCHQ6FINISH() \
+	VLD1.P 4(R9), V22.S[0] \
+	VLD1.P 4(R10), V22.S[1] \
+	VLD1.P 4(R11), V22.S[2] \
+	VLD1.P 4(R12), V22.S[3] \
+	VFNEG V26.S4, V23.S4 \
+	VFMLA V30.S4, V22.S4, V23.S4 \
+	VDUP V25.S[0], V25.S4 \
+	VFMLA V23.S4, V25.S4, V31.S4
 
 // func q6kRows4Asm(row *byte, q8 *int8, scales, sums, lut *float32, cols, blocks int, out *float32)
 TEXT ·q6kRows4Asm(SB), NOSPLIT|NOFRAME, $0-64
@@ -124,10 +121,7 @@ batchhalf:
 	MOVHU 208(R0), R17
 	FMOVS (R20)(R17<<2), F25
 	WORD $(0x4e21d800 | (30<<5) | 30) // scvtf v30.4s,v30.4s
-	BATCHQ6FINISH(R9, 0)
-	BATCHQ6FINISH(R10, 1)
-	BATCHQ6FINISH(R11, 2)
-	BATCHQ6FINISH(R12, 3)
+	BATCHQ6FINISH()
 	ADD $210, R0
 	SUB $1, R19
 	CBNZ R19, batchblock

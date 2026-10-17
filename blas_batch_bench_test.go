@@ -5,7 +5,7 @@ import "testing"
 // buildBlasBenchShape builds a plain F32 weight and a batch of n input rows
 // at the given matvec shape (rows x cols), so blasMatvecBatch (Accelerate's
 // GEMM on Darwin+cgo, matvecBatch's per-row dot otherwise) and matvecBatch
-// (the portable, always-available path) can be compared head-to-head on
+// (the portable NEON/dot path, bypassing automatic BLAS dispatch) can be compared on
 // identical data.
 func buildBlasBenchShape(n, rows, cols int) (Weight, [][]float32, [][]float32) {
 	w := Weight{F32: make([]float32, rows*cols)}
@@ -42,10 +42,7 @@ func BenchmarkMatvecBatch_VoxtralFFNShape_BLAS(b *testing.B) {
 
 func BenchmarkMatvecBatch_VoxtralFFNShape_Portable(b *testing.B) {
 	w, xs, outs := buildBlasBenchShape(372, 5120, 1280)
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		matvecBatch(w, xs, outs)
-	}
+	benchmarkPortableF32Batch(b, w, xs, outs)
 }
 
 // BenchmarkMatvecBatch_ParakeetFFNShape_{BLAS,Portable} do the same at
@@ -63,8 +60,14 @@ func BenchmarkMatvecBatch_ParakeetFFNShape_BLAS(b *testing.B) {
 
 func BenchmarkMatvecBatch_ParakeetFFNShape_Portable(b *testing.B) {
 	w, xs, outs := buildBlasBenchShape(44, 4096, 1024)
+	benchmarkPortableF32Batch(b, w, xs, outs)
+}
+
+func benchmarkPortableF32Batch(b *testing.B, w Weight, xs, outs [][]float32) {
+	cols := len(xs[0])
+	task := &batchF32MatvecTask{weights: w.F32, xs: xs, outs: outs, p: len(xs), cols: cols, tiled: hasFastDotF32x4 && len(xs) >= 4}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		matvecBatch(w, xs, outs)
+		parallelRowsBatchedTask(len(w.F32)/cols, task)
 	}
 }
