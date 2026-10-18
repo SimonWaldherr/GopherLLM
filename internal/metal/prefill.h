@@ -73,7 +73,7 @@ static const char* gllm_prefill_source =
 // never alias a shared Go cache: a failed/canceled submission publishes nothing.
 enum {
  PF_X,PF_XN,PF_Q,PF_QR,PF_K,PF_KR,PF_V,PF_ATTN,PF_PROJ,PF_GATE,PF_UP,PF_HID,
- PF_SN,PF_CS,PF_TEMP,PF_PENDING_K,PF_PENDING_V,PF_PARTIAL,PF_BUFFERS,
+ PF_SN,PF_CS,PF_TEMP,PF_PENDING_K,PF_PENDING_V,PF_PARTIAL,PF_LOGITS,PF_ARGMAX,PF_RECENT,PF_BUFFERS,
 };
 #define GLLM_PREFILL_PARTIAL_BYTES ((NSUInteger)64*1024*1024)
 #define GLLM_PREFILL_TOTAL_BYTES ((NSUInteger)256*1024*1024)
@@ -108,13 +108,14 @@ static bool gllm_prefill_init(void) {
  }
  return false;
 }
-static bool gllm_prefill_buffers(GLLMDecoder* d,int batch,int start_pos,bool tiled) {
+static bool gllm_prefill_buffers(GLLMDecoder* d,int batch,int start_pos,bool tiled,bool verify) {
  NSUInteger p=(NSUInteger)batch,q=(NSUInteger)d->heads*128,kv=(NSUInteger)d->kvheads*128;
  NSUInteger chunks=((NSUInteger)start_pos+p+31)/32;
  NSUInteger partial=tiled?MIN(GLLM_PREFILL_PARTIAL_BYTES/sizeof(float),p*q/128*chunks*130):1;
  NSUInteger count[PF_BUFFERS]={
   p*d->dim,p*d->dim,p*q,p*q,p*kv,p*kv,p*kv,p*q,p*d->dim,p*d->hidden,p*d->hidden,p*d->hidden,
   p*64,p*64,p,p*kv*d->layers,p*kv*d->layers,partial,
+  verify?p*d->outputWeight->rows:1,verify?p*2:1,verify?p*GLLM_REPEAT_WINDOW:1,
  };
  GLLMPrefill* work=d->prefill;
  NSUInteger total=0;
@@ -174,26 +175,34 @@ static void gllm_prefill_attention(id<MTLComputeCommandEncoder> e,GLLMDecoder* d
 }
 // This function writes device-private scratch only. Publication is separate,
 // after the Go caller has checked cancellation and the command completed.
-static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,const float* cs,const float* temperature,int start_pos,int batch,bool interleaved,bool tiled) {
+static void gllm_prefill_quantized(id<MTLComputeCommandEncoder> e,GLLMMetalWeight* w,uint32_t quant,id<MTLBuffer> x,id<MTLBuffer> out,int batch) {
+ if(gllm_metal_encode_verify(e,w,x,out,batch,quant))return;
+ gllm_metal_encode_quantized_to(e,w,quant,x,out,batch,4);
+}
+static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,const float* cs,const float* temperature,int start_pos,int batch,bool interleaved,bool tiled,const uint32_t* recent,const uint32_t* counts,float penalty) {
  @autoreleasepool {
  GLLMDecoder* d=ptr;
  if(d==NULL || batch<2 || batch>256 || start_pos<0 || start_pos>d->maxlen-batch || input==NULL || sn==NULL || cs==NULL || temperature==NULL)return false;
- if(!gllm_prefill_init() || !gllm_prefill_buffers(d,batch,start_pos,tiled))return false;
+ bool verify=counts!=NULL;
+ if(verify && (batch>8 || d->outputWeight==NULL || recent==NULL || !isfinite(penalty) || penalty<=0))return false;
+ if(verify)for(int i=0;i<batch;i++)if(counts[i]>GLLM_REPEAT_WINDOW)return false;
+ if(!gllm_prefill_init() || !gllm_prefill_buffers(d,batch,start_pos,tiled,verify))return false;
  GLLMPrefill* p=d->prefill;
  for(int layer=0;layer<d->layers;layer++)for(int i=0;i<7;i++)if(d->layer[layer].w[i]==NULL)return false;
  memcpy([p->b[PF_X] contents],input,(NSUInteger)batch*d->dim*sizeof(float));
  memcpy([p->b[PF_SN] contents],sn,(NSUInteger)batch*64*sizeof(float));
  memcpy([p->b[PF_CS] contents],cs,(NSUInteger)batch*64*sizeof(float));
  memcpy([p->b[PF_TEMP] contents],temperature,(NSUInteger)batch*sizeof(float));
+ if(verify)memcpy([p->b[PF_RECENT] contents],recent,(NSUInteger)batch*GLLM_REPEAT_WINDOW*sizeof(uint32_t));
  id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();
  id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
  if(cb==nil || e==nil)return false;
  for(int layer=0;layer<d->layers;layer++){
   GLLMDecodeLayer* l=&d->layer[layer];
   gllm_decode_norm(e,p->b[PF_X],l->norm,p->b[PF_XN],d->dim,batch,d->eps);
-  gllm_metal_encode_quantized_to(e,l->w[0],l->quant[0],p->b[PF_XN],p->b[PF_Q],batch,4);
-  gllm_metal_encode_quantized_to(e,l->w[1],l->quant[1],p->b[PF_XN],p->b[PF_K],batch,4);
-  gllm_metal_encode_quantized_to(e,l->w[2],l->quant[2],p->b[PF_XN],p->b[PF_V],batch,4);
+  gllm_prefill_quantized(e,l->w[0],l->quant[0],p->b[PF_XN],p->b[PF_Q],batch);
+  gllm_prefill_quantized(e,l->w[1],l->quant[1],p->b[PF_XN],p->b[PF_K],batch);
+  gllm_prefill_quantized(e,l->w[2],l->quant[2],p->b[PF_XN],p->b[PF_V],batch);
   id<MTLBuffer> q=p->b[PF_Q],k=p->b[PF_K];
   if(l->qNorm!=nil){gllm_decode_norm(e,q,l->qNorm,p->b[PF_QR],128,batch*d->heads,d->eps);q=p->b[PF_QR];}
   if(l->kNorm!=nil){gllm_decode_norm(e,k,l->kNorm,p->b[PF_KR],128,batch*d->kvheads,d->eps);k=p->b[PF_KR];}
@@ -205,18 +214,28 @@ static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,cons
   uint32_t count=(uint32_t)kvCount;[e setBytes:&count length:sizeof(count) atIndex:2];
   [e dispatchThreadgroups:MTLSizeMake((kvCount+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
   gllm_prefill_attention(e,d,l,p,qr,layer,batch,start_pos,tiled);
-  gllm_metal_encode_quantized_to(e,l->w[3],l->quant[3],p->b[PF_ATTN],p->b[PF_PROJ],batch,4);
+  gllm_prefill_quantized(e,l->w[3],l->quant[3],p->b[PF_ATTN],p->b[PF_PROJ],batch);
   gllm_prefill_add(e,p->b[PF_X],p->b[PF_PROJ],(uint32_t)batch*d->dim);
   gllm_decode_norm(e,p->b[PF_X],l->ffnNorm,p->b[PF_XN],d->dim,batch,d->eps);
-  gllm_metal_encode_quantized_to(e,l->w[4],l->quant[4],p->b[PF_XN],p->b[PF_GATE],batch,4);
-  gllm_metal_encode_quantized_to(e,l->w[5],l->quant[5],p->b[PF_XN],p->b[PF_UP],batch,4);
+  gllm_prefill_quantized(e,l->w[4],l->quant[4],p->b[PF_XN],p->b[PF_GATE],batch);
+  gllm_prefill_quantized(e,l->w[5],l->quant[5],p->b[PF_XN],p->b[PF_UP],batch);
   gllm_metal_encode_silu(e,p->b[PF_GATE],p->b[PF_UP],p->b[PF_HID],(uint32_t)batch*d->hidden);
-  gllm_metal_encode_quantized_to(e,l->w[6],l->quant[6],p->b[PF_HID],p->b[PF_PROJ],batch,4);
+  gllm_prefill_quantized(e,l->w[6],l->quant[6],p->b[PF_HID],p->b[PF_PROJ],batch);
   gllm_prefill_add(e,p->b[PF_X],p->b[PF_PROJ],(uint32_t)batch*d->dim);
  }
  gllm_decode_norm(e,p->b[PF_X],d->outputNorm,p->b[PF_XN],d->dim,batch,d->eps);
+ if(verify){
+  gllm_prefill_quantized(e,d->outputWeight,d->outputQuant,p->b[PF_XN],p->b[PF_LOGITS],batch);
+  for(int i=0;i<batch;i++)gllm_metal_encode_argmax_recent_to(e,d->outputWeight,
+   p->b[PF_LOGITS],(NSUInteger)i*d->outputWeight->rows*sizeof(float),p->b[PF_ARGMAX],(NSUInteger)i*sizeof(GLLMArgmaxResult),
+   p->b[PF_RECENT],(NSUInteger)i*GLLM_REPEAT_WINDOW*sizeof(uint32_t),counts[i],penalty);
+ }
  [e endEncoding];[cb commit];[cb waitUntilCompleted];
  if([cb status]!=MTLCommandBufferStatusCompleted){gllm_set_error(@"whole prefill command failed",[cb error]);return false;}
+ if(verify){
+  const GLLMArgmaxResult* r=[p->b[PF_ARGMAX] contents];
+  for(int i=0;i<batch;i++)if(r[i].index>=(uint32_t)d->outputWeight->rows || !isfinite(r[i].value))return false;
+ }
  return true;
  }
 }
@@ -233,4 +252,8 @@ static void gllm_prefill_publish_cache(void* ptr,int layer,int start_pos,int bat
 static void gllm_prefill_publish_output(void* ptr,int batch,float* residual,float* output) {
  GLLMDecoder* d=ptr;GLLMPrefill* p=d->prefill;NSUInteger bytes=(NSUInteger)batch*d->dim*sizeof(float);
  memcpy(residual,[p->b[PF_X] contents],bytes);memcpy(output,[p->b[PF_XN] contents],bytes);
+}
+static void gllm_prefill_publish_tokens(void* ptr,int batch,uint32_t* tokens) {
+ GLLMPrefill* p=((GLLMDecoder*)ptr)->prefill;const GLLMArgmaxResult* r=[p->b[PF_ARGMAX] contents];
+ for(int i=0;i<batch;i++)tokens[i]=r[i].index;
 }

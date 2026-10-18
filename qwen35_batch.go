@@ -23,8 +23,9 @@ type qwen35BatchScratch struct {
 // As with token decode, the caller resets recurrent state for a cold request
 // (generationWorkspace does so) or restores the complete matching snapshot.
 func (r *Runner) prefillQwen35At(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
-	if !r.canBatchQwen35() {
-		return fmt.Errorf("gopherllm: Qwen chunked prefill requires a dense CPU hybrid model")
+	metal := r.canBatchQwen35Metal(cache)
+	if !r.canBatchQwen35() && !metal {
+		return fmt.Errorf("gopherllm: Qwen chunked prefill requires a supported dense hybrid model")
 	}
 	if cache == nil || cache.Qwen35 == nil || startPos < 0 || startPos > cache.MaxLen || len(tokens) > cache.MaxLen-startPos {
 		return fmt.Errorf("gopherllm: Qwen chunked prefill has an invalid cache range")
@@ -35,7 +36,16 @@ func (r *Runner) prefillQwen35At(ctx context.Context, cache *KVCache, buf *Decod
 			return err
 		}
 		end := min(start+chunk, len(tokens))
-		if err := forwardQwen35BatchInto(ctx, r.config, r.qwen35, cache, buf, tokens[start:end], startPos+start, end == len(tokens), logits); err != nil {
+		var err error
+		if metal {
+			_, err = forwardQwen35MetalBatchStatesInto(ctx, r.config, r.qwen35, cache, buf, tokens[start:end], startPos+start)
+			if err == nil && end == len(tokens) && logits != nil {
+				r.qwen35.Output.MatvecInto(buf.XN, logits)
+			}
+		} else {
+			err = forwardQwen35BatchInto(ctx, r.config, r.qwen35, cache, buf, tokens[start:end], startPos+start, end == len(tokens), logits)
+		}
+		if err != nil {
 			return err
 		}
 	}
@@ -75,6 +85,8 @@ func forwardQwen35Batch(ctx context.Context, cfg Config, weights Qwen35Weights, 
 		return nil, fmt.Errorf("gopherllm: Qwen block has an invalid cache range or exceeds 32 tokens")
 	}
 	b := &buf.qwenBatch
+	replay := &buf.speculative.qwenReplay
+	replay.begin(cfg, cache.Qwen35.Layers, p, allStates && buf.speculative.active)
 	X := reuseBatchViews(&b.XFlat, &b.X, p, cfg.Dim)
 	XN := reuseBatchViews(&b.XNFlat, &b.XN, p, cfg.Dim)
 	Proj := reuseBatchViews(&b.ProjFlat, &b.Proj, p, cfg.Dim)
@@ -139,6 +151,7 @@ func forwardQwen35Batch(ctx context.Context, cfg Config, weights Qwen35Weights, 
 			w := layer.DeltaNet
 			matvecBatch2Slabs(w.QKVConv, w.Gate, XN, QKV, Gate, b.XNFlat, b.QKVFlat, b.GateFlat)
 			matvecBatch2Slabs(w.AlphaProj, w.BetaProj, XN, Alpha, Beta, b.XNFlat, b.AlphaFlat, b.BetaFlat)
+			replay.capture(layer.RecurrentCacheSlot, b.QKVFlat, b.GateFlat, b.AlphaFlat, b.BetaFlat)
 			for token := range tokens {
 				if err := ctx.Err(); err != nil {
 					return nil, err

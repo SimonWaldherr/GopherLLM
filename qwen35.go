@@ -2,7 +2,7 @@ package gopherllm
 
 // Native Qwen3.5 / Qwen3.6 / Qwen3.8 ("qwen35") inference.
 //
-// EXPERIMENTAL: this is a native, text-only single-token decode path for the
+// EXPERIMENTAL: this is a native, text-only inference path for the
 // Qwen3.5/3.6/3.8 hybrid architecture. Its DeltaNet and gated-attention math
 // follows the Qwen reference graph and the llama.cpp GGUF conversion layout:
 // QKV is [Q|K|V], Q/K use L2 normalization, and full attention uses a sigmoid
@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 )
 
 type qwen35LayerKind uint8
@@ -128,25 +129,31 @@ type Qwen35MTPWeights struct {
 	Output         Weight
 }
 
-// qwen35MTPExecutionWeights selects CPU-SIMD views of the MTP body matrices
-// even when the large target graph uses selective Metal offload. One draft
-// block performs several small, dependency-chained matvecs; individually
-// submitting them to Metal costs more synchronization than it saves. The
-// vocab-wide shared head intentionally remains on Metal, where its projection
-// plus argmax reduction does amortize one command buffer. This only changes a
-// value copy, so the original Metal ownership remains available to the target
-// decoder and is released exactly once with the loaded model.
+var mtpMetalBodyEnabled = os.Getenv("GOPHERLLM_MTP_METAL_BODY") != "0"
+
+// Keep embedding/hidden mixing and K/V on the CPU so scalar and batched cache
+// catch-up retain the same arithmetic as drafting. Large Q/O projections and
+// complete fused FFNs can use their existing Metal views. Small matrices keep
+// CPU SIMD to avoid command-buffer overhead. This changes value copies only;
+// the loaded model remains the single owner of every accelerator resource.
 func qwen35MTPExecutionWeights(weights Qwen35MTPWeights) Qwen35MTPWeights {
 	disableMetal := func(w *Weight) { w.Metal = nil }
 	disableMetal(&weights.TokenEmbd)
 	disableMetal(&weights.EHProj)
-	disableMetal(&weights.Attention.Q)
 	disableMetal(&weights.Attention.K)
 	disableMetal(&weights.Attention.V)
-	disableMetal(&weights.Attention.O)
-	disableMetal(&weights.FFN.Gate)
-	disableMetal(&weights.FFN.Up)
-	disableMetal(&weights.FFN.Down)
+	if !mtpMetalBodyEnabled || !metalWeightUsesDirect(weights.Attention.Q.Metal) {
+		disableMetal(&weights.Attention.Q)
+	}
+	if !mtpMetalBodyEnabled || !metalWeightUsesDirect(weights.Attention.O.Metal) {
+		disableMetal(&weights.Attention.O)
+	}
+	if !mtpMetalBodyEnabled || !metalWeightUsesDirect(weights.FFN.Gate.Metal) || !metalWeightUsesDirect(weights.FFN.Up.Metal) ||
+		!metalQwen35FFNBatchReady(weights.FFN.Gate.Metal, weights.FFN.Up.Metal, weights.FFN.Down.Metal) {
+		disableMetal(&weights.FFN.Gate)
+		disableMetal(&weights.FFN.Up)
+		disableMetal(&weights.FFN.Down)
+	}
 	return weights
 }
 
@@ -707,13 +714,19 @@ func ForwardQwen35BodyInto(cfg Config, weights Qwen35Weights, cache *KVCache, bu
 // is part of Qwen's MTP training graph: at position p the draft layer combines
 // token[p] with target_hidden[p-1] and predicts token[p+1].
 func ForwardQwen35MTPBodyInto(cfg Config, weights Qwen35MTPWeights, state *Qwen35MTPState, token uint32, hPrev []float32, pos int) {
+	forwardQwen35MTPBodyInto(cfg, qwen35MTPExecutionWeights(weights), state, token, hPrev, pos)
+}
+
+// forwardQwen35MTPBodyInto evaluates the complete draft body with the supplied
+// execution views. K/V catch-up and drafting share CPU input mixing; the query,
+// output and FFN projections may use the loaded accelerator views.
+func forwardQwen35MTPBodyInto(cfg Config, weights Qwen35MTPWeights, state *Qwen35MTPState, token uint32, hPrev []float32, pos int) {
 	if state == nil || state.KV == nil || state.Scratch == nil {
 		panic("Qwen MTP forward requires an MTP cache")
 	}
 	if len(hPrev) < cfg.Dim {
 		panic("Qwen MTP forward received a short target hidden state")
 	}
-	weights = qwen35MTPExecutionWeights(weights)
 	buf := state.Scratch
 	weights.TokenEmbd.RowInto(int(token), cfg.Dim, &buf.XN2)
 	rmsNormInto(buf.XN2, weights.EmbeddingNorm, cfg.RMSNormEps, &buf.X)
@@ -725,7 +738,20 @@ func ForwardQwen35MTPBodyInto(cfg Config, weights Qwen35MTPWeights, state *Qwen3
 
 	ropeHalf, ropePairs := prepareRopeScratch(pos, cfg.HeadDim, cfg.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
 	rmsNormInto(buf.X, weights.Norm, cfg.RMSNormEps, &buf.XN)
-	qwen35AttentionForward(cfg, weights.Attention, state.KV, buf.XN, 0, pos, ropeHalf, ropePairs, buf)
+	if w := weights.Attention; w.Q.Metal != nil && w.K.Metal == nil && w.V.Metal == nil {
+		// The generic attention helper prefers CPU Q/K/V fusion for mixed
+		// views. Select the large query projection explicitly while retaining
+		// exactly the same CPU K/V arithmetic as authoritative catch-up.
+		w.Q.MatvecInto(buf.XN, &buf.QGate)
+		if !tryMatvec2Into(w.K, w.V, buf.XN, &buf.Q4KXSums, &buf.K, &buf.V) {
+			w.K.MatvecInto(buf.XN, &buf.K)
+			w.V.MatvecInto(buf.XN, &buf.V)
+		}
+		qwen35AttentionMix(cfg, w, state.KV, 0, pos, ropeHalf, ropePairs, buf)
+		w.O.MatvecInto(buf.AttnOut[:cfg.NHeads*cfg.ValueDim], &buf.Proj)
+	} else {
+		qwen35AttentionForward(cfg, weights.Attention, state.KV, buf.XN, 0, pos, ropeHalf, ropePairs, buf)
+	}
 	addInPlace(buf.X[:cfg.Dim], buf.Proj[:cfg.Dim])
 	rmsNormInto(buf.X, weights.PostAttnNorm, cfg.RMSNormEps, &buf.XN)
 	qwen35FFNForward(weights.FFN, buf.XN, buf)
@@ -746,8 +772,12 @@ func qwen35MTPProcess(cfg Config, weights *Qwen35MTPWeights, state *Qwen35MTPSta
 	if weights == nil || state == nil {
 		return
 	}
-	ForwardQwen35MTPBodyInto(cfg, *weights, state, token, state.PendingHidden, pos)
-	copy(state.PendingHidden, targetHidden[:cfg.Dim])
+	if !qwen35MTPKVOnlyEligible(*weights) {
+		ForwardQwen35MTPBodyInto(cfg, *weights, state, token, state.PendingHidden, pos)
+		copy(state.PendingHidden, targetHidden[:cfg.Dim])
+		return
+	}
+	qwen35MTPProcessKVInto(cfg, *weights, state, token, targetHidden, pos)
 }
 
 // qwen35MTPDraftGreedy produces up to maxTokens candidate continuations from
@@ -888,6 +918,14 @@ func qwen35AttendHeadGroupsRange(cfg *Config, cache *KVCache, buf *DecodeBuffer,
 // decay the state, write beta*(V-recall) through K, then read through the
 // scaled Q before gated RMSNorm and the output projection.
 func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache, x []float32, layer int, buf *DecodeBuffer) {
+	qwen35DeltaNetMix(cfg, w, state, x, layer, buf)
+	w.Out.MatvecInto(buf.MambaY, &buf.Proj)
+}
+
+// qwen35DeltaNetMix preserves the chronological recurrent update and leaves
+// its gated output in MambaY. Independent output projections can then share
+// their CPU weight reads across several positions.
+func qwen35DeltaNetMix(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache, x []float32, layer int, buf *DecodeBuffer) {
 	// QKV and the output gate share the same input. For CPU-resident Q4_K
 	// layers, compute them in one quantized worker-pool dispatch (and reuse
 	// x-sums) instead of launching the gate projection after the recurrent
@@ -906,7 +944,6 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 		w.BetaProj.MatvecInto(x, &buf.MambaBeta)
 	}
 	qwen35DeltaNetStep(cfg, w, state, buf.MambaIn, buf.MambaZ, buf.MambaDT, buf.MambaBeta, layer, buf)
-	w.Out.MatvecInto(buf.MambaY, &buf.Proj)
 }
 
 // qwen35DeltaNetStep advances one token's convolution and recurrent state
@@ -1035,7 +1072,7 @@ func qwen35FFNForward(w Qwen35FFNWeights, x []float32, buf *DecodeBuffer) {
 	// down. Keep those three stages inside the existing Metal command buffer
 	// when it is available; otherwise the fused CPU gate/up kernel below is
 	// still used. This is intentionally checked before allocating Hidden.
-	if matvecMetalSwiGLUInto(w.Gate.Metal, w.Up.Metal, w.Down.Metal, x, &buf.Proj) {
+	if matvecMetalQwen35SwiGLUInto(w.Gate.Metal, w.Up.Metal, w.Down.Metal, x, &buf.Proj) {
 		return
 	}
 	if !tryMatvec2Into(w.Gate, w.Up, x, &buf.Q4KXSums, &buf.Gate, &buf.Up) {

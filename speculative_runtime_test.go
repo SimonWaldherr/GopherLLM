@@ -457,8 +457,8 @@ func TestSpeculativeLookupMiddleRejectionAndMTPCatchup(t *testing.T) {
 }
 
 func TestSpeculativeMTPSerialPauseKeepsDraftCacheSynchronized(t *testing.T) {
-	// The target always chooses 3 while MTP chooses 0. Three rejected
-	// three-candidate windows shrink to one; three more trigger a serial pause.
+	// The target always chooses 3 while MTP chooses 0. Two rejected
+	// three-candidate windows shrink to one; two more trigger a serial pause.
 	baseline, speculative := speculativeFixedQwenRunner(t, 3), speculativeFixedQwenRunner(t, 3)
 	opts := speculativeRuntimeOptions()
 	messages := []ChatMessage{UserMessage("aaaaaaaa")}
@@ -473,7 +473,7 @@ func TestSpeculativeMTPSerialPauseKeepsDraftCacheSynchronized(t *testing.T) {
 	}
 	speculativeRequireSameResult(t, got, want)
 	stats := got.Stats.Speculation
-	if stats == nil || stats.Blocks != 6 || stats.DraftedTokens != 12 || stats.AcceptedTokens != 0 {
+	if stats == nil || stats.Blocks != 4 || stats.DraftedTokens != 8 || stats.AcceptedTokens != 0 {
 		t.Fatalf("rejected MTP work did not enter the serial pause: %+v", stats)
 	}
 	speculativeRequireSameVisibleState(t, speculative, baseline)

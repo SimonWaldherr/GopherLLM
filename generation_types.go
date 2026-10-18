@@ -80,7 +80,7 @@ type GenerationOptions struct {
 	// token; non-greedy sampling is rejected rather than silently changing its
 	// distribution.
 	MTPDraftTokens int
-	// PromptLookupTokens reuses known continuations of repeated 4–8-token
+	// PromptLookupTokens reuses known continuations of repeated 4–64-token
 	// history suffixes as exact greedy draft candidates. Zero disables lookup;
 	// values 1–7 cap the candidates, each verified by the target. Lookup takes
 	// precedence over MTP when both are enabled and a matching passage exists.

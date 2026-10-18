@@ -14,7 +14,9 @@ type speculativeWindow struct {
 	maxIndex int
 	index    int
 	dwell    int
+	misses   int
 	pause    int
+	probing  bool
 	serial   float64
 	sizes    [3]int
 	stats    [3]speculativeWindowStats
@@ -141,6 +143,36 @@ func (w *speculativeWindow) observe(s speculativeWindowSample) {
 		return
 	}
 	w.dwell++
+	if s.Accepted == 0 {
+		w.misses++
+	} else {
+		w.misses = 0
+	}
+	if w.misses >= 2 {
+		// Repeated complete misses are a draft-quality signal even while
+		// kernel setup makes early timing samples unreliable. Do not pay for
+		// three wide blocks and three narrow blocks before backing off.
+		if w.index > 0 {
+			w.index--
+		} else {
+			w.pause = speculativeSerialPause
+		}
+		w.misses, w.dwell, w.probing = 0, 0, false
+		return
+	}
+	if w.probing {
+		// A slow, high-acceptance smaller window may simply underfill the
+		// verifier. One larger block measures that possibility; if it loses,
+		// return immediately rather than spending three expensive probes.
+		w.probing = false
+		smaller := w.stats[w.index-1]
+		if stat.acceptance < 0.50 || stat.cost > smaller.cost*1.10 ||
+			(w.serial > 0 && stat.cost > w.serial*1.10) {
+			w.index--
+			w.dwell = 0
+			return
+		}
+	}
 	if w.dwell < 3 {
 		return
 	}
@@ -150,6 +182,14 @@ func (w *speculativeWindow) observe(s speculativeWindowSample) {
 		smaller := w.stats[w.index-1]
 		if smaller.samples >= 3 && stat.cost > smaller.cost*1.10 {
 			slow = true
+		}
+		if slow && stat.acceptance >= 0.85 && w.index < w.maxIndex && w.stats[w.index+1].samples == 0 {
+			// P4 can lose to serial while P8 amortizes the same weight reads.
+			// Explore an unmeasured larger size once before falling back to P2.
+			w.index++
+			w.dwell = 0
+			w.probing = true
+			return
 		}
 		if slow || stat.acceptance < 0.50 {
 			w.index--

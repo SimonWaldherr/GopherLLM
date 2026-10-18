@@ -46,6 +46,27 @@ func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]flo
 	return *views
 }
 
+// prepareDenseBatchInputs prepares embedding and rotary tables for eligible
+// dense GPU verification. Eligibility must be checked before calling it.
+func prepareDenseBatchInputs(c Config, w ModelWeights, buf *DecodeBuffer, tokens []uint32, start int) {
+	b := &buf.batch
+	x := reuseBatchViews(&b.XFlat, &b.X, len(tokens), c.Dim)
+	reuseBatchViews(&b.XNFlat, &b.XN, len(tokens), c.Dim)
+	sn := reuseBatchViews(&b.RopeSinFlat, &b.RopeSin, len(tokens), 64)
+	cs := reuseBatchViews(&b.RopeCosFlat, &b.RopeCos, len(tokens), 64)
+	ensureLenNoClear(&b.RopeTemperature, len(tokens))
+	for i, token := range tokens {
+		w.TokenEmbd.RowInto(int(token), c.Dim, &x[i])
+		if image, ok := buf.ImageEmbeds[start+i]; ok {
+			copy(x[i], image)
+		} else if c.EmbeddingScale != 1 {
+			ScaleF32(x[i], c.EmbeddingScale)
+		}
+		prepareRopeScratch(start+i, c.HeadDim, c.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &sn[i], &cs[i])
+		b.RopeTemperature[i] = attentionTemperatureAt(c, start+i)
+	}
+}
+
 // batchAttentionTask holds the per-layer state for independent prompt-token
 // attention work. Keeping it in a pool lets ForwardBatchInto reuse the worker
 // pool without creating an escaping closure for every transformer layer.

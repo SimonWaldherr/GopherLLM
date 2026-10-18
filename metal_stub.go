@@ -62,11 +62,25 @@ func matvecMetalSwiGLUBatchInto(_, _, _ *MetalWeight, _ []float32, _ int, _ *[]f
 	return false
 }
 
+func metalQwen35FFNBatchReady(_, _, _ *MetalWeight) bool { return false }
+
+func matvecMetalSwiGLUDecodeBatchInto(gate, up, down *MetalWeight, x []float32, batch int, out *[]float32) bool {
+	return false
+}
+
+func matvecMetalQwen35SwiGLUInto(gate, up, down *MetalWeight, x []float32, out *[]float32) bool {
+	return false
+}
+
 func (r *Runner) metalBatchFFNPrefillChunk() int { return 0 }
 
 func releaseMetalWeight(_ *MetalWeight) {}
 
 type metalDenseState struct{}
+
+func tryMetalDenseVerify(context.Context, Config, ModelWeights, *KVCache, *DecodeBuffer, []uint32, int, [][]uint32, float32, *[]uint32) ([][]float32, bool, error) {
+	return nil, false, nil
+}
 
 func tryMetalDensePrefill(context.Context, Config, ModelWeights, *KVCache, *DecodeBuffer, int, int, bool) (bool, error) {
 	return false, nil

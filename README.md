@@ -528,21 +528,26 @@ already-emitted seed, so it accepts at most seven draft candidates. An entirely
 accepted block also supplies the next target prediction. Stop tokens, stop
 strings, repetition penalties and cancellation retain their ordinary semantics.
 
-Prompt lookup proposes known continuations of repeated 4–8-token suffixes in
+Prompt lookup proposes known continuations of repeated 4–64-token suffixes in
 the most recent 8192 prompt/output tokens. Enable it explicitly with
 `--prompt-lookup-tokens 7`, `WithPromptLookupTokens(7)`, or the JSON configuration
 field `generation.prompt_lookup_tokens`. Values are 0–7; zero disables it.
 For example:
 
 ```sh
-bin/gopherllm model.gguf --temp 0 --prompt-lookup-tokens 7 \
+bin/gopherllm model.gguf --temp 0 --repeat-penalty 1 --prompt-lookup-tokens 7 \
   --prompt 'Continue this repeated code pattern...'
 ```
 
 ```go
 res, err := model.Generate(ctx, prompt,
-    gopherllm.WithTemperature(0), gopherllm.WithPromptLookupTokens(7))
+    gopherllm.WithTemperature(0), gopherllm.WithRepeatPenalty(1),
+    gopherllm.WithPromptLookupTokens(7))
 ```
+
+These copying examples disable repetition penalties because intentional reuse
+is the task. Repetition penalties remain supported; keep the application's
+sampling settings unchanged when comparing performance.
 
 Qwen GGUFs with a loaded NextN head can also use `--mtp-draft-tokens N` or
 `WithMTPDraftTokens(N)`. Both methods require deterministic sampling
@@ -555,14 +560,35 @@ Each request starts at the second available window, usually three candidates,
 and adjusts among 1/3/7 drafts plus an exact smaller user cap. Including the seed,
 the regular windows fill 2/4/8 target positions. Selection uses acceptance and
 elapsed draft, verification and reconciliation cost per emitted token.
-Measurements are discarded after generation. If the one-candidate window
+Measurements are discarded after generation. A slow four-position block with
+at least 85% draft acceptance can test one previously unmeasured larger window
+before shrinking; its measured cost decides whether to retain it. Two completely
+rejected blocks shrink the window early, independently of cold kernel timings.
+If the one-candidate window
 accepts fewer than half its proposals or costs over 10% more than measured
 serial decoding, drafting pauses for twelve serial steps before retrying.
-Eligible dense Metal transformers use the short GPU block graph. Dense CPU
-Qwen hybrids batch target projections while keeping DeltaNet
-updates chronological, and their MTP prefill consumes every target hidden state
-in order. MoE, out-of-core and accelerator-backed Qwen graphs retain serial MTP;
-quantized Qwen projections also retain it when Q8 activations are disabled.
+Eligible dense Metal transformers share unpacked weights across the short
+block's positions in registers, with the body, vocabulary projection and
+position-specific token reductions in one command buffer. Dense CPU vocabulary
+projections reuse weight rows across four to eight positions. Qwen hybrids batch
+target projections while keeping DeltaNet updates chronological. On rejection,
+up to 32 MiB of retained projection inputs avoid repeating the large target
+projections when restoring the accepted recurrent prefix. The MTP head batches
+catch-up from known target states, including prefill. Catch-up computes only
+embedding/hidden mixing and K/V: attention output, Q, O, FFN and vocabulary
+projections are unused because the next boundary comes from the target model.
+Eligible dense Metal hybrids batch FFNs and CPU-Q8 DeltaNet output projections.
+Single-token and batched FFNs use the same GPU reduction order; attention and
+recurrent updates retain their chronological CPU/Metal schedule. Contracting
+Q6_K FFN down projections can be fused from 2048 rows, while standalone matvec
+thresholds stay unchanged.
+This path requires F32 KV. MoE, out-of-core and unsupported accelerator-backed
+Qwen graphs retain serial MTP. Quantized CPU Qwen projections also retain it
+when Q8 activations are disabled.
+For drafting, sufficiently large prepared Q/O and fused FFN matrices can stay
+on Metal. The MTP input mixing and K/V remain on the CPU so drafting and cache
+catch-up keep the same K/V arithmetic. WebGPU projection views retain full-body
+catch-up.
 Set `GOPHERLLM_NO_BLOCK_VERIFY=1` to compare against serial target verification.
 
 `GenerationResult.Stats.Speculation` reports `Blocks`, `DraftedTokens`,
@@ -573,10 +599,43 @@ drafting is disabled; serial fallback leaves `Blocks` at zero. Measure total
 decode time and accepted tokens on the intended model and hardware before
 assuming a throughput gain.
 
-A local Ministral-3B Q4_K_M copying test on M2 Max (36 output tokens,
-repeat penalty 1, median of three runs) produced identical greedy output but
-took 0.60 s with lookup versus 0.52 s with serial decoding. Speculation remains
-opt-in. `TestSpeculativeConfiguredModelParity` repeats the comparison when
+On M2 Max with eight CPU threads and Metal, a 128-token record-copying task
+produced exactly the same token IDs with serial decoding and prompt lookup.
+Five measured rounds alternated execution order after one warmup per mode;
+prompt caches were cleared between requests. Greedy sampling used repeat
+penalty 1. Median times were:
+
+| Model | Serial decode | Lookup decode | Serial total | Lookup total |
+|---|---:|---:|---:|---:|
+| Ministral-3B Q4_K_M | 2.196 s | 1.427 s | 2.955 s | 2.183 s |
+| Qwen-4B Q8_0 | 2.427 s | 2.140 s | 3.160 s | 2.888 s |
+
+These gains depend on reusable text. A code-editing task with few accepted
+proposals remained slower, so speculation remains opt-in. The record-copying
+results measure prompt lookup; neither checkpoint contains a native MTP head.
+
+The same 128-token copying task also measured native MTP on
+[Qwen3.5-4B-MTP Q4_K_M](https://huggingface.co/prithivMLmods/Qwen3.5-4B-MTP-GGUF/blob/dd65086bdcdd7a8f242a2e54cfe11caf8cd51097/Qwen3.5-4B.Q4_K_M.gguf).
+With `--mtp-draft-tokens 7`, five alternating pairs after warmup produced
+identical tokens. Median decode time fell from 6.628 s to 6.107 s (7.9% less
+time), and total request time from 13.540 s to 12.847 s (5.1% less time).
+Decode was faster in all five pairs; total time was faster in four. Both modes
+used the same default Metal FFN kernels, eight CPU threads and cleared prompt
+caches. This is workload-dependent: separate three-pair code-editing runs with
+one or three MTP candidates took about 3% and 9% longer to decode than serial.
+
+`TestSpeculationConfiguredGenerationAB` repeats the paired copy/code comparison
+when `GOPHERLLM_SPEC_AB_MODEL` points to a local GGUF. Set
+`GOPHERLLM_SPEC_AB_METAL=1`, `GOPHERLLM_SPEC_AB_MAX_TOKENS=128` and build with
+`-tags metal`; `GOPHERLLM_SPEC_AB_MODES` selects `lookup7`, `mtp1`, `mtp3`, `mtp7` or
+combinations such as `lookup7_mtp3`. `GOPHERLLM_SPEC_AB_SAMPLES=5` and
+`GOPHERLLM_SPEC_AB_WARMUPS=1` select the rounds above;
+`GOPHERLLM_SPEC_AB_WORKLOAD=copy` selects the copying task;
+`GOPHERLLM_SPEC_AB_JSON` saves samples and medians. The separate
+`TestSpeculationConfiguredFullMTPBounded` accepts a complete Qwen hybrid model
+through `GOPHERLLM_SPEC_AB_RAW_MODEL` for a bounded MTP parity/performance check.
+
+`TestSpeculativeConfiguredModelParity` provides a shorter parity check when
 `GOPHERLLM_VALIDATE_MODEL` points to a local dense GGUF; set
 `GOPHERLLM_VALIDATE_METAL=1` and build with `-tags metal` to require the GPU.
 
@@ -1536,6 +1595,8 @@ details in the bullets they annotate):
 | `GOPHERLLM_DISABLE_SIMD` | Disable SSE2/AVX2 on x86-64, ARM64 Q8 activation quantization, and ARM64 `FEAT_DotProd` detection |
 | `GOPHERLLM_NO_BATCH_PREFILL` | Per-token prefill instead of batched |
 | `GOPHERLLM_NO_BLOCK_VERIFY` | `1` disables speculative block verification for serial A/B comparison; native MTP retains its serial verifier |
+| `GOPHERLLM_NO_MTP_BATCH` | `1` restores per-token MTP catch-up for comparison |
+| `GOPHERLLM_MTP_METAL_BODY` | `0` keeps the complete native MTP draft body on the CPU; the shared vocabulary head remains on its configured backend |
 | `GOPHERLLM_PREFILL_CHUNK` | Override batched-prefill chunk size (`1`-`256`) |
 | `GOPHERLLM_NO_GROUPED_GQA` | Disable the grouped-GQA/MQA decode path (any ratio, any KV cache format) (A/B benchmarking and debugging) |
 | `GOPHERLLM_Q8_ACTIVATIONS` | `0` disables the default int8-activation Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/Q4_1/MXFP4/Q2_K/Q3_K matvecs (x86-64, and arm64 with `FEAT_DotProd`) |
@@ -1545,6 +1606,8 @@ details in the bullets they annotate):
 | `GOPHERLLM_METAL_ROWS_PER_GROUP` | Override legacy Metal rows per threadgroup (`2`, `4`, `6`, or `8`; default `4`, adaptively `6` for Ministral-3B FFNs); new Q8_0 and coalesced prefill kernels use four rows |
 | `GOPHERLLM_METAL_COALESCED` | `0` disables the four-token Q4_K/Q6_K prefill fallback; also set `GOPHERLLM_METAL_MATRIX=0` to restore the legacy prefill kernels |
 | `GOPHERLLM_METAL_MATRIX` | `0` disables SIMD-group matrix prefill and restores the four-token kernels; decode is unchanged |
+| `GOPHERLLM_METAL_VERIFY_VECTOR` | `0` disables register-shared 2–8-position matvecs, including short prefill batches; larger batches and serial decode are unchanged |
+| `GOPHERLLM_METAL_QWEN_FFN_VECTOR` | `0` restores the legacy Qwen FFN reduction in both single-token decode and block verification |
 | `GOPHERLLM_METAL_GEMMA` | `0` disables fused GeGLU, vectorized Gemma output and native Metal batch prefill (enabled by default) |
 | `GOPHERLLM_METAL_DENSE_DECODE` | `0` disables complete dense Metal decode for eligible Ministral/Qwen models (enabled by default) |
 | `GOPHERLLM_METAL_WHOLE_PREFILL` | `0` disables complete GPU-resident dense prefill chunks (enabled by default for eligible shapes) |

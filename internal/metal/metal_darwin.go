@@ -563,6 +563,7 @@ static bool gllm_metal_init_q6k(void) {
 }
 
 #include "matrix.h"
+#include "verify.h"
 #include "coalesced.h"
 
 static id<MTLCommandBuffer> gllm_metal_new_command_buffer(void) {
@@ -695,16 +696,17 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 	}
 }
 
-static void gllm_metal_encode_q4k_to(
+static void gllm_metal_encode_q4k_mode(
 	id<MTLComputeCommandEncoder> enc,
 	GLLMMetalWeight* w,
 	id<MTLBuffer> x_buffer,
 	id<MTLBuffer> out_buffer,
 	int batch,
-	int default_rows_per_group
+	int default_rows_per_group,
+	bool decode_order
 ) {
-	if (gllm_metal_encode_matrix(enc, w, x_buffer, out_buffer, batch, 4)) return;
-	if (gllm_metal_encode_coalesced(enc, w, x_buffer, out_buffer, batch, false)) return;
+	if (!decode_order && gllm_metal_encode_matrix(enc, w, x_buffer, out_buffer, batch, 4)) return;
+	if (!decode_order && gllm_metal_encode_coalesced(enc, w, x_buffer, out_buffer, batch, false)) return;
 	[enc setComputePipelineState:gllm_q4k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
@@ -722,6 +724,10 @@ static void gllm_metal_encode_q4k_to(
 	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, (NSUInteger)batch, 1);
 	MTLSize threads = MTLSizeMake(32 * ((NSUInteger)rows_per_group / 2), 1, 1);
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+static void gllm_metal_encode_q4k_to(id<MTLComputeCommandEncoder> enc,GLLMMetalWeight* w,id<MTLBuffer> x,id<MTLBuffer> out,int batch,int rows) {
+	gllm_metal_encode_q4k_mode(enc,w,x,out,batch,rows,false);
 }
 
 static void gllm_metal_encode_q4k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
@@ -748,16 +754,17 @@ static void gllm_metal_encode_q5k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 }
 
-static void gllm_metal_encode_q6k_to(
+static void gllm_metal_encode_q6k_mode(
 	id<MTLComputeCommandEncoder> enc,
 	GLLMMetalWeight* w,
 	id<MTLBuffer> x_buffer,
 	id<MTLBuffer> out_buffer,
 	int batch,
-	int default_rows_per_group
+	int default_rows_per_group,
+	bool decode_order
 ) {
-	if (gllm_metal_encode_matrix(enc, w, x_buffer, out_buffer, batch, 6)) return;
-	if (gllm_metal_encode_coalesced(enc, w, x_buffer, out_buffer, batch, true)) return;
+	if (!decode_order && gllm_metal_encode_matrix(enc, w, x_buffer, out_buffer, batch, 6)) return;
+	if (!decode_order && gllm_metal_encode_coalesced(enc, w, x_buffer, out_buffer, batch, true)) return;
 	[enc setComputePipelineState:gllm_q6k_pipeline];
 	[enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
 	[enc setBuffer:x_buffer offset:0 atIndex:1];
@@ -775,6 +782,10 @@ static void gllm_metal_encode_q6k_to(
 	MTLSize groups = MTLSizeMake(((NSUInteger)w->rows + (NSUInteger)rows_per_group - 1) / (NSUInteger)rows_per_group, (NSUInteger)batch, 1);
 	MTLSize threads = MTLSizeMake(32 * ((NSUInteger)rows_per_group / 2), 1, 1);
 	[enc dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+}
+
+static void gllm_metal_encode_q6k_to(id<MTLComputeCommandEncoder> enc,GLLMMetalWeight* w,id<MTLBuffer> x,id<MTLBuffer> out,int batch,int rows) {
+	gllm_metal_encode_q6k_mode(enc,w,x,out,batch,rows,false);
 }
 
 static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, id<MTLBuffer> x_buffer, int default_rows_per_group) {
@@ -1080,7 +1091,8 @@ static int gllm_metal_q4k2_silu_batch(
 	const float* x,
 	float* out,
 	int batch,
-	bool down_q4
+	bool down_q4,
+	bool decode_order
 ) {
 	@autoreleasepool {
 		GLLMMetalWeight* gate = (GLLMMetalWeight*)gate_handle;
@@ -1112,11 +1124,15 @@ static int gllm_metal_q4k2_silu_batch(
 			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 			int ffn_rows_per_group =
 				gate->cols <= 3072 && gate->rows <= 9216 && down->rows <= 3072 ? 6 : 4;
-			gllm_metal_encode_q4k_to(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, ffn_rows_per_group);
-			gllm_metal_encode_q4k_to(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, ffn_rows_per_group);
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,gate,gllm_batch_workspace.x,gllm_batch_workspace.gate,batch,4) : gllm_metal_encode_verify(enc,gate,gllm_batch_workspace.x,gllm_batch_workspace.gate,batch,4)))
+				gllm_metal_encode_q4k_mode(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, ffn_rows_per_group, decode_order);
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,4) : gllm_metal_encode_verify(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,4)))
+				gllm_metal_encode_q4k_mode(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, ffn_rows_per_group, decode_order);
 			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, gllm_batch_workspace.hidden, (uint32_t)(count * (NSUInteger)gate->rows));
-			if (down_q4) gllm_metal_encode_q4k_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group);
-			else gllm_metal_encode_q6k_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group);
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,down_q4?4:6) : gllm_metal_encode_verify(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,down_q4?4:6))) {
+				if (down_q4) gllm_metal_encode_q4k_mode(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group, decode_order);
+				else gllm_metal_encode_q6k_mode(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group, decode_order);
+			}
 			[enc endEncoding];
 			[cb commit];
 			[cb waitUntilCompleted];
@@ -1719,15 +1735,21 @@ func MatvecQ4K2SwiGLUQ6K(gate, up, down *Weight, x, out []float32) bool {
 // complete FFN sequence: returning intermediate Gate/Up/Hidden slabs would
 // reintroduce the CPU/GPU traffic this path removes.
 func MatvecQ4K2SwiGLUQ6KBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
-	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, false)
+	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, false, false)
 }
 
 // MatvecQ4K2SwiGLUQ4KBatch includes contracting Q4_K FFN projections.
 func MatvecQ4K2SwiGLUQ4KBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
-	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, true)
+	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, true, false)
 }
 
-func matvecQ4K2SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int, downQ4 bool) bool {
+// MatvecQ4K2SwiGLUDecodeBatch retains the decode reduction order before
+// downstream CPU-Q8 activation quantization in mixed hybrid graphs.
+func MatvecQ4K2SwiGLUDecodeBatch(gate, up, down *Weight, x, out []float32, batch int, downQ4 bool) bool {
+	return matvecQ4K2SwiGLUBatch(gate, up, down, x, out, batch, downQ4, true)
+}
+
+func matvecQ4K2SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int, downQ4, decodeOrder bool) bool {
 	if gate == nil || up == nil || down == nil || gate.ptr == nil || up.ptr == nil || down.ptr == nil || batch <= 0 || batch > 256 ||
 		gate.cols != up.cols || gate.rows != up.rows || down.cols != gate.rows ||
 		gate.cols <= 0 || gate.rows <= 0 || down.rows <= 0 ||
@@ -1742,6 +1764,7 @@ func matvecQ4K2SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int, 
 		(*C.float)(unsafe.Pointer(&out[0])),
 		C.int(batch),
 		C.bool(downQ4),
+		C.bool(decodeOrder),
 	)
 	runtime.KeepAlive(gate)
 	runtime.KeepAlive(up)
@@ -1891,6 +1914,14 @@ func ArgmaxQ8_0Penalized(w *Weight, x []float32, recent []uint32, repeatPenalty 
 }
 
 func MatvecQ8_0SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
+	return matvecQ8_0SwiGLUBatch(gate, up, down, x, out, batch, false)
+}
+
+func MatvecQ8_0SwiGLUDecodeBatch(gate, up, down *Weight, x, out []float32, batch int) bool {
+	return matvecQ8_0SwiGLUBatch(gate, up, down, x, out, batch, true)
+}
+
+func matvecQ8_0SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int, decodeOrder bool) bool {
 	if gate == nil || up == nil || down == nil || gate.ptr == nil || up.ptr == nil || down.ptr == nil || batch <= 0 || batch > 256 ||
 		gate.cols != up.cols || gate.rows != up.rows || down.cols != gate.rows ||
 		gate.cols <= 0 || gate.rows <= 0 || down.rows <= 0 ||
@@ -1904,6 +1935,7 @@ func MatvecQ8_0SwiGLUBatch(gate, up, down *Weight, x, out []float32, batch int) 
 		(*C.float)(unsafe.Pointer(&x[0])),
 		(*C.float)(unsafe.Pointer(&out[0])),
 		C.int(batch),
+		C.bool(decodeOrder),
 	)
 	runtime.KeepAlive(gate)
 	runtime.KeepAlive(up)
@@ -2078,6 +2110,25 @@ func (d *Decoder) BindCache(index int, k, v []float32) bool {
 // Only the new suffix and outputs are published, after successful completion
 // and a final cancellation check. A false result leaves all Go data unchanged.
 func (d *Decoder) PrefillBatch(ctx context.Context, input, sn, cs, temperature []float32, start, batch int, interleaved, tiled bool, keys, values [][]float32, residual, output []float32) (bool, error) {
+	return d.prefillBatch(ctx, input, sn, cs, temperature, start, batch, interleaved, tiled, keys, values, residual, output, nil, 1, nil)
+}
+
+// VerifyBatch submits body, vocabulary projection and position-specific greedy
+// reduction together. Hidden states never round-trip through the CPU between
+// these operations. All public outputs retain the prefill transaction boundary.
+func (d *Decoder) VerifyBatch(ctx context.Context, input, sn, cs, temperature []float32, start, batch int, interleaved, tiled bool, keys, values [][]float32, residual, output []float32, recent [][]uint32, penalty float32, tokens []uint32) (bool, error) {
+	if batch < 2 || batch > 8 || len(recent) != batch || len(tokens) < batch || penalty <= 0 || math.IsNaN(float64(penalty)) || math.IsInf(float64(penalty), 0) {
+		return false, nil
+	}
+	for _, history := range recent {
+		if len(history) > 64 {
+			return false, nil
+		}
+	}
+	return d.prefillBatch(ctx, input, sn, cs, temperature, start, batch, interleaved, tiled, keys, values, residual, output, recent, penalty, tokens)
+}
+
+func (d *Decoder) prefillBatch(ctx context.Context, input, sn, cs, temperature []float32, start, batch int, interleaved, tiled bool, keys, values [][]float32, residual, output []float32, recent [][]uint32, penalty float32, tokens []uint32) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -2101,7 +2152,20 @@ func (d *Decoder) PrefillBatch(ctx context.Context, input, sn, cs, temperature [
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	ok := bool(C.gllm_prefill_batch(d.ptr, (*C.float)(unsafe.Pointer(&input[0])), (*C.float)(unsafe.Pointer(&sn[0])), (*C.float)(unsafe.Pointer(&cs[0])), (*C.float)(unsafe.Pointer(&temperature[0])), C.int(start), C.int(batch), C.bool(interleaved), C.bool(tiled)))
+	var rp, cp *C.uint32_t
+	if recent != nil {
+		if d.outputRows <= 0 {
+			return false, nil
+		}
+		history := argmaxBatchHistoryPool.Get().(*argmaxBatchHistory)
+		defer argmaxBatchHistoryPool.Put(history)
+		for i := range recent {
+			history.counts[i] = uint32(len(recent[i]))
+			copy(history.tokens[i*64:], recent[i])
+		}
+		rp, cp = (*C.uint32_t)(unsafe.Pointer(&history.tokens[0])), (*C.uint32_t)(unsafe.Pointer(&history.counts[0]))
+	}
+	ok := bool(C.gllm_prefill_batch(d.ptr, (*C.float)(unsafe.Pointer(&input[0])), (*C.float)(unsafe.Pointer(&sn[0])), (*C.float)(unsafe.Pointer(&cs[0])), (*C.float)(unsafe.Pointer(&temperature[0])), C.int(start), C.int(batch), C.bool(interleaved), C.bool(tiled), rp, cp, C.float(penalty)))
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -2114,6 +2178,9 @@ func (d *Decoder) PrefillBatch(ctx context.Context, input, sn, cs, temperature [
 		C.gllm_prefill_publish_cache(d.ptr, C.int(layer), C.int(start), C.int(batch), (*C.float)(unsafe.Pointer(&keys[layer][0])), (*C.float)(unsafe.Pointer(&values[layer][0])))
 	}
 	C.gllm_prefill_publish_output(d.ptr, C.int(batch), (*C.float)(unsafe.Pointer(&residual[0])), (*C.float)(unsafe.Pointer(&output[0])))
+	if recent != nil {
+		C.gllm_prefill_publish_tokens(d.ptr, C.int(batch), (*C.uint32_t)(unsafe.Pointer(&tokens[0])))
+	}
 	runtime.KeepAlive(keys)
 	runtime.KeepAlive(values)
 	runtime.KeepAlive(d)

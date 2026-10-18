@@ -174,6 +174,69 @@ func tryMetalDenseGreedy(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, 
 	return next, ok
 }
 
+// tryMetalDenseVerify keeps hidden states on-device between the transformer
+// and vocabulary projection. False leaves all Go KV rows unchanged.
+func tryMetalDenseVerify(ctx context.Context, c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, tokens []uint32, start int, recent [][]uint32, penalty float32, predictions *[]uint32) ([][]float32, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	n := len(tokens)
+	if n < 2 || n > 8 || len(recent) != n || predictions == nil || k == nil || b == nil || start < 0 || start > k.MaxLen-n ||
+		os.Getenv("GOPHERLLM_NO_GREEDY_ARGMAX") == "1" ||
+		os.Getenv("GOPHERLLM_METAL_WHOLE_PREFILL") == "0" || os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") == "0" ||
+		!metalBatchAttentionEnabled || !metalFusedFFNEnabled || len(b.RopeInvFreq) < 64 ||
+		len(w.OutputBias) > 0 || !finite32(c.LogitScale) || c.LogitScale <= 0 || !finite32(c.FinalLogitSoftcap) || c.FinalLogitSoftcap < 0 ||
+		(penalty != 1 && c.FinalLogitSoftcap > 0) || !finite32(penalty) || penalty <= 0 {
+		return nil, false, nil
+	}
+	for _, history := range recent {
+		if len(history) > 64 {
+			return nil, false, nil
+		}
+	}
+	s := metalDenseFor(c, w, k, b)
+	if s == nil || !s.bindOutput(c, w) {
+		return nil, false, nil
+	}
+	prepareDenseBatchInputs(c, w, b, tokens, start)
+	ensureLenNoClear(predictions, n)
+	work := &b.batch
+	ok, err := s.decoder.VerifyBatch(ctx, work.XFlat, work.RopeSinFlat, work.RopeCosFlat, work.RopeTemperature, start, n, ropeInterleaved(c.Arch), metalBatchAttentionTiled, k.K, k.V, work.XFlat, work.XNFlat, recent, penalty, *predictions)
+	runtime.KeepAlive(s)
+	if !ok || err != nil {
+		return nil, false, err
+	}
+	ensureLenNoClear(&b.XN, c.Dim)
+	copy(b.XN, work.XN[n-1])
+	return work.XN, true, nil
+}
+
+func (s *metalDenseState) bindOutput(c Config, w ModelWeights) bool {
+	if w.Output.F32 != nil || w.Output.Metal == nil || w.Output.Cols != c.Dim || w.Output.Rows != c.VocabSize {
+		return false
+	}
+	var output *metalbackend.Weight
+	var quant uint32
+	switch w.Output.Type {
+	case GGMLTypeQ4_K:
+		output, quant = w.Output.Metal.q4, 4
+	case GGMLTypeQ6_K:
+		output, quant = w.Output.Metal.q6, 6
+	case GGMLTypeQ8_0:
+		output, quant = w.Output.Metal.q8, 8
+	}
+	if output == nil {
+		return false
+	}
+	if s.output != output {
+		if !s.decoder.BindOutput(output, quant) {
+			return false
+		}
+		s.output = output
+	}
+	return true
+}
+
 func tryMetalDenseStep(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, token uint32, pos int, logits *[]float32, recent []uint32, penalty float32, next *uint32) bool {
 	s := metalDenseFor(c, w, k, b)
 	if s == nil || pos < 0 || pos >= k.MaxLen {

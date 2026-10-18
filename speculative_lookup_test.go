@@ -149,9 +149,13 @@ func TestPromptLookupDraftMatchesReference(t *testing.T) {
 		history = append(history, history[start:start+length]...)
 		split := rng.Intn(len(history)) // Keep at least the current seed generated.
 		limit := 1 + rng.Intn(8)
+		maxGram := min(promptLookupMaxNgram, len(history)-1)
+		if len(history)-limit >= 4 {
+			maxGram = min(maxGram, len(history)-limit)
+		}
 		var bestStart, bestGram, bestCount = -1, -1, -1
 		for start := 0; start < len(history); start++ {
-			for gram := 4; gram <= 8; gram++ {
+			for gram := 4; gram <= maxGram; gram++ {
 				if start+gram >= len(history) || gram > len(history) ||
 					!slices.Equal(history[start:start+gram], history[len(history)-gram:]) {
 					continue
@@ -171,6 +175,29 @@ func TestPromptLookupDraftMatchesReference(t *testing.T) {
 		got := promptLookupDraft(history[:split], history[split:], limit, nil)
 		if !slices.Equal(got, want) {
 			t.Fatalf("trial=%d split=%d limit=%d history=%v: got %v want %v", trial, split, limit, history, got, want)
+		}
+	}
+}
+
+func TestPromptLookupDraftKeepsNumberedPassageContext(t *testing.T) {
+	// Twelve lines share a body longer than eight tokens. The final eight
+	// tokens cannot identify a line, so selecting the latest such match
+	// incorrectly proposes END after every line instead of the next number.
+	var passage []uint32
+	for line := 1; line <= 12; line++ {
+		passage = append(passage, uint32(1000+line))
+		for word := uint32(1); word <= 12; word++ {
+			passage = append(passage, word)
+		}
+		passage = append(passage, 90) // newline
+	}
+	prompt := append(slices.Clone(passage), 9999) // END
+	for completed := 1; completed < 12; completed++ {
+		generated := passage[:completed*14]
+		want := passage[len(generated) : len(generated)+7]
+		got := promptLookupDraft(prompt, generated, 7, nil)
+		if !slices.Equal(got, want) {
+			t.Fatalf("after line %d proposed %v, want %v", completed, got, want)
 		}
 	}
 }

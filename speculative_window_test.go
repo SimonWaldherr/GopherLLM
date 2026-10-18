@@ -113,7 +113,7 @@ func TestSpeculativeWindowFindsFasterLargerWindow(t *testing.T) {
 func TestSpeculativeWindowRollbackCostAndRejection(t *testing.T) {
 	for _, sample := range []speculativeWindowSample{
 		{Drafted: 3, Accepted: 0, Emitted: 1, Draft: time.Millisecond, Verify: time.Millisecond},
-		{Drafted: 3, Accepted: 3, Emitted: 4, Verify: time.Millisecond, Rollback: 7 * time.Millisecond, SerialPerToken: time.Millisecond},
+		{Drafted: 3, Accepted: 2, Emitted: 3, Verify: time.Millisecond, Rollback: 7 * time.Millisecond, SerialPerToken: time.Millisecond},
 	} {
 		w := newSpeculativeWindow(8)
 		for range 3 {
@@ -121,6 +121,38 @@ func TestSpeculativeWindowRollbackCostAndRejection(t *testing.T) {
 		}
 		if got := w.limit(100, 100); got != 1 {
 			t.Fatalf("unprofitable sample %+v retained window %d", sample, got)
+		}
+	}
+}
+
+func TestSpeculativeWindowExploresHighAcceptanceLargerSizeOnce(t *testing.T) {
+	for _, largerCost := range []time.Duration{6 * time.Millisecond, 16 * time.Millisecond} {
+		w := newSpeculativeWindow(7)
+		slowerSmall := speculativeWindowSample{Drafted: 3, Accepted: 3, Emitted: 4, Verify: 6 * time.Millisecond, SerialPerToken: time.Millisecond}
+		for range 3 {
+			w.observe(slowerSmall)
+		}
+		if got := w.limit(100, 100); got != 7 || !w.probing {
+			t.Fatalf("high-acceptance P4 did not test unmeasured P8: size=%d probing=%t", got, w.probing)
+		}
+		w.observe(speculativeWindowSample{Drafted: 7, Accepted: 7, Emitted: 8, Verify: largerCost, SerialPerToken: time.Millisecond})
+		if w.probing || w.stats[2].samples != 1 {
+			t.Fatal("controlled exploration did not finish after one larger block")
+		}
+		if largerCost == 6*time.Millisecond {
+			if got := w.limit(100, 100); got != 7 {
+				t.Fatalf("measured faster P8 was discarded: %d", got)
+			}
+		} else {
+			if got := w.limit(100, 100); got != 3 {
+				t.Fatalf("measured slower P8 was not abandoned immediately: %d", got)
+			}
+			for range 3 {
+				w.observe(slowerSmall)
+			}
+			if got := w.limit(100, 100); got != 1 || w.probing {
+				t.Fatalf("known slow larger size was repeatedly explored: size=%d probing=%t", got, w.probing)
+			}
 		}
 	}
 }
@@ -145,6 +177,30 @@ func TestSpeculativeWindowNoTimingWhiplash(t *testing.T) {
 	}
 	if got := w.limit(100, 100); got != 7 {
 		t.Fatalf("cold sample prevented recovery: %d", got)
+	}
+}
+
+func TestSpeculativeWindowRepeatedMissesBackOffBeforeTimingSettles(t *testing.T) {
+	w := newSpeculativeWindow(7)
+	miss := speculativeWindowSample{Drafted: 3, Emitted: 1, Verify: time.Second}
+	w.observe(miss)
+	if w.limit(100, 100) != 3 {
+		t.Fatal("one miss prematurely changed the draft window")
+	}
+	w.observe(miss)
+	if w.limit(100, 100) != 1 {
+		t.Fatal("two complete misses retained the wide window")
+	}
+	miss.Drafted = 1
+	w.observe(miss)
+	w.observe(miss)
+	for range speculativeSerialPause {
+		if w.limit(100, 100) != 0 {
+			t.Fatal("repeated smallest-window misses did not pause drafting")
+		}
+	}
+	if w.limit(100, 100) != 1 {
+		t.Fatal("drafting did not resume after the bounded pause")
 	}
 }
 
@@ -225,10 +281,14 @@ func TestSpeculativeWindowPausesUnprofitableSmallestSize(t *testing.T) {
 		{Drafted: 1, Accepted: 1, Emitted: 2, Verify: time.Millisecond, Rollback: 2 * time.Millisecond, SerialPerToken: time.Millisecond},
 	} {
 		w := newSpeculativeWindow(1)
-		for range 2 {
+		observations := 3
+		if sample.Accepted == 0 {
+			observations = 2
+		}
+		for range observations - 1 {
 			w.observe(sample)
 			if got := w.limit(100, 100); got != 1 {
-				t.Fatalf("paused before three observations: %d", got)
+				t.Fatalf("paused before %d observations: %d", observations, got)
 			}
 		}
 		w.observe(sample)
@@ -308,7 +368,7 @@ func TestSpeculativeWindowPauseRequiresMeasuredSlowdown(t *testing.T) {
 
 func TestSpeculativeWindowCanGrowAfterSerialPause(t *testing.T) {
 	w := newSpeculativeWindow(7)
-	for range 6 {
+	for range 4 {
 		n := w.limit(100, 100)
 		w.observe(speculativeWindowSample{Drafted: n, Emitted: 1, Verify: 2 * time.Millisecond, SerialPerToken: time.Millisecond})
 	}

@@ -106,10 +106,10 @@ static void* gllm_metal_new_q8_0(const void* data, long len, int rows, int cols,
 	}
 }
 
-static void gllm_metal_encode_q8_0_to(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w,
-    id<MTLBuffer> x, id<MTLBuffer> out, int batch) {
-    if (gllm_metal_encode_matrix(enc, w, x, out, batch, 8)) return;
-    bool packed = batch >= 4;
+static void gllm_metal_encode_q8_0_mode(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w,
+ id<MTLBuffer> x, id<MTLBuffer> out, int batch, bool decode_order) {
+    if (!decode_order && gllm_metal_encode_matrix(enc, w, x, out, batch, 8)) return;
+    bool packed = !decode_order && batch >= 4;
     [enc setComputePipelineState:packed ? gllm_q8_0_batch4_pipeline : gllm_q8_0_pipeline];
     [enc setBuffer:w->weights offset:w->weight_offset atIndex:0];
     [enc setBuffer:x offset:0 atIndex:1]; [enc setBuffer:out offset:0 atIndex:2];
@@ -118,6 +118,10 @@ static void gllm_metal_encode_q8_0_to(id<MTLComputeCommandEncoder> enc, GLLMMeta
     [enc setBytes:&p length:sizeof(p) atIndex:3];
     [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)w->rows+3)/4, packed ? (batch+3)/4 : batch, 1)
         threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+}
+static void gllm_metal_encode_q8_0_to(id<MTLComputeCommandEncoder> enc,GLLMMetalWeight* w,
+ id<MTLBuffer> x,id<MTLBuffer> out,int batch) {
+    gllm_metal_encode_q8_0_mode(enc,w,x,out,batch,false);
 }
 static int gllm_metal_q8_0_matvec(void* handle, const float* x, float* out) {
 	@autoreleasepool {
@@ -203,7 +207,8 @@ static int gllm_metal_q8_0_silu_batch(
 	void* down_handle,
 	const float* x,
 	float* out,
-	int batch
+	int batch,
+	bool decode_order
 ) {
 	@autoreleasepool {
 		GLLMMetalWeight* gate = (GLLMMetalWeight*)gate_handle;
@@ -234,10 +239,13 @@ static int gllm_metal_q8_0_silu_batch(
 			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
-			gllm_metal_encode_q8_0_to(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch);
-			gllm_metal_encode_q8_0_to(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch);
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,gate,gllm_batch_workspace.x,gllm_batch_workspace.gate,batch,8) : gllm_metal_encode_verify(enc,gate,gllm_batch_workspace.x,gllm_batch_workspace.gate,batch,8)))
+				gllm_metal_encode_q8_0_mode(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, decode_order);
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,8) : gllm_metal_encode_verify(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,8)))
+				gllm_metal_encode_q8_0_mode(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, decode_order);
 			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, gllm_batch_workspace.hidden, (uint32_t)(count * (NSUInteger)gate->rows));
-			gllm_metal_encode_q8_0_to(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch);
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,8) : gllm_metal_encode_verify(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,8)))
+				gllm_metal_encode_q8_0_mode(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, decode_order);
 			[enc endEncoding];
 			[cb commit];
 			[cb waitUntilCompleted];
