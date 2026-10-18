@@ -80,6 +80,11 @@ type GenerationOptions struct {
 	// token; non-greedy sampling is rejected rather than silently changing its
 	// distribution.
 	MTPDraftTokens int
+	// PromptLookupTokens reuses known continuations of repeated 4–8-token
+	// history suffixes as exact greedy draft candidates. Zero disables lookup;
+	// values 1–7 cap the candidates, each verified by the target. Lookup takes
+	// precedence over MTP when both are enabled and a matching passage exists.
+	PromptLookupTokens int
 	// FIMSuffix switches generation from ordinary chat completion to
 	// Mistral/Codestral fill-in-the-middle: the single message passed to
 	// GenerateChat (its Content, plain text, no chat template applied) is
@@ -160,8 +165,8 @@ func (o GenerationOptions) ActiveTools() []ToolDefinition {
 }
 
 func (o GenerationOptions) Validate() error {
-	if o.JSONObject && (len(o.ActiveTools()) > 0 || len(o.StopSequences) > 0 || o.MTPDraftTokens > 0) {
-		return fmt.Errorf("JSON output cannot be combined with tools, stop sequences or MTP")
+	if o.JSONObject && (len(o.ActiveTools()) > 0 || len(o.StopSequences) > 0 || o.MTPDraftTokens > 0 || o.PromptLookupTokens > 0) {
+		return fmt.Errorf("JSON output cannot be combined with tools, stop sequences, MTP or prompt lookup")
 	}
 	if o.MaxTokens <= 0 {
 		return fmt.Errorf("max_tokens must be greater than 0")
@@ -187,6 +192,12 @@ func (o GenerationOptions) Validate() error {
 	if o.MTPDraftTokens < 0 || o.MTPDraftTokens > 32 {
 		return fmt.Errorf("mtp_draft_tokens must be in the range [0, 32]")
 	}
+	if o.PromptLookupTokens < 0 || o.PromptLookupTokens > 7 {
+		return fmt.Errorf("prompt_lookup_tokens must be in the range [0, 7]")
+	}
+	if o.PromptLookupTokens > 0 && o.Sampler.Temperature >= 1e-6 && o.Sampler.TopK != 1 {
+		return fmt.Errorf("prompt_lookup_tokens requires greedy sampling (temperature 0 or top_k 1) to preserve exact output")
+	}
 	return nil
 }
 
@@ -202,6 +213,17 @@ type GenerationStats struct {
 	PrefillTime     time.Duration
 	DecodeTime      time.Duration
 	TotalTime       time.Duration
+	// Speculation reports block verification work when drafting is enabled.
+	// Serial fallback leaves Blocks at zero; ordinary generation leaves nil.
+	Speculation *SpeculationStats `json:",omitempty"`
+}
+
+type SpeculationStats struct {
+	Blocks, DraftedTokens, AcceptedTokens int
+	// DiscardedInputs counts tentative target rows excluded from the resident
+	// prefix, including a seed when cancellation restores the earlier boundary.
+	DiscardedInputs                            int
+	DraftTime, VerificationTime, ReconcileTime time.Duration
 }
 
 // PromptCacheInfo reports how much of a rendered prompt was already present

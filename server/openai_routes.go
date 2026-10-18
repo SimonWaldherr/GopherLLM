@@ -100,33 +100,23 @@ func registerOpenAIRoutes(mux *http.ServeMux, state *runnerState, embedder *embe
 				// new tool results and the current tool schemas have been added.
 				generate = memory.Wrap(generate)
 			}
-			// Only a stream needs this pre-flight. Headers are committed with an
-			// SSE stream's first chunk, so a context error discovered during
-			// generation could no longer be reported as a 4xx — it has to be
-			// caught before anything is written. The non-streaming path below
-			// has no such constraint: RunAgenticChatObserved surfaces the very
-			// same error and turns it into the very same 400, so preparing the
-			// context here would only do the work twice. That is not a
-			// rounding error. Preparation re-renders and re-tokenizes the
-			// retained history once per candidate turn boundary, which is
-			// quadratic in conversation length: measured against the real
-			// Ministral-3 3B, a 128-message history in "recent" mode costs
-			// ~608 ms and a 256-message one ~2.3 s, all of it before the first
-			// token. Dropping the duplicate cut a non-streaming request's
-			// allocations by 48%.
+			// Catch bounded-context errors before committing SSE headers, then
+			// consume this exact request-local plan once instead of repeating the
+			// suffix search/tokenization. Tool rounds use the ordinary generator
+			// (including recall when enabled) and prepare their changed prompt.
 			if body.Stream && contextMode != gopherllm.ContextWindowFull {
 				effectiveOptions, _ := gopherllm.AgenticOptionsForTools(options, selectedSkills, tools)
-				var err error
+				var prepare gopherllm.ChatContextPreparer
 				if memory != nil {
-					_, _, err = memory.Prepare(messages, effectiveOptions)
-				} else {
-					_, _, err = r.PrepareChatContext(messages, effectiveOptions)
+					prepare = memory.Prepare
 				}
+				plan, err := r.PrepareChatGeneration(messages, effectiveOptions, prepare)
 				if err != nil {
 					logInferenceResult(logw, requestID, "/v1/chat/completions", model, body.Stream, gopherllm.GenerationResult{}, err)
 					writeAPIError(w, 400, "invalid_request", "", err.Error())
 					return
 				}
+				generate = plan.Wrap(generate)
 			}
 			if body.Stream && !structured {
 				includeUsage := body.StreamOptions != nil && body.StreamOptions.IncludeUsage

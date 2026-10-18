@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"context"
 	"math"
 	"sync"
 )
@@ -25,6 +26,7 @@ type batchDecodeBuffer struct {
 	QKVFlat, GateUpFlat                     []float32
 	RopeSinFlat, RopeCosFlat                []float32
 	RopeSWASinFlat, RopeSWACosFlat          []float32
+	RopeTemperature                         []float32
 	X, XN, Q, K, V, AttnOut, Proj, AttnProj [][]float32
 	Gate, Up, Hidden, QKV, GateUp           [][]float32
 	RopeSin, RopeCos                        [][]float32
@@ -278,6 +280,10 @@ func matvecBatchNoQ8(w Weight, xs, outs [][]float32) {
 // embedding runners: useQ8Activations is process-global and cannot safely be
 // toggled around one model invocation.
 func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
+	matvecBatchWithQ8AndSlabs(w, xs, outs, useQ8, nil, nil)
+}
+
+func matvecBatchWithQ8AndSlabs(w Weight, xs, outs [][]float32, useQ8 bool, input, output []float32) {
 	p := len(xs)
 	if p == 0 {
 		return
@@ -286,7 +292,7 @@ func matvecBatchWithQ8(w Weight, xs, outs [][]float32, useQ8 bool) {
 	if cols == 0 {
 		return
 	}
-	if matvecBatchBLAS(w, xs, outs, useQ8) {
+	if matvecBatchBLASWithSlabs(w, xs, outs, useQ8, input, output) {
 		return
 	}
 
@@ -501,9 +507,37 @@ func forwardBatchPoolInto(config Config, weights ModelWeights, cache *KVCache, b
 // when non-nil, requests final hidden states for all tokens; otherwise the
 // normal generation path only normalizes/projects the final token.
 func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, computeLast bool, logits *[]float32, poolSum []float32) {
+	_ = forwardBatchIntoContext(context.Background(), config, weights, cache, buf, tokens, startPos, computeLast, logits, poolSum)
+}
+
+// forwardBatchIntoContext permits a complete GPU chunk to check cancellation
+// before publishing its private outputs and newly computed KV rows.
+func forwardBatchIntoContext(ctx context.Context, config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, computeLast bool, logits *[]float32, poolSum []float32) error {
+	return forwardBatchGraphIntoContext(ctx, config, weights, cache, buf, tokens, startPos, computeLast, logits, poolSum, false)
+}
+
+// forwardBatchStatesIntoContext returns every output-normalized hidden state
+// from a verification block. Rows borrow buf.batch.XN and remain valid only
+// until the next batched forward using buf. The final row is also copied to
+// buf.XN, matching the single-token body's result. Short GPU submissions are
+// enabled only here; ordinary prompt prefill keeps its larger batch threshold.
+func forwardBatchStatesIntoContext(ctx context.Context, config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int) ([][]float32, error) {
+	if err := forwardBatchGraphIntoContext(ctx, config, weights, cache, buf, tokens, startPos, true, nil, nil, true); err != nil {
+		return nil, err
+	}
+	if len(tokens) == 0 {
+		return nil, nil
+	}
+	return buf.batch.XN, nil
+}
+
+func forwardBatchGraphIntoContext(ctx context.Context, config Config, weights ModelWeights, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, computeLast bool, logits *[]float32, poolSum []float32, allStates bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p := len(tokens)
 	if p == 0 {
-		return
+		return nil
 	}
 	dim := config.Dim
 	headDim := config.HeadDim
@@ -519,15 +553,6 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	b := &buf.batch
 	X := reuseBatchViews(&b.XFlat, &b.X, p, dim)
 	XN := reuseBatchViews(&b.XNFlat, &b.XN, p, dim)
-	Q := reuseBatchViews(&b.QFlat, &b.Q, p, qLen)
-	K := reuseBatchViews(&b.KFlat, &b.K, p, kLen)
-	V := reuseBatchViews(&b.VFlat, &b.V, p, vLen)
-	AttnOut := reuseBatchViews(&b.AttnOutFlat, &b.AttnOut, p, attnLen)
-	Proj := reuseBatchViews(&b.ProjFlat, &b.Proj, p, dim)
-	var AttnProj [][]float32
-	if config.ParallelResidual {
-		AttnProj = reuseBatchViews(&b.AttnProjFlat, &b.AttnProj, p, dim)
-	}
 	// The CPU FFN intermediates are deliberately allocated lazily below. A
 	// direct Metal SwiGLU block keeps them on-device, so eagerly reserving the
 	// three p*HiddenDim slabs here would add large, untouched allocations to
@@ -587,8 +612,41 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 	if config.Arch == "phi2" {
 		qScale, scale = scale, 1
 	}
+	if ropePairs == 64 {
+		handled, err := tryMetalDensePrefill(ctx, config, weights, cache, buf, startPos, p, allStates)
+		if err != nil {
+			return err
+		}
+		if handled {
+			if poolSum != nil {
+				for _, row := range XN {
+					addInPlace(poolSum, row)
+				}
+			}
+			if computeLast {
+				ensureLenNoClear(&buf.XN, dim)
+				copy(buf.XN, XN[p-1])
+				if logits != nil {
+					ProjectLogitsInto(config, weights, buf, logits)
+				}
+			}
+			return nil
+		}
+	}
+	Q := reuseBatchViews(&b.QFlat, &b.Q, p, qLen)
+	K := reuseBatchViews(&b.KFlat, &b.K, p, kLen)
+	V := reuseBatchViews(&b.VFlat, &b.V, p, vLen)
+	AttnOut := reuseBatchViews(&b.AttnOutFlat, &b.AttnOut, p, attnLen)
+	Proj := reuseBatchViews(&b.ProjFlat, &b.Proj, p, dim)
+	var AttnProj [][]float32
+	if config.ParallelResidual {
+		AttnProj = reuseBatchViews(&b.AttnProjFlat, &b.AttnProj, p, dim)
+	}
 	denseBatch := prepareMetalDenseBatch(config, weights, cache, buf, p)
 	for l := 0; l < config.NLayers; l++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		layer := weights.Layers[l]
 		for t := 0; t < p; t++ {
 			if config.usesPostNormOnly() {
@@ -600,7 +658,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		if layer.HasQKV {
 			qkvLen := qLen + kLen + vLen
 			QKV = reuseBatchViews(&b.QKVFlat, &b.QKV, p, qkvLen)
-			matvecBatch(layer.WQKV, XN, QKV)
+			matvecBatchSlabs(layer.WQKV, XN, QKV, b.XNFlat, b.QKVFlat)
 			for t := 0; t < p; t++ {
 				copy(Q[t], QKV[t][:qLen])
 				copy(K[t], QKV[t][qLen:qLen+kLen])
@@ -608,7 +666,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			}
 		} else {
 			if !denseBatch || !metalDenseBatchProjectionQKV(buf, l, b.XNFlat, b.QFlat, b.KFlat, b.VFlat, p) {
-				matvecBatch3(layer.WQ, layer.WK, layer.WV, XN, Q, K, V)
+				matvecBatch3Slabs(layer.WQ, layer.WK, layer.WV, XN, Q, K, V, b.XNFlat, b.QFlat, b.KFlat, b.VFlat)
 			}
 		}
 
@@ -663,7 +721,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 
 		if !denseBatch || !metalDenseBatchProjection(buf, l, 3, b.AttnOutFlat, b.ProjFlat, p) {
-			matvecBatch(layer.WO, AttnOut, Proj)
+			matvecBatchSlabs(layer.WO, AttnOut, Proj, b.AttnOutFlat, b.ProjFlat)
 		}
 		for t := 0; t < p; t++ {
 			addInPlace(Proj[t], layer.BO)
@@ -719,14 +777,14 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 				Up = reuseBatchViews(&b.UpFlat, &b.Up, p, hDim)
 			}
 			if config.usesPlainMLP() {
-				matvecBatch(layer.W3, XN, Up)
+				matvecBatchSlabs(layer.W3, XN, Up, b.XNFlat, b.UpFlat)
 				for t := 0; t < p; t++ {
 					addInPlace(Up[t], layer.FFNUpBias)
 				}
 			} else if layer.HasGateUp {
-				matvecBatch(layer.WGateUp, XN, GateUp)
+				matvecBatchSlabs(layer.WGateUp, XN, GateUp, b.XNFlat, b.GateUpFlat)
 			} else {
-				matvecBatch2(layer.W1, layer.W3, XN, Gate, Up)
+				matvecBatch2Slabs(layer.W1, layer.W3, XN, Gate, Up, b.XNFlat, b.GateFlat, b.UpFlat)
 			}
 			activationTask := batchActivationTaskPool.Get().(*batchActivationTask)
 			activationTask.gate, activationTask.up, activationTask.gateUp, activationTask.hidden = Gate, Up, GateUp, Hidden
@@ -735,7 +793,7 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			parallelChunksTask(p, activationTask)
 			*activationTask = batchActivationTask{}
 			batchActivationTaskPool.Put(activationTask)
-			matvecBatch(layer.W2, Hidden, Proj)
+			matvecBatchSlabs(layer.W2, Hidden, Proj, b.HiddenFlat, b.ProjFlat)
 		}
 		for t := 0; t < p; t++ {
 			addInPlace(Proj[t], layer.FFNDownBias)
@@ -752,15 +810,22 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 		}
 	}
 
-	if poolSum != nil {
+	if poolSum != nil || allStates {
 		for t := 0; t < p; t++ {
 			normalizeDecoderInto(config, X[t], weights.OutputNorm, weights.OutputNormBias, &XN[t])
-			addInPlace(poolSum, XN[t])
+			if poolSum != nil {
+				addInPlace(poolSum, XN[t])
+			}
 		}
 	}
 	if computeLast {
 		last := p - 1
-		normalizeDecoderInto(config, X[last], weights.OutputNorm, weights.OutputNormBias, &buf.XN)
+		if allStates {
+			ensureLenNoClear(&buf.XN, dim)
+			copy(buf.XN, XN[last])
+		} else {
+			normalizeDecoderInto(config, X[last], weights.OutputNorm, weights.OutputNormBias, &buf.XN)
+		}
 		if logits != nil {
 			weights.Output.MatvecInto(buf.XN, logits)
 			addInPlace(*logits, weights.OutputBias)
@@ -772,4 +837,5 @@ func forwardBatchInto(config Config, weights ModelWeights, cache *KVCache, buf *
 			}
 		}
 	}
+	return ctx.Err()
 }

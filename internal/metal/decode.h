@@ -216,12 +216,14 @@ typedef struct {
 } GLLMDecodeLayer;
 typedef struct {
  int dim,hidden,heads,kvheads,layers,maxlen;
+ void* prefill;
  float eps,scale;
  GLLMMetalWeight* outputWeight; uint32_t outputQuant; id<MTLBuffer> logits,recent,argmax;
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
 static id<MTLComputePipelineState> gllm_dec_pipes[13]={nil};
+static void gllm_prefill_release(void* ptr);
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
  @synchronized(gllm_queue) {
@@ -253,6 +255,7 @@ static id<MTLBuffer> gllm_dec_buffer(NSUInteger n) {
 static void gllm_decode_release(void* ptr) {
  if(ptr==NULL)return;
  GLLMDecoder* d=ptr;
+ gllm_prefill_release(d->prefill);
  if(d->layer!=NULL)for(int i=0;i<d->layers;i++) {
   GLLMDecodeLayer* l=&d->layer[i];
   [l->norm release];[l->ffnNorm release];[l->qNorm release];[l->kNorm release];[l->k release];[l->v release];

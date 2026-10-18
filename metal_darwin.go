@@ -136,16 +136,25 @@ func argmaxMetalQ6KPenalized(w *MetalWeight, x []float32, recent []uint32, repea
 
 // argmaxMetalQ6KBatch keeps a short Q6_K vocabulary verification window on
 // the GPU. xs is contiguous [batch][hidden] data and tokens receives one
-// greedy winner per position. Unlike the single-token path it deliberately
-// has no repeat penalty: each verifier position has different history, so
-// sharing one penalty set would be incorrect. The backend preserves the
-// sampler's finite-value filtering and lowest-token tie rule.
+// greedy winner per position. The backend preserves the sampler's finite-value
+// filtering and lowest-token tie rule.
 func argmaxMetalQ6KBatch(w *MetalWeight, xs []float32, tokens []uint32, batch int) bool {
 	if !metalWeightUsesDirect(w) || w.q6 == nil || w.typ != GGMLTypeQ6_K || batch <= 0 || batch > metalBatchArgmaxMaxTokens ||
 		w.cols <= 0 || batch > len(xs)/w.cols || len(tokens) < batch {
 		return false
 	}
 	return metalbackend.ArgmaxQ6KBatch(w.q6, xs, tokens, batch)
+}
+
+// argmaxMetalQ6KBatchPenalized keeps each position's independent repetition
+// history in the same GPU submission as the vocabulary projections.
+func argmaxMetalQ6KBatchPenalized(w *MetalWeight, xs []float32, tokens []uint32, recent [][]uint32, penalty float32) bool {
+	batch := len(recent)
+	if !metalWeightUsesDirect(w) || w.q6 == nil || w.typ != GGMLTypeQ6_K || batch <= 0 || batch > metalBatchArgmaxMaxTokens ||
+		w.cols <= 0 || batch > len(xs)/w.cols || len(tokens) < batch {
+		return false
+	}
+	return metalbackend.ArgmaxQ6KBatchPenalized(w.q6, xs, tokens, recent, penalty)
 }
 
 func matvecMetalQ4K2Into(a, b *MetalWeight, x []float32, aRows, bRows, cols int, aOut, bOut *[]float32) bool {

@@ -22,12 +22,13 @@
 //   bits9..5=Rn, bits4..0=Rd
 //
 // SDOT is FEAT_DotProd: optional in ARMv8.2, mandatory from ARMv8.4. Executing
-// it on a part without it is a SIGILL, so NOTHING in this file may run until
+// it on a part without it is a SIGILL, so the row-dot kernels may run only after
 // hasDotProd (dotprod_arm64.go) has confirmed the CPU implements it. That
 // contract is enforced in exactly one place: the q4kDotAsmOK-style init
 // variables in q8k_dot_arm64.go short-circuit on hasDotProd before calling any
 // validate* function, and every kernel entry point is already guarded by its
-// *DotAsmOK flag. Do not call a function from this file on any other path.
+// *DotAsmOK flag. The activation quantizer at the end uses baseline NEON only
+// and has its own validation flag; it does not require FEAT_DotProd.
 //
 // This file was previously gated darwin && arm64 precisely because every Apple
 // Silicon part (M1 and later, A11 and later) has dotprod, making a probe
@@ -727,3 +728,103 @@ TEXT ·q3kQ8Dots16Asm(SB), NOSPLIT|NOFRAME, $0-32
 	Q3EMIT
 
 	RET
+
+// Q8 activation quantization uses baseline NEON, with no SDOT requirement.
+// Identical arithmetic to q8kQuantizePortable: absmax/127, 127/absmax, then
+// magnitude rounding via (abs(x*inv)+2^23)-2^23 and sign restoration.
+// Plain XTN retains the low byte exactly like Go's int8 conversion; saturating
+// narrowing would change the portable results when subnormal absmax makes
+// inv infinite. NaN comparisons are masked out before the maximum reduction.
+#define Q8KQUANT(N,V) \
+ VFMUL V29.S4, V.S4, V.S4 \
+ VFABS V.S4, V8.S4 \
+ VFADD V30.S4, V8.S4, V8.S4 \
+ VFSUB V30.S4, V8.S4, V8.S4 \
+ VAND V31.B16, V.B16, V.B16 \
+ VORR V8.B16, V.B16, V.B16 \
+ WORD $(0x4ea1b800 | ((N)<<5) | (N)) // fcvtzs vN.4s, vN.4s
+
+// func q8kQuantizeNEONAsm(x *float32, q8 *int8, scales *float32, blocks int)
+TEXT ·q8kQuantizeNEONAsm(SB), NOSPLIT|NOFRAME, $0-32
+ MOVD x+0(FP), R0
+ MOVD q8+8(FP), R1
+ MOVD scales+16(FP), R2
+ MOVD blocks+24(FP), R3
+ CBZ R3, q8quant_done
+ FMOVS $(127.0), F28
+ FMOVS $(8388608.0), F30
+ VDUP V30.S[0], V30.S4
+ MOVD $0x80000000, R4
+ VDUP R4, V31.S4
+q8quant_block:
+ VEOR V16.B16, V16.B16, V16.B16
+ VEOR V17.B16, V17.B16, V17.B16
+ VEOR V18.B16, V18.B16, V18.B16
+ VEOR V19.B16, V19.B16, V19.B16
+ MOVD R0, R6
+ MOVD $16, R5
+q8quant_max:
+ VLD1.P 64(R6), [V0.S4, V1.S4, V2.S4, V3.S4]
+ VFCMEQ V0.S4, V0.S4, V4.S4
+ VFCMEQ V1.S4, V1.S4, V5.S4
+ VFCMEQ V2.S4, V2.S4, V6.S4
+ VFCMEQ V3.S4, V3.S4, V7.S4
+ VAND V4.B16, V0.B16, V0.B16
+ VAND V5.B16, V1.B16, V1.B16
+ VAND V6.B16, V2.B16, V2.B16
+ VAND V7.B16, V3.B16, V3.B16
+ VFABS V0.S4, V0.S4
+ VFABS V1.S4, V1.S4
+ VFABS V2.S4, V2.S4
+ VFABS V3.S4, V3.S4
+ VFMAX V0.S4, V16.S4, V16.S4
+ VFMAX V1.S4, V17.S4, V17.S4
+ VFMAX V2.S4, V18.S4, V18.S4
+ VFMAX V3.S4, V19.S4, V19.S4
+ SUB $1, R5
+ CBNZ R5, q8quant_max
+ VFMAX V17.S4, V16.S4, V16.S4
+ VFMAX V19.S4, V18.S4, V18.S4
+ VFMAX V18.S4, V16.S4, V16.S4
+ VFMAXP V16.S4, V16.S4, V16.S4
+ VFMAXP V16.S4, V16.S4, V16.S4
+ FMOVS F16, R4
+ CBZ R4, q8quant_zero
+ FDIVS F28, F16, F0
+ FMOVS.P F0, 4(R2)
+ FDIVS F16, F28, F29
+ VDUP V29.S[0], V29.S4
+ MOVD $16, R5
+q8quant_convert:
+ VLD1.P 64(R0), [V0.S4, V1.S4, V2.S4, V3.S4]
+ Q8KQUANT(0,V0)
+ Q8KQUANT(1,V1)
+ Q8KQUANT(2,V2)
+ Q8KQUANT(3,V3)
+ VXTN V0.S4, V4.H4
+ VXTN2 V1.S4, V4.H8
+ VXTN V2.S4, V5.H4
+ VXTN2 V3.S4, V5.H8
+ VXTN V4.H8, V6.B8
+ VXTN2 V5.H8, V6.B16
+ VST1.P [V6.B16], 16(R1)
+ SUB $1, R5
+ CBNZ R5, q8quant_convert
+ B q8quant_next
+q8quant_zero:
+ VEOR V0.B16, V0.B16, V0.B16
+ FMOVS.P F0, 4(R2)
+ VMOV V0.B16, V1.B16
+ VMOV V0.B16, V2.B16
+ VMOV V0.B16, V3.B16
+ MOVD $4, R5
+q8quant_clear:
+ VST1.P [V0.B16, V1.B16, V2.B16, V3.B16], 64(R1)
+ SUB $1, R5
+ CBNZ R5, q8quant_clear
+ ADD $1024, R0
+q8quant_next:
+ SUB $1, R3
+ CBNZ R3, q8quant_block
+q8quant_done:
+ RET

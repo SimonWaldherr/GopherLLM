@@ -75,6 +75,10 @@ func (r *Runner) GenerateChatStream(messages []ChatMessage, options GenerationOp
 // content with reasoning and tool calls already extracted (classifyOutput)
 // and a FinishReason of "stop", "length", or "tool_calls".
 func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool) (GenerationResult, error) {
+	return r.generateChatStreamUntil(messages, options, onToken, nil)
+}
+
+func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options GenerationOptions, onToken func(string) bool, prepared *preparedChatData) (GenerationResult, error) {
 	if onToken == nil {
 		onToken = func(string) bool { return true }
 	}
@@ -111,7 +115,9 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// from repopulating the cache after its prefill completes.
 	var mistralKVPrefixEpoch uint64
 	mistralKVPrefixEnabled := false
-	if r.kind == loadedStandard {
+	if prepared != nil {
+		mistralKVPrefixEpoch, mistralKVPrefixEnabled = prepared.mistralKVPrefixEpoch, prepared.mistralKVPrefixEnabled
+	} else if r.kind == loadedStandard {
 		mistralKVPrefixEpoch, mistralKVPrefixEnabled = r.mistralKVPrefixCacheEpoch()
 	}
 	var contextWindow *ContextWindowInfo
@@ -120,7 +126,13 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// HTTP handler. Agentic requests append assistant tool calls and tool
 	// results between iterations; each subsequent model call must be budgeted
 	// against those effective messages and active tools as well.
-	if normalizedContextWindowMode(options.ContextWindowMode) != ContextWindowFull {
+	if prepared != nil {
+		// Only PreparedChat.Wrap can supply this owned, exact-match plan. Keep
+		// its fence from before preflight rendering rather than starting a new
+		// cache epoch after a concurrent Clear/Disable.
+		info := prepared.info
+		contextWindow, tokens = &info, prepared.tokens
+	} else if normalizedContextWindowMode(options.ContextWindowMode) != ContextWindowFull {
 		prepared, info, err := r.prepareChatContext(messages, options, &tokens)
 		if err != nil {
 			return GenerationResult{}, err
@@ -312,7 +324,10 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 		r.prefixCache = state
 	}()
 	if prefillOffset < len(tokens) {
-		if r.canBatchPrefill() || r.canBatchNativeGemma4() {
+		// The MTP head consumes every target hidden state in chronological
+		// order, after the target's independent projections have been batched.
+		qwenBatch := r.canBatchQwen35() && (mtpDraftTokens == 0 || r.canVerifyQwen35())
+		if qwenBatch || r.canBatchPrefill() || r.canBatchNativeGemma4() {
 			// Greedy output needs only the final normalized hidden state. Asking
 			// the batch graph to omit its vocabulary projection lets
 			// greedyOutputToken retain a direct Metal Q6_K reduction on-device;
@@ -324,8 +339,18 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 			if !greedyFastPath {
 				batchLogits = &logits
 			}
-			if err := r.prefillBatchedAt(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, batchLogits); err != nil {
-				return GenerationResult{}, err
+			var prefillErr error
+			if qwenBatch {
+				if mtpDraftTokens > 0 {
+					prefillErr = r.prefillQwen35MTPAt(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, batchLogits)
+				} else {
+					prefillErr = r.prefillQwen35At(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, batchLogits)
+				}
+			} else {
+				prefillErr = r.prefillBatchedAt(ctx, cache, buf, tokens[prefillOffset:], prefillOffset, batchLogits)
+			}
+			if prefillErr != nil {
+				return GenerationResult{}, prefillErr
 			}
 		} else {
 			for pos := prefillOffset; pos < len(tokens); pos++ {
@@ -406,8 +431,18 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	finishReason := "length"
 	haveNextToken := haveInitialNextToken
 	nextToken := initialNextToken
+	mtpWindow := newSpeculativeWindow(min(mtpDraftTokens, speculativeMaxPositions-1))
+	lookupWindow := newSpeculativeWindow(options.PromptLookupTokens)
+	var serialPerToken time.Duration
+	var speculation *SpeculationStats
+	if mtpDraftTokens > 0 || options.PromptLookupTokens > 0 {
+		speculation = new(SpeculationStats)
+	}
+	// This runs before the resident-prefix defer: an interrupted speculative
+	// block must not leave future recurrent state attached to older metadata.
+	defer func() { r.abortSpeculativeBlock(cache, buf) }()
 	buildResult := func() GenerationResult {
-		stats := GenerationStats{QueueTime: queueTime, PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart)}
+		stats := GenerationStats{QueueTime: queueTime, PromptTokens: len(tokens), GeneratedTokens: len(generated), TTFT: ttft, PrefillTime: prefillTime, DecodeTime: time.Since(decodeStart), TotalTime: time.Since(totalStart), Speculation: speculation}
 		content, reasoning, calls := r.classifyOutput(output.String(), options.ActiveTools(), rng)
 		if options.JSONObject {
 			content = output.String()
@@ -484,6 +519,15 @@ func (r *Runner) GenerateChatStreamUntil(messages []ChatMessage, options Generat
 	// target body has produced the real hidden state, which overwrites any
 	// speculative MTP row at this position with the authoritative pair.
 	verifyToken := func(token uint32, mtpPrepared bool) uint32 {
+		began := time.Now()
+		defer func() {
+			elapsed := time.Since(began)
+			if serialPerToken == 0 {
+				serialPerToken = elapsed
+			} else {
+				serialPerToken = (3*serialPerToken + elapsed) / 4
+			}
+		}()
 		var targetNext uint32
 		if greedyFastPath {
 			var ok bool
@@ -547,7 +591,113 @@ decode:
 		if len(generated) >= options.MaxTokens || pos >= cacheLen {
 			break
 		}
+		serialMTPDraftLimit := mtpDraftTokens
+		if (mtpDraftTokens > 0 || options.PromptLookupTokens > 0) && r.canVerifyBlock(cache) {
+			// Inputs include the seed and every proposed token, so the last
+			// row supplies a bonus prediction after an entirely accepted draft.
+			// Eight target rows therefore leave room for at most seven drafts.
+			available := cacheLen - pos - 1
+			// Leave one output slot for the bonus prediction. Otherwise the
+			// final input row would be computed and immediately discarded at
+			// max_tokens (including an unnecessary Qwen restore/replay).
+			remaining := options.MaxTokens - len(generated) - 1
+			var drafts []uint32
+			requested := 0
+			window := &lookupWindow
+			seedPrepared := false
+			draftBegan := time.Now()
+			if options.PromptLookupTokens > 0 {
+				limit := lookupWindow.limit(available, remaining)
+				requested = limit
+				drafts = promptLookupDraft(tokens, generated, limit, buf.speculative.lookup[:0])
+				buf.speculative.lookup = drafts
+			}
+			if len(drafts) == 0 && mtpDraftTokens > 0 {
+				window = &mtpWindow
+				limit := mtpWindow.limit(available, remaining)
+				requested = limit
+				// A suspended adaptive window must not re-enter the legacy
+				// drafter below. Serial target work still catches up the MTP
+				// cache so the next probe starts at an authoritative boundary.
+				serialMTPDraftLimit = limit
+				drafts = qwen35MTPDraftGreedy(r.config, r.qwen35.MTP, cache.Qwen35MTP, token, pos, limit, recent, options.Sampler.RepeatPenalty)
+				seedPrepared = len(drafts) > 0
+			}
+			draftDuration := time.Since(draftBegan)
+			if len(drafts) > 0 {
+				inputs := buf.speculative.inputs[:len(drafts)+1]
+				inputs[0] = token
+				copy(inputs[1:], drafts)
+				verifyBegan := time.Now()
+				handled, verifyErr := r.prepareSpeculativeBlock(ctx, cache, buf, inputs, pos, recent, options.Sampler.RepeatPenalty)
+				if verifyErr != nil {
+					return buildResult(), verifyErr
+				}
+				if handled {
+					verifyDuration := time.Since(verifyBegan)
+					s := &buf.speculative
+					speculation.Blocks++
+					speculation.DraftedTokens += len(drafts)
+					speculation.DraftTime += draftDuration
+					speculation.VerificationTime += verifyDuration
+					keep, accepted := s.count, 0
+					stop := false
+					next := s.predictions[len(drafts)]
+					for i, candidate := range drafts {
+						if err := ctx.Err(); err != nil {
+							abortBegan := time.Now()
+							r.abortSpeculativeBlock(cache, buf)
+							speculation.DiscardedInputs += s.count
+							speculation.ReconcileTime += time.Since(abortBegan)
+							return buildResult(), err
+						}
+						if s.predictions[i] != candidate {
+							keep, next = i+1, s.predictions[i]
+							break
+						}
+						before := len(generated)
+						keepDecoding, canceled = emitToken(candidate)
+						accepted += len(generated) - before
+						speculation.AcceptedTokens += len(generated) - before
+						if canceled {
+							abortBegan := time.Now()
+							r.abortSpeculativeBlock(cache, buf)
+							speculation.DiscardedInputs += s.count
+							speculation.ReconcileTime += time.Since(abortBegan)
+							return buildResult(), ErrGenerationCanceled
+						}
+						if !keepDecoding || len(generated) >= options.MaxTokens || pos+i+1 >= cacheLen {
+							keep, stop = i+1, true
+							break
+						}
+					}
+					commitBegan := time.Now()
+					if err := r.finishSpeculativeBlock(ctx, cache, buf, keep, mtpDraftTokens > 0, seedPrepared); err != nil {
+						speculation.DiscardedInputs += s.count
+						speculation.ReconcileTime += time.Since(commitBegan)
+						return buildResult(), err
+					}
+					commitDuration := time.Since(commitBegan)
+					speculation.DiscardedInputs += s.count - keep
+					speculation.ReconcileTime += commitDuration
+					if cacheEligible {
+						residentTokens = append(residentTokens, s.inputs[:keep]...)
+					}
+					pos += keep
+					nextToken, haveNextToken = next, true
+					window.observe(speculativeWindowSample{Requested: requested, Drafted: len(drafts), Accepted: accepted, Emitted: 1 + accepted, Draft: draftDuration, Verify: verifyDuration, Rollback: commitDuration, SerialPerToken: serialPerToken})
+					if stop {
+						break decode
+					}
+					continue
+				}
+			}
+		}
 		if mtpDraftTokens == 0 {
+			var serialBegan time.Time
+			if options.PromptLookupTokens > 0 {
+				serialBegan = time.Now()
+			}
 			if greedyFastPath {
 				var ok bool
 				nextToken, ok = r.forwardGreedyToken(cache, buf, token, pos, recent, options.Sampler.RepeatPenalty, &logits)
@@ -562,18 +712,24 @@ decode:
 				}
 			}
 			pos++
+			if !serialBegan.IsZero() {
+				elapsed := time.Since(serialBegan)
+				if serialPerToken == 0 {
+					serialPerToken = elapsed
+				} else {
+					serialPerToken = (3*serialPerToken + elapsed) / 4
+				}
+			}
 			continue
 		}
 
-		// Seed MTP with the just-emitted target token, then verify candidates
-		// one by one. Qwen's hybrid target currently has a serial DeltaNet
-		// recurrence, so verification remains sequential; keeping it exact here
-		// makes the MTP head safe today and lets a future chunked verifier reuse
-		// the synchronized cache without changing generation semantics.
+		// Unsupported block backends retain serial MTP verification. Each
+		// accepted target hidden state synchronizes the draft cache before
+		// its prediction can become visible to the caller.
 		// Never score draft positions that cannot be emitted in this request.
 		// Besides avoiding wasted MTP work near max_tokens, this keeps a
 		// one-token completion to exactly one draft-head evaluation.
-		draftLimit := min(mtpDraftTokens, min(cacheLen-pos, options.MaxTokens-len(generated)))
+		draftLimit := min(serialMTPDraftLimit, min(cacheLen-pos, options.MaxTokens-len(generated)))
 		drafts := qwen35MTPDraftGreedy(r.config, r.qwen35.MTP, cache.Qwen35MTP, token, pos,
 			draftLimit, recent, options.Sampler.RepeatPenalty)
 		currentToken := token

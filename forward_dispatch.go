@@ -202,6 +202,37 @@ func (r *Runner) canBatchPrefill() bool {
 	return true
 }
 
+// canBatchQwen35 is separate from canBatchPrefill: the hybrid graph requires
+// chronological convolution/DeltaNet updates that the standard batch graph
+// does not implement. Keep sparse experts, out-of-core and accelerator-backed
+// graphs on their established token path until each has its own schedule.
+func (r *Runner) canBatchQwen35() bool {
+	if r.kind != loadedQwen35 || r.outOfCore || r.config.Arch == "qwen35moe" || len(r.qwen35.Layers) == 0 || os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") != "" {
+		return false
+	}
+	cpu := func(w Weight) bool { return w.Metal == nil && w.GPU == nil }
+	if !cpu(r.qwen35.TokenEmbd) || !cpu(r.qwen35.Output) {
+		return false
+	}
+	for _, layer := range r.qwen35.Layers {
+		if layer.FFN.MoE != nil || !cpu(layer.FFN.Gate) || !cpu(layer.FFN.Up) || !cpu(layer.FFN.Down) {
+			return false
+		}
+		if layer.Kind == qwen35Attention {
+			w := layer.Attention
+			if !cpu(w.Q) || !cpu(w.K) || !cpu(w.V) || !cpu(w.O) {
+				return false
+			}
+		} else {
+			w := layer.DeltaNet
+			if !cpu(w.QKVConv) || !cpu(w.Gate) || !cpu(w.AlphaProj) || !cpu(w.BetaProj) || !cpu(w.Out) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // prefillBatched processes the prompt in chunks, streaming each weight once per
 // chunk instead of once per token.
 //
@@ -241,7 +272,9 @@ func (r *Runner) prefillBatchedAt(ctx context.Context, cache *KVCache, buf *Deco
 			return err
 		}
 		end := min(start+chunk, n)
-		ForwardBatchInto(r.config, weights, cache, buf, tokens[start:end], startPos+start, end == n, logits)
+		if err := forwardBatchIntoContext(ctx, r.config, weights, cache, buf, tokens[start:end], startPos+start, end == n, logits, nil); err != nil {
+			return err
+		}
 	}
 	return nil
 }

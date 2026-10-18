@@ -71,6 +71,7 @@ typedef struct {
 	id<MTLBuffer> v;
 	id<MTLBuffer> attnOut;
 	id<MTLBuffer> attnPartial;
+	id<MTLBuffer> recent;
 } GLLMMetalBatchWorkspace;
 
 static id<MTLDevice> gllm_device = nil;
@@ -786,13 +787,15 @@ static void gllm_metal_encode_q6k(id<MTLComputeCommandEncoder> enc, GLLMMetalWei
 // one-vector buffers below. A separate dispatch per position is intentional:
 // the reduction needs a whole-threadgroup view of one vocabulary row, but all
 // projections and reductions still share one command buffer.
-static void gllm_metal_encode_argmax_to(
+static void gllm_metal_encode_argmax_recent_to(
 	id<MTLComputeCommandEncoder> enc,
 	GLLMMetalWeight* w,
 	id<MTLBuffer> values,
 	NSUInteger values_offset,
 	id<MTLBuffer> result,
 	NSUInteger result_offset,
+	id<MTLBuffer> recent,
+	NSUInteger recent_offset,
 	uint32_t recent_count,
 	float repeat_penalty
 ) {
@@ -801,10 +804,19 @@ static void gllm_metal_encode_argmax_to(
 	[enc setBuffer:result offset:result_offset atIndex:1];
 	uint32_t rows = (uint32_t)w->rows;
 	[enc setBytes:&rows length:sizeof(rows) atIndex:2];
-	[enc setBuffer:w->recent offset:0 atIndex:3];
+	[enc setBuffer:recent offset:recent_offset atIndex:3];
 	[enc setBytes:&recent_count length:sizeof(recent_count) atIndex:4];
 	[enc setBytes:&repeat_penalty length:sizeof(repeat_penalty) atIndex:5];
 	[enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void gllm_metal_encode_argmax_to(
+	id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w,
+	id<MTLBuffer> values, NSUInteger values_offset,
+	id<MTLBuffer> result, NSUInteger result_offset,
+	uint32_t recent_count, float repeat_penalty
+) {
+	gllm_metal_encode_argmax_recent_to(enc,w,values,values_offset,result,result_offset,w->recent,0,recent_count,repeat_penalty);
 }
 
 static void gllm_metal_encode_argmax(id<MTLComputeCommandEncoder> enc, GLLMMetalWeight* w, uint32_t recent_count, float repeat_penalty) {
@@ -864,7 +876,8 @@ static bool gllm_metal_ensure_batch_argmax_buffers(GLLMMetalWeight* w, int batch
 	}
 	return gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x, count * (NSUInteger)w->cols * sizeof(float)) &&
 		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.out, count * (NSUInteger)w->rows * sizeof(float)) &&
-		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.argmax, count * sizeof(GLLMArgmaxResult));
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.argmax, count * sizeof(GLLMArgmaxResult)) &&
+		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.recent, count * GLLM_REPEAT_WINDOW * sizeof(uint32_t));
 }
 
 static bool gllm_metal_ensure_batch_ffn_buffers(GLLMMetalWeight* gate, GLLMMetalWeight* up, GLLMMetalWeight* down, int batch) {
@@ -1226,20 +1239,19 @@ static int gllm_metal_q6k_argmax(void* handle, const float* x, const uint32_t* r
 // speculative greedy verifier needs only one valid token per position, and
 // copying [batch][vocab] floats would erase the benefit of batching.
 //
-// Repeat penalties are intentionally out of scope here. They have a distinct
-// recent-token set at every speculative position, so applying them safely
-// belongs in a later verifier graph rather than incorrectly sharing one set.
-static int gllm_metal_q6k_argmax_batch(void* handle, const float* xs, uint32_t* tokens, int batch) {
+// Histories are fixed-stride [batch][64] with independent lengths. Each
+// reduction binds its own history offset and snapshots its count in setBytes;
+// no CPU rewrite can change a position's history after command encoding.
+static int gllm_metal_q6k_argmax_batch_penalized(void* handle, const float* xs, uint32_t* tokens, int batch, const uint32_t* recent, const uint32_t* counts, float penalty) {
 	@autoreleasepool {
 		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
 		if (w == NULL || w->weights == nil || xs == NULL || tokens == NULL || batch <= 0 || batch > GLLM_BATCH_ARGMAX_MAX_TOKENS ||
 			w->rows <= 0 || w->cols <= 0 || w->row_bytes != (w->cols / 256) * 210 ||
-			!gllm_metal_init_q6k()) {
+			!isfinite(penalty) || penalty <= 0 || !gllm_metal_init_q6k()) {
 			return 0;
 		}
-		if (w->recent == nil) {
-			strncpy(gllm_error, "missing Metal batch argmax buffers", sizeof(gllm_error) - 1);
-			return 0;
+		for (int position=0;position<batch;position++) {
+			if (counts!=NULL && (counts[position]>GLLM_REPEAT_WINDOW || (counts[position]>0 && recent==NULL))) return 0;
 		}
 
 		// The workspace is shared with batched FFN prefill. Every command here is
@@ -1255,15 +1267,18 @@ static int gllm_metal_q6k_argmax_batch(void* handle, const float* xs, uint32_t* 
 			NSUInteger value_stride = (NSUInteger)w->rows * sizeof(float);
 			NSUInteger result_stride = sizeof(GLLMArgmaxResult);
 			memcpy([gllm_batch_workspace.x contents], xs, x_len);
+			if (recent!=NULL) memcpy([gllm_batch_workspace.recent contents],recent,count*GLLM_REPEAT_WINDOW*sizeof(uint32_t));
 
 			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
 			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			if (cb==nil || enc==nil) return 0;
 			gllm_metal_encode_q6k_to(enc, w, gllm_batch_workspace.x, gllm_batch_workspace.out, batch, 4);
 			for (int position = 0; position < batch; ++position) {
-				gllm_metal_encode_argmax_to(enc, w,
+				gllm_metal_encode_argmax_recent_to(enc, w,
 					gllm_batch_workspace.out, (NSUInteger)position * value_stride,
 					gllm_batch_workspace.argmax, (NSUInteger)position * result_stride,
-					0, 1.0f);
+					gllm_batch_workspace.recent, (NSUInteger)position*GLLM_REPEAT_WINDOW*sizeof(uint32_t),
+					counts!=NULL?counts[position]:0, penalty);
 			}
 			[enc endEncoding];
 			[cb commit];
@@ -1286,6 +1301,10 @@ static int gllm_metal_q6k_argmax_batch(void* handle, const float* xs, uint32_t* 
 		}
 		return 0; // unreachable, keeps C's control-flow analysis explicit.
 	}
+}
+
+static int gllm_metal_q6k_argmax_batch(void* handle, const float* xs, uint32_t* tokens, int batch) {
+	return gllm_metal_q6k_argmax_batch_penalized(handle,xs,tokens,batch,NULL,NULL,1.0f);
 }
 
 static void gllm_metal_release_weight(void* handle) {
@@ -1357,6 +1376,8 @@ static void gllm_metal_encode_quantized_to(id<MTLComputeCommandEncoder> enc, GLL
 	else if (quant == 6) gllm_metal_encode_q6k_to(enc, w, x, out, batch, rows_per_group);
 	else gllm_metal_encode_q8_0_to(enc, w, x, out, batch);
 }
+
+#include "prefill.h"
 
 // gllm_decode_project_qkv fuses a prompt chunk's Q, K, and V projections --
 // they all read the same normalized input and are otherwise independent of
@@ -1562,9 +1583,11 @@ static bool gllm_decode_batch_attention_tiled(void* ptr, int layer, const float*
 import "C"
 
 import (
+	"context"
 	"math"
 	"os"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -1761,7 +1784,7 @@ func ArgmaxQ6KPenalized(w *Weight, x []float32, recent []uint32, repeatPenalty f
 // ArgmaxQ6KBatch finds the deterministic argmax for each contiguous input in
 // xs ([batch][cols]) without reading a [batch][rows] logits slab back to the
 // CPU. It is intentionally limited to the short greedy-verification window;
-// repeat penalties are position-specific and are not silently approximated.
+// ArgmaxQ6KBatchPenalized additionally accepts independent position histories.
 // The Metal reduction retains the lowest vocabulary index on ties, matching
 // ArgmaxQ6KPenalized and the package sampler.
 func ArgmaxQ6KBatch(w *Weight, xs []float32, tokens []uint32, batch int) bool {
@@ -1775,6 +1798,41 @@ func ArgmaxQ6KBatch(w *Weight, xs []float32, tokens []uint32, batch int) bool {
 		(*C.uint32_t)(unsafe.Pointer(&tokens[0])),
 		C.int(batch),
 	)
+	runtime.KeepAlive(w)
+	return ok != 0
+}
+
+type argmaxBatchHistory struct {
+	tokens [8 * 64]uint32
+	counts [8]uint32
+}
+
+var argmaxBatchHistoryPool = sync.Pool{New: func() any { return new(argmaxBatchHistory) }}
+
+// ArgmaxQ6KBatchPenalized applies the established sparse penalty separately
+// for every projected row. Duplicate history entries retain their repeated
+// application, matching the sampler and the single-token Metal reduction.
+func ArgmaxQ6KBatchPenalized(w *Weight, xs []float32, tokens []uint32, recent [][]uint32, penalty float32) bool {
+	batch := len(recent)
+	if w == nil || w.ptr == nil || batch <= 0 || batch > 8 || w.rows <= 0 || w.cols <= 0 ||
+		batch > len(xs)/w.cols || len(tokens) < batch || penalty <= 0 || math.IsNaN(float64(penalty)) || math.IsInf(float64(penalty), 0) {
+		return false
+	}
+	for _, history := range recent {
+		if len(history) > 64 {
+			return false
+		}
+	}
+	history := argmaxBatchHistoryPool.Get().(*argmaxBatchHistory)
+	for i := range recent {
+		history.counts[i] = uint32(len(recent[i]))
+		copy(history.tokens[i*64:], recent[i])
+	}
+	ok := C.gllm_metal_q6k_argmax_batch_penalized(w.ptr,
+		(*C.float)(unsafe.Pointer(&xs[0])), (*C.uint32_t)(unsafe.Pointer(&tokens[0])), C.int(batch),
+		(*C.uint32_t)(unsafe.Pointer(&history.tokens[0])), (*C.uint32_t)(unsafe.Pointer(&history.counts[0])), C.float(penalty))
+	argmaxBatchHistoryPool.Put(history)
+	runtime.KeepAlive(w)
 	return ok != 0
 }
 
@@ -1866,6 +1924,7 @@ type Decoder struct {
 	dim, heads, kvheads, layers, maxlen int
 	hidden                              int
 	outputRows                          int
+	sharedK, sharedV                    []unsafe.Pointer
 }
 
 func NewDecoder(dim, hidden, heads, kvheads, layers, maxlen int, eps, scale float32, norm []float32) *Decoder {
@@ -1876,12 +1935,14 @@ func NewDecoder(dim, hidden, heads, kvheads, layers, maxlen int, eps, scale floa
 	if p == nil {
 		return nil
 	}
-	return &Decoder{ptr: p, hidden: hidden, dim: dim, heads: heads, kvheads: kvheads, layers: layers, maxlen: maxlen}
+	return &Decoder{ptr: p, hidden: hidden, dim: dim, heads: heads, kvheads: kvheads, layers: layers, maxlen: maxlen, sharedK: make([]unsafe.Pointer, layers), sharedV: make([]unsafe.Pointer, layers)}
 }
 func (d *Decoder) Close() {
 	if d != nil && d.ptr != nil {
 		C.gllm_decode_release(d.ptr)
 		d.ptr = nil
+		clear(d.sharedK)
+		clear(d.sharedV)
 	}
 }
 func (d *Decoder) BindLayer(index int, w [7]*Weight, quant [7]uint32, norm, ffn, qnorm, knorm []float32, window int) bool {
@@ -1938,7 +1999,7 @@ func (d *Decoder) Cache(layer, pos int, k, v []float32, upload bool) bool {
 // letting repeated chunked-prefill syncs avoid re-copying an already-resident
 // prefix. from is clamped to pos by the caller; from==pos is a no-op success.
 func (d *Decoder) CacheAppend(layer, from, pos int, k, v []float32) bool {
-	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || from < 0 || pos < from || pos >= d.maxlen {
+	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || from < 0 || pos < from || pos > d.maxlen {
 		return false
 	}
 	n := d.kvheads * 128 * pos
@@ -2003,10 +2064,68 @@ func (d *Decoder) BindCache(index int, k, v []float32) bool {
 		return false
 	}
 	ok := bool(C.gllm_decode_bind_cache(d.ptr, C.int(index), unsafe.Pointer(&k[0]), unsafe.Pointer(&v[0]), C.NSUInteger(bytes)))
+	if ok {
+		d.sharedK[index], d.sharedV[index] = unsafe.Pointer(&k[0]), unsafe.Pointer(&v[0])
+	}
 	runtime.KeepAlive(k)
 	runtime.KeepAlive(v)
 	runtime.KeepAlive(d)
 	return ok
+}
+
+// PrefillBatch submits the complete dense graph in one command buffer. The
+// caller serializes use of the decoder and owns disjoint K/V layer slices.
+// Only the new suffix and outputs are published, after successful completion
+// and a final cancellation check. A false result leaves all Go data unchanged.
+func (d *Decoder) PrefillBatch(ctx context.Context, input, sn, cs, temperature []float32, start, batch int, interleaved, tiled bool, keys, values [][]float32, residual, output []float32) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if d == nil || d.ptr == nil || batch < 2 || batch > 256 || start < 0 || start > d.maxlen-batch || len(keys) != d.layers || len(values) != d.layers || len(input) < batch*d.dim || len(residual) < batch*d.dim || len(output) < batch*d.dim || len(sn) < batch*64 || len(cs) < batch*64 || len(temperature) < batch {
+		return false, nil
+	}
+	n := (start + batch) * d.kvheads * 128
+	for layer := range keys {
+		if len(keys[layer]) < n || len(values[layer]) < n || (d.sharedK[layer] != nil && (d.sharedK[layer] != unsafe.Pointer(&keys[layer][0]) || d.sharedV[layer] != unsafe.Pointer(&values[layer][0]))) {
+			return false, nil
+		}
+	}
+	// Go is authoritative, including branch restores at the same address and
+	// position. Shared caches are read directly; private caches resync every
+	// prefix, regardless of the previous prefill/decode synchronization count.
+	for layer := range keys {
+		if !d.Cache(layer, start, keys[layer], values[layer], true) {
+			return false, nil
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	ok := bool(C.gllm_prefill_batch(d.ptr, (*C.float)(unsafe.Pointer(&input[0])), (*C.float)(unsafe.Pointer(&sn[0])), (*C.float)(unsafe.Pointer(&cs[0])), (*C.float)(unsafe.Pointer(&temperature[0])), C.int(start), C.int(batch), C.bool(interleaved), C.bool(tiled)))
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	// Everything below is validated and cannot fail. A request's generation
+	// lock prevents observers from seeing an intermediate publication.
+	for layer := range keys {
+		C.gllm_prefill_publish_cache(d.ptr, C.int(layer), C.int(start), C.int(batch), (*C.float)(unsafe.Pointer(&keys[layer][0])), (*C.float)(unsafe.Pointer(&values[layer][0])))
+	}
+	C.gllm_prefill_publish_output(d.ptr, C.int(batch), (*C.float)(unsafe.Pointer(&residual[0])), (*C.float)(unsafe.Pointer(&output[0])))
+	runtime.KeepAlive(keys)
+	runtime.KeepAlive(values)
+	runtime.KeepAlive(d)
+	return true, nil
+}
+
+// PrefillScratchBytes reports retained scratch, including pending KV rows.
+func (d *Decoder) PrefillScratchBytes() int {
+	if d == nil || d.ptr == nil {
+		return 0
+	}
+	return int(C.gllm_prefill_bytes(d.ptr))
 }
 
 // GeluFFN keeps all intermediate activations on the GPU. batch is bounded

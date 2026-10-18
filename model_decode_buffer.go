@@ -103,6 +103,8 @@ type DecodeBuffer struct {
 	Gemma4PLE      []float32
 	Gemma4PLEInput []float32
 	gemmaBatch     gemma4BatchScratch
+	qwenBatch      qwen35BatchScratch
+	speculative    speculativeVerifyScratch
 	batch          batchDecodeBuffer
 	// ImageEmbeds maps an absolute sequence position to a vision-projector
 	// embedding that must overwrite the ordinary token-embedding-table

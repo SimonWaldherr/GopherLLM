@@ -191,6 +191,13 @@ func WithMTPDraftTokens(n int) GenOption {
 	return func(o *GenerationOptions) { o.MTPDraftTokens = n }
 }
 
+// WithPromptLookupTokens enables up to n known-history draft candidates (1–7).
+// Each candidate is target-verified; generation must use temperature 0 or top-k
+// 1. Zero disables lookup. With MTP enabled, matching history is tried first.
+func WithPromptLookupTokens(n int) GenOption {
+	return func(o *GenerationOptions) { o.PromptLookupTokens = n }
+}
+
 // WithTemperature sets the sampling temperature; 0 selects greedy decoding.
 func WithTemperature(t float32) GenOption {
 	return func(o *GenerationOptions) { o.Sampler.Temperature = t }

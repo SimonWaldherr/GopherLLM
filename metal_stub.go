@@ -2,6 +2,8 @@
 
 package gopherllm
 
+import "context"
+
 type MetalWeight struct{}
 
 func MetalAvailable() bool { return false }
@@ -40,6 +42,10 @@ func argmaxMetalQ6KPenalized(_ *MetalWeight, _ []float32, _ []uint32, _ float32)
 
 func argmaxMetalQ6KBatch(_ *MetalWeight, _ []float32, _ []uint32, _ int) bool { return false }
 
+func argmaxMetalQ6KBatchPenalized(_ *MetalWeight, _ []float32, _ []uint32, _ [][]uint32, _ float32) bool {
+	return false
+}
+
 func matvecMetalQ4K2Into(_, _ *MetalWeight, _ []float32, _, _, _ int, _, _ *[]float32) bool {
 	return false
 }
@@ -61,6 +67,10 @@ func (r *Runner) metalBatchFFNPrefillChunk() int { return 0 }
 func releaseMetalWeight(_ *MetalWeight) {}
 
 type metalDenseState struct{}
+
+func tryMetalDensePrefill(context.Context, Config, ModelWeights, *KVCache, *DecodeBuffer, int, int, bool) (bool, error) {
+	return false, nil
+}
 
 func tryMetalDenseDecode(Config, ModelWeights, *KVCache, *DecodeBuffer, uint32, int) bool {
 	return false

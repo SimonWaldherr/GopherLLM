@@ -31,6 +31,41 @@ func TestParseCLISamplerFlags(t *testing.T) {
 	}
 }
 
+func TestParseCLIPromptLookup(t *testing.T) {
+	cfg, err := parseCLI([]string{"model.gguf", "--temp", "0", "--prompt-lookup-tokens", "7", "--mtp-draft-tokens", "4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.options.PromptLookupTokens != 7 || cfg.options.MTPDraftTokens != 4 {
+		t.Fatalf("speculation options = %+v", cfg.options)
+	}
+	if err := cfg.options.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--prompt-lookup-tokens"},
+		{"--prompt-lookup-tokens", "nope"},
+	} {
+		if _, err := parseCLI(args); err == nil {
+			t.Fatalf("accepted invalid flag value: %v", args)
+		}
+	}
+	for _, args := range [][]string{
+		{"--temp", "0", "--prompt-lookup-tokens", "-1"},
+		{"--temp", "0", "--prompt-lookup-tokens", "8"},
+		{"--prompt-lookup-tokens", "4"},
+		{"--temp", "0", "--prompt-lookup-tokens", "4", "--json-object"},
+	} {
+		cfg, err := parseCLI(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.options.Validate() == nil {
+			t.Fatalf("accepted invalid generation options: %v", args)
+		}
+	}
+}
+
 func TestParseCLIServeAndStops(t *testing.T) {
 	cfg, err := parseCLI([]string{
 		"m", "--serve", "127.0.0.1:8080", "--chat",

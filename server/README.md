@@ -453,6 +453,25 @@ expose `gopherllm_cache` with `mode`, `hit`, `reused_tokens`, and
 `prompt_tokens`; OpenAI-compatible usage also reports
 `usage.prompt_tokens_details.cached_tokens`.
 
+Local server generation can opt into exact greedy prompt lookup through its
+startup defaults:
+
+```sh
+bin/gopherllm model.gguf --serve --chat --temp 0 --prompt-lookup-tokens 7
+```
+
+The equivalent config is `generation.prompt_lookup_tokens: 7` with
+`generation.temperature: 0`; embedded handlers set
+`HandlerOptions.Defaults.PromptLookupTokens`. The range is 0–7, with zero
+disabled. Requests must retain deterministic sampling (temperature zero or
+top-k one); JSON-object constrained output cannot use speculation. These are
+local inference defaults, with no additional per-request HTTP field or browser
+setting. A matching history continuation takes precedence over an enabled Qwen
+MTP head; a miss falls back to MTP. Short block verification, adaptive windows
+and `GenerationResult.Stats.Speculation` are described in the
+[core documentation](../README.md#speculative-decoding). Throughput depends on
+the model, accepted candidates and target hardware.
+
 ## HTTP API
 
 Chat, completions, embeddings, `/health`, `/deployment`, and `/privacy` are

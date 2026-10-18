@@ -661,9 +661,50 @@ func q3kDotQ8KRow(row []byte, q8 []int8, xscales []float32, blocks int) float32 
 }
 
 func q8kQuantize(x []float32, q8 []int8, scales []float32, blocks int) {
-	// The quantizer is a float absmax pass plus a round-to-int8 pass; it is
-	// bandwidth-bound on the activation vector, which is tiny next to a weight
-	// matrix, and it runs once per matvec rather than once per row. Not worth
-	// its own assembly.
+	if blocks <= 0 {
+		return
+	}
+	if blocks > len(x)/256 || blocks > len(q8)/256 || blocks > len(scales) {
+		panic("gopherllm: short Q8 activation quantization buffers")
+	}
+	if q8kQuantizeNEONOK {
+		q8kQuantizeNEONAsm(&x[0], &q8[0], &scales[0], blocks)
+		return
+	}
 	q8kQuantizePortable(x, q8, scales, blocks)
+}
+
+// This uses baseline ARM64 NEON only; unlike the row-dot kernels it does not
+// require SDOT. Keep the portable implementation as its startup/test oracle.
+var q8kQuantizeNEONOK = os.Getenv("GOPHERLLM_DISABLE_SIMD") == "" && validateQ8KQuantizeNEON()
+
+//go:noescape
+func q8kQuantizeNEONAsm(x *float32, q8 *int8, scales *float32, blocks int)
+
+func validateQ8KQuantizeNEON() bool {
+	const blocks = 5
+	var x [blocks * 256]float32
+	for i := range 256 {
+		x[i] = float32(i%254-127) + .5
+		x[256+i] = math.Float32frombits(uint32(i&1) << 31)
+		x[512+i] = float32(i%127-63) / 8
+		if i%11 == 0 {
+			x[512+i] = math.Float32frombits(0x7f800001 + uint32(i))
+		}
+		x[768+i] = float32(i - 127)
+		x[1024+i] = math.Float32frombits(uint32(i%255+1) | uint32(i&1)<<31)
+	}
+	x[0], x[1], x[768] = 127, -127, float32(math.Inf(1))
+	var got, want [blocks * 256]int8
+	var scales, wantScales [blocks]float32
+	q8kQuantizeNEONAsm(&x[0], &got[0], &scales[0], blocks)
+	q8kQuantizePortable(x[:], want[:], wantScales[:], blocks)
+	ok := slices.Equal(got[:], want[:])
+	for i := range scales {
+		ok = ok && math.Float32bits(scales[i]) == math.Float32bits(wantScales[i])
+	}
+	if !ok {
+		fmt.Fprintln(os.Stderr, "gopherllm: NEON Q8 activation quantization self-check failed; using the portable quantizer")
+	}
+	return ok
 }

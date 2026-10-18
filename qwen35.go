@@ -8,7 +8,7 @@ package gopherllm
 // QKV is [Q|K|V], Q/K use L2 normalization, and full attention uses a sigmoid
 // gate. The implementation has focused unit coverage, including the optional
 // one-layer MTP draft head used for exact greedy speculation, but does not yet
-// offer cross-runtime logit-parity validation, chunked DeltaNet prefill, or
+// offer cross-runtime logit-parity validation, parallel DeltaNet recurrence, or
 // multimodal vision/3D-MRoPE.
 //
 // Reconstructed architecture: most layers replace ordinary self-attention
@@ -304,16 +304,30 @@ func (c *Qwen35Cache) bytes() int64 {
 // cache. Qwen's DeltaNet state is updated in place for every token, so K/V
 // rows alone are insufficient to resume a cached chat prefix safely.
 func (c *Qwen35Cache) snapshot() *Qwen35Cache {
-	if c == nil {
-		return nil
-	}
-	snap := &Qwen35Cache{
-		Layers: c.Layers, Channels: c.Channels, ConvLen: c.ConvLen,
-		Heads: c.Heads, HeadDim: c.HeadDim,
-	}
-	snap.Conv = append(snap.Conv, c.Conv...)
-	snap.State = append(snap.State, c.State...)
+	var snap *Qwen35Cache
+	c.snapshotInto(&snap)
 	return snap
+}
+
+// snapshotInto retains one independent recurrent checkpoint, reusing its
+// backing storage between speculative blocks. A checkpoint contains every
+// recurrent layer because rejected suffixes cannot be removed by rewinding
+// attention K/V positions alone. The checkpoint does not alias the live cache.
+func (c *Qwen35Cache) snapshotInto(dst **Qwen35Cache) {
+	if c == nil {
+		*dst = nil
+		return
+	}
+	if *dst == nil || *dst == c {
+		*dst = new(Qwen35Cache)
+	}
+	snapshot := *dst
+	snapshot.Layers, snapshot.Channels, snapshot.ConvLen = c.Layers, c.Channels, c.ConvLen
+	snapshot.Heads, snapshot.HeadDim = c.Heads, c.HeadDim
+	ensureLenNoClear(&snapshot.Conv, len(c.Conv))
+	ensureLenNoClear(&snapshot.State, len(c.State))
+	copy(snapshot.Conv, c.Conv)
+	copy(snapshot.State, c.State)
 }
 
 // restore replaces this cache's mutable recurrent state from a snapshot.
@@ -775,15 +789,23 @@ func qwen35MTPDraftGreedy(cfg Config, weights *Qwen35MTPWeights, state *Qwen35MT
 // doubled Q projection is split into a QK-normed/RoPE'd query and a per-head
 // sigmoid gate applied before the O projection.
 func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache, x []float32, layer, pos, ropeHalf, ropePairs int, buf *DecodeBuffer) {
-	headDim := cfg.HeadDim
-	nHeads := cfg.NHeads
-	kvMul := max(1, cfg.KVMul)
 	// Qwen3.8's Q4_K_M export uses Q4_K/Q4_K/Q6_K for Q/K/V.  The mixed
 	// kernel shares the Q4 activation sums and one worker-pool dispatch across
 	// all three projections (and uses the matching fused Metal path for
 	// compatible shapes). It also retains the ordinary per-weight fallback for other
 	// Qwen3.5/3.6/3.8 quantizations.
 	tryMatvecAttentionInto(w.Q, w.K, w.V, x, &buf.Q4KXSums, &buf.QGate, &buf.K, &buf.V)
+	qwen35AttentionMix(cfg, w, cache, layer, pos, ropeHalf, ropePairs, buf)
+	w.O.MatvecInto(buf.AttnOut[:cfg.NHeads*cfg.ValueDim], &buf.Proj)
+}
+
+// qwen35AttentionMix consumes already projected Q/gate, K and V. The batched
+// prefill graph uses the same token-local normalization, causal cache update
+// and attention arithmetic as decode, then batches only the O projection.
+func qwen35AttentionMix(cfg Config, w Qwen35AttentionWeights, cache *KVCache, layer, pos, ropeHalf, ropePairs int, buf *DecodeBuffer) {
+	headDim := cfg.HeadDim
+	nHeads := cfg.NHeads
+	kvMul := max(1, cfg.KVMul)
 	if len(buf.QGate) < nHeads*2*headDim {
 		panic("Qwen hybrid attention: attn_q projection has an invalid shape")
 	}
@@ -825,7 +847,6 @@ func qwen35AttentionForward(cfg Config, w Qwen35AttentionWeights, cache *KVCache
 			out[d] *= fastSigmoidF32(g)
 		}
 	}
-	w.O.MatvecInto(buf.AttnOut[:nHeads*cfg.ValueDim], &buf.Proj)
 }
 
 // qwen35ParallelAttendHeadGroups is the Qwen-specific long-context GQA path.
@@ -867,10 +888,6 @@ func qwen35AttendHeadGroupsRange(cfg *Config, cache *KVCache, buf *DecodeBuffer,
 // decay the state, write beta*(V-recall) through K, then read through the
 // scaled Q before gated RMSNorm and the output projection.
 func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache, x []float32, layer int, buf *DecodeBuffer) {
-	dInner, dState, nHeads, nGroups := cfg.SSMInner, cfg.SSMState, cfg.SSMHeads, cfg.SSMGroups
-	headDim := dInner / nHeads
-	channels := dInner + 2*nGroups*dState
-
 	// QKV and the output gate share the same input. For CPU-resident Q4_K
 	// layers, compute them in one quantized worker-pool dispatch (and reuse
 	// x-sums) instead of launching the gate projection after the recurrent
@@ -882,12 +899,28 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 		tryMatvec2Into(w.QKVConv, w.Gate, x, &buf.Q4KXSums, &buf.MambaIn, &buf.MambaZ)
 	if !qkvGateFused {
 		w.QKVConv.MatvecInto(x, &buf.MambaIn)
+		w.Gate.MatvecInto(x, &buf.MambaZ)
 	}
-	if len(buf.MambaIn) < channels {
+	if !tryMatvec2Into(w.AlphaProj, w.BetaProj, x, &buf.Q4KXSums, &buf.MambaDT, &buf.MambaBeta) {
+		w.AlphaProj.MatvecInto(x, &buf.MambaDT)
+		w.BetaProj.MatvecInto(x, &buf.MambaBeta)
+	}
+	qwen35DeltaNetStep(cfg, w, state, buf.MambaIn, buf.MambaZ, buf.MambaDT, buf.MambaBeta, layer, buf)
+	w.Out.MatvecInto(buf.MambaY, &buf.Proj)
+}
+
+// qwen35DeltaNetStep advances one token's convolution and recurrent state
+// from independent projected inputs. Both decode and chunked prefill call
+// this exact recurrence, in chronological token order for each layer.
+func qwen35DeltaNetStep(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache, qkv, gate, alphaInput, betaInput []float32, layer int, buf *DecodeBuffer) {
+	dInner, dState, nHeads, nGroups := cfg.SSMInner, cfg.SSMState, cfg.SSMHeads, cfg.SSMGroups
+	headDim := dInner / nHeads
+	channels := dInner + 2*nGroups*dState
+	if len(qkv) < channels {
 		panic("Qwen hybrid Gated DeltaNet qkv projection has an invalid shape")
 	}
 	ensureLenNoClear(&buf.MambaConv, channels)
-	copy(buf.MambaConv, buf.MambaIn[:channels])
+	copy(buf.MambaConv, qkv[:channels])
 
 	// Causal depthwise convolution, then SiLU over the Q|K|V channels.
 	ensureLenNoClear(&buf.MambaKernel, cfg.SSMConv)
@@ -934,13 +967,6 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 		qwen35L2NormalizeInPlace(buf.MambaC[group*dState:(group+1)*dState], cfg.RMSNormEps, 1)
 	}
 
-	ensureLenNoClear(&buf.MambaDT, nHeads)
-	ensureLenNoClear(&buf.MambaBeta, nHeads)
-	if !tryMatvec2Into(w.AlphaProj, w.BetaProj, x, &buf.Q4KXSums, &buf.MambaDT, &buf.MambaBeta) {
-		w.AlphaProj.MatvecInto(x, &buf.MambaDT)
-		w.BetaProj.MatvecInto(x, &buf.MambaBeta)
-	}
-
 	// Each DeltaNet head owns a disjoint state matrix and output range. On the
 	// production 27B geometry a head updates a 128x128 matrix, so splitting
 	// heads across the persistent worker pool is substantially coarser than an
@@ -950,9 +976,9 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 	ensureLenNoClear(&buf.MambaRecall, nHeads*headDim)
 	updateHeads := func(start, end int) {
 		for h := start; h < end; h++ {
-			alpha := nemotronSoftplus(buf.MambaDT[h] + w.DTBias[h])
+			alpha := nemotronSoftplus(alphaInput[h] + w.DTBias[h])
 			decay := float32(math.Exp(float64(alpha * w.A[h])))
-			beta := fastSigmoidF32(buf.MambaBeta[h])
+			beta := fastSigmoidF32(betaInput[h])
 			group := h % nGroups
 			q := buf.MambaB[group*dState : group*dState+dState]
 			k := buf.MambaC[group*dState : group*dState+dState]
@@ -988,14 +1014,9 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+cfg.RMSNormEps)))
 		mulScaleF32(part, w.Norm[:headDim], scale, part)
 	}
-	if !qkvGateFused {
-		ensureLenNoClear(&buf.MambaZ, dInner)
-		w.Gate.MatvecInto(x, &buf.MambaZ)
-	}
-	for i, g := range buf.MambaZ[:dInner] {
+	for i, g := range gate[:dInner] {
 		buf.MambaY[i] *= g * fastSigmoidF32(g)
 	}
-	w.Out.MatvecInto(buf.MambaY, &buf.Proj)
 }
 
 // qwen35L2NormalizeInPlace applies the Qwen/FLA L2 normalization used by the

@@ -3,6 +3,7 @@
 package gopherllm
 
 import (
+	"context"
 	metalbackend "github.com/SimonWaldherr/GopherLLM/internal/metal"
 	"math"
 	"os"
@@ -22,13 +23,6 @@ type metalDenseState struct {
 	dim, hidden, heads, kvheads, layers, window int
 	eps, scale                                  float32
 	refs, owned                                 []*metalbackend.Weight
-	// batchKVSynced[layer] is how far (position count) that layer's persistent
-	// Metal K/V buffer has been uploaded by metalDenseBatchAttention, letting
-	// each successive prefill chunk append only the new suffix instead of
-	// re-copying the whole prefix. It can only lag behind reality (e.g. after
-	// single-token decode's own full resync), never overstate it, so a stale
-	// value causes redundant-but-correct re-upload rather than stale data.
-	batchKVSynced []int
 }
 
 func (s *metalDenseState) close() {
@@ -84,7 +78,7 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache) *metalDenseState {
 	if scale == 0 {
 		scale = float32(1 / math.Sqrt(128))
 	}
-	s := &metalDenseState{sharedK: make([][]float32, c.NLayers), sharedV: make([][]float32, c.NLayers), owner: &w.Layers[0], cache: k, dim: c.Dim, hidden: c.HiddenDim, heads: c.NHeads, kvheads: c.NKVHeads, layers: c.NLayers, window: c.SlidingWindow, eps: c.RMSNormEps, scale: c.AttentionScale, batchKVSynced: make([]int, c.NLayers)}
+	s := &metalDenseState{sharedK: make([][]float32, c.NLayers), sharedV: make([][]float32, c.NLayers), owner: &w.Layers[0], cache: k, dim: c.Dim, hidden: c.HiddenDim, heads: c.NHeads, kvheads: c.NKVHeads, layers: c.NLayers, window: c.SlidingWindow, eps: c.RMSNormEps, scale: c.AttentionScale}
 	s.decoder = metalbackend.NewDecoder(c.Dim, c.HiddenDim, c.NHeads, c.NKVHeads, c.NLayers, k.MaxLen, c.RMSNormEps, scale, w.OutputNorm)
 	if s.decoder == nil {
 		return nil
@@ -345,6 +339,33 @@ func metalDenseFor(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) *metal
 func prepareMetalDenseBatch(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, batch int) bool {
 	return batch >= 16 && batch <= metalBatchFFNMaxTokens && os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" && metalDenseFor(c, w, k, b) != nil
 }
+
+func tryMetalDensePrefill(ctx context.Context, c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, start, batch int, shortVerifier bool) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if os.Getenv("GOPHERLLM_METAL_WHOLE_PREFILL") == "0" || !metalBatchAttentionEnabled || !metalFusedFFNEnabled {
+		return false, nil
+	}
+	eligible := false
+	if shortVerifier && batch >= 2 && batch <= 8 {
+		eligible = os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" && metalDenseFor(c, w, k, b) != nil
+	} else {
+		eligible = prepareMetalDenseBatch(c, w, k, b, batch)
+	}
+	if !eligible {
+		return false, nil
+	}
+	s := b.metalDense
+	work := &b.batch
+	ensureLenNoClear(&work.RopeTemperature, batch)
+	for i := range work.RopeTemperature {
+		work.RopeTemperature[i] = attentionTemperatureAt(c, start+i)
+	}
+	ok, err := s.decoder.PrefillBatch(ctx, work.XFlat, work.RopeSinFlat, work.RopeCosFlat, work.RopeTemperature, start, batch, ropeInterleaved(c.Arch), metalBatchAttentionTiled, k.K, k.V, work.XFlat, work.XNFlat)
+	runtime.KeepAlive(s)
+	return ok, err
+}
 func metalDenseBatchProjection(b *DecodeBuffer, layer, matrix int, x, out []float32, batch int) bool {
 	if b == nil || b.metalDense == nil {
 		return false
@@ -405,18 +426,11 @@ func metalDenseBatchAttention(b *DecodeBuffer, layer int, cache *KVCache, q []fl
 	}
 	s := b.metalDense
 	pos := startPos + batch
-	from := 0
-	if layer < len(s.batchKVSynced) {
-		from = s.batchKVSynced[layer]
-		if from > pos {
-			from = 0
-		}
-	}
-	if !s.decoder.CacheAppend(layer, from, pos, cache.K[layer], cache.V[layer]) {
+	// A restored branch can reuse the same cache address and position. A
+	// synchronization count cannot prove its prefix contents are unchanged.
+	// Shared caches are already current; private buffers copy the full prefix.
+	if !s.decoder.CacheAppend(layer, 0, pos, cache.K[layer], cache.V[layer]) {
 		return false
-	}
-	if layer < len(s.batchKVSynced) {
-		s.batchKVSynced[layer] = pos
 	}
 	var ok bool
 	if metalBatchAttentionTiled {

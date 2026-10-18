@@ -40,18 +40,19 @@ type fileLayaConfig struct {
 }
 
 type fileGenerationConfig struct {
-	JSONObject     *bool    `json:"json_object,omitempty"`
-	MaxTokens      *int     `json:"max_tokens,omitempty"`
-	MTPDraftTokens *int     `json:"mtp_draft_tokens,omitempty"`
-	Temperature    *float32 `json:"temperature,omitempty"`
-	TopP           *float32 `json:"top_p,omitempty"`
-	TopK           *int     `json:"top_k,omitempty"`
-	MinP           *float32 `json:"min_p,omitempty"`
-	RepeatPenalty  *float32 `json:"repeat_penalty,omitempty"`
-	Seed           *uint64  `json:"seed,omitempty"`
-	SystemPrompt   *string  `json:"system_prompt,omitempty"`
-	Stop           []string `json:"stop,omitempty"`
-	ContextWindow  *string  `json:"context_window_mode,omitempty"`
+	JSONObject         *bool    `json:"json_object,omitempty"`
+	MaxTokens          *int     `json:"max_tokens,omitempty"`
+	MTPDraftTokens     *int     `json:"mtp_draft_tokens,omitempty"`
+	PromptLookupTokens *int     `json:"prompt_lookup_tokens,omitempty"`
+	Temperature        *float32 `json:"temperature,omitempty"`
+	TopP               *float32 `json:"top_p,omitempty"`
+	TopK               *int     `json:"top_k,omitempty"`
+	MinP               *float32 `json:"min_p,omitempty"`
+	RepeatPenalty      *float32 `json:"repeat_penalty,omitempty"`
+	Seed               *uint64  `json:"seed,omitempty"`
+	SystemPrompt       *string  `json:"system_prompt,omitempty"`
+	Stop               []string `json:"stop,omitempty"`
+	ContextWindow      *string  `json:"context_window_mode,omitempty"`
 }
 
 type fileRuntimeConfig struct {
@@ -104,63 +105,64 @@ var cliOptionalValueOptions = map[string]bool{
 // second flag. The early config/preset scan uses it so a system prompt such as
 // "--preset" cannot accidentally be interpreted as an option.
 var cliValueOptions = map[string]bool{
-	"--classify-csv":       true,
-	"--instruction":        true,
-	"--decision-type":      true,
-	"--criteria":           true,
-	"--csv-column":         true,
-	"--result-column":      true,
-	"--csv-delimiter":      true,
-	"--laya-model":         true,
-	"--laya-subfolder":     true,
-	"--classify":           true,
-	"--config":             true,
-	"--preset":             true,
-	"--model":              true,
-	"--model-dir":          true,
-	"--mmproj":             true,
-	"--image":              true,
-	"--hf-list":            true,
-	"--prompt":             true,
-	"-p":                   true,
-	"--serve":              true,
-	"--enable":             true,
-	"--deployment":         true,
-	"--admin-token":        true,
-	"--admin-token-file":   true,
-	"--chat-history":       true,
-	"--wasm-dir":           true,
-	"--max-connections":    true,
-	"--max-tokens":         true,
-	"-n":                   true,
-	"--mtp-draft-tokens":   true,
-	"--temp":               true,
-	"-t":                   true,
-	"--top-p":              true,
-	"--top-k":              true,
-	"--min-p":              true,
-	"--repeat-penalty":     true,
-	"--seed":               true,
-	"--context-window":     true,
-	"--threads":            true,
-	"--system-prompt":      true,
-	"--stop":               true,
-	"--skills-dir":         true,
-	"--rag-docs":           true,
-	"--rag-embed-model":    true,
-	"--rag-snapshot":       true,
-	"--os-commands":        true,
-	"--os-commands-allow":  true,
-	"--bench-runs":         true,
-	"--kernel-bench-runs":  true,
-	"--kernel-bench-layer": true,
-	"--request-timeout":    true,
-	"--timeout":            true,
-	"--auto-effort":        true,
-	"--cpuprofile":         true,
-	"--find-token":         true,
-	"--token-neighbors":    true,
-	"--neighbors":          true,
+	"--classify-csv":         true,
+	"--instruction":          true,
+	"--decision-type":        true,
+	"--criteria":             true,
+	"--csv-column":           true,
+	"--result-column":        true,
+	"--csv-delimiter":        true,
+	"--laya-model":           true,
+	"--laya-subfolder":       true,
+	"--classify":             true,
+	"--config":               true,
+	"--preset":               true,
+	"--model":                true,
+	"--model-dir":            true,
+	"--mmproj":               true,
+	"--image":                true,
+	"--hf-list":              true,
+	"--prompt":               true,
+	"-p":                     true,
+	"--serve":                true,
+	"--enable":               true,
+	"--deployment":           true,
+	"--admin-token":          true,
+	"--admin-token-file":     true,
+	"--chat-history":         true,
+	"--wasm-dir":             true,
+	"--max-connections":      true,
+	"--max-tokens":           true,
+	"-n":                     true,
+	"--mtp-draft-tokens":     true,
+	"--prompt-lookup-tokens": true,
+	"--temp":                 true,
+	"-t":                     true,
+	"--top-p":                true,
+	"--top-k":                true,
+	"--min-p":                true,
+	"--repeat-penalty":       true,
+	"--seed":                 true,
+	"--context-window":       true,
+	"--threads":              true,
+	"--system-prompt":        true,
+	"--stop":                 true,
+	"--skills-dir":           true,
+	"--rag-docs":             true,
+	"--rag-embed-model":      true,
+	"--rag-snapshot":         true,
+	"--os-commands":          true,
+	"--os-commands-allow":    true,
+	"--bench-runs":           true,
+	"--kernel-bench-runs":    true,
+	"--kernel-bench-layer":   true,
+	"--request-timeout":      true,
+	"--timeout":              true,
+	"--auto-effort":          true,
+	"--cpuprofile":           true,
+	"--find-token":           true,
+	"--token-neighbors":      true,
+	"--neighbors":            true,
 }
 
 func configPathFromArgs(args []string) (string, error) { return singleCLIOptionValue(args, "--config") }
@@ -252,6 +254,9 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		}
 		if g.MTPDraftTokens != nil {
 			cfg.options.MTPDraftTokens = *g.MTPDraftTokens
+		}
+		if g.PromptLookupTokens != nil {
+			cfg.options.PromptLookupTokens = *g.PromptLookupTokens
 		}
 		if g.JSONObject != nil {
 			cfg.options.JSONObject = *g.JSONObject
@@ -444,18 +449,19 @@ func effectiveContextWindowMode(mode gopherllm.ContextWindowMode) string {
 // HF_TOKEN and transient user prompts are intentionally not part of the schema.
 func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	type effectiveGenerationConfig struct {
-		JSONObject     bool     `json:"json_object,omitempty"`
-		MaxTokens      int      `json:"max_tokens"`
-		MTPDraftTokens int      `json:"mtp_draft_tokens"`
-		Temperature    float32  `json:"temperature"`
-		TopP           float32  `json:"top_p"`
-		TopK           int      `json:"top_k"`
-		MinP           float32  `json:"min_p"`
-		RepeatPenalty  float32  `json:"repeat_penalty"`
-		Seed           uint64   `json:"seed"`
-		SystemPrompt   string   `json:"system_prompt"`
-		Stop           []string `json:"stop,omitempty"`
-		ContextWindow  string   `json:"context_window_mode"`
+		JSONObject         bool     `json:"json_object,omitempty"`
+		MaxTokens          int      `json:"max_tokens"`
+		MTPDraftTokens     int      `json:"mtp_draft_tokens"`
+		PromptLookupTokens int      `json:"prompt_lookup_tokens"`
+		Temperature        float32  `json:"temperature"`
+		TopP               float32  `json:"top_p"`
+		TopK               int      `json:"top_k"`
+		MinP               float32  `json:"min_p"`
+		RepeatPenalty      float32  `json:"repeat_penalty"`
+		Seed               uint64   `json:"seed"`
+		SystemPrompt       string   `json:"system_prompt"`
+		Stop               []string `json:"stop,omitempty"`
+		ContextWindow      string   `json:"context_window_mode"`
 	}
 	type effectiveRuntimeConfig struct {
 		Threads      int    `json:"threads,omitempty"`
@@ -505,18 +511,19 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		Preset:   cfg.preset,
 		ModelDir: cfg.modelDir,
 		Generation: effectiveGenerationConfig{
-			JSONObject:     cfg.options.JSONObject,
-			MaxTokens:      cfg.options.MaxTokens,
-			MTPDraftTokens: cfg.options.MTPDraftTokens,
-			Temperature:    cfg.options.Sampler.Temperature,
-			TopP:           cfg.options.Sampler.TopP,
-			TopK:           cfg.options.Sampler.TopK,
-			MinP:           cfg.options.Sampler.MinP,
-			RepeatPenalty:  cfg.options.Sampler.RepeatPenalty,
-			Seed:           cfg.options.Seed,
-			SystemPrompt:   cfg.options.SystemPrompt,
-			Stop:           append([]string(nil), cfg.options.StopSequences...),
-			ContextWindow:  effectiveContextWindowMode(cfg.options.ContextWindowMode),
+			JSONObject:         cfg.options.JSONObject,
+			MaxTokens:          cfg.options.MaxTokens,
+			MTPDraftTokens:     cfg.options.MTPDraftTokens,
+			PromptLookupTokens: cfg.options.PromptLookupTokens,
+			Temperature:        cfg.options.Sampler.Temperature,
+			TopP:               cfg.options.Sampler.TopP,
+			TopK:               cfg.options.Sampler.TopK,
+			MinP:               cfg.options.Sampler.MinP,
+			RepeatPenalty:      cfg.options.Sampler.RepeatPenalty,
+			Seed:               cfg.options.Seed,
+			SystemPrompt:       cfg.options.SystemPrompt,
+			Stop:               append([]string(nil), cfg.options.StopSequences...),
+			ContextWindow:      effectiveContextWindowMode(cfg.options.ContextWindowMode),
 		},
 		Runtime: effectiveRuntimeConfig{
 			PrepareQuant: cfg.prepareQuant,

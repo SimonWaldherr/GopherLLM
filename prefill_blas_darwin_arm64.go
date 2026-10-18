@@ -55,6 +55,10 @@ func (t *prefillBLASDequantTask) runRows(start, end int) {
 // keeps its existing kernels and exact fused-projection contract. Small
 // batches retain NEON to avoid packing and cgo overhead.
 func matvecBatchBLAS(w Weight, xs, outs [][]float32, useQ8 bool) bool {
+	return matvecBatchBLASWithSlabs(w, xs, outs, useQ8, nil, nil)
+}
+
+func matvecBatchBLASWithSlabs(w Weight, xs, outs [][]float32, useQ8 bool, inputSlab, outputSlab []float32) bool {
 	p := len(xs)
 	if p < 16 || len(outs) != p {
 		return false
@@ -95,19 +99,25 @@ func matvecBatchBLAS(w Weight, xs, outs [][]float32, useQ8 bool) bool {
 		}
 	}
 
-	b := prefillBLASPool.Get().(*prefillBLASScratch)
-	defer prefillBLASPool.Put(b)
 	// Let Accelerate choose processor-specific matrix blocking on M4/SME as
 	// well as earlier Apple silicon. Contiguous F32 batches need just one GEMM
 	// and, when disjoint, no activation copies or additional output scratch.
 	if dequant == nil && p >= prefillBLASMatrixMinTokens {
-		input, directInput := contiguousBatchRows(xs, cols)
-		output, directOutput := contiguousBatchRows(outs, rows)
+		input, directInput := batchRowsInSlab(xs, cols, inputSlab)
+		if !directInput {
+			input, directInput = contiguousBatchRows(xs, cols)
+		}
+		output, directOutput := batchRowsInSlab(outs, rows, outputSlab)
+		if !directOutput {
+			output, directOutput = contiguousBatchRows(outs, rows)
+		}
 		if directInput && directOutput && !batchSlicesOverlap(input, output) {
 			voxtralblas.Mul(p, rows, cols, w.F32, input, output)
 			return true
 		}
 	}
+	b := prefillBLASPool.Get().(*prefillBLASScratch)
+	defer prefillBLASPool.Put(b)
 	// Snapshot inputs once, including the in-place case, before writing any
 	// tile's outputs. Per-token views need not share a backing allocation.
 	ensureLenNoClear(&b.input, p*cols)

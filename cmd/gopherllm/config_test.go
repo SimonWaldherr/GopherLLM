@@ -101,7 +101,7 @@ func TestConfigAndPresetScanIgnoreFlagLookingValues(t *testing.T) {
 }
 
 func TestWriteEffectiveConfigIsReusableAndSecretFree(t *testing.T) {
-	cfg, err := parseCLI([]string{"--preset", "deterministic", "--hf-offline", "--threads", "2", "--model", "local.gguf"})
+	cfg, err := parseCLI([]string{"--preset", "deterministic", "--hf-offline", "--threads", "2", "--model", "local.gguf", "--prompt-lookup-tokens", "5", "--mtp-draft-tokens", "4"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,8 +117,27 @@ func TestWriteEffectiveConfigIsReusableAndSecretFree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("printed config was not reusable: %v\n%s", err, out.String())
 	}
-	if reloaded.preset != "deterministic" || reloaded.options.Sampler.Temperature != 0 || !reloaded.hfOffline || !reloaded.threadsSet || reloaded.threads != 2 {
+	if reloaded.preset != "deterministic" || reloaded.options.Sampler.Temperature != 0 || reloaded.options.PromptLookupTokens != 5 || reloaded.options.MTPDraftTokens != 4 || !reloaded.hfOffline || !reloaded.threadsSet || reloaded.threads != 2 {
 		t.Fatalf("reloaded effective config = %+v", reloaded)
+	}
+}
+
+func TestPromptLookupConfigAndExplicitDisable(t *testing.T) {
+	path := writeTestConfig(t, `{"version":1,"preset":"deterministic","generation":{"prompt_lookup_tokens":7}}`)
+	cfg, err := parseCLI([]string{"--config", path})
+	if err != nil || cfg.options.PromptLookupTokens != 7 {
+		t.Fatalf("lookup config = %d, error = %v", cfg.options.PromptLookupTokens, err)
+	}
+	cfg, err = parseCLI([]string{"--config", path, "--prompt-lookup-tokens", "0"})
+	if err != nil || cfg.options.PromptLookupTokens != 0 {
+		t.Fatalf("explicit disable = %d, error = %v", cfg.options.PromptLookupTokens, err)
+	}
+	var out bytes.Buffer
+	if err := writeEffectiveConfig(&out, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"prompt_lookup_tokens": 0`) {
+		t.Fatalf("effective config lost explicit disabled value: %s", out.String())
 	}
 }
 
