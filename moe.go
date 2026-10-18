@@ -643,6 +643,11 @@ func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 	// which experts were selected), and on any layout it declines, every
 	// expert falls back to the original per-expert path unchanged.
 	batchedGateUp := expertMatvecGateUpBatchInto(w.Gate, w.Up, selected, x, &buf.Q4KXSums, &buf.Gate, &buf.Up)
+	batchedDown := batchedGateUp && w.Down.Input == out && expertDownBatchReady(w.Down, selected)
+	if batchedDown {
+		buf.moeDown.prepare(w.Down, len(selected))
+	}
+	ensureLenNoClear(&buf.Hidden, out)
 	for i, choice := range selected {
 		var gateVals, upVals []float32
 		if batchedGateUp {
@@ -658,19 +663,32 @@ func sparseMoEForward(w *SparseMoEWeights, x []float32, buf *DecodeBuffer) {
 		}
 		w.GateBias.addTo(choice.Index, gateVals)
 		w.UpBias.addTo(choice.Index, upVals)
-		ensureLenNoClear(&buf.Hidden, out)
+		hidden := buf.Hidden
+		if batchedDown {
+			hidden = buf.moeDown.hidden[i*out : (i+1)*out]
+		}
 		if w.OAIActivation {
 			for j := range out {
 				gate := min(gateVals[j], float32(7))
 				up := clamp(upVals[j], -7, 7)
-				buf.Hidden[j] = gate * nemotronSigmoid(1.702*gate) * (up + 1)
+				hidden[j] = gate * nemotronSigmoid(1.702*gate) * (up + 1)
 			}
 		} else {
-			siluMulF32(gateVals, upVals, buf.Hidden)
+			siluMulF32(gateVals, upVals, hidden)
 		}
-		expertMatvecInto(w.Down, choice.Index, buf.Hidden, &buf.MOE, &buf.ExpertRow)
-		w.DownBias.addTo(choice.Index, buf.MOE)
-		AxpyF32(buf.Proj[:w.Down.Output], routing[i]*w.Scale, buf.MOE)
+		if !batchedDown {
+			expertMatvecInto(w.Down, choice.Index, hidden, &buf.MOE, &buf.ExpertRow)
+			w.DownBias.addTo(choice.Index, buf.MOE)
+			AxpyF32(buf.Proj[:w.Down.Output], routing[i]*w.Scale, buf.MOE)
+		}
+	}
+	if batchedDown {
+		expertDownBatchInto(w.Down, selected, &buf.moeDown)
+		for i, choice := range selected {
+			result := buf.moeDown.down[i*w.Down.Output : (i+1)*w.Down.Output]
+			w.DownBias.addTo(choice.Index, result)
+			AxpyF32(buf.Proj[:w.Down.Output], routing[i]*w.Scale, result)
+		}
 	}
 	if w.SharedGateIn != nil || w.SharedGate != nil || w.SharedUp != nil || w.SharedDown != nil {
 		if w.SharedGate == nil || w.SharedUp == nil || w.SharedDown == nil {

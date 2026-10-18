@@ -96,6 +96,9 @@ type DecodeBuffer struct {
 	MTPInput     []float32
 	ExpertRow    []float32
 	ExpertHidden []float32
+	// moeDown retains at most 8 MiB of selected-expert activation/output
+	// scratch. Dense models never allocate it.
+	moeDown moeDownBatchScratch
 	// Gemma4PLE and Gemma4PLEInput retain a token's prepared E2B per-layer
 	// embedding slices and their raw embedding-row source. They are grown only
 	// when a native PLE model is used, so ordinary decoder workspaces stay the

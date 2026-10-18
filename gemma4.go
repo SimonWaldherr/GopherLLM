@@ -783,16 +783,42 @@ func forwardNativeGemma4MoE(config Config, layer Gemma4LayerWeights, moe *Gemma4
 	normalizeDecoderInto(config, buf.X[:dim], moe.PreNorm2, nil, &buf.XN2)
 	ensureLenNoClear(&buf.Proj, dim)
 	clear(buf.Proj[:dim])
+	width := moe.Gate.Output
+	batchedGateUp := expertMatvecGateUpBatchInto(moe.Gate, moe.Up, selected, buf.XN2[:dim], &buf.Q4KXSums, &buf.Gate, &buf.Up)
+	batchedDown := batchedGateUp && expertDownBatchReady(moe.Down, selected)
+	if batchedDown {
+		buf.moeDown.prepare(moe.Down, len(selected))
+	}
+	ensureLenNoClear(&buf.Hidden, width)
 	for i, choice := range selected {
-		if !expertMatvec2Into(moe.Gate, moe.Up, choice.Index, buf.XN2[:dim], &buf.Q4KXSums, &buf.Gate, &buf.Up) {
-			expertMatvecInto(moe.Gate, choice.Index, buf.XN2[:dim], &buf.Gate, &buf.ExpertRow)
-			expertMatvecInto(moe.Up, choice.Index, buf.XN2[:dim], &buf.Up, &buf.ExpertRow)
+		gate, up := buf.Gate, buf.Up
+		if batchedGateUp {
+			gate, up = gate[i*width:(i+1)*width], up[i*width:(i+1)*width]
+		} else {
+			if !expertMatvec2Into(moe.Gate, moe.Up, choice.Index, buf.XN2[:dim], &buf.Q4KXSums, &buf.Gate, &buf.Up) {
+				expertMatvecInto(moe.Gate, choice.Index, buf.XN2[:dim], &buf.Gate, &buf.ExpertRow)
+				expertMatvecInto(moe.Up, choice.Index, buf.XN2[:dim], &buf.Up, &buf.ExpertRow)
+			}
+			gate, up = buf.Gate, buf.Up
 		}
-		ensureLenNoClear(&buf.Hidden, moe.Gate.Output)
-		geluMulF32(buf.Gate[:moe.Gate.Output], buf.Up[:moe.Gate.Output], buf.Hidden[:moe.Gate.Output])
-		expertMatvecInto(moe.Down, choice.Index, buf.Hidden[:moe.Gate.Output], &buf.MOE, &buf.ExpertRow)
-		ScaleF32(buf.MOE[:dim], moe.DownScale[choice.Index])
-		AxpyF32(buf.Proj[:dim], routing[i], buf.MOE[:dim])
+		hidden := buf.Hidden
+		if batchedDown {
+			hidden = buf.moeDown.hidden[i*width : (i+1)*width]
+		}
+		geluMulF32(gate[:width], up[:width], hidden[:width])
+		if !batchedDown {
+			expertMatvecInto(moe.Down, choice.Index, hidden[:width], &buf.MOE, &buf.ExpertRow)
+			ScaleF32(buf.MOE[:dim], moe.DownScale[choice.Index])
+			AxpyF32(buf.Proj[:dim], routing[i], buf.MOE[:dim])
+		}
+	}
+	if batchedDown {
+		expertDownBatchInto(moe.Down, selected, &buf.moeDown)
+		for i, choice := range selected {
+			result := buf.moeDown.down[i*dim : (i+1)*dim]
+			ScaleF32(result, moe.DownScale[choice.Index])
+			AxpyF32(buf.Proj[:dim], routing[i], result)
+		}
 	}
 	rmsNormInto(buf.Proj[:dim], moe.PostNorm2, config.RMSNormEps, &buf.Proj)
 	addInPlace(buf.Proj[:dim], buf.AttnProj[:dim])

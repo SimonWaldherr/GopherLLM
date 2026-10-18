@@ -29,10 +29,16 @@ func quantExpertWeightForTest(typ GGMLType, input, output, experts int, seed int
 				row[off+1] = 0x2c
 				row[off+3] = 0x1c
 				off += 144
+			case GGMLTypeQ5_K:
+				row[off+1], row[off+3] = 0x2c, 0x1c
+				off += 176
 			case GGMLTypeQ6_K:
 				// Q6_K stores its f16 block scale at the end.
 				row[off+209] = 0x2c
 				off += 210
+			case GGMLTypeQ8_0:
+				row[off+1] = 0x2c
+				off += 34
 			case GGMLTypeMXFP4:
 				// MXFP4's exponent is the last byte of each 32-value block.
 				// Keep scale at 2^(127-127)=1 so random mantissas stay finite.

@@ -1608,6 +1608,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_METAL_MATRIX` | `0` disables SIMD-group matrix prefill and restores the four-token kernels; decode is unchanged |
 | `GOPHERLLM_METAL_VERIFY_VECTOR` | `0` disables register-shared 2–8-position matvecs, including short prefill batches; larger batches and serial decode are unchanged |
 | `GOPHERLLM_METAL_QWEN_FFN_VECTOR` | `0` restores the legacy Qwen FFN reduction in both single-token decode and block verification |
+| `GOPHERLLM_NO_MOE_DOWN_BATCH` | `1` restores separate worker dispatches for selected experts' down projections |
 | `GOPHERLLM_METAL_GEMMA` | `0` disables fused GeGLU, vectorized Gemma output and native Metal batch prefill (enabled by default) |
 | `GOPHERLLM_METAL_DENSE_DECODE` | `0` disables complete dense Metal decode for eligible Ministral/Qwen models (enabled by default) |
 | `GOPHERLLM_METAL_WHOLE_PREFILL` | `0` disables complete GPU-resident dense prefill chunks (enabled by default for eligible shapes) |
@@ -1707,6 +1708,29 @@ adds its gated shared expert. `gpt-oss` uses the same sparse foundation with
 its expert/router biases, OAI-SwiGLU activation, learned attention sinks, and
 alternating local/full-attention schedule. Sparse MoE prompt prefill stays
 per-token so the decode graph and its quantized expert kernels are shared.
+
+The common sparse graph and native Gemma 4 A4B coalesce eligible selected
+experts' gate/up and down projections into one worker dispatch per stage.
+Down inputs remain distinct per expert, and the weighted sum retains router
+order, biases, activation functions and Gemma's branch norms. The down path
+supports F32, Q4_K, Q5_K, Q6_K, Q8_0 and MXFP4, provided gate/up batching is
+available. It reuses existing CPU SIMD kernels and bounds additional down-stage
+scratch to 8 MiB and 32 active experts; other layouts retain per-expert decode.
+Set `GOPHERLLM_NO_MOE_DOWN_BATCH=1` to disable down batching.
+
+With Ornith-1.0-35B Q4_K_M on M2 Max, eight CPU threads and Q8 activations,
+three alternating warm pairs generated the same 64 tokens. Median CPU-only
+decode fell from 3.951 s to 3.240 s, and total request time from 5.338 s to
+4.339 s. Prefix caches were cleared before every request and both modes used
+the same greedy sampling. Later CPU/Metal comparisons under memory pressure
+retained output parity but had substantially higher absolute times; the
+21.2 GB checkpoint's working set matters on a 32 GB Mac.
+To repeat this full-model comparison, set
+`GOPHERLLM_MOE_MODEL` to a local MoE GGUF and run
+`go test -run '^TestMoEConfiguredGenerationParity$' -v .`; add `-tags metal`
+and `GOPHERLLM_MOE_METAL=1` to test Metal. `BenchmarkMoEConfiguredLayer`
+isolates one real sparse layer with synthetic inputs, rather than reporting
+whole-model throughput.
 
 `qwen2` covers text-only Qwen2/Qwen2.5 GGUFs, including Qwen2.5-Coder,
 Qwen2.5-Math, and QwQ checkpoints when they declare that architecture;
