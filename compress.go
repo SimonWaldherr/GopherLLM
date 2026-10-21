@@ -1,25 +1,24 @@
 package gopherllm
 
-// Post-training model compression (Phase A: plain round-to-nearest
-// requantization — the calibration-driven GPTQ/AWQ/SmoothQuant/SparseGPT
-// methods land in later files/phases). CompressModel reads a source GGUF,
-// requantizes eligible weight tensors to a target format, and writes the
-// result to a new GGUF file, following the same mmap+ParseGGUF pattern
-// analyze.go/inspectGGUF already use for header-only work — this just also
-// touches tensor bytes.
+// GGUF post-training compression with round-to-nearest row encoders and
+// optional mixed-precision tensor presets. Source weights remain mapped while
+// bounded row chunks are decoded, quantized, and streamed to a new container.
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"slices"
 	"time"
 )
 
 // tensorToF32 fully decodes raw as numel float32 values, regardless of
 // whether dtype is a plain float format or a quantized one. dequantTensor
-// (model.go) only covers the quantized formats — F32/F16/F64/BF16 aren't
+// (model_load.go) only covers the quantized formats — F32/F16/F64/BF16 aren't
 // "quantized" in that sense, so requantizing a typical unquantized source
 // GGUF (this feature's main use case) needs this small extra step first.
 func tensorToF32(dtype GGMLType, raw []byte, numel int) ([]float32, bool) {
@@ -56,8 +55,9 @@ func tensorToF32(dtype GGMLType, raw []byte, numel int) ([]float32, bool) {
 // ParseCompressFormat maps a CLI-facing format name to the GGMLType
 // CompressModel accepts, restricted to the formats quantize_rtn.go has
 // encoders for (the full GGMLType enum covers many more read-only formats
-// that aren't valid compression targets here). Q3_K and Q2_K are deliberately
-// opt-in: they reduce the memory bandwidth consumed per generated token, at a
+// that aren't valid compression targets here). This legacy parser returns
+// only a base type; use ParseCompressOptions to retain mixed preset policies.
+// Q3_K and Q2_K are opt-in: they reduce the memory bandwidth consumed per generated token, at a
 // progressively larger model-quality cost.
 func ParseCompressFormat(name string) (GGMLType, bool) {
 	switch name {
@@ -105,13 +105,9 @@ func compressFormatRank(t GGMLType) int {
 	}
 }
 
-// outputFloorFormat is llama.cpp's own convention for its quantize tool:
-// the token embedding and output/LM-head tensors are disproportionately
-// sensitive to quantization error, so even aggressive presets keep them at
-// Q6_K rather than the base target. namedOutputTensors are the two
-// well-known GGUF tensor names this applies to across every architecture
-// this codebase loads (model.go, gemma4.go, qwen35.go, deepseek2.go all
-// agree on these names).
+// outputFloorFormat is the legacy single-target policy's quality floor:
+// token embeddings and output heads keep Q6_K when the base target is lower.
+// Mixed presets use their own policy, including separate input embeddings.
 const outputFloorFormat = GGMLTypeQ6_K
 
 var namedOutputTensors = map[string]bool{
@@ -126,11 +122,17 @@ type CompressOptions struct {
 	// supported (the formats quantize_rtn.go has encoders for). Q2_K/Q3_K
 	// trade output quality for less memory traffic during decode.
 	TargetFormat GGMLType
+	// Preset selects a mixed tensor policy, such as Q4_K_M. TargetFormat may
+	// be omitted or set to the preset's base type. Empty preserves the legacy
+	// single-target policy.
+	Preset string
 	// Uniform disables the output/embedding quality floor (outputFloorFormat)
-	// and applies TargetFormat everywhere without exception. Default false
-	// matches llama.cpp's own quantize tool convention; set true only for
-	// research/testing that specifically wants strictly uniform quantization.
+	// for eligible matrices. Default false
+	// preserves the legacy quality floor. Mixed presets reject Uniform;
+	// use their base TargetFormat for strictly uniform quantization.
 	Uniform bool
+	// Context cancels conversion between bounded chunks. Nil means Background.
+	Context context.Context
 	// LogWriter receives one line per tensor decision (requantized, passed
 	// through verbatim, and why) plus periodic progress during large
 	// compressions. Defaults to io.Discard.
@@ -146,13 +148,20 @@ func blockDivides(dtype GGMLType, numel int) bool {
 }
 
 // quantizeRowFor returns the per-row RTN encoder for dtype, or nil if dtype
-// isn't one of the formats quantize_rtn.go supports.
+// has no encoder. This includes shape-fallback formats that are not public
+// compression targets.
 func quantizeRowFor(dtype GGMLType) func(row []float32, cols int) []byte {
 	switch dtype {
+	case GGMLTypeF16:
+		return quantizeRowF16
 	case GGMLTypeQ8_0:
 		return QuantizeRowQ8_0
 	case GGMLTypeQ4_0:
 		return QuantizeRowQ4_0
+	case GGMLTypeQ5_0:
+		return QuantizeRowQ5_0
+	case GGMLTypeQ5_1:
+		return QuantizeRowQ5_1
 	case GGMLTypeQ2_K:
 		return QuantizeRowQ2K
 	case GGMLTypeQ3_K:
@@ -231,63 +240,69 @@ func sameFile(a, b string) bool {
 	return os.SameFile(ai, bi)
 }
 
-// CompressModel reads sourcePath's GGUF and writes a requantized copy to
-// outPath. Weight tensors already at a higher-than-target precision (or
-// even a different quantized format — dequantized via the existing,
-// trusted dequantTensor first) are requantized row by row, in parallel
-// across rows; everything else (norms, biases, tensors whose row length
-// doesn't fit the target format's block size, tensors already at the target
-// format) is copied through unchanged.
+// CompressModel writes a requantized, single-file GGUF. Rows are converted in
+// bounded chunks, including 3-D expert banks. Preset selects a mixed tensor
+// policy; without it the existing TargetFormat/output-floor policy applies.
 //
-// outPath must not be the same file as sourcePath: CompressModel keeps
-// sourcePath memory-mapped and readable throughout, and truncating that
-// same file via outPath's os.Create would corrupt the mapping mid-read
-// (SIGBUS on Unix; an outright open failure on Windows, where the mapping
-// keeps the file locked). Compress to a temporary path and rename it into
-// place afterward if an in-place update is what's wanted.
-//
-// A source that is one shard of a split/sharded GGUF (split.count > 1 in
-// its metadata) is rejected outright rather than silently compressing only
-// that shard's tensor subset — merging shards first is a real, separate
-// feature (see gguf_split.go's loadSplitRunner), not something Phase A
-// attempts.
+// The source remains mapped and must differ from outPath, including through
+// symlinks or hardlinks. The destination is replaced only after a sibling
+// temporary file has been flushed, closed, and verified. Cancellation or a
+// conversion error preserves any existing destination.
 func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
-	if quantizeRowFor(opts.TargetFormat) == nil {
-		return fmt.Errorf("compress: unsupported target format %s (supported: Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)", opts.TargetFormat)
+	opts, err := resolveCompressOptions(opts)
+	if err != nil {
+		return err
+	}
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if sameFile(sourcePath, outPath) {
-		return fmt.Errorf("compress: --compress-out must not be the same file as the source model (%s); compress to a different path and rename it afterward if you want to replace the original", sourcePath)
+		return fmt.Errorf("compress: output must not be the same file as the source model (%s)", sourcePath)
 	}
 	logw := opts.LogWriter
 	if logw == nil {
 		logw = io.Discard
 	}
-
 	mmap, err := OpenMmap(sourcePath)
 	if err != nil {
 		return fmt.Errorf("compress: open %s: %w", sourcePath, err)
 	}
 	defer mmap.Close()
-	src, err := ParseGGUF(mmap.Bytes())
+	raw := mmap.Bytes()
+	src, err := ParseGGUF(raw)
 	if err != nil {
 		return fmt.Errorf("compress: parse %s: %w", sourcePath, err)
 	}
 	if shardNo, shardCount, ok := splitInfo(src); ok {
-		return fmt.Errorf("compress: %s is shard %d/%d of a split GGUF; --compress needs a single merged file (merging split shards is not yet supported by this command)", sourcePath, shardNo+1, shardCount)
+		return fmt.Errorf("compress: %s is shard %d/%d of a split GGUF; merge the shards before quantizing", sourcePath, shardNo+1, shardCount)
 	}
-	raw := mmap.Bytes()
-
-	// Phase 1: decide every tensor's output type up front (required by
-	// GGUFWriter's two-phase contract) and log the decision.
+	planner := newCompressionPlanner(src, opts)
 	planned := make([]PlannedTensor, len(src.Tensors))
 	requantize := make([]bool, len(src.Tensors))
+	sourceSizes := make([]int, len(src.Tensors))
 	var beforeBytes, afterBytes int64
 	for i, t := range src.Tensors {
-		outType, doRequant := planTensor(t, opts)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		before, err := compressionTensorSize(t)
+		if err != nil {
+			return err
+		}
+		if !compressionRangeValid(raw, src.DataOffset, t.Offset, before) {
+			return fmt.Errorf("compress: tensor %q: byte range runs past the end of the source file", t.Name)
+		}
+		outType, doRequant := planner.plan(t)
+		after, err := compressionTensorSize(TensorInfo{Name: t.Name, Dims: t.Dims, DType: outType})
+		if err != nil {
+			return err
+		}
 		planned[i] = PlannedTensor{Name: t.Name, Dims: t.Dims, DType: outType}
-		requantize[i] = doRequant
-		before, _ := t.DType.DataSize(t.Numel())
-		after, _ := outType.DataSize(t.Numel())
+		requantize[i], sourceSizes[i] = doRequant, before
 		beforeBytes += int64(before)
 		afterBytes += int64(after)
 		if doRequant {
@@ -296,89 +311,53 @@ func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
 			fmt.Fprintf(logw, "passthrough %-40s %s\n", t.Name, t.DType)
 		}
 	}
-	fmt.Fprintf(logw, "total: %d bytes -> %d bytes (%.1f%%)\n", beforeBytes, afterBytes, 100*float64(afterBytes)/float64(beforeBytes))
-
-	// split.no/split.count/split.tensors.count are rejected above for the
-	// common case (a raw shard), but strip them defensively too: a
-	// hand-edited or already-merged-then-relabeled source could still carry
-	// them, and they would otherwise describe a shard layout that no longer
-	// exists in the (single-file) output.
-	metadata := src.Metadata
-	for _, key := range splitKeys {
-		if _, ok := metadata[key]; ok {
-			if metadata == nil || len(metadata) == len(src.Metadata) {
-				cp := make(map[string]MetaValue, len(src.Metadata))
-				for k, v := range src.Metadata {
-					cp[k] = v
-				}
-				metadata = cp
-			}
-			delete(metadata, key)
-		}
+	if beforeBytes > 0 {
+		fmt.Fprintf(logw, "total: %d bytes -> %d bytes (%.1f%%)\n", beforeBytes, afterBytes, 100*float64(afterBytes)/float64(beforeBytes))
 	}
 
-	out, err := os.Create(outPath)
+	metadata := compressionMetadata(src.Metadata, opts)
+	out, err := os.CreateTemp(filepath.Dir(outPath), "."+filepath.Base(outPath)+".*.tmp")
 	if err != nil {
-		return fmt.Errorf("compress: create %s: %w", outPath, err)
+		return fmt.Errorf("compress: create temporary output for %s: %w", outPath, err)
 	}
-	defer out.Close()
-
+	tempPath := out.Name()
+	defer func() {
+		out.Close()
+		os.Remove(tempPath)
+	}()
 	alignment := int(src.GetU32("general.alignment", 32))
 	gw, err := NewGGUFWriter(out, metadata, planned, alignment)
 	if err != nil {
 		return fmt.Errorf("compress: write header: %w", err)
 	}
-
-	// Phase 2: encode each tensor (rows in parallel across numThreads()
-	// cores — RTN is pure per-row scalar arithmetic with no cross-row
-	// dependency, so this is embarrassingly parallel), then stream bytes in
-	// the same order as planned. Progress is logged periodically, not per
-	// tensor, so a multi-hundred-tensor model doesn't spam the log while a
-	// multi-minute run still gives visible signs of life.
 	lastProgress := time.Now()
 	for i, t := range src.Tensors {
-		size, ok := t.DType.DataSize(t.Numel())
-		if !ok {
-			return fmt.Errorf("compress: tensor %q: unsupported source type %s", t.Name, t.DType)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		start := src.DataOffset + int(t.Offset)
-		if start < 0 || start+size > len(raw) {
-			return fmt.Errorf("compress: tensor %q: out of bounds (offset %d, size %d, file %d bytes)", t.Name, start, size, len(raw))
-		}
-		srcBytes := raw[start : start+size]
-
-		var outBytes []byte
-		if !requantize[i] {
-			outBytes = srcBytes
-		} else {
-			rows, cols := rowsOf(t)
-			f32, ok := tensorToF32(t.DType, srcBytes, t.Numel())
-			if !ok {
-				return fmt.Errorf("compress: tensor %q: cannot dequantize source type %s for requantization", t.Name, t.DType)
+		data := raw[start : start+sourceSizes[i]]
+		err := gw.WriteTensorStream(func(dst io.Writer) error {
+			if requantize[i] {
+				return writeCompressedTensor(ctx, dst, t, data, planned[i].DType)
 			}
-			outType := planned[i].DType
-			// The output/embedding quality floor can raise this tensor above the
-			// requested target (for example Q3_K -> Q6_K). Select the encoder
-			// from the planned tensor type rather than reusing the global target
-			// encoder, otherwise its packed bytes would be interpreted as the
-			// wrong GGML format on reload.
-			rowQuantize := quantizeRowFor(outType)
-			if rowQuantize == nil {
-				return fmt.Errorf("compress: tensor %q: unsupported planned target type %s", t.Name, outType)
-			}
-			rowSize, ok := outType.DataSize(cols)
-			if !ok {
-				return fmt.Errorf("compress: tensor %q: cannot size target type %s", t.Name, outType)
-			}
-			outBytes = make([]byte, rows*rowSize)
-			parallelRows(rows, func(rstart, rend int) {
-				for r := rstart; r < rend; r++ {
-					rowBytes := rowQuantize(f32[r*cols:(r+1)*cols], cols)
-					copy(outBytes[r*rowSize:(r+1)*rowSize], rowBytes)
+			for len(data) > 0 {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-			})
-		}
-		if err := gw.WriteTensor(outBytes); err != nil {
+				n := min(len(data), 1<<20)
+				written, err := dst.Write(data[:n])
+				if err != nil {
+					return err
+				}
+				if written != n {
+					return io.ErrShortWrite
+				}
+				data = data[n:]
+			}
+			return nil
+		})
+		if err != nil {
 			return fmt.Errorf("compress: tensor %q: %w", t.Name, err)
 		}
 		if now := time.Now(); now.Sub(lastProgress) > 3*time.Second {
@@ -387,10 +366,82 @@ func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
 		}
 	}
 	if err := gw.Close(); err != nil {
+		return fmt.Errorf("compress: flush output: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("compress: sync output: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("compress: close output: %w", err)
+	}
+	if err := verifyCompressedOutput(tempPath, planned); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, outPath); err != nil {
+		return fmt.Errorf("compress: install %s: %w", outPath, err)
+	}
+	return nil
+}
 
-	return verifyCompressedOutput(outPath, planned)
+// compressionTensorSize checks dimensions before using unchecked Numel/DataSize
+// arithmetic. Sizing one block first avoids overflow in DataSize's products.
+func compressionTensorSize(t TensorInfo) (int, error) {
+	maxInt := int(^uint(0) >> 1)
+	numel := 1
+	if len(t.Dims) == 0 {
+		return 0, fmt.Errorf("compress: tensor %q: missing dimensions", t.Name)
+	}
+	for _, d := range t.Dims {
+		if d == 0 || d > uint64(maxInt/numel) {
+			return 0, fmt.Errorf("compress: tensor %q: invalid or overflowing dimensions", t.Name)
+		}
+		numel *= int(d)
+	}
+	block := t.DType.BlockSize()
+	bytes, ok := t.DType.DataSize(block)
+	if !ok || bytes <= 0 {
+		return 0, fmt.Errorf("compress: tensor %q: unsupported type %s", t.Name, t.DType)
+	}
+	if t.Dims[0]%uint64(block) != 0 || numel/block > maxInt/bytes {
+		return 0, fmt.Errorf("compress: tensor %q: invalid row length or overflowing byte size for %s", t.Name, t.DType)
+	}
+	return numel / block * bytes, nil
+}
+
+func compressionRangeValid(raw []byte, dataOffset int, offset uint64, size int) bool {
+	if dataOffset < 0 || dataOffset > len(raw) || size < 0 {
+		return false
+	}
+	remaining := len(raw) - dataOffset
+	return offset <= uint64(remaining) && size <= remaining-int(offset)
+}
+
+func compressionMetadata(source map[string]MetaValue, opts CompressOptions) map[string]MetaValue {
+	metadata := make(map[string]MetaValue, len(source)+3)
+	for k, v := range source {
+		metadata[k] = v
+	}
+	for _, key := range splitKeys {
+		delete(metadata, key)
+	}
+	// These are llama_ftype values, not GGML tensor type IDs.
+	fileTypes := map[GGMLType]uint32{
+		GGMLTypeQ4_0: 2, GGMLTypeQ8_0: 7, GGMLTypeQ2_K: 10,
+		GGMLTypeQ3_K: 11, GGMLTypeQ4_K: 14, GGMLTypeQ5_K: 16, GGMLTypeQ6_K: 18,
+	}
+	fileType := fileTypes[opts.TargetFormat]
+	if opts.Preset == "Q4_K_M" {
+		fileType = 15
+	} else if opts.Preset == "Q5_K_M" {
+		fileType = 17
+	}
+	metadata["general.file_type"] = MetaValue{Kind: "u32", Value: fileType}
+	metadata["general.quantization_version"] = MetaValue{Kind: "u32", Value: uint32(2)}
+	metadata["gopherllm.quantization.method"] = MetaValue{Kind: "str", Value: "rtn"}
+	return metadata
 }
 
 // verifyCompressedOutput re-opens a just-written GGUF and checks its
@@ -418,14 +469,14 @@ func verifyCompressedOutput(outPath string, planned []PlannedTensor) error {
 		if gotT.Name != want.Name || gotT.DType != want.DType {
 			return fmt.Errorf("compress: wrote %s but tensor %d is %q/%s, planned %q/%s", outPath, i, gotT.Name, gotT.DType, want.Name, want.DType)
 		}
-		if gotT.Numel() != (TensorInfo{Dims: want.Dims}).Numel() {
-			return fmt.Errorf("compress: wrote %s but tensor %q has %d elements, planned %d", outPath, want.Name, gotT.Numel(), (TensorInfo{Dims: want.Dims}).Numel())
+		if !slices.Equal(gotT.Dims, want.Dims) {
+			return fmt.Errorf("compress: wrote %s but tensor %q has dimensions %v, planned %v", outPath, want.Name, gotT.Dims, want.Dims)
 		}
-		size, ok := gotT.DType.DataSize(gotT.Numel())
-		if !ok {
-			return fmt.Errorf("compress: wrote %s but tensor %q has an unsizable type %s", outPath, want.Name, gotT.DType)
+		size, err := compressionTensorSize(gotT)
+		if err != nil {
+			return err
 		}
-		if got.DataOffset+int(gotT.Offset)+size > len(mmap.Bytes()) {
+		if !compressionRangeValid(mmap.Bytes(), got.DataOffset, gotT.Offset, size) {
 			return fmt.Errorf("compress: wrote %s but tensor %q's byte range runs past the end of the file", outPath, want.Name)
 		}
 	}

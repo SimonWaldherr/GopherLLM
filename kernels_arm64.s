@@ -46,8 +46,9 @@ reduce:
 	VFMLA V10.S4, V31.S4, V0.S4
 	VFMLA V11.S4, V31.S4, V0.S4
 	// Preserve (lane0+lane1)+(lane2+lane3), without SIMD/GPR transfers.
-	VFADDP V0.S4, V0.S4, V0.S4
-	VFADDP V0.S4, V0.S4, V0.S4
+	// Go 1.25 requires the raw encoding for FADDP V0.4S, V0.4S, V0.4S.
+	WORD $0x6e20d400
+	WORD $0x6e20d400
 	CBZ R2, done
 
 tail:

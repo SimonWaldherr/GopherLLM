@@ -66,8 +66,8 @@ type expertDownTask struct {
 	rowBytes int
 	sumWidth int
 	useQ8    bool
-	q8       [moeDownBatchMaxExperts][]int8
-	scales   [moeDownBatchMaxExperts][]float32
+	q8       []int8
+	scales   []float32
 }
 
 func (t *expertDownTask) runRows(start, end int) {
@@ -86,17 +86,18 @@ func (t *expertDownTask) runRows(start, end int) {
 		plane, _ := expertPlaneWeight(t.w, t.selected[j].Index)
 		sums := t.sums[j*t.sumWidth : (j+1)*t.sumWidth]
 		if t.useQ8 {
+			q8, scales := t.q8[j*cols:(j+1)*cols], t.scales[j*(cols/256):(j+1)*(cols/256)]
 			switch t.w.Weight.Type {
 			case GGMLTypeQ4_K:
-				dotQ4KRowsQ8(plane.Raw, t.q8[j], t.scales[j], sums, cols, t.rowBytes, lo, hi, out)
+				dotQ4KRowsQ8(plane.Raw, q8, scales, sums, cols, t.rowBytes, lo, hi, out)
 			case GGMLTypeQ5_K:
-				dotQ5KRowsQ8(plane.Raw, t.q8[j], t.scales[j], sums, cols, t.rowBytes, lo, hi, out)
+				dotQ5KRowsQ8(plane.Raw, q8, scales, sums, cols, t.rowBytes, lo, hi, out)
 			case GGMLTypeQ6_K:
-				dotQ6KRowsQ8(plane.Raw, t.q8[j], t.scales[j], sums, cols, t.rowBytes, lo, hi, out)
+				dotQ6KRowsQ8(plane.Raw, q8, scales, sums, cols, t.rowBytes, lo, hi, out)
 			case GGMLTypeQ8_0:
-				dotQ8_0RowsQ8(plane.Raw, t.q8[j], t.scales[j], cols, t.rowBytes, lo, hi, out)
+				dotQ8_0RowsQ8(plane.Raw, q8, scales, cols, t.rowBytes, lo, hi, out)
 			case GGMLTypeMXFP4:
-				dotMXFP4RowsQ8(plane.Raw, t.q8[j], t.scales[j], cols, t.rowBytes, lo, hi, out)
+				dotMXFP4RowsQ8(plane.Raw, q8, scales, cols, t.rowBytes, lo, hi, out)
 			}
 			continue
 		}
@@ -132,40 +133,38 @@ func expertDownBatchInto(w ExpertWeight, selected []ExpertScore, scratch *moeDow
 	task := expertDownTaskPool.Get().(*expertDownTask)
 	task.w, task.selected = w, selected
 	task.x, task.out = scratch.hidden[:n*cols], scratch.down
-	var leases [moeDownBatchMaxExperts]q8ScratchLease
+	var lease q8ScratchLease
 	if w.Weight.F32 == nil {
 		task.rowBytes, _ = w.Weight.Type.DataSize(cols)
-		switch w.Weight.Type {
-		case GGMLTypeQ4_K, GGMLTypeQ5_K:
-			task.sumWidth = cols / 32
-		case GGMLTypeQ6_K:
-			task.sumWidth = cols / 16
-		}
-		ensureLenNoClear(&scratch.sums, n*task.sumWidth)
-		task.sums = scratch.sums
 		task.useQ8 = useQ8Activations.Load()
-		for j := range n {
-			x := task.x[j*cols : (j+1)*cols]
-			sums := task.sums[j*task.sumWidth : (j+1)*task.sumWidth : (j+1)*task.sumWidth]
-			switch w.Weight.Type {
-			case GGMLTypeQ4_K, GGMLTypeQ5_K:
-				fillQ4KXSums(x, cols, &sums)
-			case GGMLTypeQ6_K:
-				fillQ6KXSums16(x, cols, &sums)
-				ScaleF32(sums, 32)
-			}
-			if task.useQ8 {
-				task.q8[j], task.scales[j], leases[j] = acquireQ8(x, cols)
-			}
-		}
+		lease = task.prepareInputs(&scratch.sums)
 	}
 	parallelRowsTask(n*w.Output, task)
 	if task.useQ8 {
-		for j := range n {
-			releaseQ8(task.q8[j], task.scales[j], leases[j])
-		}
+		releaseQ8(task.q8, task.scales, lease)
 	}
 	// Never retain mapped model weights or request activation views in the pool.
 	*task = expertDownTask{}
 	expertDownTaskPool.Put(task)
+}
+
+// Expert inputs occupy complete 256-element blocks in one slab. Quantize
+// that slab with a single lease, keeping each expert's block scales and sums
+// independent. This also avoids one SIMD call per expert for offset sums.
+func (t *expertDownTask) prepareInputs(sums *[]float32) q8ScratchLease {
+	cols := len(t.x)
+	switch t.w.Weight.Type {
+	case GGMLTypeQ4_K, GGMLTypeQ5_K:
+		t.sumWidth = t.w.Input / 32
+		t.sums = fillQ4KXSums(t.x, cols, sums)
+	case GGMLTypeQ6_K:
+		t.sumWidth = t.w.Input / 16
+		t.sums = fillQ6KXSums16(t.x, cols, sums)
+		ScaleF32(t.sums, 32)
+	}
+	var lease q8ScratchLease
+	if t.useQ8 {
+		t.q8, t.scales, lease = acquireQ8(t.x, cols)
+	}
+	return lease
 }

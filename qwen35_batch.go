@@ -25,7 +25,7 @@ type qwen35BatchScratch struct {
 func (r *Runner) prefillQwen35At(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
 	metal := r.canBatchQwen35Metal(cache)
 	if !r.canBatchQwen35() && !metal {
-		return fmt.Errorf("gopherllm: Qwen chunked prefill requires a supported dense hybrid model")
+		return fmt.Errorf("gopherllm: Qwen chunked prefill requires a supported hybrid model")
 	}
 	if cache == nil || cache.Qwen35 == nil || startPos < 0 || startPos > cache.MaxLen || len(tokens) > cache.MaxLen-startPos {
 		return fmt.Errorf("gopherllm: Qwen chunked prefill has an invalid cache range")

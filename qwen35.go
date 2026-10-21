@@ -428,8 +428,15 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 	}
 	inferred := inferTensorSizes(data, gguf)
 	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
+	cpuOnly := qwen35CPUOnlyWeights(cfg, tensors)
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		prepare, metal := prepareQuantized, useMetal
+		// Explicit prepared-CPU loading retains its original fusion choices.
+		// Embedding rows never consume prepared/Metal matvec resources.
+		if cpuOnly[name] && (!prepareQuantized || name == "token_embd.weight") {
+			prepare, metal = false, false
+		}
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, prepare, metal, lazyScalarWeights)
 	}
 	// The depthwise DeltaNet convolution is tiny relative to the checkpoint but
 	// runs once per channel for every recurrent layer and generated token. Keep

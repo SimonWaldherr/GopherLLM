@@ -110,26 +110,23 @@ func (w *speculativeWindow) observe(s speculativeWindowSample) {
 	}
 	// Add as floats so three valid durations cannot overflow time.Duration.
 	elapsed := float64(s.Draft) + float64(s.Verify) + float64(s.Rollback)
-	if elapsed <= 0 {
-		return
-	}
 	stat := &w.stats[index]
-	cost := elapsed / float64(s.Emitted)
-	acceptance := float64(s.Accepted) / float64(s.Drafted)
-	if stat.samples == 0 {
-		stat.cost, stat.acceptance = cost, acceptance
-	} else {
-		// The first pass at each size can allocate/compile backend scratch;
-		// replace its timing before making any policy decision. Thereafter a
-		// half-weight update smooths load changes without retaining cold costs.
-		if stat.samples == 1 {
-			stat.cost = cost
+	if elapsed > 0 {
+		cost := elapsed / float64(s.Emitted)
+		acceptance := float64(s.Accepted) / float64(s.Drafted)
+		if stat.samples == 0 {
+			stat.cost, stat.acceptance = cost, acceptance
 		} else {
-			stat.cost += (cost - stat.cost) * 0.5
+			// Discard cold timing before making a cost-based decision.
+			if stat.samples == 1 {
+				stat.cost = cost
+			} else {
+				stat.cost += (cost - stat.cost) * 0.5
+			}
+			stat.acceptance += (acceptance - stat.acceptance) * 0.5
 		}
-		stat.acceptance += (acceptance - stat.acceptance) * 0.5
+		stat.samples++
 	}
-	stat.samples++
 	if s.SerialPerToken > 0 {
 		if w.serial == 0 {
 			w.serial = float64(s.SerialPerToken)
@@ -142,7 +139,6 @@ func (w *speculativeWindow) observe(s speculativeWindowSample) {
 	if index != w.index {
 		return
 	}
-	w.dwell++
 	if s.Accepted == 0 {
 		w.misses++
 	} else {
@@ -160,6 +156,13 @@ func (w *speculativeWindow) observe(s speculativeWindowSample) {
 		w.misses, w.dwell, w.probing = 0, 0, false
 		return
 	}
+	// Coarse clocks can report zero for real work (notably tiny Windows
+	// fixtures). Rejection counts remain useful; zero is not a free-cost
+	// sample and must not drive window growth or timing-based backoff.
+	if elapsed <= 0 {
+		return
+	}
+	w.dwell++
 	if w.probing {
 		// A slow, high-acceptance smaller window may simply underfill the
 		// verifier. One larger block measures that possibility; if it loses,

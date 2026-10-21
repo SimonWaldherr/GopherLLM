@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -8,6 +9,56 @@ import (
 	"testing"
 	"time"
 )
+
+// The real expert matrix bank, with 32 synthetic token inputs. This isolates
+// weight reuse from the full hybrid model's recurrent/attention work and VM
+// pressure. Full-request latency is measured separately on macOS.
+func BenchmarkMoEConfiguredPrefill(b *testing.B) {
+	r := loadMoEPerformanceModel(b)
+	if r.kind != loadedQwen35 || r.qwen35.Layers[0].FFN.MoE == nil {
+		b.Skip("requires a Qwen3.5-MoE checkpoint")
+	}
+	w := r.qwen35.Layers[0].FFN.MoE
+	const p = 32
+	if !moePrefillReady(w, p) {
+		b.Fatal("unsupported expert layout")
+	}
+	var input, output []float32
+	var xs, outs [][]float32
+	xs = reuseBatchViews(&input, &xs, p, w.Gate.Input)
+	outs = reuseBatchViews(&output, &outs, p, w.Down.Output)
+	copy(input, randomExpertInput(len(input), 39021))
+	reference, oracle := make([]float32, len(output)), &DecodeBuffer{}
+	for i, x := range xs {
+		sparseMoEForward(w, x, oracle)
+		copy(reference[i*w.Down.Output:], oracle.Proj)
+	}
+	for _, grouped := range []bool{false, true} {
+		b.Run(fmt.Sprintf("grouped=%t", grouped), func(b *testing.B) {
+			setPerformanceThreads(b, 8)
+			buf := &DecodeBuffer{}
+			run := func() {
+				if grouped {
+					if err := sparseMoEPrefill(context.Background(), w, xs, outs, buf); err != nil {
+						b.Fatal(err)
+					}
+				} else {
+					for i, x := range xs {
+						sparseMoEForward(w, x, buf)
+						copy(outs[i], buf.Proj)
+					}
+				}
+			}
+			run()
+			requireMoEPrefillExact(b, output, reference)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				run()
+			}
+		})
+	}
+}
 
 func loadMoEPerformanceModel(t testing.TB) *Runner {
 	t.Helper()
@@ -30,6 +81,39 @@ func loadMoEPerformanceModel(t testing.TB) *Runner {
 	}
 	t.Logf("model=%s arch=%s layers=%d experts=%d used=%d dim=%d file_bytes=%d mapped=%t metal=%t q8=%t threads=8", path, r.arch, r.config.NLayers, r.config.ExpertCount, r.config.ExpertUsedCount, r.config.Dim, info.FileSizeBytes, r.IsMapped(), metal, useQ8Activations.Load())
 	return r
+}
+
+// Compare complete real-model FFNs against independently dispatched down
+// projections, without a long generation benchmark or a timing assertion.
+func TestMoEConfiguredDownParity(t *testing.T) {
+	r := loadMoEPerformanceModel(t)
+	if r.kind != loadedQwen35 {
+		t.Skip("requires Qwen3.5-MoE")
+	}
+	previous := disableExpertDownBatch.Load()
+	t.Cleanup(func() { disableExpertDownBatch.Store(previous) })
+	checked := 0
+	for index, layer := range r.qwen35.Layers {
+		w := layer.FFN.MoE
+		if w == nil {
+			continue
+		}
+		x := randomExpertInput(w.Gate.Input, int64(42300+index))
+		got, want := &DecodeBuffer{}, &DecodeBuffer{}
+		disableExpertDownBatch.Store(false)
+		sparseMoEForward(w, x, got)
+		if len(got.moeDown.down) == 0 {
+			t.Fatalf("layer %d did not batch down projections", index)
+		}
+		disableExpertDownBatch.Store(true)
+		sparseMoEForward(w, x, want)
+		requireMoEPrefillExact(t, got.Proj, want.Proj)
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("configured checkpoint has no routed experts to compare")
+	}
+	t.Logf("down projection parity: layers=%d", checked)
 }
 
 // This isolates one real layer's complete FFN branch. Its input is synthetic;

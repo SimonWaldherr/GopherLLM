@@ -1,6 +1,7 @@
 //go:build arm64
 
 #include "textflag.h"
+#include "arm64_fp_compat.h"
 
 #define SDOT(D, N, M) WORD $(0x4E809400 | ((M)<<16) | ((N)<<5) | (D))
 
@@ -80,7 +81,7 @@ q40block:
  LEGACYQ4SCALES()
 q40sub:
  LEGACYQ4DOTS(2)
- VFMUL V20.S4, V16.S4, V16.S4
+ FMUL4S(16, 16, 20)
  VFMLS V18.S4, V19.S4, V16.S4
  VFMLA V17.S4, V16.S4, V31.S4
  ADD $18, R0
@@ -104,10 +105,10 @@ q41sub:
  MOVHU 2(R0), R20
  FMOVS (R13)(R20<<2), F18
  VDUP V18.S[0], V18.S4
- VFMUL V17.S4, V20.S4, V21.S4
- VFMUL V21.S4, V16.S4, V16.S4
+ FMUL4S(21, 20, 17)
+ FMUL4S(16, 16, 21)
  VFMLA V18.S4, V19.S4, V16.S4
- VFADD V16.S4, V31.S4, V31.S4
+ FADD4S(31, 31, 16)
  ADD $20, R0
  SUB $1, R15
  CBNZ R15, q41sub

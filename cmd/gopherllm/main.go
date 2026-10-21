@@ -25,7 +25,8 @@ import (
 
 func printUsage(name string) {
 	fmt.Fprintf(os.Stderr, "gopherllm %s\n\n", gopherllm.Version)
-	fmt.Fprintf(os.Stderr, "Usage: %s [model.gguf|model-name|model-dir|hf:owner/repo:quant@revision] [options]\n\n", name)
+	fmt.Fprintf(os.Stderr, "Usage: %s [model.gguf|model-name|model-dir|hf:owner/repo:quant@revision] [options]\n", name)
+	fmt.Fprintf(os.Stderr, "       %s quantize <input.gguf> <output.gguf> <type> [--threads N]\n\n", name)
 	fmt.Fprintln(os.Stderr, "If the model is omitted, the last successfully loaded local model is reused.")
 	fmt.Fprintln(os.Stderr, "Hugging Face: hf:owner/repo:Q4_K_M[@revision] downloads and reuses GGUFs from the HF cache.")
 	fmt.Fprintln(os.Stderr)
@@ -86,6 +87,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
 	fmt.Fprintln(os.Stderr, "  --metal                   Use selective Metal Q4_K/Q5_K/Q6_K/Q8_0 offload when available")
 	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute supported quantized scale data during load for faster matvecs")
+	fmt.Fprintln(os.Stderr, "  --prefault <mode>         Mmap warm-up: all | core | none (default: core; skips sparse expert banks)")
 	fmt.Fprintln(os.Stderr, "  --out-of-core             CPU-only mmap inference; keep sparse MoE experts and scalar weights demand-paged")
 	fmt.Fprintln(os.Stderr, "  --system-prompt <T>       Override the default system prompt")
 	fmt.Fprintln(os.Stderr, "  --stop <text>             Stop generation when this string appears")
@@ -120,10 +122,10 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --token-neighbors <t>     Show embedding-space nearest neighbors of a token (id or text)")
 	fmt.Fprintln(os.Stderr, "  --neighbors <N>           Neighbor count for --token-neighbors (default: 12)")
 	fmt.Fprintln(os.Stderr, "  --compress                Requantize the GGUF to --compress-format via round-to-nearest and exit")
-	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target: Q8_0 | Q4_0 | Q2_K | Q3_K | Q4_K | Q5_K | Q6_K")
+	fmt.Fprintln(os.Stderr, "  --compress-format <F>     Target: Q8_0 | Q4_0 | Q2_K | Q3_K | Q4_K | Q4_K_M | Q5_K | Q5_K_M | Q6_K")
 	fmt.Fprintln(os.Stderr, "  --compress-out <path>     Output path for --compress (required, must differ from the source)")
 	fmt.Fprintln(os.Stderr, "  --compress-uniform        Quantize token_embd/output tensors to --compress-format too")
-	fmt.Fprintln(os.Stderr, "                            (default: floor them at Q6_K, matching llama.cpp's quantize tool)")
+	fmt.Fprintln(os.Stderr, "                            (default: Q6_K floor; mixed presets use their own tensor policy)")
 }
 
 type cliConfig struct {
@@ -186,6 +188,7 @@ type cliConfig struct {
 	metalExplicit    bool
 	prepareQuant     bool
 	outOfCore        bool
+	prefault         gopherllm.MmapPrefaultMode
 	inspect          bool
 	listMetadata     bool
 	skillsDir        string
@@ -229,6 +232,11 @@ func main() {
 
 func run() error {
 	args := os.Args
+	if len(args) > 1 && args[1] == "quantize" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		return runQuantize(ctx, args[2:], os.Stderr)
+	}
 	for _, arg := range args[1:] {
 		if arg == "--help" || arg == "-h" {
 			printUsage(args[0])
@@ -424,7 +432,7 @@ func run() error {
 		return analyzeGGUF(modelPath, cfg)
 	}
 	if cfg.compress {
-		return runCompress(modelPath, cfg)
+		return runCompressContext(commandCtx, modelPath, cfg)
 	}
 	// A nearby compatible Pixtral projector is part of a multimodal model
 	// release, not an optional UI-only extra. Make the normal initial CLI
@@ -448,7 +456,7 @@ func run() error {
 	// actually measuring both ways. An explicit --metal is the operator's call
 	// and is never second-guessed.
 	if cfg.autoTune && !cfg.metalExplicit && metalAvailable {
-		base := gopherllm.LoadOptions{PrepareQuantized: cfg.prepareQuant}
+		base := gopherllm.LoadOptions{PrepareQuantized: cfg.prepareQuant, Prefault: cfg.prefault}
 		probe, cached, probeErr := gopherllm.ProbeMetalOrCached(modelPath, base, 0, cfg.autoTuneRefresh)
 		switch {
 		case probeErr != nil:
@@ -466,6 +474,7 @@ func run() error {
 		gopherllm.WithPrepareQuantized(cfg.prepareQuant),
 		gopherllm.WithMetal(cfg.useMetal),
 		gopherllm.WithOutOfCore(cfg.outOfCore),
+		gopherllm.WithMmapPrefault(cfg.prefault),
 	}
 	if visionProjectorPath != "" {
 		openOpts = append(openOpts, gopherllm.WithVisionProjector(visionProjectorPath))
@@ -613,6 +622,7 @@ func serverModelLoadOptions(cfg cliConfig) gopherllm.LoadOptions {
 		PrepareQuantized: cfg.prepareQuant,
 		UseMetal:         cfg.useMetal,
 		OutOfCore:        cfg.outOfCore,
+		Prefault:         cfg.prefault,
 	}
 	if cfg.mmprojPathSet && cfg.mmprojPath != "" {
 		options.VisionProjectorPath = cfg.mmprojPath
@@ -728,7 +738,12 @@ func buildAgentOSRunner(cfg cliConfig) (*agentos.Runner, error) {
 }
 
 func parseCLI(args []string) (cliConfig, error) {
-	cfg := cliConfig{modelDir: gopherllm.DefaultModelDir(), preset: "balanced", options: gopherllm.DefaultGenerationOptions(), benchRuns: 3, kernelBenchRuns: 25, maxConn: 8, deploymentMode: server.DeploymentLocal}
+	cfg := cliConfig{
+		modelDir: gopherllm.DefaultModelDir(), prefault: gopherllm.MmapPrefaultCore,
+		preset: "balanced", options: gopherllm.DefaultGenerationOptions(),
+		benchRuns: 3, kernelBenchRuns: 25, maxConn: 8,
+		deploymentMode: server.DeploymentLocal,
+	}
 	configPath, err := configPathFromArgs(args)
 	if err != nil {
 		return cfg, err
@@ -1038,6 +1053,16 @@ func parseCLI(args []string) (cliConfig, error) {
 			cfg.metalExplicit = true
 		case "--prepare-quant":
 			cfg.prepareQuant = true
+		case "--prefault":
+			value, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			mode, err := parsePrefaultMode(value)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.prefault = mode
 		case "--out-of-core":
 			cfg.outOfCore = true
 		case "--system-prompt":
@@ -1321,22 +1346,25 @@ func analyzeGGUF(path string, cfg cliConfig) error {
 // cfg.compressOut. No weights are loaded through the normal Runner path —
 // CompressModel reads tensor bytes directly from the source file's mmap.
 func runCompress(modelPath string, cfg cliConfig) error {
+	return runCompressContext(context.Background(), modelPath, cfg)
+}
+
+func runCompressContext(ctx context.Context, modelPath string, cfg cliConfig) error {
 	if cfg.compressOut == "" {
 		return fmt.Errorf("--compress requires --compress-out <path>")
 	}
-	format, ok := gopherllm.ParseCompressFormat(cfg.compressFormat)
+	opts, ok := gopherllm.ParseCompressOptions(cfg.compressFormat)
 	if !ok {
-		return fmt.Errorf("--compress-format %q is not supported (want one of: Q8_0, Q4_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K)", cfg.compressFormat)
+		return fmt.Errorf("--compress-format %q is not supported (want one of: %s)", cfg.compressFormat, quantizeFormats)
 	}
-	if format == gopherllm.GGMLTypeQ2_K || format == gopherllm.GGMLTypeQ3_K {
-		fmt.Fprintf(os.Stderr, "Warning: %s is an aggressive low-bit target; evaluate output quality on representative prompts before replacing the source model.\n", format)
+	if opts.TargetFormat == gopherllm.GGMLTypeQ2_K || opts.TargetFormat == gopherllm.GGMLTypeQ3_K {
+		fmt.Fprintf(os.Stderr, "Warning: %s is an aggressive low-bit target; evaluate output quality on representative prompts before replacing the source model.\n", opts.TargetFormat)
 	}
-	fmt.Fprintf(os.Stderr, "Compressing %s -> %s (%s)\n", modelPath, cfg.compressOut, format)
-	if err := gopherllm.CompressModel(modelPath, cfg.compressOut, gopherllm.CompressOptions{
-		TargetFormat: format,
-		Uniform:      cfg.compressUniform,
-		LogWriter:    os.Stderr,
-	}); err != nil {
+	opts.Uniform = cfg.compressUniform
+	opts.Context = ctx
+	opts.LogWriter = os.Stderr
+	fmt.Fprintf(os.Stderr, "Compressing %s -> %s (%s)\n", modelPath, cfg.compressOut, compressTargetName(opts))
+	if err := gopherllm.CompressModel(modelPath, cfg.compressOut, opts); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Wrote %s\n", cfg.compressOut)
@@ -1535,4 +1563,17 @@ func runWithTimeout(timeout time.Duration, fn func() (gopherllm.GenerationResult
 func printStats(s gopherllm.GenerationStats) {
 	tps := float64(s.GeneratedTokens) / max(1e-9, s.DecodeTime.Seconds())
 	fmt.Fprintf(os.Stderr, "prompt=%d generated=%d ttft=%s prefill=%s decode=%s total=%s tok/s=%.2f\n", s.PromptTokens, s.GeneratedTokens, s.TTFT.Round(time.Millisecond), s.PrefillTime.Round(time.Millisecond), s.DecodeTime.Round(time.Millisecond), s.TotalTime.Round(time.Millisecond), tps)
+}
+
+func parsePrefaultMode(value string) (gopherllm.MmapPrefaultMode, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "all":
+		return gopherllm.MmapPrefaultAll, nil
+	case "core":
+		return gopherllm.MmapPrefaultCore, nil
+	case "none":
+		return gopherllm.MmapPrefaultNone, nil
+	default:
+		return 0, fmt.Errorf("invalid prefault mode %q: want all, core or none", value)
+	}
 }

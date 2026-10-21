@@ -65,7 +65,7 @@ func (r *Runner) canVerifyBlock(cache *KVCache) bool {
 		return false
 	}
 	if r.kind == loadedQwen35 {
-		return (r.canVerifyQwen35() || r.canBatchQwen35Metal(cache)) && cache.Qwen35 != nil && cache.Qwen35.bytes() <= speculativeMaxCheckpointBytes
+		return r.config.Arch == "qwen35" && (r.canVerifyQwen35() || r.canBatchQwen35Metal(cache)) && cache.Qwen35 != nil && cache.Qwen35.bytes() <= speculativeMaxCheckpointBytes
 	}
 	if !useQ8Activations.Load() && (cache.F16 || cache.I8) {
 		quantized := func(w Weight) bool { return w.F32 == nil && len(w.Raw) > 0 && !rawScalarWeight(w) }

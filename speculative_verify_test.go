@@ -50,8 +50,9 @@ func TestSpeculativeStandardLookupRuntime(t *testing.T) {
 					t.Fatal(err)
 				}
 				speculativeRequireSameResult(t, got, want)
+				// A tiny verifier can finish within one Windows timer tick.
 				stats := got.Stats.Speculation
-				if stats == nil || stats.Blocks == 0 || stats.AcceptedTokens == 0 || stats.AcceptedTokens > stats.DraftedTokens || stats.VerificationTime <= 0 {
+				if stats == nil || stats.Blocks == 0 || stats.AcceptedTokens == 0 || stats.AcceptedTokens > stats.DraftedTokens || stats.VerificationTime < 0 {
 					t.Fatalf("missing/inconsistent block statistics: %+v", stats)
 				}
 				if !slices.Equal(r.prefixCache.tokens, wantResident) || r.workspaceBuf.speculative.active {

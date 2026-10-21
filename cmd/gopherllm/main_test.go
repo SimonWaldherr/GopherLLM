@@ -102,6 +102,39 @@ func TestParseCLIOutOfCore(t *testing.T) {
 	}
 }
 
+func TestPrefaultCLIConfigAndServerReload(t *testing.T) {
+	defaults, err := parseCLI([]string{"model.gguf"})
+	if err != nil || defaults.prefault != gopherllm.MmapPrefaultCore {
+		t.Fatalf("default CLI prefault: %v, %v", defaults.prefault, err)
+	}
+	for _, mode := range []string{"all", "core", "none"} {
+		cfg, err := parseCLI([]string{"model.gguf", "--metal", "--prefault", mode})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := serverModelLoadOptions(cfg); got.Prefault.String() != mode || !got.UseMetal {
+			t.Fatalf("model reload lost prefill policy: %+v", got)
+		}
+		fromFile := cliConfig{}
+		if err := applyFileConfig(&fromFile, fileConfig{Runtime: &fileRuntimeConfig{Prefault: &mode}}); err != nil {
+			t.Fatal(err)
+		}
+		if fromFile.prefault != cfg.prefault {
+			t.Fatal("config file and CLI differ")
+		}
+	}
+	if _, err := parseCLI([]string{"model.gguf", "--prefault", "invalid"}); err == nil {
+		t.Fatal("invalid prefault mode accepted")
+	}
+	if _, err := parseCLI([]string{"model.gguf", "--prefault"}); err == nil {
+		t.Fatal("missing prefault mode accepted")
+	}
+	bad := "invalid"
+	if err := applyFileConfig(&cliConfig{}, fileConfig{Runtime: &fileRuntimeConfig{Prefault: &bad}}); err == nil {
+		t.Fatal("invalid config policy accepted")
+	}
+}
+
 func TestParseCLIDeploymentModesAndAdminTokenSources(t *testing.T) {
 	cfg, err := parseCLI([]string{"--serve", "127.0.0.1:8080", "--deployment", "managed", "--admin-token-file", "/run/secrets/admin"})
 	if err != nil {

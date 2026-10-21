@@ -45,8 +45,9 @@ dot_reduce:
 	VDUP V31.S[0], V31.S4
 	VFMLA V9.S4, V31.S4, V0.S4
 	// The scalar result keeps the original pairwise reduction tree.
-	VFADDP V0.S4, V0.S4, V0.S4
-	VFADDP V0.S4, V0.S4, V0.S4
+	// Go 1.25 requires the raw encoding for FADDP V0.4S, V0.4S, V0.4S.
+	WORD $0x6e20d400
+	WORD $0x6e20d400
 	FMOVS F0, ret+48(FP)
 	RET
 

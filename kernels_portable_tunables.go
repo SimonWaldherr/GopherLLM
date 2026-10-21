@@ -85,6 +85,15 @@ func releaseQ8(q8 []int8, xscale []float32, lease q8ScratchLease) {
 	xscaleScratchPool.Put(lease.xscale)
 }
 
+// quantizeQ8Into writes directly into caller-owned activation storage.
+// Unlike acquireQ8 it needs no temporary lease or subsequent copy.
+func quantizeQ8Into(x []float32, q8 []int8, scales []float32) {
+	if len(x)%256 != 0 || len(q8) < len(x) || len(scales) < len(x)/256 {
+		panic("gopherllm: invalid Q8 activation buffers")
+	}
+	q8kQuantize(x, q8, scales, len(x)/256)
+}
+
 func dotQ4KRowsQ8(data []byte, q8 []int8, xscale, xsums []float32, cols, rowBytes, start, end int, out []float32) {
 	blocks := cols / 256
 	for r := start; r < end; r++ {

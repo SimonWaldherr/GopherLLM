@@ -111,8 +111,8 @@ and optionally runs Ministral for task suggestions and row explanations.
   GGUFs run through GopherLLM's own inference engine.
 - Direct Hugging Face GGUF imports with cache reuse, split-model downloads,
   private/gated-model tokens, and revision selection.
-- `--compress`: requantize any GGUF to Q8_0/Q4_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K, writing
-  a smaller, independently loadable file (see
+- `quantize` / `--compress`: convert local GGUF weights to Q8_0/Q4_0/Q2_K/Q3_K/
+  Q4_K/Q5_K/Q6_K or mixed Q4_K_M/Q5_K_M presets, writing an independently loadable file (see
   [Model Compression](#model-compression)).
 - Native Laya and compatible ModernBERT/mmBERT decision checkpoints: Hugging
   Face downloads, `choice`/`score`/`noul` classification, and a Jev-style
@@ -917,61 +917,67 @@ The same features are available in the library as `AnalyzeGGUF`,
 
 ## Model Compression
 
-Requantize a GGUF to a smaller format and write it to a new file:
+Quantize a local GGUF with positional arguments, like `llama-quantize`:
 
 ```sh
-bin/gopherllm /path/to/model.gguf --compress --compress-format Q4_K --compress-out smaller.gguf
+bin/gopherllm quantize model-f16.gguf model-Q4_K_M.gguf Q4_K_M
+# Optional: limit CPU workers
+bin/gopherllm quantize model-f16.gguf model-Q5_K_M.gguf Q5_K_M --threads 8
 ```
 
-Supported target formats: `Q8_0`, `Q4_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`,
-`Q6_K`. Every eligible weight matrix (2-D or higher, row length divisible by
-the target format's block size — 32 for Q8_0/Q4_0, 256 for K-quants) is
-dequantized, if not already plain float, and requantized with
-round-to-nearest; norm/bias vectors and any tensor that doesn't fit the target
-block size are copied through unchanged. `Q3_K` reduces packed weight traffic
-by about 24% relative to Q4_K (110 vs. 144 bytes per 256 weights); `Q2_K`
-reduces it about 42% (84 vs. 144 bytes), but both are explicitly quality-for-
-speed trade-offs and should be evaluated on representative prompts.
-They currently use the CPU quantized kernels rather than the selective
-Q4_K/Q6_K Metal fast path, so use `--bench-json` on the deployment machine
-before choosing a low-bit artifact for GPU inference.
-The result is an ordinary, independently loadable GGUF — no relationship to
-the source file is retained, and the output is re-parsed and spot-checked
-against the plan before `--compress` reports success.
-
-The token embedding and output/LM-head tensors are floored at Q6_K rather
-than following an aggressive target format down to e.g. Q4_0 — the same
-convention llama.cpp's own `quantize` tool uses, since those two tensors are
-disproportionately sensitive to quantization error. Pass `--compress-uniform`
-to quantize them to the main target format like everything else instead.
-
-`--compress-out` must name a different file than the source: the source
-stays memory-mapped and readable throughout, so writing over it in place
-would corrupt the mapping mid-read. Compress to a new path and rename it
-afterward if you want to replace the original. A source that is one shard
-of a split/sharded GGUF (`split.count` in its metadata) is rejected with a
-clear error rather than silently compressing only that shard's tensors —
-point `--compress` at a single merged file.
+Supported targets: `Q8_0`, `Q4_0`, `Q2_K`, `Q3_K`, `Q4_K`, `Q4_K_M`,
+`Q5_K`, `Q5_K_M`, and `Q6_K`. Float sources (F32, F16, BF16, F64) and
+supported quantized sources can be converted. Existing command-line flags
+remain available:
 
 ```sh
-$ bin/gopherllm model-f16.gguf --compress --compress-format Q4_K --compress-out model-q4_k.gguf
-Compressing model-f16.gguf -> model-q4_k.gguf (Q4_K)
-requantize blk.0.attn_q.weight              F16 -> Q4_K (393216 bytes -> 110592 bytes)
-...
-total: 6871947264 bytes -> 2147024896 bytes (31.2%)
-Wrote model-q4_k.gguf
+bin/gopherllm model-f16.gguf --compress --compress-format Q4_K_M --compress-out model-Q4_K_M.gguf
 ```
 
-This is plain round-to-nearest quantization today — no calibration data, no
-weighted error minimization (unlike llama.cpp's `imatrix`-guided quantize).
-It's the foundation a planned calibration-aware toolkit (GPTQ, AWQ,
-SmoothQuant, and SparseGPT-style pruning) builds on, to get closer to
-`llm-compressor`-style quality at low bit-widths; that work targets the
-mainline dense-transformer attention/FFN tensors specifically and hasn't
-landed yet.
+`Q4_K_M` and `Q5_K_M` are mixed tensor presets, rather than aliases for a
+single GGML type. They use Q4_K or Q5_K for most matrices and Q6_K for
+selected attention-value and FFN-down projections and the output head.
+A separate input embedding keeps the base type; a tied embedding receives
+the output-head upgrade. Small tensors, normalization weights, expert
+routers, and recurrent convolution kernels retain their source precision.
+The planner also accounts for MoE/hybrid layouts and uses Q5_0, Q5_1, Q8_0,
+or F16 when a matrix's row width cannot fit the selected block layout.
+This tensor policy follows [llama.cpp's mixed presets](https://github.com/ggml-org/llama.cpp/blob/master/src/llama-quant.cpp).
 
-The same feature is available in the library as `gopherllm.CompressModel`
-and `gopherllm.ParseCompressFormat`.
+The base targets retain the previous policy: quantize eligible matrices
+with compatible row widths, keep norm/bias vectors unchanged, and floor
+both token embeddings and output heads at Q6_K when the target is lower.
+Use `--uniform` with the subcommand, or `--compress-uniform` with the legacy
+flags, to disable that floor. Uniform mode cannot be combined with a mixed
+preset; choose its base type (`Q4_K` or `Q5_K`) instead.
+
+Conversion streams row chunks with an 8 MiB shared float/output scratch
+budget, plus the writer buffer and one encoded row per active worker. A
+single oversized row is the minimum chunk. Entire MoE expert banks are
+never expanded into float32 at once. The source stays memory-mapped;
+normal OS page-cache usage is additional to this scratch budget.
+
+Output is a normal, independently loadable GGUF, with updated file-type and
+quantization-version metadata and preserved tokenizer/model metadata. A
+sibling temporary file is flushed, closed, and its tensor descriptors and
+byte ranges verified before replacing the destination. Conversion errors
+or cancellation preserve an existing destination and remove the temporary
+file. Input and output must identify different files, including through
+symlinks or hardlinks. Split GGUF shards must be merged first.
+
+The encoders use plain round-to-nearest (RTN), without calibration data or
+weighted error optimization. Matching a llama.cpp preset's tensor policy
+does **not** promise identical bytes, perplexity, or model quality. Evaluate
+the converted model on representative tasks before choosing a low-bit
+artifact. Q3_K and Q2_K reduce packed weight traffic relative to Q4_K by
+about 24% and 42%, respectively, with a larger quality trade-off. They use
+the CPU quantized kernels rather than the selective Q4_K/Q6_K Metal path;
+measure `--bench-json` on the deployment machine.
+
+The library API is `CompressModel(source, output, options)`.
+`ParseCompressOptions("Q4_K_M")` retains the mixed preset in
+`CompressOptions.Preset`; the older `ParseCompressFormat` returns only its
+base GGML type. Set `CompressOptions.Context` for cancellation.
 
 ## Auto Mode (hardware autotuning)
 
@@ -1511,10 +1517,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   falls back to the f16 or f32 cache instead of silently corrupting attention.
   Scalar-only for now (no AVX2/NEON kernels yet); not part of `--auto`'s
   search.
-- After mmap'ing a single-file GGUF, every page is touched once up front
-  across all worker threads (`prefaultPages`) before the model is reported
-  loaded. A memory-mapped file only pages in on first touch, and a forward
-  pass touches essentially every weight byte — without this, the *first*
+- After mmap'ing a single-file GGUF, the CLI warms backbone tensors across
+  worker threads before reporting the model loaded (`--prefault core`).
+  Packed sparse expert banks remain demand-paged. `--prefault all` touches
+  every page up front, matching the library's zero-value load policy.
+  A memory-mapped file only pages in on first touch. A dense forward pass
+  touches essentially every weight byte — without warm-up, the *first*
   request after startup silently inherited that page-in cost (disk I/O, or on
   Windows, real-time antivirus scanning of each mapped page) inside its own
   TTFT instead of load time. For a one-shot CLI run this doesn't change total
@@ -1706,8 +1714,8 @@ and every `[input, output, expert]` tensor before loading; Mixtral/Qwen3 use
 top-k-renormalized routing, while Qwen2-MoE preserves its full-router mass and
 adds its gated shared expert. `gpt-oss` uses the same sparse foundation with
 its expert/router biases, OAI-SwiGLU activation, learned attention sinks, and
-alternating local/full-attention schedule. Sparse MoE prompt prefill stays
-per-token so the decode graph and its quantized expert kernels are shared.
+alternating local/full-attention schedule. These sparse graphs share the
+per-token decode kernels; Qwen3.5-MoE also has the grouped prefill path below.
 
 The common sparse graph and native Gemma 4 A4B coalesce eligible selected
 experts' gate/up and down projections into one worker dispatch per stage.
@@ -1717,6 +1725,89 @@ supports F32, Q4_K, Q5_K, Q6_K, Q8_0 and MXFP4, provided gate/up batching is
 available. It reuses existing CPU SIMD kernels and bounds additional down-stage
 scratch to 8 MiB and 32 active experts; other layouts retain per-expert decode.
 Set `GOPHERLLM_NO_MOE_DOWN_BATCH=1` to disable down batching.
+
+Gate/up dispatch tasks are pooled and cleared after use, so they retain no
+model mappings or request buffers. On M2 Max with Go 1.25.3, eight threads,
+eight active experts and 2048×512 projections, the warmed
+`BenchmarkExpertGateUpBatch` went from five allocations per Q4_K/Q6_K call
+to zero (F32: three to zero). Compatible CPU shared experts also combine
+gate/up into one dispatch and reuse activation preprocessing; direct GPU and
+prepared projections keep their existing kernels. These changes apply to
+serial prefill and decoding, including the CPU expert work in Metal models.
+`TestMoEConfiguredSharedParity` compares every shared-expert layer of a local
+Qwen3.5-MoE checkpoint with the original separate projections. Alternating
+timing runs encountered competing builds in all 32 host-load samples, so the
+allocation reduction is verified but no additional throughput or paging gain
+is claimed from those runs.
+
+Down projections prepare all selected experts' activation blocks in one pass,
+using one temporary Q8/scales buffer pair instead of one pair per expert.
+Block scales and offset sums remain independent, and expert outputs retain
+their original reduction order. The grouped prefill path also quantizes
+directly into its existing workspace, avoiding the temporary-buffer copy.
+`TestMoEConfiguredDownParity` checks all routed FFNs against separately
+dispatched down projections; Ornith's 40 layers match exactly with both CPU
+and Metal loading. `BenchmarkExpertDownInputs` isolates input preparation
+from matrix multiplication and worker dispatch. On M2 Max, Go 1.25.3, one
+thread and eight 512-wide expert inputs, four alternating pairs measured
+median preparation times of 2.503 µs → 2.306 µs for Q4_K and 2.810 µs →
+2.612 µs for Q6_K (7.9% and 7.1% less time). No competing compiler/test
+process appeared in 32 host-load samples. These are preparation timings,
+not full-model token throughput. ARM64 SIMD and portable tests pass;
+AMD64 fallback tests also pass under Rosetta; the AMD64 Q8 tests are skipped
+there because the required CPU features are unavailable.
+
+Bias-free SwiGLU experts with eight-lane-aligned hidden rows also share one
+activation call across the slab. Biases, GPT-OSS activations and scalar tails
+retain per-expert evaluation. `BenchmarkMoEActivation` measured 3.477 µs
+per-expert versus 3.426 µs batched for eight 512-wide experts on M2 Max
+(Go 1.25.3, one thread, four alternating pairs, no competing compiler/test
+process in 39 load samples). This is a small activation-stage saving of
+1.5%; the 32-expert case showed no clear benefit. The arithmetic and
+reduction order are unchanged, with bit-exact output checks.
+
+An experimental Qwen3.5-MoE/Ornith prefill groups up to 32 tokens by selected
+expert, streams that expert's gate/up/down rows across its matching tokens,
+distributes work by each group's token count, and retains the original router
+order when summing each token's result. It reuses the CPU Q8
+activation kernels, including ARM's four-position Q4_K/Q6_K row kernels.
+Attention and DeltaNet stay chronological and retain their CPU/Metal choices.
+Additional grouped-expert scratch is limited to 16 MiB per decode workspace;
+expert banks stay mapped and are never copied to Metal or expanded to floats.
+This path requires Q8 activations, F32 KV, Q4_K/Q6_K gate/up, and a supported
+quantized down projection. Compressed KV, out-of-core, unsupported layouts
+and MTP-enabled sparse prefill keep their established schedule.
+Enable it explicitly with `GOPHERLLM_MOE_PREFILL=1`;
+`GOPHERLLM_NO_MOE_PREFILL=1` disables it again for comparison. It stays off by
+default: isolated-layer savings have not translated into a repeatable
+full-model latency improvement under memory pressure.
+
+Metal loading without `--prepare-quant` skips the separate token embedding
+and Qwen3.5-MoE projection pairs that always execute in fused CPU kernels.
+Tied output heads and used GPU projections retain their accelerator resources.
+The CLI defaults to `--prefault core`, warming backbone tensors without eagerly reading every
+expert bank; `--prefault all` restores full warm-up, and `none` leaves all
+weights demand-paged. The library's zero-value load option still means `all`;
+`--out-of-core` remains CPU-only. Avoid `--prepare-quant` when minimizing RAM
+use. The operating system can still evict mapped pages under memory pressure.
+
+On macOS, `TestMoEConfiguredPrefillParity` compares complete 64-token
+responses with grouping on/off, clears conversation caches for each request,
+and reports prefill/decode times, process-local major/minor faults and scratch
+bytes. On an M2 Max with 32 GB, three alternating pairs after a warmup
+(45 prompt tokens, 64 generated tokens, eight threads, Q8 activations,
+F32 KV, no prepared weights, prefault=none) reproduced identical output IDs
+within each backend. A follow-up with other builds paused recorded median
+CPU prefill of 10.206 s serial versus 11.316 s grouped; complete-request
+latency was 23.435 s versus 25.363 s, and median major faults were 722,232
+versus 745,751. This remains an observation under memory pressure, with no
+continuous host-load monitoring for the CPU series. A fresh Metal series
+also passed output parity, but host-load monitoring captured other Go
+compilers or test binaries in 25 of 39 samples; those timings are unsuitable
+for a speedup claim. These results do not justify enabling grouped prefill
+by default or claiming a decode gain.
+Use the same `GOPHERLLM_MOE_MODEL` and optional
+`GOPHERLLM_MOE_METAL=1` settings as the generation benchmark below.
 
 With Ornith-1.0-35B Q4_K_M on M2 Max, eight CPU threads and Q8 activations,
 three alternating warm pairs generated the same 64 tokens. Median CPU-only

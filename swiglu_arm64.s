@@ -1,6 +1,7 @@
 //go:build arm64
 
 #include "textflag.h"
+#include "arm64_fp_compat.h"
 
 // func siluMulF32NEON(gate, up, out *float32, n int)
 //
@@ -47,13 +48,13 @@ swiglu_loop4:
 	VLD1.P 16(R1), [V1.S4]
 	// Saturated lanes still multiply the original gate at the end. Clamp
 	// only the exponential input to keep exponent construction in range.
-	VFMAX V25.S4, V0.S4, V2.S4
-	VFMIN V24.S4, V2.S4, V2.S4
+	FMAX4S(2, 0, 25)
+	FMIN4S(2, 2, 24)
 	VEOR V28.B16, V2.B16, V2.B16
 
 	// k = trunc(fma(x, invLn2, copysign(0.5, x))). A comparison rather
 	// than the sign bit treats -0 like the scalar t >= 0 branch.
-	VFCMLT $(0.0), V2.S4, V3.S4
+	FCMLTZ4S(3, 2)
 	VAND V28.B16, V3.B16, V3.B16
 	VORR V22.B16, V3.B16, V3.B16
 	VFMLA V16.S4, V2.S4, V3.S4
@@ -83,19 +84,19 @@ swiglu_loop4:
 	VFMLA V9.S4, V2.S4, V10.S4
 	VADD V27.S4, V3.S4, V3.S4
 	VSHL $23, V3.S4, V3.S4
-	VFMUL V3.S4, V10.S4, V10.S4
-	VFADD V23.S4, V10.S4, V9.S4
-	VFDIV V9.S4, V23.S4, V9.S4
+	FMUL4S(10, 10, 3)
+	FADD4S(9, 10, 23)
+	FDIV4S(9, 23, 9)
 
 	// Match SigmoidF32's exact early returns at both saturation bounds.
-	VFCMGE V24.S4, V0.S4, V4.S4
-	VFCMGE V0.S4, V25.S4, V5.S4
+	FCMGE4S(4, 0, 24)
+	FCMGE4S(5, 25, 0)
 	VAND V4.B16, V23.B16, V10.B16
-	VBIC V4.B16, V9.B16, V9.B16
+	BIC16B(9, 9, 4)
 	VORR V10.B16, V9.B16, V9.B16
-	VBIC V5.B16, V9.B16, V9.B16
-	VFMUL V0.S4, V9.S4, V9.S4
-	VFMUL V1.S4, V9.S4, V9.S4
+	BIC16B(9, 9, 5)
+	FMUL4S(9, 9, 0)
+	FMUL4S(9, 9, 1)
 	VST1.P [V9.S4], 16(R2)
 	SUB $4, R3, R3
 	CBNZ R3, swiglu_loop4

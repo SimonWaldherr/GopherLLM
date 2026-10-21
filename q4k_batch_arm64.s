@@ -1,6 +1,7 @@
 //go:build arm64
 
 #include "textflag.h"
+#include "arm64_fp_compat.h"
 
 #define SDOT(Vd, Vn, Vm) WORD $(0x4E809400 | ((Vm)<<16) | ((Vn)<<5) | (Vd))
 
@@ -82,7 +83,7 @@ batch_group:
 // sub-block order, as in combineQ4KStyle and q4kRowDecodeAsm.
 #define BATCHQ4COMBINE() \
  VDUP R23, V21.S4 \
- VMLA V21.S4, V16.S4, V30.S4 \
+ MLA4S(30, 16, 21) \
  SCVTFWS R24, F22 \
  VDUP V22.S[0], V22.S4 \
  VLD1.P 4(R5), V6.S[0] \
@@ -116,10 +117,10 @@ batch_group:
  VLD1.P 4(R12), V16.S[3] \
  VDUP V24.S[0], V24.S4 \
  VDUP V25.S[0], V25.S4 \
- VFMUL V24.S4, V16.S4, V16.S4 \
- VFMUL V30.S4, V16.S4, V16.S4 \
+ FMUL4S(16, 16, 24) \
+ FMUL4S(16, 16, 30) \
  VFMLS V25.S4, V26.S4, V16.S4 \
- VFADD V16.S4, V31.S4, V31.S4
+ FADD4S(31, 31, 16)
 
 // func q4kRows4Asm(row *byte, q8 *int8, scales, sums, lut *float32, cols, blocks int, out *float32)
 TEXT ·q4kRows4Asm(SB), NOSPLIT|NOFRAME, $0-64

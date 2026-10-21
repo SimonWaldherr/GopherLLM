@@ -60,6 +60,7 @@ type fileRuntimeConfig struct {
 	Metal        *bool   `json:"metal,omitempty"`
 	PrepareQuant *bool   `json:"prepare_quant,omitempty"`
 	OutOfCore    *bool   `json:"out_of_core,omitempty"`
+	Prefault     *string `json:"prefault,omitempty"`
 	Timeout      *string `json:"timeout,omitempty"`
 	AutoTune     *bool   `json:"auto_tune,omitempty"`
 	AutoRefresh  *bool   `json:"auto_refresh,omitempty"`
@@ -306,6 +307,13 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		if r.OutOfCore != nil {
 			cfg.outOfCore = *r.OutOfCore
 		}
+		if r.Prefault != nil {
+			mode, err := parsePrefaultMode(*r.Prefault)
+			if err != nil {
+				return fmt.Errorf("config runtime.prefault: %w", err)
+			}
+			cfg.prefault = mode
+		}
 		if r.Timeout != nil {
 			d, err := time.ParseDuration(*r.Timeout)
 			if err != nil || d <= 0 {
@@ -468,6 +476,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		Metal        *bool  `json:"metal,omitempty"`
 		PrepareQuant bool   `json:"prepare_quant,omitempty"`
 		OutOfCore    bool   `json:"out_of_core,omitempty"`
+		Prefault     string `json:"prefault,omitempty"`
 		Timeout      string `json:"timeout,omitempty"`
 		AutoTune     bool   `json:"auto_tune,omitempty"`
 		AutoRefresh  bool   `json:"auto_refresh,omitempty"`
@@ -528,6 +537,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		Runtime: effectiveRuntimeConfig{
 			PrepareQuant: cfg.prepareQuant,
 			OutOfCore:    cfg.outOfCore,
+			Prefault:     cfg.prefault.String(),
 			AutoTune:     cfg.autoTune,
 			AutoRefresh:  cfg.autoTuneRefresh,
 			AutoEffort:   cfg.autoTuneEffort,

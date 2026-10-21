@@ -9,7 +9,6 @@ import (
 )
 
 const (
-	metalQ4KDirectMinRows = 8192
 	metalQ5KDirectMinRows = 3072
 	metalQ6KDirectMinRows = 3072
 	// Bound the process-wide Metal prefill workspace. Larger externally supplied

@@ -1,6 +1,7 @@
 //go:build arm64
 
 #include "textflag.h"
+#include "arm64_fp_compat.h"
 
 // NEON int8 dot-product kernels for the Q8K activation path on arm64.
 //
@@ -736,10 +737,10 @@ TEXT ·q3kQ8Dots16Asm(SB), NOSPLIT|NOFRAME, $0-32
 // narrowing would change the portable results when subnormal absmax makes
 // inv infinite. NaN comparisons are masked out before the maximum reduction.
 #define Q8KQUANT(N,V) \
- VFMUL V29.S4, V.S4, V.S4 \
- VFABS V.S4, V8.S4 \
- VFADD V30.S4, V8.S4, V8.S4 \
- VFSUB V30.S4, V8.S4, V8.S4 \
+ FMUL4S(N, N, 29) \
+ FABS4S(8, N) \
+ FADD4S(8, 8, 30) \
+ FSUB4S(8, 8, 30) \
  VAND V31.B16, V.B16, V.B16 \
  VORR V8.B16, V.B16, V.B16 \
  WORD $(0x4ea1b800 | ((N)<<5) | (N)) // fcvtzs vN.4s, vN.4s
@@ -765,29 +766,29 @@ q8quant_block:
  MOVD $16, R5
 q8quant_max:
  VLD1.P 64(R6), [V0.S4, V1.S4, V2.S4, V3.S4]
- VFCMEQ V0.S4, V0.S4, V4.S4
- VFCMEQ V1.S4, V1.S4, V5.S4
- VFCMEQ V2.S4, V2.S4, V6.S4
- VFCMEQ V3.S4, V3.S4, V7.S4
+ FCMEQ4S(4, 0, 0)
+ FCMEQ4S(5, 1, 1)
+ FCMEQ4S(6, 2, 2)
+ FCMEQ4S(7, 3, 3)
  VAND V4.B16, V0.B16, V0.B16
  VAND V5.B16, V1.B16, V1.B16
  VAND V6.B16, V2.B16, V2.B16
  VAND V7.B16, V3.B16, V3.B16
- VFABS V0.S4, V0.S4
- VFABS V1.S4, V1.S4
- VFABS V2.S4, V2.S4
- VFABS V3.S4, V3.S4
- VFMAX V0.S4, V16.S4, V16.S4
- VFMAX V1.S4, V17.S4, V17.S4
- VFMAX V2.S4, V18.S4, V18.S4
- VFMAX V3.S4, V19.S4, V19.S4
+ FABS4S(0, 0)
+ FABS4S(1, 1)
+ FABS4S(2, 2)
+ FABS4S(3, 3)
+ FMAX4S(16, 16, 0)
+ FMAX4S(17, 17, 1)
+ FMAX4S(18, 18, 2)
+ FMAX4S(19, 19, 3)
  SUB $1, R5
  CBNZ R5, q8quant_max
- VFMAX V17.S4, V16.S4, V16.S4
- VFMAX V19.S4, V18.S4, V18.S4
- VFMAX V18.S4, V16.S4, V16.S4
- VFMAXP V16.S4, V16.S4, V16.S4
- VFMAXP V16.S4, V16.S4, V16.S4
+ FMAX4S(16, 16, 17)
+ FMAX4S(18, 18, 19)
+ FMAX4S(16, 16, 18)
+ FMAXP4S(16, 16, 16)
+ FMAXP4S(16, 16, 16)
  FMOVS F16, R4
  CBZ R4, q8quant_zero
  FDIVS F28, F16, F0
@@ -801,12 +802,12 @@ q8quant_convert:
  Q8KQUANT(1,V1)
  Q8KQUANT(2,V2)
  Q8KQUANT(3,V3)
- VXTN V0.S4, V4.H4
- VXTN2 V1.S4, V4.H8
- VXTN V2.S4, V5.H4
- VXTN2 V3.S4, V5.H8
- VXTN V4.H8, V6.B8
- VXTN2 V5.H8, V6.B16
+ XTN4H(4, 0)
+ XTN8H(4, 1)
+ XTN4H(5, 2)
+ XTN8H(5, 3)
+ XTN8B(6, 4)
+ XTN16B(6, 5)
  VST1.P [V6.B16], 16(R1)
  SUB $1, R5
  CBNZ R5, q8quant_convert

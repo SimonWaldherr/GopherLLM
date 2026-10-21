@@ -403,6 +403,9 @@ func NewGGUFWriter(w io.Writer, metadata map[string]MetaValue, planned []Planned
 // up to the next tensor's aligned offset (or, for the last tensor, does
 // nothing further — call Close to flush).
 func (gw *GGUFWriter) WriteTensor(data []byte) error {
+	if gw.cw.err != nil {
+		return gw.cw.err
+	}
 	if gw.next >= len(gw.tensors) {
 		return fmt.Errorf("WriteTensor called more times than planned (%d tensors)", len(gw.tensors))
 	}
@@ -415,8 +418,73 @@ func (gw *GGUFWriter) WriteTensor(data []byte) error {
 	if !ok || len(data) != want {
 		return fmt.Errorf("tensor %q: got %d bytes, want %d", t.Name, len(data), want)
 	}
-	if _, err := gw.cw.Write(data); err != nil {
+	return gw.WriteTensorStream(func(w io.Writer) error {
+		_, err := w.Write(data)
 		return err
+	})
+}
+
+// tensorStreamWriter limits one callback to its tensor's planned byte range.
+// The sticky error also catches callbacks which ignore a failed Write.
+type tensorStreamWriter struct {
+	w         io.Writer
+	remaining int
+	err       error
+}
+
+func (w *tensorStreamWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if len(p) > w.remaining {
+		w.err = fmt.Errorf("tensor stream exceeds its planned size by %d bytes", len(p)-w.remaining)
+		return 0, w.err
+	}
+	n, err := w.w.Write(p)
+	if n < 0 || n > len(p) {
+		n, err = 0, io.ErrShortWrite
+	} else if n != len(p) && err == nil {
+		err = io.ErrShortWrite
+	}
+	w.remaining -= n
+	w.err = err
+	return n, err
+}
+
+// WriteTensorStream writes the next planned tensor without buffering its whole
+// payload. write must emit exactly the planned byte count. An incomplete stream,
+// overrun, or callback error permanently invalidates the writer: later writes
+// and Close return that error instead of accepting a partially written tensor.
+// The callback must finish using its writer before returning.
+func (gw *GGUFWriter) WriteTensorStream(write func(io.Writer) error) error {
+	if gw.cw.err != nil {
+		return gw.cw.err
+	}
+	if gw.next >= len(gw.tensors) {
+		return fmt.Errorf("WriteTensorStream called more times than planned (%d tensors)", len(gw.tensors))
+	}
+	t := gw.tensors[gw.next]
+	size, ok := t.DType.DataSize(t.Numel())
+	if !ok {
+		gw.cw.err = fmt.Errorf("tensor %q: unsupported output type %s", t.Name, t.DType)
+		return gw.cw.err
+	}
+	stream := &tensorStreamWriter{w: gw.cw, remaining: size}
+	var err error
+	if write == nil {
+		err = fmt.Errorf("nil tensor stream callback")
+	} else {
+		err = write(stream)
+	}
+	if err == nil {
+		err = stream.err
+	}
+	if err == nil && stream.remaining != 0 {
+		err = fmt.Errorf("%w: %d bytes missing", io.ErrUnexpectedEOF, stream.remaining)
+	}
+	if err != nil {
+		gw.cw.err = fmt.Errorf("tensor %q: %w", t.Name, err)
+		return gw.cw.err
 	}
 	gw.next++
 	if gw.next < len(gw.tensors) {
@@ -436,11 +504,12 @@ func (gw *GGUFWriter) WriteTensor(data []byte) error {
 // Close flushes any buffered output. It does not close the underlying
 // io.Writer (NewGGUFWriter never took ownership of it).
 func (gw *GGUFWriter) Close() error {
-	if gw.next != len(gw.tensors) {
-		return fmt.Errorf("GGUFWriter closed after %d of %d planned tensors", gw.next, len(gw.tensors))
-	}
 	if gw.cw.err != nil {
 		return gw.cw.err
 	}
-	return gw.cw.bw.Flush()
+	if gw.next != len(gw.tensors) {
+		return fmt.Errorf("GGUFWriter closed after %d of %d planned tensors", gw.next, len(gw.tensors))
+	}
+	gw.cw.err = gw.cw.bw.Flush()
+	return gw.cw.err
 }

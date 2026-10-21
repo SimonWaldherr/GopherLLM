@@ -2,6 +2,10 @@
 
 #include "textflag.h"
 
+// Go 1.25 does not recognize VFADDP. Encode the ARMv8 FADDP instruction
+// directly, retaining the same pairwise floating-point reduction tree.
+#define FADDP4S(Vd, Vn, Vm) WORD $(0x6e20d400 | ((Vm)<<16) | ((Vn)<<5) | (Vd))
+
 // Four f32 dot products sharing x. The accumulation tree intentionally
 // matches dotF32 so grouped and separate attention remain numerically stable.
 // func dotF32x4(q0, q1, q2, q3, x *float32, n int) (s0, s1, s2, s3 float32)
@@ -97,9 +101,9 @@ dot4_reduce:
 
 	// Pairwise reduction preserves each head's exact scalar addition tree.
 	// First interleave the two pair sums per head, then sum those pairs.
-	VFADDP V4.S4, V0.S4, V16.S4
-	VFADDP V12.S4, V8.S4, V17.S4
-	VFADDP V17.S4, V16.S4, V18.S4
+	FADDP4S(16, 0, 4)
+	FADDP4S(17, 8, 12)
+	FADDP4S(18, 16, 17)
 	VDUP V18.S[0], V24.S4
 	VDUP V18.S[1], V25.S4
 	VDUP V18.S[2], V26.S4
@@ -316,9 +320,9 @@ dotf16x4_reduce:
 	VFMLA V5.S4, V31.S4, V4.S4
 	VFMLA V7.S4, V31.S4, V6.S4
 
-	VFADDP V2.S4, V0.S4, V16.S4
-	VFADDP V6.S4, V4.S4, V17.S4
-	VFADDP V17.S4, V16.S4, V18.S4
+	FADDP4S(16, 0, 2)
+	FADDP4S(17, 4, 6)
+	FADDP4S(18, 16, 17)
 	MOVD $s0+48(FP), R0
 	VST1 [V18.S4], (R0)
 	RET

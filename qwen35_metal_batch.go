@@ -6,7 +6,8 @@ import (
 	"os"
 )
 
-// canBatchQwen35Metal admits the FFN batching schedule below. Mixer
+// canBatchQwen35Metal admits dense Metal FFNs or grouped sparse CPU experts.
+// It selects the mixed execution schedule below. Mixer
 // projections retain their original GPU/CPU arithmetic choices.
 // Compressed KV and unsupported FFNs remain on the existing serial path.
 func (r *Runner) canBatchQwen35Metal(cache *KVCache) bool {
@@ -16,7 +17,7 @@ func (r *Runner) canBatchQwen35Metal(cache *KVCache) bool {
 }
 
 func qwen35MetalBatchEligible(cfg Config, weights Qwen35Weights, cache *KVCache) bool {
-	if cfg.Arch != "qwen35" || cfg.NLayers <= 0 || len(weights.Layers) != cfg.NLayers ||
+	if (cfg.Arch != "qwen35" && cfg.Arch != "qwen35moe") || cfg.NLayers <= 0 || len(weights.Layers) != cfg.NLayers ||
 		cache == nil || cache.F16 || cache.I8 || cache.Qwen35 == nil ||
 		cache.layerCount() != qwen35AttentionLayerCount(weights) || cache.Qwen35.Layers != qwen35RecurrentLayerCount(weights) ||
 		cache.PerPosKDim != cfg.NKVHeads*cfg.HeadDim || cache.PerPosVDim != cfg.NKVHeads*cfg.ValueDim ||
@@ -25,7 +26,11 @@ func qwen35MetalBatchEligible(cfg Config, weights Qwen35Weights, cache *KVCache)
 	}
 	for _, layer := range weights.Layers {
 		w := layer.FFN
-		if w.MoE != nil || w.Gate.GPU != nil || w.Up.GPU != nil || w.Down.GPU != nil ||
+		if cfg.Arch == "qwen35moe" {
+			if !moePrefillEnabled() || !moePrefillReady(w.MoE, 32) {
+				return false
+			}
+		} else if w.MoE != nil || w.Gate.GPU != nil || w.Up.GPU != nil || w.Down.GPU != nil ||
 			w.Gate.Cols != cfg.Dim || w.Up.Cols != cfg.Dim || w.Down.Rows != cfg.Dim ||
 			!metalQwen35FFNBatchReady(w.Gate.Metal, w.Up.Metal, w.Down.Metal) {
 			return false
@@ -47,7 +52,8 @@ func qwen35MetalBatchEligible(cfg Config, weights Qwen35Weights, cache *KVCache)
 
 // forwardQwen35MetalBatchStatesInto keeps every recurrent and full-attention
 // step in its established chronological CPU/Metal path. FFNs stream all
-// positions together on Metal; eligible DeltaNet output projections reuse
+// positions together on Metal, or group sparse CPU experts across positions.
+// Eligible DeltaNet output projections reuse
 // their CPU-Q8 weights across positions. This preserves the mixed execution model:
 // a CPU-Q8 projection is never silently replaced by a GPU-float projection.
 // The returned normalized rows borrow buf.qwenBatch.XN. As with the CPU hybrid
@@ -62,7 +68,7 @@ func forwardQwen35MetalBatchStatesInto(ctx context.Context, cfg Config, weights 
 		return nil, nil
 	}
 	if p > 32 || buf == nil || !qwen35MetalBatchEligible(cfg, weights, cache) || start < 0 || start > cache.MaxLen || p > cache.MaxLen-start {
-		return nil, fmt.Errorf("gopherllm: Qwen Metal block requires supported dense FFNs, F32 KV and a valid range of at most 32 tokens")
+		return nil, fmt.Errorf("gopherllm: Qwen Metal block requires supported FFNs, F32 KV and a valid range of at most 32 tokens")
 	}
 	b := &buf.qwenBatch
 	X := reuseBatchViews(&b.XFlat, &b.X, p, cfg.Dim)
@@ -133,7 +139,11 @@ func forwardQwen35MetalBatchStatesInto(ctx context.Context, cfg Config, weights 
 		}
 		// Preserve the serial GPU reduction before the next CPU-Q8 mixer:
 		// even a 1e-8 FFN difference can cross an activation-rounding tie.
-		if !matvecMetalSwiGLUDecodeBatchInto(layer.FFN.Gate.Metal, layer.FFN.Up.Metal, layer.FFN.Down.Metal, b.XNFlat, p, &b.ProjFlat) {
+		if layer.FFN.MoE != nil {
+			if err := sparseMoEPrefill(ctx, layer.FFN.MoE, XN, Proj, buf); err != nil {
+				return nil, err
+			}
+		} else if !matvecMetalSwiGLUDecodeBatchInto(layer.FFN.Gate.Metal, layer.FFN.Up.Metal, layer.FFN.Down.Metal, b.XNFlat, p, &b.ProjFlat) {
 			// A failed GPU submission writes no projection output. Retain the
 			// original row schedule, including its existing fallback behavior.
 			for i := range tokens {

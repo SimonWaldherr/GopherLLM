@@ -99,6 +99,8 @@ type DecodeBuffer struct {
 	// moeDown retains at most 8 MiB of selected-expert activation/output
 	// scratch. Dense models never allocate it.
 	moeDown moeDownBatchScratch
+	// moePrefill retains at most 16 MiB for grouping tokens by expert.
+	moePrefill moePrefillScratch
 	// Gemma4PLE and Gemma4PLEInput retain a token's prepared E2B per-layer
 	// embedding slices and their raw embedding-row source. They are grown only
 	// when a native PLE model is used, so ordinary decoder workspaces stay the

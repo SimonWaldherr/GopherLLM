@@ -32,6 +32,38 @@ func TestSpeculativeWindowBounds(t *testing.T) {
 	}
 }
 
+func TestSpeculativeWindowZeroDurationStillBacksOffRejectedDrafts(t *testing.T) {
+	w := newSpeculativeWindow(7)
+	for pass, want := range []int{3, 1, 1, 0} {
+		n := w.limit(100, 100)
+		w.observe(speculativeWindowSample{Requested: n, Drafted: n, Emitted: 1})
+		if got := w.limit(100, 100); got != want {
+			t.Fatalf("zero-duration rejection %d: window=%d, want %d", pass+1, got, want)
+		}
+	}
+	for _, stat := range w.stats {
+		if stat.samples != 0 || stat.cost != 0 {
+			t.Fatal("zero-duration work was recorded as a timing sample")
+		}
+	}
+	// The check above consumed one pause step. The remaining pause must stay
+	// bounded, then drafting resumes at the smallest window.
+	for range speculativeSerialPause - 1 {
+		if w.limit(100, 100) != 0 {
+			t.Fatal("serial pause ended early")
+		}
+	}
+	if w.limit(100, 100) != 1 {
+		t.Fatal("serial pause did not resume drafting")
+	}
+	for range 8 {
+		w.observe(speculativeWindowSample{Drafted: 1, Accepted: 1, Emitted: 2})
+	}
+	if w.index != 0 || w.stats[0].samples != 0 {
+		t.Fatal("zero-duration accepted work caused timing-based growth")
+	}
+}
+
 func TestSpeculativeWindowIncludesSeedInVerifierSize(t *testing.T) {
 	for _, tc := range []struct {
 		maxDraft int

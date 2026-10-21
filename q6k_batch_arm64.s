@@ -1,6 +1,7 @@
 //go:build arm64
 
 #include "textflag.h"
+#include "arm64_fp_compat.h"
 
 #define SDOT(D,N,M) WORD $(0x4E809400 | ((M)<<16) | ((N)<<5) | (D))
 
@@ -43,7 +44,7 @@
 	VADDP V24.S4, V22.S4, V22.S4 \
 	MOVB.P 1(R16), R17 \
 	VDUP R17, V27.S4 \
-	VMLA V27.S4, V22.S4, V30.S4 \
+	MLA4S(30, 22, 27) \
 	WORD $(0x4e21d800 | (27<<5) | 27) \
 	VLD1.P 4(R5), V6.S[0] \
 	VLD1.P 4(R6), V6.S[1] \
@@ -59,7 +60,7 @@
 	VLD1.P 4(R10), V22.S[1] \
 	VLD1.P 4(R11), V22.S[2] \
 	VLD1.P 4(R12), V22.S[3] \
-	VFNEG V26.S4, V23.S4 \
+	FNEG4S(23, 26) \
 	VFMLA V30.S4, V22.S4, V23.S4 \
 	VDUP V25.S[0], V25.S4 \
 	VFMLA V23.S4, V25.S4, V31.S4

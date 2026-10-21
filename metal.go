@@ -80,3 +80,6 @@ type Q4KMatrix struct {
 	Rows int
 	Cols int
 }
+
+// Shared with loader policies that avoid preparing CPU-only projection pairs.
+const metalQ4KDirectMinRows = 8192

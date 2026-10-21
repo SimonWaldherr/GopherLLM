@@ -327,6 +327,10 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 		// The MTP head consumes every target hidden state in chronological
 		// order, after the target's independent projections have been batched.
 		qwenBatch := r.canBatchQwen35Metal(cache) || r.canBatchQwen35() && (mtpDraftTokens == 0 || r.canVerifyQwen35())
+		// Sparse MTP keeps its established chronological target/head path.
+		if mtpDraftTokens > 0 && r.config.Arch == "qwen35moe" {
+			qwenBatch = false
+		}
 		if qwenBatch || r.canBatchPrefill() || r.canBatchNativeGemma4() {
 			// Greedy output needs only the final normalized hidden state. Asking
 			// the batch graph to omit its vocabulary projection lets
