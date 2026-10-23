@@ -122,6 +122,20 @@ func matvecMetalQ6KInto(w *MetalWeight, x []float32, rows, cols int, out *[]floa
 	return metalbackend.MatvecQ6K(w.q6, x, *out)
 }
 
+// Batch only scheduling: direct Q6_K projections retain scalar Metal
+// arithmetic before subsequent CPU activation quantization.
+func matvecMetalQ6KDecodeBatchInto(w *MetalWeight, x []float32, batch int, out *[]float32) bool {
+	if !metalWeightUsesDirect(w) || w.typ != GGMLTypeQ6_K || w.q6 == nil || out == nil ||
+		batch <= 0 || batch > 32 || w.rows <= 0 || w.cols <= 0 || w.cols%256 != 0 ||
+		w.rows > 1<<31-1 || w.cols > 1<<31-1 || batch > len(x)/w.cols ||
+		batch > int(^uint(0)>>1)/w.rows ||
+		uint64(batch) > uint64(^uint32(0))/uint64(w.cols) || uint64(batch) > uint64(^uint32(0))/uint64(w.rows) {
+		return false
+	}
+	ensureLenNoClear(out, batch*w.rows)
+	return metalbackend.MatvecQ6KDecodeBatch(w.q6, x, *out, batch)
+}
+
 func argmaxMetalQ6K(w *MetalWeight, x []float32) (uint32, bool) {
 	return argmaxMetalQ6KPenalized(w, x, nil, 1)
 }

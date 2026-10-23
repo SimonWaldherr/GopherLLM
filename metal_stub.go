@@ -34,6 +34,10 @@ func matvecMetalQ6KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) boo
 	return false
 }
 
+func matvecMetalQ6KDecodeBatchInto(_ *MetalWeight, _ []float32, _ int, _ *[]float32) bool {
+	return false
+}
+
 func argmaxMetalQ6K(_ *MetalWeight, _ []float32) (uint32, bool) { return 0, false }
 
 func argmaxMetalQ6KPenalized(_ *MetalWeight, _ []float32, _ []uint32, _ float32) (uint32, bool) {

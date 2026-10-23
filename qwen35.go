@@ -973,25 +973,33 @@ func qwen35DeltaNetStep(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache,
 	// method dispatch for every channel; quantized/future kernels retain the
 	// general RowInto fallback.
 	f32Kernel := w.ConvKernel.F32
-	for ch := range channels {
-		kernel := buf.MambaKernel[:cfg.SSMConv]
-		if len(f32Kernel) >= (ch+1)*cfg.SSMConv {
-			kernel = f32Kernel[ch*cfg.SSMConv : (ch+1)*cfg.SSMConv]
-		} else {
-			w.ConvKernel.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
-		}
-		off := state.convOffset(layer, ch)
-		v := float32(0)
-		for k := 0; k < state.ConvLen; k++ {
-			v += kernel[k] * state.Conv[off+k]
-		}
-		v += kernel[state.ConvLen] * buf.MambaConv[ch]
-		if state.ConvLen > 0 {
-			copy(state.Conv[off:off+state.ConvLen-1], state.Conv[off+1:off+state.ConvLen])
-			state.Conv[off+state.ConvLen-1] = buf.MambaConv[ch]
-		}
-		buf.MambaConv[ch] = v * fastSigmoidF32(v)
+	convolved := false
+	if cfg.SSMConv == 4 && state.ConvLen == 3 {
+		off := state.convOffset(layer, 0)
+		convolved = qwen35Conv4(f32Kernel, state.Conv[off:off+channels*3], buf.MambaConv)
 	}
+	if !convolved {
+		for ch := range channels {
+			kernel := buf.MambaKernel[:cfg.SSMConv]
+			if len(f32Kernel) >= (ch+1)*cfg.SSMConv {
+				kernel = f32Kernel[ch*cfg.SSMConv : (ch+1)*cfg.SSMConv]
+			} else {
+				w.ConvKernel.RowInto(ch, cfg.SSMConv, &buf.MambaKernel)
+			}
+			off := state.convOffset(layer, ch)
+			v := float32(0)
+			for k := 0; k < state.ConvLen; k++ {
+				v += kernel[k] * state.Conv[off+k]
+			}
+			v += kernel[state.ConvLen] * buf.MambaConv[ch]
+			if state.ConvLen > 0 {
+				copy(state.Conv[off:off+state.ConvLen-1], state.Conv[off+1:off+state.ConvLen])
+				state.Conv[off+state.ConvLen-1] = buf.MambaConv[ch]
+			}
+			buf.MambaConv[ch] = v
+		}
+	}
+	qwen35DeltaSilu(buf.MambaConv)
 
 	ensureLenNoClear(&buf.MambaX, dInner)         // V, one vector per value head.
 	ensureLenNoClear(&buf.MambaB, nGroups*dState) // Q, one vector per key group.
@@ -1018,36 +1026,21 @@ func qwen35DeltaNetStep(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache,
 	// head its own recall span; the former one-head scratch was necessarily
 	// serial.
 	ensureLenNoClear(&buf.MambaRecall, nHeads*headDim)
-	updateHeads := func(start, end int) {
-		for h := start; h < end; h++ {
-			alpha := nemotronSoftplus(alphaInput[h] + w.DTBias[h])
-			decay := float32(math.Exp(float64(alpha * w.A[h])))
-			beta := fastSigmoidF32(betaInput[h])
-			group := h % nGroups
-			q := buf.MambaB[group*dState : group*dState+dState]
-			k := buf.MambaC[group*dState : group*dState+dState]
-			xv := buf.MambaX[h*headDim : h*headDim+headDim]
-			recall := buf.MambaRecall[h*headDim : (h+1)*headDim]
-
-			off := state.stateOffset(layer, h)
-			for d := range headDim {
-				row := state.State[off+d*headDim : off+d*headDim+headDim]
-				ScaleF32(row, decay)
-				recall[d] = DotF32(row, k)
-			}
-			for d := range headDim {
-				row := state.State[off+d*headDim : off+d*headDim+headDim]
-				delta := beta * (xv[d] - recall[d])
-				AxpyF32(row, delta, k)
-				buf.MambaY[h*headDim+d] = DotF32(row, q)
-			}
-		}
+	task := &buf.qwenDelta
+	off := state.stateOffset(layer, 0)
+	*task = qwen35DeltaTask{
+		headDim: headDim, keyDim: dState, groups: nGroups,
+		state: state.State[off : off+nHeads*headDim*headDim],
+		q:     buf.MambaB, k: buf.MambaC, v: buf.MambaX,
+		alpha: alphaInput, beta: betaInput, a: w.A, dt: w.DTBias,
+		out: buf.MambaY, recall: buf.MambaRecall,
 	}
 	if nHeads >= 8 && headDim >= 64 {
-		parallelChunks(nHeads, updateHeads)
+		parallelChunksTask(nHeads, task)
 	} else {
-		updateHeads(0, nHeads)
+		task.runRows(0, nHeads)
 	}
+	*task = qwen35DeltaTask{}
 
 	// Qwen's Gated RMSNorm normalizes the recurrent output first, then applies
 	// SiLU(z). Applying the gate before RMSNorm would mostly cancel its scale
@@ -1058,9 +1051,7 @@ func qwen35DeltaNetStep(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache,
 		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+cfg.RMSNormEps)))
 		mulScaleF32(part, w.Norm[:headDim], scale, part)
 	}
-	for i, g := range gate[:dInner] {
-		buf.MambaY[i] *= g * fastSigmoidF32(g)
-	}
+	qwen35DeltaGate(gate[:dInner], buf.MambaY)
 }
 
 // qwen35L2NormalizeInPlace applies the Qwen/FLA L2 normalization used by the

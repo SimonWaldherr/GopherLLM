@@ -78,10 +78,11 @@ type DecodeBuffer struct {
 	// rather than adding a parallel "DeltaNet*" set, since they play the same
 	// per-head-scratch role as MambaDT etc.), MambaRecall holds one distinct
 	// head-width span per head for what the state predicts for this token's key
-	// before the delta correction. This permits the independent head updates to
-	// run in parallel without per-token allocations.
+	// before the delta correction in the fallback kernel. The fused ARM64
+	// kernel keeps that value in registers instead.
 	MambaBeta   []float32
 	MambaRecall []float32
+	qwenDelta   qwen35DeltaTask
 	// QGate/AttnGate are Qwen3.5's gated-attention scratch: attn_q projects
 	// each head to [query(headDim) | gate(headDim)] rather than plain
 	// headDim, so QGate holds the raw strided projection and AttnGate the

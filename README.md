@@ -577,14 +577,15 @@ projections when restoring the accepted recurrent prefix. The MTP head batches
 catch-up from known target states, including prefill. Catch-up computes only
 embedding/hidden mixing and K/V: attention output, Q, O, FFN and vocabulary
 projections are unused because the next boundary comes from the target model.
-Eligible dense Metal hybrids batch FFNs and CPU-Q8 DeltaNet output projections.
+Eligible dense Metal hybrids batch FFNs, CPU-Q8 DeltaNet input/output
+projections and direct Q6_K QKV projections.
 Single-token and batched FFNs use the same GPU reduction order; attention and
 recurrent updates retain their chronological CPU/Metal schedule. Contracting
 Q6_K FFN down projections can be fused from 2048 rows, while standalone matvec
 thresholds stay unchanged.
-This path requires F32 KV. MoE, out-of-core and unsupported accelerator-backed
-Qwen graphs retain serial MTP. Quantized CPU Qwen projections also retain it
-when Q8 activations are disabled.
+This dense path supports F32, F16 and I8 KV. MoE, out-of-core and unsupported
+accelerator-backed Qwen graphs retain serial MTP. Quantized CPU Qwen projections
+also retain it when Q8 activations are disabled.
 For drafting, sufficiently large prepared Q/O and fused FFN matrices can stay
 on Metal. The MTP input mixing and K/V remain on the CPU so drafting and cache
 catch-up keep the same K/V arithmetic. WebGPU projection views retain full-body
@@ -1839,15 +1840,57 @@ experimental warning. Dense CPU hybrids batch attention/DeltaNet and FFN
 projections in chunks of up to 32 tokens while preserving the existing chronological
 convolution/DeltaNet recurrence and causal attention. MTP prefill uses the same
 batches and catches its separate draft head up with every target hidden state.
-Sparse experts, out-of-core models and accelerator-backed weights retain serial
-prefill. With active MTP, quantized projections also retain serial prefill when
-Q8 activations are disabled. `GOPHERLLM_NO_BATCH_PREFILL=1` disables hybrid batching.
-Float projection kernels can reduce sums differently from serial decode;
+Dense Metal hybrids preserve their decode arithmetic while batching supported
+projections and FFNs, including with F16/I8 KV. Other accelerator-backed
+layouts and out-of-core models retain serial prefill; grouped sparse prefill
+has its separate opt-in above. With active MTP, quantized CPU-only projections
+retain serial prefill when Q8 activations are disabled.
+`GOPHERLLM_NO_BATCH_PREFILL=1` disables hybrid batching.
+CPU float projection kernels can reduce sums differently from serial decode;
 F16/I8 cache rounding can therefore produce different stored bytes.
 On the M2 Max, the small quantized test graph measured 1.9–2.4× faster prefill.
 A separate check using the first four of a real 27B model's 64 layers produced
 identical logits, convolution and recurrent state for 8/32-token prompts.
 This partial-graph check is not a throughput measurement of the complete 27B model.
+
+ARM64 DeltaNet fuses decay/recall and update/output into two passes per row,
+preserving the previous dot-product reduction and rounding. Four-tap convolution,
+SiLU and output gating use NEON, and the recurrent worker task is reused without
+per-step allocations. Other architectures and unsupported dimensions retain the
+existing kernels. This includes Qwen3.8-27B GGUFs declaring `qwen35`.
+
+Metal prefill prepares independent DeltaNet inputs across up to 32 positions
+before chronological state updates. CPU projections retain Q8 row arithmetic;
+prepared and float-only inputs keep their token path. Direct Q6_K QKV retains
+the scalar GPU reduction with one submission/readback per block. Weight storage
+is unchanged. Dense F16/I8 KV uses the same schedule with token-local cache
+codecs. Tests compare state, cache bytes, replay and continuation bit-for-bit.
+
+Component benchmarks on a 32-GB M2 Max with Go 1.25.3 measured these medians
+over four alternating pairs. Parallel CPU work used eight threads.
+
+| Component | Previous | Optimized |
+| --- | ---: | ---: |
+| DeltaNet step, 48 heads × 128, excluding projections | 389.8 µs | 124.3 µs |
+| Four-tap convolution, 10240 channels, single-threaded | 47.5 µs | 14.9 µs |
+| Metal Q6_K QKV, 10240×5120 matrix, 32 positions | 37.45 ms | 13.30 ms |
+| Recurrent mixer including input/output projections, 32 positions | 72.49 ms | 34.60 ms |
+
+The projection/mixer fixtures retain one layer with repeated encoded row patterns;
+both mixer modes use the same batched output projection. These measurements
+exclude FFN, periodic full attention and vocabulary work and do not establish
+complete-model throughput.
+
+For a complete local-model comparison, set `GOPHERLLM_QWEN_PERF_MODEL` to the
+GGUF path and run `TestQwen35ConfiguredSerialPerformance`; add
+`GOPHERLLM_QWEN_PERF_METAL=1` with a `-tags metal` test build for Metal. Each
+run uses 16 raw prompt tokens, a 16-token output cap, cleared conversation
+caches, one warm-up and three samples, logging token digests and separate
+prefill/decode times. A complete Qwen3.8-27B Q4_K_M check completed four requests
+per build: all eight emitted 16 tokens with identical token digests. Paging and
+concurrent compiler/simulator activity prevented a reliable timing comparison;
+no full-model speedup is claimed.
+
 Vision families that require visual-feature injection
 or multimodal MRoPE remain outside this text-generation scope: `qwen2vl`,
 `qwen3vl`, `qwen3vlmoe`, and `qwen3next`. Qwen3.6/3.8 GGUFs with one trailing

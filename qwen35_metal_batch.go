@@ -9,7 +9,8 @@ import (
 // canBatchQwen35Metal admits dense Metal FFNs or grouped sparse CPU experts.
 // It selects the mixed execution schedule below. Mixer
 // projections retain their original GPU/CPU arithmetic choices.
-// Compressed KV and unsupported FFNs remain on the existing serial path.
+// Dense graphs preserve token-local cache codecs; grouped sparse experts
+// retain their existing F32-KV admission.
 func (r *Runner) canBatchQwen35Metal(cache *KVCache) bool {
 	return r != nil && r.kind == loadedQwen35 && !r.outOfCore &&
 		os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") == "" &&
@@ -18,7 +19,7 @@ func (r *Runner) canBatchQwen35Metal(cache *KVCache) bool {
 
 func qwen35MetalBatchEligible(cfg Config, weights Qwen35Weights, cache *KVCache) bool {
 	if (cfg.Arch != "qwen35" && cfg.Arch != "qwen35moe") || cfg.NLayers <= 0 || len(weights.Layers) != cfg.NLayers ||
-		cache == nil || cache.F16 || cache.I8 || cache.Qwen35 == nil ||
+		cache == nil || cfg.Arch == "qwen35moe" && (cache.F16 || cache.I8) || cache.Qwen35 == nil ||
 		cache.layerCount() != qwen35AttentionLayerCount(weights) || cache.Qwen35.Layers != qwen35RecurrentLayerCount(weights) ||
 		cache.PerPosKDim != cfg.NKVHeads*cfg.HeadDim || cache.PerPosVDim != cfg.NKVHeads*cfg.ValueDim ||
 		weights.TokenEmbd.GPU != nil || weights.Output.GPU != nil {
@@ -68,7 +69,7 @@ func forwardQwen35MetalBatchStatesInto(ctx context.Context, cfg Config, weights 
 		return nil, nil
 	}
 	if p > 32 || buf == nil || !qwen35MetalBatchEligible(cfg, weights, cache) || start < 0 || start > cache.MaxLen || p > cache.MaxLen-start {
-		return nil, fmt.Errorf("gopherllm: Qwen Metal block requires supported FFNs, F32 KV and a valid range of at most 32 tokens")
+		return nil, fmt.Errorf("gopherllm: Qwen Metal block requires supported FFNs, compatible KV and a valid range of at most 32 tokens")
 	}
 	b := &buf.qwenBatch
 	X := reuseBatchViews(&b.XFlat, &b.X, p, cfg.Dim)
@@ -89,33 +90,39 @@ func forwardQwen35MetalBatchStatesInto(ctx context.Context, cfg Config, weights 
 			Mixed = reuseBatchViews(&b.MixedFlat, &b.Mixed, p, cfg.SSMInner)
 		}
 		var QKV, Gate, Alpha, Beta [][]float32
-		if layer.Kind == qwen35DeltaNet && replay.valid {
+		var batchQKV, batchGate, batchAlphaBeta bool
+		for i := range tokens {
+			rmsNormInto(X[i], layer.Norm, cfg.RMSNormEps, &XN[i])
+		}
+		if layer.Kind == qwen35DeltaNet {
 			channels := cfg.SSMInner + 2*cfg.SSMGroups*cfg.SSMState
 			QKV = reuseBatchViews(&b.QKVFlat, &b.QKV, p, channels)
 			Gate = reuseBatchViews(&b.GateFlat, &b.Gate, p, cfg.SSMInner)
 			Alpha = reuseBatchViews(&b.AlphaFlat, &b.Alpha, p, cfg.SSMHeads)
 			Beta = reuseBatchViews(&b.BetaFlat, &b.Beta, p, cfg.SSMHeads)
+			batchQKV, batchGate, batchAlphaBeta = qwen35MetalBatchDeltaInputs(layer.DeltaNet, XN, b)
 		}
 		for i := range tokens {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			rmsNormInto(X[i], layer.Norm, cfg.RMSNormEps, &XN[i])
 			if layer.Kind == qwen35Attention {
 				half, pairs := prepareRopeScratch(start+i, cfg.HeadDim, cfg.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &buf.RopeSin, &buf.RopeCos)
 				qwen35AttentionForward(cfg, layer.Attention, cache, XN[i], layer.KVCacheSlot, start+i, half, pairs, buf)
 			} else {
+				qkv, gate, alpha, beta := qwen35DeltaNetBatchInputs(layer.DeltaNet, XN[i], buf,
+					QKV[i], Gate[i], Alpha[i], Beta[i], batchQKV, batchGate, batchAlphaBeta)
+				qwen35DeltaNetStep(cfg, layer.DeltaNet, cache.Qwen35, qkv, gate, alpha, beta, layer.RecurrentCacheSlot, buf)
 				if batchDeltaOut {
-					qwen35DeltaNetMix(cfg, layer.DeltaNet, cache.Qwen35, XN[i], layer.RecurrentCacheSlot, buf)
 					copy(Mixed[i], buf.MambaY)
 				} else {
-					qwen35DeltaNetForward(cfg, layer.DeltaNet, cache.Qwen35, XN[i], layer.RecurrentCacheSlot, buf)
+					layer.DeltaNet.Out.MatvecInto(buf.MambaY, &buf.Proj)
 				}
 				if replay.valid {
-					copy(QKV[i], buf.MambaIn)
-					copy(Gate[i], buf.MambaZ)
-					copy(Alpha[i], buf.MambaDT)
-					copy(Beta[i], buf.MambaBeta)
+					copy(QKV[i], qkv)
+					copy(Gate[i], gate)
+					copy(Alpha[i], alpha)
+					copy(Beta[i], beta)
 				}
 			}
 			if !batchDeltaOut {

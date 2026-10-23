@@ -53,6 +53,8 @@ enum {
 	// production prefill candidates already top out at 256; larger batches
 	// safely fall back to the established CPU path.
 	GLLM_BATCH_FFN_MAX_TOKENS = 256,
+	// Qwen hybrid prefill retains at most 32 positions per recurrent chunk.
+	GLLM_BATCH_PROJECTION_MAX_TOKENS = 32,
 };
 
 // One reusable workspace serves all transformer layers. Retaining batch
@@ -1208,6 +1210,51 @@ static int gllm_metal_q6k_matvec(void* handle, const float* x, float* out) {
 	}
 }
 
+// Use the scalar projection's pipeline and reduction for each position.
+// Matrix/coalesced prefill kernels can change rounding before the CPU's Q8
+// activation quantization, so this schedule batches only submission/readback.
+static int gllm_metal_q6k_decode_batch(void* handle, const float* x, float* out, int batch) {
+	@autoreleasepool {
+		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
+		if (w == NULL || w->weights == nil || x == NULL || out == NULL ||
+			batch <= 0 || batch > GLLM_BATCH_PROJECTION_MAX_TOKENS || w->rows <= 0 ||
+			w->cols <= 0 || w->cols % 256 != 0 || w->row_bytes != (w->cols / 256) * 210 ||
+			!gllm_metal_init_q6k()) {
+			return 0;
+		}
+		NSUInteger count = (NSUInteger)batch;
+		if (count > NSUIntegerMax / sizeof(float) / (NSUInteger)w->cols ||
+			count > NSUIntegerMax / sizeof(float) / (NSUInteger)w->rows ||
+			count > UINT32_MAX / (NSUInteger)w->cols || count > UINT32_MAX / (NSUInteger)w->rows) {
+			return 0;
+		}
+		@synchronized(gllm_queue) {
+			NSUInteger x_len = count * (NSUInteger)w->cols * sizeof(float);
+			NSUInteger out_len = count * (NSUInteger)w->rows * sizeof(float);
+			if (!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x, x_len) ||
+				!gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.out, out_len)) {
+				return 0;
+			}
+			memcpy([gllm_batch_workspace.x contents], x, x_len);
+			id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+			if (cb == nil) return 0;
+			id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+			if (enc == nil) return 0;
+			gllm_metal_encode_q6k_mode(enc, w, gllm_batch_workspace.x, gllm_batch_workspace.out, batch, 4, true);
+			[enc endEncoding];
+			[cb commit];
+			[cb waitUntilCompleted];
+			if ([cb status] != MTLCommandBufferStatusCompleted) {
+				strncpy(gllm_error, "Metal batched Q6_K projection failed", sizeof(gllm_error) - 1);
+				return 0;
+			}
+			memcpy(out, [gllm_batch_workspace.out contents], out_len);
+			return 1;
+		}
+		return 0;
+	}
+}
+
 static int gllm_metal_q6k_argmax(void* handle, const float* x, const uint32_t* recent, uint32_t recent_count, float repeat_penalty, uint32_t* token) {
 	@autoreleasepool {
 		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
@@ -1777,6 +1824,22 @@ func MatvecQ6K(w *Weight, x, out []float32) bool {
 		return false
 	}
 	ok := C.gllm_metal_q6k_matvec(w.ptr, (*C.float)(unsafe.Pointer(&x[0])), (*C.float)(unsafe.Pointer(&out[0])))
+	return ok != 0
+}
+
+// MatvecQ6KDecodeBatch projects contiguous [batch][cols] inputs into
+// [batch][rows] outputs with the same reduction as independent MatvecQ6K
+// calls. It writes no output when validation or GPU submission fails.
+func MatvecQ6KDecodeBatch(w *Weight, x, out []float32, batch int) bool {
+	if w == nil || w.ptr == nil || batch <= 0 || batch > C.GLLM_BATCH_PROJECTION_MAX_TOKENS ||
+		w.rows <= 0 || w.cols <= 0 || w.rows > 1<<31-1 || w.cols > 1<<31-1 || w.cols%256 != 0 ||
+		batch > len(x)/w.cols || batch > len(out)/w.rows ||
+		uint64(batch) > uint64(^uint32(0))/uint64(w.cols) || uint64(batch) > uint64(^uint32(0))/uint64(w.rows) {
+		return false
+	}
+	ok := C.gllm_metal_q6k_decode_batch(w.ptr, (*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&out[0])), C.int(batch))
+	runtime.KeepAlive(w)
 	return ok != 0
 }
 

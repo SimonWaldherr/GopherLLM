@@ -341,8 +341,8 @@ func TestQwen35MetalBatchEligibilityAndCancellation(t *testing.T) {
 		t.Fatal("eligible Metal model declined")
 	}
 	for _, format := range []kvFormat{kvF16, kvI8} {
-		if r.canBatchQwen35Metal(qwen35BatchCache(cfg, weights, format)) {
-			t.Fatal("compressed KV accepted")
+		if !r.canBatchQwen35Metal(qwen35BatchCache(cfg, weights, format)) {
+			t.Fatal("dense compressed KV declined")
 		}
 	}
 	for _, mutate := range []func(*Runner){
