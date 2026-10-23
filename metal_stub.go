@@ -8,6 +8,10 @@ type MetalWeight struct{}
 
 func MetalAvailable() bool { return false }
 
+func applyMetalDenseRows(int) {}
+
+func metalDenseTuningReady(Config, ModelWeights, *KVCache, *DecodeBuffer) bool { return false }
+
 func matvecMetalQ8_0Into(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) bool { return false }
 
 func argmaxMetalQ8_0Penalized(_ *MetalWeight, _ []float32, _ []uint32, _ float32) (uint32, bool) {

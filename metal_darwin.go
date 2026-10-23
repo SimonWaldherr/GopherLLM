@@ -36,6 +36,12 @@ func MetalError() string {
 	return metalbackend.LastError()
 }
 
+func applyMetalDenseRows(rows int) { metalbackend.SetDenseRowsPerGroup(rows) }
+
+func metalDenseTuningReady(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) bool {
+	return metalDenseFor(c, w, k, b) != nil
+}
+
 // metalWeightMayUseDirect gates standalone matvec offload. Contracting Q4_K
 // FFN weights have a separate preparation exception for fused FFNs; this
 // must not lower the standalone threshold for narrow attention projections.

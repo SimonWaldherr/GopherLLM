@@ -303,7 +303,7 @@ func tryMetalDenseStep(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, to
 	// directly; external allocations copy the prefix and read back the new row.
 	// Both preserve cache edits, rewinds, restoration and CPU fallback.
 	for i := range w.Layers {
-		if !s.decoder.Cache(i, pos, k.K[i], k.V[i], true) {
+		if s.sharedK[i] == nil && !s.decoder.Cache(i, pos, k.K[i], k.V[i], true) {
 			return false
 		}
 	}
@@ -313,7 +313,9 @@ func tryMetalDenseStep(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, to
 		return false
 	}
 	for i := range w.Layers {
-		s.decoder.Cache(i, pos, k.K[i][pos*k.PerPosKDim:], k.V[i][pos*k.PerPosVDim:], false)
+		if s.sharedK[i] == nil {
+			s.decoder.Cache(i, pos, k.K[i][pos*k.PerPosKDim:], k.V[i][pos*k.PerPosVDim:], false)
+		}
 	}
 	runtime.KeepAlive(s)
 	return true
@@ -346,11 +348,12 @@ func metalKVShareable(v []float32) bool {
 	return len(v) > 0 && uintptr(unsafe.Pointer(&v[0]))%uintptr(page) == 0 && cap(v) >= (len(v)*4+page-1)/page*(page/4)
 }
 func (s *metalDenseState) matchesCache(k *KVCache) bool {
-	if s.cache != k {
+	if s.cache != k || len(k.K) != len(s.sharedK) || len(k.V) != len(s.sharedV) {
 		return false
 	}
 	for i, v := range s.sharedK {
-		if v != nil && (&v[0] != &k.K[i][0] || &s.sharedV[i][0] != &k.V[i][0]) {
+		if v != nil && (len(v) != len(k.K[i]) || len(s.sharedV[i]) != len(k.V[i]) ||
+			&v[0] != &k.K[i][0] || &s.sharedV[i][0] != &k.V[i][0]) {
 			return false
 		}
 	}

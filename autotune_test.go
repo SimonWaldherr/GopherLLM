@@ -228,12 +228,12 @@ func TestChooseToggleMapsIncumbent(t *testing.T) {
 
 func TestSingleDecodeChangesIsolatesEachKnob(t *testing.T) {
 	origin := tunerConfig{threads: 12, q8: true, kvF16: true, oversubscribe: false, prefillChunk: 32}
-	proposed := tunerConfig{threads: 6, q8: false, kvF16: true, oversubscribe: true, prefillChunk: 128}
+	proposed := tunerConfig{threads: 6, q8: false, kvF16: true, oversubscribe: true, prefillChunk: 128, metalDenseRows: 2}
 	changes := singleDecodeChanges(origin, proposed)
-	// q8, threads, oversubscribe differ; kvF16 matches; prefillChunk is excluded
+	// q8, threads, oversubscribe and Metal rows differ; kvF16 matches; prefillChunk is excluded
 	// because it does not affect decode.
-	if len(changes) != 3 {
-		t.Fatalf("expected 3 isolated changes, got %d: %+v", len(changes), changes)
+	if len(changes) != 4 {
+		t.Fatalf("expected 4 isolated changes, got %d: %+v", len(changes), changes)
 	}
 	for _, c := range changes {
 		diffs := 0
@@ -247,6 +247,9 @@ func TestSingleDecodeChangesIsolatesEachKnob(t *testing.T) {
 			diffs++
 		}
 		if c.cfg.oversubscribe != origin.oversubscribe {
+			diffs++
+		}
+		if c.cfg.metalDenseRows != origin.metalDenseRows {
 			diffs++
 		}
 		if diffs != 1 {
@@ -268,6 +271,7 @@ func TestTunerConfigRoundTrips(t *testing.T) {
 	want := before
 	want.threads = max(1, before.threads/2)
 	want.prefillChunk = 64
+	want.metalDenseRows = 2
 	want.apply()
 	got := captureTunerConfig(Config{Dim: 3072, HiddenDim: 9216})
 	if got.threads != want.threads {
@@ -278,6 +282,9 @@ func TestTunerConfigRoundTrips(t *testing.T) {
 	}
 	if got.oversubscribe != want.oversubscribe {
 		t.Fatal("oversubscribe did not round-trip")
+	}
+	if got.metalDenseRows != want.metalDenseRows {
+		t.Fatal("Metal dense rows did not round-trip")
 	}
 	// The amd64-only knobs must round-trip where supported and stay off where
 	// they are compile-time disabled.
@@ -314,6 +321,7 @@ func TestAutoTuneResultApplyAndSpeedups(t *testing.T) {
 	res := AutoTuneResult{
 		Threads: 3, Q8Activations: false, KVCacheF16: false,
 		OversubscribeDispatch: !before.oversubscribe, PrefillChunk: 96,
+		MetalDenseRows:   8,
 		BaselineDecodeMs: 200, TunedDecodeMs: 100,
 		BaselinePrefillTps: 10, TunedPrefillTps: 20,
 	}
@@ -326,6 +334,9 @@ func TestAutoTuneResultApplyAndSpeedups(t *testing.T) {
 	}
 	if prefillChunkSize(Config{}) != 96 {
 		t.Fatal("Apply did not set the prefill chunk")
+	}
+	if metalDenseRowsOverrideValue() != 8 {
+		t.Fatal("Apply did not set Metal dense rows")
 	}
 	if got := res.DecodeSpeedup(); got != 2 {
 		t.Fatalf("DecodeSpeedup = %v, want 2", got)
@@ -346,6 +357,153 @@ func TestAutoTuneResultApplyAndSpeedups(t *testing.T) {
 	}
 	if !strings.Contains(res.SettingsLine(), "threads=3") {
 		t.Fatalf("settings line should report threads, got %q", res.SettingsLine())
+	}
+	if !strings.Contains(res.SettingsLine(), "metal-dense-rows=8") {
+		t.Fatalf("settings line should report Metal dense rows, got %q", res.SettingsLine())
+	}
+}
+
+func TestChooseMetalDenseRows(t *testing.T) {
+	before := CaptureRuntimeTuning()
+	defer before.Apply()
+	for _, tc := range []struct {
+		name            string
+		current, winner int
+		timings         map[int][]float64
+	}{
+		{"two", 0, 2, map[int][]float64{2: {80, 80, 80}, 4: {100, 100, 100}, 8: {110, 110, 110}}},
+		{"eight", 2, 8, map[int][]float64{2: {100, 100, 100}, 4: {100, 100, 100}, 8: {80, 80, 80}}},
+		{"default-tie", 0, 0, map[int][]float64{2: {100, 100, 100}, 4: {100, 100, 100}, 8: {100, 100, 100}}},
+		{"explicit-tie", 8, 8, map[int][]float64{2: {100, 100, 100}, 4: {100, 100, 100}, 8: {100, 100, 100}}},
+		{"noise", 0, 0, map[int][]float64{2: {70, 105, 105}, 4: {100, 100, 100}, 8: {99, 99, 99}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setMetalDenseRows(tc.current)
+			next := map[int]int{}
+			tn := &autoTuner{opts: AutoTuneOptions{Rounds: 3}.withDefaults()}
+			tn.decodeProbeFn = func() float64 {
+				rows := metalDenseRowsOverrideValue()
+				value := tc.timings[rows][next[rows]]
+				next[rows]++
+				return value
+			}
+			tn.chooseMetalDenseRows()
+			if got := metalDenseRowsOverrideValue(); got != tc.winner {
+				t.Fatalf("selected rows=%d, want %d", got, tc.winner)
+			}
+			if len(tn.trials) != 1 || len(tn.trials[0].Candidates) != 3 {
+				t.Fatalf("missing row-schedule measurements: %+v", tn.trials)
+			}
+		})
+	}
+}
+
+func TestMetalDenseRowsFinalDecodeGuard(t *testing.T) {
+	before := captureTunerConfig(Config{})
+	defer before.apply()
+	origin := before
+	origin.metalDenseRows = 0
+	proposed := origin
+	proposed.metalDenseRows = 2
+	proposed.threads++
+	for _, rowsWin := range []bool{true, false} {
+		t.Run(fmt.Sprint(rowsWin), func(t *testing.T) {
+			tn := &autoTuner{opts: AutoTuneOptions{Rounds: 3}.withDefaults()}
+			tn.decodeProbeFn = func() float64 {
+				c := captureTunerConfig(Config{})
+				if c.threads != origin.threads {
+					return 120 // Reject both the combined config and threads alone.
+				}
+				if c.metalDenseRows == 2 {
+					if rowsWin {
+						return 80
+					}
+					return 105
+				}
+				return 100
+			}
+			got, baseline, tuned := tn.finalizeDecode(origin, proposed)
+			wantRows, wantTime := 0, float64(100)
+			if rowsWin {
+				wantRows, wantTime = 2, 80
+			}
+			if got.threads != origin.threads || got.metalDenseRows != wantRows || baseline != 100 || tuned != wantTime {
+				t.Fatalf("final guard returned %v at %.0f -> %.0f ms/token", got, baseline, tuned)
+			}
+		})
+	}
+}
+
+func TestMetalDenseRowsRuntimeSnapshot(t *testing.T) {
+	before := CaptureRuntimeTuning()
+	defer before.Apply()
+	for _, rows := range []int{0, 2, 4, 8} {
+		setMetalDenseRows(rows)
+		snapshot := CaptureRuntimeTuning()
+		setMetalDenseRows(8)
+		snapshot.Apply()
+		if got := metalDenseRowsOverrideValue(); got != rows {
+			t.Fatalf("restored rows=%d, want raw override %d", got, rows)
+		}
+	}
+	setMetalDenseRows(3)
+	if got := metalDenseRowsOverrideValue(); got != 0 {
+		t.Fatalf("invalid rows must restore the default, got %d", got)
+	}
+}
+
+func TestMetalDenseRowsEnvironmentPinsCalibration(t *testing.T) {
+	for _, tc := range []struct {
+		vector, rows string
+		pinned       bool
+	}{
+		{"", "", false}, {"1", "2", true}, {"1", "4", true}, {"1", "8", true},
+		{"1", "6", false}, {"0", "", true}, {"0", "8", true},
+	} {
+		t.Setenv("GOPHERLLM_METAL_DENSE_VECTOR", tc.vector)
+		t.Setenv("GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP", tc.rows)
+		if got := metalDenseRowsEnvPinned(); got != tc.pinned {
+			t.Fatalf("vector=%q rows=%q: pinned=%v, want %v", tc.vector, tc.rows, got, tc.pinned)
+		}
+		if tc.pinned {
+			// A pinned schedule must return before allocating a workspace or
+			// probing an otherwise incomplete runner.
+			tn := &autoTuner{r: &Runner{kind: loadedStandard}}
+			tn.tuneMetalDenseRows()
+			if len(tn.trials) != 0 {
+				t.Fatal("explicit environment settings must skip Metal calibration")
+			}
+		}
+	}
+}
+
+func TestAutoTuneKeyIncludesDenseScheduleEnvironment(t *testing.T) {
+	before := CaptureRuntimeTuning()
+	defer before.Apply()
+	r := &Runner{}
+	t.Setenv("GOPHERLLM_METAL_DENSE_VECTOR", "1")
+	t.Setenv("GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP", "")
+	defaultKey := r.autoTuneKey()
+	setMetalDenseRows(2)
+	if r.autoTuneKey() != defaultKey {
+		t.Fatal("the calibrated runtime result must not change its own cache key")
+	}
+	t.Setenv("GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP", "invalid")
+	if r.autoTuneKey() != defaultKey {
+		t.Fatal("an invalid override must retain the default calibration key")
+	}
+	seen := map[string]bool{defaultKey: true}
+	for _, rows := range []string{"2", "4", "8"} {
+		t.Setenv("GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP", rows)
+		key := r.autoTuneKey()
+		if seen[key] {
+			t.Fatalf("row override %s reused a different schedule's calibration key", rows)
+		}
+		seen[key] = true
+	}
+	t.Setenv("GOPHERLLM_METAL_DENSE_VECTOR", "0")
+	if seen[r.autoTuneKey()] {
+		t.Fatal("the legacy vector path must have a separate calibration key")
 	}
 }
 

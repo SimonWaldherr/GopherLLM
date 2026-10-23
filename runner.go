@@ -102,6 +102,7 @@ type Runner struct {
 	closed         bool
 	workspaceCache *KVCache
 	workspaceBuf   *DecodeBuffer
+	coreMLFFN      coreMLFFNSet
 	bertScratch    bertEmbeddingScratch
 	prefixCache    prefixCacheState
 	conversations  conversationCache
@@ -619,6 +620,8 @@ func (r *Runner) Close() error {
 		r.workspaceBuf.metalDense = nil
 	}
 	r.releaseMetalWeights()
+	r.coreMLFFN.close()
+	r.coreMLFFN = nil
 	r.clearWeightContainers()
 	// PrepareChatContext may render an image without taking genLock. Hold the
 	// exclusive vision lease across both accelerator release and unmapping so

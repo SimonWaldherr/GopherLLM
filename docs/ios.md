@@ -196,4 +196,8 @@ CI runs these on every push.
 - The KV cache uses f32 on ARM64 by default. The half-size f16 cache is only
   switchable with the `GOPHERLLM_KV_F16=1` environment variable, which must be
   set before the app launches (for example in the Xcode scheme).
-- The Apple Neural Engine is not used.
+- The bundled C ABI and Swift package use CPU/Metal for text generation.
+  Optional Go APIs support separate Core ML embedding encoders and experimental
+  prefill FFNs on iOS 16+; these are not exposed through the C ABI or Swift
+  package. See [Core ML embeddings](../README.md#apple-neural-engine-embeddings)
+  and [prefill FFNs](../benchmarks/coreml/ffn.md).

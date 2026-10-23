@@ -80,7 +80,7 @@ func forwardQwen35MetalBatchStatesInto(ctx context.Context, cfg Config, weights 
 	}
 	replay := &buf.speculative.qwenReplay
 	replay.begin(cfg, cache.Qwen35.Layers, p, buf.speculative.active)
-	for _, layer := range weights.Layers {
+	for layerIndex, layer := range weights.Layers {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -144,9 +144,15 @@ func forwardQwen35MetalBatchStatesInto(ctx context.Context, cfg Config, weights 
 		if layer.Kind == qwen35DeltaNet && replay.valid {
 			replay.capture(layer.RecurrentCacheSlot, b.QKVFlat, b.GateFlat, b.AlphaFlat, b.BetaFlat)
 		}
-		// Preserve the serial GPU reduction before the next CPU-Q8 mixer:
-		// even a 1e-8 FFN difference can cross an activation-rounding tie.
-		if layer.FFN.MoE != nil {
+		// The default retains the serial GPU reduction before the next CPU-Q8
+		// mixer. A separately enabled Core ML export uses approximate FP16.
+		coreMLHandled, err := tryCoreMLFFN(ctx, buf, layerIndex, b.XNFlat, b.ProjFlat, p)
+		if err != nil {
+			return nil, err
+		}
+		if coreMLHandled {
+			// Output is already model-width; no hidden slab crosses devices.
+		} else if layer.FFN.MoE != nil {
 			if err := sparseMoEPrefill(ctx, layer.FFN.MoE, XN, Proj, buf); err != nil {
 				return nil, err
 			}

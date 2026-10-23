@@ -17,7 +17,7 @@ import (
 
 // tuningApplyMu serializes writes to the process-global kernel-selection
 // atomics (thread count, quantization mode, KV format, dispatch, prefill
-// chunk) across Runners. Runner.genLock already keeps one Runner's own writes
+// chunk, Metal scheduling) across Runners. Runner.genLock keeps a Runner's writes
 // (e.g. a calibration sweep's many candidate apply() calls) from interleaving
 // with its own reads, but genLock is per-Runner: a second, independently
 // loaded Runner (for example a dedicated embedding model) has no lock over
@@ -159,6 +159,9 @@ type AutoTuneResult struct {
 	KVCacheF16            bool `json:"kv_cache_f16"`
 	OversubscribeDispatch bool `json:"oversubscribe_dispatch"`
 	PrefillChunk          int  `json:"prefill_chunk"`
+	// MetalDenseRows is the calibrated number of independent SIMD groups per
+	// dense-vector threadgroup. Zero preserves the default schedule.
+	MetalDenseRows int `json:"metal_dense_rows,omitempty"`
 
 	BaselineDecodeMs   float64 `json:"baseline_decode_ms"`
 	TunedDecodeMs      float64 `json:"tuned_decode_ms"`
@@ -211,12 +214,17 @@ func (r AutoTuneResult) Apply() {
 	setKVF16(r.KVCacheF16)
 	oversubscribeDispatch.Store(r.OversubscribeDispatch)
 	SetPrefillChunk(r.PrefillChunk)
+	setMetalDenseRows(r.MetalDenseRows)
 }
 
 // SettingsLine renders the chosen settings as one line.
 func (r AutoTuneResult) SettingsLine() string {
-	return fmt.Sprintf("threads=%d q8-activations=%v kv-f16=%v oversubscribe=%v prefill-chunk=%d",
+	line := fmt.Sprintf("threads=%d q8-activations=%v kv-f16=%v oversubscribe=%v prefill-chunk=%d",
 		r.Threads, r.Q8Activations, r.KVCacheF16, r.OversubscribeDispatch, r.PrefillChunk)
+	if r.MetalDenseRows > 0 {
+		line += fmt.Sprintf(" metal-dense-rows=%d", r.MetalDenseRows)
+	}
+	return line
 }
 
 // GainsLine renders the measured improvement as one line, or "" when nothing
@@ -246,10 +254,11 @@ func (r AutoTuneResult) Summary() string {
 // tunerConfig is the full set of runtime knobs, so a candidate configuration
 // can be captured, compared against, and restored as a unit.
 type tunerConfig struct {
-	threads       int
-	q8            bool
-	kvF16         bool
-	oversubscribe bool
+	threads        int
+	q8             bool
+	kvF16          bool
+	oversubscribe  bool
+	metalDenseRows int
 	// prefillChunk is the RAW setting: 0 means "leave the default resolution
 	// alone". Storing the resolved number here instead would make restoring a
 	// captured config pin that number as an explicit override, silently
@@ -261,8 +270,8 @@ type tunerConfig struct {
 // Auto Mode may change. Hosts that tune after initialization can capture it
 // first and restore it when switching to an uncalibrated model.
 //
-// The snapshot deliberately includes the raw prefill override rather than its
-// resolved value, preserving environment and model-aware defaults on restore.
+// The snapshot includes raw prefill and Metal-scheduling overrides rather than
+// resolved values, preserving environment and model-aware defaults on restore.
 type RuntimeTuning struct {
 	config tunerConfig
 	valid  bool
@@ -288,11 +297,12 @@ func (t RuntimeTuning) Apply() {
 
 func captureTunerConfig(Config) tunerConfig {
 	return tunerConfig{
-		threads:       numThreads(),
-		q8:            q8ActivationsEnabled(),
-		kvF16:         kvF16Enabled(),
-		oversubscribe: oversubscribeDispatch.Load(),
-		prefillChunk:  prefillChunkOverrideValue(),
+		threads:        numThreads(),
+		q8:             q8ActivationsEnabled(),
+		kvF16:          kvF16Enabled(),
+		oversubscribe:  oversubscribeDispatch.Load(),
+		prefillChunk:   prefillChunkOverrideValue(),
+		metalDenseRows: metalDenseRowsOverrideValue(),
 	}
 }
 
@@ -313,11 +323,12 @@ func (c tunerConfig) apply() {
 	setKVF16(c.kvF16)
 	oversubscribeDispatch.Store(c.oversubscribe)
 	SetPrefillChunk(c.prefillChunk)
+	setMetalDenseRows(c.metalDenseRows)
 }
 
 func (c tunerConfig) String() string {
-	return fmt.Sprintf("threads=%d q8=%v kv-f16=%v oversubscribe=%v chunk=%d",
-		c.threads, c.q8, c.kvF16, c.oversubscribe, c.prefillChunk) // raw chunk: 0 = default
+	return fmt.Sprintf("threads=%d q8=%v kv-f16=%v oversubscribe=%v chunk=%d metal-dense-rows=%d",
+		c.threads, c.q8, c.kvF16, c.oversubscribe, c.prefillChunk, c.metalDenseRows) // raw overrides: 0 = default
 }
 
 // autoTuner holds the probe workspace and current knob state during a run.
@@ -397,7 +408,14 @@ func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
 	t.tuneQ8Activations()
 	t.tuneThreads()
 	t.tuneDispatch()
+	t.tuneMetalDenseRows()
 	t.tuneKVF16()
+	// F16 KV disables the dense GPU decoder. Compare KV formats against the
+	// calibrated F32 path; if calibration started in F16 and selected F32,
+	// calibrate its newly available dense decoder now instead.
+	if origin.kvF16 && !kvF16Enabled() {
+		t.tuneMetalDenseRows()
+	}
 	tuned := captureTunerConfig(r.config)
 
 	// Coordinate descent explores cheaply but accepts each knob against a noisy
@@ -435,6 +453,7 @@ func (r *Runner) AutoTune(opts AutoTuneOptions) (AutoTuneResult, error) {
 		KVCacheF16:            tuned.kvF16,
 		OversubscribeDispatch: tuned.oversubscribe,
 		PrefillChunk:          tuned.resolvedPrefillChunk(r.config),
+		MetalDenseRows:        tuned.metalDenseRows,
 		BaselineDecodeMs:      baselineDecode,
 		TunedDecodeMs:         tunedDecode,
 		BaselinePrefillTps:    basePrefill,
@@ -528,6 +547,9 @@ func singleDecodeChanges(origin, proposed tunerConfig) []decodeChange {
 	}
 	if proposed.kvF16 != origin.kvF16 {
 		add("kv-cache-f16", func(c *tunerConfig) { c.kvF16 = proposed.kvF16 })
+	}
+	if proposed.metalDenseRows != origin.metalDenseRows {
+		add(fmt.Sprintf("metal-dense-rows=%d", proposed.metalDenseRows), func(c *tunerConfig) { c.metalDenseRows = proposed.metalDenseRows })
 	}
 	return out
 }
@@ -748,10 +770,23 @@ func (t *autoTuner) tuneQ8Activations() {
 
 func (t *autoTuner) tuneThreads() {
 	cands := threadCandidates(runtime.NumCPU())
+	cur := numThreads()
+	found := false
+	for _, n := range cands {
+		if n == cur {
+			found = true
+			break
+		}
+	}
+	if !found {
+		// An explicit thread count need not be in the topology-derived set.
+		// Always measure the actual incumbent before considering a change.
+		cands = append(cands, cur)
+		sort.Sort(sort.Reverse(sort.IntSlice(cands)))
+	}
 	if len(cands) < 2 {
 		return
 	}
-	cur := numThreads()
 	incumbent := 0
 	vals := make([]string, len(cands))
 	for i, n := range cands {
@@ -806,6 +841,37 @@ func (t *autoTuner) tuneKVF16() {
 		return
 	}
 	t.chooseToggle("kv-cache-f16", kvF16Enabled(), setKVF16)
+}
+
+func (t *autoTuner) tuneMetalDenseRows() {
+	if metalDenseRowsEnvPinned() || t.r == nil || t.r.kind != loadedStandard || kvF16Enabled() {
+		return
+	}
+	cache, buf := t.workspace()
+	// A prepared FFN alone does not imply that the complete dense graph is
+	// usable. Only calibrate a decoder that could actually be constructed.
+	if !metalDenseTuningReady(t.r.config, t.r.standard, cache, buf) {
+		return
+	}
+	t.chooseMetalDenseRows()
+}
+
+func (t *autoTuner) chooseMetalDenseRows() {
+	cur := metalDenseRowsOverrideValue()
+	rows := []int{2, 4, 8}
+	values := []string{"2", "4", "8"}
+	incumbent := 1 // The uncalibrated schedule is four rows per group.
+	for i, n := range rows {
+		if n == cur {
+			incumbent = i
+		}
+	}
+	t.choose("metal-dense-rows", values, incumbent, func(i int) { setMetalDenseRows(rows[i]) })
+	// A tie must preserve the raw default, so capture/restore does not turn an
+	// uncalibrated runner into a pinned four-row configuration.
+	if cur == 0 && metalDenseRowsOverrideValue() == 4 {
+		setMetalDenseRows(0)
+	}
 }
 
 // tunePrefillChunk picks the prompt-prefill chunk size and returns the
@@ -920,13 +986,13 @@ func medianFloat(v []float64) float64 {
 // key as before.
 func (r *Runner) autoTuneKey() string {
 	h := fnv.New128a()
-	fmt.Fprintf(h, "v1|%s|%s|dim=%d|layers=%d|heads=%d/%d|hidden=%d|vocab=%d|out=%v|embd=%v|metal=%t|prepared=%t|%s",
+	fmt.Fprintf(h, "v2|%s|%s|dim=%d|layers=%d|heads=%d/%d|hidden=%d|vocab=%d|out=%v|embd=%v|metal=%t|prepared=%t|%s|dense-schedule=%s",
 		r.arch, hostFingerprint(),
 		r.config.Dim, r.config.NLayers, r.config.NHeads, r.config.NKVHeads,
 		r.config.HiddenDim, r.config.VocabSize,
 		r.standard.Output.Type, r.standard.TokenEmbd.Type,
 		r.standard.Output.Metal != nil, r.standard.Output.Prepared != nil,
-		quantMixFingerprint(r))
+		quantMixFingerprint(r), metalDenseScheduleEnvironment())
 	return hex.EncodeToString(h.Sum(nil))[:24]
 }
 

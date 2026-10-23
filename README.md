@@ -436,6 +436,113 @@ ids := model.Tokenize("hello")
 gopherllm.AnalyzeGGUF(model.GGUF(), model.Tokenizer()).WriteText(os.Stdout)
 ```
 
+### Apple Neural Engine embeddings
+
+The optional `coreml` package runs a separate embedding encoder with CPU and
+Neural Engine permission, leaving the GPU available to the chat model. It
+loads one compiled model and reuses its input arrays and output backing.
+It does not allocate a chat KV cache or load a second GGUF Runner.
+Build your application with `CGO_ENABLED=1 go build -tags 'metal coreml'`.
+The backend requires macOS 13/iOS 16 or newer; other builds return
+`coreml.ErrUnavailable`.
+
+Export a local **BERT embedding GGUF** once, using Python 3.12 and the optional
+conversion dependencies. The exporter uses static shapes, FP16, BC1S tensors,
+1×1 convolutions and separate attention heads following
+[Apple's ANE transformer guidance](https://machinelearning.apple.com/research/neural-engine-transformers).
+It supports mean and CLS pooling; Nomic/RoPE and chat decoder graphs are not
+supported by this exporter. FP16 exports can be larger than their Q4 sources.
+
+```sh
+python3.12 -m venv .venv-coreml
+.venv-coreml/bin/python -m pip install 'coremltools>=9,<10' 'gguf>=0.19,<0.20'
+.venv-coreml/bin/python scripts/export_coreml_embeddings.py encoder.gguf encoder.mlpackage \
+  --sequence-length 128 --compile-to encoder.mlmodelc
+```
+
+Keep the compiled `.mlmodelc` at a stable path and keep the embedder open across
+requests, so loading and specialization stay outside the prediction path.
+For document indexing, `--batch-size 2`, `4` or `8` exports a fixed batch that
+shares one set of encoder weights across several texts. `EmbedBatch` groups
+inputs automatically, reuses bounded scratch and discards unused tail outputs.
+The default is one text per prediction, suitable for individual search queries.
+Larger exports can improve bulk throughput but also increase scratch and
+single-query latency; compare them on the target Mac before choosing one.
+For CLS-pooling encoders, `--prune-cls` omits the unused final-layer query and
+feed-forward positions while retaining keys and values for every input token.
+Optional `--weight-compression palette8` stores only convolution weights in
+256-entry palettes. Vocabulary embeddings, biases and normalization parameters
+remain FP16, as does model computation. Compression slightly changes vectors;
+use a new `EmbedderID` and check retrieval on the intended corpus. The default
+keeps FP16 weights and the complete final layer.
+Use the exact source checkpoint's tokenizer, including its boundary tokens:
+
+```go
+import (
+    "github.com/SimonWaldherr/GopherLLM/coreml"
+    "github.com/SimonWaldherr/GopherLLM/rag"
+)
+
+tok, err := coreml.LoadTokenizer("encoder.gguf") // metadata only; no retained weights
+if err != nil { return err }
+encoder, err := coreml.OpenEmbedder("encoder.mlmodelc", tok, coreml.Options{PadToken: tok.PadToken})
+if err != nil { return err }
+defer encoder.Close()
+chunks := rag.Chunker{Tokenizer: tok.Tokenizer,
+    MaxRunes: encoder.Info().SequenceLength - len(tok.Encode("")), OverlapRunes: 8}
+index := rag.New(rag.Options{Embedder: encoder, EmbedderID: "encoder-coreml-fp16-s128-v1", Chunker: chunks})
+if err := index.Add(ctx, rag.Doc{ID: "note", Text: "The processor executes the program's instructions."}); err != nil {
+    return err
+}
+// index.Search uses this encoder without disturbing a chat Runner.
+```
+
+`server.HandlerOptions` and `ServeOptions` accept the same caller-owned encoder
+through `RAGEmbedder`, `RAGEmbedderID` and `RAGChunker`. Close it after the
+handler stops. Change the ID when the model, tokenizer or embedding conventions
+change. Inputs exceeding the model's fixed sequence length fail explicitly;
+reserve tokens for boundaries and any document/query prefixes when chunking.
+
+`CPUAndNeuralEngine` permits CPU fallback. `coreml.Inspect(path, units)` reports
+the preferred devices in Core ML's compute plan on macOS 14.4/iOS 17.4 or newer;
+these counts describe planned placement, not observed utilization or time share.
+On the M2 Max, CLS pruning plus palette8 reduced warm Granite Embedding 278m
+single-query latency from 3.18 to 1.75–1.77 ms at a 64-token capacity.
+Minimum source-GGUF cosine was 0.9998955; the small multilingual retrieval
+fixture retained every source Top-1 hit and Top-3 neighbour set. These encoder
+measurements exclude model loading and do not establish faster chat decoding.
+The [benchmark methodology and results](benchmarks/coreml/README.md) include
+CPU/ANE comparisons, batch sizes, compression, memory limits and raw data.
+M4 throughput has not been measured.
+
+To repeat the encoder parity, compute-plan and warm-latency checks with the
+exported model:
+
+```sh
+GOPHERLLM_COREML_MODEL="$PWD/encoder.mlmodelc" GOPHERLLM_COREML_GGUF="$PWD/encoder.gguf" \
+  CGO_ENABLED=1 go test -tags 'metal coreml' ./coreml -run '^TestCoreMLConfiguredEmbeddings$' -count=1 -v
+```
+
+To compare exports with different batch sizes, set `GOPHERLLM_COREML_BATCH_MODELS`
+to their colon-separated paths and run `TestCoreMLBatchComparison` instead.
+It checks source-GGUF parity and reports warm latency for 1, 4, 17 and 32 texts,
+loading one native model at a time. Repeat in reverse model order when other
+applications are active.
+
+### Core ML prefill for Qwen and Ministral
+
+An optional [FFN exporter and runtime](benchmarks/coreml/ffn.md) can execute
+selected dense Qwen/Ministral SwiGLU blocks through Core ML during ordinary
+prefill. It reuses native buffers and checks source hashes, embedded graph
+metadata and numerical parity before attaching an export. Complete Metal
+prefill chunks retain priority; decode, speculative verification and Qwen MTP
+prefill retain their current arithmetic. Build with `-tags 'metal coreml'` and
+enable exports explicitly through `Runner.SetCoreMLFFN`.
+
+This adds separately compiled weights and is not a RAM-saving setting.
+Benchmark the actual prompt/model before enabling it; layer timings do not
+establish an end-to-end generation speedup.
+
 ### Tools with a Go function
 
 `gopherllm.NewTool` derives a tool's JSON Schema from a plain Go struct by
@@ -1337,8 +1444,39 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   M2 Max). `scripts/benchmark_mistral.py` checked identical greedy text over
   three alternating before/after pairs, generating 64/32 tokens respectively.
   Cached decode medians were 978 → 1009 ms (3B) and 1435 → 1471 ms (14B).
-  Background-load variation was present; these runs establish lower prefill
-  time and fewer weight copies, not higher decoding throughput.
+  A follow-up with six cached samples per version measured 929 → 931 ms (3B) and
+  1582 → 1589 ms (14B), so the initial slowdown was not stable. Background-load
+  variation was present; these runs establish lower prefill time and fewer
+  weight copies, not higher decoding throughput.
+- Dense Metal decode reads scheduling overrides once per token, skips shared-KV
+  transfer calls and omits the second Q/K barrier when neither head is normalized.
+  Auto mode measures two, four and eight SIMD groups per threadgroup for the
+  loaded dense graph, retaining four until calibration shows a sufficient gain.
+  Each row keeps its previous lane assignment and floating-point reduction order.
+  The mapped-weight savings remain 448.8 MiB (3B) and 1150.8 MiB (14B), with no
+  copied weights in the dense decoder. On the same M2 Max, host command encoding
+  measured 0.313 → 0.258 ms/token (3B) and 0.497 → 0.388 ms/token (14B).
+  Sixteen alternating samples per version in one loaded Runner measured cached
+  decode medians of 1.062 → 1.057 s for 64 generated tokens (3B) and
+  1.800 → 1.767 s for 32 tokens (14B). GPU time showed no clear improvement and
+  background load varied, so these results do not establish higher decoding
+  throughput.
+  To check full logits, greedy predictions, residual/KV bits and weight ownership
+  against fixed inputs with a local model, run:
+
+  ```sh
+  GOPHERLLM_MINISTRAL_MODEL=/path/to/Ministral-Q4_K_M.gguf \
+    CGO_ENABLED=1 go test -tags metal -run '^TestMinistralConfiguredDecode$' -count=1 -v .
+  ```
+
+  Add `GOPHERLLM_MINISTRAL_AUTOTUNE=1` to exercise quick calibration, including
+  the native row-group sweep, without writing a persistent tuning cache.
+
+  This uses eight threads, F32 KV, 160 prompt tokens and 64 decode inputs.
+  `GOPHERLLM_MINISTRAL_DECODE_CONTEXT`, `GOPHERLLM_MINISTRAL_DECODE_STEPS` and
+  `GOPHERLLM_MINISTRAL_DECODE_REPS` adjust the workload.
+  `GOPHERLLM_MINISTRAL_DECODE_SWEEP=1` interleaves 4/2/8/8/2/4 SIMD-group counts
+  in one loaded model and requires identical output bits across all schedules.
 - ARM64 Q8_0 prefill processes four tokens together while preserving the
   existing Q8 arithmetic. Native dense Gemma 4 uses layer-wise prompt batches,
   including its token-dependent per-layer projections. On the measured M2 Max,
@@ -1559,17 +1697,19 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   multi-second page-in tax. Set `GOPHERLLM_NO_PREFAULT=1` to restore pure lazy
   paging.
 
-### M4 and M4 Pro Macs
+### M2 Max, M4 and M4 Pro Macs
 
 The CPU mix and memory interface differ substantially between these chips:
 
 | Mac chip variant | Performance + efficiency cores | GPU cores | Peak memory bandwidth |
 |---|---|---|---|
+| M2 Max | 8 + 4 | 30 or 38 | 400 GB/s |
 | M4, 10-core CPU | 4 + 6 | 10 in Mac mini | 120 GB/s |
 | M4 Pro, 12-core CPU | 8 + 4 | 16 | 273 GB/s |
 | M4 Pro, 14-core CPU | 10 + 4 | 20 | 273 GB/s |
 
-Sources: [Apple's Mac mini specifications](https://support.apple.com/en-us/121555)
+Sources: [Apple's M2 Max specifications](https://support.apple.com/en-us/111835),
+[Mac mini specifications](https://support.apple.com/en-us/121555)
 and [M4 Pro announcement](https://www.apple.com/newsroom/2024/10/apple-introduces-m4-pro-and-m4-max/).
 The [two-port M4 iMac](https://support.apple.com/en-us/121556) instead has four
 performance and four efficiency cores, an eight-core GPU and 120 GB/s bandwidth.
@@ -1584,6 +1724,14 @@ which selects its matrix implementation for the available CPU at runtime.
   now includes 8 and 10 threads; the 14-core variant includes 10 and 12.
   These counts do not pin goroutines to particular cores; the tuner selects
   settings only after its timing and final-validation checks.
+  Explicit thread counts remain candidates even when they are absent from the
+  topology-derived list; tied measurements retain the current setting.
+- Dense Metal decode also measures two, four and eight SIMD groups per
+  threadgroup using the complete decode probe and final validation. The
+  uncalibrated schedule uses four; explicit environment overrides take priority.
+  The choice is cached with the model and host identity, allowing M2 Max and
+  M4 to select different schedules without a chip-name assumption. Kernel
+  arithmetic and mapped-weight ownership are unchanged.
 - Auto-tuning and Metal-probe caches include chip name, Mac model, CPU family,
   P/E counts, exposed SME features and the availability of the CGO prefill
   backend. A result for a twelve-core M2 Max is no longer reused for a
@@ -1649,6 +1797,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_METAL_DENSE_DECODE` | `0` disables complete dense Metal decode for eligible Ministral/Qwen models (enabled by default) |
 | `GOPHERLLM_METAL_WHOLE_PREFILL` | `0` disables complete GPU-resident dense prefill chunks (enabled by default for eligible shapes) |
 | `GOPHERLLM_METAL_DENSE_VECTOR` | `0` uses legacy matvec kernels within complete Metal decode for comparison |
+| `GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP` | Override dense Metal SIMD groups per threadgroup (`2`, `4`, or `8`; uncalibrated default `4`, auto mode measures all three) |
 | `GOPHERLLM_METAL_DENSE_CONCURRENT` | `0` serializes all dispatches within complete Metal decode |
 | `GOPHERLLM_METAL_DENSE_SHARED_KV` | `0` uses staging copies instead of pinned shared F32 KV buffers |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables hybrid-path Metal Gate/Up + SiLU + Down fusion; disable dense decode above to select that path |

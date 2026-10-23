@@ -8,6 +8,7 @@ import (
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"github.com/SimonWaldherr/GopherLLM/agentos"
+	"github.com/SimonWaldherr/GopherLLM/rag"
 )
 
 // HandlerOptions configures the mountable HTTP API handler.
@@ -123,6 +124,23 @@ type HandlerOptions struct {
 	// it), so it is configured the same way RAGDocsDir and SkillsDir are,
 	// not through a runtime HTTP route. Ignored unless Features.RAG is set.
 	RAGEmbedModelPath string
+	// RAGEmbedder optionally supplies a dedicated encoder, such as a Core ML
+	// embedder. It takes precedence over RAGEmbedModelPath. The caller retains
+	// ownership and must close it only after the handler stops using it.
+	// RAGEmbedderID is required; without it, vector search is disabled and the
+	// configuration error is logged. Ignored unless Features.RAG is set.
+	RAGEmbedder rag.Embedder
+	// RAGEmbedderID identifies the model, tokenizer and embedding conventions
+	// of RAGEmbedder. Change it whenever the vector space changes; snapshots
+	// from a different identity are refused rather than mixed.
+	RAGEmbedderID string
+	// RAGChunker bounds document windows before embedding. The zero value
+	// uses rag's defaults. For a fixed S-token encoder, set Tokenizer to its
+	// matching base GGUF tokenizer and MaxRunes to S minus the boundary-token
+	// count (typically S-2), with a small OverlapRunes. TitlePrefix requires
+	// additional token reserve; leave it false without that reserve. Inputs
+	// exceeding the encoder limit are rejected, never silently truncated.
+	RAGChunker rag.Chunker
 	// RAGSnapshotPath, if set, persists the RAG knowledge base to this file
 	// (encoding/gob, written by rag.Index.Save) after every add or remove,
 	// and restores it from that file at handler construction. Without this,
@@ -179,6 +197,11 @@ type ServeOptions struct {
 	RAGDocsDir string
 	// RAGEmbedModelPath is forwarded to HandlerOptions.RAGEmbedModelPath.
 	RAGEmbedModelPath string
+	// RAGEmbedder and RAGEmbedderID forward the caller-owned encoder identity.
+	RAGEmbedder   rag.Embedder
+	RAGEmbedderID string
+	// RAGChunker is forwarded to HandlerOptions.RAGChunker.
+	RAGChunker rag.Chunker
 	// RAGSnapshotPath is forwarded to HandlerOptions.RAGSnapshotPath.
 	RAGSnapshotPath string
 }

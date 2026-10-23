@@ -10,6 +10,7 @@ package gopherllm
 // activation slabs. Not safe for concurrent use; Runner.genLock serializes
 // requests.
 type DecodeBuffer struct {
+	coreMLFFN    coreMLFFNSet // installed only for ordinary prompt prefill
 	metalDense   *metalDenseState
 	metalMapping []byte
 	X            []float32

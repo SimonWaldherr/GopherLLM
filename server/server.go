@@ -104,6 +104,9 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		OSMSearchURL:          opts.OSMSearchURL,
 		RAGDocsDir:            opts.RAGDocsDir,
 		RAGEmbedModelPath:     opts.RAGEmbedModelPath,
+		RAGEmbedder:           opts.RAGEmbedder,
+		RAGEmbedderID:         opts.RAGEmbedderID,
+		RAGChunker:            opts.RAGChunker,
 		RAGSnapshotPath:       opts.RAGSnapshotPath,
 	})
 	defer handler.Close()
@@ -230,7 +233,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	}
 	wikimediaTools := NewResearchTools(ResearchOptions{Wikimedia: true})
 	osmTools := NewResearchTools(ResearchOptions{OpenStreetMap: true, OSMSearchURL: opts.OSMSearchURL})
-	ragOpts := rag.Options{}
+	ragOpts := rag.Options{Chunker: opts.RAGChunker}
 	var ragEmbedRunner *gopherllm.Runner
 	if opts.Features.RAG {
 		// A dedicated embedding model turns the knowledge base from BM25-only
@@ -242,7 +245,13 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		// rag.Index fixes its Embedder at construction, so a knowledge base
 		// whose vector half could disappear mid-process is not a contract this
 		// package offers.
-		if path := strings.TrimSpace(opts.RAGEmbedModelPath); path != "" {
+		if opts.RAGEmbedder != nil {
+			if id := strings.TrimSpace(opts.RAGEmbedderID); id != "" {
+				ragOpts.Embedder, ragOpts.EmbedderID = opts.RAGEmbedder, id
+			} else {
+				fmt.Fprintln(logw, "Warning: rag: RAGEmbedder requires RAGEmbedderID (continuing with keyword-only search)")
+			}
+		} else if path := strings.TrimSpace(opts.RAGEmbedModelPath); path != "" {
 			runner, _, err := gopherllm.RunnerFromPathWithOptions(path, opts.ModelLoadOptions)
 			if err != nil {
 				fmt.Fprintf(logw, "Warning: rag: embedding model %s: %v (continuing with keyword-only search)\n", path, err)

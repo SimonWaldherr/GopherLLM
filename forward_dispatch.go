@@ -248,6 +248,12 @@ func (r *Runner) prefillBatched(ctx context.Context, cache *KVCache, buf *Decode
 // offset is what lets an append-only chat process only the new rendered-token
 // suffix while attention still reads the cached prefix rows.
 func (r *Runner) prefillBatchedAt(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
+	if buf == nil {
+		return fmt.Errorf("gopherllm: prefill requires a decode buffer")
+	}
+	previousFFN := buf.coreMLFFN
+	buf.coreMLFFN = r.coreMLFFN
+	defer func() { buf.coreMLFFN = previousFFN }()
 	if r.canBatchNativeGemma4() {
 		// Bound native per-token PLE and mixed-head scratch independently of the
 		// generic transformer's flat batch slabs.

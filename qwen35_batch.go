@@ -23,6 +23,12 @@ type qwen35BatchScratch struct {
 // The caller resets recurrence for a cold request or supplies the complete
 // recurrent boundary matching the cached prefix at startPos.
 func (r *Runner) prefillQwen35At(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
+	if buf == nil {
+		return fmt.Errorf("gopherllm: Qwen prefill requires a decode buffer")
+	}
+	previousFFN := buf.coreMLFFN
+	buf.coreMLFFN = r.coreMLFFN
+	defer func() { buf.coreMLFFN = previousFFN }()
 	metal := r.canBatchQwen35Metal(cache)
 	if !r.canBatchQwen35() && !metal {
 		return fmt.Errorf("gopherllm: Qwen chunked prefill requires a supported hybrid model")
@@ -108,7 +114,7 @@ func forwardQwen35Batch(ctx context.Context, cfg Config, weights Qwen35Weights, 
 			prepareRopeScratch(startPos+token, cfg.HeadDim, cfg.RopeDimensionCount, buf.RopeInvFreq, buf.RopeMscale, &b.RopeSin[token], &b.RopeCos[token])
 		}
 	}
-	for _, layer := range weights.Layers {
+	for layerIndex, layer := range weights.Layers {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -167,18 +173,24 @@ func forwardQwen35Batch(ctx context.Context, cfg Config, weights Qwen35Weights, 
 		}
 		// Dense SwiGLU projections share the established Q8/float batch paths;
 		// activation arithmetic stays identical to qwen35FFNForward.
-		hiddenDim := layer.FFN.Gate.Rows
-		if layer.FFN.Gate.F32 != nil {
-			hiddenDim = len(layer.FFN.Gate.F32) / cfg.Dim
+		coreMLHandled, err := tryCoreMLFFN(ctx, buf, layerIndex, b.XNFlat, b.ProjFlat, p)
+		if err != nil {
+			return nil, err
 		}
-		Gate := reuseBatchViews(&b.FFNGateFlat, &b.FFNGate, p, hiddenDim)
-		Up := reuseBatchViews(&b.UpFlat, &b.Up, p, hiddenDim)
-		Hidden := reuseBatchViews(&b.HiddenFlat, &b.Hidden, p, hiddenDim)
-		matvecBatch2Slabs(layer.FFN.Gate, layer.FFN.Up, XN, Gate, Up, b.XNFlat, b.FFNGateFlat, b.UpFlat)
-		for token := range tokens {
-			siluMulF32(Gate[token], Up[token], Hidden[token])
+		if !coreMLHandled {
+			hiddenDim := layer.FFN.Gate.Rows
+			if layer.FFN.Gate.F32 != nil {
+				hiddenDim = len(layer.FFN.Gate.F32) / cfg.Dim
+			}
+			Gate := reuseBatchViews(&b.FFNGateFlat, &b.FFNGate, p, hiddenDim)
+			Up := reuseBatchViews(&b.UpFlat, &b.Up, p, hiddenDim)
+			Hidden := reuseBatchViews(&b.HiddenFlat, &b.Hidden, p, hiddenDim)
+			matvecBatch2Slabs(layer.FFN.Gate, layer.FFN.Up, XN, Gate, Up, b.XNFlat, b.FFNGateFlat, b.UpFlat)
+			for token := range tokens {
+				siluMulF32(Gate[token], Up[token], Hidden[token])
+			}
+			matvecBatchSlabs(layer.FFN.Down, Hidden, Proj, b.HiddenFlat, b.ProjFlat)
 		}
-		matvecBatchSlabs(layer.FFN.Down, Hidden, Proj, b.HiddenFlat, b.ProjFlat)
 		for token := range tokens {
 			addInPlace(X[token], Proj[token])
 		}

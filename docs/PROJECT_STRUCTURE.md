@@ -16,6 +16,7 @@ own lives in a subpackage, and implementation details below `internal/`.
 | `bindings/rust/`, `bindings/python/` | Rust crate and Python package over the C ABI |
 | `server/` | OpenAI-/Ollama-compatible HTTP API, streaming, embedded chat UI |
 | `rag/`, `agent/` | Hybrid BM25/vector retrieval; Model + retrieval + tools with citations |
+| `coreml/`, `internal/coreml/` | Optional embedding adapter and native Core ML runtime; `coreml_ffn*.go` attaches experimental prefill FFNs (`coreml` build tag) |
 | `agentos/` | Sandboxed command execution for agent tools |
 | `huggingface/` | Hub search, download and `hf:` model resolution (kept out of the root package so it does not pull in `net/http`) |
 | `voiceweb/` | Browser audio-capture worklet shared by web UIs |

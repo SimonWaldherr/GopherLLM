@@ -9,6 +9,7 @@ package metal
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1728,6 +1729,30 @@ func LastError() string {
 // create. Zero means that no Metal device is available.
 func MaxBufferLength() uint64 {
 	return uint64(C.gllm_metal_max_buffer_length())
+}
+
+// SetDenseRowsPerGroup installs a calibrated dense-vector schedule without
+// initializing a device or allocating buffers. Zero restores the default;
+// explicit GOPHERLLM_METAL_DENSE_* environment settings take precedence.
+func SetDenseRowsPerGroup(rows int) {
+	if rows != 2 && rows != 4 && rows != 8 {
+		rows = 0
+	}
+	C.gllm_decode_set_rows_per_group(C.int(rows))
+}
+
+// DenseRowsPerGroup reports the resolved dense-vector schedule, including
+// environment overrides. Zero means the legacy vector path is selected.
+// Reading it does not initialize Metal or allocate device buffers.
+func DenseRowsPerGroup() int {
+	rows := int(C.gllm_decode_schedule())
+	if rows < 0 {
+		return 0
+	}
+	if rows == 0 {
+		return 4
+	}
+	return rows
 }
 
 // PrepareQ5K uploads a Q5_K weight matrix. Unlike PrepareQ6K it allocates no

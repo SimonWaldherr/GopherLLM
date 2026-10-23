@@ -776,13 +776,17 @@ func forwardBatchGraphIntoContext(ctx context.Context, config Config, weights Mo
 		// with a split one, and the activation task must never observe a stale
 		// fused view from the preceding layer.
 		GateUp = nil
-		fusedMetalBatchFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
+		coreMLHandled, err := tryCoreMLFFN(ctx, buf, l, b.XNFlat, b.ProjFlat, p)
+		if err != nil {
+			return err
+		}
+		fusedBatchFFN := coreMLHandled || !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
 			len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
 			matvecMetalSwiGLUBatchInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, b.XNFlat, p, &b.ProjFlat)
-		if !fusedMetalBatchFFN && config.UseGELU && !config.UseExactGELU && !config.usesPlainMLP() && !layer.HasGateUp && len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 {
-			fusedMetalBatchFFN = matvecMetalGeGLUInto(layer.W1, layer.W3, layer.W2, b.XNFlat, p, &b.ProjFlat)
+		if !fusedBatchFFN && config.UseGELU && !config.UseExactGELU && !config.usesPlainMLP() && !layer.HasGateUp && len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 {
+			fusedBatchFFN = matvecMetalGeGLUInto(layer.W1, layer.W3, layer.W2, b.XNFlat, p, &b.ProjFlat)
 		}
-		if !fusedMetalBatchFFN {
+		if !fusedBatchFFN {
 			// Every CPU FFN form needs its final hidden slab. The other inputs
 			// stay lazy: a fused gate/up tensor can feed the activation directly
 			// from its two halves, avoiding two p*HiddenDim copies and slabs.

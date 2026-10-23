@@ -3,6 +3,7 @@ package rag
 import (
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
@@ -83,6 +84,9 @@ func (c Chunker) unitLen(s string) int {
 // unit that fits MaxRunes. The result is deterministic — the same input
 // always produces the same offsets — which is what lets a golden-ranking test
 // pin a corpus's expected results as literal data.
+// If a single rune alone exceeds a token budget, it is retained as one chunk:
+// splitting its UTF-8 bytes would corrupt the text. An embedding model can then
+// report that the configured budget cannot represent this input.
 func (c Chunker) Split(doc Doc) []Chunk {
 	text := doc.Text
 	if text == "" {
@@ -139,25 +143,42 @@ func (c Chunker) packPieces(text string, pieces []span) []span {
 			// then a hard cut) and pack its own sub-pieces directly, without
 			// re-entering sentence splitting.
 			sub := c.splitOversizedPiece(text, piece)
+			if len(sub) == 1 && sub[0] == piece {
+				// A single rune can require multiple byte-fallback tokens. Keep
+				// it intact and make progress rather than recursively trying the
+				// same unsplittable span forever.
+				out = append(out, piece)
+				continue
+			}
 			out = append(out, c.packPieces(text, sub)...)
 			continue
 		}
-		if curLen > 0 && curLen+pieceLen > c.maxSize() {
+		joinedLen := pieceLen
+		if curLen > 0 {
+			joinedLen = c.unitLen(text[cur.start:piece.end])
+		}
+		if curLen > 0 && joinedLen > c.maxSize() {
 			flush()
 			// Repeat the tail of the previous window at the start of this
-			// one, so content near a chunk boundary is still findable whole.
+			// one only when the complete span still fits. The overlap is
+			// optional; the retrieval/embedding budget is not.
 			if overlapStart := overlapPoint(text, out[len(out)-1], c.effectiveOverlap(), c.unitLen); overlapStart < out[len(out)-1].end {
-				cur = span{start: overlapStart, end: piece.end}
-				curLen = c.unitLen(text[cur.start:cur.end])
-				continue
+				if combinedLen := c.unitLen(text[overlapStart:piece.end]); combinedLen <= c.maxSize() {
+					cur = span{start: overlapStart, end: piece.end}
+					curLen = combinedLen
+					continue
+				}
 			}
 		}
 		if curLen == 0 {
 			cur = piece
+			curLen = pieceLen
 		} else {
 			cur.end = piece.end
+			// Separating whitespace and tokenizer boundary effects make the
+			// length of the joined text differ from the sum of piece lengths.
+			curLen = joinedLen
 		}
-		curLen += pieceLen
 	}
 	flush()
 	return out
@@ -165,7 +186,8 @@ func (c Chunker) packPieces(text string, pieces []span) []span {
 
 // splitOversizedPiece falls back from a sentence that alone exceeds MaxRunes
 // to whitespace-separated words, and — if even one word does not fit — a hard
-// rune cut. Each returned span already fits MaxRunes on its own.
+// rune cut. Each returned span fits MaxRunes unless even one rune alone
+// exceeds a token budget.
 func (c Chunker) splitOversizedPiece(text string, p span) []span {
 	words := splitWhitespace(text, p)
 	var out []span
@@ -182,28 +204,42 @@ func (c Chunker) splitOversizedPiece(text string, p span) []span {
 	return out
 }
 
-// hardCut splits p into rune-boundary-safe windows of at most MaxRunes each,
+// hardCut splits p into rune-boundary-safe windows within the configured unit
+// budget (except an indivisible rune that itself needs too many tokens),
 // the cascade's last resort for a single unbroken run with no whitespace at
 // all (a URL, a hash, a run of CJK/Han text with no ASCII spaces).
 func (c Chunker) hardCut(text string, p span) []span {
 	var out []span
-	runes := []rune(text[p.start:p.end])
 	// Map rune index back to a byte offset within p, since Chunk.Start/End
 	// are byte offsets into the original Doc.Text.
-	byteOffsets := make([]int, len(runes)+1)
-	off := p.start
-	for i, r := range runes {
-		byteOffsets[i] = off
-		off += len(string(r))
+	byteOffsets := make([]int, 0, utf8.RuneCountInString(text[p.start:p.end])+1)
+	for offset := range text[p.start:p.end] {
+		byteOffsets = append(byteOffsets, p.start+offset)
 	}
-	byteOffsets[len(runes)] = p.end
+	byteOffsets = append(byteOffsets, p.end)
+	nRunes := len(byteOffsets) - 1
 	max := c.maxSize()
 	if max <= 0 {
 		max = 1
 	}
-	for start := 0; start < len(runes); start += max {
-		end := min(start+max, len(runes))
+	for start := 0; start < nRunes; {
+		end := min(start+max, nRunes)
+		if c.Tokenizer != nil {
+			// Token counts are not necessarily monotone as text is extended:
+			// adding a rune may create a vocabulary merge. Grow conservatively
+			// and verify each actual prefix, keeping at least one whole rune.
+			end = start + 1
+			if c.unitLen(text[byteOffsets[start]:byteOffsets[end]]) <= max {
+				for candidate := end + 1; candidate <= nRunes; candidate++ {
+					if c.unitLen(text[byteOffsets[start]:byteOffsets[candidate]]) > max {
+						break
+					}
+					end = candidate
+				}
+			}
+		}
 		out = append(out, span{start: byteOffsets[start], end: byteOffsets[end]})
+		start = end
 	}
 	return out
 }
