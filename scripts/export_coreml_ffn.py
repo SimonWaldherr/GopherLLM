@@ -156,11 +156,15 @@ def build_program(reader, spec, hidden_chunk=0, activation_scale=16):
     gate = weights.get(prefix + "ffn_gate.weight", (spec.hidden_dimension, spec.dimension))[:, :, None, None]
     up = weights.get(prefix + "ffn_up.weight", (spec.hidden_dimension, spec.dimension))[:, :, None, None]
     down = weights.get(prefix + "ffn_down.weight", (spec.dimension, spec.hidden_dimension))[:, :, None, None]
+    # Weights.get owns these FP16 buffers. Scale in place and check bounded
+    # row batches instead of allocating another full projection and mask.
     with np.errstate(over="ignore", invalid="ignore"):
-        gate = gate * np.float16(activation_scale)
-        up = up * np.float16(activation_scale)
-    if not np.isfinite(gate).all() or not np.isfinite(up).all():
-        raise ValueError("activation scale overflows FP16 projection weights; choose a smaller scale")
+        for projection in (gate, up):
+            for begin in range(0, spec.hidden_dimension, 128):
+                rows = projection[begin:begin + 128]
+                np.multiply(rows, np.float16(activation_scale), out=rows)
+                if not np.isfinite(rows).all():
+                    raise ValueError("activation scale overflows FP16 projection weights; choose a smaller scale")
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(spec.tokens, spec.dimension), dtype=types.fp32)],
                 opset_version=ct.target.iOS16)

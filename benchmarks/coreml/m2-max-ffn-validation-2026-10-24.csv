@@ -1,0 +1,13 @@
+measurement,model,units,tokens,dimension,run,statistic,before_ms,after_ms,paired_saving_ms,pairs,bitwise_equal,allocs_per_op,measured_at
+native_ffn,ministral3b-ffn-l0-t32-scaled16.mlmodelc,ane,32,3072,1,median,3.318625,3.152333,0.17404200000000003,144,True,,2026-10-23T23:30:38Z
+native_ffn,ministral3b-ffn-l0-t32-scaled16.mlmodelc,ane,32,3072,2,median,3.306334,3.133,0.1679170000000001,144,True,,2026-10-23T23:30:39Z
+native_ffn,ministral3b-ffn-l0-t32-scaled16.mlmodelc,ane,32,3072,3,median,3.297959,3.1405,0.16599999999999993,144,True,,2026-10-23T23:30:40Z
+native_ffn,qwen35-ffn-l0-t32-h4352-scaled8.mlmodelc,cpu,32,5120,1,median,6.099709,5.83375,0.2642489999999995,81,True,,2026-10-23T23:31:12Z
+native_ffn,qwen35-ffn-l0-t32-h4352-scaled8.mlmodelc,cpu,32,5120,2,median,6.1095,5.840541,0.2869579999999994,81,True,,2026-10-23T23:31:13Z
+native_ffn,qwen35-ffn-l0-t32-h4352-scaled8.mlmodelc,cpu,32,5120,3,median,6.118208,5.861959,0.2562489999999995,81,True,,2026-10-23T23:31:14Z
+copy_backend,,go,32,3072,1,mean,0.181291,0.017424,,,,0,
+copy_backend,,go,32,3072,2,mean,0.186785,0.017337,,,,0,
+copy_backend,,go,32,3072,3,mean,0.186559,0.01787,,,,0,
+copy_backend,,go,32,5120,1,mean,0.314016,0.032395,,,,0,
+copy_backend,,go,32,5120,2,mean,0.307804,0.028818,,,,0,
+copy_backend,,go,32,5120,3,mean,0.304986,0.029173,,,,0,

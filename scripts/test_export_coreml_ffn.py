@@ -148,13 +148,19 @@ class GraphParity(unittest.TestCase):
     def test_projection_scale_rejects_fp16_weight_overflow(self):
         import numpy as np
         import gguf
-        reader = fixture()
-        for tensor in reader.tensors:
-            tensor.data = np.full(tensor.shape[::-1], 5000, dtype=np.float32)
-            tensor.tensor_type = gguf.GGMLQuantizationType.F32
-        spec = exporter.read_spec(reader, 0, 1)
-        with self.assertRaisesRegex(ValueError, "activation scale overflows"):
-            exporter.build_program(reader, spec, activation_scale=16)
+        for overflow_row in (0, 200):
+            with self.subTest(row=overflow_row):
+                reader = fixture(**{"qwen35.feed_forward_length": 256})
+                for tensor in reader.tensors:
+                    tensor.shape = (256, 8) if "down" in tensor.name else (8, 256)
+                    tensor.data = np.full(tensor.shape[::-1], .01, dtype=np.float32)
+                    tensor.tensor_type = gguf.GGMLQuantizationType.F32
+                reader.tensors[0].data[overflow_row, 0] = 5000
+                original = reader.tensors[0].data.copy()
+                spec = exporter.read_spec(reader, 0, 1)
+                with self.assertRaisesRegex(ValueError, "activation scale overflows"):
+                    exporter.build_program(reader, spec, activation_scale=16)
+                np.testing.assert_array_equal(reader.tensors[0].data, original)
 
     def test_stable_silu_matches_real_gate_range_on_cpu_and_neural_engine(self):
         import numpy as np

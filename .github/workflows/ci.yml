@@ -46,6 +46,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Test Core ML contracts
+        run: go test -tags coreml ./...
+
       - name: Vet
         run: go vet ./...
 

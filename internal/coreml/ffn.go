@@ -3,8 +3,9 @@ package coreml
 import (
 	"errors"
 	"fmt"
-	"math"
 	"sync"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // FFNInfo describes a compiled, stateless hidden-state projection. Inputs and
@@ -75,18 +76,14 @@ func (m *FFN) Predict(input, output []float32) error {
 	if len(input) != count || len(output) != count {
 		return fmt.Errorf("coreml: FFN input and output must each contain %d values", count)
 	}
-	for _, value := range input {
-		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			return errors.New("coreml: FFN input contains a non-finite value")
-		}
+	if !numeric.AllFiniteF32(input) {
+		return errors.New("coreml: FFN input contains a non-finite value")
 	}
 	if err := m.backend.predict(input, output); err != nil {
 		return err
 	}
-	for _, value := range output {
-		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			return ErrFFNNonFiniteOutput
-		}
+	if !numeric.AllFiniteF32(output) {
+		return ErrFFNNonFiniteOutput
 	}
 	return nil
 }

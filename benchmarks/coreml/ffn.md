@@ -172,3 +172,64 @@ path showed much larger logit drift (cosine 0.98452, relative L2 17.63%). That
 path uses a different activation approximation; these results do not establish
 quality equivalence to existing Q8 CPU generation. Evaluate actual prompts and
 outputs before deployment. No automatic backend switch was enabled.
+
+## Validation overhead, 2026-10-24
+
+The FFN adapter now checks NaN/Inf with integer NEON operations on ARM64 and
+IEEE-754 exponent bits on other architectures. It preserves all finite values,
+including subnormals and signed zero, without changing the exported graph or
+adding runtime buffers. Overflow still retries the original FFN.
+
+On the same M2 Max, a copying backend isolates the Go checks and locking from
+Core ML. For 32x3072 values this fell from 181–187 to 17–18 microseconds per
+call; for 32x5120, from 305–314 to 29–32 microseconds. Both paths allocate zero
+Go objects per call. These are wrapper measurements, not model throughput.
+
+A native comparison alternated scalar checks and the new checks on the same
+loaded model, reversing their order within pairs. Each of three runs used nine
+windows of at least 100 ms after warmup. The following single-request medians
+include the native prediction and both copies:
+
+| Layer-0 export, 32 rows | Scalar checks | ARM64 checks | Reduction |
+|---|---:|---:|---:|
+| Ministral-3-3B, scale 16, CPU + ANE | 3.298–3.319 ms | 3.133–3.152 ms | 4.8–5.2% |
+| Qwen3.8-27B, scale 8, hidden chunks 4352, CPU only | 6.100–6.118 ms | 5.834–5.862 ms | 4.2–4.4% |
+
+Outputs were bitwise identical. [Raw measurements](m2-max-ffn-validation-2026-10-24.csv)
+include the paired median savings (166–174 microseconds for Ministral,
+256–287 for Qwen). Separate-process comparisons fluctuated under background
+load; these results use one warm native model. This does not establish faster
+whole-model generation or an M4 result.
+
+```sh
+GOPHERLLM_COREML_FFN_PATH=/path/to/ffn-l0.mlmodelc \
+GOPHERLLM_COREML_FFN_UNITS=ane \
+  CGO_ENABLED=1 go test -tags coreml ./internal/coreml \
+  -run '^TestFFNConfiguredValidationBenchmark$' -count=3 -v
+go test ./internal/coreml -run '^$' -bench BenchmarkFFNValidation -count=3
+```
+
+Use `GOPHERLLM_COREML_FFN_UNITS=cpu` for the Qwen export above. Separately, the
+exporter now scales gate/up weights in place and checks 128-row batches for
+overflow. This avoids a full temporary projection (170 MiB for Qwen,
+54 MiB for Ministral) during that export step. Inference RAM is unchanged;
+the full converter's peak RSS was not measured.
+
+The load-time quality probe also reuses each dequantized weight row for all
+three reference inputs. Gate/up activations are handled in 128-row blocks;
+the dot-product reductions, SwiGLU arithmetic and rejection thresholds stay
+the same. Tests compare every reference value bitwise for F32, F16 and mixed
+Q4_K/Q6_K weights, including block tails and one, two and three probes.
+
+On synthetic Q4_K gate/up and Q6_K down weights, the reference calculation
+took 193–199 ms before and 78–80 ms after at Ministral-3B dimensions. At
+Qwen-27B dimensions it took 608–613 ms before and 247–251 ms after. These are
+three warm runs of three iterations on the M2 Max, about 60% less time for
+this calculation. [Raw measurements](m2-max-ffn-reference-2026-10-24.csv) also
+retain the more variable initial runs. The benchmark excludes source hashes,
+Core ML prediction and model loading; it does not measure total startup time.
+
+```sh
+CGO_ENABLED=0 go test -tags coreml . -run '^$' \
+  -bench '^BenchmarkCoreMLFFNReference$' -benchtime=3x -count=3
+```

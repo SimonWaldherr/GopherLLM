@@ -304,21 +304,9 @@ func validateCoreMLFFNQuality(model coreMLFFNPredictor, m coreMLFFNManifest, gat
 	if err := model.Predict(input, output); err != nil {
 		return err
 	}
-	gateRows, upRows, hidden := make([]float32, m.HiddenDimension), make([]float32, m.HiddenDimension), make([]float32, m.HiddenDimension)
-	want := make([]float32, m.Dimension)
-	var row []float32
-	project := func(weight Weight, x, result []float32) {
-		for i := range result {
-			weight.RowInto(i, len(x), &row)
-			result[i] = DotF32(row, x)
-		}
-	}
+	reference := coreMLFFNReference(m, gate, up, down, input)
 	for token := 0; token < min(m.Tokens, 3); token++ {
-		x := input[token*m.Dimension : (token+1)*m.Dimension]
-		project(gate, x, gateRows)
-		project(up, x, upRows)
-		siluMulF32(gateRows, upRows, hidden)
-		project(down, hidden, want)
+		want := reference[token*m.Dimension : (token+1)*m.Dimension]
 		var dot, aa, bb, delta float64
 		for i, reference := range want {
 			value := float64(output[token*m.Dimension+i])
@@ -340,6 +328,46 @@ func validateCoreMLFFNQuality(model coreMLFFNPredictor, m coreMLFFNManifest, gat
 		}
 	}
 	return nil
+}
+
+// Reuse each decoded weight row across the three probes. Blocking gate/up
+// activations keeps scratch near the former three hidden-width buffers.
+// A block is a multiple of both NEON and AVX2 lane counts, preserving the
+// ordinary SwiGLU vector/tail arithmetic and each DotF32 reduction order.
+func coreMLFFNReference(m coreMLFFNManifest, gate, up, down Weight, input []float32) []float32 {
+	probes := min(m.Tokens, 3)
+	const block = 128
+	var gates, ups [3][block]float32
+	hidden := make([]float32, probes*m.HiddenDimension)
+	reference := make([]float32, probes*m.Dimension)
+	row := make([]float32, max(m.Dimension, m.HiddenDimension))
+	for begin := 0; begin < m.HiddenDimension; begin += block {
+		end := min(begin+block, m.HiddenDimension)
+		for i := begin; i < end; i++ {
+			gate.RowInto(i, m.Dimension, &row)
+			for token := 0; token < probes; token++ {
+				x := input[token*m.Dimension : (token+1)*m.Dimension]
+				gates[token][i-begin] = DotF32(row, x)
+			}
+			up.RowInto(i, m.Dimension, &row)
+			for token := 0; token < probes; token++ {
+				x := input[token*m.Dimension : (token+1)*m.Dimension]
+				ups[token][i-begin] = DotF32(row, x)
+			}
+		}
+		for token := 0; token < probes; token++ {
+			siluMulF32(gates[token][:end-begin], ups[token][:end-begin],
+				hidden[token*m.HiddenDimension+begin:token*m.HiddenDimension+end])
+		}
+	}
+	for i := 0; i < m.Dimension; i++ {
+		down.RowInto(i, m.HiddenDimension, &row)
+		for token := 0; token < probes; token++ {
+			x := hidden[token*m.HiddenDimension : (token+1)*m.HiddenDimension]
+			reference[token*m.Dimension+i] = DotF32(row, x)
+		}
+	}
+	return reference
 }
 
 // Scoped to ordinary prefill by the Runner. Never install this on decode or
