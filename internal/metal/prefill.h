@@ -2,6 +2,17 @@
 static const char* gllm_prefill_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
+"struct PN { uint n; float eps; };\n"
+"kernel void pf_add_norm(device float* x [[buffer(0)]],const device float* update [[buffer(1)]],const device float* w [[buffer(2)]],device float* y [[buffer(3)]],constant PN& p [[buffer(4)]],uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint group [[threadgroup_position_in_grid]]) {\n"
+" threadgroup float sums[8];\n"
+" float sum=0;uint base=group*p.n;\n"
+" for(uint i=tid;i<p.n;i+=256){float value=x[base+i]+update[base+i];x[base+i]=value;sum+=value*value;}\n"
+" sum=simd_sum(sum);if(lane==0)sums[sg]=sum;\n"
+" threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+" float total=simd_sum(lane<8?sums[lane]:0.0f);\n"
+" float scale=rsqrt(total/float(p.n)+p.eps);\n"
+" for(uint i=tid;i<p.n;i+=256)y[base+i]=x[base+i]*scale*w[i];\n"
+"}\n"
 "struct PR { uint heads,batch,interleaved,is_query; };\n"
 "kernel void pf_rope(const device float* x [[buffer(0)]],device float* y [[buffer(1)]],const device float* sn [[buffer(2)]],const device float* cs [[buffer(3)]],const device float* temperature [[buffer(4)]],constant PR& p [[buffer(5)]],uint i [[thread_position_in_grid]]) {\n"
 " if(i>=p.batch*p.heads*128)return;\n"
@@ -80,7 +91,7 @@ enum {
 typedef struct { id<MTLBuffer> b[PF_BUFFERS]; } GLLMPrefill;
 typedef struct { uint32_t heads,batch,interleaved,is_query; } GLLMPrefillRope;
 typedef struct { uint32_t heads,kvheads,stride,start_pos,window,chunks,base_token;float scale; } GLLMPrefillAttention;
-static id<MTLComputePipelineState> gllm_prefill_pipes[5]={nil};
+static id<MTLComputePipelineState> gllm_prefill_pipes[6]={nil};
 
 static void gllm_prefill_release(void* ptr) {
  GLLMPrefill* p=ptr;if(p==NULL)return;
@@ -94,16 +105,16 @@ static bool gllm_prefill_init(void) {
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_prefill_source] options:nil error:&error];
   if(lib==nil){gllm_set_error(@"prefill shader compilation failed",error);return false;}
-  NSString* names[5]={@"pf_rope",@"pf_copy",@"pf_attention",@"pf_attention_part",@"pf_attention_merge"};
-  id<MTLComputePipelineState> pipes[5]={nil};bool ok=true;
-  for(int i=0;i<5;i++){
+  NSString* names[6]={@"pf_rope",@"pf_copy",@"pf_attention",@"pf_attention_part",@"pf_attention_merge",@"pf_add_norm"};
+  id<MTLComputePipelineState> pipes[6]={nil};bool ok=true;
+  for(int i=0;i<6;i++){
    id<MTLFunction> fn=[lib newFunctionWithName:names[i]];
    pipes[i]=fn!=nil?[gllm_device newComputePipelineStateWithFunction:fn error:&error]:nil;[fn release];
    if(pipes[i]==nil || [pipes[i] threadExecutionWidth]!=32 || [pipes[i] maxTotalThreadsPerThreadgroup]<256)ok=false;
   }
   [lib release];
-  if(!ok){for(int i=0;i<5;i++)[pipes[i] release];gllm_set_error(@"prefill pipelines unavailable",error);return false;}
-  for(int i=0;i<5;i++)gllm_prefill_pipes[i]=pipes[i];
+  if(!ok){for(int i=0;i<6;i++)[pipes[i] release];gllm_set_error(@"prefill pipelines unavailable",error);return false;}
+  for(int i=0;i<6;i++)gllm_prefill_pipes[i]=pipes[i];
   return true;
  }
  return false;
@@ -141,9 +152,14 @@ static NSUInteger gllm_prefill_bytes(void* ptr) {
  for(int i=0;i<PF_BUFFERS;i++)bytes+=[p->b[i] length];
  return bytes;
 }
-static void gllm_prefill_add(id<MTLComputeCommandEncoder> e,id<MTLBuffer> x,id<MTLBuffer> y,uint32_t n) {
- [e setComputePipelineState:gllm_dec_pipes[3]];[e setBuffer:x offset:0 atIndex:0];[e setBuffer:y offset:0 atIndex:1];
- [e setBytes:&n length:sizeof(n) atIndex:2];[e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+// Preserve the separate addition's float32 residual and dec_norm's strided
+// accumulation/SIMD reduction order while eliminating one dispatch per norm.
+// Each thread owns its residual elements throughout the reduction barrier.
+static void gllm_prefill_add_norm(id<MTLComputeCommandEncoder> e,id<MTLBuffer> x,id<MTLBuffer> update,id<MTLBuffer> w,id<MTLBuffer> out,int n,int groups,float eps) {
+ [e setComputePipelineState:gllm_prefill_pipes[5]];[e setBuffer:x offset:0 atIndex:0];[e setBuffer:update offset:0 atIndex:1];
+ [e setBuffer:w offset:0 atIndex:2];[e setBuffer:out offset:0 atIndex:3];
+ GLLMNormParams p={(uint32_t)n,eps};[e setBytes:&p length:sizeof(p) atIndex:4];
+ [e dispatchThreadgroups:MTLSizeMake(groups,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
 }
 static void gllm_prefill_rope(id<MTLComputeCommandEncoder> e,GLLMPrefill* p,id<MTLBuffer> x,id<MTLBuffer> y,NSUInteger offset,int heads,int batch,bool interleaved,bool query) {
  GLLMPrefillRope rp={(uint32_t)heads,(uint32_t)batch,(uint32_t)interleaved,(uint32_t)query};
@@ -197,9 +213,9 @@ static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,cons
  id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();
  id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
  if(cb==nil || e==nil)return false;
+ gllm_decode_norm(e,p->b[PF_X],d->layer[0].norm,p->b[PF_XN],d->dim,batch,d->eps);
  for(int layer=0;layer<d->layers;layer++){
   GLLMDecodeLayer* l=&d->layer[layer];
-  gllm_decode_norm(e,p->b[PF_X],l->norm,p->b[PF_XN],d->dim,batch,d->eps);
   gllm_prefill_quantized(e,l->w[0],l->quant[0],p->b[PF_XN],p->b[PF_Q],batch);
   gllm_prefill_quantized(e,l->w[1],l->quant[1],p->b[PF_XN],p->b[PF_K],batch);
   gllm_prefill_quantized(e,l->w[2],l->quant[2],p->b[PF_XN],p->b[PF_V],batch);
@@ -215,15 +231,14 @@ static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,cons
   [e dispatchThreadgroups:MTLSizeMake((kvCount+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
   gllm_prefill_attention(e,d,l,p,qr,layer,batch,start_pos,tiled);
   gllm_prefill_quantized(e,l->w[3],l->quant[3],p->b[PF_ATTN],p->b[PF_PROJ],batch);
-  gllm_prefill_add(e,p->b[PF_X],p->b[PF_PROJ],(uint32_t)batch*d->dim);
-  gllm_decode_norm(e,p->b[PF_X],l->ffnNorm,p->b[PF_XN],d->dim,batch,d->eps);
+  gllm_prefill_add_norm(e,p->b[PF_X],p->b[PF_PROJ],l->ffnNorm,p->b[PF_XN],d->dim,batch,d->eps);
   gllm_prefill_quantized(e,l->w[4],l->quant[4],p->b[PF_XN],p->b[PF_GATE],batch);
   gllm_prefill_quantized(e,l->w[5],l->quant[5],p->b[PF_XN],p->b[PF_UP],batch);
   gllm_metal_encode_silu(e,p->b[PF_GATE],p->b[PF_UP],p->b[PF_HID],(uint32_t)batch*d->hidden);
   gllm_prefill_quantized(e,l->w[6],l->quant[6],p->b[PF_HID],p->b[PF_PROJ],batch);
-  gllm_prefill_add(e,p->b[PF_X],p->b[PF_PROJ],(uint32_t)batch*d->dim);
+  id<MTLBuffer> nextNorm=layer+1<d->layers?d->layer[layer+1].norm:d->outputNorm;
+  gllm_prefill_add_norm(e,p->b[PF_X],p->b[PF_PROJ],nextNorm,p->b[PF_XN],d->dim,batch,d->eps);
  }
- gllm_decode_norm(e,p->b[PF_X],d->outputNorm,p->b[PF_XN],d->dim,batch,d->eps);
  if(verify){
   gllm_prefill_quantized(e,d->outputWeight,d->outputQuant,p->b[PF_XN],p->b[PF_LOGITS],batch);
   for(int i=0;i<batch;i++)gllm_metal_encode_argmax_recent_to(e,d->outputWeight,

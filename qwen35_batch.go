@@ -20,8 +20,8 @@ type qwen35BatchScratch struct {
 }
 
 // prefillQwen35At resumes an already initialized hybrid cache at startPos.
-// As with token decode, the caller resets recurrent state for a cold request
-// (generationWorkspace does so) or restores the complete matching snapshot.
+// The caller resets recurrence for a cold request or supplies the complete
+// recurrent boundary matching the cached prefix at startPos.
 func (r *Runner) prefillQwen35At(ctx context.Context, cache *KVCache, buf *DecodeBuffer, tokens []uint32, startPos int, logits *[]float32) error {
 	metal := r.canBatchQwen35Metal(cache)
 	if !r.canBatchQwen35() && !metal {

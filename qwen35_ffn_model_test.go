@@ -24,11 +24,12 @@ func BenchmarkQwen35MetalFFNConfigured(b *testing.B) {
 	if r.kind != loadedQwen35 || len(r.qwen35.Layers) == 0 || r.qwen35.MTP == nil {
 		b.Fatal("a complete Qwen model with a native MTP head is required")
 	}
+	draft := qwen35MTPExecutionWeights(*r.qwen35.MTP)
 	for _, target := range []struct {
 		name string
 		ffn  Qwen35FFNWeights
 	}{
-		{"trunk", r.qwen35.Layers[0].FFN}, {"mtp", r.qwen35.MTP.FFN},
+		{"trunk", r.qwen35.Layers[0].FFN}, {"mtp", draft.FFN},
 	} {
 		w := target.ffn
 		if !metalQwen35FFNBatchReady(w.Gate.Metal, w.Up.Metal, w.Down.Metal) {

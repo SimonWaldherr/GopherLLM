@@ -23,6 +23,7 @@ type metalDenseState struct {
 	dim, hidden, heads, kvheads, layers, window int
 	eps, scale                                  float32
 	refs, owned                                 []*metalbackend.Weight
+	borrowedWeightBytes, copiedWeightBytes      int64
 }
 
 func (s *metalDenseState) close() {
@@ -73,7 +74,7 @@ func metalDenseEligible(c Config, w ModelWeights, k *KVCache) bool {
 	return true
 }
 
-func newMetalDenseState(c Config, w ModelWeights, k *KVCache) *metalDenseState {
+func newMetalDenseState(c Config, w ModelWeights, k *KVCache, mapping []byte) *metalDenseState {
 	scale := c.AttentionScale
 	if scale == 0 {
 		scale = float32(1 / math.Sqrt(128))
@@ -116,18 +117,26 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache) *metalDenseState {
 				return fail()
 			}
 			if p == nil {
+				borrow := weightBytesInMapping(m.Raw, mapping)
 				switch quant[j] {
 				case 4:
-					p = metalbackend.PrepareQ4K(m.Raw, m.Rows, m.Cols, false)
+					p = metalbackend.PrepareQ4K(m.Raw, m.Rows, m.Cols, borrow)
 				case 6:
-					p = metalbackend.PrepareQ6K(m.Raw, m.Rows, m.Cols, false)
+					p = metalbackend.PrepareQ6K(m.Raw, m.Rows, m.Cols, borrow)
 				case 8:
-					p = metalbackend.PrepareQ8_0(m.Raw, m.Rows, m.Cols, false)
+					p = metalbackend.PrepareQ8_0(m.Raw, m.Rows, m.Cols, borrow)
 				}
 				if p == nil {
 					return fail()
 				}
 				s.owned = append(s.owned, p)
+				rowBytes, _ := m.Type.DataSize(m.Cols)
+				weightBytes := int64(m.Rows) * int64(rowBytes)
+				if borrow {
+					s.borrowedWeightBytes += weightBytes
+				} else {
+					s.copiedWeightBytes += weightBytes
+				}
 			}
 			refs[j] = p
 			s.refs = append(s.refs, p)
@@ -390,7 +399,7 @@ func metalDenseFor(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) *metal
 		s = nil
 	}
 	if s == nil {
-		s = newMetalDenseState(c, w, k)
+		s = newMetalDenseState(c, w, k, b.metalMapping)
 		if s == nil {
 			return nil
 		}

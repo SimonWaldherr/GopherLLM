@@ -110,14 +110,16 @@ func onlineAttentionGroup4(queries, keys, values []float32, keyStride, valueStri
 	out1 := out[valueHeadDim : 2*valueHeadDim]
 	out2 := out[2*valueHeadDim : 3*valueHeadDim]
 	out3 := out[3*valueHeadDim : 4*valueHeadDim]
-	for i := 0; i < n; i++ {
-		vOff := (startT + i) * valueStride
-		if vOff+valueHeadDim > len(values) {
-			break
+	if !gqa4WeightedValuesF32(out, values, scores, valueHeadDim, valueStride, span, startT, n) {
+		for i := 0; i < n; i++ {
+			vOff := (startT + i) * valueStride
+			if vOff+valueHeadDim > len(values) {
+				break
+			}
+			axpyF32x4(&out0[0], &out1[0], &out2[0], &out3[0],
+				scores[i], scores[span+i], scores[2*span+i], scores[3*span+i],
+				&values[vOff], valueHeadDim)
 		}
-		axpyF32x4(&out0[0], &out1[0], &out2[0], &out3[0],
-			scores[i], scores[span+i], scores[2*span+i], scores[3*span+i],
-			&values[vOff], valueHeadDim)
 	}
 	ScaleF32(out0, 1/denoms[0])
 	ScaleF32(out1, 1/denoms[1])

@@ -15,8 +15,9 @@ const (
 	// returning from load, making first-token latency predictable.
 	MmapPrefaultAll MmapPrefaultMode = iota
 	// MmapPrefaultCore warms dense/router/backbone tensors but skips known
-	// sparse-MoE expert banks. It is useful when the experts dominate model
-	// size and normal routing selects only a small top-k subset.
+	// sparse-MoE expert banks, Qwen's optional NextN draft layer, and untied
+	// quantized input embeddings.
+	// These tensors remain demand-paged until inference needs their rows.
 	MmapPrefaultCore
 	// MmapPrefaultNone leaves every tensor demand-paged.
 	MmapPrefaultNone
@@ -72,7 +73,54 @@ func isSparseExpertTensor(name string, info TensorInfo) bool {
 		strings.HasSuffix(name, ".ffn_down_exps.weight")
 }
 
-// corePrefaultRanges returns all data ranges except sparse expert banks. The
+// qwen35NextNPrefaultPrefix recognizes the single trailing NextN layer that
+// LoadQwen35Model excludes from the target decoder. Do not infer optional
+// layers from unrelated architectures or an incomplete metadata declaration.
+func qwen35NextNPrefaultPrefix(gguf *GGUFFile) string {
+	arch, _ := gguf.GetString("general.architecture")
+	if arch != "qwen35" && arch != "qwen35moe" {
+		return ""
+	}
+	layers := gguf.GetU32(arch+".block_count", 0)
+	nextN := gguf.GetU32(arch+".nextn_predict_layers", 0)
+	if layers <= 1 || nextN > 1 {
+		return ""
+	}
+	prefix := fmt.Sprintf("blk.%d.", layers-1)
+	marker, previousMarker := false, false
+	previous := fmt.Sprintf("blk.%d.nextn.eh_proj.weight", layers-2)
+	for _, tensor := range gguf.Tensors {
+		marker = marker || tensor.Name == prefix+"nextn.eh_proj.weight"
+		previousMarker = previousMarker || tensor.Name == previous
+	}
+	if !marker || (nextN == 0 && previousMarker) {
+		return ""
+	}
+	return prefix
+}
+
+// An untied packed input embedding is only read one token row at a time.
+// Warming its entire vocabulary bank can evict decoder weights that every
+// generated token needs. Scalar embeddings are expanded by the normal loader,
+// and tied embeddings double as the output projection, so keep those warm.
+func hasRowOnlyPackedEmbedding(gguf *GGUFFile) bool {
+	separateOutput, packedEmbedding := false, false
+	for _, tensor := range gguf.Tensors {
+		if tensor.Name == "output.weight" {
+			separateOutput = true
+		}
+		if tensor.Name == "token_embd.weight" && len(tensor.Dims) == 2 && tensor.Dims[0] > 0 && tensor.Dims[1] > 0 {
+			block := tensor.DType.BlockSize()
+			bytes, known := tensor.DType.DataSize(tensor.Numel())
+			packedEmbedding = known && bytes > 0 && block > 1 && tensor.Dims[0]%uint64(block) == 0
+		}
+	}
+	return separateOutput && packedEmbedding
+}
+
+// corePrefaultRanges returns all data ranges except sparse expert banks and
+// Qwen's optional NextN layer and untied packed input embeddings. These weights
+// need not displace target-decoder pages during ordinary startup. The
 // byte-size fallback deliberately mirrors loadWeight: unusual GGUF producers
 // with ambiguous packing still get the offset-derived range inferred by the
 // regular loader.
@@ -81,9 +129,17 @@ func corePrefaultRanges(data []byte, gguf *GGUFFile) (ranges []mmapByteRange, sk
 		return nil, 0
 	}
 	inferred := inferTensorSizes(data, gguf)
+	nextNPrefix := qwen35NextNPrefaultPrefix(gguf)
+	rowEmbedding := hasRowOnlyPackedEmbedding(gguf)
 	for _, info := range gguf.Tensors {
 		if isSparseExpertTensor(info.Name, info) {
 			skippedExperts++
+			continue
+		}
+		if nextNPrefix != "" && strings.HasPrefix(info.Name, nextNPrefix) {
+			continue
+		}
+		if rowEmbedding && info.Name == "token_embd.weight" {
 			continue
 		}
 		bytes, ok := info.DType.DataSize(info.Numel())

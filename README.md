@@ -1232,7 +1232,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   0.11B F32 GGUF generation benchmark from 39.150 to 38.081 ms/op.
 - Use `--prepare-quant` when slower startup is acceptable; it precomputes Q4_K
   scale/min data plus selected Q6_K scale data, then switches supported rows to
-  prepared kernels.
+  prepared kernels. Untied packed input embeddings use row lookups and need
+  neither prepared CPU scale/min arrays nor Metal handles. For Ministral 3 14B
+  Q4_K_M this avoids 160 MiB of prepared tables; `--prefault core` also leaves
+  its 360 MiB packed input embedding demand-paged. These are tensor/array sizes,
+  not measurements of total RSS or paging performance. Tied embeddings, including
+  Ministral 3 3B's vocabulary output, retain their output-projection resources.
 - Use `--out-of-core` when a GGUF, especially a large sparse-MoE
   model, does not fit comfortably in RAM or Apple unified memory. It keeps the
   model CPU-only, disables Metal and prepared-quant copies, leaves F16/F32/BF16
@@ -1284,8 +1289,13 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   keeps the default repeat penalty from forcing a 131k-logit readback and CPU
   scan on Ministral 3B. GGUF files opened
   through mmap are exposed to Metal as shared no-copy weight buffers;
-  byte-backed models retain the copying path for cgo safety. Prepared ARM64
-  kernels remain as the fallback for small projections and Metal failures. The
+  the complete decoder also uses no-copy views for projections registered on
+  demand, after verifying that their raw bytes belong to the Runner's OS
+  mapping. Go-owned matrices, including loader-padded weights, and byte-backed
+  models retain owned copies for cgo safety. Prepared ARM64 kernels remain as
+  the fallback for small projections and Metal failures. Local Ministral 3
+  Q4_K_M checks eliminated 448.8 MiB of duplicate GPU weight buffers for 3B
+  and 1150.8 MiB for 14B; mapped weight pages remain under OS control. The
   path remains experimental; use
   `--kernel-bench-json` and `--bench-json` on the target Mac before deployment.
 - Metal also supports large Q8_0 FFNs and vocabulary projections, including
@@ -1311,6 +1321,8 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   previously missed FFN fusion because their down projection was not Q6_K.
 - Eligible dense Ministral/Qwen/Llama chunks keep normalization, RoPE,
   attention, residuals and FFN intermediates on the GPU in one command buffer.
+  Prefill and verification fuse each residual addition with the following
+  RMS normalization, preserving the existing float32 state and reduction order.
   New KV rows are published only after successful completion and a cancellation
   check. Retained scratch, including pending KV, is capped at 256 MiB; attention
   partials are capped at 64 MiB. Unsupported shapes and smaller chunks retain
@@ -1319,6 +1331,14 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   transformer-body prefill measured 186 → 156 ms for 32 tokens and 454 → 404 ms
   for 128 tokens, with no steady-state allocations. These measurements exclude
   model loading and the vocabulary projection.
+  With mapped-weight reuse and residual/normalization fusion, complete CLI
+  requests measured 265 → 200 ms for Ministral 3 3B and 723 → 567 ms for 14B
+  uncached prefill (27 prompt tokens, Q4_K_M, Metal, eight threads on a 32-GB
+  M2 Max). `scripts/benchmark_mistral.py` checked identical greedy text over
+  three alternating before/after pairs, generating 64/32 tokens respectively.
+  Cached decode medians were 978 → 1009 ms (3B) and 1435 → 1471 ms (14B).
+  Background-load variation was present; these runs establish lower prefill
+  time and fewer weight copies, not higher decoding throughput.
 - ARM64 Q8_0 prefill processes four tokens together while preserving the
   existing Q8 arithmetic. Native dense Gemma 4 uses layer-wise prompt batches,
   including its token-dependent per-layer projections. On the measured M2 Max,
@@ -1443,6 +1463,12 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   3B forward improved about 3-4% there. Batched prefill already has token-level
   parallelism and uses grouped GQA directly. Set `GOPHERLLM_NO_GROUPED_GQA=1`
   for an A/B rollback.
+  For 128-channel F32 heads, weighted-V accumulation keeps 16 channels from
+  all four queries in registers across 256-position tiles, preserving the
+  chronological FMA sequence. That component measured 3.9x faster at 4k and
+  4.5x at 32k positions on the M2 Max with Ministral's 1024-float V stride;
+  these are kernel timings, not complete decoding speedups. Short spans and
+  other long-context layouts retain the row kernel.
   Non-ARM64 targets (amd64 included) run the same grouped-GQA decode
   algorithm: the shared-row dot/AXPY step is composed from portable or x86-64
   SIMD `DotF32`/`AxpyF32` kernels instead of a hand-fused NEON kernel,
@@ -1520,8 +1546,9 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   search.
 - After mmap'ing a single-file GGUF, the CLI warms backbone tensors across
   worker threads before reporting the model loaded (`--prefault core`).
-  Packed sparse expert banks remain demand-paged. `--prefault all` touches
-  every page up front, matching the library's zero-value load policy.
+  Packed sparse expert banks and untied packed input embeddings remain
+  demand-paged. `--prefault all` touches every page up front, matching the
+  library's zero-value load policy.
   A memory-mapped file only pages in on first touch. A dense forward pass
   touches essentially every weight byte — without warm-up, the *first*
   request after startup silently inherited that page-in cost (disk I/O, or on
@@ -1865,6 +1892,26 @@ prepared and float-only inputs keep their token path. Direct Q6_K QKV retains
 the scalar GPU reduction with one submission/readback per block. Weight storage
 is unchanged. Dense F16/I8 KV uses the same schedule with token-local cache
 codecs. Tests compare state, cache bytes, replay and continuation bit-for-bit.
+
+For memory-constrained Macs, the Qwen prefix cache reuses the unchanged live
+DeltaNet state rather than retaining a second copy. Qwen3.8-27B keeps 149.625 MiB
+of recurrent state instead of 299.25 MiB; KV growth transfers that allocation.
+Serial requests release unused MTP KV and speculative verification scratch.
+Mapped, unprepared MTP weights register their Metal resources only when used.
+`--prefault core` skips the optional NextN block and the separate packed input
+embedding: 251.1 + 682.0 MiB of avoided eager reads in this GGUF. Tied output
+embeddings remain warm; physical residency remains under OS control.
+Metal borrowing failures retain the CPU path without silently copying a matrix.
+Explicit `--prefault all` and prepared loading retain their existing policies.
+
+`TestQwen35ConfiguredMemory` uses the same model environment variables as the
+comparison below. On a 32-GB M2 Max, Qwen3.8-27B Q4_K_M with Metal, Q8 activations,
+no prepared weights and no prefault used 380.8 → 232.1 MiB of retained Go heap
+after GC for a 16-token prompt plus four generated tokens, with identical token
+digests. This excludes mapped weights and driver allocations; it is not total
+model residency or a paging speedup measurement. Leave `--prepare-quant` off
+when conserving memory: its
+expanded scale tables are unused by Q8 activation kernels.
 
 Component benchmarks on a 32-GB M2 Max with Go 1.25.3 measured these medians
 over four alternating pairs. Parallel CPU work used eight threads.

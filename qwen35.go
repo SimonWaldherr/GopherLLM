@@ -127,6 +127,7 @@ type Qwen35MTPWeights struct {
 	FFN            Qwen35FFNWeights
 	SharedHeadNorm []float32
 	Output         Weight
+	lazyMetal      *qwen35MTPLazyMetal
 }
 
 var mtpMetalBodyEnabled = os.Getenv("GOPHERLLM_MTP_METAL_BODY") != "0"
@@ -137,6 +138,7 @@ var mtpMetalBodyEnabled = os.Getenv("GOPHERLLM_MTP_METAL_BODY") != "0"
 // CPU SIMD to avoid command-buffer overhead. This changes value copies only;
 // the loaded model remains the single owner of every accelerator resource.
 func qwen35MTPExecutionWeights(weights Qwen35MTPWeights) Qwen35MTPWeights {
+	weights = weights.withLazyMetal()
 	disableMetal := func(w *Weight) { w.Metal = nil }
 	disableMetal(&weights.TokenEmbd)
 	disableMetal(&weights.EHProj)
@@ -585,8 +587,17 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 			Output:         out,
 			SharedHeadNorm: outNorm,
 		}
+		loadMTP := load
+		if useMetal && borrow && !prepareQuantized {
+			// The optional head must not register its mapped weight pages with
+			// Metal until a request actually enables MTP.
+			mtp.lazyMetal = &qwen35MTPLazyMetal{mapping: data}
+			loadMTP = func(name string) (Weight, error) {
+				return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, false, false, lazyScalarWeights)
+			}
+		}
 		if _, ok := tensors[prefix+"nextn.embed_tokens.weight"]; ok {
-			mtp.TokenEmbd, err = load(prefix + "nextn.embed_tokens.weight")
+			mtp.TokenEmbd, err = loadMTP(prefix + "nextn.embed_tokens.weight")
 		}
 		if err == nil {
 			mtp.EmbeddingNorm, err = loadVec(prefix + "nextn.enorm.weight")
@@ -595,7 +606,7 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 			mtp.HiddenNorm, err = loadVec(prefix + "nextn.hnorm.weight")
 		}
 		if err == nil {
-			mtp.EHProj, err = load(prefix + "nextn.eh_proj.weight")
+			mtp.EHProj, err = loadMTP(prefix + "nextn.eh_proj.weight")
 		}
 		if err == nil {
 			mtp.Norm, err = loadVec(prefix + "attn_norm.weight")
@@ -604,16 +615,16 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 			mtp.PostAttnNorm, err = loadVec(prefix + "post_attention_norm.weight")
 		}
 		if err == nil {
-			mtp.Attention.Q, err = load(prefix + "attn_q.weight")
+			mtp.Attention.Q, err = loadMTP(prefix + "attn_q.weight")
 		}
 		if err == nil {
-			mtp.Attention.K, err = load(prefix + "attn_k.weight")
+			mtp.Attention.K, err = loadMTP(prefix + "attn_k.weight")
 		}
 		if err == nil {
-			mtp.Attention.V, err = load(prefix + "attn_v.weight")
+			mtp.Attention.V, err = loadMTP(prefix + "attn_v.weight")
 		}
 		if err == nil {
-			mtp.Attention.O, err = load(prefix + "attn_output.weight")
+			mtp.Attention.O, err = loadMTP(prefix + "attn_output.weight")
 		}
 		if err == nil {
 			mtp.Attention.QNorm, err = loadVec(prefix + "attn_q_norm.weight")
@@ -622,13 +633,13 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 			mtp.Attention.KNorm, err = loadVec(prefix + "attn_k_norm.weight")
 		}
 		if err == nil {
-			mtp.FFN.Gate, err = load(prefix + "ffn_gate.weight")
+			mtp.FFN.Gate, err = loadMTP(prefix + "ffn_gate.weight")
 		}
 		if err == nil {
-			mtp.FFN.Up, err = load(prefix + "ffn_up.weight")
+			mtp.FFN.Up, err = loadMTP(prefix + "ffn_up.weight")
 		}
 		if err == nil {
-			mtp.FFN.Down, err = load(prefix + "ffn_down.weight")
+			mtp.FFN.Down, err = loadMTP(prefix + "ffn_down.weight")
 		}
 		if err == nil {
 			if _, ok := tensors[prefix+"nextn.shared_head_norm.weight"]; ok {
@@ -639,7 +650,7 @@ func LoadQwen35Model(data []byte, gguf *GGUFFile, borrow, prepareQuantized, useM
 			// Most Qwen exports share the target LM head, but preserve a
 			// checkpoint-provided dedicated head when it is present.
 			if _, ok := tensors[prefix+"nextn.shared_head_head.weight"]; ok {
-				mtp.Output, err = load(prefix + "nextn.shared_head_head.weight")
+				mtp.Output, err = loadMTP(prefix + "nextn.shared_head_head.weight")
 			}
 		}
 		if err != nil {
@@ -1094,6 +1105,7 @@ func releaseQwen35MetalWeights(weights *Qwen35Weights) {
 	releaser.release(&weights.Output)
 	if weights.MTP != nil {
 		mtp := weights.MTP
+		mtp.releaseLazyMetal(&releaser)
 		releaser.release(&mtp.TokenEmbd)
 		releaser.release(&mtp.EHProj)
 		releaser.release(&mtp.Attention.Q)

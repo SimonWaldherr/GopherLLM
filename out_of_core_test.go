@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -194,6 +195,139 @@ func TestCorePrefaultRangesSkipFusedSparseGateUpExperts(t *testing.T) {
 				t.Fatalf("fused expert tensor %s starts in prefault range %+v", tensor.Name, r)
 			}
 		}
+	}
+}
+
+func TestCorePrefaultRangesKeepQwenNextNCold(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		arch    string
+		layers  uint32
+		nextN   uint32
+		markers []string
+		cold    bool
+	}{
+		{"dense-metadata", "qwen35", 3, 1, []string{"blk.2.nextn.eh_proj.weight"}, true},
+		{"moe-metadata", "qwen35moe", 3, 1, []string{"blk.2.nextn.eh_proj.weight"}, true},
+		{"dense-marker-fallback", "qwen35", 3, 0, []string{"blk.2.nextn.eh_proj.weight"}, true},
+		{"moe-marker-fallback", "qwen35moe", 3, 0, []string{"blk.2.nextn.eh_proj.weight"}, true},
+		{"metadata-without-marker", "qwen35", 3, 1, nil, false},
+		{"nontrailing-marker", "qwen35", 3, 0, []string{"blk.1.nextn.eh_proj.weight"}, false},
+		{"unsupported-nextn-count", "qwen35", 3, 2, []string{"blk.1.nextn.eh_proj.weight", "blk.2.nextn.eh_proj.weight"}, false},
+		{"unsupported-marker-chain", "qwen35", 3, 0, []string{"blk.1.nextn.eh_proj.weight", "blk.2.nextn.eh_proj.weight"}, false},
+		{"missing-trunk", "qwen35", 1, 1, []string{"blk.0.nextn.eh_proj.weight"}, false},
+		{"missing-layer-count", "qwen35", 0, 1, []string{"blk.2.nextn.eh_proj.weight"}, false},
+		{"other-architecture", "exaone4", 3, 1, []string{"blk.2.nextn.eh_proj.weight"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &GGUFFile{Metadata: map[string]MetaValue{
+				"general.architecture":            {Kind: "str", Value: tc.arch},
+				tc.arch + ".block_count":          {Kind: "u32", Value: tc.layers},
+				tc.arch + ".nextn_predict_layers": {Kind: "u32", Value: tc.nextN},
+			}}
+			if tc.nextN == 0 {
+				delete(g.Metadata, tc.arch+".nextn_predict_layers")
+			}
+			names := []string{
+				"token_embd.weight", "output.weight", "output_norm.weight",
+				"blk.0.attn_q.weight", "blk.1.ffn_up.weight",
+				"blk.2.attn_q.weight", "blk.2.ffn_down.weight", "blk.2.attn_norm.weight",
+				// A similar layer number or a companion encoder is not the draft block.
+				"blk.20.attn_q.weight", "vision.blk.2.attn_q.weight",
+			}
+			names = append(names, tc.markers...)
+			const tensorBytes = 64
+			for i, name := range names {
+				g.Tensors = append(g.Tensors, TensorInfo{
+					Name: name, Dims: []uint64{16}, DType: GGMLTypeF32, Offset: uint64(i * tensorBytes),
+				})
+			}
+			data := make([]byte, len(names)*tensorBytes)
+			ranges, skippedExperts := corePrefaultRanges(data, g)
+			if skippedExperts != 0 {
+				t.Fatalf("NextN tensors counted as sparse experts: %d", skippedExperts)
+			}
+			for i, name := range names {
+				wantWarm := !(tc.cold && strings.HasPrefix(name, "blk.2."))
+				// Check both ends so a neighboring warm tensor cannot hide a
+				// partial overlap with an optional tensor after range merging.
+				for _, offset := range []int{i * tensorBytes, (i+1)*tensorBytes - 1} {
+					warm := false
+					for _, r := range ranges {
+						warm = warm || (offset >= r.start && offset < r.end)
+					}
+					if warm != wantWarm {
+						t.Fatalf("%s byte %d: warm=%t, want %t (ranges=%v)", name, offset, warm, wantWarm, ranges)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestCorePrefaultRangesKeepUntiedInputEmbeddingCold(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		arch     string
+		typ      GGMLType
+		dims     []uint64
+		separate bool
+		cold     bool
+	}{
+		{"dense-q4k", "qwen35", GGMLTypeQ4_K, []uint64{256, 3}, true, true},
+		{"moe-q6k", "qwen35moe", GGMLTypeQ6_K, []uint64{256, 3}, true, true},
+		{"dense-q8", "qwen35", GGMLTypeQ8_0, []uint64{256, 3}, true, true},
+		{"tied-output", "qwen35", GGMLTypeQ4_K, []uint64{256, 3}, false, false},
+		{"standard-architecture", "llama", GGMLTypeQ4_K, []uint64{256, 3}, true, true},
+		{"ministral14b-untied", "mistral3", GGMLTypeQ4_K, []uint64{5120, 3}, true, true},
+		{"ministral3b-tied", "mistral3", GGMLTypeQ6_K, []uint64{3072, 3}, false, false},
+		{"f32-expanded", "qwen35", GGMLTypeF32, []uint64{256, 3}, true, false},
+		{"f16-expanded", "qwen35", GGMLTypeF16, []uint64{256, 3}, true, false},
+		{"bf16-expanded", "qwen35", GGMLTypeBF16, []uint64{256, 3}, true, false},
+		{"f64-expanded", "qwen35", GGMLTypeF64, []uint64{256, 3}, true, false},
+		{"unknown-format", "qwen35", GGMLTypeUnknown, []uint64{256, 3}, true, false},
+		{"invalid-row-packing", "qwen35", GGMLTypeQ4_K, []uint64{257, 3}, true, false},
+		{"not-a-matrix", "qwen35", GGMLTypeQ4_K, []uint64{768}, true, false},
+		{"empty-matrix", "qwen35", GGMLTypeQ4_K, []uint64{256, 0}, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := &GGUFFile{Metadata: map[string]MetaValue{
+				"general.architecture": {Kind: "str", Value: tc.arch},
+			}}
+			embedding := TensorInfo{Name: "token_embd.weight", Dims: tc.dims, DType: tc.typ}
+			bytes, _ := tc.typ.DataSize(embedding.Numel())
+			// Give malformed descriptors a small nonempty inferred range so the
+			// test verifies conservative retention rather than dropping no bytes.
+			embeddingBytes := max(64, bytes)
+			g.Tensors = append(g.Tensors, embedding,
+				TensorInfo{Name: "output_norm.weight", Dims: []uint64{16}, DType: GGMLTypeF32, Offset: uint64(embeddingBytes)},
+				TensorInfo{Name: "blk.0.attn_q.weight", Dims: []uint64{16}, DType: GGMLTypeF32, Offset: uint64(embeddingBytes + 64)})
+			if tc.separate {
+				g.Tensors = append(g.Tensors, TensorInfo{Name: "output.weight", Dims: []uint64{256, 3}, DType: GGMLTypeQ6_K, Offset: uint64(embeddingBytes + 128)})
+			}
+			data := make([]byte, embeddingBytes+128+630)
+			ranges, skippedExperts := corePrefaultRanges(data, g)
+			if skippedExperts != 0 {
+				t.Fatalf("embedding counted as sparse experts: %d", skippedExperts)
+			}
+			for i, tensor := range g.Tensors {
+				wantWarm := i != 0 || !tc.cold
+				start := int(tensor.Offset)
+				length, _ := tensor.DType.DataSize(tensor.Numel())
+				if i == 0 && length <= 0 {
+					length = embeddingBytes
+				}
+				for _, offset := range []int{start, start + length - 1} {
+					warm := false
+					for _, r := range ranges {
+						warm = warm || (offset >= r.start && offset < r.end)
+					}
+					if warm != wantWarm {
+						t.Fatalf("%s byte %d: warm=%t, want %t (ranges=%v)", tensor.Name, offset, warm, wantWarm, ranges)
+					}
+				}
+			}
+		})
 	}
 }
 

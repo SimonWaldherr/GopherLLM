@@ -15,10 +15,9 @@ import (
 
 func TestMetalMinistralSelectivePreparationThresholds(t *testing.T) {
 	// Ministral-3 GQA has 3K/5K Q and O projections and 1K K/V
-	// projections. Those matrices are deliberately CPU-side: no current Metal
-	// operation can dispatch them, so preparing GPU buffers for them would only
-	// extend model load and consume unified memory. Its 3B FFN and vocabulary
-	// projection remain above the crossover.
+	// projections. Standalone operations keep them CPU-side below the measured
+	// crossover; the complete dense decoder registers its own handles on demand.
+	// Its 3B FFN and vocabulary projection remain above the crossover.
 	tests := []struct {
 		name string
 		typ  GGMLType

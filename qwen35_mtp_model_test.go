@@ -41,26 +41,23 @@ func BenchmarkQwen35MTPBodyConfiguredHead(b *testing.B) {
 	if r.kind != loadedQwen35 || r.qwen35.MTP == nil {
 		b.Fatal("a native Qwen checkpoint with a loaded MTP head is required")
 	}
-	cfg, original := r.config, *r.qwen35.MTP
-	for name, w := range map[string]Weight{"Q": original.Attention.Q,
-		"gate": original.FFN.Gate, "up": original.FFN.Up, "down": original.FFN.Down} {
+	cfg, selected := r.config, qwen35MTPExecutionWeights(*r.qwen35.MTP)
+	for name, w := range map[string]Weight{"Q": selected.Attention.Q,
+		"gate": selected.FFN.Gate, "up": selected.FFN.Up, "down": selected.FFN.Down} {
 		if w.Metal == nil {
 			b.Fatalf("MTP %s has no Metal view; this would not compare the requested backend", name)
 		}
 	}
-	cpu := mtpHeadCPUWeights(original)
-	hybrid := original
-	hybrid.TokenEmbd.Metal, hybrid.EHProj.Metal = nil, nil
-	hybrid.Attention.K.Metal, hybrid.Attention.V.Metal = nil, nil
+	cpu := mtpHeadCPUWeights(selected)
 	var bodyBytes int64
-	for _, w := range [...]Weight{original.EHProj, original.Attention.Q, original.Attention.K, original.Attention.V,
-		original.Attention.O, original.FFN.Gate, original.FFN.Up, original.FFN.Down} {
+	for _, w := range [...]Weight{selected.EHProj, selected.Attention.Q, selected.Attention.K, selected.Attention.V,
+		selected.Attention.O, selected.FFN.Gate, selected.FFN.Up, selected.FFN.Down} {
 		bodyBytes += int64(len(w.Raw)) + int64(len(w.F32))*4
 	}
 	b.Logf("model=%s layers_loaded=%d layers_evaluated=0(target)+1(MTP) dim=%d body_projection_bytes=%d load=%v mapped=%t Q8=%t prepare=false prefault=none threads=8 no_vocab=true",
 		path, cfg.NLayers, cfg.Dim, bodyBytes, info.LoadTime, r.IsMapped(), useQ8Activations.Load())
-	for name, w := range map[string]Weight{"EH": original.EHProj, "Q": original.Attention.Q, "K": original.Attention.K,
-		"V": original.Attention.V, "O": original.Attention.O, "gate": original.FFN.Gate, "up": original.FFN.Up, "down": original.FFN.Down} {
+	for name, w := range map[string]Weight{"EH": selected.EHProj, "Q": selected.Attention.Q, "K": selected.Attention.K,
+		"V": selected.Attention.V, "O": selected.Attention.O, "gate": selected.FFN.Gate, "up": selected.FFN.Up, "down": selected.FFN.Down} {
 		b.Logf("projection=%s rows=%d cols=%d type=%d metal=%t direct=%t", name, w.Rows, w.Cols, w.Type, w.Metal != nil, metalWeightUsesDirect(w.Metal))
 	}
 	const prefixLen, cacheLen = 8, 16
@@ -86,20 +83,21 @@ func BenchmarkQwen35MTPBodyConfiguredHead(b *testing.B) {
 		}
 		return s
 	}
-	reference, metalState, hybridState := newState(), newState(), newState()
+	reference, metalState := newState(), newState()
 	forwardQwen35MTPBodyInto(cfg, cpu, reference, token, hPrev, prefixLen)
-	forwardQwen35MTPBodyInto(cfg, original, metalState, token, hPrev, prefixLen)
-	forwardQwen35MTPBodyInto(cfg, hybrid, hybridState, token, hPrev, prefixLen)
-	originalError := mtpHeadRelativeL2(b, metalState.Scratch.XN, reference.Scratch.XN)
-	hybridError := mtpHeadRelativeL2(b, hybridState.Scratch.XN, reference.Scratch.XN)
-	bound := max(.02, 4*originalError)
-	if hybridError > bound {
-		b.Fatalf("hybrid hidden relative L2=%g exceeds CPU-Q8/GPU comparison envelope %g (original Metal=%g)", hybridError, bound, originalError)
+	forwardQwen35MTPBodyInto(cfg, selected, metalState, token, hPrev, prefixLen)
+	// CPU Q8 activation rounding and Metal float reductions intentionally use
+	// different arithmetic. Bound their hidden-state difference directly; the
+	// selected execution path must still retain the exact CPU K/V below.
+	const maxHiddenRelativeL2 = .02
+	hiddenError := mtpHeadRelativeL2(b, metalState.Scratch.XN, reference.Scratch.XN)
+	if hiddenError > maxHiddenRelativeL2 {
+		b.Fatalf("selected Metal hidden relative L2=%g exceeds CPU comparison bound %g", hiddenError, maxHiddenRelativeL2)
 	}
 	positions := prefixLen + 1
 	k, v := positions*reference.KV.PerPosKDim, positions*reference.KV.PerPosVDim
-	if !slices.Equal(hybridState.KV.K[0][:k], reference.KV.K[0][:k]) || !slices.Equal(hybridState.KV.V[0][:v], reference.KV.V[0][:v]) {
-		b.Fatal("hybrid Q/O/FFN offload changed the CPU K/V contract")
+	if !slices.Equal(metalState.KV.K[0][:k], reference.KV.K[0][:k]) || !slices.Equal(metalState.KV.V[0][:v], reference.KV.V[0][:v]) {
+		b.Fatal("selected Metal Q/O/FFN offload changed the CPU K/V contract")
 	}
 	catchup := newState()
 	copy(catchup.PendingHidden, hPrev)
@@ -107,12 +105,11 @@ func BenchmarkQwen35MTPBodyConfiguredHead(b *testing.B) {
 	if !slices.Equal(catchup.KV.K[0][:k], reference.KV.K[0][:k]) || !slices.Equal(catchup.KV.V[0][:v], reference.KV.V[0][:v]) {
 		b.Fatal("real MTP KV-only catch-up differs from the full CPU body")
 	}
-	b.Logf("first_body_hidden_relative_L2 originalMetal=%g hybridQOFFN=%g hybrid_envelope=%g hybrid_KV=bit_exact original_K_L2=%g original_V_L2=%g",
-		originalError, hybridError, bound, mtpHeadRelativeL2(b, metalState.KV.K[0][:k], reference.KV.K[0][:k]), mtpHeadRelativeL2(b, metalState.KV.V[0][:v], reference.KV.V[0][:v]))
+	b.Logf("first_body_hidden_relative_L2 selected_metal=%g bound=%g selected_KV=bit_exact", hiddenError, maxHiddenRelativeL2)
 	for _, mode := range []struct {
 		name    string
 		weights Qwen35MTPWeights
-	}{{"cpu", cpu}, {"original_metal", original}, {"hybrid_qo_ffn", hybrid}} {
+	}{{"cpu", cpu}, {"selected_metal", selected}} {
 		b.Run(mode.name, func(b *testing.B) {
 			setPerformanceThreads(b, 8)
 			state := newState()

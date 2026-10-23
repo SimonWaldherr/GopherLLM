@@ -119,6 +119,9 @@ type Runner struct {
 	mistralKVPrefixCacheMu sync.Mutex
 	mistralKVPrefixCache   mistralKVPrefixCache
 	mappedFile             *MmapFile
+	// metalMapping proves which raw weight views can be borrowed by a lazily
+	// created dense decoder, including during load-time pipeline warmup.
+	metalMapping []byte
 	// extraMappedFiles holds the additional shard mappings of an out-of-core
 	// split GGUF. Those models have no single mappedFile: every weight is a
 	// view into one of these, so all of them must outlive the Runner and all
@@ -391,6 +394,9 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 		return nil, err
 	}
 	r := &Runner{gguf: gguf, arch: arch, tok: tok, outOfCore: options.OutOfCore}
+	if options.UseMetal && borrowQuantized {
+		r.metalMapping = data
+	}
 	if options.OutOfCore {
 		fmt.Fprintln(logw, "Out-of-core: CPU mmap mode; sparse experts remain demand-paged (Metal and prepared quantization disabled)")
 	}
@@ -629,6 +635,7 @@ func (r *Runner) Close() error {
 	r.visionMu.Unlock()
 	r.workspaceCache = nil
 	r.workspaceBuf = nil
+	r.metalMapping = nil
 	r.bertScratch = bertEmbeddingScratch{}
 	r.prefixCache = prefixCacheState{}
 	r.conversations = conversationCache{}

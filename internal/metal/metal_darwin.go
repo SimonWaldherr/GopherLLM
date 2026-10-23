@@ -577,13 +577,26 @@ static id<MTLCommandBuffer> gllm_metal_new_command_buffer(void) {
 
 static id<MTLBuffer> gllm_metal_new_weight_buffer(const void* data, long len, bool no_copy, NSUInteger* offset) {
 	*offset = 0;
+	NSUInteger limit = [gllm_device maxBufferLength];
+	if (len <= 0 || (NSUInteger)len > limit) {
+		strncpy(gllm_error, "Metal weight exceeds maxBufferLength", sizeof(gllm_error) - 1);
+		return nil;
+	}
 	if (no_copy) {
 		NSUInteger page = (NSUInteger)getpagesize();
 		uintptr_t address = (uintptr_t)data;
 		uintptr_t base = address & ~((uintptr_t)page - 1);
 		NSUInteger delta = (NSUInteger)(address - base);
+		if ((NSUInteger)len > NSUIntegerMax - delta - (page - 1)) {
+			strncpy(gllm_error, "Metal borrowed weight range overflow", sizeof(gllm_error) - 1);
+			return nil;
+		}
 		NSUInteger span = delta + (NSUInteger)len;
 		NSUInteger rounded = (span + page - 1) & ~(page - 1);
+		if (rounded > limit) {
+			strncpy(gllm_error, "Metal borrowed weight exceeds maxBufferLength", sizeof(gllm_error) - 1);
+			return nil;
+		}
 		id<MTLBuffer> buffer = [gllm_device
 			newBufferWithBytesNoCopy:(void*)base
 			length:rounded
@@ -593,8 +606,19 @@ static id<MTLBuffer> gllm_metal_new_weight_buffer(const void* data, long len, bo
 			*offset = delta;
 			return buffer;
 		}
+		// Borrowed weights can cover most of unified memory. A failed mapping
+		// must leave the caller on its CPU path, rather than allocate a second
+		// complete copy that forces the original file pages out of memory.
+		strncpy(gllm_error, "failed to borrow Metal weight buffer", sizeof(gllm_error) - 1);
+		return nil;
 	}
 	return [gllm_device newBufferWithBytes:data length:(NSUInteger)len options:MTLResourceStorageModeShared];
+}
+
+static unsigned long long gllm_metal_max_buffer_length(void) {
+	@autoreleasepool {
+		return gllm_metal_init() ? (unsigned long long)[gllm_device maxBufferLength] : 0;
+	}
 }
 
 static void* gllm_metal_new_q4k(const void* data, long len, int rows, int cols, bool no_copy) {
@@ -616,6 +640,7 @@ static void* gllm_metal_new_q4k(const void* data, long len, int rows, int cols, 
 		w->cols = cols;
 		w->row_bytes = (cols / 256) * 144;
 		w->weights = gllm_metal_new_weight_buffer(data, len, no_copy, &w->weight_offset);
+		if (w->weights == nil) { free(w); return NULL; }
 		w->x = [gllm_device newBufferWithLength:(NSUInteger)cols * sizeof(float) options:MTLResourceStorageModeShared];
 		w->out = [gllm_device newBufferWithLength:(NSUInteger)rows * sizeof(float) options:MTLResourceStorageModeShared];
 		if (w->weights == nil || w->x == nil || w->out == nil) {
@@ -647,6 +672,7 @@ static void* gllm_metal_new_q5k(const void* data, long len, int rows, int cols, 
 		w->cols = cols;
 		w->row_bytes = (cols / 256) * 176;
 		w->weights = gllm_metal_new_weight_buffer(data, len, no_copy, &w->weight_offset);
+		if (w->weights == nil) { free(w); return NULL; }
 		w->x = [gllm_device newBufferWithLength:(NSUInteger)cols * sizeof(float) options:MTLResourceStorageModeShared];
 		w->out = [gllm_device newBufferWithLength:(NSUInteger)rows * sizeof(float) options:MTLResourceStorageModeShared];
 		if (w->weights == nil || w->x == nil || w->out == nil) {
@@ -680,6 +706,7 @@ static void* gllm_metal_new_q6k(const void* data, long len, int rows, int cols, 
 		w->cols = cols;
 		w->row_bytes = (cols / 256) * 210;
 		w->weights = gllm_metal_new_weight_buffer(data, len, no_copy, &w->weight_offset);
+		if (w->weights == nil) { free(w); return NULL; }
 		w->x = [gllm_device newBufferWithLength:(NSUInteger)cols * sizeof(float) options:MTLResourceStorageModeShared];
 		w->out = [gllm_device newBufferWithLength:(NSUInteger)rows * sizeof(float) options:MTLResourceStorageModeShared];
 		w->argmax = [gllm_device newBufferWithLength:sizeof(GLLMArgmaxResult) options:MTLResourceStorageModeShared];
@@ -1660,8 +1687,24 @@ type Weight struct {
 	cols int
 }
 
+// quantizedWeightData bounds both the GPU layout and the allocation to the
+// matrix itself. Extra bytes in a containing mapped region are never copied.
+func quantizedWeightData(data []byte, rows, cols, blockSize, blockBytes int) []byte {
+	if rows <= 0 || rows > math.MaxInt32 || cols <= 0 || cols > math.MaxInt32 || cols%blockSize != 0 {
+		return nil
+	}
+	blocks := cols / blockSize
+	if blocks > math.MaxInt32/blockBytes || blocks > len(data)/blockBytes/rows {
+		return nil
+	}
+	return data[:rows*blocks*blockBytes]
+}
+
+// PrepareQ4K prepares one quantized matrix. With noCopy, data must remain
+// mapped until Release; allocation failure returns nil without copying it.
 func PrepareQ4K(data []byte, rows, cols int, noCopy bool) *Weight {
-	if rows <= 0 || cols <= 0 || cols%256 != 0 || len(data) == 0 {
+	data = quantizedWeightData(data, rows, cols, 256, 144)
+	if len(data) == 0 {
 		return nil
 	}
 	ptr := C.gllm_metal_new_q4k(unsafe.Pointer(&data[0]), C.long(len(data)), C.int(rows), C.int(cols), C.bool(noCopy))
@@ -1681,11 +1724,18 @@ func LastError() string {
 	return C.GoString(C.gllm_metal_last_error())
 }
 
+// MaxBufferLength is the largest individual buffer the current device can
+// create. Zero means that no Metal device is available.
+func MaxBufferLength() uint64 {
+	return uint64(C.gllm_metal_max_buffer_length())
+}
+
 // PrepareQ5K uploads a Q5_K weight matrix. Unlike PrepareQ6K it allocates no
 // argmax/recent buffers: Q5_K is never the output projection, so the on-device
 // argmax path does not apply to it.
 func PrepareQ5K(data []byte, rows, cols int, noCopy bool) *Weight {
-	if rows <= 0 || cols <= 0 || cols%256 != 0 || len(data) == 0 {
+	data = quantizedWeightData(data, rows, cols, 256, 176)
+	if len(data) == 0 {
 		return nil
 	}
 	ptr := C.gllm_metal_new_q5k(unsafe.Pointer(&data[0]), C.long(len(data)), C.int(rows), C.int(cols), C.bool(noCopy))
@@ -1706,7 +1756,8 @@ func MatvecQ5K(w *Weight, x, out []float32) bool {
 }
 
 func PrepareQ6K(data []byte, rows, cols int, noCopy bool) *Weight {
-	if rows <= 0 || cols <= 0 || cols%256 != 0 || len(data) == 0 {
+	data = quantizedWeightData(data, rows, cols, 256, 210)
+	if len(data) == 0 {
 		return nil
 	}
 	ptr := C.gllm_metal_new_q6k(unsafe.Pointer(&data[0]), C.long(len(data)), C.int(rows), C.int(cols), C.bool(noCopy))
@@ -1932,10 +1983,8 @@ func Release(w *Weight) {
 }
 
 func PrepareQ8_0(data []byte, rows, cols int, noCopy bool) *Weight {
-	if rows <= 0 || cols <= 0 || cols%32 != 0 || len(data) == 0 {
-		return nil
-	}
-	if rows > math.MaxInt32 || cols/32 > math.MaxInt32/34 || cols/32 > len(data)/34/rows {
+	data = quantizedWeightData(data, rows, cols, 32, 34)
+	if len(data) == 0 {
 		return nil
 	}
 	ptr := C.gllm_metal_new_q8_0(unsafe.Pointer(&data[0]), C.long(len(data)), C.int(rows), C.int(cols), C.bool(noCopy))

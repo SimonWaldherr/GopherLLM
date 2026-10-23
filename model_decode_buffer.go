@@ -10,8 +10,9 @@ package gopherllm
 // activation slabs. Not safe for concurrent use; Runner.genLock serializes
 // requests.
 type DecodeBuffer struct {
-	metalDense *metalDenseState
-	X          []float32
+	metalDense   *metalDenseState
+	metalMapping []byte
+	X            []float32
 	// PosEmbd is scratch space for the gathered absolute-position-embedding
 	// row (GPT-2/StarCoder v1 only; see Config.usesAbsolutePositionEmbd).
 	PosEmbd  []float32

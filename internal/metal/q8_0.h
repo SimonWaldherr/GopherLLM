@@ -88,6 +88,7 @@ static void* gllm_metal_new_q8_0(const void* data, long len, int rows, int cols,
 		w->cols = cols;
 		w->row_bytes = (cols / 32) * 34;
 		w->weights = gllm_metal_new_weight_buffer(data, len, no_copy, &w->weight_offset);
+		if (w->weights == nil) { free(w); return NULL; }
 		w->x = [gllm_device newBufferWithLength:(NSUInteger)cols * sizeof(float) options:MTLResourceStorageModeShared];
 		w->out = [gllm_device newBufferWithLength:(NSUInteger)rows * sizeof(float) options:MTLResourceStorageModeShared];
 		w->argmax = [gllm_device newBufferWithLength:sizeof(GLLMArgmaxResult) options:MTLResourceStorageModeShared];

@@ -6,8 +6,10 @@ package gopherllm
 // an identical request skip even the final prompt-token forward pass. Greedy
 // Q6_K output can retain its exact next token instead, avoiding that large
 // snapshot and preserving the GPU no-readback win across an identical prompt.
-// Qwen35 additionally needs its independent DeltaNet state to resume the
-// prefix. Runner.genLock protects the whole structure.
+// Qwen35 additionally needs its DeltaNet state to resume the prefix. A chat
+// boundary borrows the unchanged live state; independent checkpoints remain
+// valid for callers that explicitly captured one. Runner.genLock protects the
+// whole structure and invalidates the boundary before that live state changes.
 type prefixCacheState struct {
 	cache                     *KVCache
 	tokens                    []uint32
@@ -173,7 +175,7 @@ func (r *Runner) prefixCacheSupportedWithMTP(cache *KVCache, useMTP bool) bool {
 	if r.kind == loadedQwen35 {
 		// Qwen3.8's DeltaNet cache is needed in addition to K/V rows. Bound the
 		// combined retained footprint to the same budget that guards normal
-		// prefix caching; a 27B Qwen3.8 snapshot is about 150 MiB and fits with
+		// prefix caching; a 27B Qwen3.8 state is about 150 MiB and fits with
 		// the common short-context f16 or i8 K/V cache.
 		if cache.Qwen35 == nil {
 			return false
@@ -209,9 +211,9 @@ func (r *Runner) prefixReuseWithMTP(cache *KVCache, tokens []uint32, useMTP bool
 		return 0
 	}
 	if r.kind == loadedQwen35 {
-		// A single snapshot represents the state after the complete resident
+		// One recurrent boundary represents the complete resident
 		// token sequence, unlike ordinary K/V rows reusable at arbitrary prefixes.
-		// It is therefore valid only when the complete snapshot prefix matches.
+		// It is therefore valid only when the complete resident prefix matches.
 		// If the new prompt ends exactly there without matching prompt logits,
 		// the generic one-token re-forward fallback would update DeltaNet state
 		// twice, so leave it cold instead.
@@ -226,7 +228,7 @@ func (r *Runner) prefixReuseWithMTP(cache *KVCache, tokens []uint32, useMTP bool
 		if useMTP && (cache.Qwen35MTP == nil || len(state.qwen35MTP) != len(cache.Qwen35MTP.PendingHidden)) {
 			return 0
 		}
-		if !cache.Qwen35.restore(state.qwen35) {
+		if state.qwen35 == nil || state.qwen35 != cache.Qwen35 && !cache.Qwen35.restore(state.qwen35) {
 			return 0
 		}
 		if useMTP && !cache.Qwen35MTP.restorePending(state.qwen35MTP) {
@@ -242,6 +244,18 @@ func (r *Runner) prefixReuseWithMTP(cache *KVCache, tokens []uint32, useMTP bool
 // rather than re-prefilling prior turns. Retaining at most 512 MiB avoids
 // turning one unusually large context into a permanent memory commitment.
 func (r *Runner) generationWorkspace(cacheLen int, enableMTP ...bool) (*KVCache, *DecodeBuffer) {
+	return r.generationWorkspaceWithPrefix(cacheLen, false, enableMTP...)
+}
+
+// generationChatWorkspace preserves the recorded prefix's recurrence
+// until chat has decided whether to resume it. A miss must reset that state
+// after invalidating the old prefix and before writing any prompt positions.
+// Other workspace users retain generationWorkspace's cold-start contract.
+func (r *Runner) generationChatWorkspace(cacheLen int, enableMTP bool) (*KVCache, *DecodeBuffer) {
+	return r.generationWorkspaceWithPrefix(cacheLen, true, enableMTP)
+}
+
+func (r *Runner) generationWorkspaceWithPrefix(cacheLen int, preservePrefix bool, enableMTP ...bool) (*KVCache, *DecodeBuffer) {
 	useMTP := len(enableMTP) > 0 && enableMTP[0] && r.kind == loadedQwen35 && r.qwen35.MTP != nil
 	kDim, vDim, maxHead, maxKV, maxVal := r.cacheDims()
 	layers := r.kvCacheLayerCount()
@@ -280,9 +294,8 @@ func (r *Runner) generationWorkspace(cacheLen int, enableMTP ...bool) (*KVCache,
 			r.workspaceCache = cache
 			if shapeCompatible && r.prefixCache.cache == old && r.kind != loadedNemotronH && r.kind != loadedMamba2 {
 				if copied := copyKVPrefix(cache, old, len(r.prefixCache.tokens)); copied == len(r.prefixCache.tokens) {
-					// Qwen's recurrent snapshot is independent from its K/V rows,
-					// so a geometrically grown cache can retain both. Keep their
-					// combined footprint within the normal prefix-cache budget.
+					// Qwen's recurrent state can migrate with these K/V rows.
+					// Keep their combined footprint within the prefix budget.
 					if r.kind != loadedQwen35 || (r.prefixCache.qwen35 != nil &&
 						kvCacheStorageBytes(cache)+r.prefixCache.qwen35.bytes() <= maxReusableKVCacheBytes) {
 						r.prefixCache.cache = cache
@@ -317,10 +330,25 @@ func (r *Runner) generationWorkspace(cacheLen int, enableMTP ...bool) (*KVCache,
 	}
 	if r.kind == loadedQwen35 {
 		recurrentLayers := qwen35RecurrentLayerCount(r.qwen35)
+		// Replacing the retained attention workspace also transfers ownership
+		// of its live recurrence. Keep the original allocation for both prefix
+		// appends and cold conversation switches; chat resets only on a miss.
+		// A one-off cache outside the retention budget remains independent of
+		// the smaller retained workspace and its still-usable prefix.
+		if cache != old && cache == r.workspaceCache && old != nil && old.Qwen35.compatible(r.config, recurrentLayers) {
+			cache.Qwen35 = old.Qwen35
+		}
 		if !cache.Qwen35.compatible(r.config, recurrentLayers) {
 			cache.Qwen35 = newQwen35Cache(r.config, recurrentLayers)
 		}
-		cache.Qwen35.reset()
+		if !preservePrefix {
+			// Direct scratch users intentionally start cold. If the old prefix
+			// borrowed this live state, retire its metadata before zeroing it.
+			if r.prefixCache.cache == cache && r.prefixCache.qwen35 == cache.Qwen35 {
+				r.clearPrefixCache()
+			}
+			cache.Qwen35.reset()
+		}
 		if useMTP {
 			oldMTP := (*Qwen35MTPState)(nil)
 			if old != nil {
@@ -344,5 +372,6 @@ func (r *Runner) generationWorkspace(cacheLen int, enableMTP ...bool) (*KVCache,
 	if r.workspaceBuf == nil {
 		r.workspaceBuf = NewDecodeBuffer(r.config, maxHead, maxKV, maxVal)
 	}
+	r.workspaceBuf.metalMapping = r.metalMapping
 	return cache, r.workspaceBuf
 }

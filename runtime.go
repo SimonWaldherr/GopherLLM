@@ -165,7 +165,18 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 		return GenerationResult{}, err
 	}
 	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
-	cache, buf := r.generationWorkspace(cacheLen, mtpDraftTokens > 0)
+	cache, buf := r.generationChatWorkspace(cacheLen, mtpDraftTokens > 0)
+	if r.kind == loadedQwen35 && mtpDraftTokens == 0 && options.PromptLookupTokens == 0 {
+		// Serial requests need neither a recurrent verification checkpoint nor
+		// draft-head KV. Retire the MTP boundary before releasing those rows so
+		// a cancellation cannot leave an apparently reusable draft prefix.
+		r.prefixCache.qwen35MTP = nil
+		cache.Qwen35MTP = nil
+		if r.workspaceCache != nil {
+			r.workspaceCache.Qwen35MTP = nil
+		}
+		buf.speculative = speculativeVerifyScratch{}
+	}
 	buf.ImageEmbeds = imageEmbeds
 	defer func() { buf.ImageEmbeds = nil }()
 	cacheInfo := PromptCacheInfo{Mode: "disabled", PromptTokens: len(tokens)}
@@ -184,9 +195,8 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 	// prefix-cache reuse would save.
 	cacheEligible := len(imageEmbeds) == 0 && r.prefixCacheSupportedWithMTP(cache, mtpDraftTokens > 0)
 	// A grown Qwen workspace can still be retained for the current request
-	// while exceeding the stricter K/V-plus-snapshot prefix budget. Drop an
-	// old snapshot attached to that workspace immediately rather than keeping
-	// memory that can no longer be reused.
+	// while exceeding the stricter K/V-plus-recurrence prefix budget. Invalidate
+	// its old prefix metadata immediately when that boundary cannot be reused.
 	if !cacheEligible && r.kind == loadedQwen35 && r.prefixCache.cache == cache {
 		r.clearPrefixCache()
 	}
@@ -269,13 +279,30 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 			promptHasGreedyToken = true
 		} else {
 			prefillOffset = max(0, len(tokens)-1)
+			if r.kind == loadedQwen35 {
+				// A cached greedy token cannot supply stochastic logits. Unlike
+				// attention-only K/V, DeltaNet cannot rewind by one position.
+				prefillOffset = 0
+			}
 			cacheInfo.Hit = prefillOffset > 0
 			cacheInfo.ReusedTokens = prefillOffset
 		}
 	}
+	if r.kind == loadedQwen35 && prefillOffset == 0 {
+		cache.Qwen35.reset()
+		if mtpDraftTokens > 0 {
+			cache.Qwen35MTP.reset()
+		}
+	}
 	prefillBegan := time.Now()
-	residentTokens := cachedResidentTokens[:0]
-	promptLogits := cachedPromptLogits[:0]
+	var residentTokens []uint32
+	var promptLogits []float32
+	if cacheEligible {
+		// Only the retired prefix's storage is writable scratch. A temporary
+		// noneligible workspace can leave another retained prefix usable.
+		residentTokens = cachedResidentTokens[:0]
+		promptLogits = cachedPromptLogits[:0]
+	}
 	recent := recentTokenWindowInto(buf.RecentTokens[:0], tokens)
 	prefillComplete := false
 	defer func() {
@@ -294,11 +321,15 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 			r.clearPrefixCache()
 			return
 		}
-		var qwen35Snapshot *Qwen35Cache
+		var qwen35Boundary *Qwen35Cache
 		var qwen35MTP []float32
 		if r.kind == loadedQwen35 {
-			qwen35Snapshot = cache.Qwen35.snapshot()
-			if qwen35Snapshot == nil {
+			// The live state is already at the exact advertised resident token
+			// boundary. genLock and prefix invalidation keep it unchanged until
+			// the next request either resumes it or starts a cold sequence.
+			// Retaining a clone here would double Qwen3.8-27B's 150 MiB state.
+			qwen35Boundary = cache.Qwen35
+			if qwen35Boundary == nil {
 				r.clearPrefixCache()
 				return
 			}
@@ -318,7 +349,7 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 			promptGreedyToken:         promptGreedyToken,
 			promptGreedyRepeatPenalty: promptGreedyRepeatPenalty,
 			promptHasGreedyToken:      promptHasGreedyToken,
-			qwen35:                    qwen35Snapshot,
+			qwen35:                    qwen35Boundary,
 			qwen35MTP:                 qwen35MTP,
 		}
 		r.prefixCache = state

@@ -68,7 +68,12 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		config.RopeFactorsShort = factors
 	}
 
-	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
+	// With a separate vocabulary projection, embeddings only serve RowInto
+	// lookups. That code reads the original packed rows and never uses prepared
+	// matvec scales or accelerator handles. Tied embeddings still need those
+	// resources for the output projection below.
+	_, separateOutput := tensorIdx["output.weight"]
+	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized && !separateOutput, useMetal && !separateOutput, lazyScalarWeights)
 	if err != nil {
 		return config, ModelWeights{}, err
 	}
