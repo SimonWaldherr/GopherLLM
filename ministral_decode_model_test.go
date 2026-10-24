@@ -11,6 +11,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -229,4 +230,125 @@ func ministralDecodeFloatDigest(t testing.TB, groups ...[]float32) string {
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Compare complete cached chat requests, including sampling, on one loaded
+// model. The fixed prompt also reproduces the earlier 27-token Ministral run.
+func TestMinistralConfiguredGeneration(t *testing.T) {
+	path := os.Getenv("GOPHERLLM_MINISTRAL_MODEL")
+	if path == "" {
+		t.Skip("set GOPHERLLM_MINISTRAL_MODEL to a local Ministral GGUF")
+	}
+	if !MetalAvailable() {
+		t.Fatal(MetalError())
+	}
+	setPerformanceThreads(t, 8)
+	oldF16, oldI8 := useF16KVCache.Swap(false), useI8KVCache.Swap(false)
+	oldQ8 := useQ8Activations.Swap(q8ActivationsAvailable())
+	t.Cleanup(func() {
+		useF16KVCache.Store(oldF16)
+		useI8KVCache.Store(oldI8)
+		useQ8Activations.Store(oldQ8)
+	})
+	t.Setenv("GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP", "4")
+	t.Setenv("GOPHERLLM_METAL_DENSE_PARALLEL_ARGMAX", "0")
+	r, _, err := RunnerFromPathWithOptions(path, LoadOptions{UseMetal: true, Prefault: MmapPrefaultCore, LogWriter: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close() })
+	if !r.IsMapped() || r.kind != loadedStandard || (r.arch != "mistral3" && r.arch != "ministral") {
+		t.Fatal("requires a mapped standard Ministral model")
+	}
+	opts := DefaultGenerationOptions()
+	opts.MaxTokens, opts.Seed, opts.Sampler.Temperature = 64, 41, 0
+	messages := []ChatMessage{UserMessage("Erkläre in fünf Sätzen, wie ein Computerprogramm ausgeführt wird.")}
+	var referenceTokens []uint32
+	var referenceText, referenceState string
+	run := func() GenerationResult {
+		t.Helper()
+		result, err := r.GenerateChat(messages, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Stats.GeneratedTokens != opts.MaxTokens {
+			t.Fatalf("short workload: got %d tokens, want %d", result.Stats.GeneratedTokens, opts.MaxTokens)
+		}
+		b, cache := r.workspaceBuf, r.workspaceCache
+		if b.metalDense == nil || b.metalDense.borrowedWeightBytes == 0 || b.metalDense.copiedWeightBytes != 0 {
+			t.Fatal("decode lost its mapped-weight memory savings")
+		}
+		tokens := b.GeneratedTokens[:result.Stats.GeneratedTokens]
+		groups := [][]float32{b.X, b.XN}
+		resident := len(r.prefixCache.tokens)
+		for layer := range cache.K {
+			groups = append(groups, cache.K[layer][:resident*cache.PerPosKDim], cache.V[layer][:resident*cache.PerPosVDim])
+		}
+		digest := ministralDecodeFloatDigest(t, groups...)
+		if referenceTokens == nil {
+			referenceTokens, referenceText, referenceState = slices.Clone(tokens), result.Text, digest
+		} else if result.Text != referenceText || !slices.Equal(tokens, referenceTokens) || digest != referenceState {
+			t.Fatal("generation or residual/KV state differs from the serial argmax reference")
+		}
+		return result
+	}
+	warm := run()
+	// ABBA order limits drift from other processes without reloading weights.
+	for cycle := range 4 {
+		for order, mode := range []string{"0", "1", "1", "0"} {
+			t.Setenv("GOPHERLLM_METAL_DENSE_PARALLEL_ARGMAX", mode)
+			result := run()
+			if result.PromptCache == nil || result.PromptCache.ReusedTokens != result.Stats.PromptTokens {
+				t.Fatal("timed request did not reuse the complete prompt")
+			}
+			report := map[string]any{
+				"model": path, "cycle": cycle, "order": order, "parallel_argmax": mode == "1",
+				"prompt_tokens": result.Stats.PromptTokens, "tokens": result.Stats.GeneratedTokens,
+				"decode_seconds": result.Stats.DecodeTime.Seconds(), "tokens_per_second": float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds(),
+				"token_digest": specABDigest(referenceTokens), "state_sha256": referenceState,
+				"borrowed_weight_bytes": r.workspaceBuf.metalDense.borrowedWeightBytes, "copied_weight_bytes": r.workspaceBuf.metalDense.copiedWeightBytes,
+			}
+			raw, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fmt.Println("MINISTRAL_GENERATION_JSON " + string(raw))
+		}
+	}
+	// Replay each fixed decode input in ABBA order as well. This pairs the
+	// complete decoder at token granularity when host load drifts during a
+	// full request; every mode overwrites the same cache position.
+	baselineTimes, parallelTimes, savings := make([]time.Duration, len(referenceTokens)), make([]time.Duration, len(referenceTokens)), make([]time.Duration, len(referenceTokens))
+	paired := make([]map[string]any, 0, len(referenceTokens))
+	depth := warm.Stats.PromptTokens
+	for i, token := range referenceTokens {
+		var want uint32
+		for order, mode := range []string{"0", "1", "1", "0"} {
+			t.Setenv("GOPHERLLM_METAL_DENSE_PARALLEL_ARGMAX", mode)
+			began := time.Now()
+			next, ok := tryMetalDenseGreedy(r.config, r.standard, r.workspaceCache, r.workspaceBuf, token, depth+i, referenceTokens[:i+1], 1.1)
+			elapsed := time.Since(began)
+			if !ok || (order > 0 && next != want) {
+				t.Fatal("paired fixed-input prediction differs from reference")
+			}
+			want = next
+			if mode == "0" {
+				baselineTimes[i] += elapsed / 2
+			} else {
+				parallelTimes[i] += elapsed / 2
+			}
+		}
+		savings[i] = baselineTimes[i] - parallelTimes[i]
+		paired = append(paired, map[string]any{"position": depth + i, "baseline_ns": baselineTimes[i].Nanoseconds(), "parallel_ns": parallelTimes[i].Nanoseconds()})
+	}
+	report := map[string]any{
+		"model": path, "samples": paired, "prompt_tokens": depth,
+		"baseline_median_seconds": specABDuration(baselineTimes).Seconds(), "parallel_median_seconds": specABDuration(parallelTimes).Seconds(),
+		"paired_median_savings_seconds": specABDuration(savings).Seconds(),
+	}
+	raw, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("MINISTRAL_DECODE_PAIRS_JSON " + string(raw))
 }

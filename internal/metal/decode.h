@@ -58,6 +58,55 @@ static const char* gllm_decode_source =
 " }\n"
 " out[head*128+lane]=acc.x/s;out[head*128+lane+32]=acc.y/s;out[head*128+lane+64]=acc.z/s;out[head*128+lane+96]=acc.w/s;\n"
 "}\n"
+"struct DecWinner { float value; uint index; };\n"
+"inline bool dec_better(DecWinner a, DecWinner b) {\n"
+" return a.value>b.value || (a.value==b.value && a.index<b.index);\n"
+"}\n"
+"inline DecWinner dec_reduce_winner(DecWinner best,threadgroup DecWinner* scratch,uint lane,uint sg) {\n"
+" for(uint offset=16;offset>0;offset>>=1) {\n"
+"  DecWinner other={simd_shuffle_down(best.value,offset),simd_shuffle_down(best.index,offset)};\n"
+"  if(lane<offset && dec_better(other,best))best=other;\n"
+" }\n"
+" if(lane==0)scratch[sg]=best;\n"
+" threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+" if(sg!=0)return best;\n"
+" best=lane<8?scratch[lane]:DecWinner{-INFINITY,0};\n"
+" for(uint offset=16;offset>0;offset>>=1) {\n"
+"  DecWinner other={simd_shuffle_down(best.value,offset),simd_shuffle_down(best.index,offset)};\n"
+"  if(lane<offset && dec_better(other,best))best=other;\n"
+" }\n"
+" return best;\n"
+"}\n"
+"kernel void dec_argmax_part(device float* values [[buffer(0)]],device DecWinner* partial [[buffer(1)]],constant uint& n [[buffer(2)]],const device uint* recent [[buffer(3)]],constant uint& count [[buffer(4)]],constant float& penalty [[buffer(5)]],uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint group [[threadgroup_position_in_grid]]) {\n"
+" uint begin=group*4096,end=min(begin+4096,n);\n"
+" // Each group owns a disjoint range, including its repeated penalty updates.\n"
+" if(tid==0 && penalty!=1.0f)for(uint j=0;j<count;j++) {\n"
+"  uint i=recent[j];\n"
+"  if(i>=begin && i<end) {\n"
+"   float v=values[i];\n"
+"   values[i]=isfinite(v)?(v>0.0f?v/penalty:v*penalty):-INFINITY;\n"
+"  }\n"
+" }\n"
+" threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);\n"
+" DecWinner best={-INFINITY,0};\n"
+" for(uint i=begin+tid;i<end;i+=256) {\n"
+"  float v=values[i];\n"
+"  DecWinner candidate={isfinite(v)?v:-INFINITY,i};\n"
+"  if(dec_better(candidate,best))best=candidate;\n"
+" }\n"
+" threadgroup DecWinner scratch[8];\n"
+" best=dec_reduce_winner(best,scratch,lane,sg);\n"
+" if(tid==0)partial[group]=best;\n"
+"}\n"
+"kernel void dec_argmax_merge(const device DecWinner* partial [[buffer(0)]],device DecWinner* result [[buffer(1)]],constant uint& count [[buffer(2)]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" DecWinner best={-INFINITY,0};\n"
+" for(uint i=lane;i<count;i+=32)if(dec_better(partial[i],best))best=partial[i];\n"
+" for(uint offset=16;offset>0;offset>>=1) {\n"
+"  DecWinner other={simd_shuffle_down(best.value,offset),simd_shuffle_down(best.index,offset)};\n"
+"  if(lane<offset && dec_better(other,best))best=other;\n"
+" }\n"
+" if(lane==0)result[0]=best;\n"
+"}\n"
 "struct MV { uint rows,cols,row_bytes,rows_per_group; };\n"
 "kernel void dec_q4(const device uchar* data [[buffer(0)]],const device float* x [[buffer(1)]],device float* y [[buffer(2)]],constant MV& p [[buffer(3)]],uint group [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
 " uint row=group*p.rows_per_group+sg; if(row>=p.rows)return;\n"
@@ -218,11 +267,11 @@ typedef struct {
  int dim,hidden,heads,kvheads,layers,maxlen;
  void* prefill;
  float eps,scale;
- GLLMMetalWeight* outputWeight; uint32_t outputQuant; id<MTLBuffer> logits,recent,argmax;
+ GLLMMetalWeight* outputWeight; uint32_t outputQuant; id<MTLBuffer> logits,recent,argmax,argmaxPartials;
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
-static id<MTLComputePipelineState> gllm_dec_pipes[13]={nil};
+static id<MTLComputePipelineState> gllm_dec_pipes[15]={nil};
 static void gllm_prefill_release(void* ptr);
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
@@ -233,18 +282,18 @@ static bool gllm_decode_init(void) {
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_decode_source] options:nil error:&error];
   if(lib==nil){gllm_set_error(@"decode shader compilation failed",error);return false;}
-  NSString* names[13]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up"};
-  id<MTLComputePipelineState> pipes[13]={nil};
+  NSString* names[15]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up",@"dec_argmax_part",@"dec_argmax_merge"};
+  id<MTLComputePipelineState> pipes[15]={nil};
   bool ok=true;
-  for(int i=0;i<13;i++) {
+  for(int i=0;i<15;i++) {
    id<MTLFunction> fn=[lib newFunctionWithName:names[i]];
    pipes[i]=fn!=nil?[gllm_device newComputePipelineStateWithFunction:fn error:&error]:nil;
    [fn release];
    if(pipes[i]==nil || [pipes[i] threadExecutionWidth]!=32 || [pipes[i] maxTotalThreadsPerThreadgroup]<256)ok=false;
   }
   [lib release];
-  if(!ok){for(int i=0;i<13;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
-  for(int i=0;i<13;i++)gllm_dec_pipes[i]=pipes[i];
+  if(!ok){for(int i=0;i<15;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
+  for(int i=0;i<15;i++)gllm_dec_pipes[i]=pipes[i];
   return true;
  }
  return false;
@@ -263,7 +312,7 @@ static void gllm_decode_release(void* ptr) {
  free(d->layer);
  [d->x release];[d->xn release];[d->q release];[d->qr release];[d->k release];[d->kr release];[d->v release];
  [d->attn release];[d->proj release];[d->gate release];[d->up release];[d->hid release];
- [d->sn release];[d->cs release];[d->partial release];[d->outputNorm release];[d->logits release];[d->recent release];[d->argmax release];free(d);
+ [d->sn release];[d->cs release];[d->partial release];[d->outputNorm release];[d->logits release];[d->recent release];[d->argmax release];[d->argmaxPartials release];free(d);
 }
 static void* gllm_decode_new(int dim,int hidden,int heads,int kvheads,int layers,int maxlen,float eps,float scale,const float* norm) {
  @autoreleasepool {
@@ -305,7 +354,9 @@ static bool gllm_decode_output(void* ptr,void* weight,uint32_t quant) {
  if(d->argmax==nil)d->argmax=gllm_dec_buffer(2);
  if(d->recent==nil || d->argmax==nil)return false;
  id<MTLBuffer> logits=gllm_dec_buffer(w->rows); if(logits==nil)return false;
- [d->logits release];d->logits=logits;d->outputWeight=w;d->outputQuant=quant;return true;
+ id<MTLBuffer> partials=gllm_dec_buffer(2*(((NSUInteger)w->rows+4095)/4096));
+ if(partials==nil){[logits release];return false;}
+ [d->logits release];[d->argmaxPartials release];d->logits=logits;d->argmaxPartials=partials;d->outputWeight=w;d->outputQuant=quant;return true;
  }
 }
 // The Go caller pins these pointer-free allocations until decoder release.
@@ -400,6 +451,27 @@ static void gllm_decode_add(id<MTLComputeCommandEncoder> e,GLLMDecoder* d) {
 static void gllm_decode_barrier(id<MTLComputeCommandEncoder> e,bool concurrent) {
  if(concurrent)[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
+// Large vocabularies use independent 4096-value reductions, then merge their
+// winners. The scratch belongs to this decoder, including when weights are shared.
+static void gllm_decode_argmax(id<MTLComputeCommandEncoder> e,GLLMDecoder* d,uint32_t recent_count,float penalty,bool concurrent) {
+ const char* setting=getenv("GOPHERLLM_METAL_DENSE_PARALLEL_ARGMAX");
+ uint32_t rows=d->outputWeight->rows,parts=(rows+4095)/4096;
+ if(rows>=16384 && (setting==NULL || strcmp(setting,"0")!=0)) {
+  [e setComputePipelineState:gllm_dec_pipes[13]];
+  [e setBuffer:d->logits offset:0 atIndex:0];[e setBuffer:d->argmaxPartials offset:0 atIndex:1];
+  [e setBytes:&rows length:sizeof(rows) atIndex:2];[e setBuffer:d->recent offset:0 atIndex:3];
+  [e setBytes:&recent_count length:sizeof(recent_count) atIndex:4];[e setBytes:&penalty length:sizeof(penalty) atIndex:5];
+  [e dispatchThreadgroups:MTLSizeMake(parts,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  gllm_decode_barrier(e,concurrent);
+  [e setComputePipelineState:gllm_dec_pipes[14]];
+  [e setBuffer:d->argmaxPartials offset:0 atIndex:0];[e setBuffer:d->argmax offset:0 atIndex:1];
+  [e setBytes:&parts length:sizeof(parts) atIndex:2];
+  [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+ } else {
+  GLLMMetalWeight output=*d->outputWeight;output.recent=d->recent;
+  gllm_metal_encode_argmax_to(e,&output,d->logits,0,d->argmax,0,recent_count,penalty);
+ }
+}
 static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const float* cs,int pairs,int pos,bool interleaved,float temperature,float* residual,float* output,float* logits,const uint32_t* recent,uint32_t recent_count,float penalty,uint32_t* next) {
  @autoreleasepool {
  GLLMDecoder* d=ptr;
@@ -481,8 +553,7 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
  }
  if(next!=NULL) {
   gllm_decode_barrier(e,concurrent);
-  GLLMMetalWeight output=*d->outputWeight;output.recent=d->recent;
-  gllm_metal_encode_argmax_to(e,&output,d->logits,0,d->argmax,0,recent_count,penalty);
+  gllm_decode_argmax(e,d,recent_count,penalty,concurrent);
  }
  [e endEncoding];[cb commit];[cb waitUntilCompleted];
  if([cb status]!=MTLCommandBufferStatusCompleted){gllm_set_error(@"dense decode command failed",[cb error]);return false;}

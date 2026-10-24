@@ -1461,6 +1461,17 @@ effects, so prefer `--bench-runs 3` or more when comparing changes.
   1.800 → 1.767 s for 32 tokens (14B). GPU time showed no clear improvement and
   background load varied, so these results do not establish higher decoding
   throughput.
+  Greedy decode now reduces vocabularies of at least 16384 entries in parallel
+  4096-entry blocks, then merges their winners. Repeated penalties, non-finite
+  handling and lowest-index ties retain the previous behavior. Partial winners
+  use eight bytes per block (256 bytes for 131072 entries), owned by each decoder;
+  mapped weights and shared KV are unchanged. Three paired Ministral-3B runs on
+  the M2 Max saved a median 133–219 µs per complete decode step, with identical generated
+  tokens and residual/KV bits. Complete cached requests gained 0.55–3.20% per
+  paired run, reaching 75–76 tokens/s in the faster runs and 59 under heavier
+  host load. These used a warmed 27-token chat prompt and 64-token output cap;
+  the longer fixed-input benchmark below is a different workload. See
+  [all measurements and reproduction commands](benchmarks/metal/ministral-decode.md).
   To check full logits, greedy predictions, residual/KV bits and weight ownership
   against fixed inputs with a local model, run:
 
@@ -1799,6 +1810,7 @@ details in the bullets they annotate):
 | `GOPHERLLM_METAL_DENSE_VECTOR` | `0` uses legacy matvec kernels within complete Metal decode for comparison |
 | `GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP` | Override dense Metal SIMD groups per threadgroup (`2`, `4`, or `8`; uncalibrated default `4`, auto mode measures all three) |
 | `GOPHERLLM_METAL_DENSE_CONCURRENT` | `0` serializes all dispatches within complete Metal decode |
+| `GOPHERLLM_METAL_DENSE_PARALLEL_ARGMAX` | `0` restores single-threadgroup vocabulary selection in dense Metal greedy decode for A/B measurements |
 | `GOPHERLLM_METAL_DENSE_SHARED_KV` | `0` uses staging copies instead of pinned shared F32 KV buffers |
 | `GOPHERLLM_METAL_FUSED_FFN` | `0` disables hybrid-path Metal Gate/Up + SiLU + Down fusion; disable dense decode above to select that path |
 | `GOPHERLLM_DISABLE_YARN` | Ignore declared YaRN RoPE scaling |
