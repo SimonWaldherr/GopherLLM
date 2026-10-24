@@ -26,6 +26,10 @@ func prepareMetalWeight(_ []byte, _ GGMLType, _, _ int, _ bool) *MetalWeight {
 
 func metalWeightUsesDirect(_ *MetalWeight) bool { return false }
 
+func qwen35OverlapDeltaInputs(Qwen35DeltaNetWeights, []float32, *DecodeBuffer) bool {
+	return false
+}
+
 func matvecMetalQ4KInto(_ *MetalWeight, _ []float32, _, _ int, _ *[]float32) bool {
 	return false
 }

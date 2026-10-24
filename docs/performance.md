@@ -157,6 +157,15 @@ For complete recent experiments with raw data and reproduction commands, see
   Metal FFNs during prefill; attention, shared KV and per-layer embeddings keep
   their existing semantics. Q4_K/Q6_K/Q8_0 vocabulary projections use vectorized
   Metal kernels. Set `GOPHERLLM_METAL_GEMMA=0` to compare the previous path.
+  GeGLU and Qwen Q8_0 SwiGLU reuse the consumed gate buffer for activation;
+  `GOPHERLLM_METAL_FFN_INPLACE=0` restores a separate activation buffer.
+  Gemma greedy selection reduces large vocabularies in parallel. On M2 Max,
+  real E2B/26B-A4B output projection/selection pairs saved about 0.28 ms;
+  whole-model results varied with host load. Repetition penalties combined
+  with nonlinear logit softcapping retain the materialized-logit path.
+  Set `GOPHERLLM_METAL_GEMMA_PARALLEL_ARGMAX=0` for comparison. See the
+  [model priorities and measured changes](../benchmarks/metal/model-priorities-2026-10.md)
+  for memory savings, raw measurements and the rejected Q4 prefill candidate.
 - Prefill batches of at least 16 tokens use 32×32 tiled Q4_K/Q6_K/Q8_0
   matrix kernels with Metal SIMD-group matrix multiply-accumulate and float32
   operands. Weights are decoded into shared tiles without expanding the model.
@@ -212,6 +221,15 @@ For complete recent experiments with raw data and reproduction commands, see
   host load. These used a warmed 27-token chat prompt and 64-token output cap;
   the longer fixed-input benchmark below is a different workload. See
   [all measurements and reproduction commands](../benchmarks/metal/ministral-decode.md).
+  For at most 128 visible positions, attention tiles and their ordered merge
+  now share one threadgroup. Three cold-prompt Ministral-3B comparisons measured
+  a small 0.24–0.80% decode gain with unchanged KV and mapped-weight storage.
+  Qwen's hybrid decoder overlaps its direct Q6_K QKV projection with independent
+  CPU projections and reuses the gate slab for SiLU, saving 2.125 MiB of shared
+  activation scratch at 32 positions. Its projection latency improved, but
+  paging and host-load variation prevented a stable whole-model speedup estimate.
+  See the [32 GiB benchmark report and raw data](../benchmarks/metal/decode-paging.md)
+  for timings, memory counters, limitations and opt-out switches.
   To check full logits, greedy predictions, residual/KV bits and weight ownership
   against fixed inputs with a local model, run:
 
@@ -437,8 +455,8 @@ For complete recent experiments with raw data and reproduction commands, see
   search.
 - After mmap'ing a single-file GGUF, the CLI warms backbone tensors across
   worker threads before reporting the model loaded (`--prefault core`).
-  Packed sparse expert banks and untied packed input embeddings remain
-  demand-paged. `--prefault all` touches every page up front, matching the
+  Packed sparse expert banks, untied packed input embeddings and Gemma 4's
+  per-layer token lookup tables remain demand-paged. `--prefault all` touches every page up front, matching the
   library's zero-value load policy.
   A memory-mapped file only pages in on first touch. A dense forward pass
   touches essentially every weight byte — without warm-up, the *first*

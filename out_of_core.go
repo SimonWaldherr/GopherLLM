@@ -16,7 +16,7 @@ const (
 	MmapPrefaultAll MmapPrefaultMode = iota
 	// MmapPrefaultCore warms dense/router/backbone tensors but skips known
 	// sparse-MoE expert banks, Qwen's optional NextN draft layer, and untied
-	// quantized input embeddings.
+	// quantized input embeddings and Gemma 4's per-layer lookup tables.
 	// These tensors remain demand-paged until inference needs their rows.
 	MmapPrefaultCore
 	// MmapPrefaultNone leaves every tensor demand-paged.
@@ -119,7 +119,7 @@ func hasRowOnlyPackedEmbedding(gguf *GGUFFile) bool {
 }
 
 // corePrefaultRanges returns all data ranges except sparse expert banks and
-// Qwen's optional NextN layer and untied packed input embeddings. These weights
+// Qwen's optional NextN layer, untied packed inputs and Gemma's PLE tables. These weights
 // need not displace target-decoder pages during ordinary startup. The
 // byte-size fallback deliberately mirrors loadWeight: unusual GGUF producers
 // with ambiguous packing still get the offset-derived range inferred by the
@@ -131,6 +131,8 @@ func corePrefaultRanges(data []byte, gguf *GGUFFile) (ranges []mmapByteRange, sk
 	inferred := inferTensorSizes(data, gguf)
 	nextNPrefix := qwen35NextNPrefaultPrefix(gguf)
 	rowEmbedding := hasRowOnlyPackedEmbedding(gguf)
+	arch, _ := gguf.GetString("general.architecture")
+	gemmaLookups := arch == "gemma4"
 	for _, info := range gguf.Tensors {
 		if isSparseExpertTensor(info.Name, info) {
 			skippedExperts++
@@ -140,6 +142,9 @@ func corePrefaultRanges(data []byte, gguf *GGUFFile) (ranges []mmapByteRange, sk
 			continue
 		}
 		if rowEmbedding && info.Name == "token_embd.weight" {
+			continue
+		}
+		if gemmaLookups && info.Name == "per_layer_token_embd.weight" {
 			continue
 		}
 		bytes, ok := info.DType.DataSize(info.Numel())

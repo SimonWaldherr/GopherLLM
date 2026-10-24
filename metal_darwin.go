@@ -32,6 +32,27 @@ func MetalError() string {
 	return metalbackend.LastError()
 }
 
+// Qwen's Q6 QKV projection is independent of its smaller CPU projections.
+// Submit it first and keep the caller busy until readback, without allocating
+// another weight buffer or dispatching a goroutine into the CPU worker pool.
+func qwen35OverlapDeltaInputs(w Qwen35DeltaNetWeights, x []float32, buf *DecodeBuffer) bool {
+	q := w.QKVConv
+	if q.F32 != nil || q.GPU != nil || q.Type != GGMLTypeQ6_K || q.Cols != len(x) ||
+		q.Metal == nil || q.Metal.q6 == nil || q.Metal.rows != q.Rows || q.Metal.cols != q.Cols || !metalWeightUsesDirect(q.Metal) ||
+		!qwen35MetalBatchCPUInput(w.Gate) || !qwen35MetalBatchCPUInput(w.AlphaProj) || !qwen35MetalBatchCPUInput(w.BetaProj) ||
+		os.Getenv("GOPHERLLM_QWEN_OVERLAP_INPUTS") == "0" {
+		return false
+	}
+	ensureLenNoClear(&buf.MambaIn, q.Rows)
+	return metalbackend.MatvecQ6KWhile(q.Metal.q6, x, buf.MambaIn, func() {
+		w.Gate.MatvecInto(x, &buf.MambaZ)
+		if !tryMatvec2Into(w.AlphaProj, w.BetaProj, x, &buf.Q4KXSums, &buf.MambaDT, &buf.MambaBeta) {
+			w.AlphaProj.MatvecInto(x, &buf.MambaDT)
+			w.BetaProj.MatvecInto(x, &buf.MambaBeta)
+		}
+	})
+}
+
 func applyMetalDenseRows(rows int) { metalbackend.SetDenseRowsPerGroup(rows) }
 
 func metalDenseTuningReady(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) bool {

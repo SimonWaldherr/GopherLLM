@@ -15,6 +15,7 @@ package metal
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <mach/mach.h>
 
 typedef struct {
 	id<MTLBuffer> weights;
@@ -69,6 +70,7 @@ typedef struct {
 	id<MTLBuffer> hidden;
 	id<MTLBuffer> out;
 	id<MTLBuffer> argmax;
+	id<MTLBuffer> argmaxPartials;
 	id<MTLBuffer> q;
 	id<MTLBuffer> k;
 	id<MTLBuffer> v;
@@ -86,6 +88,30 @@ static id<MTLComputePipelineState> gllm_silu_pipeline = nil;
 static id<MTLComputePipelineState> gllm_argmax_pipeline = nil;
 static GLLMMetalBatchWorkspace gllm_batch_workspace = {0};
 static char gllm_error[1024];
+
+static bool gllm_process_memory(uint64_t* resident, uint64_t* footprint, uint64_t* faults, uint64_t* pageins) {
+	task_vm_info_data_t vm = {0};
+	mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) != KERN_SUCCESS) return false;
+	task_events_info_data_t events = {0};
+	count = TASK_EVENTS_INFO_COUNT;
+	if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t)&events, &count) != KERN_SUCCESS) return false;
+	*resident = vm.resident_size;
+	*footprint = vm.phys_footprint;
+	*faults = events.faults;
+	*pageins = events.pageins;
+	return true;
+}
+
+// Retained shared activation bytes, excluding model weights and driver overhead.
+static NSUInteger gllm_batch_scratch_bytes(void) {
+	@synchronized(gllm_queue) {
+		GLLMMetalBatchWorkspace* b = &gllm_batch_workspace;
+		return [b->x length] + [b->gate length] + [b->up length] + [b->hidden length] + [b->out length] + [b->argmax length] + [b->argmaxPartials length] +
+			[b->q length] + [b->k length] + [b->v length] + [b->attnOut length] + [b->attnPartial length] + [b->recent length];
+	}
+	return 0;
+}
 
 static void gllm_set_error(NSString* prefix, NSError* error) {
 	const char* p = prefix ? [prefix UTF8String] : "Metal error";
@@ -921,7 +947,7 @@ static bool gllm_metal_ensure_batch_argmax_buffers(GLLMMetalWeight* w, int batch
 		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.recent, count * GLLM_REPEAT_WINDOW * sizeof(uint32_t));
 }
 
-static bool gllm_metal_ensure_batch_ffn_buffers(GLLMMetalWeight* gate, GLLMMetalWeight* up, GLLMMetalWeight* down, int batch) {
+static bool gllm_metal_ensure_batch_ffn_buffers(GLLMMetalWeight* gate, GLLMMetalWeight* up, GLLMMetalWeight* down, int batch, bool reuse_gate) {
 	if (gate == NULL || up == NULL || down == NULL || batch <= 0 || batch > GLLM_BATCH_FFN_MAX_TOKENS || gate->cols <= 0 || gate->rows <= 0 || down->rows <= 0) {
 		return false;
 	}
@@ -939,8 +965,16 @@ static bool gllm_metal_ensure_batch_ffn_buffers(GLLMMetalWeight* gate, GLLMMetal
 	return gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.x, gate_x_len) &&
 		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.gate, hidden_len) &&
 		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.up, hidden_len) &&
-		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.hidden, hidden_len) &&
+		(reuse_gate || gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.hidden, hidden_len)) &&
 		gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.out, out_len);
+}
+
+static bool gllm_metal_reuse_ffn_gate(bool qwen_decode_order) {
+	const char* setting = getenv("GOPHERLLM_METAL_FFN_INPLACE");
+	if (setting && strcmp(setting, "0") == 0) return false;
+	// Preserve the existing Qwen-only opt-out for reproducible comparisons.
+	setting = qwen_decode_order ? getenv("GOPHERLLM_METAL_QWEN_INPLACE_SILU") : NULL;
+	return !(setting && strcmp(setting, "0") == 0);
 }
 
 static int gllm_metal_q4k_matvec(void* handle, const float* x, float* out) {
@@ -1142,9 +1176,15 @@ static int gllm_metal_q4k2_silu_batch(
 		// concurrent runners from overlapping writes; the command buffer is
 		// already synchronous, so this does not add a GPU synchronization point.
 		@synchronized(gllm_queue) {
-			if (!gllm_metal_ensure_batch_ffn_buffers(gate, up, down, batch)) {
+			// Generic Q4_K prefill was slower with the aliased activation on
+			// the measured Ministral shape. Keep its separate hidden buffer.
+			bool reuse_gate = decode_order && gllm_metal_reuse_ffn_gate(true);
+			if (!gllm_metal_ensure_batch_ffn_buffers(gate, up, down, batch, reuse_gate)) {
 				return 0;
 			}
+			// Each SiLU thread reads and replaces only its own gate element.
+			// The gate is dead after activation; no third hidden slab is needed.
+			id<MTLBuffer> hidden = reuse_gate ? gllm_batch_workspace.gate : gllm_batch_workspace.hidden;
 			NSUInteger count = (NSUInteger)batch;
 			NSUInteger x_len = count * (NSUInteger)gate->cols * sizeof(float);
 			NSUInteger out_len = count * (NSUInteger)down->rows * sizeof(float);
@@ -1158,10 +1198,10 @@ static int gllm_metal_q4k2_silu_batch(
 				gllm_metal_encode_q4k_mode(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, ffn_rows_per_group, decode_order);
 			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,4) : gllm_metal_encode_verify(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,4)))
 				gllm_metal_encode_q4k_mode(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, ffn_rows_per_group, decode_order);
-			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, gllm_batch_workspace.hidden, (uint32_t)(count * (NSUInteger)gate->rows));
-			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,down_q4?4:6) : gllm_metal_encode_verify(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,down_q4?4:6))) {
-				if (down_q4) gllm_metal_encode_q4k_mode(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group, decode_order);
-				else gllm_metal_encode_q6k_mode(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group, decode_order);
+			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, hidden, (uint32_t)(count * (NSUInteger)gate->rows));
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,down,hidden,gllm_batch_workspace.out,batch,down_q4?4:6) : gllm_metal_encode_verify(enc,down,hidden,gllm_batch_workspace.out,batch,down_q4?4:6))) {
+				if (down_q4) gllm_metal_encode_q4k_mode(enc, down, hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group, decode_order);
+				else gllm_metal_encode_q6k_mode(enc, down, hidden, gllm_batch_workspace.out, batch, ffn_rows_per_group, decode_order);
 			}
 			[enc endEncoding];
 			[cb commit];
@@ -1234,6 +1274,37 @@ static int gllm_metal_q6k_matvec(void* handle, const float* x, float* out) {
 		} else {
 			strncpy(gllm_error, "Metal command buffer failed", sizeof(gllm_error) - 1);
 		}
+		return ok;
+	}
+}
+
+// The input is copied before returning; no Go memory is retained by the GPU.
+// The caller must finish the submission before reusing or freeing this weight.
+static void* gllm_metal_q6k_begin(void* handle, const float* x) {
+	@autoreleasepool {
+		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
+		if (w == NULL || w->weights == nil || w->x == nil || w->out == nil ||
+			x == NULL || !gllm_metal_init_q6k()) return NULL;
+		memcpy([w->x contents], x, (NSUInteger)w->cols * sizeof(float));
+		id<MTLCommandBuffer> cb = gllm_metal_new_command_buffer();
+		if (cb == nil) return NULL;
+		id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+		if (enc == nil) return NULL;
+		gllm_metal_encode_q6k(enc, w, w->x, 4);
+		[enc endEncoding];
+		[cb commit];
+		return (void*)[cb retain];
+	}
+}
+
+static bool gllm_metal_q6k_finish(void* handle, void* submission, float* out) {
+	@autoreleasepool {
+		GLLMMetalWeight* w = (GLLMMetalWeight*)handle;
+		id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)submission;
+		[cb waitUntilCompleted];
+		bool ok = [cb status] == MTLCommandBufferStatusCompleted;
+		if (ok && out != NULL) memcpy(out, [w->out contents], (NSUInteger)w->rows * sizeof(float));
+		[cb release];
 		return ok;
 	}
 }
@@ -1903,6 +1974,25 @@ func MatvecQ6K(w *Weight, x, out []float32) bool {
 	return ok != 0
 }
 
+// MatvecQ6KWhile runs CPU work while the GPU projects x. The caller must own w
+// exclusively until return, including during work. Work must not use or close w.
+// Completion is awaited even if work panics, so its native buffers remain safe.
+func MatvecQ6KWhile(w *Weight, x, out []float32, work func()) (ok bool) {
+	if w == nil || w.ptr == nil || w.cols <= 0 || w.rows <= 0 || len(x) < w.cols || len(out) < w.rows || work == nil {
+		return false
+	}
+	submission := C.gllm_metal_q6k_begin(w.ptr, (*C.float)(unsafe.Pointer(&x[0])))
+	if submission == nil {
+		return false
+	}
+	defer func() {
+		ok = bool(C.gllm_metal_q6k_finish(w.ptr, submission, (*C.float)(unsafe.Pointer(&out[0]))))
+		runtime.KeepAlive(w)
+	}()
+	work()
+	return
+}
+
 // MatvecQ6KDecodeBatch projects contiguous [batch][cols] inputs into
 // [batch][rows] outputs with the same reduction as independent MatvecQ6K
 // calls. It writes no output when validation or GPU submission fails.
@@ -2441,4 +2531,17 @@ func (d *Decoder) BatchAttentionTiled(layer int, q []float32, startPos, batch in
 	ok := C.gllm_decode_batch_attention_tiled(d.ptr, C.int(layer), (*C.float)(unsafe.Pointer(&q[0])), C.int(startPos), C.int(batch), (*C.float)(unsafe.Pointer(&out[0])))
 	runtime.KeepAlive(d)
 	return bool(ok)
+}
+
+// BatchScratchBytes reports retained process-wide activation buffers. Model
+// weights, per-weight vectors and Metal driver allocations are excluded.
+func BatchScratchBytes() uint64 { return uint64(C.gllm_batch_scratch_bytes()) }
+
+// ProcessMemory reports Mach task counters without forking a process. Resident
+// file mappings and charged physical footprint measure different quantities;
+// page-ins are VM events, not a count of SSD reads.
+func ProcessMemory() (resident, footprint, faults, pageins uint64, ok bool) {
+	var r, p, f, i C.uint64_t
+	ok = bool(C.gllm_process_memory(&r, &p, &f, &i))
+	return uint64(r), uint64(p), uint64(f), uint64(i), ok
 }

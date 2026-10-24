@@ -33,7 +33,9 @@ static bool gllm_geglu(void* gh,void* uh,void* dh,const uint32_t* quant,const fl
  if(!gllm_gelu_quant_valid(g,quant[0]) || !gllm_gelu_quant_valid(u,quant[1]) || !gllm_gelu_quant_valid(d,quant[2]) ||
     g->rows!=u->rows || g->cols!=u->cols || d->cols!=g->rows || batch<1 || batch>GLLM_BATCH_FFN_MAX_TOKENS || !gllm_geglu_init())return false;
  @synchronized(gllm_queue) {
-  if(!gllm_metal_ensure_batch_ffn_buffers(g,u,d,batch))return false;
+  bool reuse_gate=gllm_metal_reuse_ffn_gate(false);
+  if(!gllm_metal_ensure_batch_ffn_buffers(g,u,d,batch,reuse_gate))return false;
+  id<MTLBuffer> hidden=reuse_gate?gllm_batch_workspace.gate:gllm_batch_workspace.hidden;
   memcpy([gllm_batch_workspace.x contents],x,(NSUInteger)batch*g->cols*sizeof(float));
   id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();
   id<MTLComputeCommandEncoder> e=[cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
@@ -41,12 +43,12 @@ static bool gllm_geglu(void* gh,void* uh,void* dh,const uint32_t* quant,const fl
   gllm_gelu_matvec(e,u,quant[1],gllm_batch_workspace.x,gllm_batch_workspace.up,batch);
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
   [e setComputePipelineState:gllm_geglu_pipeline];
-  [e setBuffer:gllm_batch_workspace.gate offset:0 atIndex:0];[e setBuffer:gllm_batch_workspace.up offset:0 atIndex:1];[e setBuffer:gllm_batch_workspace.hidden offset:0 atIndex:2];
+  [e setBuffer:gllm_batch_workspace.gate offset:0 atIndex:0];[e setBuffer:gllm_batch_workspace.up offset:0 atIndex:1];[e setBuffer:hidden offset:0 atIndex:2];
   uint32_t n=(uint32_t)((NSUInteger)batch*g->rows);[e setBytes:&n length:sizeof(n) atIndex:3];
   NSUInteger threads=MIN((NSUInteger)256,[gllm_geglu_pipeline maxTotalThreadsPerThreadgroup]);
   [e dispatchThreadgroups:MTLSizeMake((n+threads-1)/threads,1,1) threadsPerThreadgroup:MTLSizeMake(threads,1,1)];
   [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-  gllm_gelu_matvec(e,d,quant[2],gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch);
+  gllm_gelu_matvec(e,d,quant[2],hidden,gllm_batch_workspace.out,batch);
   [e endEncoding];[cb commit];[cb waitUntilCompleted];
   if([cb status]!=MTLCommandBufferStatusCompleted){gllm_set_error(@"GeGLU command failed",[cb error]);return false;}
   memcpy(out,[gllm_batch_workspace.out contents],(NSUInteger)batch*d->rows*sizeof(float));return true;
@@ -61,6 +63,9 @@ static bool gllm_gemma_output(void* handle,uint32_t quant,const float* x,float* 
  if(!gllm_gelu_quant_valid(w,quant) || count>GLLM_REPEAT_WINDOW || !gllm_decode_init() || !gllm_metal_init_q6k())return false;
  @synchronized(gllm_queue) {
   if(!gllm_metal_ensure_batch_argmax_buffers(w,1))return false;
+  const char* setting=getenv("GOPHERLLM_METAL_GEMMA_PARALLEL_ARGMAX");
+  bool parallel=next!=NULL && w->rows>=16384 && !(setting && strcmp(setting,"0")==0);
+  if(parallel && !gllm_metal_ensure_batch_buffer(&gllm_batch_workspace.argmaxPartials,((NSUInteger)w->rows+4095)/4096*sizeof(GLLMArgmaxResult)))return false;
   if(next!=NULL) {
    if(gllm_gemma_recent==nil)gllm_gemma_recent=gllm_dec_buffer(GLLM_REPEAT_WINDOW);
    if(gllm_gemma_recent==nil)return false;
@@ -70,8 +75,11 @@ static bool gllm_gemma_output(void* handle,uint32_t quant,const float* x,float* 
   id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
   gllm_decode_quantized(e,w,quant,gllm_batch_workspace.x,gllm_batch_workspace.out);
   if(next!=NULL) {
-   GLLMMetalWeight temp=*w;temp.recent=gllm_gemma_recent;
-   gllm_metal_encode_argmax_to(e,&temp,gllm_batch_workspace.out,0,gllm_batch_workspace.argmax,0,count,penalty);
+   if(parallel)gllm_parallel_argmax(e,gllm_batch_workspace.out,gllm_batch_workspace.argmaxPartials,gllm_batch_workspace.argmax,gllm_gemma_recent,w->rows,count,penalty,false);
+   else {
+    GLLMMetalWeight temp=*w;temp.recent=gllm_gemma_recent;
+    gllm_metal_encode_argmax_to(e,&temp,gllm_batch_workspace.out,0,gllm_batch_workspace.argmax,0,count,penalty);
+   }
   }
   [e endEncoding];[cb commit];[cb waitUntilCompleted];
   if([cb status]!=MTLCommandBufferStatusCompleted){gllm_set_error(@"Gemma output projection failed",[cb error]);return false;}

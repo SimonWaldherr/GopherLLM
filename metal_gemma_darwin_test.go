@@ -67,9 +67,17 @@ func TestMetalGeGLUParity(t *testing.T) {
 					x[i] = float32(rng.NormFloat64()) * .2
 				}
 				var got, want []float32
+				t.Setenv("GOPHERLLM_METAL_FFN_INPLACE", "1")
 				if !matvecMetalGeGLUInto(g, u, d, x, batch, &got) {
 					t.Fatal("fusion unavailable", MetalError())
 				}
+				old := append([]float32(nil), got...)
+				t.Setenv("GOPHERLLM_METAL_FFN_INPLACE", "0")
+				if !matvecMetalGeGLUInto(g, u, d, x, batch, &got) {
+					t.Fatal("reference unavailable")
+				}
+				requireMoEPrefillExact(t, got, old)
+				t.Setenv("GOPHERLLM_METAL_FFN_INPLACE", "1")
 				for i := 0; i < batch; i++ {
 					var a, b, h, o []float32
 					cg.MatvecInto(x[i*256:(i+1)*256], &a)

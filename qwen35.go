@@ -944,6 +944,10 @@ func qwen35DeltaNetForward(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cac
 // its gated output in MambaY. Independent output projections can then share
 // their CPU weight reads across several positions.
 func qwen35DeltaNetMix(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache, x []float32, layer int, buf *DecodeBuffer) {
+	if qwen35OverlapDeltaInputs(w, x, buf) {
+		qwen35DeltaNetStep(cfg, w, state, buf.MambaIn, buf.MambaZ, buf.MambaDT, buf.MambaBeta, layer, buf)
+		return
+	}
 	// QKV and the output gate share the same input. For CPU-resident Q4_K
 	// layers, compute them in one quantized worker-pool dispatch (and reuse
 	// x-sums) instead of launching the gate projection after the recurrent

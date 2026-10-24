@@ -176,7 +176,8 @@ func loadNativeGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepare
 
 	inferred := inferTensorSizes(data, gguf)
 	lazyScalarWeights := len(outOfCore) > 0 && outOfCore[0]
-	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensors, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
+	_, separateOutput := tensors["output.weight"]
+	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensors, inferred, false, borrowQuantized, prepareQuantized && !separateOutput, useMetal && !separateOutput, lazyScalarWeights || separateOutput)
 	if err != nil {
 		return config, Gemma4Weights{}, err
 	}
@@ -218,7 +219,10 @@ func loadNativeGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepare
 		if len(projNorm) != perLayerDim {
 			return config, Gemma4Weights{}, fmt.Errorf("gemma4 per_layer_proj_norm.weight has length %d, want %d", len(projNorm), perLayerDim)
 		}
-		perLayerToken, err := loadWeight(data, gguf.DataOffset, "per_layer_token_embd.weight", tensors, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
+		// PLE tables are row lookups, never matrix projections. Keep borrowed
+		// scalar rows packed too: expanding the entire vocabulary wastes RAM
+		// and touches pages that the current prompt will never use.
+		perLayerToken, err := loadWeight(data, gguf.DataOffset, "per_layer_token_embd.weight", tensors, inferred, false, borrowQuantized, false, false, true)
 		if err != nil {
 			return config, Gemma4Weights{}, err
 		}

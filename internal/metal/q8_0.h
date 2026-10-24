@@ -229,9 +229,11 @@ static int gllm_metal_q8_0_silu_batch(
 		// concurrent runners from overlapping writes; the command buffer is
 		// already synchronous, so this does not add a GPU synchronization point.
 		@synchronized(gllm_queue) {
-			if (!gllm_metal_ensure_batch_ffn_buffers(gate, up, down, batch)) {
+			bool reuse_gate = gllm_metal_reuse_ffn_gate(decode_order);
+			if (!gllm_metal_ensure_batch_ffn_buffers(gate, up, down, batch, reuse_gate)) {
 				return 0;
 			}
+			id<MTLBuffer> hidden = reuse_gate ? gllm_batch_workspace.gate : gllm_batch_workspace.hidden;
 			NSUInteger count = (NSUInteger)batch;
 			NSUInteger x_len = count * (NSUInteger)gate->cols * sizeof(float);
 			NSUInteger out_len = count * (NSUInteger)down->rows * sizeof(float);
@@ -244,9 +246,9 @@ static int gllm_metal_q8_0_silu_batch(
 				gllm_metal_encode_q8_0_mode(enc, gate, gllm_batch_workspace.x, gllm_batch_workspace.gate, batch, decode_order);
 			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,8) : gllm_metal_encode_verify(enc,up,gllm_batch_workspace.x,gllm_batch_workspace.up,batch,8)))
 				gllm_metal_encode_q8_0_mode(enc, up, gllm_batch_workspace.x, gllm_batch_workspace.up, batch, decode_order);
-			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, gllm_batch_workspace.hidden, (uint32_t)(count * (NSUInteger)gate->rows));
-			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,8) : gllm_metal_encode_verify(enc,down,gllm_batch_workspace.hidden,gllm_batch_workspace.out,batch,8)))
-				gllm_metal_encode_q8_0_mode(enc, down, gllm_batch_workspace.hidden, gllm_batch_workspace.out, batch, decode_order);
+			gllm_metal_encode_silu(enc, gllm_batch_workspace.gate, gllm_batch_workspace.up, hidden, (uint32_t)(count * (NSUInteger)gate->rows));
+			if(!(decode_order ? gllm_metal_encode_qwen_ffn_vector(enc,down,hidden,gllm_batch_workspace.out,batch,8) : gllm_metal_encode_verify(enc,down,hidden,gllm_batch_workspace.out,batch,8)))
+				gllm_metal_encode_q8_0_mode(enc, down, hidden, gllm_batch_workspace.out, batch, decode_order);
 			[enc endEncoding];
 			[cb commit];
 			[cb waitUntilCompleted];
