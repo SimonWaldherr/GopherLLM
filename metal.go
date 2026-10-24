@@ -82,4 +82,35 @@ type Q4KMatrix struct {
 }
 
 // Shared with loader policies that avoid preparing CPU-only projection pairs.
-const metalQ4KDirectMinRows = 8192
+const (
+	metalQ4KDirectMinRows = 8192
+	metalQ5KDirectMinRows = 3072
+	metalQ6KDirectMinRows = 3072
+)
+
+// metalWeightMayUseDirect gates standalone matvec offload. Contracting Q4_K
+// FFN weights have a separate preparation exception for fused FFNs; this
+// must not lower the standalone threshold for narrow attention projections.
+func metalWeightMayUseDirect(typ GGMLType, rows int) bool {
+	switch typ {
+	case GGMLTypeQ4_K:
+		// Q4_K attention-output projections in Mistral-family GQA models are
+		// typically 3K-5K rows. On an M2 Max their CPU Q8_K/NEON path is
+		// 35-50% faster than a standalone Metal dispatch; reserve direct GPU
+		// work for the large FFN/vocabulary-shaped matrices that amortize the
+		// command-buffer boundary.
+		return rows >= metalQ4KDirectMinRows
+	case GGMLTypeQ5_K:
+		// Q5_K carries Q4_K's scale structure with an extra bitplane, so its
+		// CPU kernel is slightly slower per row than Q4_K's while the GPU cost
+		// is nearly identical — the crossover therefore sits at the Q6_K
+		// threshold rather than Q4_K's higher one.
+		return rows >= metalQ5KDirectMinRows
+	case GGMLTypeQ6_K:
+		return rows >= metalQ6KDirectMinRows
+	case GGMLTypeQ8_0:
+		return rows >= 2048
+	default:
+		return false
+	}
+}

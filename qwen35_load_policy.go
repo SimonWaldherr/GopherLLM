@@ -22,6 +22,12 @@ func qwen35CPUOnlyWeights(cfg Config, tensors map[string]TensorInfo) map[string]
 			if !aOK || !bOK || len(a.Dims) != 2 || len(b.Dims) != 2 || a.Dims[0] != b.Dims[0] || a.DType != b.DType || a.Dims[0]%256 != 0 {
 				continue
 			}
+			// The recurrent mixer bypasses pair fusion when QKV has a direct
+			// Metal view, regardless of the gate's size or quantization. Keep
+			// that view: stripping it changes both placement and arithmetic.
+			if pair[0] == "attn_qkv.weight" && (a.Dims[1] > uint64(^uint(0)>>1) || metalWeightMayUseDirect(a.DType, int(a.Dims[1]))) {
+				continue
+			}
 			switch a.DType {
 			case GGMLTypeQ4_K:
 				// Only a pair of direct Q4_K weights can take the fused GPU
