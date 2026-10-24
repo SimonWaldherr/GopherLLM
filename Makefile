@@ -25,9 +25,9 @@ METAL_TAGS   ?= metal
 # METAL: whether the plain build/run/serve targets (as opposed to the
 # explicit *-metal targets, which always want it) use Metal GPU offload.
 # Defaults to on when building natively on macOS with a C compiler
-# available, since Metal is a real ~1.5-2x decode / ~10x load speedup on
-# Apple GPUs and cgo cross-compiles are unaffected (cross-build always uses
-# CROSS_CGO_ENABLED, never this variable). Override with `METAL=0` to force
+# available. Throughput depends on the model and workload; measurements live
+# under benchmarks/metal. Cross-build always uses CROSS_CGO_ENABLED, never
+# this variable. Override with `METAL=0` to force
 # the portable CPU-only build, e.g. for a CI runner without Xcode.
 UNAME_S      := $(shell uname -s)
 METAL_CC_OK  := $(shell command -v $(METAL_CC) >/dev/null 2>&1 && echo 1)

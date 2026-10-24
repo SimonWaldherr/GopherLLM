@@ -49,11 +49,32 @@ jobs:
       - name: Test Core ML contracts
         run: go test -tags coreml ./...
 
+      - name: Test and vet native Apple backends
+        if: runner.os == 'macOS'
+        run: |
+          go test -tags 'metal coreml' ./...
+          go vet -tags 'metal coreml' ./...
+
       - name: Vet
         run: go vet ./...
 
       - name: Build
         run: go build ./...
+
+  coreml-exporters:
+    name: Core ML exporter contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test without Core ML dependencies
+        run: python -m unittest discover -s scripts -p 'test_export_coreml*.py'
 
   cross-build:
     name: Cross-build
