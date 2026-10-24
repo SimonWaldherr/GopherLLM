@@ -146,6 +146,7 @@ var cliValueOptions = map[string]bool{
 	"--seed":                 true,
 	"--context-window":       true,
 	"--threads":              true,
+	"--prefault":             true,
 	"--system-prompt":        true,
 	"--stop":                 true,
 	"--skills-dir":           true,

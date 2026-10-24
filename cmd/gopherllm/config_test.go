@@ -98,6 +98,12 @@ func TestConfigAndPresetScanIgnoreFlagLookingValues(t *testing.T) {
 	if cfg.chatHistoryPath != "/tmp/chats.gz" {
 		t.Fatalf("chat history path = %q", cfg.chatHistoryPath)
 	}
+	for _, value := range []string{"--config", "--preset"} {
+		_, err := parseCLI([]string{"--prefault", value, "local.gguf"})
+		if err == nil || !strings.Contains(err.Error(), "invalid prefault mode") {
+			t.Fatalf("prefault value %q was treated as an option: %v", value, err)
+		}
+	}
 }
 
 func TestWriteEffectiveConfigIsReusableAndSecretFree(t *testing.T) {
