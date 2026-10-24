@@ -40,6 +40,9 @@ func reuseBatchViews(flat *[]float32, views *[][]float32, p, stride int) [][]flo
 	} else {
 		*views = (*views)[:p]
 	}
+	// A shorter batch can replace the flat slab when its rows grow wider.
+	// Spare descriptors must not keep the previous allocation alive.
+	clear((*views)[p:cap(*views)])
 	for i := 0; i < p; i++ {
 		(*views)[i] = (*flat)[i*stride : (i+1)*stride : (i+1)*stride]
 	}

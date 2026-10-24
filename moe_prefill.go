@@ -81,11 +81,6 @@ func (s *moePrefillScratch) prepare(w *SparseMoEWeights, p int) {
 	reuseBatchViews(&s.gate, &s.gateRows, n, hidden)
 	reuseBatchViews(&s.up, &s.upRows, n, hidden)
 	reuseBatchViews(&s.down, &s.downRows, n, dim)
-	// A shorter chunk in a wider layer can replace a flat slab while reusing
-	// the row-view allocation. Its spare views must not retain the old slab.
-	clear(s.gateRows[n:cap(s.gateRows)])
-	clear(s.upRows[n:cap(s.upRows)])
-	clear(s.downRows[n:cap(s.downRows)])
 	ensureLenNoClear(&s.hidden, n*hidden)
 	ensureLenNoClear(&s.q8, n*width)
 	ensureLenNoClear(&s.scales, n*width/256)

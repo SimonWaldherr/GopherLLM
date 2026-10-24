@@ -6,6 +6,33 @@ import (
 	"testing"
 )
 
+func TestBatchViewsReleaseReplacedSlab(t *testing.T) {
+	var flat []float32
+	var rows [][]float32
+	reuseBatchViews(&flat, &rows, 32, 256)
+	old := &flat[0]
+	// A shorter batch in a wider layer replaces the flat allocation but
+	// reuses the row descriptors. Unused descriptors must release the old slab.
+	reuseBatchViews(&flat, &rows, 17, 512)
+	if &flat[0] == old {
+		t.Fatal("fixture did not replace the slab")
+	}
+	for _, shape := range [][2]int{{17, 512}, {3, 128}, {0, 128}, {32, 128}} {
+		p, width := shape[0], shape[1]
+		reuseBatchViews(&flat, &rows, p, width)
+		for i, row := range rows {
+			if len(row) != width || cap(row) != width || &row[0] != &flat[i*width] {
+				t.Fatalf("batch %d: row %d no longer views the current slab", p, i)
+			}
+		}
+		for _, row := range rows[len(rows):cap(rows)] {
+			if row != nil {
+				t.Fatalf("batch %d: unused row retains activation storage", p)
+			}
+		}
+	}
+}
+
 func TestBatchRowsInExplicitSlab(t *testing.T) {
 	var flat []float32
 	var rows [][]float32
