@@ -23,6 +23,7 @@ reduces FP16 headroom, so the runtime must validate each exported block.
 """
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass
 import hashlib
 import json
@@ -235,15 +236,18 @@ def export(source, output, layer=0, tokens=32, compile_to=None, weight_compressi
     output.parent.mkdir(parents=True, exist_ok=True)
     # Save and compile before publishing. Failed conversions or compilation
     # leave neither a partial model nor a misleading success manifest.
-    with tempfile.TemporaryDirectory(prefix=".gopherllm-coreml-ffn-", dir=output.parent) as temporary:
-        stage = Path(temporary)
+    with ExitStack() as staging:
+        stage = Path(staging.enter_context(tempfile.TemporaryDirectory(prefix=".gopherllm-coreml-ffn-", dir=output.parent)))
         package = stage / output.name
         model.save(str(package))
         compiled = None
         if compile_to is not None:
             compile_to.parent.mkdir(parents=True, exist_ok=True)
-            # Core ML's compiler expects an explicit .mlmodelc destination.
-            compiled = stage / compile_to.name
+            # Keep each staged artifact on its destination filesystem so the
+            # final rename also works when exports live on separate volumes.
+            compiled_stage = Path(staging.enter_context(tempfile.TemporaryDirectory(
+                prefix=".gopherllm-coreml-ffn-", dir=compile_to.parent)))
+            compiled = compiled_stage / compile_to.name
             ct.models.utils.compile_model(str(package), destination_path=str(compiled))
         manifests = {output.with_suffix(".json"): contract}
         if compile_to is not None:

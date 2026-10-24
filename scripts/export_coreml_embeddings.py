@@ -20,6 +20,7 @@ their original exported values. Compare embedding quality before adopting it.
 """
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass
 import json
 import math
@@ -356,13 +357,25 @@ def export(source, output, sequence, compile_to=None, batch_size=1, prune_cls=Fa
     token_embedding = next(tensor for tensor in reader.tensors if tensor.name == "token_embd.weight")
     model.user_defined_metadata["gopherllm.vocabulary_size"] = str(int(token_embedding.shape[1]))
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".gopherllm-coreml-", dir=output.parent) as temporary:
-        staged = Path(temporary) / output.name
+    with ExitStack() as staging:
+        package_stage = Path(staging.enter_context(tempfile.TemporaryDirectory(prefix=".gopherllm-coreml-", dir=output.parent)))
+        staged = package_stage / output.name
         model.save(str(staged))
+        compiled = None
+        if compile_to is not None:
+            compile_to.parent.mkdir(parents=True, exist_ok=True)
+            compiled_stage = Path(staging.enter_context(tempfile.TemporaryDirectory(
+                prefix=".gopherllm-coreml-", dir=compile_to.parent)))
+            compiled = compiled_stage / compile_to.name
+            ct.models.utils.compile_model(str(staged), destination_path=str(compiled))
+        # Conversion and compilation must succeed before publishing either
+        # artifact. Recheck destinations after these potentially lengthy steps.
+        for path in (output, compile_to):
+            if path is not None and path.exists():
+                raise ValueError(f"output already exists: {path}")
         staged.rename(output)
-    if compile_to is not None:
-        compile_to.parent.mkdir(parents=True, exist_ok=True)
-        ct.models.utils.compile_model(str(output), destination_path=str(compile_to))
+        if compiled is not None:
+            compiled.rename(compile_to)
     return {"source": str(source), "model": str(output), "compiled_model": str(compile_to) if compile_to else None,
             "sequence_length": sequence, "batch_size": batch_size,
             "prune_cls": prune_cls and spec.pooling == 2,

@@ -157,3 +157,60 @@ func TestWriteCompressedTensorErrors(t *testing.T) {
 		t.Fatalf("already canceled error = %v, writes = %d", err, w.writes)
 	}
 }
+
+func TestWriteCompressedTensorRejectsEncodingOverflow(t *testing.T) {
+	for _, target := range []GGMLType{GGMLTypeF16, GGMLTypeQ5_0, GGMLTypeQ5_1, GGMLTypeQ8_0, GGMLTypeQ4_0,
+		GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K, GGMLTypeQ6_K} {
+		t.Run(target.String(), func(t *testing.T) {
+			const cols = 256
+			tensor := TensorInfo{Name: "weights", Dims: []uint64{cols, 2}, DType: GGMLTypeF32}
+			raw := make([]byte, cols*2*4)
+			for i := range cols * 2 {
+				binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(math.MaxFloat32))
+			}
+			w := &compressTrackingWriter{}
+			if err := writeCompressedTensor(context.Background(), w, tensor, raw, target); err == nil || w.writes != 0 {
+				t.Fatalf("overflow error = %v, writes = %d", err, w.writes)
+			}
+		})
+	}
+}
+
+func TestWriteCompressedTensorPreservesRepresentableLargeValues(t *testing.T) {
+	for _, tc := range []struct {
+		target GGMLType
+		value  float32
+	}{
+		{GGMLTypeF16, 65519}, // Rounds to 65504 without overflowing.
+		{GGMLTypeQ5_0, 500000},
+		{GGMLTypeQ5_1, 500000},
+		{GGMLTypeQ8_0, 500000},
+	} {
+		t.Run(tc.target.String(), func(t *testing.T) {
+			const cols = 256
+			tensor := TensorInfo{Name: "weights", Dims: []uint64{cols, 2}, DType: GGMLTypeF32}
+			raw := make([]byte, cols*2*4)
+			for i := range cols * 2 {
+				value := tc.value
+				if tc.target == GGMLTypeQ5_1 && i%2 == 0 {
+					value = 0 // Its affine minimum must itself fit in FP16.
+				}
+				binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(value))
+			}
+			var output bytes.Buffer
+			if err := writeCompressedTensor(context.Background(), &output, tensor, raw, tc.target); err != nil {
+				t.Fatal(err)
+			}
+			values, ok := tensorToF32(tc.target, output.Bytes(), cols*2)
+			if !ok {
+				t.Fatal("cannot decode target")
+			}
+			for i, value := range values {
+				want := math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
+				if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) || abs32(value-want) > abs32(want)*.001 {
+					t.Fatalf("encoded value %d = %g, source %g", i, value, want)
+				}
+			}
+		})
+	}
+}

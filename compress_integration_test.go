@@ -76,7 +76,7 @@ func TestCompressMetadataDoesNotMutateSource(t *testing.T) {
 }
 
 func TestCompressFailurePreservesDestination(t *testing.T) {
-	for _, mode := range []string{"truncated", "nonfinite", "cancel-during-write"} {
+	for _, mode := range []string{"truncated", "nonfinite", "overflow", "cancel-during-write"} {
 		t.Run(mode, func(t *testing.T) {
 			data := buildRequantizableLlamaGGUF()
 			ctx, cancel := context.WithCancel(context.Background())
@@ -91,6 +91,8 @@ func TestCompressFailurePreservesDestination(t *testing.T) {
 				data = data[:len(data)-128]
 			case "nonfinite":
 				binary.LittleEndian.PutUint32(data[g.DataOffset:], math.Float32bits(float32(math.NaN())))
+			case "overflow":
+				binary.LittleEndian.PutUint32(data[g.DataOffset:], math.Float32bits(math.MaxFloat32))
 			case "cancel-during-write":
 				opts.LogWriter = cancelCompressionLog{cancel: cancel}
 			}

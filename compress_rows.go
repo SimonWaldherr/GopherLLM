@@ -69,10 +69,12 @@ func writeCompressedTensor(ctx context.Context, dst io.Writer, t TensorInfo, src
 		})
 		// Reject non-finite input before the integer encoders see it. F64
 		// conversion can overflow F32, so validation follows decoding.
+		checkRange := false
 		for i, v := range floats[:n*cols] {
 			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
 				return fmt.Errorf("tensor %q: non-finite value in row %d", t.Name, first+i/cols)
 			}
+			checkRange = checkRange || v > 65504 || v < -65504
 		}
 		parallelRows(n, func(start, end int) {
 			for row := start; row < end; row++ {
@@ -80,6 +82,23 @@ func writeCompressedTensor(ctx context.Context, dst io.Writer, t TensorInfo, src
 				copy(output[row*rowBytes:(row+1)*rowBytes], encoded)
 			}
 		})
+		// All target encodings store their scales (or values) in FP16.
+		// Larger inputs can still be representable after quantization, so
+		// validate their actual output instead of imposing an input cutoff.
+		// Reuse the decoded slab; ordinary weight ranges need no second pass.
+		if checkRange {
+			decodeOutput := compressRowDecoder(outType)
+			parallelRows(n, func(start, end int) {
+				for row := start; row < end; row++ {
+					decodeOutput(output[row*rowBytes:(row+1)*rowBytes], floats[row*cols:(row+1)*cols])
+				}
+			})
+			for i, v := range floats[:n*cols] {
+				if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+					return fmt.Errorf("tensor %q: %s overflow in row %d", t.Name, outType, first+i/cols)
+				}
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
