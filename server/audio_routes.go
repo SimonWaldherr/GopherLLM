@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -9,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -18,6 +18,7 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/internal/wav"
 )
 
 const transcriptionMaxSeconds = 30
@@ -662,63 +663,20 @@ func decodeTranscriptionWAV(raw []byte) ([]float32, error) {
 	if uint64(binary.LittleEndian.Uint32(raw[4:8]))+8 != uint64(len(raw)) {
 		return nil, fmt.Errorf("invalid WAV container length")
 	}
-	var format, channels, bits, blockAlign uint16
-	var rate uint32
-	var data []byte
-	haveFmt := false
-	for offset := 12; offset < len(raw); {
-		if len(raw)-offset < 8 {
-			return nil, fmt.Errorf("truncated WAV chunk header")
-		}
-		size := uint64(binary.LittleEndian.Uint32(raw[offset+4 : offset+8]))
-		start := offset + 8
-		if size > uint64(len(raw)-start) {
-			return nil, fmt.Errorf("truncated WAV chunk")
-		}
-		end := start + int(size)
-		switch string(raw[offset : offset+4]) {
-		case "fmt ":
-			if haveFmt || size < 16 {
-				return nil, fmt.Errorf("invalid WAV fmt chunk")
-			}
-			haveFmt = true
-			format = binary.LittleEndian.Uint16(raw[start:])
-			channels = binary.LittleEndian.Uint16(raw[start+2:])
-			rate = binary.LittleEndian.Uint32(raw[start+4:])
-			blockAlign = binary.LittleEndian.Uint16(raw[start+12:])
-			bits = binary.LittleEndian.Uint16(raw[start+14:])
-		case "data":
-			if data != nil {
-				return nil, fmt.Errorf("multiple WAV data chunks are unsupported")
-			}
-			data = raw[start:end]
-		}
-		offset = end + int(size%2)
-		if offset > len(raw) {
-			return nil, fmt.Errorf("missing WAV chunk padding")
-		}
+	info, err := wav.Inspect(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		return nil, err
 	}
-	if !haveFmt || channels != 1 || rate != 16000 || !((format == 1 && bits == 16) || (format == 3 && bits == 32)) || blockAlign != bits/8 {
+	if info.Channels != 1 || info.SampleRate != 16000 || !info.PCM() || info.BlockAlign != info.BitsPerSample/8 {
 		return nil, fmt.Errorf("audio must be mono 16 kHz PCM16 or float32 WAV")
 	}
-	width := int(bits / 8)
-	if len(data) == 0 || len(data)%width != 0 {
+	width := int64(info.BitsPerSample / 8)
+	if info.DataSize == 0 || info.DataSize%width != 0 {
 		return nil, fmt.Errorf("empty or incomplete WAV samples")
 	}
-	count := len(data) / width
-	if count > 16000*transcriptionMaxSeconds {
+	if info.DataSize/width > 16000*transcriptionMaxSeconds {
 		return nil, fmt.Errorf("audio exceeds the %d-second limit", transcriptionMaxSeconds)
 	}
-	samples := make([]float32, count)
-	for i := range samples {
-		if format == 1 {
-			samples[i] = float32(int16(binary.LittleEndian.Uint16(data[i*width:]))) / 32768
-		} else {
-			samples[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*width:]))
-			if math.IsNaN(float64(samples[i])) || math.IsInf(float64(samples[i]), 0) {
-				return nil, fmt.Errorf("WAV contains non-finite samples")
-			}
-		}
-	}
-	return samples, nil
+	data := raw[int(info.DataOffset):int(info.DataOffset+info.DataSize)]
+	return wav.DecodeMono(data, info.Format)
 }

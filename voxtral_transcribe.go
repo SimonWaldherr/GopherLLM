@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"strings"
 	"time"
 )
@@ -29,19 +28,8 @@ const (
 func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []float32, maxExtraSteps int, logw io.Writer) (string, error) {
 	// Cheap, load-independent checks first so an invalid request never pays
 	// for opening and mapping the (potentially multi-GB) GGUF at all.
-	if err := ctx.Err(); err != nil {
+	if err := validateVoxtralOfflineInput(ctx, samples, maxExtraSteps); err != nil {
 		return "", err
-	}
-	if len(samples) == 0 {
-		return "", fmt.Errorf("audio is empty")
-	}
-	if maxExtraSteps < 0 || maxExtraSteps > 256 {
-		return "", fmt.Errorf("max extra steps must be between 0 and 256")
-	}
-	for _, sample := range samples {
-		if math.IsNaN(float64(sample)) || math.IsInf(float64(sample), 0) {
-			return "", fmt.Errorf("audio contains non-finite samples")
-		}
 	}
 	if logw == nil {
 		logw = io.Discard
@@ -99,19 +87,8 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 // decodeVoxtralRealtimeOffline; only how the config/weights/tokenizer are
 // obtained differs.
 func TranscribeVoxtralRealtimeFromSafetensors(ctx context.Context, dir string, samples []float32, maxExtraSteps int, logw io.Writer) (string, error) {
-	if err := ctx.Err(); err != nil {
+	if err := validateVoxtralOfflineInput(ctx, samples, maxExtraSteps); err != nil {
 		return "", err
-	}
-	if len(samples) == 0 {
-		return "", fmt.Errorf("audio is empty")
-	}
-	if maxExtraSteps < 0 || maxExtraSteps > 256 {
-		return "", fmt.Errorf("max extra steps must be between 0 and 256")
-	}
-	for _, sample := range samples {
-		if math.IsNaN(float64(sample)) || math.IsInf(float64(sample), 0) {
-			return "", fmt.Errorf("audio contains non-finite samples")
-		}
 	}
 	if logw == nil {
 		logw = io.Discard
@@ -138,19 +115,8 @@ func TranscribeVoxtralRealtimeFromSafetensors(ctx context.Context, dir string, s
 // live-session path uses). Only the decode loop's step function differs
 // between the two; encoding, prefill and text assembly are identical.
 func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, tok *Tokenizer, tokenTypes []uint32, eosID, bosID int, samples []float32, maxExtraSteps int, disableFast bool, logw io.Writer) (string, error) {
-	if err := ctx.Err(); err != nil {
+	if err := validateVoxtralOfflineInput(ctx, samples, maxExtraSteps); err != nil {
 		return "", err
-	}
-	if len(samples) == 0 {
-		return "", fmt.Errorf("audio is empty")
-	}
-	if maxExtraSteps < 0 || maxExtraSteps > 256 {
-		return "", fmt.Errorf("max extra steps must be between 0 and 256")
-	}
-	for _, sample := range samples {
-		if math.IsNaN(float64(sample)) || math.IsInf(float64(sample), 0) {
-			return "", fmt.Errorf("audio contains non-finite samples")
-		}
 	}
 	if logw == nil {
 		logw = io.Discard

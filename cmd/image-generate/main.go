@@ -7,11 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"image/png"
+	"io"
 	"os"
 	"os/signal"
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/internal/outputfile"
 )
 
 func main() {
@@ -35,9 +37,7 @@ func run() error {
 	if *steps < 1 || *steps > 1000 || *timeout <= 0 || *threads < 0 {
 		return fmt.Errorf("steps must be 1..1000, timeout positive and threads nonnegative")
 	}
-	if _, err := os.Lstat(*output); err == nil {
-		return fmt.Errorf("output already exists: %s", *output)
-	} else if !os.IsNotExist(err) {
+	if err := outputfile.CheckNew(*output); err != nil {
 		return err
 	}
 	if *threads > 0 {
@@ -58,24 +58,9 @@ func run() error {
 		return err
 	}
 	elapsed := time.Since(start)
-	f, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
+	if err := outputfile.Write(*output, func(w io.Writer) error { return png.Encode(w, img) }); err != nil {
 		return err
 	}
-	complete := false
-	defer func() {
-		_ = f.Close()
-		if !complete {
-			_ = os.Remove(*output)
-		}
-	}()
-	if err := png.Encode(f, img); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	complete = true
 	fmt.Fprintf(os.Stderr, "%s: %dx%d image, %d steps in %s\n", *output, img.Bounds().Dx(), img.Bounds().Dy(), *steps, elapsed.Round(time.Millisecond))
 	return nil
 }

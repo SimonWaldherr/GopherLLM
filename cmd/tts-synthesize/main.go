@@ -14,6 +14,7 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/internal/outputfile"
 )
 
 func main() {
@@ -41,9 +42,7 @@ func run() error {
 	if math.IsNaN(*speed) || *speed < .25 || *speed > 4 {
 		return fmt.Errorf("speed must be between 0.25 and 4")
 	}
-	if _, err := os.Lstat(*output); err == nil {
-		return fmt.Errorf("output already exists: %s", *output)
-	} else if !os.IsNotExist(err) {
+	if err := outputfile.CheckNew(*output); err != nil {
 		return err
 	}
 	if *text == "-" {
@@ -74,24 +73,9 @@ func run() error {
 		return err
 	}
 	elapsed := time.Since(start)
-	f, err := os.OpenFile(*output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
+	if err := outputfile.Write(*output, audio.WriteWAV); err != nil {
 		return err
 	}
-	complete := false
-	defer func() {
-		_ = f.Close()
-		if !complete {
-			_ = os.Remove(*output)
-		}
-	}()
-	if err := audio.WriteWAV(f); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	complete = true
 	fmt.Fprintf(os.Stderr, "%s: %.2f s audio at %d Hz, synthesized in %s\n", *output, float64(len(audio.Samples))/float64(audio.SampleRate), audio.SampleRate, elapsed.Round(time.Millisecond))
 	return nil
 }

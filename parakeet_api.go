@@ -54,6 +54,12 @@ func (m *ParakeetModel) TranscribeOffline(ctx context.Context, samples []float32
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+	if len(samples) == 0 {
+		return "", fmt.Errorf("audio is empty")
+	}
+	if err := validateAudioSamples(samples); err != nil {
+		return "", err
+	}
 	frames, err := ParakeetEncode(m.cfg, m.weights, samples)
 	if err != nil {
 		return "", fmt.Errorf("encoding audio: %w", err)

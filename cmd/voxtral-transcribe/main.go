@@ -16,6 +16,7 @@ import (
 	"os"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/internal/audioinput"
 )
 
 func main() {
@@ -37,7 +38,7 @@ func main() {
 }
 
 func run(modelPath, audioPath string, maxExtraSteps int, verbose bool) error {
-	samples, err := loadAudio16kMono(audioPath)
+	samples, err := audioinput.Load16kMono(audioPath)
 	if err != nil {
 		return fmt.Errorf("loading audio: %w", err)
 	}

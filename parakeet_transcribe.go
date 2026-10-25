@@ -3,7 +3,6 @@ package gopherllm
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 )
 
@@ -49,10 +48,8 @@ func TranscribeParakeet(modelPath string, samples []float32, logw func(string, .
 	if len(samples) == 0 {
 		return "", fmt.Errorf("audio is empty")
 	}
-	for _, s := range samples {
-		if math.IsNaN(float64(s)) || math.IsInf(float64(s), 0) {
-			return "", fmt.Errorf("audio contains non-finite samples")
-		}
+	if err := validateAudioSamples(samples); err != nil {
+		return "", err
 	}
 	model, err := OpenParakeet(modelPath, nil)
 	if err != nil {

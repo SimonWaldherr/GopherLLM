@@ -2,9 +2,7 @@ package gopherllm
 
 import (
 	"context"
-	"fmt"
 	"io"
-	"math"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -71,10 +69,8 @@ func (s *VoxtralRealtimeSession) Push(ctx context.Context, pcm []float32, final 
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	for _, sample := range pcm {
-		if math.IsNaN(float64(sample)) || math.IsInf(float64(sample), 0) {
-			return "", fmt.Errorf("audio contains non-finite samples")
-		}
+	if err := validateAudioSamples(pcm); err != nil {
+		return "", err
 	}
 	if s.audio == nil {
 		var err error

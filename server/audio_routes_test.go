@@ -81,6 +81,28 @@ func TestDecodeTranscriptionWAV(t *testing.T) {
 	}
 }
 
+func TestDecodeTranscriptionWAVKeepsStrictFraming(t *testing.T) {
+	valid := transcriptionWAV(1, false)
+	for _, chunk := range [][]byte{valid[12:36], valid[36:]} {
+		raw := append(append([]byte(nil), valid...), chunk...)
+		binary.LittleEndian.PutUint32(raw[4:], uint32(len(raw)-8))
+		if _, err := decodeTranscriptionWAV(raw); err == nil {
+			t.Fatalf("accepted duplicate %q chunk", chunk[:4])
+		}
+	}
+	if _, err := decodeTranscriptionWAV(append(valid, 0)); err == nil || !strings.Contains(err.Error(), "container length") {
+		t.Fatalf("accepted trailing byte: %v", err)
+	}
+	for _, floating := range []bool{false, true} {
+		if _, err := decodeTranscriptionWAV(transcriptionWAV(16000*transcriptionMaxSeconds, floating)); err != nil {
+			t.Fatalf("rejected exact duration limit, float=%v: %v", floating, err)
+		}
+		if _, err := decodeTranscriptionWAV(transcriptionWAV(16000*transcriptionMaxSeconds+1, floating)); err == nil {
+			t.Fatalf("accepted excess duration, float=%v", floating)
+		}
+	}
+}
+
 func audioCatalogFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()

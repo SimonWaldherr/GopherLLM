@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // WriteWAV writes mono 16-bit PCM with a RIFF/WAVE header. Samples outside
@@ -17,10 +19,8 @@ func (a SpeechAudio) WriteWAV(w io.Writer) error {
 	if uint64(len(a.Samples)) > (1<<32-1-36)/2 {
 		return fmt.Errorf("WAV: recording exceeds the RIFF size limit")
 	}
-	for _, value := range a.Samples {
-		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			return fmt.Errorf("WAV: non-finite sample")
-		}
+	if !numeric.AllFiniteF32(a.Samples) {
+		return fmt.Errorf("WAV: non-finite sample")
 	}
 	var header [44]byte
 	copy(header[:], "RIFF")

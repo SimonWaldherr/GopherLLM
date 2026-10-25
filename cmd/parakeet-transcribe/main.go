@@ -13,6 +13,7 @@ import (
 	"os"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/internal/audioinput"
 )
 
 func main() {
@@ -26,7 +27,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	samples, err := loadAudio16kMono(*audioPath)
+	samples, err := audioinput.Load16kMono(*audioPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error: loading audio:", err)
 		os.Exit(1)
