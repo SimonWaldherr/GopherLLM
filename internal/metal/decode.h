@@ -54,8 +54,7 @@ static const char* gllm_decode_source =
 " partial[o+lane]=acc.x;partial[o+lane+32]=acc.y;partial[o+lane+64]=acc.z;partial[o+lane+96]=acc.w;\n"
 " if(lane==0){partial[o+128]=m;partial[o+129]=s;}\n"
 "}\n"
-"kernel void dec_attention_short(const device float* q [[buffer(0)]],const device float* k [[buffer(1)]],const device float* v [[buffer(2)]],device float* out [[buffer(3)]],constant AP& p [[buffer(4)]],uint head [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
-" threadgroup float partial[4*130];\n"
+"inline void dec_attention_fused(const device float* q,const device float* k,const device float* v,device float* out,constant AP& p,uint head,uint sg,uint lane,threadgroup float* partial) {\n"
 " if(sg<p.chunks) {\n"
 "  DecAttentionTile tile=dec_attention_tile(q,k,v,p,head,sg,lane);uint o=sg*130;\n"
 "  partial[o+lane]=tile.acc.x;partial[o+lane+32]=tile.acc.y;partial[o+lane+64]=tile.acc.z;partial[o+lane+96]=tile.acc.w;\n"
@@ -71,6 +70,15 @@ static const char* gllm_decode_source =
 "  s+=a*partial[o+129];acc+=a*float4(partial[o+lane],partial[o+lane+32],partial[o+lane+64],partial[o+lane+96]);\n"
 " }\n"
 " out[head*128+lane]=acc.x/s;out[head*128+lane+32]=acc.y/s;out[head*128+lane+64]=acc.z/s;out[head*128+lane+96]=acc.w/s;\n"
+"}\n"
+"kernel void dec_attention_short(const device float* q [[buffer(0)]],const device float* k [[buffer(1)]],const device float* v [[buffer(2)]],device float* out [[buffer(3)]],constant AP& p [[buffer(4)]],uint head [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" threadgroup float partial[4*130];dec_attention_fused(q,k,v,out,p,head,sg,lane,partial);\n"
+"}\n"
+"kernel void dec_attention_medium(const device float* q [[buffer(0)]],const device float* k [[buffer(1)]],const device float* v [[buffer(2)]],device float* out [[buffer(3)]],constant AP& p [[buffer(4)]],uint head [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" threadgroup float partial[8*130];dec_attention_fused(q,k,v,out,p,head,sg,lane,partial);\n"
+"}\n"
+"kernel void dec_attention_long(const device float* q [[buffer(0)]],const device float* k [[buffer(1)]],const device float* v [[buffer(2)]],device float* out [[buffer(3)]],constant AP& p [[buffer(4)]],uint head [[threadgroup_position_in_grid]],uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {\n"
+" threadgroup float partial[16*130];dec_attention_fused(q,k,v,out,p,head,sg,lane,partial);\n"
 "}\n"
 "kernel void dec_attention_merge(const device float* partial [[buffer(0)]],device float* out [[buffer(1)]],constant AP& p [[buffer(2)]],uint head [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {\n"
 " float m=-INFINITY;\n"
@@ -295,7 +303,9 @@ typedef struct {
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
-static id<MTLComputePipelineState> gllm_dec_pipes[16]={nil};
+static NSString* const gllm_dec_names[]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up",@"dec_argmax_part",@"dec_argmax_merge",@"dec_attention_short",@"dec_attention_medium",@"dec_attention_long"};
+enum { GLLMDecodePipelineCount=sizeof(gllm_dec_names)/sizeof(gllm_dec_names[0]) };
+static id<MTLComputePipelineState> gllm_dec_pipes[GLLMDecodePipelineCount]={nil};
 static void gllm_prefill_release(void* ptr);
 static bool gllm_decode_init(void) {
  if(!gllm_metal_init())return false;
@@ -306,18 +316,17 @@ static bool gllm_decode_init(void) {
   NSError* error=nil;
   id<MTLLibrary> lib=[gllm_device newLibraryWithSource:[NSString stringWithUTF8String:gllm_decode_source] options:nil error:&error];
   if(lib==nil){gllm_set_error(@"decode shader compilation failed",error);return false;}
-  NSString* names[16]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up",@"dec_argmax_part",@"dec_argmax_merge",@"dec_attention_short"};
-  id<MTLComputePipelineState> pipes[16]={nil};
+  id<MTLComputePipelineState> pipes[GLLMDecodePipelineCount]={nil};
   bool ok=true;
-  for(int i=0;i<16;i++) {
-   id<MTLFunction> fn=[lib newFunctionWithName:names[i]];
+  for(int i=0;i<GLLMDecodePipelineCount;i++) {
+   id<MTLFunction> fn=[lib newFunctionWithName:gllm_dec_names[i]];
    pipes[i]=fn!=nil?[gllm_device newComputePipelineStateWithFunction:fn error:&error]:nil;
    [fn release];
    if(pipes[i]==nil || [pipes[i] threadExecutionWidth]!=32 || [pipes[i] maxTotalThreadsPerThreadgroup]<256)ok=false;
   }
   [lib release];
-  if(!ok){for(int i=0;i<16;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
-  for(int i=0;i<16;i++)gllm_dec_pipes[i]=pipes[i];
+  if(!ok){for(int i=0;i<GLLMDecodePipelineCount;i++)[pipes[i] release];gllm_set_error(@"decode pipelines unavailable",error);return false;}
+  for(int i=0;i<GLLMDecodePipelineCount;i++)gllm_dec_pipes[i]=pipes[i];
   return true;
  }
  return false;
@@ -547,11 +556,11 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
   uint32_t start=l->window>0 && pos>l->window?pos-l->window:0;
   uint32_t chunks=(pos-start+32)/32;
   GLLMAttentionParams ap={(uint32_t)d->heads,(uint32_t)d->kvheads,128,stride,(uint32_t)pos,start,chunks,d->scale};
-  if(fused_attention && chunks<=4) {
-   [e setComputePipelineState:gllm_dec_pipes[15]];
+  if(fused_attention && chunks<=16 && (chunks<=8 || [gllm_dec_pipes[17] maxTotalThreadsPerThreadgroup]>=512)) {
+   [e setComputePipelineState:gllm_dec_pipes[chunks<=4?15:(chunks<=8?16:17)]];
    [e setBuffer:q offset:0 atIndex:0];[e setBuffer:l->k offset:0 atIndex:1];[e setBuffer:l->v offset:0 atIndex:2];
    [e setBuffer:d->attn offset:0 atIndex:3];[e setBytes:&ap length:sizeof(ap) atIndex:4];
-   [e dispatchThreadgroups:MTLSizeMake(d->heads,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+   [e dispatchThreadgroups:MTLSizeMake(d->heads,1,1) threadsPerThreadgroup:MTLSizeMake(chunks<=4?128:(chunks<=8?256:512),1,1)];
   } else {
    [e setComputePipelineState:gllm_dec_pipes[4]];[e setBuffer:q offset:0 atIndex:0];[e setBuffer:l->k offset:0 atIndex:1];[e setBuffer:l->v offset:0 atIndex:2];[e setBuffer:d->partial offset:0 atIndex:3];[e setBytes:&ap length:sizeof(ap) atIndex:4];
    [e dispatchThreadgroups:MTLSizeMake((d->heads*chunks+3)/4,1,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];

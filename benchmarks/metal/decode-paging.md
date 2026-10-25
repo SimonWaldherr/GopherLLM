@@ -164,3 +164,72 @@ attention boundaries through 130 positions, sliding windows, serial/concurrent
 Metal encoders, both FFN down-projection quantizations, vector-kernel fallback,
 invalid inputs and completion after a CPU callback panic. Real-model comparisons
 also check the complete live state, not only generated text.
+
+## Attention through 512 positions, 2026-10-25
+
+The fused attention path now handles up to sixteen 32-position tiles. Up to
+128 visible positions it retains the existing 128-thread kernel; positions
+129–256 use 256 threads and 4160 bytes of threadgroup scratch. Positions
+257–512 use 512 threads and 8320 bytes of scratch when the pipeline supports
+that threadgroup size. Longer spans and unsupported sizes retain the
+two-dispatch path. All three fused kernels share the same tile and merge code,
+preserving reduction order. The change adds no persistent activation or weight
+buffers. Pipeline table sizes are derived from the function list.
+
+On the same M2 Max with 32 GiB, `TestMetalConfiguredAttentionBenchmark` loads
+Ministral-3-3B Q4_K_M once per run, prefills 160 deterministic token IDs, warms
+both paths, then compares complete greedy decode steps at positions 160–191.
+For each position it runs the separate/fused/fused/separate sequence with the
+same input, overwriting that cache row. Timings include vocabulary argmax and
+repeat penalty 1.1. Loading, prefill and state comparisons are excluded. This
+is a fixed-input step benchmark, not autoregressive chat throughput.
+
+| Run | Separate median | Fused median | Median reduction | Median paired saving |
+|---|---:|---:|---:|---:|
+| 1 | 16.018 ms | 14.780 ms | 7.7% | 0.690 ms |
+| 2 | 27.474 ms | 26.393 ms | 3.9% | 5.717 ms |
+| 3 | 16.746 ms | 16.337 ms | 2.4% | 0.690 ms |
+
+The fused path was faster in 24, 21 and 22 of 32 paired positions. Background
+load varied substantially, especially in run 2; the median of paired savings
+is not the difference of the two independent medians. Predictions, residuals,
+final normalized state and the current KV row were bitwise identical after
+every step. Native fixtures additionally compare the full KV cache across
+tile boundaries through position 513, sliding windows and both encoder modes.
+
+Each decoder reported 470,605,824 borrowed weight bytes and zero copied weight
+bytes in both modes. This is the decoder's borrowed subset, not total model
+memory. RSS, paging, M4 and full-chat throughput improvements were not measured
+in this comparison. [Raw per-position measurements](m2-max-attention-span-2026-10-25.jsonl)
+retain all runs, including the longer-context comparisons below.
+
+The 512-thread path was measured separately with the same method at positions
+384–415, for Ministral-3-3B Instruct and Ministral-3-14B Reasoning Q4_K_M:
+
+| Model / run | Separate median | Fused median | Median reduction | Median paired saving |
+|---|---:|---:|---:|---:|
+| 3B / 1 | 13.659 ms | 13.532 ms | 0.93% | 0.138 ms |
+| 3B / 2 | 13.688 ms | 13.570 ms | 0.87% | 0.136 ms |
+| 3B / 3 | 13.786 ms | 13.664 ms | 0.89% | 0.109 ms |
+| 14B / 1 | 47.104 ms | 46.606 ms | 1.06% | 0.530 ms |
+| 14B / 2 | 48.767 ms | 48.355 ms | 0.84% | 0.400 ms |
+| 14B / 3 | 49.501 ms | 49.055 ms | 0.90% | 0.391 ms |
+
+The fused path won 24/28/24 of 32 pairs for 3B and 30/22/26 for 14B. Every
+prediction and checked state remained bitwise identical. The 14B decoder
+borrowed 1,206,681,600 weight bytes and copied zero, again a subset of the
+model's weights. These small step-latency improvements do not establish a
+reduction in paging or faster complete chat requests.
+
+```sh
+CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-attention.test .
+GOPHERLLM_ATTENTION_MODEL=/path/to/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
+  /tmp/gopherllm-attention.test -test.run '^TestMetalConfiguredAttentionBenchmark$' \
+  -test.count=3 -test.v
+```
+
+Set `GOPHERLLM_ATTENTION_DEPTH=384` for the longer-context comparison. The
+benchmark accepts depths from 32 to 1024, with 32 decode positions per run.
+The existing `GOPHERLLM_METAL_DENSE_FUSED_ATTENTION=0` switch disables all
+fused spans. A combined RoPE/KV-write kernel was also tested but discarded
+because its paired timings showed no consistent advantage.

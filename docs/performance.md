@@ -221,9 +221,17 @@ For complete recent experiments with raw data and reproduction commands, see
   host load. These used a warmed 27-token chat prompt and 64-token output cap;
   the longer fixed-input benchmark below is a different workload. See
   [all measurements and reproduction commands](../benchmarks/metal/ministral-decode.md).
-  For at most 128 visible positions, attention tiles and their ordered merge
-  now share one threadgroup. Three cold-prompt Ministral-3B comparisons measured
-  a small 0.24–0.80% decode gain with unchanged KV and mapped-weight storage.
+  For at most 512 visible positions, attention tiles and their ordered merge
+  share one threadgroup. The original 128-position path measured a small
+  0.24–0.80% decode gain in three cold-prompt Ministral-3B comparisons. Extending
+  it to 256 positions reduced median complete decode-step latency by 2.4–7.7%
+  in three paired runs at positions 160–191, with identical predictions and
+  checked residual/KV bits. Spans of 257–512 positions use a 512-thread kernel
+  when supported by the pipeline, with the tiled path as fallback. At positions
+  384–415 this reduced median step latency by 0.87–0.93% for 3B and 0.84–1.06%
+  for 14B across three paired runs each. KV and mapped-weight storage are
+  unchanged. These fixed-input measurements do not establish a full-chat
+  throughput gain.
   Qwen's hybrid decoder overlaps its direct Q6_K QKV projection with independent
   CPU projections and reuses the gate slab for SiLU, saving 2.125 MiB of shared
   activation scratch at 32 positions. Its projection latency improved, but

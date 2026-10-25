@@ -17,10 +17,10 @@ func TestMetalDenseFusedAttentionParity(t *testing.T) {
 		for _, dim := range []int{256, 3072} {
 			t.Run(fmt.Sprintf("%s/%d", arch, dim), func(t *testing.T) {
 				cfg, _, w := metalResidualNormFixture(t, arch, dim)
-				k, b := metalPrefillBuffer(t, cfg, 160)
+				k, b := metalPrefillBuffer(t, cfg, 600)
 				for _, concurrent := range []string{"0", "1"} {
 					t.Setenv("GOPHERLLM_METAL_DENSE_CONCURRENT", concurrent)
-					for _, pos := range []int{0, 1, 31, 32, 63, 64, 95, 96, 127, 128, 129} {
+					for _, pos := range []int{0, 1, 31, 32, 63, 64, 95, 96, 127, 128, 129, 159, 160, 191, 192, 223, 224, 255, 256, 257, 287, 288, 319, 320, 351, 352, 383, 384, 415, 416, 447, 448, 479, 480, 511, 512, 513} {
 						var want string
 						for _, mode := range []string{"0", "1"} {
 							t.Setenv("GOPHERLLM_METAL_DENSE_FUSED_ATTENTION", mode)
