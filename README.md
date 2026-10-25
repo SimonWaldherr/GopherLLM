@@ -121,9 +121,9 @@ and optionally runs Ministral for task suggestions and row explanations.
 - Native YOLOv8 and YOLO11 object detection from safetensors or Ultralytics
   `.pt` files, without an ONNX, PyTorch or Python runtime (see
   [Object detection (YOLO)](#object-detection-yolo)).
-- Native German MMS/VITS speech synthesis to WAV and unconditional CIFAR-10
-  diffusion to 32×32 PNG, with local Safetensors weights. These first Go/CLI
-  paths do not yet provide text-to-image or video generation
+- Native German MMS/VITS speech synthesis to WAV, Qwen-Image-2.1/Turbo
+  text-to-image generation to RGBA PNG, and unconditional CIFAR-10 diffusion.
+  Image editing and video generation are not yet implemented
   ([setup, limitations and examples](docs/generation.md)).
 
 ## Requirements

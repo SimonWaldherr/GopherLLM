@@ -2,6 +2,11 @@ package gopherllm
 
 import "unsafe"
 
+// Packed projections share these bounds with callers that split large token
+// batches. Keeping a tail above the minimum avoids dropping out of BLAS.
+const prefillBLASInputElements = 2 << 20
+const prefillBLASPackedMinTokens = 128
+
 // contiguousBatchRows returns the slab behind equal-width row views. Requiring
 // the first row's capacity to cover the whole slab proves it is one allocation;
 // adjacent but independently allocated rows must never be spanned by a slice.

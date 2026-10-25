@@ -166,8 +166,8 @@ func TestPrefillBLASDeclinesInvalidBatches(t *testing.T) {
 
 func TestPrefillBLASMatrixTileBudgets(t *testing.T) {
 	for _, rows := range []int{32, 259, 3072, 1 << 20} {
-		for _, cols := range []int{64, 768, 16384} {
-			for _, tokens := range []int{16, 33, 128, 32768} {
+		for _, cols := range []int{64, 768, 4096, 12288, 16384} {
+			for _, tokens := range []int{16, 33, 128, 256, 32768} {
 				if tokens > prefillBLASInputElements/cols {
 					continue
 				}
@@ -179,8 +179,8 @@ func TestPrefillBLASMatrixTileBudgets(t *testing.T) {
 					if compute < rows && compute%scatter != 0 {
 						t.Fatal("compute tiles must preserve the existing scatter boundaries")
 					}
-					if expanded && (compute != scatter || compute*cols > prefillBLASTileElements) {
-						t.Fatal("weight-expansion tiles exceeded the existing memory/dispatch bound")
+					if expanded && compute*cols > prefillBLASTileElements {
+						t.Fatal("weight-expansion tiles exceeded the existing memory bound")
 					}
 				}
 			}
@@ -248,28 +248,32 @@ func TestPrefillBLASContiguousInPlace(t *testing.T) {
 }
 
 func TestPrefillBLASOverlappingOutputOrder(t *testing.T) {
-	const tokens, rows, cols, overlap = 33, 259, 256, 13
-	w := prefillBLASTestWeight(GGMLTypeF32, rows, cols)
-	xs, outs, expectedViews := make([][]float32, tokens), make([][]float32, tokens), make([][]float32, tokens)
-	actual, expected := make([]float32, (tokens-1)*(rows-overlap)+rows), make([]float32, (tokens-1)*(rows-overlap)+rows)
-	for token := range xs {
-		xs[token] = benchFloatSlice(cols)
-		start := token * (rows - overlap)
-		outs[token], expectedViews[token] = actual[start:start+rows], expected[start:start+rows]
+	for _, typ := range []GGMLType{GGMLTypeF32, GGMLTypeQ4_K, GGMLTypeQ6_K, GGMLTypeQ8_0} {
+		t.Run(fmt.Sprintf("type%d", typ), func(t *testing.T) {
+			const tokens, rows, cols, overlap = 128, 259, 256, 13
+			w := prefillBLASTestWeight(typ, rows, cols)
+			xs, outs, expectedViews := make([][]float32, tokens), make([][]float32, tokens), make([][]float32, tokens)
+			actual, expected := make([]float32, (tokens-1)*(rows-overlap)+rows), make([]float32, (tokens-1)*(rows-overlap)+rows)
+			for token := range xs {
+				xs[token] = benchFloatSlice(cols)
+				start := token * (rows - overlap)
+				outs[token], expectedViews[token] = actual[start:start+rows], expected[start:start+rows]
+			}
+			want := prefillBLASReference(w, xs)
+			// Reproduce the former 128-row, tile-major copy order. Overlapping outputs
+			// expose a different final writer if a larger GEMM scatters token-major.
+			for start := 0; start < rows; start += 128 {
+				end := min(start+128, rows)
+				for token := range xs {
+					copy(expectedViews[token][start:end], want[token][start:end])
+				}
+			}
+			if !matvecBatchBLAS(w, xs, outs, false) {
+				t.Fatal("overlapping output views declined")
+			}
+			checkPrefillBLASOutput(t, [][]float32{actual}, [][]float32{expected})
+		})
 	}
-	want := prefillBLASReference(w, xs)
-	// Reproduce the former 128-row, tile-major copy order. Overlapping outputs
-	// expose a different final writer if a larger GEMM scatters token-major.
-	for start := 0; start < rows; start += 128 {
-		end := min(start+128, rows)
-		for token := range xs {
-			copy(expectedViews[token][start:end], want[token][start:end])
-		}
-	}
-	if !matvecBatchBLAS(w, xs, outs, false) {
-		t.Fatal("overlapping output views declined")
-	}
-	checkPrefillBLASOutput(t, [][]float32{actual}, [][]float32{expected})
 }
 
 func BenchmarkApplePrefillMatrixLayout(b *testing.B) {

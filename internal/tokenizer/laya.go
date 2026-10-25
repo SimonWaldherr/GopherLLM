@@ -21,6 +21,7 @@ type LayaTokenizer struct {
 	fallback       bool
 	CLS, SEP, Mask uint32
 	MaskText       string
+	split          func(string) []string
 }
 type layaAddedToken struct {
 	ID         uint32 `json:"id"`
@@ -181,7 +182,9 @@ func (t *LayaTokenizer) encodePlain(out []uint32, text string) ([]uint32, error)
 		return out, nil
 	}
 	var pieces []string
-	if t.metaspace {
+	if t.split != nil {
+		pieces = t.split(text)
+	} else if t.metaspace {
 		text = strings.ReplaceAll(text, " ", "▁")
 		if !strings.HasPrefix(text, "▁") {
 			text = "▁" + text

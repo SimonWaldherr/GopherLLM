@@ -1,0 +1,201 @@
+{
+  "date": "2026-10-25",
+  "hardware": "Apple M2 Max, 32 GiB RAM",
+  "go": "1.25.3",
+  "backend": "native Go with Accelerate",
+  "gomaxprocs": 8,
+  "threads": 8,
+  "prompt": "A red ceramic teapot on a pale blue table, studio photograph.",
+  "checkpoint": {
+    "repository": "Qwen/Qwen-Image-2.1-Turbo",
+    "revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+    "matrices": "Q8_0",
+    "runtime": "native Go"
+  },
+  "repository_base": "b9608db22755779cb5ffbf4be07c816be66b8da5",
+  "source_state": "uncommitted native Qwen-Image-2.1 implementation",
+  "binary_sha256": "ddc457839a835bae49c0c5178118367c5577c89d7e25d179dc12724ea80998a3",
+  "measurement": "Separate CLI processes; wall time includes loading and PNG output. Filesystem cache warmed by checksum verification. No performance baseline.",
+  "system_swap_used_mib_before_runs": 15942,
+  "shards": [
+    {
+      "file": "text_encoder/model.gguf",
+      "bytes": 8041747872,
+      "sha256": "89654aaf24cb65421aa5a0b72a79290975a713776dccfe5dd9638a8d8ce466c6"
+    },
+    {
+      "file": "transformer/diffusion_pytorch_model-00001-of-00002.gguf",
+      "bytes": 5295689632,
+      "sha256": "e86519ab58c2beefbd5d2d2f030090ae8468984614dfd90455adaa12b38ddb56"
+    },
+    {
+      "file": "transformer/diffusion_pytorch_model-00002-of-00002.gguf",
+      "bytes": 2264165824,
+      "sha256": "0c3885b4c2ec69ff1863321660a0f8612b2a28cdff03b6417cf073f2b208870a"
+    },
+    {
+      "file": "vae/diffusion_pytorch_model.gguf",
+      "bytes": 675502240,
+      "sha256": "9245d35bf046d5119b4b33204f41207ec7e465b9770d78c0295e670a9c27ab28"
+    }
+  ],
+  "runs": [
+    {
+      "width": 64,
+      "height": 64,
+      "steps": 8,
+      "seed": 42,
+      "guidance": 1,
+      "wall_seconds": 30.39,
+      "user_seconds": 113.6,
+      "system_seconds": 15.66,
+      "maximum_rss_bytes": 14518616064,
+      "peak_memory_footprint_bytes": 1220505792,
+      "page_reclaims": 276187,
+      "page_faults": 812289,
+      "reported_swaps": 0,
+      "output": ".cache/qwen-image21/smoke-64.png",
+      "output_bytes": 6634,
+      "output_sha256": "8ea60f2224a7da8f846319dc9c98f4db235492b8fc07be21434ed0fac55d8583",
+      "rgba_extrema": [
+        [
+          95,
+          255
+        ],
+        [
+          0,
+          255
+        ],
+        [
+          0,
+          255
+        ],
+        [
+          203,
+          255
+        ]
+      ]
+    },
+    {
+      "width": 256,
+      "height": 256,
+      "steps": 8,
+      "seed": 42,
+      "guidance": 1,
+      "wall_seconds": 92.93,
+      "user_seconds": 188.3,
+      "system_seconds": 21.97,
+      "maximum_rss_bytes": 14156562432,
+      "peak_memory_footprint_bytes": 2118267792,
+      "page_reclaims": 349734,
+      "page_faults": 813151,
+      "reported_swaps": 0,
+      "output": "benchmarks/generative/qwen-image21-turbo-teapot.png",
+      "output_bytes": 68550,
+      "output_sha256": "1f5ad1ff44bc63a9ec4fd72adeb25ec9e18d1be4fe119a5b3200fae4c7fa89ab",
+      "rgba_extrema": [
+        [
+          8,
+          255
+        ],
+        [
+          0,
+          240
+        ],
+        [
+          0,
+          249
+        ],
+        [
+          252,
+          255
+        ]
+      ]
+    }
+  ],
+  "optimization_comparison": {
+    "date": "2026-10-26",
+    "width": 256,
+    "height": 256,
+    "steps": 8,
+    "seed": 42,
+    "guidance": 1,
+    "method": "ABBA order, separate CLI processes, warm filesystem cache, same checkpoint/prompt and eight workers. No builds or tests launched during these runs. Two samples per variant; not a confidence interval.",
+    "before": "128-token projection/FFN slabs and at most 128 rows per packed-weight GEMM.",
+    "after": "Balanced slabs of at most 256 tokens within the existing 8 MiB input limit; packed-weight GEMMs use up to 256 rows within the existing 4 MiB expansion limit.",
+    "before_binary_sha256": "ddc457839a835bae49c0c5178118367c5577c89d7e25d179dc12724ea80998a3",
+    "after_binary_sha256": "36717cca0945b49904fabbaf0023d97f09135963dc33d4466c460a5c68a68c73",
+    "source_note": "Measured performance paths match this change. The later rotary-dimension overflow check and source formatting do not affect valid-model inference.",
+    "system_swap_used_mib_during_first_run": 12812.5,
+    "runs": [
+      {
+        "order": 1,
+        "variant": "before-optimization",
+        "wall_seconds": 97.39,
+        "user_seconds": 188.38,
+        "system_seconds": 25.92,
+        "maximum_rss_bytes": 12264620032,
+        "peak_memory_footprint_bytes": 2223338432,
+        "page_reclaims": 218395,
+        "page_faults": 943396,
+        "reported_swaps": 0,
+        "involuntary_context_switches": 2907695,
+        "output_sha256": "1f5ad1ff44bc63a9ec4fd72adeb25ec9e18d1be4fe119a5b3200fae4c7fa89ab"
+      },
+      {
+        "order": 2,
+        "variant": "optimized",
+        "wall_seconds": 72.16,
+        "user_seconds": 148.72,
+        "system_seconds": 22.0,
+        "maximum_rss_bytes": 12530417664,
+        "peak_memory_footprint_bytes": 2232939408,
+        "page_reclaims": 211403,
+        "page_faults": 943022,
+        "reported_swaps": 0,
+        "involuntary_context_switches": 2053714,
+        "output_sha256": "96b7384ba2ea940eba8abd1d61ad94e0a270d76c7d82456160dbc5e4283203c5"
+      },
+      {
+        "order": 3,
+        "variant": "optimized",
+        "wall_seconds": 67.46,
+        "user_seconds": 145.86,
+        "system_seconds": 19.7,
+        "maximum_rss_bytes": 13152108544,
+        "peak_memory_footprint_bytes": 2231546792,
+        "page_reclaims": 488383,
+        "page_faults": 857408,
+        "reported_swaps": 0,
+        "involuntary_context_switches": 1910359,
+        "output_sha256": "96b7384ba2ea940eba8abd1d61ad94e0a270d76c7d82456160dbc5e4283203c5"
+      },
+      {
+        "order": 4,
+        "variant": "before-optimization",
+        "wall_seconds": 96.52,
+        "user_seconds": 189.84,
+        "system_seconds": 26.05,
+        "maximum_rss_bytes": 12932530176,
+        "peak_memory_footprint_bytes": 2221683648,
+        "page_reclaims": 339958,
+        "page_faults": 921370,
+        "reported_swaps": 0,
+        "involuntary_context_switches": 2885765,
+        "output_sha256": "1f5ad1ff44bc63a9ec4fd72adeb25ec9e18d1be4fe119a5b3200fae4c7fa89ab"
+      }
+    ],
+    "median_before_seconds": 96.955,
+    "median_after_seconds": 69.81,
+    "latency_reduction_percent": 27.997524624825942,
+    "speedup": 1.3888411402377883,
+    "pixel_comparison": {
+      "rgba_channels": 262144,
+      "changed_channels": 20,
+      "maximum_absolute_error": 1,
+      "mean_absolute_error": 7.62939453125e-05,
+      "within_variant_outputs_byte_identical": true
+    },
+    "optimized_output": "benchmarks/generative/qwen-image21-turbo-teapot-optimized.png"
+  }
+}

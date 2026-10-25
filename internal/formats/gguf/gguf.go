@@ -516,6 +516,12 @@ func parseGGUF(data []byte) (*GGUFFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Every metadata entry requires at least a string length, a type tag,
+	// and a one-byte value. A tensor descriptor needs at least one dimension.
+	// Check counts before allocating, including on 32-bit hosts.
+	if nKV > 1<<20 || nKV > uint64((len(data)-c.pos)/13) || nTensors > 1<<20 || nTensors > uint64((len(data)-c.pos)/32) {
+		return nil, fmt.Errorf("invalid GGUF entry counts: %d metadata, %d tensors", nKV, nTensors)
+	}
 	metadata := make(map[string]MetaValue, int(nKV))
 	for range int(nKV) {
 		key, err := c.str()
@@ -542,6 +548,9 @@ func parseGGUF(data []byte) (*GGUFFile, error) {
 		if err != nil {
 			return nil, err
 		}
+		if nDims == 0 || nDims > 16 || uint64(nDims) > uint64((len(data)-c.pos)/8) {
+			return nil, fmt.Errorf("invalid GGUF tensor rank %d", nDims)
+		}
 		dims := make([]uint64, int(nDims))
 		for i := range dims {
 			dims[i], err = c.u64()
@@ -562,10 +571,17 @@ func parseGGUF(data []byte) (*GGUFFile, error) {
 	alignment := 32
 	if v, ok := metadata["general.alignment"]; ok {
 		if n, ok := v.AsU32(); ok && n > 0 {
+			if uint64(n) > uint64(^uint(0)>>1) {
+				return nil, fmt.Errorf("GGUF alignment exceeds host integer size")
+			}
 			alignment = int(n)
 		}
 	}
-	return &GGUFFile{Metadata: metadata, Tensors: tensors, DataOffset: divCeil(c.pos, alignment) * alignment, Version: version}, nil
+	padding := (alignment - c.pos%alignment) % alignment
+	if c.pos > int(^uint(0)>>1)-padding {
+		return nil, fmt.Errorf("GGUF data offset exceeds host integer size")
+	}
+	return &GGUFFile{Metadata: metadata, Tensors: tensors, DataOffset: c.pos + padding, Version: version}, nil
 }
 
 // GetU32/GetF32/GetString are convenience metadata lookups; the numeric
@@ -609,12 +625,12 @@ func (g *GGUFFile) GetBool(key string, def bool) bool {
 // every read verifies remaining length so truncated files fail with a clear
 // "unexpected EOF at byte N" instead of a panic.
 type cursor struct {
-	data []byte
-	pos  int
+	data       []byte
+	pos, depth int
 }
 
 func (c *cursor) need(n int) error {
-	if n < 0 || c.pos+n > len(c.data) {
+	if n < 0 || n > len(c.data)-c.pos {
 		return fmt.Errorf("unexpected EOF at byte %d", c.pos)
 	}
 	return nil
@@ -660,6 +676,9 @@ func (c *cursor) str() (string, error) {
 	n64, err := c.u64()
 	if err != nil {
 		return "", err
+	}
+	if n64 > uint64(len(c.data)-c.pos) {
+		return "", fmt.Errorf("invalid string length at byte %d", c.pos)
 	}
 	n := int(n64)
 	if err := c.need(n); err != nil {
@@ -708,6 +727,25 @@ func (c *cursor) value(t uint32) (MetaValue, error) {
 		if err != nil {
 			return MetaValue{}, err
 		}
+		minimum := 1
+		switch elem {
+		case 0, 1, 7:
+		case 2, 3:
+			minimum = 2
+		case 4, 5, 6:
+			minimum = 4
+		case 8, 10, 11, 12:
+			minimum = 8
+		case 9:
+			minimum = 12
+		default:
+			return MetaValue{}, fmt.Errorf("unknown GGUF array element type %d", elem)
+		}
+		if count > uint64((len(c.data)-c.pos)/minimum) || count > 1<<24 || c.depth >= 16 {
+			return MetaValue{}, fmt.Errorf("invalid GGUF array size or nesting")
+		}
+		c.depth++
+		defer func() { c.depth-- }()
 		// Typed fast paths for the huge tokenizer arrays (100k+ vocab
 		// strings, scores, per-layer bool maps): storing a typed slice
 		// avoids boxing every element into a MetaValue interface, which

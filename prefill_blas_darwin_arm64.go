@@ -12,7 +12,6 @@ import (
 // also built on iOS: a full F32 copy of a quantized matrix would be too large
 // for a phone, while a reusable row tile fits in at most four MiB.
 const prefillBLASTileElements = 1 << 20
-const prefillBLASInputElements = 2 << 20
 const prefillBLASMatrixMinTokens = 32
 const hasApplePrefillBLAS = true
 
@@ -26,7 +25,14 @@ var prefillBLASPool = sync.Pool{New: func() any { return new(prefillBLASScratch)
 func prefillBLASRowTiles(rows, cols, tokens int, expandWeights bool) (compute, scatter int) {
 	scatter = min(128, prefillBLASTileElements/cols, prefillBLASInputElements/tokens, rows)
 	compute = scatter
-	if !expandWeights && tokens >= prefillBLASMatrixMinTokens {
+	if expandWeights && tokens >= prefillBLASPackedMinTokens {
+		// Fill the existing four-MiB weight budget before waking the worker
+		// pool again. Scatter order remains unchanged for overlapping views.
+		compute = min(256, prefillBLASTileElements/cols, prefillBLASInputElements/tokens, rows)
+		if compute < rows {
+			compute -= compute % scatter
+		}
+	} else if !expandWeights && tokens >= prefillBLASMatrixMinTokens {
 		// F32 weights already exist: only temporary output memory is bounded.
 		compute = min(rows, prefillBLASInputElements/tokens)
 		if compute < rows {
@@ -77,7 +83,7 @@ func matvecBatchBLASWithSlabs(w Weight, xs, outs [][]float32, useQ8 bool, inputS
 	} else {
 		// Dequantization plus tile dispatch loses to NEON on short batches.
 		// Only long float batches amortize that work (e.g. Nomic embeddings).
-		if useQ8 || p < 128 || rows <= 0 || w.Cols != cols {
+		if useQ8 || p < prefillBLASPackedMinTokens || rows <= 0 || w.Cols != cols {
 			return false
 		}
 		dequant = dequantRowInto(w, cols)

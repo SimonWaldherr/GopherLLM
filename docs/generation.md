@@ -1,21 +1,91 @@
 # Native speech and image generation
 
-The first generation stage exposes two local Go APIs and standalone commands:
+Generation uses local Go APIs and standalone commands:
 
 | Capability | Supported checkpoint | Output |
 | --- | --- | --- |
 | German text-to-speech | `facebook/mms-tts-deu` | Mono 16 kHz PCM/WAV |
 | Unconditional image generation | `google/ddpm-cifar10-32` | 32×32 RGB/PNG |
+| Text-to-image generation | Qwen-Image-2.1 / Turbo | RGBA/PNG |
 
 Inference runs in the GopherLLM process. Neither command starts Python or
 downloads weights. Matrix operations use the existing Accelerate backend on
 macOS with CGO and Go/SIMD kernels otherwise. These paths do not yet use Metal
 or Core ML. The Go module still has no third-party dependencies.
 
-Text-conditioned image generation and video generation are not implemented.
-The image model below is a small diffusion reference model, not a replacement
-for a text-to-image model. These first APIs are not yet exposed through the
-chat server, mobile package or language bindings.
+Qwen-Image-2.1 has a separate native text-to-image path described below. Image
+editing, reference-image conditioning and video generation are not implemented.
+The CIFAR model remains a small unconditional diffusion reference. These APIs
+are not yet exposed through the chat server, mobile package or language bindings.
+
+## Qwen-Image-2.1
+
+The native pipeline implements the Qwen3-VL text encoder, 32-layer single-stream
+DiT, Flow Matching Euler sampler and RGBA VAE. It preserves the unnormalized
+text-encoder features, mixed causal/bidirectional attention and compact prefix
+KV reuse across denoising steps. Turbo uses its saved eight-sigma schedule;
+passing a different step count is rejected instead of silently changing it.
+
+Use Python 3.11 or newer with NumPy to download the selected official revision
+and convert large matrices to Q8_0:
+
+```sh
+python3 -m venv .cache/qwen-download
+.cache/qwen-download/bin/pip install numpy
+.cache/qwen-download/bin/python scripts/download_qwen_image21.py \
+  .cache/qwen-image21/turbo --variant turbo
+```
+
+The importer reads HTTP ranges and writes GGUF component shards directly. It
+does not keep a second full copy of the original checkpoint. Norms and VAE
+convolutions retain their original precision; unused vision and LM-head weights
+are omitted. The Turbo component files occupy about 15.16 GiB. Reserve extra
+free space for normal system operation, particularly swap on a busy Mac.
+`--workers 16` raises the bounded download concurrency from its default of four.
+`--variant base` selects the original 40-step model. The downloader
+pins the upstream revision and retains the model's LICENSE and provenance.
+Weight terms are separate from this repository's code license.
+
+```sh
+CGO_ENABLED=1 go run ./cmd/image-generate \
+  -model .cache/qwen-image21/turbo \
+  -prompt 'A red ceramic teapot on a pale blue table, studio photograph.' \
+  -width 256 -height 256 -seed 42 -threads 8 -out teapot.png
+```
+
+The Go runtime performs inference itself; Python and NumPy are only used for
+offline download/conversion and reference fixtures. On macOS, CGO enables the
+existing Accelerate matrix kernels. This image pipeline does not yet offload
+the DiT or VAE to Metal/Core ML. Large matrices remain mapped, FFNs use bounded
+token slabs, and VAE decoding uses overlapping spatial tiles above 256 pixels.
+Requests whose estimated DiT state exceeds 2 GiB are rejected before allocating
+it; very long prompts may therefore need shortening.
+
+```go
+model, err := gopherllm.OpenQwenImage21(ctx, "/path/to/qwen-image21")
+if err != nil { return err }
+defer model.Close()
+img, err := model.Generate(ctx, gopherllm.QwenImage21Options{
+    Prompt: "A red ceramic teapot on a pale blue table.",
+    Width: 256, Height: 256, Seed: 42,
+})
+if err != nil { return err }
+return png.Encode(writer, img)
+```
+
+Original Diffusers safetensors directories are also accepted. The default is
+256×256 to keep initial local runs manageable, rather than the official 2K
+default. Dimensions must be multiples of 32, from 32 through 2048. The returned
+image has straight RGBA channels. For transparency, use the official prompt
+form: `This is an RGBA image with transparency. ... The image has alpha channel
+and the background is transparent.` A seed reproduces Go's noise sequence, not
+PyTorch's. Q8_0 is approximate; support for the graph does not imply bitwise
+equivalence to a BF16 reference or fast 2K generation on a 32 GB Mac.
+
+Text-to-image is the implemented scope. Image editing, multiple references,
+prompt-rewriting models, LoRA adapters and quantized formats other than those
+handled by this importer have not been integrated. See the
+[validation report](../benchmarks/generative/qwen-image21.md) for tested paths.
 
 ## German speech
 
@@ -104,7 +174,7 @@ if err != nil {
 return png.Encode(writer, img)
 ```
 
-Both APIs validate model dimensions and reject unsupported architectures.
+The APIs validate model dimensions and reject unsupported architectures.
 Each model serializes requests to bound simultaneous workspace use. Context
 cancellation applies while waiting and between operators; `Close` waits for
 the active request, releases weights and is safe to call again. Returned
@@ -119,7 +189,6 @@ Transformers using the same nonzero random inputs. The
 outputs and complete 7-, 23- and 50-step samples against Diffusers. Python is
 only needed to regenerate those test references, not for Go inference.
 
-The next image stage needs a text encoder, conditioned denoiser and image
-autoencoder with a separate real-checkpoint reference test. Video then needs
-temporal model operations and bounded frame processing. Neither is implied
-by the current CIFAR model support.
+Image editing still needs the vision encoder and condition-image token layout.
+Video needs temporal model operations and bounded frame processing. Neither
+is implied by text-to-image or CIFAR model support.

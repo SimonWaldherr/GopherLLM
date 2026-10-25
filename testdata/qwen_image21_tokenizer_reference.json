@@ -1,0 +1,257 @@
+[
+  {
+    "text": "A blue cube.",
+    "pieces": [
+      "A",
+      " blue",
+      " cube",
+      "."
+    ],
+    "tokens": [
+      32,
+      6303,
+      23739,
+      13
+    ]
+  },
+  {
+    "text": "",
+    "pieces": [],
+    "tokens": []
+  },
+  {
+    "text": "  hello   world",
+    "pieces": [
+      " ",
+      " hello",
+      "  ",
+      " world"
+    ],
+    "tokens": [
+      220,
+      23811,
+      256,
+      1879
+    ]
+  },
+  {
+    "text": "12345 Ⅷ² 你好１２",
+    "pieces": [
+      "1",
+      "2",
+      "3",
+      "4",
+      "5",
+      " ",
+      "Ⅷ",
+      "²",
+      " 你好",
+      "１",
+      "２"
+    ],
+    "tokens": [
+      16,
+      17,
+      18,
+      19,
+      20,
+      220,
+      70467,
+      100,
+      29456,
+      220,
+      108386,
+      20109,
+      24918
+    ]
+  },
+  {
+    "text": "WE'RE can't I'm",
+    "pieces": [
+      "WE",
+      "'RE",
+      " can",
+      "'t",
+      " I",
+      "'m"
+    ],
+    "tokens": [
+      12457,
+      94153,
+      646,
+      944,
+      358,
+      2776
+    ]
+  },
+  {
+    "text": "café é",
+    "pieces": [
+      "café",
+      " é"
+    ],
+    "tokens": [
+      924,
+      58858,
+      3958
+    ]
+  },
+  {
+    "text": "́a á̂ ऑ",
+    "pieces": [
+      "́a",
+      " á",
+      "̂",
+      " ऑ"
+    ],
+    "tokens": [
+      53839,
+      64,
+      18698,
+      136,
+      224,
+      14925,
+      239
+    ]
+  },
+  {
+    "text": "\t hi\r\n  there\n\t",
+    "pieces": [
+      "\t",
+      " hi",
+      "\r\n",
+      " ",
+      " there",
+      "\n",
+      "\t"
+    ],
+    "tokens": [
+      197,
+      15588,
+      319,
+      220,
+      1052,
+      198,
+      197
+    ]
+  },
+  {
+    "text": "🙂 !?\nnext",
+    "pieces": [
+      "🙂",
+      " !?\n",
+      "next"
+    ],
+    "tokens": [
+      145080,
+      753,
+      5267,
+      3600
+    ]
+  },
+  {
+    "text": "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n",
+    "pieces": [
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "system",
+      "\n",
+      "Comprehend",
+      " and",
+      " analyze",
+      " the",
+      " provided",
+      " prompt",
+      ".<|",
+      "im",
+      "_end",
+      "|>\n"
+    ],
+    "tokens": [
+      151644,
+      8948,
+      198,
+      1092,
+      30782,
+      408,
+      323,
+      23643,
+      279,
+      3897,
+      9934,
+      13,
+      151645,
+      198
+    ]
+  },
+  {
+    "text": "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\nA blue cube.<|im_end|>\n<|im_start|>assistant\n",
+    "pieces": [
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "system",
+      "\n",
+      "Comprehend",
+      " and",
+      " analyze",
+      " the",
+      " provided",
+      " prompt",
+      ".<|",
+      "im",
+      "_end",
+      "|>\n",
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "user",
+      "\n",
+      "A",
+      " blue",
+      " cube",
+      ".<|",
+      "im",
+      "_end",
+      "|>\n",
+      "<|",
+      "im",
+      "_start",
+      "|>",
+      "assistant",
+      "\n"
+    ],
+    "tokens": [
+      151644,
+      8948,
+      198,
+      1092,
+      30782,
+      408,
+      323,
+      23643,
+      279,
+      3897,
+      9934,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      32,
+      6303,
+      23739,
+      13,
+      151645,
+      198,
+      151644,
+      77091,
+      198
+    ]
+  }
+]

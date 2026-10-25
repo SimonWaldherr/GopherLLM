@@ -1,11 +1,12 @@
-// Command image-generate samples the native unconditional CIFAR-10 diffusion
-// model. This first image-generation path produces 32x32 PNGs without a prompt.
+// Command image-generate runs native Qwen-Image-2.1 text-to-image generation
+// or the unconditional CIFAR-10 reference model.
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"image"
 	"image/png"
 	"io"
 	"os"
@@ -24,18 +25,23 @@ func main() {
 }
 
 func run() error {
-	modelPath := flag.String("model", "", "local DDPM-CIFAR-10 model directory or Safetensors file")
+	modelPath := flag.String("model", "", "local Qwen-Image-2.1 directory or DDPM-CIFAR-10 model")
+	prompt := flag.String("prompt", "", "Qwen-Image-2.1 text prompt; omit for unconditional CIFAR generation")
+	negative := flag.String("negative-prompt", "", "negative prompt for Qwen classifier-free guidance")
+	width := flag.Int("width", 0, "Qwen output width (multiple of 32; default 256)")
+	height := flag.Int("height", 0, "Qwen output height (multiple of 32; default 256)")
+	guidance := flag.Float64("guidance", 1, "Qwen guidance scale (1 disables CFG)")
 	output := flag.String("out", "", "new PNG output file; existing files are not overwritten")
 	seed := flag.Int64("seed", 1, "random seed")
-	steps := flag.Int("steps", 50, "deterministic DDIM denoising steps (1..1000)")
+	steps := flag.Int("steps", 0, "denoising steps; 0 uses checkpoint default (Turbo: fixed 8, base: 40, CIFAR: 50)")
 	threads := flag.Int("threads", 0, "CPU worker count (0 uses runtime default)")
-	timeout := flag.Duration("timeout", 5*time.Minute, "maximum load and generation time")
+	timeout := flag.Duration("timeout", 30*time.Minute, "maximum load and generation time")
 	flag.Parse()
 	if *modelPath == "" || *output == "" || flag.NArg() != 0 {
 		return fmt.Errorf("usage: image-generate -model DIRECTORY -out image.png [-seed 1] [-steps 50]")
 	}
-	if *steps < 1 || *steps > 1000 || *timeout <= 0 || *threads < 0 {
-		return fmt.Errorf("steps must be 1..1000, timeout positive and threads nonnegative")
+	if *steps < 0 || *steps > 1000 || *timeout <= 0 || *threads < 0 {
+		return fmt.Errorf("steps must be 0..1000, timeout positive and threads nonnegative")
 	}
 	if err := outputfile.CheckNew(*output); err != nil {
 		return err
@@ -47,13 +53,33 @@ func run() error {
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	model, err := gopherllm.OpenDiffusion(ctx, *modelPath)
-	if err != nil {
-		return err
-	}
-	defer model.Close()
 	start := time.Now()
-	img, err := model.Generate(ctx, gopherllm.DiffusionOptions{Seed: *seed, Steps: *steps})
+	var img image.Image
+	var err error
+	actualSteps := *steps
+	if *prompt != "" {
+		model, loadErr := gopherllm.OpenQwenImage21(ctx, *modelPath)
+		if loadErr != nil {
+			return loadErr
+		}
+		defer model.Close()
+		img, err = model.Generate(ctx, gopherllm.QwenImage21Options{Prompt: *prompt, NegativePrompt: *negative, Width: *width, Height: *height, GuidanceScale: float32(*guidance), Seed: *seed, Steps: *steps,
+			Progress: func(done, total int) { actualSteps = total; fmt.Fprintf(os.Stderr, "denoising %d/%d\n", done, total) },
+		})
+	} else {
+		if *width != 0 || *height != 0 || *negative != "" || *guidance != 1 {
+			return fmt.Errorf("dimensions and guidance require a Qwen text prompt")
+		}
+		model, loadErr := gopherllm.OpenDiffusion(ctx, *modelPath)
+		if loadErr != nil {
+			return loadErr
+		}
+		defer model.Close()
+		img, err = model.Generate(ctx, gopherllm.DiffusionOptions{Seed: *seed, Steps: *steps})
+		if actualSteps == 0 {
+			actualSteps = 50
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -61,6 +87,6 @@ func run() error {
 	if err := outputfile.Write(*output, func(w io.Writer) error { return png.Encode(w, img) }); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "%s: %dx%d image, %d steps in %s\n", *output, img.Bounds().Dx(), img.Bounds().Dy(), *steps, elapsed.Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "%s: %dx%d image, %d steps including load in %s\n", *output, img.Bounds().Dx(), img.Bounds().Dy(), actualSteps, elapsed.Round(time.Millisecond))
 	return nil
 }
