@@ -1,0 +1,13 @@
+run,variant,benchmark,iterations,ns_per_op,bytes_per_op,allocs_per_op
+1,before,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=1-8,282,2137611,0,0
+1,before,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=4-8,69,8364809,179,0
+1,before,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=16-8,72,8267464,683,0
+2,after,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=1-8,279,2148967,0,0
+2,after,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=4-8,80,7161105,1229,0
+2,after,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=16-8,100,5963442,0,0
+3,after,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=1-8,279,2463512,0,0
+3,after,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=4-8,78,7863985,0,0
+3,after,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=16-8,100,5771540,0,0
+4,before,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=1-8,273,2376332,0,0
+4,before,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=4-8,64,8349779,193,0
+4,before,BenchmarkVoxtralEncoderStreamCheckpoint/rows_reused/frames=16-8,70,8791309,0,0

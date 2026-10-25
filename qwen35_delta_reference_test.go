@@ -41,7 +41,7 @@ func TestQwen35DeltaNetProductionGeometryExactReference(t *testing.T) {
 			}
 		}
 	}
-	for _, threads := range []int{1, 8} {
+	for _, threads := range []int{1, 5, 8} {
 		t.Run(fmt.Sprintf("threads=%d", threads), func(t *testing.T) {
 			setPerformanceThreads(t, threads)
 			got, want := initial.snapshot(), initial.snapshot()

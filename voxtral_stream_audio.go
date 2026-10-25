@@ -9,14 +9,14 @@ import (
 // voxtralStreamAudio retains STFT overlap, causal convolution tails and the
 // encoder's sliding attention window. Every sample/frame is evaluated once.
 type voxtralStreamAudio struct {
-	cfg                          VoxtralRealtimeConfig
-	dft                          voxtralDFTTables
-	samples                      []float32
-	total, frames                int
-	conv                         [2]voxtralStreamConv
-	encoder                      voxtralEncoderState
-	residual                     [][]float32
-	windowed, re, im, power, mel []float32
+	cfg           VoxtralRealtimeConfig
+	dft           voxtralDFTTables
+	samples       []float32
+	total, frames int
+	conv          [2]voxtralStreamConv
+	encoder       voxtralEncoderState
+	residual      [][]float32
+	melTask       speechMelTask
 }
 
 func newVoxtralStreamAudio(cfg VoxtralRealtimeConfig) (*voxtralStreamAudio, error) {
@@ -26,7 +26,7 @@ func newVoxtralStreamAudio(cfg VoxtralRealtimeConfig) (*voxtralStreamAudio, erro
 	}
 	raw := m.HopLength * 2 * cfg.Projector.DownsampleFactor
 	left := voxtralLeftPadTokens * raw
-	return &voxtralStreamAudio{cfg: cfg, dft: buildVoxtralDFTTables(m.NFFT), samples: make([]float32, left+m.NFFT/2), total: left}, nil
+	return &voxtralStreamAudio{cfg: cfg, dft: cachedSpeechDFT(m.NFFT), samples: make([]float32, left+m.NFFT/2), total: left}, nil
 }
 
 func (s *voxtralStreamAudio) push(ctx context.Context, w VoxtralRealtimeWeights, pcm []float32, final bool) ([][]float32, error) {
@@ -49,33 +49,17 @@ func (s *voxtralStreamAudio) push(ctx context.Context, w VoxtralRealtimeWeights,
 	if count <= 0 {
 		return nil, nil
 	}
-	rows := make([][]float32, count)
-	ensureLenNoClear(&s.windowed, m.NFFT)
-	ensureLenNoClear(&s.power, s.dft.nFreq)
-	for t := range count {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		for i := range s.windowed {
-			s.windowed[i] = s.samples[t*m.HopLength+i] * w.MelWindow[i]
-		}
-		if m.PreEmphasis != 0 {
-			prev := float32(0)
-			for i, v := range s.windowed {
-				s.windowed[i] = v - m.PreEmphasis*prev
-				prev = v
-			}
-		}
-		s.dft.cos.MatvecInto(s.windowed, &s.re)
-		s.dft.sin.MatvecInto(s.windowed, &s.im)
-		for k := range s.power {
-			s.power[k] = s.re[k]*s.re[k] + s.im[k]*s.im[k]
-		}
-		w.MelFilterbank.MatvecInto(s.power, &s.mel)
-		rows[t] = make([]float32, m.NumMels)
-		for c, v := range s.mel {
+	rows := audioMatrixRows(count, m.NumMels)
+	s.melTask = speechMelTask{ctx: ctx, dft: s.dft, samples: s.samples, window: w.MelWindow,
+		filterbank: w.MelFilterbank, frames: count, hop: m.HopLength, preEmphasis: m.PreEmphasis,
+		mel: rows[0][:count*m.NumMels], rowMajor: true, scratch: s.melTask.scratch}
+	if err := s.melTask.run(); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		for c, v := range row {
 			log := float32(math.Log10(float64(max(v, 1e-10))))
-			rows[t][c] = (max(log, m.GlobalLogMelMax-8) + 4) / 4
+			row[c] = (max(log, m.GlobalLogMelMax-8) + 4) / 4
 		}
 	}
 	used := count * m.HopLength

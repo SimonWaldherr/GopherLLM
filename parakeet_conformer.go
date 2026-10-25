@@ -61,9 +61,8 @@ func weightRows(w Weight, cols int) int {
 // for this pattern).
 func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2 Weight, eps float32) [][]float32 {
 	t := len(xs)
-	result := make([][]float32, t)
 	if t == 0 {
-		return result
+		return [][]float32{}
 	}
 	dModel := len(xs[0])
 	normed := audioMatrixRows(t, dModel)
@@ -73,24 +72,33 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 	hiddenDim := weightRows(lin1, dModel)
 	hidden := audioMatrixRows(t, hiddenDim)
 	blasMatvecBatch(lin1, normed, hidden)
-	for i := range hidden {
-		row := hidden[i]
-		for j, v := range row {
-			row[j] = swish(v)
+	// Rows are independent; keep the same Swish arithmetic in each element.
+	// Small batches stay inline to avoid worker dispatch overhead.
+	activate := func(start, end int) {
+		for i := start; i < end; i++ {
+			row := hidden[i]
+			for j, v := range row {
+				row[j] = swish(v)
+			}
 		}
+	}
+	if t >= 16 && hiddenDim >= 512 {
+		parallelChunks(t, activate)
+	} else {
+		activate(0, t)
 	}
 	outDim := weightRows(lin2, hiddenDim)
 	out := audioMatrixRows(t, outDim)
 	blasMatvecBatch(lin2, hidden, out)
-	for i := range result {
+	for i := range out {
 		row := out[i][:len(xs[i])]
 		oi := out[i]
 		for j := range row {
 			row[j] = xs[i][j] + 0.5*oi[j]
 		}
-		result[i] = row
+		out[i] = row
 	}
-	return result
+	return out
 }
 
 // parakeetConvModule runs the Conformer convolution module over the full

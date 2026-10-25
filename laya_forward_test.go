@@ -85,24 +85,32 @@ func TestLayaRotaryWorkspaceMatchesReference(t *testing.T) {
 }
 
 func TestLayaNormInPlaceMatchesSeparateOutput(t *testing.T) {
+	setPerformanceThreads(t, 8)
 	for _, dim := range []int{8, 768} {
-		x, want := layaRows(7, dim), layaRows(7, dim)
-		norm := layaNorm{weight: make([]float32, dim), bias: make([]float32, dim), epsilon: 1e-5}
-		for i := range norm.weight {
-			norm.weight[i] = float32(i%13+1) / 7
-			norm.bias[i] = float32(i%17-8) / 19
-		}
-		for p, row := range x {
-			for i := range row {
-				row[i] = float32((p*dim+i)%113-56) / 17
+		for _, count := range []int{7, 33, 129} {
+			x, want := layaRows(count, dim), layaRows(count, dim)
+			norm := layaNorm{weight: make([]float32, dim), bias: make([]float32, dim), epsilon: 1e-5}
+			for i := range norm.weight {
+				norm.weight[i] = float32(i%13+1) / 7
+				norm.bias[i] = float32(i%17-8) / 19
 			}
-			layerNormInto(row, norm.weight, norm.bias, norm.epsilon, &want[p])
-		}
-		norm.inPlace(x)
-		for p, row := range x {
-			for i, v := range row {
-				if math.Float32bits(v) != math.Float32bits(want[p][i]) {
-					t.Fatalf("dim%d position%d column%d: got %g want %g", dim, p, i, v, want[p][i])
+			for p, row := range x {
+				for i := range row {
+					row[i] = float32((p*dim+i)%113-56) / 17
+				}
+				layerNormInto(row, norm.weight, norm.bias, norm.epsilon, &want[p])
+			}
+			var buffer layaBuffer
+			separate := norm.into(x, &buffer)
+			if buffer.normTask.in != nil || buffer.normTask.out != nil || buffer.normTask.norm.weight != nil || buffer.normTask.norm.bias != nil {
+				t.Fatal("normalization task retained tensor views after returning")
+			}
+			norm.inPlace(x)
+			for p, row := range x {
+				for i, value := range row {
+					if math.Float32bits(value) != math.Float32bits(want[p][i]) || math.Float32bits(separate[p][i]) != math.Float32bits(want[p][i]) {
+						t.Fatalf("rows%d dim%d position%d column%d: parallel normalization differs", count, dim, p, i)
+					}
 				}
 			}
 		}

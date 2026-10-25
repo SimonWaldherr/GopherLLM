@@ -228,6 +228,11 @@ For complete recent experiments with raw data and reproduction commands, see
   CPU projections and reuses the gate slab for SiLU, saving 2.125 MiB of shared
   activation scratch at 32 positions. Its projection latency improved, but
   paging and host-load variation prevented a stable whole-model speedup estimate.
+  DeltaNet workers also finish each head's RMSNorm and output gate before
+  returning. Two M2 Max kernel series measured 3.0% and 19.2% less time, with
+  bit-identical state and no new activation buffers; the larger result had a
+  noisy reference. Full-model runs did not establish a throughput gain. See the
+  [worker scheduling measurements](../benchmarks/metal/qwen-worker-norm.md).
   See the [32 GiB benchmark report and raw data](../benchmarks/metal/decode-paging.md)
   for timings, memory counters, limitations and opt-out switches.
   To check full logits, greedy predictions, residual/KV bits and weight ownership
@@ -249,6 +254,30 @@ For complete recent experiments with raw data and reproduction commands, see
 
 ## CPU kernels
 
+- Parakeet distributes independent Swish rows in wide FFN batches over the
+  existing worker pool and returns the already allocated output row views.
+  With eight workers on M2 Max, one FFN half-step fell from 2.226 to 1.420 ms
+  (36.2%); both FFNs, attention and convolution fell from 9.483 to 7.823 ms
+  (17.5%). Outputs remain bit-identical to the prior batched path. This
+  component benchmark excludes the block's final LayerNorm and does not
+  establish a whole-model speedup. See the
+  [measurements and reproduction commands](../benchmarks/encoders/parakeet-ffn-workers.md).
+- Voxtral and Parakeet process complete spectral frames per worker and share
+  immutable DFT tables for their standard frontend sizes. On an M2 Max, seven
+  seconds of audio reached mel features 6.6–7.6× faster; a complete Parakeet
+  transcription of one 3.6-second clip took 8.8% less time with identical text,
+  tokens and encoder outputs. Voxtral offline causal convolutions also distribute
+  output frames, measuring 6.1–6.9× faster separately. These component gains are
+  not a whole-model Voxtral speedup. See the
+  [speech benchmarks and memory tradeoffs](../benchmarks/encoders/speech-frontend.md).
+- Laya parallelizes independent LayerNorm rows in wide token batches. On an
+  M2 Max, representative 128/512-token layers took 17–21% less time without
+  increasing allocations. Voxtral's Darwin Accelerate attention distributes
+  heads across workers with bounded score scratch, and its encoder reuses the
+  FFN gate buffer for activations. A real checkpoint's streaming encoder layer
+  took 10% less time at four frames and 31% less at sixteen; single-frame calls
+  keep serial attention. These are layer measurements, not full-model latency.
+  See the [encoder measurements and memory tradeoffs](../benchmarks/encoders/laya-voxtral.md).
 - ARM64 Q8_0 prefill processes four tokens together while preserving the
   existing Q8 arithmetic. Native dense Gemma 4 uses layer-wise prompt batches,
   including its token-dependent per-layer projections. On the measured M2 Max,

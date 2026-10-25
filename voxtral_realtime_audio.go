@@ -16,10 +16,8 @@ import (
 // each stage's math was verified.
 
 // voxtralDFTTables holds the precomputed real-DFT basis used to turn a
-// windowed frame into a power spectrum. NFFT=400 is not a power of two, so
-// this is a direct O(freq*n) DFT (as two matvecs) rather than an FFT --
-// cheap enough here since it runs once per ~10ms frame, not per decoded
-// token.
+// windowed frame into a power spectrum. The direct DFT preserves the original
+// SIMD dot-product order; speechMelTask schedules whole frames in parallel.
 type voxtralDFTTables struct {
 	cos, sin Weight // each Cols=NFFT, rows=NFFT/2+1 (inferred from len(F32)/Cols)
 	nFreq    int
@@ -112,50 +110,29 @@ func computeVoxtralRealtimeMelSpectrogramContext(ctx context.Context, cfg Voxtra
 		return nil, 0, fmt.Errorf("mel spectrogram: audio too short to produce any frames (%d samples)", len(samples))
 	}
 
-	dft := buildVoxtralDFTTables(cfg.NFFT)
 	numMels := cfg.NumMels
 	mel = make([]float32, numMels*nFrames)
-
-	windowed := make([]float32, cfg.NFFT)
-	cosOut := make([]float32, dft.nFreq)
-	sinOut := make([]float32, dft.nFreq)
-	power := make([]float32, dft.nFreq)
-	melFrame := make([]float32, numMels)
+	task := speechMelTask{ctx: ctx, dft: cachedSpeechDFT(cfg.NFFT), samples: padded,
+		window: window, filterbank: filterbank, mel: mel, frames: nFrames,
+		hop: cfg.HopLength, preEmphasis: cfg.PreEmphasis}
+	if err := task.run(); err != nil {
+		return nil, 0, err
+	}
 	globalFloor := cfg.GlobalLogMelMax - 8.0
-
-	for t := range nFrames {
-		if err := ctx.Err(); err != nil {
-			return nil, 0, err
-		}
-		start := t * cfg.HopLength
-		frame := padded[start : start+cfg.NFFT]
-		for i, s := range frame {
-			windowed[i] = s * window[i]
-		}
-		if cfg.PreEmphasis != 0 {
-			prev := float32(0)
-			for i, v := range windowed {
-				windowed[i] = v - cfg.PreEmphasis*prev
-				prev = v
+	for i, v := range mel {
+		if i%numMels == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
 			}
 		}
-		dft.cos.MatvecInto(windowed, &cosOut)
-		dft.sin.MatvecInto(windowed, &sinOut)
-		for k := range power {
-			power[k] = cosOut[k]*cosOut[k] + sinOut[k]*sinOut[k]
+		if v < 1e-10 {
+			v = 1e-10
 		}
-		filterbank.MatvecInto(power, &melFrame)
-		for c := range numMels {
-			v := melFrame[c]
-			if v < 1e-10 {
-				v = 1e-10
-			}
-			logv := float32(math.Log10(float64(v)))
-			if logv < globalFloor {
-				logv = globalFloor
-			}
-			mel[c*nFrames+t] = (logv + 4) / 4
+		logv := float32(math.Log10(float64(v)))
+		if logv < globalFloor {
+			logv = globalFloor
 		}
+		mel[i] = (logv + 4) / 4
 	}
 	return mel, nFrames, nil
 }
@@ -192,23 +169,38 @@ func applyCausalConv1dContext(ctx context.Context, x []float32, in, length int, 
 	for c := range in {
 		copy(padded[c*paddedLen+padLeft:c*paddedLen+padLeft+length], x[c*length:(c+1)*length])
 	}
-	patch := make([]float32, in*conv.Kernel)
 	out = make([]float32, conv.Out*outLen)
-	for t := range outLen {
-		if err := ctx.Err(); err != nil {
-			return nil, 0, err
-		}
-		base := t * conv.Stride
-		for c := range in {
-			copy(patch[c*conv.Kernel:(c+1)*conv.Kernel], padded[c*paddedLen+base:c*paddedLen+base+conv.Kernel])
-		}
-		for o := range conv.Out {
-			v := DotF32(conv.Weight[o*in*conv.Kernel:(o+1)*in*conv.Kernel], patch)
-			if len(conv.Bias) > o {
-				v += conv.Bias[o]
+	workers := 1
+	if outLen*conv.Out*in*conv.Kernel >= 1<<18 {
+		workers = max(1, min(outLen, numThreads()))
+	}
+	width := in * conv.Kernel
+	patches := make([]float32, workers*width)
+	// Independent output frames retain the exact per-channel dot/GELU order.
+	// One patch per worker bounds scratch regardless of the clip duration.
+	parallelChunks(workers, func(start, end int) {
+		for worker := start; worker < end; worker++ {
+			patch := patches[worker*width : (worker+1)*width]
+			for t := worker; t < outLen; t += workers {
+				if ctx.Err() != nil {
+					return
+				}
+				base := t * conv.Stride
+				for c := range in {
+					copy(patch[c*conv.Kernel:(c+1)*conv.Kernel], padded[c*paddedLen+base:c*paddedLen+base+conv.Kernel])
+				}
+				for o := range conv.Out {
+					v := DotF32(conv.Weight[o*width:(o+1)*width], patch)
+					if len(conv.Bias) > o {
+						v += conv.Bias[o]
+					}
+					out[o*outLen+t] = geluTanh(v)
+				}
 			}
-			out[o*outLen+t] = geluTanh(v)
 		}
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
 	return out, outLen, nil
 }
@@ -290,7 +282,7 @@ type voxtralEncoderState struct {
 type voxtralEncoderScratch struct {
 	q, k, v, attnOut                    voxtralAudioMatrix
 	outProj, normed                     voxtralAudioMatrix
-	ffnGate, ffnUp, ffnAct, ffnDown     voxtralAudioMatrix
+	ffnGate, ffnUp, ffnDown             voxtralAudioMatrix
 	ropeSin, ropeCos, sin, cos, invFreq []float32
 	scores, offlineKHead, offlineVHead  []float32
 	ropeHeadDim                         int
@@ -301,7 +293,7 @@ const voxtralEncoderScratchRetentionBytes = 64 << 20
 
 func (s *voxtralEncoderScratch) retainedBytes() uint64 {
 	var size uint64
-	for _, m := range []*voxtralAudioMatrix{&s.q, &s.k, &s.v, &s.attnOut, &s.outProj, &s.normed, &s.ffnGate, &s.ffnUp, &s.ffnAct, &s.ffnDown} {
+	for _, m := range []*voxtralAudioMatrix{&s.q, &s.k, &s.v, &s.attnOut, &s.outProj, &s.normed, &s.ffnGate, &s.ffnUp, &s.ffnDown} {
 		// A row header occupies at most 24 bytes on supported platforms.
 		size += uint64(cap(m.data))*4 + uint64(cap(m.rows))*24
 	}
@@ -449,7 +441,6 @@ func forwardVoxtralEncoderRowsChunk(ctx context.Context, cfg VoxtralRealtimeConf
 	normed := scratch.normed.resize(n, dim)
 	ffnGateOut := scratch.ffnGate.resize(n, cfg.Encoder.FFNDim)
 	ffnUpOut := scratch.ffnUp.resize(n, cfg.Encoder.FFNDim)
-	ffnActOut := scratch.ffnAct.resize(n, cfg.Encoder.FFNDim)
 	ffnDownOut := scratch.ffnDown.resize(n, dim)
 
 	ensureLenNoClear(&scratch.ropeSin, n*(headDim/2))
@@ -612,9 +603,11 @@ func forwardVoxtralEncoderRowsChunk(ctx context.Context, cfg VoxtralRealtimeConf
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			siluMulF32(ffnGateOut[t], ffnUpOut[t], ffnActOut[t])
+			// Each activation consumes its gate element before replacing it.
+			// No later encoder stage needs the unactivated gate projection.
+			siluMulF32(ffnGateOut[t], ffnUpOut[t], ffnGateOut[t])
 		}
-		blasMatvecBatch(layer.FFNDown, ffnActOut, ffnDownOut)
+		blasMatvecBatch(layer.FFNDown, ffnGateOut, ffnDownOut)
 		for t := range n {
 			if err := ctx.Err(); err != nil {
 				return nil, err

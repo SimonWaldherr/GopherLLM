@@ -9,6 +9,8 @@ type qwen35DeltaTask struct {
 	state, q, k, v          []float32
 	alpha, beta, a, dt      []float32
 	out, recall             []float32
+	norm, gate              []float32
+	eps                     float32
 }
 
 func (t *qwen35DeltaTask) runRows(start, end int) {
@@ -19,8 +21,16 @@ func (t *qwen35DeltaTask) runRows(start, end int) {
 		beta := fastSigmoidF32(t.beta[h])
 		group := h % t.groups
 		q, k := t.q[group*t.keyDim:(group+1)*t.keyDim], t.k[group*t.keyDim:(group+1)*t.keyDim]
+		out := t.out[h*n : (h+1)*n]
 		qwen35DeltaHead(t.state[h*n*n:(h+1)*n*n], q, k, t.v[h*n:(h+1)*n],
-			t.out[h*n:(h+1)*n], t.recall[h*n:(h+1)*n], decay, beta)
+			out, t.recall[h*n:(h+1)*n], decay, beta)
+		// Finish the head on its worker while its output is still local. The
+		// gate follows RMSNorm; moving it before normalization changes Qwen's
+		// graph. Neither operation depends on any other head.
+		ss := DotF32(out, out)
+		scale := float32(1 / math.Sqrt(float64(ss/float32(n)+t.eps)))
+		mulScaleF32(out, t.norm[:n], scale, out)
+		qwen35DeltaGate(t.gate[h*n:(h+1)*n], out)
 	}
 }
 

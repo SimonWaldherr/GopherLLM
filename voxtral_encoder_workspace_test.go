@@ -9,6 +9,27 @@ import (
 	"testing"
 )
 
+func TestVoxtralFFNGateReuse(t *testing.T) {
+	for _, n := range []int{0, 1, 31, 32, 33, 5120} {
+		gate, up := randomExpertInput(n, 83701), randomExpertInput(n, 83702)
+		want := make([]float32, n)
+		siluMulF32(gate, up, want)
+		storage := make([]float32, n+2)
+		storage[0], storage[n+1] = 123, 456
+		got := storage[1 : n+1]
+		copy(got, gate)
+		siluMulF32(got, up, got)
+		for i, value := range want {
+			if math.Float32bits(value) != math.Float32bits(got[i]) {
+				t.Fatalf("width%d element%d: reused gate changed activation", n, i)
+			}
+		}
+		if storage[0] != 123 || storage[n+1] != 456 {
+			t.Fatal("activation overwrote a guard")
+		}
+	}
+}
+
 func voxtralEncoderTestRows(start, n, dim int) [][]float32 {
 	rows := audioMatrixRows(n, dim)
 	for i := range rows {

@@ -95,7 +95,8 @@ func blasAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, d
 	}
 	b := blasScratchBuf.Get().(*blasScratchPool)
 	defer blasScratchBuf.Put(b)
-	ensureLenNoClear(&b.scores, n*total)
+	workers := voxtralblas.AttentionWorkers(n, total, heads, numThreads())
+	ensureLenNoClear(&b.scores, workers*n*total)
 	queries, directQueries := contiguousBatchRows(q, width)
 	output, directOutput := contiguousBatchRows(out, width)
 	directOutput = directOutput && len(out) == n && !batchSlicesOverlap(output, k) && !batchSlicesOverlap(output, v)
@@ -110,7 +111,7 @@ func blasAttentionBatch(q [][]float32, k, v []float32, out [][]float32, heads, d
 		ensureLenNoClear(&b.output, n*width)
 		output = b.output
 	}
-	voxtralblas.Attention(n, total, heads, dim, past, window, stride, scale, queries, k, v, b.scores, output)
+	voxtralblas.AttentionWithWorkers(n, total, heads, dim, past, window, stride, scale, queries, k, v, b.scores, output, workers)
 	if !directOutput {
 		for t := range out {
 			copy(out[t], output[t*width:(t+1)*width])

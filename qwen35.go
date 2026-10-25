@@ -1049,6 +1049,7 @@ func qwen35DeltaNetStep(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache,
 		q:     buf.MambaB, k: buf.MambaC, v: buf.MambaX,
 		alpha: alphaInput, beta: betaInput, a: w.A, dt: w.DTBias,
 		out: buf.MambaY, recall: buf.MambaRecall,
+		norm: w.Norm, gate: gate, eps: cfg.RMSNormEps,
 	}
 	if nHeads >= 8 && headDim >= 64 {
 		parallelChunksTask(nHeads, task)
@@ -1056,17 +1057,6 @@ func qwen35DeltaNetStep(cfg Config, w Qwen35DeltaNetWeights, state *Qwen35Cache,
 		task.runRows(0, nHeads)
 	}
 	*task = qwen35DeltaTask{}
-
-	// Qwen's Gated RMSNorm normalizes the recurrent output first, then applies
-	// SiLU(z). Applying the gate before RMSNorm would mostly cancel its scale
-	// and materially changes the reference graph.
-	for h := range nHeads {
-		part := buf.MambaY[h*headDim : h*headDim+headDim]
-		ss := DotF32(part, part)
-		scale := float32(1 / math.Sqrt(float64(ss/float32(headDim)+cfg.RMSNormEps)))
-		mulScaleF32(part, w.Norm[:headDim], scale, part)
-	}
-	qwen35DeltaGate(gate[:dInner], buf.MambaY)
 }
 
 // qwen35L2NormalizeInPlace applies the Qwen/FLA L2 normalization used by the

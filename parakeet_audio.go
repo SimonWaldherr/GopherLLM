@@ -1,6 +1,7 @@
 package gopherllm
 
 import (
+	"context"
 	"fmt"
 	"math"
 )
@@ -71,34 +72,16 @@ func parakeetLogMelSpectrogram(cfg ParakeetPreprocessorConfig, filterbank []floa
 	// zero-padded n_fft buffer rather than left-aligning it.
 	padLeft := (cfg.NFFT - cfg.WinLength) / 2
 
-	dft := buildVoxtralDFTTables(cfg.NFFT)
 	numMels := cfg.NumMelBins
 	mel = make([]float32, numMels*nFrames)
-
-	frame := make([]float32, cfg.NFFT)
-	cosOut := make([]float32, dft.nFreq)
-	sinOut := make([]float32, dft.nFreq)
-	power := make([]float32, dft.nFreq)
-	melFrame := make([]float32, numMels)
-	filterbankWeight := Weight{F32: filterbank}
-
-	for t := range nFrames {
-		start := t * cfg.HopLength
-		for i := range frame {
-			frame[i] = 0
-		}
-		for i, w := range window {
-			frame[padLeft+i] = padded[start+i] * w
-		}
-		dft.cos.MatvecInto(frame, &cosOut)
-		dft.sin.MatvecInto(frame, &sinOut)
-		for k := range power {
-			power[k] = cosOut[k]*cosOut[k] + sinOut[k]*sinOut[k]
-		}
-		filterbankWeight.MatvecInto(power, &melFrame)
-		for c, v := range melFrame {
-			mel[c*nFrames+t] = float32(math.Log(float64(v) + float64(cfg.LogZeroGuard)))
-		}
+	task := speechMelTask{ctx: context.Background(), dft: cachedSpeechDFT(cfg.NFFT), samples: padded,
+		window: window, filterbank: Weight{F32: filterbank}, mel: mel, frames: nFrames,
+		hop: cfg.HopLength, windowLeft: padLeft}
+	if err := task.run(); err != nil {
+		return nil, 0, err
+	}
+	for i, v := range mel {
+		mel[i] = float32(math.Log(float64(v) + float64(cfg.LogZeroGuard)))
 	}
 
 	// Per-feature (per-mel-channel) normalization: NeMo's FilterbankFeatures

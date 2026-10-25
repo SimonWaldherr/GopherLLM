@@ -11,8 +11,9 @@ import (
 // A model retains at most 32 MiB; unusually long contexts are released after
 // their request. No token-dependent activations or K/V rows are reused as input.
 type layaBuffer struct {
-	data []float32
-	rows [][]float32
+	data     []float32
+	rows     [][]float32
+	normTask layaNormTask
 }
 
 func (b *layaBuffer) resize(n, d int, zero bool) [][]float32 {
@@ -139,9 +140,7 @@ func (n layaNorm) into(x [][]float32, b *layaBuffer) [][]float32 {
 		return x
 	}
 	out := b.resize(len(x), len(x[0]), false)
-	for i := range x {
-		layerNormInto(x[i], n.weight, n.bias, n.epsilon, &out[i])
-	}
+	n.apply(x, out, &b.normTask)
 	return out
 }
 func (l layaLinear) into(x [][]float32, b *layaBuffer, stride int) [][]float32 {
@@ -163,8 +162,34 @@ func (n layaNorm) inPlace(x [][]float32) {
 		return
 	}
 	// LayerNorm reads the complete row for mean/variance before writing values.
-	for i := range x {
-		layerNormInto(x[i], n.weight, n.bias, n.epsilon, &x[i])
+	n.apply(x, x, nil)
+}
+
+type layaNormTask struct {
+	norm    layaNorm
+	in, out [][]float32
+}
+
+func (t *layaNormTask) runRows(start, end int) {
+	for i := start; i < end; i++ {
+		layerNormInto(t.in[i], t.norm.weight, t.norm.bias, t.norm.epsilon, &t.out[i])
+	}
+}
+
+func (n layaNorm) apply(in, out [][]float32, task *layaNormTask) {
+	// Keep small heads and short requests inline; larger token batches have
+	// independent rows and preserve each row's original reduction order.
+	if len(in) >= 32 && len(in[0]) >= 256 && numThreads() > 1 {
+		if task == nil {
+			task = &layaNormTask{}
+		}
+		*task = layaNormTask{norm: n, in: in, out: out}
+		parallelChunksTask(len(in), task)
+		*task = layaNormTask{} // Do not retain input views after the barrier.
+		return
+	}
+	for i := range in {
+		layerNormInto(in[i], n.weight, n.bias, n.epsilon, &out[i])
 	}
 }
 func layaResidual(x, y [][]float32) {
