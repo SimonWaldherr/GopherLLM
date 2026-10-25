@@ -3,6 +3,7 @@
 package gopherllm
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +28,8 @@ import (
 // Set GOPHERLLM_COREML_FFN_GGUF and GOPHERLLM_COREML_FFN_PATH to opt in. The
 // optional MANIFEST and UNITS names use that same prefix. UNITS defaults to
 // cpu,ane; "ane" permits CPU fallback rather than proving ANE-only execution.
+// TUNE_ONLY=1 instead checks attachment/calibration with only the selected
+// layer's weights in a Runner; it does not load a complete generation graph.
 func TestCoreMLConfiguredFFN(t *testing.T) {
 	ggufPath, modelPath := os.Getenv("GOPHERLLM_COREML_FFN_GGUF"), os.Getenv("GOPHERLLM_COREML_FFN_PATH")
 	if ggufPath == "" || modelPath == "" {
@@ -119,6 +122,30 @@ func TestCoreMLConfiguredFFN(t *testing.T) {
 			t.Fatal(err)
 		}
 		packedBytes += size
+	}
+	if os.Getenv("GOPHERLLM_COREML_FFN_TUNE_ONLY") == "1" {
+		r := &Runner{arch: config.Arch, config: config, kind: loadedStandard}
+		if config.Arch == "qwen35" {
+			r.kind = loadedQwen35
+			r.qwen35.Layers = make([]Qwen35LayerWeights, config.NLayers)
+			r.qwen35.Layers[manifest.Layer].FFN = Qwen35FFNWeights{Gate: weights[0], Up: weights[1], Down: weights[2]}
+		} else {
+			r.standard.Layers = make([]LayerWeights, config.NLayers)
+			r.standard.Layers[manifest.Layer] = LayerWeights{W1: weights[0], W3: weights[1], W2: weights[2]}
+		}
+		var log bytes.Buffer
+		if err := r.setCoreMLFFN([]string{manifestPath}, CoreMLFFNOptions{AutoTune: true, LogWriter: &log}, func(path string, units coremlbackend.ComputeUnits) (coreMLFFNPredictor, error) {
+			return coremlbackend.OpenFFN(path, units)
+		}); err != nil {
+			t.Fatalf("calibration failed: %v\n%s", err, &log)
+		}
+		defer r.coreMLFFN.close()
+		raw, err := json.Marshal(map[string]any{"source": filepath.Base(ggufPath), "export": filepath.Base(modelPath), "calibration": log.String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Println("COREML_FFN_TUNING_JSON " + string(raw))
+		return
 	}
 	tokens, dimension, hidden := manifest.Tokens, manifest.Dimension, manifest.HiddenDimension
 	input, reference, output := make([]float32, tokens*dimension), make([]float32, tokens*dimension), make([]float32, tokens*dimension)

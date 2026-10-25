@@ -16,17 +16,10 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	nativecoreml "github.com/SimonWaldherr/GopherLLM/internal/coreml"
 )
-
-// CoreMLFFNOptions selects devices for explicitly exported prefill FFNs.
-// CPUOnly keeps these projections on the CPU. The default permits CPU and
-// Neural Engine execution, leaving the GPU available to attention; placement
-// is up to Core ML.
-type CoreMLFFNOptions struct {
-	CPUOnly bool
-}
 
 type coreMLFFNWeightBinding struct {
 	Name       string `json:"name"`
@@ -103,6 +96,9 @@ func (r *Runner) SetCoreMLFFN(manifests []string, opts CoreMLFFNOptions) error {
 
 func (r *Runner) setCoreMLFFN(manifests []string, opts CoreMLFFNOptions,
 	open func(string, nativecoreml.ComputeUnits) (coreMLFFNPredictor, error)) (err error) {
+	if len(manifests) != 0 && opts.AutoTune && opts.CPUOnly {
+		return errors.New("coreml FFN: AutoTune and CPUOnly are mutually exclusive")
+	}
 	next := make(coreMLFFNSet, len(manifests))
 	defer func() {
 		if err != nil {
@@ -124,22 +120,57 @@ func (r *Runner) setCoreMLFFN(manifests []string, opts CoreMLFFNOptions,
 		if err := r.validateCoreMLFFNManifest(manifest); err != nil {
 			return err
 		}
-		model, err := open(modelPath, units)
-		if err != nil {
-			return err
-		}
-		info := model.Info()
-		next[manifest.Layer] = &coreMLFFNLayer{model: model, info: info}
-		if info.Tokens != manifest.Tokens || info.Dimension != manifest.Dimension {
-			return errors.New("coreml FFN: compiled model shape differs from its manifest")
-		}
-		if err := validateCoreMLFFNBinding(manifest, info.Manifest); err != nil {
-			return err
-		}
 		gate, up, down, _ := r.coreMLFFNWeights(manifest.Layer)
-		if err := validateCoreMLFFNQuality(model, manifest, gate, up, down); err != nil {
+		var input, output, reference []float32
+		load := func(units nativecoreml.ComputeUnits) (layer *coreMLFFNLayer, err error) {
+			model, err := open(modelPath, units)
+			if err != nil {
+				return nil, err
+			}
+			defer func() {
+				if err != nil {
+					_ = model.Close()
+				}
+			}()
+			info := model.Info()
+			if info.Tokens != manifest.Tokens || info.Dimension != manifest.Dimension {
+				return nil, errors.New("coreml FFN: compiled model shape differs from its manifest")
+			}
+			if err := validateCoreMLFFNBinding(manifest, info.Manifest); err != nil {
+				return nil, err
+			}
+			if input == nil {
+				input = coreMLFFNProbeInput(manifest)
+				output = make([]float32, len(input))
+			}
+			if err := model.Predict(input, output); err != nil {
+				return nil, err
+			}
+			if reference == nil {
+				reference = coreMLFFNReference(manifest, gate, up, down, input)
+			}
+			if err := checkCoreMLFFNQuality(manifest, output, reference); err != nil {
+				return nil, err
+			}
+			return &coreMLFFNLayer{model: model, info: info}, nil
+		}
+		var layer *coreMLFFNLayer
+		if opts.AutoTune {
+			logw := opts.LogWriter
+			if logw == nil {
+				logw = io.Discard
+			}
+			fmt.Fprintf(logw, "Core ML FFN layer %d (%dx%d):\n", manifest.Layer, manifest.Tokens, manifest.Dimension)
+			layer, err = tuneCoreMLFFN(load, func(layer *coreMLFFNLayer) (time.Duration, error) {
+				return measureCoreMLFFN(layer.model, input, output)
+			}, logw)
+		} else {
+			layer, err = load(units)
+		}
+		if err != nil {
 			return fmt.Errorf("coreml FFN layer %d: %w", manifest.Layer, err)
 		}
+		next[manifest.Layer] = layer
 	}
 	r.coreMLFFN.close()
 	r.coreMLFFN = next
@@ -296,15 +327,24 @@ func validateCoreMLFFNBinding(want coreMLFFNManifest, embedded string) error {
 // at a time, independent of global Q8-activation and accelerator settings.
 // This is a numerical smoke check, not a substitute for corpus evaluation.
 func validateCoreMLFFNQuality(model coreMLFFNPredictor, m coreMLFFNManifest, gate, up, down Weight) error {
-	input, output := make([]float32, m.Tokens*m.Dimension), make([]float32, m.Tokens*m.Dimension)
+	input := coreMLFFNProbeInput(m)
+	output := make([]float32, len(input))
+	if err := model.Predict(input, output); err != nil {
+		return err
+	}
+	return checkCoreMLFFNQuality(m, output, coreMLFFNReference(m, gate, up, down, input))
+}
+
+func coreMLFFNProbeInput(m coreMLFFNManifest) []float32 {
+	input := make([]float32, m.Tokens*m.Dimension)
 	for i := range input {
 		scale := []float64{.125, .75, 1.5}[(i/m.Dimension)%3]
 		input[i] = float32(scale * (math.Sin(float64(i)*.271) + math.Cos(float64(i)*.037)/3))
 	}
-	if err := model.Predict(input, output); err != nil {
-		return err
-	}
-	reference := coreMLFFNReference(m, gate, up, down, input)
+	return input
+}
+
+func checkCoreMLFFNQuality(m coreMLFFNManifest, output, reference []float32) error {
 	for token := 0; token < min(m.Tokens, 3); token++ {
 		want := reference[token*m.Dimension : (token+1)*m.Dimension]
 		var dot, aa, bb, delta float64

@@ -8,12 +8,6 @@ import (
 	nativecoreml "github.com/SimonWaldherr/GopherLLM/internal/coreml"
 )
 
-// CoreMLFFNOptions selects devices for explicitly exported prefill FFNs.
-// Build with CGO_ENABLED=1 and -tags coreml on an Apple platform to use them.
-type CoreMLFFNOptions struct {
-	CPUOnly bool
-}
-
 type coreMLFFNSet map[int]struct{}
 
 func (coreMLFFNSet) close() {}

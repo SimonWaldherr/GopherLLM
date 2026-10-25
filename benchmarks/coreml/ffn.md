@@ -41,6 +41,23 @@ native models. `CoreMLFFNOptions{CPUOnly: true}` selects CPU-only execution for
 comparison; the default permits CPU and Neural Engine execution. Permission is
 not a measurement of ANE utilization.
 
+To choose devices for the current export and host, use
+`CoreMLFFNOptions{AutoTune: true, LogWriter: os.Stderr}`. This is optional and
+mutually exclusive with `CPUOnly`. Calibration loads candidates sequentially,
+validates their source binding and numerical quality, warms each candidate,
+then takes the median of nine predictions. CPU-only must beat CPU/ANE by at
+least 10% and repeat that advantage after reloading; otherwise CPU/ANE remains
+selected. If only one device mode passes validation and prediction, that mode
+is used. Rejected candidates are closed before opening the next one. An error
+leaves the previous attached selection intact.
+
+Run calibration on an otherwise idle machine: CPU load, thermal state and
+framework caches affect the result. It adds startup work and does not retune
+during generation. Only one new candidate per layer is live at a time, but an
+existing selection remains attached until replacement succeeds, and Core ML
+may retain framework caches. The log measures warm isolated FFNs, not complete prefill or
+ANE utilization. Omitting `AutoTune` preserves the existing device selection.
+
 Loading checks both source hashes and compiled metadata. It also compares three
 differently scaled deterministic rows against source-weight FP32 reference dots.
 Each row must have cosine >=0.9999 and relative L2 <=1%. Rejection leaves the
@@ -81,6 +98,11 @@ of at least 50 ms after warmup. Timings include the host/device round trip.
 variable uses the same prefix; otherwise the JSON path is derived from the
 compiled model name.
 
+Add `GOPHERLLM_COREML_FFN_TUNE_ONLY=1` to exercise attachment and calibration
+instead. It builds a Runner containing only the selected layer's source
+weights, runs the same source and quality checks as `SetCoreMLFFN`, and emits
+`COREML_FFN_TUNING_JSON`. This avoids loading a complete generation graph.
+
 All paths report error against a source-weight reference with unquantized
 activations. The ordinary CPU path may use its existing Q8-activation kernels,
 so its error is reported too. Numerical results are report-only in this
@@ -120,6 +142,30 @@ inputs, are opt-in:
 PYTHONDONTWRITEBYTECODE=1 GOPHERLLM_COREML_EXPORT_TESTS=1 \
   python -m unittest scripts/test_export_coreml_ffn.py
 ```
+
+## Device calibration, 2026-10-25
+
+On the M2 Max with 32 GiB, three native attachment/calibration runs per export
+selected CPU/ANE for both layer-0 models. The exports use the same 32-row graph
+options as the 2026-10-24 comparison below. Other applications remained active.
+
+| Export | CPU-only warm median | CPU/ANE warm median | Selection |
+|---|---:|---:|---|
+| Ministral-3-3B, scale 16 | Rejected by quality probe | 3.137–3.219 ms | CPU/ANE, all three runs |
+| Qwen3.8-27B, scale 8, hidden chunks 4352 | 12.075–16.860 ms | 9.299–12.693 ms | CPU/ANE, all three runs |
+
+Ministral's CPU-only export produced cosine 0.99987163 and relative L2 1.6028%
+on the quality probe, exceeding the accepted error. It was closed before
+timing. Qwen's CPU-only results under this load did not repeat the earlier
+isolated CPU advantage; even the one slightly faster trial did not clear the
+10% margin. These runs validate device selection and rejection, not a new
+whole-model speedup. [Calibration logs](m2-max-ffn-tuning-2026-10-25.jsonl)
+retain every run. Deterministic tests also exercise a confirmed CPU win,
+transient wins, failed predictions/reopens and candidate lifetimes.
+
+A combined gate/up convolution export was tested separately for Ministral.
+It preserved output bits but did not improve paired prediction timings, so
+the exporter graph remains unchanged.
 
 ## M2 Max results, 2026-10-24
 

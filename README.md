@@ -545,6 +545,13 @@ prefill chunks retain priority; decode, speculative verification and Qwen MTP
 prefill retain their current arithmetic. Build with `-tags 'metal coreml'` and
 enable exports explicitly through `Runner.SetCoreMLFFN`.
 
+`CoreMLFFNOptions{AutoTune: true, LogWriter: os.Stderr}` optionally compares
+CPU-only and CPU/Neural Engine execution for each export at attachment time.
+Each candidate must pass the source quality probe to be eligible. When both
+are valid, CPU-only replaces the default after two measurements show at least
+10% lower latency. Calibrate on an otherwise idle machine. This adds startup
+work and keeps the GPU available to Metal.
+
 This adds separately compiled weights and is not a RAM-saving setting.
 Benchmark the actual prompt/model before enabling it; layer timings do not
 establish an end-to-end generation speedup.
