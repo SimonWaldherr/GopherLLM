@@ -97,7 +97,7 @@ func SampleWithScratch(logits []float32, config SamplerConfig, rng *Rng, recent 
 	}
 	maxLogit := negInf32
 	for i, v := range logits {
-		if !finiteLogit(v) {
+		if !finite32(v) {
 			logits[i] = negInf32
 			continue
 		}
@@ -141,7 +141,7 @@ func applyRepeatPenalty(logits []float32, recent []uint32, penalty float32) {
 	for _, tok := range recent {
 		if int(tok) < n {
 			v := logits[tok]
-			if !finiteLogit(v) {
+			if !finite32(v) {
 				logits[tok] = negInf32
 			} else if v > 0 {
 				logits[tok] = v / penalty
@@ -241,7 +241,7 @@ func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rn
 	c := (*candidates)[:0]
 	next := 0
 	for next < len(logits) && len(c) < topK {
-		if logit := logits[next]; finiteLogit(logit) {
+		if logit := logits[next]; finite32(logit) {
 			c = append(c, TokenProb{next, logit})
 		}
 		next++
@@ -255,7 +255,7 @@ func sampleTopK(logits []float32, topK int, topP, minP, invTemp float32, rng *Rn
 			// Token ids arrive in ascending order, so a tie can never replace
 			// an existing candidate. Most vocabulary entries need only this
 			// comparison; NaN and -Inf also fail it without a finite check.
-			if logit > threshold && finiteLogit(logit) {
+			if logit > threshold && finite32(logit) {
 				c[0] = TokenProb{next + i, logit}
 				siftDownTokenProbs(c, 0)
 				threshold = c[0].Prob
@@ -404,10 +404,6 @@ func tokenProbLess(a, b TokenProb) bool {
 	return a.Token < b.Token
 }
 
-func finiteLogit(v float32) bool {
-	return math.Float32bits(v)&0x7f800000 != 0x7f800000
-}
-
 func argmaxToken(logits []float32) uint32 {
 	best := 0
 	for i := 1; i < len(logits); i++ {
@@ -421,13 +417,13 @@ func argmaxToken(logits []float32) uint32 {
 func argmaxFiniteToken(logits []float32) uint32 {
 	best := 0
 	bestValue := logits[0]
-	if !finiteLogit(bestValue) {
+	if !finite32(bestValue) {
 		bestValue = negInf32
 		logits[0] = bestValue
 	}
 	for i := 1; i < len(logits); i++ {
 		v := logits[i]
-		if !finiteLogit(v) {
+		if !finite32(v) {
 			v = negInf32
 			logits[i] = v
 		}

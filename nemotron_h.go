@@ -427,7 +427,7 @@ func nemotronSoftplus(x float32) float32 {
 }
 
 func mambaGatedValue(y, z float32) float32 {
-	return y * (z / (1 + float32(math.Exp(float64(-z)))))
+	return y * siluExact(z)
 }
 
 func nemotronSigmoid(x float32) float32 {
@@ -541,7 +541,7 @@ func mambaSSMForward(cfg Config, w NemotronMambaWeights, state *NemotronHCache, 
 			copy(state.Conv[off:off+state.ConvLen-1], state.Conv[off+1:off+state.ConvLen])
 			state.Conv[off+state.ConvLen-1] = buf.MambaConv[ch]
 		}
-		buf.MambaConv[ch] = v / (1 + float32(math.Exp(float64(-v))))
+		buf.MambaConv[ch] = siluExact(v)
 	}
 
 	ensureLenNoClear(&buf.MambaX, dInner)

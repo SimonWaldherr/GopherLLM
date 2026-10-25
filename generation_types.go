@@ -3,7 +3,6 @@ package gopherllm
 import (
 	"context"
 	"fmt"
-	"math"
 	"strings"
 	"time"
 )
@@ -199,10 +198,6 @@ func (o GenerationOptions) Validate() error {
 		return fmt.Errorf("prompt_lookup_tokens requires greedy sampling (temperature 0 or top_k 1) to preserve exact output")
 	}
 	return nil
-}
-
-func finite32(v float32) bool {
-	return !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0)
 }
 
 type GenerationStats struct {

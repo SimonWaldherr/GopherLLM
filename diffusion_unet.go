@@ -58,6 +58,7 @@ type diffusionWorkspace struct {
 	columns []float32
 	err     error
 	norm    diffusionNormTask
+	matmul  denseGemmScratch
 }
 
 func (s *diffusionWorkspace) alloc(n int) []float32 {
@@ -85,24 +86,7 @@ func (s *diffusionWorkspace) gemm(m, n, k int, a, b, out []float32) {
 	if s.canceled() {
 		return
 	}
-	if blasGemmNN(m, n, k, a, b, out) {
-		return
-	}
-	clear(out)
-	parallelRows(m, func(start, end int) {
-		for i := start; i < end; i++ {
-			if s.ctx.Err() != nil {
-				return
-			}
-			for j0 := 0; j0 < n; j0 += 256 {
-				width := min(256, n-j0)
-				dst := out[i*n+j0 : i*n+j0+width]
-				for p := range k {
-					AxpyF32(dst, a[i*k+p], b[p*n+j0:p*n+j0+width])
-				}
-			}
-		}
-	})
+	s.err = s.matmul.multiply(s.ctx, m, n, k, a, b, out)
 }
 
 func (c diffusionConv) forward(s *diffusionWorkspace, x diffusionTensor, stride, padding int) diffusionTensor {
@@ -130,13 +114,23 @@ func (c diffusionConv) forward(s *diffusionWorkspace, x diffusionTensor, stride,
 					row := input[((ch*c.kernel+ky)*c.kernel+kx)*n:][:n]
 					for oy := range h {
 						iy := oy*stride + ky - padding
+						dst := row[oy*w : (oy+1)*w]
+						if iy < 0 || iy >= x.h {
+							clear(dst)
+							continue
+						}
+						src := x.data[(ch*x.h+iy)*x.w : (ch*x.h+iy+1)*x.w]
+						if stride == 1 {
+							copyPaddedWindow(dst, src, kx-padding)
+							continue
+						}
 						for ox := range w {
 							ix := ox*stride + kx - padding
-							value := float32(0)
-							if iy >= 0 && iy < x.h && ix >= 0 && ix < x.w {
-								value = x.data[(ch*x.h+iy)*x.w+ix]
+							if ix >= 0 && ix < x.w {
+								dst[ox] = src[ix]
+							} else {
+								dst[ox] = 0
 							}
-							row[oy*w+ox] = value
 						}
 					}
 				}
@@ -191,15 +185,11 @@ func (t *diffusionNormTask) runRows(start, end int) {
 			channel := index / t.spatial
 			y := (value-float32(mean))*invStd*t.norm.weight[channel] + t.norm.bias[channel]
 			if t.activate {
-				y = diffusionSiLU(y)
+				y = siluExact(y)
 			}
 			t.dst[index] = y
 		}
 	}
-}
-
-func diffusionSiLU(value float32) float32 {
-	return value / (1 + float32(math.Exp(float64(-value))))
 }
 
 func (r diffusionResnet) forward(s *diffusionWorkspace, x diffusionTensor, time diffusionTensor) diffusionTensor {
@@ -268,14 +258,7 @@ func (a *diffusionAttention) forward(s *diffusionWorkspace, x diffusionTensor) d
 			row[i] *= scale
 			maximum = max(maximum, row[i])
 		}
-		sum := float64(0)
-		for i, value := range row {
-			row[i] = float32(math.Exp(float64(value - maximum)))
-			sum += float64(row[i])
-		}
-		for i := range row {
-			row[i] /= float32(sum)
-		}
+		softmaxF64InPlace(row, maximum)
 	}
 	transposed := s.alloc(n * n)
 	for i := range n {
@@ -325,13 +308,13 @@ func (n *diffusionUNet) forward(s *diffusionWorkspace, sample []float32, timeste
 	}
 	time = n.time1.forward(s, time, 1, 0)
 	for i := range time.data {
-		time.data[i] = diffusionSiLU(time.data[i])
+		time.data[i] = siluExact(time.data[i])
 	}
 	time = n.time2.forward(s, time, 1, 0)
 	// Every residual block applies SiLU before its time projection. All use
 	// the same embedding, so evaluate that activation once for this step.
 	for i := range time.data {
-		time.data[i] = diffusionSiLU(time.data[i])
+		time.data[i] = siluExact(time.data[i])
 	}
 	x := n.input.forward(s, diffusionTensor{sample, 3, 32, 32}, 1, 1)
 	if s.canceled() {

@@ -3,9 +3,7 @@ package gopherllm
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -15,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/SimonWaldherr/GopherLLM/internal/mmapfile"
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // SpeechAudio is mono, floating-point PCM at SampleRate samples per second.
@@ -159,10 +158,11 @@ func OpenTTS(ctx context.Context, path string) (*TTSModel, error) {
 		return nil, err
 	}
 	defer mapped.Close()
-	if len(mapped.Bytes()) < 8 || binary.LittleEndian.Uint64(mapped.Bytes()[:8]) > 1<<20 {
-		return nil, fmt.Errorf("tts: invalid or oversized safetensors header")
+	data := mapped.Bytes()
+	if len(data) < 8 || len(data) > 256<<20 || binary.LittleEndian.Uint64(data[:8]) > 1<<20 {
+		return nil, fmt.Errorf("tts: invalid or oversized safetensors file")
 	}
-	file, err := ParseSafetensors(mapped.Bytes())
+	file, err := ParseSafetensors(data)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +212,7 @@ func (m *TTSModel) Synthesize(ctx context.Context, text string, options TTSOptio
 	if speed == 0 {
 		speed = m.config.SpeakingRate
 	}
-	if !ttsFinite(speed) || speed < .25 || speed > 4 {
+	if !finite32(speed) || speed < .25 || speed > 4 {
 		return SpeechAudio{}, fmt.Errorf("tts: speed must be between 0.25 and 4")
 	}
 	noise, durationNoise := m.config.NoiseScale, m.config.NoiseScaleDuration
@@ -222,7 +222,7 @@ func (m *TTSModel) Synthesize(ctx context.Context, text string, options TTSOptio
 	if options.DurationNoiseScale != nil {
 		durationNoise = *options.DurationNoiseScale
 	}
-	if !ttsFinite(noise) || !ttsFinite(durationNoise) || noise < 0 || noise > 2 || durationNoise < 0 || durationNoise > 2 {
+	if !finite32(noise) || !finite32(durationNoise) || noise < 0 || noise > 2 || durationNoise < 0 || durationNoise > 2 {
 		return SpeechAudio{}, fmt.Errorf("tts: noise scales must be between 0 and 2")
 	}
 	hidden, means, logs, err := m.encode(ctx, ids)
@@ -261,10 +261,8 @@ func (m *TTSModel) Synthesize(ctx context.Context, text string, options TTSOptio
 	if err != nil {
 		return SpeechAudio{}, err
 	}
-	for _, v := range wave {
-		if !ttsFinite(v) {
-			return SpeechAudio{}, fmt.Errorf("tts: model produced non-finite audio")
-		}
+	if !numeric.AllFiniteF32(wave) {
+		return SpeechAudio{}, fmt.Errorf("tts: model produced non-finite audio")
 	}
 	return SpeechAudio{Samples: wave, SampleRate: m.config.SamplingRate}, nil
 }
@@ -293,39 +291,11 @@ func (m *TTSModel) tokenize(text string) ([]int, error) {
 }
 
 func ttsReadJSON(path string, value any) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() || info.Size() > 1<<20 {
-		return fmt.Errorf("tts: metadata must be a regular file no larger than 1 MiB: %s", path)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !st.Mode().IsRegular() || st.Size() > 1<<20 {
-		return fmt.Errorf("tts: metadata file too large: %s", path)
-	}
-	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
-	if err != nil {
-		return err
-	}
-	if len(data) > 1<<20 {
-		return fmt.Errorf("tts: metadata file too large: %s", path)
-	}
-	if err = json.Unmarshal(data, value); err != nil {
-		return fmt.Errorf("tts: %s: %w", path, err)
+	if err := readModelJSON(path, 1<<20, value); err != nil {
+		return fmt.Errorf("tts: %w", err)
 	}
 	return nil
 }
-
-func ttsFinite(v float32) bool { return !math.IsNaN(float64(v)) && !math.IsInf(float64(v), 0) }
 
 func (c ttsVITSConfig) validate() error {
 	if c.ModelType != "vits" ||
@@ -367,13 +337,13 @@ func (c ttsVITSConfig) validate() error {
 			return fmt.Errorf("tts: unsupported vocoder dilations")
 		}
 	}
-	if !ttsFinite(c.SpeakingRate) ||
+	if !finite32(c.SpeakingRate) ||
 		c.SpeakingRate < .25 ||
 		c.SpeakingRate > 4 ||
-		!ttsFinite(c.NoiseScale) ||
+		!finite32(c.NoiseScale) ||
 		c.NoiseScale < 0 ||
 		c.NoiseScale > 2 ||
-		!ttsFinite(c.NoiseScaleDuration) ||
+		!finite32(c.NoiseScaleDuration) ||
 		c.NoiseScaleDuration < 0 ||
 		c.NoiseScaleDuration > 2 {
 		return fmt.Errorf("tts: invalid model synthesis defaults")

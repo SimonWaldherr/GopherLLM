@@ -1,0 +1,12 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/GopherLLM
+cpu: Apple M2 Max
+BenchmarkConvolutionPatchCopy/elementwise-12         	    1028	    135889 ns/op	5063.91 MB/s	       0 B/op	       0 allocs/op
+BenchmarkConvolutionPatchCopy/elementwise-12         	     747	    141216 ns/op	4872.89 MB/s	       0 B/op	       0 allocs/op
+BenchmarkConvolutionPatchCopy/elementwise-12         	     715	    146339 ns/op	4702.30 MB/s	       0 B/op	       0 allocs/op
+BenchmarkConvolutionPatchCopy/window-12              	    5552	     21139 ns/op	32553.29 MB/s	       0 B/op	       0 allocs/op
+BenchmarkConvolutionPatchCopy/window-12              	    5942	     21045 ns/op	32697.41 MB/s	       0 B/op	       0 allocs/op
+BenchmarkConvolutionPatchCopy/window-12              	    5932	     20437 ns/op	33671.04 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/SimonWaldherr/GopherLLM	1.104s

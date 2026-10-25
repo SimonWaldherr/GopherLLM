@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"sync"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // This file holds the building blocks of the native YOLO executor in
@@ -106,7 +108,7 @@ func (cv *yoloConv) forward(x yoloTensor) (yoloTensor, error) {
 			if cv.act {
 				for i, v := range row {
 					v += bias
-					row[i] = v * yoloFastSigmoid(v)
+					row[i] = v * numeric.SigmoidF32(v)
 				}
 			} else {
 				for i := range row {
@@ -428,7 +430,7 @@ func (a *yoloAttention) forward(x yoloTensor) (yoloTensor, error) {
 			largest := yoloAttentionScores(scores, q, k, a.keyDim, n, i, scale)
 			var sum float32
 			for j, s := range scores {
-				scores[j] = yoloFastExp(s - largest)
+				scores[j] = numeric.ExpF32(s - largest)
 				sum += scores[j]
 			}
 			inv := 1 / sum

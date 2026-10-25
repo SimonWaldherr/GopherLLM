@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/GopherLLM
+cpu: Apple M2 Max
+BenchmarkAudioSampleValidation/16000/scalar-2         	    5494	    173482 ns/op	 368.91 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/16000/scalar-2         	    2581	    165532 ns/op	 386.63 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/16000/scalar-2         	     379	    264821 ns/op	 241.67 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/16000/shared-2         	  109695	      7733 ns/op	8276.44 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/16000/shared-2         	   10000	     11012 ns/op	5811.65 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/16000/shared-2         	  108830	      9758 ns/op	6558.83 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/480000/scalar-2        	     100	   4212390 ns/op	 455.80 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/480000/scalar-2        	      70	   4276411 ns/op	 448.97 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/480000/scalar-2        	      97	   3012709 ns/op	 637.30 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/480000/shared-2        	    1732	    148163 ns/op	12958.67 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/480000/shared-2        	    3072	    219491 ns/op	8747.53 MB/s	       0 B/op	       0 allocs/op
+BenchmarkAudioSampleValidation/480000/shared-2        	    1212	    167790 ns/op	11442.90 MB/s	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/SimonWaldherr/GopherLLM	6.531s

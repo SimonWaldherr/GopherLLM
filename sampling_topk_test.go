@@ -27,7 +27,7 @@ func TestTopKMatchesFullSort(t *testing.T) {
 						if i%13 == 0 {
 							logits[i] = float32(math.Inf(1))
 						}
-						if finiteLogit(logits[i]) {
+						if finite32(logits[i]) {
 							reference = append(reference, TokenProb{i, logits[i]})
 						}
 					}
@@ -76,7 +76,7 @@ func TestTopKThresholdScanEdgeCases(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/k=%d", tc.name, k), func(t *testing.T) {
 				reference := make([]TokenProb, 0, len(tc.logits))
 				for i, v := range tc.logits {
-					if finiteLogit(v) {
+					if finite32(v) {
 						reference = append(reference, TokenProb{i, v})
 					}
 				}

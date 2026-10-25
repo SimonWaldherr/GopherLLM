@@ -312,7 +312,7 @@ func argmaxQ6KRowsWithXSums(data []byte, x, xsums []float32, rows, cols, rowByte
 			} else {
 				v = DotQ6KF32(data[off:off+rowBytes], x, cols)
 			}
-			if !finiteLogit(v) {
+			if !finite32(v) {
 				continue
 			}
 			// Rows are visited in ascending order; strict > retains the
@@ -349,7 +349,7 @@ func argmaxQ4KRowsWithXSums(data []byte, x, xsums []float32, rows, cols, rowByte
 		for row := start; row < end; row++ {
 			off := row * rowBytes
 			v := dotQ4KF32WithXSums(data[off:off+rowBytes], x, xsums, cols)
-			if !finiteLogit(v) {
+			if !finite32(v) {
 				continue
 			}
 			if !localFound || v > localValue {
@@ -383,7 +383,7 @@ func argmaxQ5KRowsFloat(data []byte, x []float32, rows, cols, rowBytes int) uint
 		for row := start; row < end; row++ {
 			off := row * rowBytes
 			v := DotQ5KF32(data[off:off+rowBytes], x, cols)
-			if !finiteLogit(v) {
+			if !finite32(v) {
 				continue
 			}
 			if !localFound || v > localValue {
@@ -415,7 +415,7 @@ func argmaxQ8_0RowsFloat(data []byte, x []float32, rows, cols, rowBytes int) uin
 		for row := start; row < end; row++ {
 			off := row * rowBytes
 			v := DotQ8_0F32(data[off:off+rowBytes], x, cols)
-			if !finiteLogit(v) {
+			if !finite32(v) {
 				continue
 			}
 			if !localFound || v > localValue {
@@ -445,7 +445,7 @@ func argmaxMatvecRows(rows int, dot func(row int) float32) uint32 {
 		localFound := false
 		for row := start; row < end; row++ {
 			v := dot(row)
-			if !finiteLogit(v) {
+			if !finite32(v) {
 				continue
 			}
 			if !localFound || v > localValue || (v == localValue && row < localToken) {

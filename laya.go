@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // DecisionQuestion defines a choice, an ordinal score, or a noul (yes/no
@@ -446,10 +448,8 @@ func (m *LayaModel) Predict(ctx context.Context, req DecisionRequest) (DecisionR
 		if err != nil {
 			return DecisionResult{}, err
 		}
-		for _, v := range append(logits, act) {
-			if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-				return DecisionResult{}, fmt.Errorf("laya: inference produced non-finite values")
-			}
+		if !numeric.AllFiniteF32(logits) || !finite32(act) {
+			return DecisionResult{}, fmt.Errorf("laya: inference produced non-finite values")
 		}
 		result.Answers[names[i]] = m.decodeLaya(it.q, logits, act)
 		result.Usage.InputTokens += len(it.ids)

@@ -84,7 +84,7 @@ func TestParakeetFeedForwardMatchesPerFrameReference(t *testing.T) {
 		layerNormInto(xs[i], normW, normB, 1e-5, &norm)
 		w1.MatvecInto(norm, &act)
 		for j, v := range act {
-			act[j] = swish(v)
+			act[j] = siluExact(v)
 		}
 		w2.MatvecInto(act, &proj)
 		for j, v := range proj {
@@ -122,6 +122,9 @@ func TestParakeetConvModuleMatchesPerFrameReference(t *testing.T) {
 		}
 	}
 	got := parakeetConvModule(xs, conv, normW, normB, dim, kernel, 1e-5)
+	if batchSlicesOverlap(got[0], xs[0]) {
+		t.Fatal("convolution result aliases its input")
+	}
 	for i := range xs {
 		depth := make([]float32, dim)
 		for c := range depth {
@@ -132,7 +135,7 @@ func TestParakeetConvModuleMatchesPerFrameReference(t *testing.T) {
 				}
 			}
 			norm := (depth[c] - conv.BatchNormMean[c]) / float32(math.Sqrt(float64(conv.BatchNormVar[c])+1e-5))
-			depth[c] = swish(norm*conv.BatchNormWeight[c] + conv.BatchNormBias[c])
+			depth[c] = siluExact(norm*conv.BatchNormWeight[c] + conv.BatchNormBias[c])
 		}
 		var proj []float32
 		conv.PointwiseConv2.MatvecInto(depth, &proj)
@@ -161,6 +164,9 @@ func TestParakeetRelativePositionScoresUseEachHead(t *testing.T) {
 	got, err := parakeetRelPosSelfAttention(xs, attn, []float32{1, 1, 1, 1}, nil, heads, headDim, pos, posLen, 1e-5)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if batchSlicesOverlap(got[0], xs[0]) {
+		t.Fatal("attention result aliases its input")
 	}
 	normed := make([][]float32, count)
 	for i := range xs {

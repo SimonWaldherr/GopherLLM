@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"slices"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 func ttsLoadWeights(ctx context.Context, file *SafetensorsFile, c ttsVITSConfig) (map[string]ttsWeight, error) {
@@ -113,10 +115,8 @@ func ttsLoadWeights(ctx context.Context, file *SafetensorsFile, c ttsVITSConfig)
 		if err != nil {
 			return ttsWeight{}, err
 		}
-		for _, v := range data {
-			if !ttsFinite(v) {
-				return ttsWeight{}, fmt.Errorf("tts: non-finite tensor %s", name)
-			}
+		if !numeric.AllFiniteF32(data) {
+			return ttsWeight{}, fmt.Errorf("tts: non-finite tensor %s", name)
 		}
 		return ttsWeight{data: data, shape: shape}, nil
 	}
@@ -156,12 +156,12 @@ func ttsLoadWeights(ctx context.Context, file *SafetensorsFile, c ttsVITSConfig)
 				return nil, fmt.Errorf("tts: zero weight norm in %s", name)
 			}
 			scale := g.data[row] / float32(math.Sqrt(sum))
-			if !ttsFinite(scale) {
+			if !finite32(scale) {
 				return nil, fmt.Errorf("tts: non-finite weight norm in %s", name)
 			}
 			for j := row * stride; j < (row+1)*stride; j++ {
 				v.data[j] *= scale
-				if !ttsFinite(v.data[j]) {
+				if !finite32(v.data[j]) {
 					return nil, fmt.Errorf("tts: non-finite normalized weight in %s", name)
 				}
 			}

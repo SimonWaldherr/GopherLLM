@@ -188,6 +188,6 @@ func (m *TTSModel) dds(ctx context.Context, p string, x ttsMatrix, conditioning 
 
 func ttsGELU(x []float32) {
 	for i, v := range x {
-		x[i] = .5 * v * (1 + float32(math.Erf(float64(v)/math.Sqrt2)))
+		x[i] = geluExact(v)
 	}
 }

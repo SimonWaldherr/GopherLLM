@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"image"
-	"io"
 	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // DiffusionOptions controls unconditional CIFAR-10 image sampling. The model
@@ -138,7 +140,7 @@ func (m *DiffusionModel) Generate(ctx context.Context, opts DiffusionOptions) (i
 	for p := range 32 * 32 {
 		for c := range 3 {
 			value := sample[c*32*32+p]
-			if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			if !finite32(value) {
 				return nil, errors.New("diffusion: model produced a non-finite sample")
 			}
 			out.Pix[p*4+c] = uint8(math.RoundToEven(float64(max(float32(0), min(float32(1), value/2+0.5))) * 255))
@@ -181,35 +183,9 @@ const diffusionSchedulerDefaults = `{
 }`
 
 func diffusionValidateJSON(path, requiredJSON, defaultsJSON string) error {
-	// Opening a named pipe can block before a descriptor exists to inspect.
-	// Reject special files first, then verify the descriptor as well in case
-	// the path changed between Stat and Open.
-	st, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("diffusion: %w", err)
-	}
-	if !st.Mode().IsRegular() || st.Size() > 64<<10 {
-		return fmt.Errorf("diffusion: invalid config file %s", filepath.Base(path))
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("diffusion: %w", err)
-	}
-	defer f.Close()
-	st, err = f.Stat()
-	if err != nil || !st.Mode().IsRegular() || st.Size() > 64<<10 {
-		return fmt.Errorf("diffusion: invalid config file %s", filepath.Base(path))
-	}
-	data, err := io.ReadAll(io.LimitReader(f, 64<<10+1))
-	if err != nil {
-		return fmt.Errorf("diffusion: reading %s: %w", filepath.Base(path), err)
-	}
-	if len(data) > 64<<10 {
-		return fmt.Errorf("diffusion: oversized config file %s", filepath.Base(path))
-	}
 	var got, required, defaults map[string]any
-	if err := json.Unmarshal(data, &got); err != nil {
-		return fmt.Errorf("diffusion: %s: %w", filepath.Base(path), err)
+	if err := readModelJSON(path, 64<<10, &got); err != nil {
+		return fmt.Errorf("diffusion: %w", err)
 	}
 	_ = json.Unmarshal([]byte(requiredJSON), &required)
 	_ = json.Unmarshal([]byte(defaultsJSON), &defaults)
@@ -247,7 +223,7 @@ func (l *diffusionLoader) tensor(name string, shape ...int) []float32 {
 		return nil
 	}
 	info, ok := l.file.Tensors[name]
-	if !ok || info.DType != SafetensorsF32 || !reflect.DeepEqual(info.Shape, shape) {
+	if !ok || info.DType != SafetensorsF32 || !slices.Equal(info.Shape, shape) {
 		l.err = fmt.Errorf("diffusion: tensor %s must be F32 with shape %v", name, shape)
 		return nil
 	}
@@ -266,11 +242,9 @@ func (l *diffusionLoader) tensor(name string, shape ...int) []float32 {
 		l.err = err
 		return nil
 	}
-	for _, value := range values {
-		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
-			l.err = fmt.Errorf("diffusion: non-finite weight in %s", name)
-			return nil
-		}
+	if !numeric.AllFiniteF32(values) {
+		l.err = fmt.Errorf("diffusion: non-finite weight in %s", name)
+		return nil
 	}
 	l.used[name] = true
 	return values

@@ -17,27 +17,7 @@ type layaBuffer struct {
 }
 
 func (b *layaBuffer) resize(n, d int, zero bool) [][]float32 {
-	if cap(b.data) < n*d {
-		// A narrower row count with wider rows can grow data while reusing
-		// the header array. Clear inactive headers as well, so none retains
-		// an older backing store outside the workspace's byte accounting.
-		clear(b.rows[:cap(b.rows)])
-		b.data = make([]float32, n*d)
-	} else {
-		b.data = b.data[:n*d]
-		if zero {
-			clear(b.data)
-		}
-	}
-	if cap(b.rows) < n {
-		b.rows = make([][]float32, n)
-	} else {
-		b.rows = b.rows[:n]
-	}
-	for i := range b.rows {
-		b.rows[i] = b.data[i*d : (i+1)*d]
-	}
-	return b.rows
+	return resizeMatrixRows(&b.data, &b.rows, n, d, zero)
 }
 
 type layaWorkspace struct {
@@ -204,14 +184,7 @@ func layaSoftmax(x []float32) {
 	for _, v := range x[1:] {
 		hi = max(hi, v)
 	}
-	sum := float64(0)
-	for i, v := range x {
-		x[i] = float32(math.Exp(float64(v - hi)))
-		sum += float64(x[i])
-	}
-	for i := range x {
-		x[i] /= float32(sum)
-	}
+	softmaxF64InPlace(x, hi)
 }
 
 // A request-local pool reuses one score row per active worker, retaining the

@@ -24,7 +24,7 @@ func referenceParakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, l
 	for i := range hidden {
 		row := hidden[i]
 		for j, v := range row {
-			row[j] = swish(v)
+			row[j] = siluExact(v)
 		}
 	}
 	outDim := weightRows(lin2, hiddenDim)

@@ -2,7 +2,6 @@ package gopherllm
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -90,11 +89,7 @@ func OpenLaya(ctx context.Context, dir string) (model *LayaModel, err error) {
 	}
 	m := &LayaModel{gate: make(chan struct{}, 1), cfg: layaConfig{HeadLayers: 2, MaxLen: 512, HeadMaxLen: 192}}
 	readJSON := func(path string, out any) error {
-		b, e := os.ReadFile(filepath.Join(dir, path))
-		if e != nil {
-			return e
-		}
-		return json.Unmarshal(b, out)
+		return readModelJSON(filepath.Join(dir, path), 1<<20, out)
 	}
 	if err = readJSON("rl_agent_config.json", &m.cfg); err != nil {
 		return nil, fmt.Errorf("laya config: %w", err)

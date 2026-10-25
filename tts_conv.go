@@ -11,6 +11,7 @@ const ttsConvTileFrames = 128
 // local to the call, so finishing a long utterance does not retain its buffers.
 type ttsConvScratch struct {
 	patch, projected, packedWeight []float32
+	gemm                           denseGemmScratch
 }
 
 func ttsConvInputValid(x ttsMatrix, w ttsWeight, bias []float32, transpose bool) (in, out, kernel int, err error) {
@@ -105,17 +106,10 @@ func ttsConv1DInto(ctx context.Context, x ttsMatrix, weight ttsWeight, bias []fl
 				input := x.data[(g*in+ic)*x.length : (g*in+ic+1)*x.length]
 				for k := range kernel {
 					row := p[(ic*kernel+k)*n : (ic*kernel+k+1)*n]
-					for j := range n {
-						at := start + j - padding + k*dilation
-						if at >= 0 && at < x.length {
-							row[j] = input[at]
-						} else {
-							row[j] = 0
-						}
-					}
+					copyPaddedWindow(row, input, start-padding+k*dilation)
 				}
 			}
-			if err := ttsGemmNN(ctx, rows, n, cols, weights, p, projected[:rows*n]); err != nil {
+			if err := scratch.gemm.multiply(ctx, rows, n, cols, weights, p, projected[:rows*n]); err != nil {
 				return ttsMatrix{}, err
 			}
 			for oc := range rows {
@@ -191,7 +185,7 @@ func ttsConvTranspose1DInto(ctx context.Context, x ttsMatrix, weight ttsWeight, 
 			for ic := range in {
 				copy(input[ic*n:(ic+1)*n], x.data[ic*x.length+start:ic*x.length+start+n])
 			}
-			if err := ttsGemmNN(ctx, out, n, in, packedWeight, input[:in*n], projected[:out*n]); err != nil {
+			if err := scratch.gemm.multiply(ctx, out, n, in, packedWeight, input[:in*n], projected[:out*n]); err != nil {
 				return ttsMatrix{}, err
 			}
 			for oc := range out {
@@ -212,26 +206,4 @@ func ttsConvTranspose1DInto(ctx context.Context, x ttsMatrix, weight ttsWeight, 
 		}
 	}
 	return y, ctx.Err()
-}
-
-func ttsGemmNN(ctx context.Context, m, n, k int, a, b, out []float32) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if blasGemmNN(m, n, k, a, b, out) {
-		return ctx.Err()
-	}
-	clear(out)
-	parallelRows(m, func(start, end int) {
-		for row := start; row < end; row++ {
-			if ctx.Err() != nil {
-				return
-			}
-			dst := out[row*n : (row+1)*n]
-			for col := range k {
-				AxpyF32(dst, a[row*k+col], b[col*n:(col+1)*n])
-			}
-		}
-	})
-	return ctx.Err()
 }

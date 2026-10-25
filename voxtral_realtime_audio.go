@@ -315,18 +315,7 @@ type voxtralAudioMatrix struct {
 }
 
 func (b *voxtralAudioMatrix) resize(rows, cols int) [][]float32 {
-	if cap(b.data) < rows*cols {
-		// Reused inactive headers must not keep a replaced slab alive.
-		clear(b.rows[:cap(b.rows)])
-	}
-	ensureLenNoClear(&b.rows, rows)
-	ensureLenNoClear(&b.data, rows*cols)
-	for i := range b.rows {
-		// Preserve the remaining backing capacity so Accelerate can recognize
-		// this as one contiguous matrix without packing it again.
-		b.rows[i] = b.data[i*cols : (i+1)*cols]
-	}
-	return b.rows
+	return resizeMatrixRows(&b.data, &b.rows, rows, cols, false)
 }
 
 // growVoxtralHeadBuffer enlarges a per-layer head-major K/V buffer from

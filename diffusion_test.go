@@ -81,6 +81,23 @@ func TestDiffusionValidatesTensorBeforeAllocation(t *testing.T) {
 	}
 }
 
+func TestDiffusionRejectsNonFiniteTensorTails(t *testing.T) {
+	// Exercise both the vector body and scalar tail of the shared finite scan.
+	const count = 33
+	data := make([]byte, count*4)
+	for _, position := range []int{0, 15, 16, 31, 32} {
+		for _, bits := range []uint32{0x7f800000, 0xff800000, 0x7fc00001} {
+			clear(data)
+			binary.LittleEndian.PutUint32(data[position*4:], bits)
+			loader := diffusionLoader{ctx: context.Background(), file: &SafetensorsFile{
+				Tensors: map[string]SafetensorsTensorInfo{"weight": {DType: SafetensorsF32, Shape: []int{count}, Numel: count, End: len(data)}}, Data: data}, used: make(map[string]bool)}
+			if got := loader.tensor("weight", count); got != nil || loader.err == nil || loader.used["weight"] {
+				t.Fatalf("non-finite value accepted at %d (%08x)", position, bits)
+			}
+		}
+	}
+}
+
 func TestDiffusionDownsamplePadding(t *testing.T) {
 	x := diffusionTensor{c: 1, h: 4, w: 4, data: make([]float32, 16)}
 	for i := range x.data {

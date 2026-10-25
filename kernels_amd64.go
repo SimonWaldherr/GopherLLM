@@ -338,7 +338,7 @@ func argmaxQ6KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 			// Rows are scanned ascending, so a strict > keeps the lowest token
 			// id on ties, matching argmaxMatvecRows and argmaxFiniteToken.
 			v := q6kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = r, v, true
 			}
 		}
@@ -376,7 +376,7 @@ func argmaxQ4KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 		localFound := false
 		for r := start; r < end; r++ {
 			v := q4kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = r, v, true
 			}
 		}
@@ -412,7 +412,7 @@ func argmaxQ5KRowsQ8(data []byte, x, xsums []float32, rows, cols, rowBytes int) 
 		localFound := false
 		for r := start; r < end; r++ {
 			v := q5kDotQ8KRow(&data[r*rowBytes], q8p, xscp, xsumsp, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = r, v, true
 			}
 		}
@@ -448,7 +448,7 @@ func argmaxQ8_0RowsQ8(data []byte, x []float32, rows, cols, rowBytes int) (uint3
 		localFound := false
 		for r := start; r < end; r++ {
 			v := q8_0DotQ8KRow(&data[r*rowBytes], q8p, xscp, blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = r, v, true
 			}
 		}

@@ -32,6 +32,28 @@ func layaWorkspaceTestModel(t testing.TB) *LayaModel {
 	return m
 }
 
+func TestLayaPredictRejectsNonFiniteOutputs(t *testing.T) {
+	for _, target := range []string{"scorer", "action"} {
+		t.Run(target, func(t *testing.T) {
+			m := layaWorkspaceTestModel(t)
+			bias := m.score2.bias
+			if target == "action" {
+				bias = m.act2.bias
+			}
+			bias[0] = float32(math.NaN())
+			_, err := m.Predict(context.Background(), DecisionRequest{
+				State: "Please refund my payment.",
+				Questions: map[string]DecisionQuestion{
+					"route": {Type: "choice", Criteria: []string{"billing", "technical"}},
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "non-finite") {
+				t.Fatalf("non-finite %s output was accepted: %v", target, err)
+			}
+		})
+	}
+}
+
 func BenchmarkLayaPredictRequests(b *testing.B) {
 	for _, shape := range []struct {
 		name      string

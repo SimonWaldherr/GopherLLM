@@ -34,10 +34,6 @@ import (
 // use DotF32/AxpyF32 (this codebase's SIMD kernels) instead of scalar Go
 // loops over headDim.
 
-func swish(x float32) float32 {
-	return x / (1 + float32(math.Exp(float64(-x))))
-}
-
 // weightRows returns a Weight's output row count for a matvec over an input
 // of length cols. Rows/Cols are only populated on raw (quantized or lazy
 // scalar) weights; an owned F32 weight -- which is what every Parakeet
@@ -78,7 +74,7 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 		for i := start; i < end; i++ {
 			row := hidden[i]
 			for j, v := range row {
-				row[j] = swish(v)
+				row[j] = siluExact(v)
 			}
 		}
 	}
@@ -110,9 +106,8 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 // the FFN's linear layers do.
 func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, normB []float32, dModel, kernel int, eps float32) [][]float32 {
 	t := len(xs)
-	out := make([][]float32, t)
 	if t == 0 {
-		return out
+		return [][]float32{}
 	}
 	normed := audioMatrixRows(t, dModel)
 	for i := range xs {
@@ -167,7 +162,7 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 		row := dwOut[i]
 		for c := range row {
 			normed := (row[c] - conv.BatchNormMean[c]) / std[c]
-			row[c] = swish(normed*conv.BatchNormWeight[c] + conv.BatchNormBias[c])
+			row[c] = siluExact(normed*conv.BatchNormWeight[c] + conv.BatchNormBias[c])
 		}
 	}
 
@@ -175,15 +170,14 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 	proj := audioMatrixRows(t, projDim)
 	blasMatvecBatch(conv.PointwiseConv2, dwOut, proj)
 
-	for i := range out {
+	for i := range proj {
 		row := proj[i][:dModel]
-		pi := proj[i]
 		for c := range row {
-			row[c] = xs[i][c] + pi[c]
+			row[c] = xs[i][c] + row[c]
 		}
-		out[i] = row
+		proj[i] = row
 	}
-	return out
+	return proj
 }
 
 // parakeetRelPosSelfAttention runs one Conformer block's relative-position
@@ -200,9 +194,8 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 		return nil, fmt.Errorf("parakeet attention: sequence length %d exceeds the positional encoding table's range (max relative position %d)", t, center)
 	}
 	dModel := nHeads * headDim
-	result := make([][]float32, t)
 	if t == 0 {
-		return result, nil
+		return [][]float32{}, nil
 	}
 
 	normed := audioMatrixRows(t, len(xs[0]))
@@ -283,15 +276,12 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 
 	proj := audioMatrixRows(t, dModel)
 	blasMatvecBatch(attn.LinearOut, out, proj)
-	for i := range result {
-		row := proj[i]
-		pi := proj[i]
+	for i, row := range proj {
 		for c := range row {
-			row[c] = xs[i][c] + pi[c]
+			row[c] = xs[i][c] + row[c]
 		}
-		result[i] = row
 	}
-	return result, nil
+	return proj, nil
 }
 
 // ParakeetEncode runs the full FastConformer encoder: the mel frontend,

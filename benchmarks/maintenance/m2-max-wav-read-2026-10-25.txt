@@ -1,0 +1,18 @@
+goos: darwin
+goarch: arm64
+pkg: github.com/SimonWaldherr/GopherLLM/internal/wav
+cpu: Apple M2 Max
+BenchmarkReadMono/16bit/whole_chunk-2         	      85	   2886920 ns/op	 332.53 MB/s	 2891780 B/op	       2 allocs/op
+BenchmarkReadMono/16bit/whole_chunk-2         	     188	   1375553 ns/op	 697.90 MB/s	 2891806 B/op	       2 allocs/op
+BenchmarkReadMono/16bit/whole_chunk-2         	     100	   3349749 ns/op	 286.59 MB/s	 2891776 B/op	       2 allocs/op
+BenchmarkReadMono/16bit/bounded-2             	     100	   3080667 ns/op	 311.62 MB/s	 1957888 B/op	       2 allocs/op
+BenchmarkReadMono/16bit/bounded-2             	     100	   2570554 ns/op	 373.46 MB/s	 1957888 B/op	       2 allocs/op
+BenchmarkReadMono/16bit/bounded-2             	     212	   1021422 ns/op	 939.87 MB/s	 1957889 B/op	       2 allocs/op
+BenchmarkReadMono/32bit/whole_chunk-2         	     273	    842345 ns/op	2279.35 MB/s	 3850240 B/op	       2 allocs/op
+BenchmarkReadMono/32bit/whole_chunk-2         	     273	    999849 ns/op	1920.29 MB/s	 3850240 B/op	       2 allocs/op
+BenchmarkReadMono/32bit/whole_chunk-2         	     223	    921060 ns/op	2084.55 MB/s	 3850240 B/op	       2 allocs/op
+BenchmarkReadMono/32bit/bounded-2             	     312	    897912 ns/op	2138.29 MB/s	 1957888 B/op	       2 allocs/op
+BenchmarkReadMono/32bit/bounded-2             	     218	   1469815 ns/op	1306.29 MB/s	 1957888 B/op	       2 allocs/op
+BenchmarkReadMono/32bit/bounded-2             	     142	   1616707 ns/op	1187.60 MB/s	 1957888 B/op	       2 allocs/op
+PASS
+ok  	github.com/SimonWaldherr/GopherLLM/internal/wav	3.344s

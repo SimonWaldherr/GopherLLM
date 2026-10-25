@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/SimonWaldherr/GopherLLM/internal/formats/safetensors"
+	"github.com/SimonWaldherr/GopherLLM/internal/numeric"
 )
 
 // This file is a native executor for Ultralytics YOLO detection networks, so
@@ -689,7 +690,7 @@ func (m *YOLOModel) decodeLevel(box, cls yoloTensor, stride int, out []float32, 
 					}
 					var sum, expect float32
 					for j, v := range bins {
-						e := yoloFastExp(v - largest)
+						e := numeric.ExpF32(v - largest)
 						sum += e
 						expect += e * float32(j)
 					}
@@ -703,7 +704,7 @@ func (m *YOLOModel) decodeLevel(box, cls yoloTensor, stride int, out []float32, 
 				out[2*anchors+a] = (x2 - x1) * s
 				out[3*anchors+a] = (y2 - y1) * s
 				for c := range m.NumClasses {
-					out[(4+c)*anchors+a] = yoloFastSigmoid(cls.data[c*plane+p])
+					out[(4+c)*anchors+a] = numeric.SigmoidF32(cls.data[c*plane+p])
 				}
 			}
 		}

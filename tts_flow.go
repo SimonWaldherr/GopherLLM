@@ -76,7 +76,7 @@ func (m *TTSModel) duration(ctx context.Context, hidden ttsMatrix, noise []float
 // [-bound,bound]. Parameters follow the MMS/nflows minimum-bin conventions.
 func ttsInverseSpline(value float32, widthLogits, heightLogits, derivativeLogits []float32, bound float32) (float32, error) {
 	n := len(widthLogits)
-	if n < 2 || n > 64 || len(heightLogits) != n || len(derivativeLogits) != n-1 || !ttsFinite(value) || !ttsFinite(bound) || bound <= 0 {
+	if n < 2 || n > 64 || len(heightLogits) != n || len(derivativeLogits) != n-1 || !finite32(value) || !finite32(bound) || bound <= 0 {
 		return 0, fmt.Errorf("tts: invalid spline input")
 	}
 	if value < -bound || value > bound {
@@ -85,7 +85,7 @@ func ttsInverseSpline(value float32, widthLogits, heightLogits, derivativeLogits
 	widths, heights := append([]float32(nil), widthLogits...), append([]float32(nil), heightLogits...)
 	for _, a := range [][]float32{widths, heights, derivativeLogits} {
 		for _, v := range a {
-			if !ttsFinite(v) {
+			if !finite32(v) {
 				return 0, fmt.Errorf("tts: non-finite spline parameter")
 			}
 		}
@@ -125,7 +125,7 @@ func ttsInverseSpline(value float32, widthLogits, heightLogits, derivativeLogits
 	b := h*d0 - u*common
 	c := -delta * u
 	discriminant := b*b - 4*a*c
-	if discriminant < 0 || !ttsFinite(discriminant) {
+	if discriminant < 0 || !finite32(discriminant) {
 		return 0, fmt.Errorf("tts: invalid inverse spline discriminant")
 	}
 	denominator := -b - float32(math.Sqrt(float64(discriminant)))
@@ -134,7 +134,7 @@ func ttsInverseSpline(value float32, widthLogits, heightLogits, derivativeLogits
 	}
 	root := 2 * c / denominator
 	out := root*w + cw[bin]
-	if !ttsFinite(out) {
+	if !finite32(out) {
 		return 0, fmt.Errorf("tts: non-finite inverse spline output")
 	}
 	return out, nil

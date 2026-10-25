@@ -539,28 +539,28 @@ func (t *argmaxQ8Task) runRows(start, end int) {
 	case GGMLTypeQ6_K:
 		for row := start; row < end; row++ {
 			v := q6kDotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.xsums, t.blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = row, v, true
 			}
 		}
 	case GGMLTypeQ4_K:
 		for row := start; row < end; row++ {
 			v := q4kDotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.xsums, t.blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = row, v, true
 			}
 		}
 	case GGMLTypeQ5_K:
 		for row := start; row < end; row++ {
 			v := q5kDotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.xsums, t.blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = row, v, true
 			}
 		}
 	case GGMLTypeQ8_0:
 		for row := start; row < end; row++ {
 			v := q8_0DotQ8KRow(t.data[row*t.rowBytes:], t.q8, t.xsc, t.blocks)
-			if finiteLogit(v) && (!localFound || v > localValue) {
+			if finite32(v) && (!localFound || v > localValue) {
 				localToken, localValue, localFound = row, v, true
 			}
 		}
