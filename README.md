@@ -69,6 +69,7 @@ and optionally runs Ministral for task suggestions and row explanations.
 - [Classify a CSV with Laya](#classify-a-csv-with-laya)
 - [Features](#features)
 - [Native Laya classification](docs/laya.md)
+- [Native speech and image generation](docs/generation.md)
 - [Requirements](#requirements)
 - [Dependency policy and layout](#dependency-policy-and-layout)
 - [Quickstart](#quickstart)
@@ -120,11 +121,16 @@ and optionally runs Ministral for task suggestions and row explanations.
 - Native YOLOv8 and YOLO11 object detection from safetensors or Ultralytics
   `.pt` files, without an ONNX, PyTorch or Python runtime (see
   [Object detection (YOLO)](#object-detection-yolo)).
+- Native German MMS/VITS speech synthesis to WAV and unconditional CIFAR-10
+  diffusion to 32×32 PNG, with local Safetensors weights. These first Go/CLI
+  paths do not yet provide text-to-image or video generation
+  ([setup, limitations and examples](docs/generation.md)).
 
 ## Requirements
 
 - Go 1.25 or newer.
-- A GGUF text model. By default the tool scans:
+- A GGUF model for text generation; other modalities use the checkpoints
+  described in their guides. By default the text-model tool scans:
 
 ```sh
 ~/.cache/lm-studio/models

@@ -30,6 +30,7 @@ own lives in a subpackage, and implementation details below `internal/`.
 | `internal/testmodel/`, `internal/yolotest/` | Deterministic fixtures written on demand, so no binary model is checked in |
 | `integration/` | Black-box tests of the public module, consumer-module and opt-in local-model tests |
 | `testdata/` | Small fixtures and the external-consumer module |
+| `tts_*.go`, `audio_wave.go`, `diffusion_*.go` | Native MMS/VITS speech synthesis, PCM/WAV output and unconditional CIFAR-10 image diffusion; standalone commands in `cmd/tts-synthesize` and `cmd/image-generate` |
 | `scripts/` | Build and test scripts for the bindings (C ABI, XCFramework) and fixture generators |
 | `docs/` | Guides and the GitHub Pages site |
 

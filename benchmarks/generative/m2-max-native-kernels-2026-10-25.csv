@@ -1,0 +1,17 @@
+trial,variant,benchmark,iterations,ns_per_op,bytes_per_op,allocations_per_op,audio_seconds_per_op,realtime_multiple
+1,before,BenchmarkDiffusionCIFARStep-8,3,105044667,0,0,,
+1,before,BenchmarkTTSSynthesize-8,3,383955292,286932146,1745,1.232,3.209
+2,after,BenchmarkDiffusionCIFARStep-8,3,79714681,0,0,,
+2,after,BenchmarkTTSSynthesize-8,3,376334111,42338941,1474,1.232,3.274
+3,after,BenchmarkDiffusionCIFARStep-8,3,78755181,0,0,,
+3,after,BenchmarkTTSSynthesize-8,3,374179833,42338584,1470,1.232,3.293
+4,before,BenchmarkDiffusionCIFARStep-8,3,108884972,0,0,,
+4,before,BenchmarkTTSSynthesize-8,3,378149528,286932392,1744,1.232,3.258
+5,before,BenchmarkDiffusionCIFARStep-8,3,106975847,0,0,,
+5,before,BenchmarkTTSSynthesize-8,3,364244208,286931805,1741,1.232,3.382
+6,after,BenchmarkDiffusionCIFARStep-8,3,76167333,0,0,,
+6,after,BenchmarkTTSSynthesize-8,3,369671792,42338626,1471,1.232,3.333
+7,after,BenchmarkDiffusionCIFARStep-8,3,79331055,0,0,,
+7,after,BenchmarkTTSSynthesize-8,3,357227667,42338802,1472,1.232,3.449
+8,before,BenchmarkDiffusionCIFARStep-8,3,106667806,0,0,,
+8,before,BenchmarkTTSSynthesize-8,3,368737736,286932130,1744,1.232,3.341
