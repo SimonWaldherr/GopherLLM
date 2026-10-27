@@ -65,3 +65,32 @@ func copyPaddedWindow(dst, src []float32, start int) {
 	n := copy(dst, src[start:])
 	clear(dst[n:])
 }
+
+// Copy a window from [src[0], src[0], src[1], src[1], ...], with zero padding.
+// Only the requested patch is materialized. Inputs must not overlap.
+func copyPaddedRepeat2(dst, src []float32, start int) {
+	if start >= 2*len(src) || start <= -len(dst) {
+		clear(dst)
+		return
+	}
+	if start < 0 {
+		clear(dst[:-start])
+		dst = dst[-start:]
+		start = 0
+	}
+	n := min(len(dst), 2*len(src)-start)
+	clear(dst[n:])
+	dst = dst[:n]
+	if start&1 != 0 && len(dst) > 0 {
+		dst[0] = src[start/2]
+		dst = dst[1:]
+		start++
+	}
+	src = src[start/2:]
+	for i := 0; i < len(dst)/2; i++ {
+		dst[2*i], dst[2*i+1] = src[i], src[i]
+	}
+	if len(dst)&1 != 0 {
+		dst[len(dst)-1] = src[len(dst)/2]
+	}
+}

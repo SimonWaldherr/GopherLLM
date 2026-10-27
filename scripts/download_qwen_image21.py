@@ -36,7 +36,7 @@ _redirects = {}
 _redirect_lock = threading.Lock()
 
 
-def fetch(url, start=None, length=None):
+def fetch(url, start=None, length=None, *, token=None):
     """Require exact ranges; never accidentally consume a full large file."""
     headers = {"User-Agent": "GopherLLM-QwenImage21"}
     if start is not None:
@@ -58,9 +58,13 @@ def fetch(url, start=None, length=None):
                 "&" if "?" in request_url else "?"
             ) + f"range={start}-{start + length - 1}"
         try:
-            with urllib.request.urlopen(
-                urllib.request.Request(request_url, headers=headers), timeout=90
-            ) as response:
+            request = urllib.request.Request(request_url, headers=headers)
+            parsed = urllib.parse.urlsplit(request_url)
+            if token and parsed.scheme == "https" and parsed.hostname == "huggingface.co":
+                # Credentials belong only to the Hub origin. urllib omits
+                # unredirected headers when following signed CDN redirects.
+                request.add_unredirected_header("Authorization", "Bearer " + token)
+            with urllib.request.urlopen(request, timeout=90) as response:
                 if start is not None:
                     bounds = re.fullmatch(
                         r"bytes (\d+)-(\d+)/(\d+)",
@@ -142,17 +146,18 @@ def needed(component, name):
     )
 
 
-def range_chunks(url, begin, end, workers=4):
+def range_chunks(url, begin, end, workers=4, *, fetcher=None):
     """Prefetch a bounded number of ranges and consume them in file order."""
     if begin < 0 or end < begin or CHUNK <= 0 or not 1 <= workers <= 16:
         raise ValueError("invalid source span")
+    fetcher = fetcher or fetch
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = deque()
         position = begin
         while position < end or pending:
             while position < end and len(pending) < workers:
                 count = min(CHUNK, end - position)
-                pending.append(pool.submit(fetch, url, position, count))
+                pending.append(pool.submit(fetcher, url, position, count))
                 position += count
             yield pending.popleft().result()
 
@@ -200,9 +205,9 @@ class RangeReader:
             count -= size
 
 
-def gguf_header(plan, url, revision):
+def gguf_header(plan, url, revision, architecture="qwen_image21_component"):
     metadata = {
-        "general.architecture": "qwen_image21_component",
+        "general.architecture": architecture,
         "general.source.url": url,
         "general.source.revision": revision,
     }
@@ -263,14 +268,17 @@ def verify_existing(destination, header, expected_size):
         raise ValueError(f"existing shard checksum mismatch: {destination}")
 
 
-def import_shard(url, destination, component, revision, workers=4):
-    header_size = struct.unpack("<Q", fetch(url, 0, 8))[0]
+def import_shard(url, destination, component, revision, workers=4, *,
+                 include=None, architecture="qwen_image21_component", fetcher=None):
+    fetcher = fetcher or fetch
+    include = include or (lambda name: needed(component, name))
+    header_size = struct.unpack("<Q", fetcher(url, 0, 8))[0]
     if not 0 < header_size <= 16 << 20:
         raise ValueError("invalid safetensors header length")
-    source = json.loads(fetch(url, 8, header_size))
+    source = json.loads(fetcher(url, 8, header_size))
     plan, offset = [], 0
     for name, tensor in sorted(source.items()):
-        if name == "__metadata__" or not needed(component, name):
+        if name == "__metadata__" or not include(name):
             continue
         shape, dtype = tensor["shape"], tensor["dtype"]
         if (
@@ -297,7 +305,7 @@ def import_shard(url, destination, component, revision, workers=4):
     if not plan:
         return []
     names = [item[0] for item in plan]
-    header = gguf_header(plan, url, revision)
+    header = gguf_header(plan, url, revision, architecture)
     if destination.exists():
         verify_existing(destination, header, len(header) + offset)
         print(f"verified {destination.name}", flush=True)
@@ -318,7 +326,7 @@ def import_shard(url, destination, component, revision, workers=4):
         for span in tensor_spans(plan[completed:]):
             first = 8 + header_size + span[0][1]["data_offsets"][0]
             last = 8 + header_size + span[-1][1]["data_offsets"][1]
-            with closing(range_chunks(url, first, last, workers)) as ranges:
+            with closing(range_chunks(url, first, last, workers, fetcher=fetcher)) as ranges:
                 reader = RangeReader(ranges)
                 for name, tensor, begin, size, quantize in span:
                     padding = b"\0" * (begin - position)

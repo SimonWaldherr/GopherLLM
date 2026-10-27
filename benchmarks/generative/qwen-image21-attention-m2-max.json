@@ -1,0 +1,80 @@
+{
+  "date": "2026-10-26",
+  "hardware": "Apple M2 Max, 32 GiB RAM",
+  "go": "1.25.3",
+  "repository_base": "6f7a9e9",
+  "change": "Uncommitted batched prefix/image attention using Accelerate; no Q8 decoder or page-prefault changes.",
+  "checkpoint_revision": "fc13ba1986fcb905854dc8de2f52eee395f49b5b",
+  "prompt": "A red ceramic teapot on a pale blue table, studio photograph.",
+  "size": "256x256",
+  "steps": 8,
+  "seed": 42,
+  "guidance": 1,
+  "model_threads": 8,
+  "model_gomaxprocs": 8,
+  "method": "Fresh CLI processes in ABBA order, /usr/bin/time -l includes load and PNG output. Background workload and paging were not controlled. These runs do not establish a wall-time speedup.",
+  "runs": [
+    {
+      "variant": "1-before",
+      "wall_seconds": 120.29,
+      "user_seconds": 157.8,
+      "system_seconds": 60.64,
+      "png_sha256": "96b7384ba2ea940eba8abd1d61ad94e0a270d76c7d82456160dbc5e4283203c5",
+      "maximum_rss_bytes": 8748154880,
+      "peak_memory_footprint_bytes": 2221454224,
+      "page_faults": 2553401
+    },
+    {
+      "variant": "2-after",
+      "wall_seconds": 110.6,
+      "user_seconds": 127.74,
+      "system_seconds": 61.2,
+      "png_sha256": "01eb62d12a4ed2f60a44792f8902c5a72dcecf082b8213eb8a96cdfddaf3d87c",
+      "maximum_rss_bytes": 8070922240,
+      "peak_memory_footprint_bytes": 2197549968,
+      "page_faults": 2570464
+    },
+    {
+      "variant": "3-after",
+      "wall_seconds": 150.54,
+      "user_seconds": 132.2,
+      "system_seconds": 103.24,
+      "png_sha256": "01eb62d12a4ed2f60a44792f8902c5a72dcecf082b8213eb8a96cdfddaf3d87c",
+      "maximum_rss_bytes": 7763853312,
+      "peak_memory_footprint_bytes": 2289005576,
+      "page_faults": 4158042
+    },
+    {
+      "variant": "4-before",
+      "wall_seconds": 137.47,
+      "user_seconds": 161.99,
+      "system_seconds": 69.92,
+      "png_sha256": "96b7384ba2ea940eba8abd1d61ad94e0a270d76c7d82456160dbc5e4283203c5",
+      "maximum_rss_bytes": 8638414848,
+      "peak_memory_footprint_bytes": 2321118240,
+      "page_faults": 3094802
+    }
+  ],
+  "image_comparison": {
+    "channels_differing": 54,
+    "channels": 262144,
+    "maximum_channel_error": 1,
+    "mean_channel_error": 0.00020599365234375
+  },
+  "attention_microbenchmark": {
+    "gomaxprocs": 12,
+    "iterations": 10,
+    "repeats": 3,
+    "raw_output": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM\ncpu: Apple M2 Max\nBenchmarkQwenImage21Attention/cached=false/batched=false-12         \t      10\t  19923142 ns/op\t    1794 B/op\t       2 allocs/op\nBenchmarkQwenImage21Attention/cached=false/batched=false-12         \t      10\t  24164721 ns/op\t    3443 B/op\t       2 allocs/op\nBenchmarkQwenImage21Attention/cached=false/batched=false-12         \t      10\t  18857879 ns/op\t    1767 B/op\t       1 allocs/op\nBenchmarkQwenImage21Attention/cached=false/batched=true-12          \t      10\t   1976742 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkQwenImage21Attention/cached=false/batched=true-12          \t      10\t   2443829 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkQwenImage21Attention/cached=false/batched=true-12          \t      10\t   3685842 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkQwenImage21Attention/cached=true/batched=false-12          \t      10\t  21732817 ns/op\t    1741 B/op\t       1 allocs/op\nBenchmarkQwenImage21Attention/cached=true/batched=false-12          \t      10\t  29645150 ns/op\t      91 B/op\t       1 allocs/op\nBenchmarkQwenImage21Attention/cached=true/batched=false-12          \t      10\t  30695475 ns/op\t    3444 B/op\t       2 allocs/op\nBenchmarkQwenImage21Attention/cached=true/batched=true-12           \t      10\t   2021892 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkQwenImage21Attention/cached=true/batched=true-12           \t      10\t   2120083 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkQwenImage21Attention/cached=true/batched=true-12           \t      10\t   2036871 ns/op\t       0 B/op\t       0 allocs/op\nPASS\nok  \tgithub.com/SimonWaldherr/GopherLLM\t2.732s\n"
+  },
+  "web_ui_smoke_test": {
+    "size": "256x256",
+    "steps": 8,
+    "seed": 42,
+    "browser_reported_seconds": 172.2,
+    "output_sha256": "01eb62d12a4ed2f60a44792f8902c5a72dcecf082b8213eb8a96cdfddaf3d87c",
+    "cancellation": "Second generation aborted in browser; subsequent request admitted; server CPU returned to zero.",
+    "system_swap_used_mib_during_run": 27764.12,
+    "note": "Functional test, not a controlled timing comparison."
+  }
+}

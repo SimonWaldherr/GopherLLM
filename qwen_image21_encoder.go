@@ -23,6 +23,12 @@ type qi21TextEncoder struct {
 }
 
 func newQI21TextEncoder(configJSON, tokenizerJSON []byte, source qi21WeightSource) (*qi21TextEncoder, error) {
+	return newQwenVLTextEncoder(configJSON, tokenizerJSON, source, 0)
+}
+
+// layerLimit permits image models that consume intermediate hidden states to
+// omit the unused tail. Zero loads all layers, as required by Qwen-Image-2.1.
+func newQwenVLTextEncoder(configJSON, tokenizerJSON []byte, source qi21WeightSource, layerLimit int) (*qi21TextEncoder, error) {
 	var raw struct {
 		ModelType string `json:"model_type"`
 		Text      struct {
@@ -56,6 +62,12 @@ func newQI21TextEncoder(configJSON, tokenizerJSON []byte, source qi21WeightSourc
 	}
 	if c.Dim < 1 || c.Dim > 16384 || c.Hidden < 1 || c.Hidden > 131072 || c.Layers < 1 || c.Layers > 128 || c.Heads < 1 || c.Heads > 256 || c.KVHeads < 1 || c.Heads%c.KVHeads != 0 || c.HeadDim < 2 || c.HeadDim > 256 || c.HeadDim%2 != 0 || c.Vocab < 256 || c.Vocab > 1<<20 || c.MaxPositions < 1 || !finite32(c.Epsilon) || c.Epsilon <= 0 || !finite32(c.Theta) || c.Theta <= 0 {
 		return nil, fmt.Errorf("qwen image encoder: invalid or oversized text dimensions")
+	}
+	if layerLimit < 0 || layerLimit > c.Layers {
+		return nil, fmt.Errorf("qwen image encoder: invalid layer limit")
+	}
+	if layerLimit > 0 {
+		c.Layers = layerLimit
 	}
 	tok, err := tokenizerpkg.NewQwenImageTokenizer(tokenizerJSON)
 	if err != nil {

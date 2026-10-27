@@ -18,7 +18,7 @@ type HandlerOptions struct {
 	DecisionModel *gopherllm.LayaModel
 	// DecisionModelID is the optional public identifier accepted in requests.
 	DecisionModelID string
-	// RequestTimeout bounds each inference request; default two minutes.
+	// RequestTimeout bounds inference requests; default two minutes (images: ten minutes).
 	RequestTimeout time.Duration
 	// ObserveRequest is called once per HTTP request, including admission errors.
 	// It must be concurrency-safe and return promptly. It receives no payloads.
@@ -64,6 +64,9 @@ type HandlerOptions struct {
 	ModelDir string
 	// ModelPath is the initially loaded model's path (reported by /models).
 	ModelPath string
+	// ImageModelDir enables native Qwen/FLUX image generation from this local
+	// model directory. Requests cannot select paths or download weights.
+	ImageModelDir string
 	// WasmDir, if it contains both gopherllm.wasm and wasm_exec.js (see
 	// `make wasm-build`), enables the chat UI's "run locally in this
 	// browser tab" mode: those two files are served at /wasm/gopherllm.wasm
@@ -174,6 +177,7 @@ type ServeOptions struct {
 	ChatHistoryPath          string
 	ChatHistoryLock          *sync.Mutex
 	ModelDir                 string
+	ImageModelDir            string
 	ModelPath                string
 	// WasmDir is forwarded to HandlerOptions.WasmDir.
 	WasmDir          string

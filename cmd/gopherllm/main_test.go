@@ -439,3 +439,18 @@ func TestMinimalAndJSONCLI(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCLIImageServer(t *testing.T) {
+	cfg, err := parseCLI([]string{"--serve", "127.0.0.1:8080", "--chat", "--image-model-dir", "/models/qwen-image"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.imageModelDir != "/models/qwen-image" || !cfg.chatUI || cfg.modelSelector != nil {
+		t.Fatalf("image server configuration: %+v", cfg)
+	}
+	for _, args := range [][]string{{"--image-model-dir", "x"}, {"--serve", "--deployment", "browser", "--image-model-dir", "x"}, {"--serve", "--minimal", "--image-model-dir", "x"}} {
+		if _, err := parseCLI(args); err == nil {
+			t.Fatalf("accepted %v", args)
+		}
+	}
+}

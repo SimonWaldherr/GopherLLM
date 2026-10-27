@@ -195,3 +195,29 @@ func TestManagedDeploymentConfigKeepsTokenOutOfPrintedConfig(t *testing.T) {
 		t.Fatalf("effective config lost safe managed deployment settings: %s", printed)
 	}
 }
+
+func TestImageModelConfigOverrideAndExport(t *testing.T) {
+	path := writeTestConfig(t, `{"version":1,"server":{"address":"127.0.0.1:8080","image_model_dir":"/models/image"}}`)
+	cfg, err := parseCLI([]string{"--config", path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.imageModelDir != "/models/image" {
+		t.Fatal("image model config missing")
+	}
+	cfg, err = parseCLI([]string{"--config", path, "--image-model-dir", "/models/turbo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err = writeEffectiveConfig(&output, cfg); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := parseCLI([]string{"--config", writeTestConfig(t, output.String())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.imageModelDir != "/models/turbo" {
+		t.Fatal("image model config override lost on export")
+	}
+}

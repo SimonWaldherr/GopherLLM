@@ -233,7 +233,8 @@ type chatTemplateData struct {
 	// HasLocalRuntime reports whether this server was started with a valid
 	// WasmDir (see HandlerOptions.WasmDir) — the page only offers the
 	// "run locally in this browser tab" inference-mode toggle when true.
-	HasLocalRuntime bool
+	HasLocalRuntime    bool
+	HasImageGeneration bool
 	// Features is the space-separated list of optional capabilities this
 	// server actually backs (see Features.EnabledNames). The page removes the
 	// panels for everything absent from it, so the UI a beginner opens is the
@@ -322,6 +323,7 @@ func registerChatUIRoutes(mux *http.ServeMux, state *runnerState, opts HandlerOp
 			AdminRequired:   deployment.mode.adminRequired(),
 			AdminAuthorized: deployment.adminAuthorized(req),
 		}
+		data.HasImageGeneration = opts.ImageModelDir != "" && !deployment.mode.browserOnly()
 		if cdn, ok := mermaidCDNs[mermaid]; ok {
 			data.MermaidScript = cdn.Script
 		}

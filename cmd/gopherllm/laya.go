@@ -23,7 +23,7 @@ func runLayaCommand(ctx context.Context, cfg cliConfig) error {
 	if cfg.deploymentMode == server.DeploymentBrowser {
 		return fmt.Errorf("native Laya inference is unavailable in browser deployment")
 	}
-	if cfg.modelSelector != nil || cfg.prompt != "" || cfg.repl || cfg.embed || cfg.bench || cfg.kernelBench || cfg.compress || cfg.autoTune || cfg.imagePath != "" || cfg.mmprojPathSet || cfg.chatUI || cfg.inspect || cfg.listMetadata || cfg.listTensors || cfg.analyze || cfg.findToken != "" || cfg.tokenNeighbors != "" || cfg.metalExplicit || cfg.prepareQuant || cfg.outOfCore {
+	if cfg.imageModelDir != "" || cfg.modelSelector != nil || cfg.prompt != "" || cfg.repl || cfg.embed || cfg.bench || cfg.kernelBench || cfg.compress || cfg.autoTune || cfg.imagePath != "" || cfg.mmprojPathSet || cfg.chatUI || cfg.inspect || cfg.listMetadata || cfg.listTensors || cfg.analyze || cfg.findToken != "" || cfg.tokenNeighbors != "" || cfg.metalExplicit || cfg.prepareQuant || cfg.outOfCore {
 		return fmt.Errorf("--laya-model is a dedicated classification mode; remove chat, generation, image, embedding, compression or benchmark options")
 	}
 	modes := 0

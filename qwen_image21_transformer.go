@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 )
 
 type qi21TransformerConfig struct {
@@ -122,13 +123,26 @@ func qi21BatchRows(rows, cols int) int {
 	return limit
 }
 
+type imageProjectionRows struct {
+	in, out [qi21TokenTile][]float32
+}
+
+var imageProjectionRowsPool = sync.Pool{New: func() any { return new(imageProjectionRows) }}
+
 // Projection chunks keep BLAS input packing within eight MiB. Weight expansion
 // remains bounded by the backend's row tile; matrices stay packed in memory.
 func qi21Project(ctx context.Context, w Weight, input, output []float32) error {
 	if w.Cols <= 0 || w.Rows <= 0 || len(input)%w.Cols != 0 || len(output) != len(input)/w.Cols*w.Rows {
 		return errors.New("qwen image: invalid projection shape")
 	}
-	var inRows, outRows [qi21TokenTile][]float32
+	views := imageProjectionRowsPool.Get().(*imageProjectionRows)
+	defer func() {
+		// Parallel GEMM workers finish before returning. Drop every view so
+		// the pool cannot keep a prompt or image workspace alive afterward.
+		clear(views.in[:])
+		clear(views.out[:])
+		imageProjectionRowsPool.Put(views)
+	}()
 	rows := len(input) / w.Cols
 	for first := 0; first < rows; {
 		if err := ctx.Err(); err != nil {
@@ -138,10 +152,10 @@ func qi21Project(ctx context.Context, w Weight, input, output []float32) error {
 		in := input[first*w.Cols : (first+n)*w.Cols]
 		out := output[first*w.Rows : (first+n)*w.Rows]
 		for i := 0; i < n; i++ {
-			inRows[i] = in[i*w.Cols : (i+1)*w.Cols]
-			outRows[i] = out[i*w.Rows : (i+1)*w.Rows]
+			views.in[i] = in[i*w.Cols : (i+1)*w.Cols]
+			views.out[i] = out[i*w.Rows : (i+1)*w.Rows]
 		}
-		matvecBatchWithQ8AndSlabs(w, inRows[:n], outRows[:n], false, in, out)
+		matvecBatchWithQ8AndSlabs(w, views.in[:n], views.out[:n], false, in, out)
 		first += n
 	}
 	return nil
@@ -162,6 +176,7 @@ type qi21TransformerState struct {
 	zeroMod                     []float32
 	x, norm, q, k, v, attn, out []float32
 	gate, up                    []float32
+	scores                      []float32
 }
 
 func (m *qi21Transformer) newState(text []float32, height, width int) (*qi21TransformerState, error) {
@@ -456,22 +471,12 @@ func (s *qi21TransformerState) rotate(x []float32, position int) {
 }
 
 func (s *qi21TransformerState) attention(ctx context.Context, n, offset int) {
-	m := s.model
-	hd := m.cfg.HeadDim
-	scale := float32(1 / math.Sqrt(float64(hd)))
-	parallelRows(n*m.cfg.Heads, func(begin, end int) {
-		for row := begin; row < end; row++ {
-			if ctx.Err() != nil {
-				return
-			}
-			token, head := row/m.cfg.Heads, row%m.cfg.Heads
-			endKey := s.prefix + s.height*s.width
-			if token+offset < s.prefix {
-				endKey = token + offset + 1
-			}
-			start := token*m.dim + head*hd
-			clear(s.attn[start : start+hd])
-			onlineAttention(s.q[start:start+hd], s.k[head*hd:], s.v[head*hd:], m.dim, m.dim, hd, hd, 0, endKey-1, scale, 0, s.attn[start:start+hd])
-		}
-	})
+	if s.attentionBLAS(ctx, n, offset) {
+		return
+	}
+	s.attentionOnline(ctx, n, offset)
+}
+
+func (s *qi21TransformerState) attentionOnline(ctx context.Context, n, offset int) {
+	imageAttentionOnline(ctx, s.q, s.k, s.v, s.attn, n, s.prefix+s.height*s.width, s.model.cfg.Heads, s.model.cfg.HeadDim, offset, s.prefix)
 }

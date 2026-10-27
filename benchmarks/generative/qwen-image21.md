@@ -158,3 +158,66 @@ GOPHERLLM_QWEN_IMAGE_MODEL=.cache/qwen-image21/turbo GOMAXPROCS=8 \
 The reference generators in `scripts/` reproduce the encoder, transformer,
 VAE and complete pipeline fixtures. Image editing, reference-image conditions,
 LoRA adapters and video are outside the implemented scope.
+
+## Batched prefix/image attention
+
+On 2026-10-26, the DiT attention path was changed from per-query online
+attention to bounded Accelerate QKᵀ/softmax/PV tiles. Heads run concurrently;
+Q/K/V stay in token-major storage, and the combined score workspace is capped
+at 4 MiB. Prefix queries remain causal and image queries retain bidirectional
+attention. Cached prefix K/V and portable fallback behavior are unchanged.
+
+Synthetic attention benchmark on the M2 Max (Go 1.25.3, GOMAXPROCS=12,
+32 heads × 128 dimensions, 256 image tokens plus 32 prefix tokens, three runs
+of ten iterations; medians):
+
+| Queries | Online attention | Batched attention | Batched allocations |
+| --- | ---: | ---: | ---: |
+| Prefix + image | 19.92 ms | 2.44 ms | 0 B/op |
+| Image, prefix cached | 29.65 ms | 2.04 ms | 0 B/op |
+
+The kernel is faster, but the complete model comparison does **not** establish
+a wall-time speedup. Four fresh CLI processes used the same pretrained prompt,
+256×256, seed 42, Turbo eight steps and eight threads in ABBA order:
+
+| Variant | Wall time | User CPU time | Page faults |
+| --- | --- | --- | --- |
+| Before | 120.29 / 137.47 s | 157.80 / 161.99 s | 2.55 / 3.09 million |
+| Batched attention | 110.60 / 150.54 s | 127.74 / 132.20 s | 2.57 / 4.16 million |
+
+Median wall times were 128.88 and 130.57 seconds. Background work and paging
+were uncontrolled despite freeing RAM; these runs cannot be compared directly
+to the earlier 69.81-second projection result. The reduced CPU work does not
+remove the cost of streaming the model under memory pressure. Peak process
+footprint was 2.20–2.32 GB across the four runs; this is not total system memory
+or the size of the mapped checkpoint.
+
+Both optimized runs produced identical PNGs. Against the original, 54 of
+262,144 RGBA channels differ by one byte value (maximum difference 1).
+Tests additionally compare masks, cached-prefix queries, cancellation and
+large-key score bounds against the online path and existing reference fixtures.
+
+Raw measurements and image hashes: [attention results](qwen-image21-attention-m2-max.json).
+Reproduce the kernel comparison with:
+
+```sh
+GOMAXPROCS=12 CGO_ENABLED=1 go test -run '^$' \
+  -bench '^BenchmarkQwenImage21Attention$' -benchtime=10x -count=3 .
+```
+
+## Shared decoder and projection changes, 2026-10-27
+
+Qwen now shares pooled projection row views and fused nearest-neighbor
+upsampling/convolution with FLUX. The pool drops tensor references before
+returning; upsampling expands only a bounded row window. In the synthetic
+256-channel, 128×128 → 256×256 convolution benchmark, allocated bytes fall
+from 128 to 64 MiB. This is not a full-model RSS or paging measurement.
+Existing Qwen reference images remain within their original tolerances.
+See the [shared kernel measurements](flux3.md#kernel-and-allocation-changes-2026-10-27)
+for raw data, concurrent-load limitations and reproduction commands.
+
+On 2026-10-28, residual blocks also began reusing the consumed normalization
+buffer for their second convolution's output. This removes an intermediate
+feature-map allocation in both VAEs; Qwen's existing reference images still
+pass. The [FLUX fixture comparison](flux3.md#residual-workspace-reuse-2026-10-28)
+measures this change, without a new pretrained Qwen throughput claim.

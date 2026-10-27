@@ -1,0 +1,96 @@
+{
+  "date": "2026-10-28",
+  "hardware": "Apple M2 Max, 32 GiB",
+  "toolchain": "Go 1.25.3, darwin/arm64, CGO/Accelerate",
+  "gomaxprocs": 8,
+  "benchmark": "BenchmarkFlux3Stages/vae_256",
+  "method": "Five paired repetitions in alternating before/after order, three decodes per sample; model loading excluded. Small synthetic BFL reference graph, 256x256 RGB output.",
+  "change": "Reuse residual normalization buffers as conv2 output in Qwen and FLUX VAEs.",
+  "limitations": [
+    "These are synthetic graph results, not pretrained checkpoint throughput.",
+    "B/op measures cumulative allocations, not peak RSS, live memory or paging.",
+    "Background builds and other applications were not controlled."
+  ],
+  "samples": {
+    "before": [
+      {
+        "iterations": 3,
+        "ns_per_op": 206401083.0,
+        "bytes_per_op": 201632538.0,
+        "allocations_per_op": 94.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 253939750.0,
+        "bytes_per_op": 201631352.0,
+        "allocations_per_op": 94.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 223079444.0,
+        "bytes_per_op": 201633106.0,
+        "allocations_per_op": 96.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 203787305.0,
+        "bytes_per_op": 201630168.0,
+        "allocations_per_op": 89.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 197272264.0,
+        "bytes_per_op": 201630560.0,
+        "allocations_per_op": 90.0
+      }
+    ],
+    "after": [
+      {
+        "iterations": 3,
+        "ns_per_op": 206076500.0,
+        "bytes_per_op": 154967402.0,
+        "allocations_per_op": 72.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 200374278.0,
+        "bytes_per_op": 154967408.0,
+        "allocations_per_op": 73.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 200771153.0,
+        "bytes_per_op": 154969173.0,
+        "allocations_per_op": 74.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 202751945.0,
+        "bytes_per_op": 154967248.0,
+        "allocations_per_op": 71.0
+      },
+      {
+        "iterations": 3,
+        "ns_per_op": 202388486.0,
+        "bytes_per_op": 154969013.0,
+        "allocations_per_op": 72.0
+      }
+    ]
+  },
+  "medians": {
+    "before": {
+      "ns_per_op": 206401083.0,
+      "bytes_per_op": 201631352.0,
+      "allocations_per_op": 94.0
+    },
+    "after": {
+      "ns_per_op": 202388486.0,
+      "bytes_per_op": 154967408.0,
+      "allocations_per_op": 72.0
+    }
+  },
+  "binary_sha256": {
+    "before": "0b2367f94ce2b514a2c3ed243870e096d7384d15650780f322f78ecb6c5e068a",
+    "after": "9788fb70aea85e5ee125f17dbab6809123c679dace6cae8b6f132d8ed4740497"
+  }
+}

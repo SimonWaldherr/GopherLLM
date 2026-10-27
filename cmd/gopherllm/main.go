@@ -61,7 +61,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --enable <list>           Add optional features (model-catalog is already on):")
 	fmt.Fprintln(os.Stderr, "                            model-download, autotune, remote, web-lookup, spreadsheet, rag, all")
 	fmt.Fprintln(os.Stderr, "  --minimal                 Inference only; no catalog/UI/tools/downloads (HF cache offline)")
-	fmt.Fprintln(os.Stderr, "  --request-timeout <d>      Per-inference HTTP deadline (default 2m)")
+	fmt.Fprintln(os.Stderr, "  --request-timeout <d>      Per-inference HTTP deadline (default 2m; images 10m)")
 	fmt.Fprintln(os.Stderr, "  --json-object             Grammar-constrained JSON object output; incompatible with stop/tools/speculation")
 	fmt.Fprintln(os.Stderr, "  --full                    Shorthand for --enable all")
 	fmt.Fprintln(os.Stderr, "  --deployment <mode>       Server profile: local | managed | browser (default: local)")
@@ -69,6 +69,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --admin-token-file <path> Read the managed-server admin token from a file (preferred over CLI tokens)")
 	fmt.Fprintln(os.Stderr, "  --admin-token <token>     Managed-server admin token (or use GOPHERLLM_ADMIN_TOKEN)")
 	fmt.Fprintln(os.Stderr, "  --chat                    Enable the minimal Web UI at /chat with --serve")
+	fmt.Fprintln(os.Stderr, "  --image-model-dir <dir>   Enable native Qwen/FLUX image generation (Web UI: /images)")
 	fmt.Fprintln(os.Stderr, "  --chat-history <path>     Enable compressed server-side chat history at <path>")
 	fmt.Fprintln(os.Stderr, "                           Explicit model selectors always override the remembered model")
 	fmt.Fprintln(os.Stderr, "  --wasm-dir <path>         Serve gopherllm.wasm+wasm_exec.js from <path> for the chat UI's")
@@ -140,6 +141,7 @@ type cliConfig struct {
 	minimal                                                                        bool
 	modelSelector                                                                  *string
 	modelSelectorFromConfig                                                        bool
+	imageModelDir                                                                  string
 	modelDir                                                                       string
 	preset                                                                         string
 	prompt                                                                         string
@@ -366,6 +368,7 @@ func run() error {
 			ChatHistoryPath:   cfg.chatHistoryPath,
 			ChatHistoryLock:   &sync.Mutex{},
 			ModelDir:          cfg.modelDir,
+			ImageModelDir:     cfg.imageModelDir,
 			WasmDir:           resolveWasmDir(cfg),
 			SkillsDir:         cfg.skillsDir,
 			RAGDocsDir:        cfg.ragDocsDir,
@@ -513,7 +516,7 @@ func run() error {
 		appliedAutoTune = &res
 	}
 	if cfg.serveAddr != "" {
-		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, RequestTimeout: cfg.requestTimeout, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, RAGDocsDir: cfg.ragDocsDir, RAGEmbedModelPath: cfg.ragEmbedModel, RAGSnapshotPath: cfg.ragSnapshotPath, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
+		return server.Serve(runner, server.ServeOptions{Context: commandCtx, Addr: cfg.serveAddr, Features: cfg.features, DeploymentMode: cfg.deploymentMode, AdminToken: cfg.adminToken, Defaults: cfg.options, MaxConcurrentConnections: cfg.maxConn, RequestTimeout: cfg.requestTimeout, ChatUI: cfg.chatUI, ChatHistoryPath: cfg.chatHistoryPath, ChatHistoryLock: &sync.Mutex{}, ModelDir: cfg.modelDir, ImageModelDir: cfg.imageModelDir, ModelPath: modelPath, WasmDir: resolveWasmDir(cfg), SkillsDir: cfg.skillsDir, RAGDocsDir: cfg.ragDocsDir, RAGEmbedModelPath: cfg.ragEmbedModel, RAGSnapshotPath: cfg.ragSnapshotPath, ModelLoadOptions: serverModelLoadOptions(cfg), AppliedAutoTune: appliedAutoTune, BaselineRuntimeTuning: baselineRuntimeTuning, ModelLoaded: recordLastModel, AgentOS: agentOSRunner})
 	}
 	if cfg.embed {
 		prompt, err := promptText(cfg.prompt)
@@ -577,7 +580,9 @@ func run() error {
 }
 
 func resumeLastModel(cfg *cliConfig, logw io.Writer) bool {
-	if cfg == nil || cfg.modelSelector != nil {
+	// An explicitly configured image server must not silently retain the last
+	// multi-gigabyte chat model too. An explicit chat selector still works.
+	if cfg == nil || cfg.modelSelector != nil || cfg.imageModelDir != "" {
 		return false
 	}
 	if logw == nil {
@@ -945,6 +950,12 @@ func parseCLI(args []string) (cliConfig, error) {
 				return cfg, err
 			}
 			cfg.adminTokenFile = v
+		case "--image-model-dir":
+			v, err := next(arg)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.imageModelDir = v
 		case "--chat":
 			cfg.chatUI = true
 		case "--chat-history":
@@ -1253,6 +1264,9 @@ func parseCLI(args []string) (cliConfig, error) {
 		cfg.hfOffline = true
 	} else {
 		cfg.features = cfg.features.Merge(server.Features{ModelCatalog: true})
+	}
+	if cfg.imageModelDir != "" && (cfg.serveAddr == "" || cfg.deploymentMode == server.DeploymentBrowser || cfg.minimal) {
+		return cfg, fmt.Errorf("--image-model-dir requires a local or managed server without --minimal")
 	}
 	if cfg.chatUI && cfg.serveAddr == "" {
 		return cfg, fmt.Errorf("--chat requires --serve <addr>")

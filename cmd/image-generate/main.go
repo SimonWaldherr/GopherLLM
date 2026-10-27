@@ -1,4 +1,4 @@
-// Command image-generate runs native Qwen-Image-2.1 text-to-image generation
+// Command image-generate runs native Qwen/FLUX text-to-image generation
 // or the unconditional CIFAR-10 reference model.
 package main
 
@@ -25,15 +25,15 @@ func main() {
 }
 
 func run() error {
-	modelPath := flag.String("model", "", "local Qwen-Image-2.1 directory or DDPM-CIFAR-10 model")
-	prompt := flag.String("prompt", "", "Qwen-Image-2.1 text prompt; omit for unconditional CIFAR generation")
-	negative := flag.String("negative-prompt", "", "negative prompt for Qwen classifier-free guidance")
-	width := flag.Int("width", 0, "Qwen output width (multiple of 32; default 256)")
-	height := flag.Int("height", 0, "Qwen output height (multiple of 32; default 256)")
-	guidance := flag.Float64("guidance", 1, "Qwen guidance scale (1 disables CFG)")
+	modelPath := flag.String("model", "", "local Qwen-Image-2.1 / FLUX 3 Klein directory or DDPM-CIFAR-10 model")
+	prompt := flag.String("prompt", "", "text prompt; omit for unconditional CIFAR generation")
+	negative := flag.String("negative-prompt", "", "negative prompt for classifier-free guidance")
+	width := flag.Int("width", 0, "output width (Qwen: multiple of 32, FLUX: 16; default 256)")
+	height := flag.Int("height", 0, "output height (Qwen: multiple of 32, FLUX: 16; default 256)")
+	guidance := flag.Float64("guidance", 0, "guidance scale (1 disables CFG; 0 uses checkpoint default)")
 	output := flag.String("out", "", "new PNG output file; existing files are not overwritten")
 	seed := flag.Int64("seed", 1, "random seed")
-	steps := flag.Int("steps", 0, "denoising steps; 0 uses checkpoint default (Turbo: fixed 8, base: 40, CIFAR: 50)")
+	steps := flag.Int("steps", 0, "denoising steps; 0 uses checkpoint default (Qwen Turbo: 8, Qwen base: 40, FLUX: 16/50, CIFAR: 50)")
 	threads := flag.Int("threads", 0, "CPU worker count (0 uses runtime default)")
 	timeout := flag.Duration("timeout", 30*time.Minute, "maximum load and generation time")
 	flag.Parse()
@@ -58,17 +58,17 @@ func run() error {
 	var err error
 	actualSteps := *steps
 	if *prompt != "" {
-		model, loadErr := gopherllm.OpenQwenImage21(ctx, *modelPath)
+		model, loadErr := gopherllm.OpenImageModel(ctx, *modelPath)
 		if loadErr != nil {
 			return loadErr
 		}
 		defer model.Close()
-		img, err = model.Generate(ctx, gopherllm.QwenImage21Options{Prompt: *prompt, NegativePrompt: *negative, Width: *width, Height: *height, GuidanceScale: float32(*guidance), Seed: *seed, Steps: *steps,
+		img, err = model.Generate(ctx, gopherllm.ImageGenerationOptions{Prompt: *prompt, NegativePrompt: *negative, Width: *width, Height: *height, GuidanceScale: float32(*guidance), Seed: *seed, Steps: *steps,
 			Progress: func(done, total int) { actualSteps = total; fmt.Fprintf(os.Stderr, "denoising %d/%d\n", done, total) },
 		})
 	} else {
-		if *width != 0 || *height != 0 || *negative != "" || *guidance != 1 {
-			return fmt.Errorf("dimensions and guidance require a Qwen text prompt")
+		if *width != 0 || *height != 0 || *negative != "" || (*guidance != 0 && *guidance != 1) {
+			return fmt.Errorf("dimensions and guidance require a text prompt")
 		}
 		model, loadErr := gopherllm.OpenDiffusion(ctx, *modelPath)
 		if loadErr != nil {

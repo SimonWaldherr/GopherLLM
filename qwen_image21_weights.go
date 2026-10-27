@@ -106,7 +106,7 @@ func (s *qi21Weights) floats(name string, shape ...int) ([]float32, error) {
 	return values, nil
 }
 
-func qi21OpenWeights(ctx context.Context, dir string) (_ *qi21Weights, err error) {
+func qi21OpenWeights(ctx context.Context, dir string, selected ...string) (_ *qi21Weights, err error) {
 	s := &qi21Weights{tensors: make(map[string]qi21StoredTensor)}
 	defer func() {
 		if err != nil {
@@ -117,6 +117,9 @@ func qi21OpenWeights(ctx context.Context, dir string) (_ *qi21Weights, err error
 		WeightMap map[string]string `json:"weight_map"`
 	}
 	for _, name := range []string{"weights.index.json", "model.safetensors.index.json", "diffusion_pytorch_model.safetensors.index.json"} {
+		if len(selected) != 0 {
+			break
+		}
 		path := filepath.Join(dir, name)
 		if _, e := os.Stat(path); errors.Is(e, os.ErrNotExist) {
 			continue
@@ -130,7 +133,14 @@ func qi21OpenWeights(ctx context.Context, dir string) (_ *qi21Weights, err error
 		break
 	}
 	files := make(map[string]bool)
-	if len(index.WeightMap) != 0 {
+	if len(selected) != 0 {
+		for _, name := range selected {
+			if !filepath.IsLocal(name) || filepath.Base(name) != name {
+				return nil, errors.New("image weights: invalid shard path")
+			}
+			files[name] = true
+		}
+	} else if len(index.WeightMap) != 0 {
 		for _, name := range index.WeightMap {
 			if !filepath.IsLocal(name) || filepath.Base(name) != name {
 				return nil, errors.New("qwen-image-2.1: invalid shard path")
@@ -231,6 +241,10 @@ func qi21OpenWeights(ctx context.Context, dir string) (_ *qi21Weights, err error
 				return nil, e
 			}
 			for tensor, t := range f.Tensors {
+				// BatchNorm's training counter is not an inference parameter.
+				if tensor == "bn.num_batches_tracked" && t.DType == "I64" && len(t.Shape) == 0 && t.Begin >= 0 && t.End-t.Begin == 8 && t.End <= len(data)-f.DataOffset {
+					continue
+				}
 				typ := GGMLTypeUnknown
 				switch t.DType {
 				case SafetensorsF32:

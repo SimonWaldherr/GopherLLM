@@ -45,28 +45,31 @@ func TestDenseGemm(t *testing.T) {
 }
 
 func TestCopyPaddedWindow(t *testing.T) {
-	for _, srcLen := range []int{0, 1, 7, 128} {
-		src := ttsConvTestData(srcLen)
-		original := slices.Clone(src)
-		for _, width := range []int{0, 1, 3, 127, 129} {
-			storage := make([]float32, width+2)
-			for start := -width - 2; start <= srcLen+2; start++ {
-				for i := range storage {
-					storage[i] = -123
-				}
-				dst := storage[1 : width+1]
-				copyPaddedWindow(dst, src, start)
-				for i, got := range dst {
-					var want float32
-					if at := start + i; at >= 0 && at < len(src) {
-						want = src[at]
+	for repeat, copyWindow := range []func([]float32, []float32, int){copyPaddedWindow, copyPaddedRepeat2} {
+		repeat++
+		for _, srcLen := range []int{0, 1, 7, 128} {
+			src := ttsConvTestData(srcLen)
+			original := slices.Clone(src)
+			for _, width := range []int{0, 1, 3, 127, 129} {
+				storage := make([]float32, width+2)
+				for start := -width - 2; start <= repeat*srcLen+2; start++ {
+					for i := range storage {
+						storage[i] = -123
 					}
-					if got != want {
-						t.Fatalf("source=%d, width=%d, start=%d: output[%d]=%g, want %g", srcLen, width, start, i, got, want)
+					dst := storage[1 : width+1]
+					copyWindow(dst, src, start)
+					for i, got := range dst {
+						var want float32
+						if at := start + i; at >= 0 && at < repeat*len(src) {
+							want = src[at/repeat]
+						}
+						if got != want {
+							t.Fatalf("repeat=%d, source=%d, width=%d, start=%d: output[%d]=%g, want %g", repeat, srcLen, width, start, i, got, want)
+						}
 					}
-				}
-				if storage[0] != -123 || storage[width+1] != -123 || !slices.Equal(src, original) {
-					t.Fatal("modified input or output boundary")
+					if storage[0] != -123 || storage[width+1] != -123 || !slices.Equal(src, original) {
+						t.Fatal("modified input or output boundary")
+					}
 				}
 			}
 		}

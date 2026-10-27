@@ -1,0 +1,779 @@
+{
+  "date": "2026-10-27",
+  "hardware": {
+    "cpu": "Apple M2 Max",
+    "physical_cores": 12,
+    "memory_bytes": 34359738368
+  },
+  "toolchain": "Go 1.25.3, darwin/arm64, CGO/Accelerate",
+  "pretrained_weights_used": false,
+  "baseline": "Uncommitted native FLUX implementation before grouped text attention, cached text RoPE, projection row pooling, DiT slab reuse and fused VAE upsampling.",
+  "limitations": [
+    "Other Go/Swift builds, benchmarks and simulators were active; wall-time samples vary substantially. These are kernel and small synthetic graph results, not full-checkpoint generation speed.",
+    "B/op measures cumulative allocation, not peak RSS, live memory or swap.",
+    "No FLUX pretrained weights available: the pinned Hugging Face files require accepted access and local credentials."
+  ],
+  "binary_sha256": {
+    "before.test": "4601dc244c75113d7a82dd7698a88748b83c68546ad5dd2e7317c57c2937831e",
+    "optimized.test": "15042584a9b8ad99e5171d5f18b5c9ea91e43758a16b8f4098c3acc49c63e57f"
+  },
+  "measurements": [
+    {
+      "benchmark": "BenchmarkFlux3Stages/dit_step-8",
+      "implementation": "before",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 3,
+          "ns_per_op": 32708361.0,
+          "bytes_per_op": 802688.0,
+          "allocations_per_op": 141.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 27932903.0,
+          "bytes_per_op": 804522.0,
+          "allocations_per_op": 143.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 45123319.0,
+          "bytes_per_op": 802848.0,
+          "allocations_per_op": 143.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 21445819.0,
+          "bytes_per_op": 802688.0,
+          "allocations_per_op": 141.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 36013542.0,
+          "bytes_per_op": 802688.0,
+          "allocations_per_op": 141.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 32708361.0,
+        "bytes_per_op": 802688.0,
+        "allocations_per_op": 141.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3Stages/dit_step-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 3,
+          "ns_per_op": 29735319.0,
+          "bytes_per_op": 6272.0,
+          "allocations_per_op": 19.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 25848347.0,
+          "bytes_per_op": 6272.0,
+          "allocations_per_op": 19.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 17392417.0,
+          "bytes_per_op": 6272.0,
+          "allocations_per_op": 19.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 27931903.0,
+          "bytes_per_op": 6272.0,
+          "allocations_per_op": 19.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 35262125.0,
+          "bytes_per_op": 6272.0,
+          "allocations_per_op": 19.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 27931903.0,
+        "bytes_per_op": 6272.0,
+        "allocations_per_op": 19.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3Stages/encoder-8",
+      "implementation": "before",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 3,
+          "ns_per_op": 91968458.0,
+          "bytes_per_op": 3220450.0,
+          "allocations_per_op": 626.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 67164111.0,
+          "bytes_per_op": 3220376.0,
+          "allocations_per_op": 625.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 82053958.0,
+          "bytes_per_op": 3225882.0,
+          "allocations_per_op": 626.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 36464417.0,
+          "bytes_per_op": 3227941.0,
+          "allocations_per_op": 630.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 67082569.0,
+          "bytes_per_op": 3221546.0,
+          "allocations_per_op": 627.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 67164111.0,
+        "bytes_per_op": 3221546.0,
+        "allocations_per_op": 626.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3Stages/encoder-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 3,
+          "ns_per_op": 34903764.0,
+          "bytes_per_op": 800120.0,
+          "allocations_per_op": 147.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 44563070.0,
+          "bytes_per_op": 800120.0,
+          "allocations_per_op": 147.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 28572264.0,
+          "bytes_per_op": 795560.0,
+          "allocations_per_op": 146.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 23177722.0,
+          "bytes_per_op": 800120.0,
+          "allocations_per_op": 147.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 112948681.0,
+          "bytes_per_op": 800120.0,
+          "allocations_per_op": 147.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 34903764.0,
+        "bytes_per_op": 800120.0,
+        "allocations_per_op": 147.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3Stages/vae_256-8",
+      "implementation": "before",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 3,
+          "ns_per_op": 498234167.0,
+          "bytes_per_op": 228893029.0,
+          "allocations_per_op": 92.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 506461083.0,
+          "bytes_per_op": 228895040.0,
+          "allocations_per_op": 97.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 345633917.0,
+          "bytes_per_op": 228893002.0,
+          "allocations_per_op": 92.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 440290986.0,
+          "bytes_per_op": 228893296.0,
+          "allocations_per_op": 95.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 1005350833.0,
+          "bytes_per_op": 228894693.0,
+          "allocations_per_op": 93.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 498234167.0,
+        "bytes_per_op": 228893296.0,
+        "allocations_per_op": 93.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3Stages/vae_256-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 3,
+          "ns_per_op": 475469903.0,
+          "bytes_per_op": 201631256.0,
+          "allocations_per_op": 94.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 397834875.0,
+          "bytes_per_op": 201632050.0,
+          "allocations_per_op": 100.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 387950056.0,
+          "bytes_per_op": 201631645.0,
+          "allocations_per_op": 98.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 285585305.0,
+          "bytes_per_op": 201630752.0,
+          "allocations_per_op": 92.0
+        },
+        {
+          "iterations": 3,
+          "ns_per_op": 754132639.0,
+          "bytes_per_op": 201631517.0,
+          "allocations_per_op": 97.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 397834875.0,
+        "bytes_per_op": 201631517.0,
+        "allocations_per_op": 97.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=160/batched=false-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 30,
+          "ns_per_op": 4639693.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 4892435.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 5003272.0,
+          "bytes_per_op": 738.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 18619962.0,
+          "bytes_per_op": 760.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 15544971.0,
+          "bytes_per_op": 1334.0,
+          "allocations_per_op": 1.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 5003272.0,
+        "bytes_per_op": 738.0,
+        "allocations_per_op": 1.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=160/batched=true-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 30,
+          "ns_per_op": 916433.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 804911.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 1454233.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 994550.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 30,
+          "ns_per_op": 1171654.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 994550.0,
+        "bytes_per_op": 0.0,
+        "allocations_per_op": 0.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=512/batched=false-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 10,
+          "ns_per_op": 96545117.0,
+          "bytes_per_op": 1980.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 100979979.0,
+          "bytes_per_op": 1869.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 245638242.0,
+          "bytes_per_op": 5324.0,
+          "allocations_per_op": 3.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 256104679.0,
+          "bytes_per_op": 7051.0,
+          "allocations_per_op": 5.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 394450929.0,
+          "bytes_per_op": 3609.0,
+          "allocations_per_op": 2.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 245638242.0,
+        "bytes_per_op": 3609.0,
+        "allocations_per_op": 2.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=512/batched=true-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 10,
+          "ns_per_op": 6792388.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 7054033.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 16301796.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 14849508.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 10,
+          "ns_per_op": 136376750.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 14849508.0,
+        "bytes_per_op": 0.0,
+        "allocations_per_op": 0.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkImageUpsampleConv/channels=256/grid=128x128/fused=false-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 5,
+          "ns_per_op": 899979683.0,
+          "bytes_per_op": 134217766.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 298693125.0,
+          "bytes_per_op": 134217731.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 2265651425.0,
+          "bytes_per_op": 134217728.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 1986118642.0,
+          "bytes_per_op": 134217728.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 1930039075.0,
+          "bytes_per_op": 134217750.0,
+          "allocations_per_op": 2.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 1930039075.0,
+        "bytes_per_op": 134217731.0,
+        "allocations_per_op": 2.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkImageUpsampleConv/channels=256/grid=128x128/fused=true-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 5,
+          "ns_per_op": 498841517.0,
+          "bytes_per_op": 67108883.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 726231958.0,
+          "bytes_per_op": 67108867.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 1265905200.0,
+          "bytes_per_op": 67110006.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 1706953467.0,
+          "bytes_per_op": 67108867.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 1829407850.0,
+          "bytes_per_op": 67109964.0,
+          "allocations_per_op": 2.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 1265905200.0,
+        "bytes_per_op": 67108883.0,
+        "allocations_per_op": 1.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkImageUpsampleConv/channels=64/grid=32x32/fused=false-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 50,
+          "ns_per_op": 43353598.0,
+          "bytes_per_op": 2097160.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 49794571.0,
+          "bytes_per_op": 2097384.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 30632589.0,
+          "bytes_per_op": 2097388.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 34067078.0,
+          "bytes_per_op": 2097272.0,
+          "allocations_per_op": 2.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 63921192.0,
+          "bytes_per_op": 2097161.0,
+          "allocations_per_op": 2.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 43353598.0,
+        "bytes_per_op": 2097272.0,
+        "allocations_per_op": 2.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkImageUpsampleConv/channels=64/grid=32x32/fused=true-8",
+      "implementation": "current",
+      "gomaxprocs": 8,
+      "samples": [
+        {
+          "iterations": 50,
+          "ns_per_op": 22653791.0,
+          "bytes_per_op": 1048580.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 41105670.0,
+          "bytes_per_op": 1048586.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 15237381.0,
+          "bytes_per_op": 1048578.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 75948488.0,
+          "bytes_per_op": 1048582.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 50,
+          "ns_per_op": 9495490.0,
+          "bytes_per_op": 1048579.0,
+          "allocations_per_op": 1.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 22653791.0,
+        "bytes_per_op": 1048580.0,
+        "allocations_per_op": 1.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=160/batched=false",
+      "implementation": "current",
+      "gomaxprocs": 1,
+      "samples": [
+        {
+          "iterations": 20,
+          "ns_per_op": 34504456.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 18888396.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 31349458.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 26456010.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 50387990.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 31349458.0,
+        "bytes_per_op": 192.0,
+        "allocations_per_op": 1.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=160/batched=true",
+      "implementation": "current",
+      "gomaxprocs": 1,
+      "samples": [
+        {
+          "iterations": 20,
+          "ns_per_op": 2068938.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 2408256.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 2746867.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 3311110.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 20,
+          "ns_per_op": 3036240.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 2746867.0,
+        "bytes_per_op": 0.0,
+        "allocations_per_op": 0.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=512/batched=false",
+      "implementation": "current",
+      "gomaxprocs": 1,
+      "samples": [
+        {
+          "iterations": 5,
+          "ns_per_op": 186809992.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 274430292.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 199344150.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 443372650.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 284664650.0,
+          "bytes_per_op": 192.0,
+          "allocations_per_op": 1.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 274430292.0,
+        "bytes_per_op": 192.0,
+        "allocations_per_op": 1.0
+      }
+    },
+    {
+      "benchmark": "BenchmarkFlux3TextAttention/tokens=512/batched=true",
+      "implementation": "current",
+      "gomaxprocs": 1,
+      "samples": [
+        {
+          "iterations": 5,
+          "ns_per_op": 27603600.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 28274550.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 17775475.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 407777850.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        },
+        {
+          "iterations": 5,
+          "ns_per_op": 25966783.0,
+          "bytes_per_op": 0.0,
+          "allocations_per_op": 0.0
+        }
+      ],
+      "median": {
+        "ns_per_op": 27603600.0,
+        "bytes_per_op": 0.0,
+        "allocations_per_op": 0.0
+      }
+    }
+  ],
+  "method": "Five paired repetitions per comparison, alternating before/after order. Stage benchmarks use preserved before/current binaries and 3 iterations per sample. Kernel comparisons execute reference and optimized paths in the same current binary; iteration counts are stored in each sample. Setup and warmup are untimed for kernels and DiT."
+}

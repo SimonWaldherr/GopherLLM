@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Generate an image · GopherLLM</title>
+  <link rel="stylesheet" href="/images.css">
+  <script src="/images.js" defer></script>
+</head>
+<body>
+  <header><a href="/chat">GopherLLM · Back to chat</a><span>Local image generation</span></header>
+  <main>
+    <section aria-labelledby="title">
+      <p class="eyebrow">GopherLLM</p>
+      <h1 id="title">Generate an image</h1>
+      <p>Your prompt and image stay on this server. Uses the model configured by its operator.</p>
+      <form id="imageForm">
+        <label for="prompt">Describe your image</label>
+        <textarea id="prompt" name="prompt" rows="5" maxlength="4096" required placeholder="A red ceramic teapot on a pale blue table, studio photograph."></textarea>
+        <div class="options">
+          <div><label for="size">Resolution</label><select id="size"><option value="256x256">256 × 256 · faster</option><option value="512x512">512 × 512 · more detail</option></select></div>
+          <div><label for="seed">Seed</label><input id="seed" type="number" min="0" max="4294967295" step="1" value="42" required></div>
+        </div>
+        <label class="retention"><input id="keepAlive" type="checkbox"> Keep model loaded for the next image</label>
+        <p class="note">Keeping it loaded avoids reloading weights, but uses more memory. This choice applies after your next generation.</p>
+        <p class="note">256 × 256 is recommended on 32 GB Macs. Generation can take several minutes. The model is released afterwards unless you keep it loaded.</p>
+        <div class="actions"><button id="generate" type="submit">Generate image</button><button id="unload" type="button">Unload model now</button><button id="cancel" type="button" hidden>Cancel</button></div>
+      </form>
+      <p id="imageStatus" role="status" aria-live="polite">Ready to generate.</p>
+    </section>
+    <section class="preview" aria-label="Generated image">
+      <p id="empty">Your image will appear here.</p>
+      <img id="result" alt="" hidden>
+      <a id="download" download="gopherllm-image.png" hidden>Download PNG</a>
+    </section>
+  </main>
+</body>
+</html>

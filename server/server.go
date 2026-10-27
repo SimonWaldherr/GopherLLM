@@ -32,6 +32,7 @@ type Handler struct {
 	embedder   *embeddingState
 	rag        *ragState
 	audioClose func()
+	imageClose func()
 	closeOnce  sync.Once
 	closeErr   error
 }
@@ -45,6 +46,9 @@ func (h *Handler) Close() error {
 		return nil
 	}
 	h.closeOnce.Do(func() {
+		if h.imageClose != nil {
+			h.imageClose()
+		}
 		if h.audioClose != nil {
 			h.audioClose()
 		}
@@ -71,7 +75,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		opts.Addr = DefaultAddr
 	}
 	networkExposed := !isLoopbackListenAddress(opts.Addr)
-	if mode == DeploymentBrowser && (initialRunner != nil || opts.DecisionModel != nil) {
+	if mode == DeploymentBrowser && (initialRunner != nil || opts.DecisionModel != nil || opts.ImageModelDir != "") {
 		return errors.New("browser deployment must not be started with a server-side model runner")
 	}
 	logw := opts.LogWriter
@@ -92,6 +96,7 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		ChatUI:                opts.ChatUI,
 		ChatHistoryPath:       opts.ChatHistoryPath,
 		ModelDir:              opts.ModelDir,
+		ImageModelDir:         opts.ImageModelDir,
 		ModelPath:             opts.ModelPath,
 		WasmDir:               opts.WasmDir,
 		ModelLoadOptions:      opts.ModelLoadOptions,
@@ -127,6 +132,9 @@ func Serve(initialRunner *gopherllm.Runner, opts ServeOptions) error {
 		fmt.Fprintf(logw, "Optional features: %s\n", strings.Join(enabled, ", "))
 	} else {
 		fmt.Fprintln(logw, "Optional features: none (see --enable)")
+	}
+	if opts.ImageModelDir != "" {
+		fmt.Fprintln(logw, "Native image generation: POST /v1/images/generations (Web UI with --chat: /images)")
 	}
 	if opts.DecisionModel != nil {
 		fmt.Fprintln(logw, "Native classification: POST /v1/systemone; CSV upload: /classify (API: POST /v1/systemone/csv)")
@@ -194,6 +202,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 	if deployment.mode.browserOnly() {
 		// This model is caller-owned. Drop the handler reference without closing
 		// it, including when the caller used an alias such as "wasm".
+		opts.ImageModelDir = ""
 		opts.DecisionModel = nil
 		opts.DecisionModelID = ""
 		// Browser deployment is an on-device inference profile, not a thin UI
@@ -354,6 +363,10 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		parakeetCache.closeAll()
 	}
 	registerVisionRoutes(mux, audioAdmissionSem, opts, &yoloModelCache{})
+	imageCache := &imageModelCache{open: func(ctx context.Context) (imageGenerationModel, error) {
+		return gopherllm.OpenImageModel(ctx, opts.ImageModelDir)
+	}}
+	imageClose := registerImageRoutes(mux, opts, imageCache.generate, imageCache.close)
 	registerModelRoutes(mux, state, embedder, modelSem, opts, deployment, &modelLoadMu, logw)
 	if opts.Features.AutoTune {
 		registerAutoTuneRoutes(mux, state, autotuneSem, logw)
@@ -372,6 +385,7 @@ func NewHandler(initialRunner *gopherllm.Runner, opts HandlerOptions) *Handler {
 		embedder:   embedder,
 		rag:        ragState,
 		audioClose: audioClose,
+		imageClose: imageClose,
 	}
 }
 

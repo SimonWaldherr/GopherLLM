@@ -17,15 +17,7 @@ import (
 // Zero Steps uses 40 for the base model or the checkpoint's fixed Turbo schedule.
 // Zero GuidanceScale means 1 (no classifier-free guidance). A scale above 1
 // requires NegativePrompt and executes a second transformer branch each step.
-type QwenImage21Options struct {
-	Prompt, NegativePrompt string
-	Width, Height, Steps   int
-	Seed                   int64
-	GuidanceScale          float32
-	// Progress is called synchronously after each completed denoising step.
-	// It must not re-enter this model. The total reflects the checkpoint schedule.
-	Progress func(completed, total int)
-}
+type QwenImage21Options = ImageGenerationOptions
 
 // QwenImage21Model owns native text-to-image components. Image editing and the
 // vision encoder are not supported. Requests serialize their workspaces; no

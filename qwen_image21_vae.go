@@ -136,6 +136,7 @@ func loadQwenImage21VAE(ctx context.Context, src qi21WeightSource, cfg qwenImage
 type qi21VAEWorkspace struct {
 	ctx            context.Context
 	patch, product []float32
+	upsampleRow    []float32
 	matmul         denseGemmScratch
 	err            error
 }
@@ -147,6 +148,22 @@ func (s *qi21VAEWorkspace) gemm(m, n, k int, a, b, out []float32) {
 }
 
 func (c qi21VAEConv) forward(s *qi21VAEWorkspace, x diffusionTensor) diffusionTensor {
+	return c.forwardSpatial(s, x, false, nil)
+}
+
+// The caller owns dst and keeps it disjoint from x. Residual blocks can reuse
+// their consumed normalization buffer instead of allocating another map.
+func (c qi21VAEConv) forwardInto(s *qi21VAEWorkspace, x diffusionTensor, dst []float32) diffusionTensor {
+	return c.forwardSpatial(s, x, false, dst)
+}
+
+// Fold nearest-neighbor upsampling into patch extraction. The expanded
+// feature map can occupy hundreds of MiB but has no other consumer.
+func (c qi21VAEConv) upsample(s *qi21VAEWorkspace, x diffusionTensor) diffusionTensor {
+	return c.forwardSpatial(s, x, true, nil)
+}
+
+func (c qi21VAEConv) forwardSpatial(s *qi21VAEWorkspace, x diffusionTensor, upsample bool, dst []float32) diffusionTensor {
 	if s.err != nil {
 		return x
 	}
@@ -154,9 +171,15 @@ func (c qi21VAEConv) forward(s *qi21VAEWorkspace, x diffusionTensor) diffusionTe
 		s.err = err
 		return x
 	}
-	n, k := x.h*x.w, c.in*c.kernel*c.kernel
-	y := diffusionTensor{make([]float32, c.out*n), c.out, x.h, x.w}
-	if c.kernel == 1 {
+	h, w := x.h, x.w
+	if upsample {
+		h *= 2
+		w *= 2
+	}
+	n, k := h*w, c.in*c.kernel*c.kernel
+	ensureLenNoClear(&dst, c.out*n)
+	y := diffusionTensor{dst, c.out, h, w}
+	if c.kernel == 1 && !upsample {
 		s.gemm(c.out, n, c.in, c.weight, x.data, y.data)
 	} else {
 		const block = 256
@@ -166,25 +189,43 @@ func (c qi21VAEConv) forward(s *qi21VAEWorkspace, x diffusionTensor) diffusionTe
 		if cap(s.product) < c.out*min(n, block) {
 			s.product = make([]float32, c.out*min(n, block))
 		}
+		if upsample {
+			ensureLenNoClear(&s.upsampleRow, min(n, block)+c.kernel-1)
+		}
 		for start := 0; start < n; start += block {
 			width := min(block, n-start)
 			patch, product := s.patch[:k*width], s.product[:c.out*width]
 			for ch := range c.in {
 				for ky := range c.kernel {
-					for kx := range c.kernel {
-						row := patch[((ch*c.kernel+ky)*c.kernel+kx)*width:][:width]
-						for p := 0; p < width; {
-							yy, xx := (start+p)/x.w+ky-c.kernel/2, (start+p)%x.w
-							run := min(width-p, x.w-xx)
+					for p := 0; p < width; {
+						yy, xx := (start+p)/w+ky-c.kernel/2, (start+p)%w
+						run := min(width-p, w-xx)
+						var src []float32
+						if yy >= 0 && yy < h {
+							if upsample {
+								yy /= 2
+							}
+							src = x.data[(ch*x.h+yy)*x.w : (ch*x.h+yy+1)*x.w]
+							if upsample {
+								// Expand one small row window for all horizontal
+								// kernel offsets, including their zero padding.
+								row := s.upsampleRow[:run+c.kernel-1]
+								copyPaddedRepeat2(row, src, xx-c.kernel/2)
+								src = row
+							}
+						}
+						for kx := range c.kernel {
+							row := patch[((ch*c.kernel+ky)*c.kernel+kx)*width:][:width]
 							dst := row[p : p+run]
-							if yy < 0 || yy >= x.h {
+							if src == nil {
 								clear(dst)
+							} else if upsample {
+								copy(dst, src[kx:kx+run])
 							} else {
-								src := x.data[(ch*x.h+yy)*x.w : (ch*x.h+yy+1)*x.w]
 								copyPaddedWindow(dst, src, xx+kx-c.kernel/2)
 							}
-							p += run
 						}
+						p += run
 					}
 				}
 			}
@@ -238,14 +279,14 @@ func (r qi21VAEResidual) forward(s *qi21VAEWorkspace, x diffusionTensor) diffusi
 	if s.err != nil {
 		return x
 	}
-	y := diffusionTensor{slices.Clone(x.data), x.c, x.h, x.w}
-	qi21VAENorm(y, r.norm1, true)
-	y = r.conv1.forward(s, y)
+	normalized := diffusionTensor{slices.Clone(x.data), x.c, x.h, x.w}
+	qi21VAENorm(normalized, r.norm1, true)
+	y := r.conv1.forward(s, normalized)
 	if s.err != nil {
 		return x
 	}
 	qi21VAENorm(y, r.norm2, true)
-	y = r.conv2.forward(s, y)
+	y = r.conv2.forwardInto(s, y, normalized.data)
 	if s.err != nil {
 		return x
 	}
@@ -306,18 +347,6 @@ func (v *qwenImage21VAE) attention(s *qi21VAEWorkspace, x diffusionTensor) diffu
 	return y
 }
 
-func qi21VAEUpsample(x diffusionTensor) diffusionTensor {
-	y := diffusionTensor{make([]float32, len(x.data)*4), x.c, x.h * 2, x.w * 2}
-	for ch := range y.c {
-		for yy := range y.h {
-			for xx := range y.w {
-				y.data[(ch*y.h+yy)*y.w+xx] = x.data[(ch*x.h+yy/2)*x.w+xx/2]
-			}
-		}
-	}
-	return y
-}
-
 // DupUp3D repeats channels before rearranging them into temporal/spatial
 // positions. For the first frame only the last temporal subpixel survives.
 func qi21VAEAddUpShortcut(dst, src diffusionTensor, temporal int) {
@@ -363,7 +392,7 @@ func (v *qwenImage21VAE) decodeTile(s *qi21VAEWorkspace, x diffusionTensor) diff
 			}
 		}
 		if up.conv != nil {
-			x = up.conv.forward(s, qi21VAEUpsample(x))
+			x = up.conv.upsample(s, x)
 			if s.err != nil {
 				return x
 			}

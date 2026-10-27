@@ -68,6 +68,7 @@ type fileRuntimeConfig struct {
 }
 
 type fileServerConfig struct {
+	ImageModelDir  *string `json:"image_model_dir,omitempty"`
 	RequestTimeout *string `json:"request_timeout,omitempty"`
 	Minimal        *bool   `json:"minimal,omitempty"`
 	Address        *string `json:"address,omitempty"`
@@ -130,6 +131,7 @@ var cliValueOptions = map[string]bool{
 	"--deployment":           true,
 	"--admin-token":          true,
 	"--admin-token-file":     true,
+	"--image-model-dir":      true,
 	"--chat-history":         true,
 	"--wasm-dir":             true,
 	"--max-connections":      true,
@@ -339,6 +341,9 @@ func applyFileConfig(cfg *cliConfig, raw fileConfig) error {
 		}
 	}
 	if s := raw.Server; s != nil {
+		if s.ImageModelDir != nil {
+			cfg.imageModelDir = *s.ImageModelDir
+		}
 		if s.RequestTimeout != nil {
 			d, err := time.ParseDuration(*s.RequestTimeout)
 			if err != nil || d <= 0 {
@@ -484,6 +489,7 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 		AutoEffort   string `json:"auto_effort,omitempty"`
 	}
 	type effectiveServerConfig struct {
+		ImageModelDir   string   `json:"image_model_dir,omitempty"`
 		RequestTimeout  string   `json:"request_timeout,omitempty"`
 		Minimal         bool     `json:"minimal,omitempty"`
 		Address         string   `json:"address,omitempty"`
@@ -556,8 +562,9 @@ func writeEffectiveConfig(w io.Writer, cfg cliConfig) error {
 	if cfg.modelSelector != nil {
 		result.Model = *cfg.modelSelector
 	}
-	if cfg.requestTimeout > 0 || cfg.minimal || cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.ragDocsDir != "" || cfg.ragEmbedModel != "" || cfg.ragSnapshotPath != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
+	if cfg.imageModelDir != "" || cfg.requestTimeout > 0 || cfg.minimal || cfg.serveAddr != "" || cfg.featuresSet || cfg.deploymentMode != server.DeploymentLocal || cfg.chatUI || cfg.chatHistoryPath != "" || cfg.maxConn != 8 || cfg.skillsDir != "" || cfg.ragDocsDir != "" || cfg.ragEmbedModel != "" || cfg.ragSnapshotPath != "" || cfg.osCommandsPolicy != "" || cfg.osCommandsAllow != "" {
 		result.Server = &effectiveServerConfig{
+			ImageModelDir:   cfg.imageModelDir,
 			Minimal:         cfg.minimal,
 			Address:         cfg.serveAddr,
 			Features:        cfg.features.EnabledNames(),

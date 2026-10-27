@@ -60,7 +60,7 @@ func observeRequests(next http.Handler, observe func(RequestObservation)) http.H
 			}
 			endpoint := r.URL.Path
 			switch endpoint {
-			case "/v1/systemone/csv", "/v1/systemone", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models", "/generate":
+			case "/v1/images/generations", "/v1/systemone/csv", "/v1/systemone", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models", "/generate":
 			default:
 				endpoint = "other"
 			}
@@ -75,13 +75,21 @@ func observeRequests(next http.Handler, observe func(RequestObservation)) http.H
 }
 
 func withInferenceDeadline(next http.Handler, timeout time.Duration) http.Handler {
+	imageTimeout := timeout
+	if imageTimeout <= 0 {
+		imageTimeout = 10 * time.Minute
+	}
 	if timeout <= 0 {
 		timeout = 2 * time.Minute
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/systemone/csv", "/v1/systemone", "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/api/generate", "/api/chat", "/api/embed", "/api/embeddings":
-			ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		case "/v1/images/generations", "/v1/systemone/csv", "/v1/systemone", "/generate", "/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/api/generate", "/api/chat", "/api/embed", "/api/embeddings":
+			deadline := timeout
+			if r.URL.Path == "/v1/images/generations" {
+				deadline = imageTimeout
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), deadline)
 			defer cancel()
 			r = r.WithContext(ctx)
 		}

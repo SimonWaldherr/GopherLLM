@@ -84,6 +84,7 @@
         </div>
       </div>
       <div class="top">
+        {{if .HasImageGeneration}}<a class="text-button" href="/images">Generate image</a>{{end}}
         <div id="status" class="status" role="status" aria-live="polite">
           <span class="status-dot" aria-hidden="true"></span>
           <span id="statusText">Ready</span>

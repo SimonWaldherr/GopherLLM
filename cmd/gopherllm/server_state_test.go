@@ -80,6 +80,11 @@ func TestResumeLastModelAppliesToAnyCLIMode(t *testing.T) {
 		t.Fatal("resume was not logged")
 	}
 
+	imageServer := cliConfig{imageModelDir: "/models/image"}
+	if resumeLastModel(&imageServer, &logs) || imageServer.modelSelector != nil {
+		t.Fatal("image server resumed an unrequested chat model")
+	}
+
 	explicit := "other.gguf"
 	cfg.modelSelector = &explicit
 	if resumeLastModel(&cfg, &logs) {
