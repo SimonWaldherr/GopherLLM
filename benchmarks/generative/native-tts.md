@@ -159,3 +159,23 @@ python scripts/tts-reference.py --model /path/to/mms-tts-deu \
 `GOPHERLLM_TTS_REFERENCE` may point to another generated reference file. Go's
 seed is deliberately not expected to match PyTorch's seed; input noise is
 captured in the fixture for numerical comparisons.
+
+## Short pointwise projections, 2026-10-29
+
+Unpadded 1×1 convolutions with at most four output channels per group and
+128 frames now write GEMM results directly to the caller's output. Other
+shapes keep the tiled packing path. Input/output overlap checks and the
+long-utterance cancellation boundaries remain in place.
+
+For a 192→2 projection over 64 frames, nine alternating batches on M2 Max
+measured **1.42×** portable and **1.20×** Accelerate throughput. Packing
+scratch falls from **49,664 bytes to zero** with the output already allocated.
+These are operator measurements, not whole-utterance synthesis timings.
+[All cases, raw output and limits](../maintenance/tts-pointwise-m2-max-2026-10-29.json).
+
+```sh
+CGO_ENABLED=0 GOMAXPROCS=8 go test ./internal/engine -run '^TestTTSPointwiseDirect' \
+  -bench '^BenchmarkTTSPointwiseDirect$' -benchtime=9x -count=1 -benchmem
+```
+
+Repeat with `CGO_ENABLED=1` on macOS to measure the Accelerate backend.

@@ -221,3 +221,40 @@ buffer for their second convolution's output. This removes an intermediate
 feature-map allocation in both VAEs; Qwen's existing reference images still
 pass. The [FLUX fixture comparison](flux3.md#residual-workspace-reuse-2026-10-28)
 measures this change, without a new pretrained Qwen throughput claim.
+
+## VAE normalization, 2026-10-28
+
+Channel RMS normalization now processes contiguous spatial windows with a
+fixed 1 KiB stack tile. Channel reduction and output arithmetic retain their
+float32 order; tests check bitwise parity and the existing VAE/pipeline oracles.
+There are no heap allocations or retained workspace growth in this operation.
+
+M2 Max, 256×128×128 values, seven alternating reference/optimized pairs:
+
+| Normalization | Previous median | Tiled median | Speedup |
+|---|---:|---:|---:|
+| Without SiLU | 37.05 ms | 8.11 ms | 4.57× |
+| With SiLU | 67.00 ms | 50.74 ms | 1.32× |
+
+Both variants include the same input copy. Background load was present; these
+are operator timings, not full-image throughput or paging measurements.
+[Raw samples and method](../maintenance/qwen-vae-norm-m2-max-2026-10-28.json).
+
+```sh
+CGO_ENABLED=0 GOMAXPROCS=8 go test ./internal/engine \
+  -run '^TestQwenImage21VAENorm' -bench '^BenchmarkQwenImage21VAENorm$' \
+  -benchtime=7x -count=1 -benchmem
+```
+
+## VAE attention reuse, 2026-10-29
+
+The decoder reuses consumed normalization storage for query layout conversion
+and attention output, and transposes its square score matrix in place.
+The existing 16×16 latent-tile bound, GEMM shapes and float64 softmax remain.
+Old/new operator outputs compare bit-for-bit on both CPU backends.
+
+For a 768-channel 16×16 tile on M2 Max, allocated bytes fall from **5.75 to
+4 MiB per call**, and allocations from seven to four. Paired median latency
+was 2.298 → 2.348 ms under background load; this change targets allocation
+volume and does not establish a Qwen throughput gain.
+[Raw measurements](../maintenance/vae-attention-reuse-m2-max-2026-10-29.json).

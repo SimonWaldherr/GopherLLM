@@ -90,6 +90,30 @@ func ttsConv1DInto(ctx context.Context, x ttsMatrix, weight ttsWeight, bias []fl
 		return y, ctx.Err()
 	}
 	rows, cols := out/groups, in*kernel
+	if kernel == 1 && padding == 0 && rows <= 4 && length <= ttsConvTileFrames {
+		// Thin duration-parameter projections already have the GEMM layout.
+		// Only one tile is bypassed, preserving long-utterance cancellation
+		// boundaries and the established packing path for wider projections.
+		for g := range groups {
+			weights := weight.data[g*rows*in : (g+1)*rows*in]
+			input := x.data[g*in*length : (g+1)*in*length]
+			output := y.data[g*rows*length : (g+1)*rows*length]
+			if err := scratch.gemm.multiply(ctx, rows, length, in, weights, input, output); err != nil {
+				return ttsMatrix{}, err
+			}
+			for oc := range rows {
+				var offset float32
+				if bias != nil {
+					offset = bias[g*rows+oc]
+				}
+				row := output[oc*length : (oc+1)*length]
+				for j := range row {
+					row[j] += offset
+				}
+			}
+		}
+		return y, nil
+	}
 	tile := min(ttsConvTileFrames, length)
 	ensureLenNoClear(&scratch.patch, cols*tile)
 	ensureLenNoClear(&scratch.projected, rows*tile)

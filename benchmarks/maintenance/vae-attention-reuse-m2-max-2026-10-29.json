@@ -1,0 +1,81 @@
+{
+  "date": "2026-10-29",
+  "base_commit": "f03b7ec",
+  "host": "Apple M2 Max",
+  "go_version": "go1.27.3 darwin/arm64",
+  "cgo_enabled": true,
+  "gomaxprocs": 8,
+  "command": "CGO_ENABLED=1 GOMAXPROCS=8 go test ./internal/engine -run '^TestVAEAttentionReuse' -bench '^BenchmarkVAEAttention' -benchtime=7x -count=1 -benchmem",
+  "method": "Seven alternating reference/reused pairs, fresh per-call VAE workspace. Per-variant sorted medians from BenchmarkVAEAttentionPaired; allocated bytes and allocation counts from the separate per-variant BenchmarkVAEAttentionReuse. The reference keeps the preceding attention layout/allocation logic but uses the same normalization and GEMM helpers as the reused path.",
+  "limits": "Kernel-level synthetic weights; host was not isolated. These are allocation totals and operator times, not whole-image throughput, peak RSS, or paging measurements. Qwen timing is effectively unchanged/slightly slower; its benefit here is reduced allocation. Qwen decoding already caps its latent attention tile at 16x16.",
+  "changes": [
+    "Qwen reuses consumed normalization storage first for token-major queries, then for mixed output; scores transpose in place instead of allocating a second square matrix.",
+    "FLUX reuses a single projection slab across Q/K/V and as attention output; consumed normalization becomes V and consumed Q becomes output. This reduces channel-map allocations from nine to four.",
+    "A shared private tiled transpose converts CHW/token-major views without changing any float32 bits. GEMM shapes, attention backend and softmax are unchanged."
+  ],
+  "cases": [
+    {
+      "family": "qwen",
+      "channels": 768,
+      "height": 16,
+      "width": 16,
+      "reference_sorted_samples_ns": [
+        2187417,
+        2231584,
+        2257416,
+        2297542,
+        2313583,
+        2509959,
+        2630333
+      ],
+      "reused_sorted_samples_ns": [
+        2186750,
+        2212875,
+        2323333,
+        2348416,
+        2352708,
+        2379083,
+        2524834
+      ],
+      "reference_median_ns": 2297542,
+      "reused_median_ns": 2348416,
+      "speedup": 0.978336887502044,
+      "reference_allocated_bytes_per_call": 6029328,
+      "reference_allocations_per_call": 7,
+      "reused_allocated_bytes_per_call": 4194306,
+      "reused_allocations_per_call": 4
+    },
+    {
+      "family": "flux",
+      "channels": 512,
+      "height": 32,
+      "width": 32,
+      "reference_sorted_samples_ns": [
+        9564292,
+        9865875,
+        9897667,
+        10008791,
+        10093791,
+        10359458,
+        10894833
+      ],
+      "reused_sorted_samples_ns": [
+        7101084,
+        7202125,
+        7390333,
+        7589958,
+        7600792,
+        7649750,
+        8097250
+      ],
+      "reference_median_ns": 10008791,
+      "reused_median_ns": 7589958,
+      "speedup": 1.3186885882635977,
+      "reference_allocated_bytes_per_call": 19924565,
+      "reference_allocations_per_call": 14,
+      "reused_allocated_bytes_per_call": 9438333,
+      "reused_allocations_per_call": 8
+    }
+  ],
+  "raw_go_output": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVAEAttentionReuse/qwen/reference=true-8         \t       7\t   2473440 ns/op\t 6029328 B/op\t       7 allocs/op\nBenchmarkVAEAttentionReuse/qwen/reference=false-8        \t       7\t   2332833 ns/op\t 4194306 B/op\t       4 allocs/op\nBenchmarkVAEAttentionReuse/flux/reference=true-8         \t       7\t  10414655 ns/op\t19924565 B/op\t      14 allocs/op\nBenchmarkVAEAttentionReuse/flux/reference=false-8        \t       7\t   7610173 ns/op\t 9438333 B/op\t       8 allocs/op\nBenchmarkVAEAttentionPaired/qwen-8                       \t       7\t   4679821 ns/op\t   2297542 reference-ns/op\t   2348416 reuse-ns/op\t         0.9783 speedup\t10223616 B/op\t      11 allocs/op\n--- BENCH: BenchmarkVAEAttentionPaired/qwen-8\n    vae_attention_reuse_test.go:227: reference_sorted_samples_ns=[2557375] reuse_sorted_samples_ns=[2416875]\n    vae_attention_reuse_test.go:227: reference_sorted_samples_ns=[2187417 2231584 2257416 2297542 2313583 2509959 2630333] reuse_sorted_samples_ns=[2186750 2212875 2323333 2348416 2352708 2379083 2524834]\nBenchmarkVAEAttentionPaired/flux-8                       \t       7\t  17617679 ns/op\t  10008791 reference-ns/op\t   7589958 reuse-ns/op\t         1.319 speedup\t29362653 B/op\t      22 allocs/op\n--- BENCH: BenchmarkVAEAttentionPaired/flux-8\n    vae_attention_reuse_test.go:227: reference_sorted_samples_ns=[10904542] reuse_sorted_samples_ns=[8445000]\n    vae_attention_reuse_test.go:227: reference_sorted_samples_ns=[9564292 9865875 9897667 10008791 10093791 10359458 10894833] reuse_sorted_samples_ns=[7101084 7202125 7390333 7589958 7600792 7649750 8097250]\nPASS\nok  \tgithub.com/SimonWaldherr/GopherLLM/internal/engine\t0.655s\n"
+}

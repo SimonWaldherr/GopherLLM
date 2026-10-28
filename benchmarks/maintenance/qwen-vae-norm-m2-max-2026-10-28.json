@@ -1,0 +1,144 @@
+{
+  "date": "2026-10-28",
+  "base_commit": "f03b7ec",
+  "host": "Apple M2 Max",
+  "go_version": "go1.27.3 darwin/arm64",
+  "cgo_enabled": false,
+  "gomaxprocs": 8,
+  "command": "CGO_ENABLED=0 GOMAXPROCS=8 go test ./internal/engine -run '^TestQwenImage21VAENorm' -bench '^BenchmarkQwenImage21VAENorm$' -benchtime=7x -count=1 -benchmem",
+  "method": "Seven alternating reference/tiled pairs per shape; each timed call copies the same source and then normalizes. Custom metrics are per-variant medians, while Go ns/op covers the complete pair and timing overhead. Setup and allocations are untimed.",
+  "limits": "Host was not isolated. A prior sequential benchmark showed large background-load drift; alternating pairs reduce order bias. This measures the normalization operator plus source copy, not complete image-generation throughput or paging. No full checkpoint run was made.",
+  "workspace": "Fixed 256-float (1024-byte) local tile; zero heap allocations and no retained workspace increase.",
+  "validation": [
+    "Bitwise agreement with the pre-change float32 loop on ordinary, zero and subnormal inputs, including partial tiles.",
+    "Equivalent signed-zero, overflow, infinity and NaN behavior.",
+    "Existing Qwen-Image VAE and complete pipeline reference tests pass with CGO_ENABLED=0 and CGO_ENABLED=1."
+  ],
+  "cases": [
+    {
+      "channels": 64,
+      "height": 32,
+      "width": 32,
+      "silu": false,
+      "pair_ns_per_op": 436679,
+      "reference_median_ns_per_op": 274125,
+      "tiled_median_ns_per_op": 78958,
+      "speedup": 3.4717824666278276,
+      "time_reduction_percent": 71.19635202918377,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "reference_sorted_samples_ns": [
+        257542,
+        259500,
+        270166,
+        274125,
+        277375,
+        278875,
+        857708
+      ],
+      "tiled_sorted_samples_ns": [
+        76458,
+        76667,
+        78291,
+        78958,
+        79667,
+        81375,
+        108292
+      ]
+    },
+    {
+      "channels": 64,
+      "height": 32,
+      "width": 32,
+      "silu": true,
+      "pair_ns_per_op": 2273506,
+      "reference_median_ns_per_op": 761583,
+      "tiled_median_ns_per_op": 665916,
+      "speedup": 1.1436622637089362,
+      "time_reduction_percent": 12.561598670138386,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "reference_sorted_samples_ns": [
+        743417,
+        747791,
+        749375,
+        761583,
+        1712959,
+        1735792,
+        2299417
+      ],
+      "tiled_sorted_samples_ns": [
+        651041,
+        651875,
+        652167,
+        665916,
+        729792,
+        1850042,
+        1959875
+      ]
+    },
+    {
+      "channels": 256,
+      "height": 128,
+      "width": 128,
+      "silu": false,
+      "pair_ns_per_op": 50561494,
+      "reference_median_ns_per_op": 37046833,
+      "tiled_median_ns_per_op": 8112875,
+      "speedup": 4.566424726129763,
+      "time_reduction_percent": 78.1010295805852,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "reference_sorted_samples_ns": [
+        36027625,
+        36853792,
+        36876833,
+        37046833,
+        39927333,
+        48612125,
+        55993209
+      ],
+      "tiled_sorted_samples_ns": [
+        6952458,
+        7757833,
+        7993291,
+        8112875,
+        9909375,
+        10577625,
+        11281833
+      ]
+    },
+    {
+      "channels": 256,
+      "height": 128,
+      "width": 128,
+      "silu": true,
+      "pair_ns_per_op": 119922982,
+      "reference_median_ns_per_op": 67003666,
+      "tiled_median_ns_per_op": 50740208,
+      "speedup": 1.3205240703782688,
+      "time_reduction_percent": 24.272489806751764,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "reference_sorted_samples_ns": [
+        65802625,
+        65984500,
+        66957416,
+        67003666,
+        68135791,
+        69285125,
+        72471167
+      ],
+      "tiled_sorted_samples_ns": [
+        47631917,
+        47828208,
+        48555625,
+        50740208,
+        51569625,
+        56113958,
+        61372209
+      ]
+    }
+  ],
+  "raw_go_output": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkQwenImage21VAENorm/channels=64/grid=32x32/activate=false-8         \t       7\t    436679 ns/op\t    274125 reference-ns/op\t     78958 tiled-ns/op\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkQwenImage21VAENorm/channels=64/grid=32x32/activate=false-8\n    qwen_image21_norm_test.go:116: reference ns/op: [750958]; tiled ns/op: [83708]\n    qwen_image21_norm_test.go:116: reference ns/op: [257542 259500 270166 274125 277375 278875 857708]; tiled ns/op: [76458 76667 78291 78958 79667 81375 108292]\nBenchmarkQwenImage21VAENorm/channels=64/grid=32x32/activate=true-8          \t       7\t   2273506 ns/op\t    761583 reference-ns/op\t    665916 tiled-ns/op\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkQwenImage21VAENorm/channels=64/grid=32x32/activate=true-8\n    qwen_image21_norm_test.go:116: reference ns/op: [2331834]; tiled ns/op: [2108084]\n    qwen_image21_norm_test.go:116: reference ns/op: [743417 747791 749375 761583 1712959 1735792 2299417]; tiled ns/op: [651041 651875 652167 665916 729792 1850042 1959875]\nBenchmarkQwenImage21VAENorm/channels=256/grid=128x128/activate=false-8      \t       7\t  50561494 ns/op\t  37046833 reference-ns/op\t   8112875 tiled-ns/op\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkQwenImage21VAENorm/channels=256/grid=128x128/activate=false-8\n    qwen_image21_norm_test.go:116: reference ns/op: [41976458]; tiled ns/op: [9547167]\n    qwen_image21_norm_test.go:116: reference ns/op: [36027625 36853792 36876833 37046833 39927333 48612125 55993209]; tiled ns/op: [6952458 7757833 7993291 8112875 9909375 10577625 11281833]\nBenchmarkQwenImage21VAENorm/channels=256/grid=128x128/activate=true-8       \t       7\t 119922982 ns/op\t  67003666 reference-ns/op\t  50740208 tiled-ns/op\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkQwenImage21VAENorm/channels=256/grid=128x128/activate=true-8\n    qwen_image21_norm_test.go:116: reference ns/op: [72341208]; tiled ns/op: [62508875]\n    qwen_image21_norm_test.go:116: reference ns/op: [65802625 65984500 66957416 67003666 68135791 69285125 72471167]; tiled ns/op: [47631917 47828208 48555625 50740208 51569625 56113958 61372209]\nPASS\nok  \tgithub.com/SimonWaldherr/GopherLLM/internal/engine\t1.756s\n"
+}

@@ -1,0 +1,150 @@
+{
+  "date": "2026-10-29",
+  "base_commit": "f03b7ec",
+  "host": "Apple M2 Max",
+  "go_version": "go1.27.3 darwin/arm64",
+  "gomaxprocs": 8,
+  "command": "GOMAXPROCS=8 go test ./internal/engine -run ^TestTTS -bench ^BenchmarkTTSPointwiseDirect$ -benchtime=9x -count=1 -benchmem (once each with CGO_ENABLED=0 and 1)",
+  "method": "Nine alternating old/current pairs, each time sample averaging sixteen calls. Output and workspace are warmed/reused. Both paths retain identical parameter/overlap validation; the reference reconstructs the previous packing algorithm. Custom medians are per call; standard Go ns/op covers a 32-call pair and timing overhead.",
+  "limits": "Host was not isolated. Wide controls use the packed path and showed timing differences under background load; these data do not isolate their cause. These are convolution operator measurements, not whole-utterance throughput or model RSS. No official MMS checkpoint run was made.",
+  "dispatch": "Direct CHW GEMM only for unpadded kernel=1, at most four output rows per group and at most 128 frames. Wider, depthwise and long convolutions keep the existing packed/depthwise paths and cancellation boundaries.",
+  "validation": [
+    "Bitwise packed/direct outputs across 1,31,127,128,129,257 frames, groups 1/2, 2/4/12 output channels, optional bias and dilation 3, in both CGO modes.",
+    "Input remains unchanged; direct cases allocate no patch/projected buffers.",
+    "All TestTTS tests including scalar convolutions, validation/cancellation, partial aliases, buffer reuse and synthetic Torch vocoder reference pass with CGO_ENABLED=0 and 1. Official MMS parity skipped because no checkpoint was configured."
+  ],
+  "runs": [
+    {
+      "backend": "portable",
+      "cases": [
+        {
+          "input_channels": 192,
+          "output_channels": 2,
+          "frames": 32,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 3492,
+          "current_median_ns": 2325,
+          "packed_scratch_bytes": 24832,
+          "current_scratch_bytes": 0,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": true,
+          "speedup": 1.5019354838709678
+        },
+        {
+          "input_channels": 192,
+          "output_channels": 2,
+          "frames": 64,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 5091,
+          "current_median_ns": 3585,
+          "packed_scratch_bytes": 49664,
+          "current_scratch_bytes": 0,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": true,
+          "speedup": 1.4200836820083682
+        },
+        {
+          "input_channels": 192,
+          "output_channels": 4,
+          "frames": 128,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 15997,
+          "current_median_ns": 12302,
+          "packed_scratch_bytes": 100352,
+          "current_scratch_bytes": 0,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": true,
+          "speedup": 1.3003576654202569
+        },
+        {
+          "input_channels": 192,
+          "output_channels": 192,
+          "frames": 32,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 193937,
+          "current_median_ns": 251156,
+          "packed_scratch_bytes": 49152,
+          "current_scratch_bytes": 49152,
+          "steady_state_pair_bytes_per_op": 592,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": false,
+          "speedup": 0.7721774514644285
+        }
+      ],
+      "raw_go_output": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkTTSPointwiseDirect/in=192/out=2/frames=32-8         \t       9\t     93546 ns/op\t      2325 direct_ns/op\t         0 direct_scratch_B\t      3492 packed_ns/op\t     24832 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=2/frames=32-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[3552] direct_sorted_ns=[2333]\n    tts_pointwise_test.go:157: packed_sorted_ns=[3481 3487 3487 3489 3492 3492 3507 3515 3523] direct_sorted_ns=[2320 2325 2325 2325 2325 2341 2359 2364 2393]\nBenchmarkTTSPointwiseDirect/in=192/out=2/frames=64-8         \t       9\t    138944 ns/op\t      3585 direct_ns/op\t         0 direct_scratch_B\t      5091 packed_ns/op\t     49664 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=2/frames=64-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[47119] direct_sorted_ns=[3565]\n    tts_pointwise_test.go:157: packed_sorted_ns=[5078 5080 5083 5088 5091 5093 5096 5122 5135] direct_sorted_ns=[3554 3562 3575 3575 3585 3588 3591 3593 3612]\nBenchmarkTTSPointwiseDirect/in=192/out=4/frames=128-8        \t       9\t    451509 ns/op\t     12302 direct_ns/op\t         0 direct_scratch_B\t     15997 packed_ns/op\t    100352 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=4/frames=128-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[15234] direct_sorted_ns=[12250]\n    tts_pointwise_test.go:157: packed_sorted_ns=[15617 15674 15677 15986 15997 16026 16039 16052 16080] direct_sorted_ns=[12270 12276 12291 12296 12302 12307 12322 12343 12349]\nBenchmarkTTSPointwiseDirect/in=192/out=192/frames=32-8       \t       9\t  12071056 ns/op\t    251156 direct_ns/op\t     49152 direct_scratch_B\t    193937 packed_ns/op\t     49152 packed_scratch_B\t     592 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=192/frames=32-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[147880] direct_sorted_ns=[278552]\n    tts_pointwise_test.go:157: packed_sorted_ns=[157080 175130 177403 183520 193937 202645 222494 576989 968312] direct_sorted_ns=[180294 214424 232218 235585 251156 269026 365080 529445 1654622]\nPASS\nok  \tgithub.com/SimonWaldherr/GopherLLM/internal/engine\t0.484s\n"
+    },
+    {
+      "backend": "Accelerate",
+      "cases": [
+        {
+          "input_channels": 192,
+          "output_channels": 2,
+          "frames": 32,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 5044,
+          "current_median_ns": 3906,
+          "packed_scratch_bytes": 24832,
+          "current_scratch_bytes": 0,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": true,
+          "speedup": 1.2913466461853558
+        },
+        {
+          "input_channels": 192,
+          "output_channels": 2,
+          "frames": 64,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 9270,
+          "current_median_ns": 7752,
+          "packed_scratch_bytes": 49664,
+          "current_scratch_bytes": 0,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": true,
+          "speedup": 1.1958204334365325
+        },
+        {
+          "input_channels": 192,
+          "output_channels": 4,
+          "frames": 128,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 5835,
+          "current_median_ns": 1408,
+          "packed_scratch_bytes": 100352,
+          "current_scratch_bytes": 0,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": true,
+          "speedup": 4.144176136363637
+        },
+        {
+          "input_channels": 192,
+          "output_channels": 192,
+          "frames": 32,
+          "pairs": 9,
+          "calls_per_timed_batch": 16,
+          "packed_median_ns": 10281,
+          "current_median_ns": 10437,
+          "packed_scratch_bytes": 49152,
+          "current_scratch_bytes": 49152,
+          "steady_state_pair_bytes_per_op": 0,
+          "steady_state_pair_allocs_per_op": 0,
+          "direct_path_selected": false,
+          "speedup": 0.9850531762000575
+        }
+      ],
+      "raw_go_output": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkTTSPointwiseDirect/in=192/out=2/frames=32-8         \t       9\t    143324 ns/op\t      3906 direct_ns/op\t         0 direct_scratch_B\t      5044 packed_ns/op\t     24832 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=2/frames=32-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[5091] direct_sorted_ns=[3914]\n    tts_pointwise_test.go:157: packed_sorted_ns=[5041 5041 5041 5041 5044 5044 5044 5046 5065] direct_sorted_ns=[3903 3903 3903 3903 3906 3906 3906 3908 3911]\nBenchmarkTTSPointwiseDirect/in=192/out=2/frames=64-8         \t       9\t    277514 ns/op\t      7752 direct_ns/op\t         0 direct_scratch_B\t      9270 packed_ns/op\t     49664 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=2/frames=64-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[9309] direct_sorted_ns=[7750]\n    tts_pointwise_test.go:157: packed_sorted_ns=[8989 9250 9250 9260 9270 9283 9682 10424 10981] direct_sorted_ns=[7520 7562 7747 7750 7752 7755 7789 7796 7958]\nBenchmarkTTSPointwiseDirect/in=192/out=4/frames=128-8        \t       9\t    115481 ns/op\t      1408 direct_ns/op\t         0 direct_scratch_B\t      5835 packed_ns/op\t    100352 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=4/frames=128-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[5890] direct_sorted_ns=[1388]\n    tts_pointwise_test.go:157: packed_sorted_ns=[5614 5677 5692 5783 5835 5869 5911 5916 5924] direct_sorted_ns=[1351 1359 1362 1382 1408 1414 1458 1466 1466]\nBenchmarkTTSPointwiseDirect/in=192/out=192/frames=32-8       \t       9\t    333384 ns/op\t     10437 direct_ns/op\t     49152 direct_scratch_B\t     10281 packed_ns/op\t     49152 packed_scratch_B\t       0 B/op\t       0 allocs/op\n--- BENCH: BenchmarkTTSPointwiseDirect/in=192/out=192/frames=32-8\n    tts_pointwise_test.go:157: packed_sorted_ns=[10265] direct_sorted_ns=[10385]\n    tts_pointwise_test.go:157: packed_sorted_ns=[9750 10250 10257 10281 10281 10286 10296 10463 11854] direct_sorted_ns=[9906 10364 10427 10432 10437 10458 10468 10544 10658]\nPASS\nok  \tgithub.com/SimonWaldherr/GopherLLM/internal/engine\t0.264s\n"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-29",
+  "base_commit": "f03b7ec1b854bc35d25dcdc7efad96b0dde387eb",
+  "request": {
+    "prompt": "A studio photograph of a glossy red ceramic teapot centered on a pale blue table. Its curved handle is on the left and its short spout points right. Soft window light casts a gentle shadow against a plain cream background. The composition contains one teapot and no other objects.",
+    "width": 256,
+    "height": 256,
+    "steps": 16,
+    "seed": 42,
+    "threads": 8,
+    "model": ".cache/flux3/klein",
+    "checkpoint_revision": "337337621b8526e120f2275d250242f4a6bedd75"
+  },
+  "binary_sha256": "acb990981fc8837a1c8ef02fa1ef29bfd804d25e9e3791383e4d2388e0d2b276",
+  "source_sha256": {
+    "internal/engine/qwen_image21_vae.go": "eee96dcc51e1d9635e1faa07223648bd7803c513a0486f358104725a99262d77",
+    "internal/engine/flux3_vae.go": "023c9e4935b136b214ef0ead501d125e72de93855cdc7a0e75e38cb39169f69e",
+    "internal/engine/tts_conv.go": "c27c99cbf4cf6c0409199c40208f165518a3ab4db869b5010d7d5371295448c8"
+  },
+  "vm_stat_before": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    61582.\nPages active:                                 529046.\nPages inactive:                               520369.\nPages speculative:                              7843.\nPages throttled:                                   0.\nPages wired down:                             419620.\nPages purgeable:                                3961.\n\"Translation faults\":                     3128314627.\nPages copy-on-write:                       274350061.\nPages zero filled:                        2003605222.\nPages reactivated:                         203034504.\nPages purged:                               51352200.\nFile-backed pages:                            412505.\nAnonymous pages:                              644753.\nPages stored in compressor:                  1116128.\nPages occupied by compressor:                 502032.\nDecompressions:                            259288629.\nCompressions:                              347094876.\nPageins:                                   132369936.\nPageouts:                                     435276.\nSwapins:                                     9821430.\nSwapouts:                                   15100026.\n",
+  "limitations": [
+    "One final pretrained correctness run; no isolated end-to-end speed comparison.",
+    "System memory counters include all concurrent processes; process RSS is not total system memory."
+  ],
+  "exit_code": 0,
+  "wall_seconds_including_load": 210.45440258301096,
+  "maximum_resident_set_bytes": 8723693568,
+  "minor_faults": 88584,
+  "major_faults": 2185372,
+  "swaps": 0,
+  "vm_stat_after": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    37048.\nPages active:                                 280151.\nPages inactive:                               283045.\nPages speculative:                              4131.\nPages throttled:                                   0.\nPages wired down:                             584145.\nPages purgeable:                                  42.\n\"Translation faults\":                     3149900291.\nPages copy-on-write:                       275580430.\nPages zero filled:                        2009339534.\nPages reactivated:                         208494379.\nPages purged:                               51650588.\nFile-backed pages:                            435029.\nAnonymous pages:                              132298.\nPages stored in compressor:                  1762528.\nPages occupied by compressor:                 851966.\nDecompressions:                            263481736.\nCompressions:                              352881838.\nPageins:                                   135510395.\nPageouts:                                     444253.\nSwapins:                                     9842318.\nSwapouts:                                   15277570.\n",
+  "image": "benchmarks/generative/flux3-teapot-256.png",
+  "image_sha256": "3d0ae815b40c8c45ed82c7086e1c94b829d3ab2c6a7f204b39ef4ac65083fca7",
+  "image_bytes": 72107,
+  "previous_image_sha256": "3d0ae815b40c8c45ed82c7086e1c94b829d3ab2c6a7f204b39ef4ac65083fca7",
+  "image_matches_reference": true,
+  "prior_reference_run": "benchmarks/generative/flux3-pretrained-256-m2-max.json",
+  "validation_note": "The newly generated PNG is byte-identical to the existing tracked reference; no duplicate image is stored."
+}

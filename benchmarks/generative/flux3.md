@@ -168,6 +168,31 @@ VAE workspace are limited to 2 GiB. These limits exclude mapped model files,
 allocator overhead and other applications. Base CFG uses two DiT states.
 The estimates are allocation guards, not a guarantee of swap-free operation.
 
+## VAE attention reuse, 2026-10-29
+
+The decoder now keeps four channel maps instead of nine during attention.
+Consumed normalization and projection buffers are reused only after their
+readers have finished. Q/K/V layout copies share a tiled transpose helper;
+GEMM shapes, attention backend and softmax arithmetic stay the same.
+
+On M2 Max, a 512-channel 32×32 attention call measured **10.009 → 7.590 ms**
+(1.32×), with allocated bytes falling from **19 to 9 MiB**. These are
+per-call operator measurements with synthetic weights and a fresh workspace,
+not peak model RSS or complete image-generation throughput.
+[Raw samples and allocation counts](../maintenance/vae-attention-reuse-m2-max-2026-10-29.json).
+
+A subsequent pretrained 256×256, 16-step run produced the exact reference PNG
+hash `3d0ae815b40c8c45ed82c7086e1c94b829d3ab2c6a7f204b39ef4ac65083fca7`.
+The run took 210.45 seconds including load and reached 8.12 GiB process peak
+RSS on the busy host. This is a correctness check, not a controlled throughput
+or paging comparison. [Validation record](flux3-pretrained-256-validation-2026-10-29.json).
+
+```sh
+CGO_ENABLED=1 GOMAXPROCS=8 go test ./internal/engine \
+  -run 'TestVAEAttentionReuse|TestTransposeVAEInto' \
+  -bench '^BenchmarkVAEAttention' -benchtime=7x -count=1 -benchmem
+```
+
 ## Reproduction
 
 Place `dit.py`, `autoencoder.py`, `text_encoder.py` and `sampling.py` from the

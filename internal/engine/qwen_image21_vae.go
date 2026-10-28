@@ -251,19 +251,32 @@ func (c qi21VAEConv) forwardSpatial(s *qi21VAEWorkspace, x diffusionTensor, upsa
 func qi21VAENorm(x diffusionTensor, gamma []float32, activate bool) {
 	n := x.h * x.w
 	scale := float32(math.Sqrt(float64(x.c)))
-	for p := range n {
-		sum := float32(0)
+	// Reduce a small spatial tile in channel order. Contiguous channel windows
+	// avoid repeatedly walking a large CHW map with a full-plane stride, while
+	// retaining the original float32 reduction and output arithmetic order.
+	var norms [256]float32
+	for start := 0; start < n; start += len(norms) {
+		width := min(len(norms), n-start)
+		denom := norms[:width]
+		clear(denom)
 		for ch := range x.c {
-			value := x.data[ch*n+p]
-			sum += value * value
-		}
-		denom := max(float32(math.Sqrt(float64(sum))), float32(1e-12))
-		for ch := range x.c {
-			value := x.data[ch*n+p] / denom * scale * gamma[ch]
-			if activate {
-				value = siluExact(value)
+			values := x.data[ch*n+start : ch*n+start+width]
+			for i, value := range values {
+				denom[i] += value * value
 			}
-			x.data[ch*n+p] = value
+		}
+		for i, sum := range denom {
+			denom[i] = max(float32(math.Sqrt(float64(sum))), float32(1e-12))
+		}
+		for ch := range x.c {
+			values := x.data[ch*n+start : ch*n+start+width]
+			for i, input := range values {
+				value := input / denom[i] * scale * gamma[ch]
+				if activate {
+					value = siluExact(value)
+				}
+				values[i] = value
+			}
 		}
 	}
 }
@@ -296,10 +309,32 @@ func (r qi21VAEResidual) forward(s *qi21VAEWorkspace, x diffusionTensor) diffusi
 	return y
 }
 
+// Transpose disjoint row-major maps a cache-sized block at a time. Both CHW
+// projections and token-major attention use this layout conversion.
+func transposeVAEInto(dst, src []float32, rows, cols int) {
+	const tile = 32
+	for first := 0; first < rows; first += tile {
+		for start := 0; start < cols; start += tile {
+			width := min(tile, cols-start)
+			for row := first; row < min(first+tile, rows); row++ {
+				values := src[row*cols+start : row*cols+start+width]
+				for j, value := range values {
+					dst[(start+j)*rows+row] = value
+				}
+			}
+		}
+	}
+}
+
 func (v *qwenImage21VAE) attention(s *qi21VAEWorkspace, x diffusionTensor) diffusionTensor {
 	if s.err != nil {
 		return x
 	}
+	if err := s.ctx.Err(); err != nil {
+		s.err = err
+		return x
+	}
+
 	n := x.h * x.w
 	normalized := diffusionTensor{slices.Clone(x.data), x.c, x.h, x.w}
 	qi21VAENorm(normalized, v.attentionNorm, false)
@@ -308,7 +343,9 @@ func (v *qwenImage21VAE) attention(s *qi21VAEWorkspace, x diffusionTensor) diffu
 		return x
 	}
 	q, k, values := qkv.data[:x.c*n], qkv.data[x.c*n:2*x.c*n], qkv.data[2*x.c*n:]
-	queries := make([]float32, n*x.c)
+	// Normalization is consumed once Q/K/V are projected. Reuse that slab
+	// first for token-major queries, then for the channel-major mixed output.
+	queries := normalized.data
 	for ch := range x.c {
 		for p := range n {
 			queries[p*x.c+ch] = q[ch*n+p]
@@ -329,14 +366,15 @@ func (v *qwenImage21VAE) attention(s *qi21VAEWorkspace, x diffusionTensor) diffu
 		}
 		softmaxF64InPlace(row, maximum)
 	}
-	transposed := make([]float32, n*n)
+	// The square score matrix has no remaining reader in its original layout.
+	// Swapping the lower triangle avoids a second quadratic allocation.
 	for i := range n {
-		for j := range n {
-			transposed[j*n+i] = scores[i*n+j]
+		for j := 0; j < i; j++ {
+			scores[i*n+j], scores[j*n+i] = scores[j*n+i], scores[i*n+j]
 		}
 	}
-	mixed := diffusionTensor{make([]float32, len(x.data)), x.c, x.h, x.w}
-	s.gemm(x.c, n, n, values, transposed, mixed.data)
+	mixed := diffusionTensor{normalized.data, x.c, x.h, x.w}
+	s.gemm(x.c, n, n, values, scores, mixed.data)
 	y := v.projection.forward(s, mixed)
 	if s.err != nil {
 		return x

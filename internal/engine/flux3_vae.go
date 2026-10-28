@@ -120,31 +120,40 @@ func (v *flux3VAE) attention(s *flux3VAEWorkspace, x diffusionTensor) diffusionT
 	if s.conv.err != nil {
 		return x
 	}
+	if err := s.conv.ctx.Err(); err != nil {
+		s.conv.err = err
+		return x
+	}
+
 	n := x.h * x.w
 	y := diffusionTensor{make([]float32, len(x.data)), x.c, x.h, x.w}
 	v.attentionNorm.apply(&s.norm, y.data, x.data, n, false)
-	flat := func(c qi21VAEConv) []float32 {
-		z := c.forward(&s.conv, y)
-		out := make([]float32, len(z.data))
-		for p := range n {
-			for ch := range x.c {
-				out[p*x.c+ch] = z.data[ch*n+p]
-			}
+	// A projection result is consumed immediately by the layout conversion.
+	// Reuse that slab for all three projections and, after the final one,
+	// for attention output. The normalization slab becomes V once its final
+	// projection has returned; Q becomes the final projection's destination.
+	projected := make([]float32, len(x.data))
+	flat := func(c qi21VAEConv, out []float32) {
+		z := c.forwardInto(&s.conv, y, projected)
+		if s.conv.err != nil {
+			return
 		}
-		return out
+		transposeVAEInto(out, z.data, x.c, n)
 	}
-	q, k, values := flat(v.q), flat(v.k), flat(v.v)
+	q, k := make([]float32, len(x.data)), make([]float32, len(x.data))
+	flat(v.q, q)
+	flat(v.k, k)
+	flat(v.v, y.data)
 	if s.conv.err != nil {
 		return x
 	}
-	mixed := make([]float32, len(x.data))
-	imageAttention(s.conv.ctx, q, k, values, mixed, n, n, 1, x.c, 0, 0, &s.scores)
-	for p := range n {
-		for ch := range x.c {
-			y.data[ch*n+p] = mixed[p*x.c+ch]
-		}
+	imageAttention(s.conv.ctx, q, k, y.data, projected, n, n, 1, x.c, 0, 0, &s.scores)
+	if err := s.conv.ctx.Err(); err != nil {
+		s.conv.err = err
+		return x
 	}
-	y = v.projection.forward(&s.conv, y)
+	transposeVAEInto(y.data, projected, n, x.c)
+	y = v.projection.forwardInto(&s.conv, y, q)
 	if s.conv.err == nil {
 		addInPlace(y.data, x.data)
 	}
