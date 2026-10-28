@@ -1,0 +1,53 @@
+{
+  "request": {
+    "prompt": "A studio photograph of a glossy red ceramic teapot centered on a pale blue table. Its curved handle is on the left and its short spout points right. Soft window light casts a gentle shadow against a plain cream background. The composition contains one teapot and no other objects.",
+    "width": 256,
+    "height": 256,
+    "steps": 16,
+    "seed": 42,
+    "threads": 8,
+    "model": ".cache/flux3/klein",
+    "checkpoint_revision": "337337621b8526e120f2275d250242f4a6bedd75"
+  },
+  "source_commit": "d440e6f5ae92bb273083e250961ec5c4098ca4d3",
+  "go_version": "go version go1.27.3 darwin/arm64",
+  "binary_sha256": "cede7238f7f03bfd0904fa547c0e75c0213c5385b332f76cbe7cf514e7e31b96",
+  "started_utc": "2026-10-28T18:12:18.115513+00:00",
+  "component_sha256": {
+    ".cache/flux3/klein/ae.gguf.sha256": "4755b224a429d41acad4dd3beec815fc10163b63a13e14e3ad4dfc5fb6574862",
+    ".cache/flux3/klein/model.gguf.sha256": "5f6697612347d059a48316a52cd62d3eb758ec1e6c3c18cfdb291b42352f77b2",
+    ".cache/flux3/klein/text_encoder/model-00002-of-00002.gguf.sha256": "dc7180aabbf0152aa73830ad829efc50cacd47cf5812f554490b83fa91e9c8b2",
+    ".cache/flux3/klein/text_encoder/model-00001-of-00002.gguf.sha256": "46e117d59deb1d3908f54996eb775e748236715ed428833de32c3f2974629d0f"
+  },
+  "vm_stat_before": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                     8981.\nPages active:                                 378595.\nPages inactive:                               379321.\nPages speculative:                              2219.\nPages throttled:                                   0.\nPages wired down:                             408548.\nPages purgeable:                               16505.\n\"Translation faults\":                     2256162580.\nPages copy-on-write:                       211138397.\nPages zero filled:                        1459627703.\nPages reactivated:                         157384890.\nPages purged:                               41948400.\nFile-backed pages:                            289163.\nAnonymous pages:                              470972.\nPages stored in compressor:                  1887156.\nPages occupied by compressor:                 862828.\nDecompressions:                            221354465.\nCompressions:                              289145950.\nPageins:                                    98916067.\nPageouts:                                     314206.\nSwapins:                                     8512714.\nSwapouts:                                   13020679.\n",
+  "memory_pressure_before": "The system has 34359738368 (2097152 pages with a page size of 16384).\nSystem-wide memory free percentage: 37%\n",
+  "exit_code": 0,
+  "wall_seconds_including_load": 103.20758241700241,
+  "maximum_resident_set_bytes": 7396179968,
+  "page_reclaims": 81479,
+  "page_faults": 525969,
+  "swaps": 0,
+  "instructions_retired": 3710871590496,
+  "cycles_elapsed": 901815883741,
+  "peak_memory_footprint": 719986200,
+  "vm_stat_after": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    48074.\nPages active:                                 350155.\nPages inactive:                               347956.\nPages speculative:                              1291.\nPages throttled:                                   0.\nPages wired down:                             411079.\nPages purgeable:                                2382.\n\"Translation faults\":                     2258850142.\nPages copy-on-write:                       211247511.\nPages zero filled:                        1460471144.\nPages reactivated:                         157979463.\nPages purged:                               42126596.\nFile-backed pages:                            451038.\nAnonymous pages:                              248364.\nPages stored in compressor:                  1923053.\nPages occupied by compressor:                 881937.\nDecompressions:                            221824890.\nCompressions:                              289860104.\nPageins:                                    99497884.\nPageouts:                                     314360.\nSwapins:                                     8523127.\nSwapouts:                                   13078707.\n",
+  "image": "benchmarks/generative/flux3-teapot-256.png",
+  "image_sha256": "3d0ae815b40c8c45ed82c7086e1c94b829d3ab2c6a7f204b39ef4ac65083fca7",
+  "image_bytes": 72107,
+  "width": 256,
+  "height": 256,
+  "hardware": {
+    "cpu": "Apple M2 Max",
+    "model": "Mac14,6",
+    "memory_bytes": 34359738368,
+    "physical_cores": 12
+  },
+  "gomaxprocs": 8,
+  "backend": "native Go with CGO/Accelerate; no Python inference, Metal or Core ML graph",
+  "model_file_bytes": 9226769888,
+  "limitations": [
+    "One prompt and seed, with Q8_0 matrices. No full-checkpoint BF16/differential comparison.",
+    "Loading included; OS file cache not cleared after download. Background work not controlled.",
+    "RSS and process counters do not describe total-system memory or attribute system-wide swap activity."
+  ]
+}

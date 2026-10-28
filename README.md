@@ -68,6 +68,7 @@ and optionally runs Ministral for task suggestions and row explanations.
 - [Try it in five minutes](#try-it-in-five-minutes)
 - [Classify a CSV with Laya](#classify-a-csv-with-laya)
 - [Features](#features)
+- [Tested models](#tested-models)
 - [Native Laya classification](docs/laya.md)
 - [Native speech and image generation](docs/generation.md)
 - [Requirements](#requirements)
@@ -126,6 +127,56 @@ and optionally runs Ministral for task suggestions and row explanations.
   the Web UI with `--image-model-dir`), and unconditional CIFAR-10 diffusion.
   Image editing and video generation are not yet implemented
   ([setup, limitations and examples](docs/generation.md)).
+
+## Tested models
+
+Recorded checkpoint tests as of **2026-10-28**. Each entry links to its evidence;
+the final table identifies component and synthetic-reference coverage. The
+broader [architecture list](#supported-architectures) describes implementation
+support rather than a successful run of every pretrained checkpoint. Results
+apply to the recorded formats, backends and workloads.
+
+### Text generation
+
+| Model | Tested weights | Upstream | Recorded validation |
+| --- | --- | --- | --- |
+| Ministral 3 3B Instruct 2512 | Q4_K_M | Mistral AI · [@mistralai](https://github.com/mistralai) | [Complete Metal chat requests and token/state parity](benchmarks/metal/ministral-decode.md) |
+| Ministral 3 14B Reasoning 2512 | Q4_K_M | Mistral AI · [@mistralai](https://github.com/mistralai) | [Prefill/decode checks](docs/performance.md#metal) and [fixed-input decoder parity through 415 positions](benchmarks/metal/decode-paging.md#attention-through-512-positions-2026-10-25) |
+| Qwen 4B | Q8_0 | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Complete serial/prompt-lookup generation comparisons](#speculative-decoding); the historical record does not identify the checkpoint revision |
+| Qwen3.5-4B with native MTP | Q4_K_M, prithivMLmods conversion | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Paired complete generation with identical tokens, using the linked pinned GGUF](#speculative-decoding) |
+| Qwen3.8-27B | Q4_K_M, `qwen35` architecture | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Complete prefill/decode requests and live-state parity](benchmarks/metal/qwen-worker-norm.md#complete-qwen38-27b-q4_k_m-model) |
+| Ornith-1.0-35B | Q4_K_M | [Ornith / DeepReinforce](https://huggingface.co/ornith-ai/Ornith-1.0-35B) | [64-token generation comparisons and all 40 routed FFNs checked with CPU/Metal loading](#supported-architectures) |
+| Gemma 4 E2B-it | Q4_K_M | Google DeepMind · [@google-deepmind](https://github.com/google-deepmind) | [Complete generation, output/state parity and packed lookup-table checks](benchmarks/metal/model-priorities-2026-10.md) |
+| Gemma 4 26B-A4B-it | Q4_K_M | Google DeepMind · [@google-deepmind](https://github.com/google-deepmind) | [Complete generation and fixed-input vocabulary-selection parity](benchmarks/metal/model-priorities-2026-10.md) |
+
+### Embeddings, classification, speech and images
+
+| Model | Task | Upstream | Recorded validation |
+| --- | --- | --- | --- |
+| Granite Embedding 278m Multilingual, Q4_K_M | Embeddings / retrieval | IBM Granite · [@ibm-granite](https://github.com/ibm-granite) | [Source-GGUF/Core ML comparisons and a multilingual retrieval fixture](benchmarks/coreml/README.md#m2-max-results-2026-10-24) |
+| Laya English, `convaiinnovations/laya` | Structured classification | Convai Innovations · [@NandhaKishorM](https://github.com/NandhaKishorM) | [Pretrained tokenizer/decision outputs compared with the upstream CPU reference](docs/laya.md#supported-checkpoints-and-validation) |
+| Laya Multilingual, `convaiinnovations/laya` subfolder `multilingual` | Multilingual classification | Convai Innovations · [@NandhaKishorM](https://github.com/NandhaKishorM) | [Download → native German classification, upstream output comparison and offline cache reuse](docs/laya.md#supported-checkpoints-and-validation) |
+| Parakeet-TDT-0.6B-v3, Q8_0 | Speech-to-text | NVIDIA · [@NVIDIA](https://github.com/NVIDIA) | [Complete transcription of a 3.61-second clip; repeated text, token and encoder-output parity](benchmarks/encoders/speech-frontend.md#complete-parakeet-transcription) |
+| `facebook/mms-tts-deu`, F32 | German text-to-speech | Meta / FAIR · [@facebookresearch](https://github.com/facebookresearch) | [Full-checkpoint waveform comparison with PyTorch and native WAV generation](benchmarks/generative/native-tts.md) |
+| `google/ddpm-cifar10-32`, F32 | Unconditional 32×32 image generation | Google checkpoint; [DDPM authors](https://github.com/hojonathanho/diffusion) | [Full-checkpoint UNet and complete DDIM sampling compared with Diffusers](benchmarks/generative/native-diffusion.md) |
+| Qwen-Image-2.1-Turbo, Q8_0 matrices | Text-to-image | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Pretrained 64×64 and 256×256 PNG generation, visual inspection and recorded hashes](benchmarks/generative/qwen-image21.md#pretrained-turbo-generation) |
+| FLUX 3 Image Klein distilled, Q8_0 matrices | Text-to-image | Black Forest Labs · [@black-forest-labs](https://github.com/black-forest-labs) | [Pretrained 256×256 generation, 16 steps, seed 42: 103.21 s including loading, 6.89 GiB maximum RSS](benchmarks/generative/flux3.md#pretrained-generation-2026-10-28) |
+
+The timing and RSS above describe one M2 Max run, not a speed guarantee or a
+swap-free memory budget. The linked reports retain workload, hardware and
+paging limitations. FLUX's [generated image](benchmarks/generative/flux3-teapot-256.png)
+and [raw measurements](benchmarks/generative/flux3-pretrained-256-m2-max.json)
+are included; its downloaded weights remain outside Git.
+
+### Component and reference coverage
+
+| Model / graph | Upstream | Scope of successful checks |
+| --- | --- | --- |
+| Voxtral Mini 4B Realtime 2602, Q6_K GGUF | Mistral AI · [@mistralai](https://github.com/mistralai) | [Streaming encoder layer with real checkpoint weights](benchmarks/encoders/laya-voxtral.md), plus frontend/decoder fixtures; these measurements do not establish full-transcription accuracy or latency |
+| Qwen3-VL-4B-Instruct | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [First 32 text layers and eight intermediate states exercised inside pretrained FLUX generation](benchmarks/generative/flux3.md); no standalone vision-language evaluation |
+| Qwen-Image-2.1 base | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Shared component references and base scheduler checks](benchmarks/generative/qwen-image21.md#independent-numerical-tests); no pretrained base image run recorded |
+| FLUX 3 Image Klein Base | Black Forest Labs · [@black-forest-labs](https://github.com/black-forest-labs) | [Synthetic official-reference DiT and complete CFG pipelines](benchmarks/generative/flux3.md#checks-completed); no pretrained base generation recorded |
+| YOLOv8 / YOLO11 | Ultralytics · [@ultralytics](https://github.com/ultralytics) | [Synthetic checkpoint loading, forward/detection and numerical-reference tests](internal/vision/yolo/yolo_model_test.go); [`.pt` loading tests](internal/vision/yolo/torch_checkpoint_test.go) cover the supported tensor layouts |
 
 ## Requirements
 

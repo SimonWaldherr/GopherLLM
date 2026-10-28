@@ -95,8 +95,9 @@ The native Go implementation supports text-to-image generation with the BFL
 base and distilled checkpoints. It stacks eight intermediate Qwen3-VL hidden
 states and includes padding masks, separate image/text streams, joint attention, four-axis
 RoPE, flow-map target-time conditioning, Euler sampling and FLUX RGB decoder.
-The pipeline is **experimental**: small official-reference tests pass, but a
-pretrained image test is pending access to the gated weights. See the
+The pipeline is **experimental**: small official-reference tests pass, and the
+pretrained distilled Q8_0 checkpoint has generated a 256×256 image on a 32 GiB
+M2 Max. Larger images and pretrained base CFG remain unvalidated. See the
 [validation record](../benchmarks/generative/flux3.md).
 
 First obtain access to [the official checkpoint](https://huggingface.co/black-forest-labs/flux-3-image-klein)

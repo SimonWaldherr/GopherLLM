@@ -1,9 +1,42 @@
 # FLUX 3 Image Klein validation
 
 Status on 2026-10-28: native text-to-image implementation, **experimental**.
-The full pretrained checkpoint has not been run. Hugging Face returned HTTP 401
-for its gated files and this machine has no configured Hub token. There is no
-pretrained image-quality, throughput, peak-RSS or paging claim in this report.
+The distilled pretrained checkpoint now passes a native 256×256 generation test
+on the 32 GiB M2 Max. This is one prompt/seed with Q8_0 matrices, not a quality
+evaluation or a validation of larger images, base CFG or editing.
+
+## Pretrained generation, 2026-10-28
+
+The authenticated range importer downloaded the pinned distilled checkpoint
+and converted its required matrices to Q8_0. The four component GGUF files
+occupy 8.59 GiB; text encoder layers 33–36 and unused image branches are omitted.
+Go 1.27.3 with CGO/Accelerate ran the native engine from commit `d440e6f`, with
+GOMAXPROCS=8, eight workers, 16 steps and seed 42. Python was used for download
+and measurement only; the generator itself was the compiled Go executable.
+
+| Metric | Observed value |
+| --- | ---: |
+| Output | 256×256 RGB PNG |
+| Wall time, including loading and process teardown | 103.21 s |
+| Maximum resident set size, reported by macOS `time -l` | 7,396,179,968 bytes (6.89 GiB) |
+| Process page faults | 525,969 |
+| System swap-ins / swap-outs during the run | 10,413 / 58,028 pages |
+
+The image visibly matches the prompt's single red teapot, left handle, right
+spout, pale blue table and cream background. This is a visual smoke test;
+there is no full-checkpoint BF16/differential image comparison. Loading is
+included but the OS file cache was not cleared after downloading. This is a
+single observation without a controlled background load or speedup comparison.
+
+The process reports zero `swaps`, while system-wide swap counters increased.
+Those counters include other applications and cannot attribute paging solely
+to GopherLLM. RSS includes resident mapped pages; it is not a total-system RAM
+or swap-free-operation guarantee.
+
+![Native FLUX 256×256 teapot](flux3-teapot-256.png)
+
+The complete prompt, component/image hashes, VM snapshots and measurements are
+in [`flux3-pretrained-256-m2-max.json`](flux3-pretrained-256-m2-max.json).
 
 ## Reference and scope
 
@@ -39,6 +72,7 @@ decoder resampling/residual structure match the production architecture.
 | Native Q8_0 component loading | Both variants load, omit unused text layers and retain packed matrix storage |
 | Cancellation, close and validation | Invalid inputs rejected; cancellation after the first step permits later reuse; closed models reject generation |
 | CLI smoke test | A 64×96 PNG generated from the synthetic fixture |
+| Pretrained distilled CLI | Native 256×256, 16-step Q8_0 generation completes and produces a plausible prompt-matching image |
 | HTTP smoke test | `/images`, two 256×256 native generations with retention on/off, and `/v1/images/unload` passed using the synthetic fixture |
 | Existing Qwen image tests | Pass with shared projection/attention infrastructure and automatic model dispatch |
 | Full `go test ./...` | Pass with local loopback test servers permitted |
@@ -150,5 +184,6 @@ python -m unittest discover -s scripts -p 'test_download_*.py'
 node --test server/web_ui/images_test.cjs
 ```
 
-For the pending pretrained test, obtain model access and authenticate locally,
-then follow [the download and generation instructions](../../docs/generation.md#flux-3-image-klein).
+To reproduce the pretrained test, obtain model access and authenticate locally,
+then follow [the download and generation instructions](../../docs/generation.md#flux-3-image-klein)
+with the prompt and settings in the pretrained measurement JSON.

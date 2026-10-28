@@ -35,3 +35,4 @@ GopherLLM.test
 /bindings/swift/.swiftpm/
 xcuserdata/
 DerivedData/
+scripts/__pycache__
