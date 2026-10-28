@@ -35,6 +35,7 @@ const voxtralTranscript = document.getElementById("voxtralTranscript");
 let pendingImageDataURL = null; // data:image/...;base64,XXXX, or null
 let history = []; // [{role, content, imageDataURL?}]
 let voxtralCapture = null;
+let messageScrollPending = false;
 
 function setVoxtralStatus(text, cls) {
   voxtralStatus.textContent = text;
@@ -61,8 +62,9 @@ function resampleTo16k(input, sourceRate, state) {
 }
 
 async function drainVoxtral(capture) {
-  if (capture.sending) return;
-  capture.sending = true;
+  if (capture.sending) return capture.sending;
+  let drained;
+  capture.sending = new Promise((resolve) => { drained = resolve; });
   try {
     while (voxtralCapture === capture && capture.queue.length) {
       const pcm = capture.queue.shift();
@@ -70,22 +72,29 @@ async function drainVoxtral(capture) {
       if (text) voxtralTranscript.textContent = text;
     }
   } catch (err) {
+    capture.error = err;
+    capture.queue.length = 0;
     setVoxtralStatus("transcription failed: " + (err.message || err), "error");
-  } finally { capture.sending = false; }
+  } finally { capture.sending = null; drained(); }
 }
 
 async function stopVoxtralCapture() {
   const capture = voxtralCapture;
   if (!capture) return;
+  capture.processor.onaudioprocess = null;
   capture.source.disconnect(); capture.processor.disconnect(); capture.silence.disconnect();
   capture.media.getTracks().forEach((track) => track.stop());
-  while (capture.sending || capture.queue.length) await new Promise((resolve) => setTimeout(resolve, 25));
-  const text = await window.gopherllm_stopVoxtral();
-  if (text) voxtralTranscript.textContent = text;
-  await capture.context.close();
-  voxtralCapture = null;
-  voxtralRecordButton.textContent = "🎤 Start transcription";
-  setVoxtralStatus("stopped", "ok");
+  try {
+    await drainVoxtral(capture);
+    const text = await window.gopherllm_stopVoxtral();
+    if (text) voxtralTranscript.textContent = text;
+    if (capture.error) throw capture.error;
+    setVoxtralStatus("stopped", "ok");
+  } finally {
+    voxtralCapture = null;
+    voxtralRecordButton.textContent = "🎤 Start transcription";
+    await capture.context.close();
+  }
 }
 
 function setLoadStatus(text, cls) {
@@ -124,22 +133,29 @@ function readFileAsDataURL(file) {
   });
 }
 
-function renderMessages() {
-  messagesEl.innerHTML = "";
-  for (const m of history) {
-    const div = document.createElement("div");
-    div.className = "msg msg-" + m.role;
-    if (m.imageDataURL) {
-      const img = document.createElement("img");
-      img.src = m.imageDataURL;
-      div.appendChild(img);
-    }
-    const textNode = document.createElement("span");
-    textNode.textContent = m.content;
-    div.appendChild(textNode);
-    messagesEl.appendChild(div);
+function scrollMessages() {
+  if (messageScrollPending) return;
+  messageScrollPending = true;
+  requestAnimationFrame(() => {
+    messageScrollPending = false;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  });
+}
+
+function appendMessage(message) {
+  const row = document.createElement("div");
+  row.className = "msg msg-" + message.role;
+  if (message.imageDataURL) {
+    const image = document.createElement("img");
+    image.addEventListener("load", scrollMessages);
+    image.src = message.imageDataURL;
+    row.appendChild(image);
   }
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  const text = document.createTextNode(message.content);
+  row.appendChild(text);
+  messagesEl.appendChild(row);
+  scrollMessages();
+  return text;
 }
 
 function updateAttachVisibility() {
@@ -243,11 +259,13 @@ async function main() {
       voxtralRecordButton.disabled = false;
       return;
     }
+    voxtralRecordButton.disabled = true;
+    let context, media;
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("microphone access requires HTTPS or localhost");
       await window.gopherllm_startVoxtral();
-      const context = new (window.AudioContext || window.webkitAudioContext)();
-      const media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+      context = new (window.AudioContext || window.webkitAudioContext)();
+      media = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
       const source = context.createMediaStreamSource(media);
       const processor = context.createScriptProcessor(4096, 1, 1);
       // ScriptProcessor must be connected to run; a zero-gain sink avoids
@@ -255,6 +273,7 @@ async function main() {
       const silence = context.createGain(); silence.gain.value = 0;
       const capture = { context, media, source, processor, silence, queue: [], sending: false, resample: { tail: new Float32Array(0), pos: 0 } };
       processor.onaudioprocess = (event) => {
+        if (capture.error) return;
         const pcm = resampleTo16k(event.inputBuffer.getChannelData(0), context.sampleRate, capture.resample);
         if (pcm.length) { capture.queue.push(pcm); void drainVoxtral(capture); }
       };
@@ -265,8 +284,10 @@ async function main() {
       setVoxtralStatus("listening…");
     } catch (err) {
       setVoxtralStatus("could not start: " + (err.message || err), "error");
+      if (media) media.getTracks().forEach((track) => track.stop());
+      if (context) await context.close();
       try { await window.gopherllm_stopVoxtral(); } catch (_) {}
-    }
+    } finally { voxtralRecordButton.disabled = false; }
   });
 
   loadButton.addEventListener("click", async () => {
@@ -368,7 +389,7 @@ async function main() {
 
     const userMsg = { role: "user", content, imageDataURL: pendingImageDataURL };
     history.push(userMsg);
-    renderMessages();
+    appendMessage(userMsg);
 
     const wireMessages = history.map((m) => {
       const wire = { role: m.role, content: m.content };
@@ -386,7 +407,7 @@ async function main() {
 
     const assistantMsg = { role: "assistant", content: "" };
     history.push(assistantMsg);
-    renderMessages();
+    const assistantText = appendMessage(assistantMsg);
 
     sendButton.disabled = true;
     stopButton.classList.remove("hidden");
@@ -396,13 +417,16 @@ async function main() {
         JSON.stringify({ maxTokens: 512, temperature: 0.7, topP: 0.9, topK: 40, repeatPenalty: 1.1 }),
         (tok) => {
           assistantMsg.content += tok;
-          renderMessages();
+          assistantText.appendData(tok);
+          scrollMessages();
           return true;
         }
       );
     } catch (err) {
-      assistantMsg.content += "\n[error: " + (err && err.message ? err.message : String(err)) + "]";
-      renderMessages();
+      const error = "\n[error: " + (err && err.message ? err.message : String(err)) + "]";
+      assistantMsg.content += error;
+      assistantText.appendData(error);
+      scrollMessages();
     } finally {
       sendButton.disabled = false;
       stopButton.classList.add("hidden");

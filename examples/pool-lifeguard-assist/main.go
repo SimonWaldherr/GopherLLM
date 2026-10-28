@@ -24,7 +24,7 @@ func main() {
 	modelPath := flag.String("model", "", "path to local text GGUF (required)")
 	projectorPath := flag.String("mmproj", "", "path to matching Pixtral vision projector GGUF (required)")
 	zone := flag.String("zone", "Pool A", "operator-owned zone or camera label")
-	frames := flag.String("frames", "", "comma-separated paths to one or more local JPEG/PNG/WebP frames (required)")
+	frames := flag.String("frames", "", "comma-separated paths to one or more local JPEG/PNG frames (required)")
 	flag.Parse()
 	if *modelPath == "" || *projectorPath == "" || *frames == "" {
 		log.Fatal("-model, -mmproj, and -frames are required")

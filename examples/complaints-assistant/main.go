@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,8 +12,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"unicode/utf8"
 
@@ -21,6 +20,11 @@ import (
 
 const maxRequestBytes = 24 << 10
 const maxDetailsRunes = 4000
+
+//go:embed index.html app.js style.css
+var assets embed.FS
+
+type generateFunc func(context.Context, string, ...gopherllm.GenOption) (gopherllm.GenerationResult, error)
 
 type assistRequest struct {
 	Order struct {
@@ -74,15 +78,13 @@ func main() {
 	}
 	defer model.Close()
 
-	// Serve the static files next to this source file rather than relative
-	// to the process's working directory, so `go run .` from inside this
-	// directory works the same as `go run ./examples/complaints-assistant`
-	// from the repo root.
-	_, thisFile, _, _ := runtime.Caller(0)
-	staticDir := filepath.Dir(thisFile)
+	log.Printf("Complaints Assistant demo: http://%s (in-process model: %s)", *addr, *modelPath)
+	log.Fatal(http.ListenAndServe(*addr, newHandler(model.Generate)))
+}
 
+func newHandler(generate generateFunc) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.Dir(staticDir)))
+	mux.Handle("/", http.FileServer(http.FS(assets)))
 	mux.HandleFunc("/api/assist", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)
@@ -91,10 +93,14 @@ func main() {
 		}
 		defer r.Body.Close()
 		var in assistRequest
-		decoder := json.NewDecoder(io.LimitReader(r.Body, maxRequestBytes))
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&in); err != nil {
 			http.Error(w, "invalid demo request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			http.Error(w, "exactly one JSON request required", http.StatusBadRequest)
 			return
 		}
 		if strings.TrimSpace(in.Order.Number) == "" || strings.TrimSpace(in.Details) == "" {
@@ -107,7 +113,7 @@ func main() {
 		}
 
 		prompt := fmt.Sprintf("Order: %s\nProduct: %s\nPurchase date: %s\nPrice: %s\nWarranty until: %s\nIssue category: %s\nCustomer description: %s", in.Order.Number, in.Order.Product, in.Order.PurchasedAt, in.Order.Price, in.Order.WarrantyEnds, in.IssueType, in.Details)
-		generated, err := model.Generate(r.Context(), prompt,
+		generated, err := generate(r.Context(), prompt,
 			gopherllm.WithSystemPrompt(supportSystemPrompt),
 			gopherllm.WithMaxTokens(420),
 			gopherllm.WithTemperature(0.2),
@@ -129,8 +135,7 @@ func main() {
 		_ = json.NewEncoder(w).Encode(out)
 	})
 
-	log.Printf("Complaints Assistant demo: http://%s (in-process model: %s)", *addr, *modelPath)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	return mux
 }
 
 const supportSystemPrompt = `You are a careful customer-support intake assistant. Return ONLY valid JSON with this exact shape:

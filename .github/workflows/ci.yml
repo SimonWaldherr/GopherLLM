@@ -22,7 +22,8 @@ jobs:
           node --check server/web_ui/script.js
           node --check server/web_ui/vision.js
           node --check cmd/csv-workbench/web/app.js
-          node --test server/web_ui/*test.cjs cmd/csv-workbench/frontend.test.cjs
+          node --check cmd/gopherllm-wasm/demo/app.js
+          node --test server/web_ui/*test.cjs cmd/csv-workbench/frontend.test.cjs cmd/gopherllm-wasm/demo/app.test.cjs
 
   test:
     name: Test (${{ matrix.os }})

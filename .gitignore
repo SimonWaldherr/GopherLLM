@@ -16,6 +16,7 @@ GopherLLM.test
 
 # Local exports may contain private conversation or retrieval data.
 /rag/private/
+hestia-data/
 
 # Rust and Python bindings (bindings/rust, bindings/python) build artifacts.
 # Cargo.lock is intentionally not committed: this is a library crate (like

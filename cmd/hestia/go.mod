@@ -35,4 +35,4 @@ require (
 	simonwaldherr.de/go/smallr v0.0.5 // indirect
 )
 
-replace tinyRAG => /Users/simonwaldherr/git/tinyRAG
+replace tinyRAG => ../../../tinyRAG

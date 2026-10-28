@@ -102,7 +102,9 @@ final class LLMViewModel: ObservableObject {
             }
             if !streamingReply.isEmpty { messages.append(.assistant(streamingReply)) }
             streamingReply = ""
-            status = .ready
+            if status == .generating {
+                status = engine.isLoaded ? .ready : .noModel
+            }
         }
     }
 
@@ -116,7 +118,11 @@ final class LLMViewModel: ObservableObject {
     private func inspectSelected() {
         selectedInfo = nil
         guard let url = selected?.url else { return }
-        Task { selectedInfo = try? await GopherLLMEngine.inspectModel(at: url) }
+        Task {
+            let info = try? await GopherLLMEngine.inspectModel(at: url)
+            guard selected?.url == url else { return }
+            selectedInfo = info
+        }
     }
 
     private func fail(_ error: Error) {

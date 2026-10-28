@@ -412,7 +412,11 @@ func run() error {
 	} else if metalAvailable {
 		fmt.Fprintln(os.Stderr, "Metal: available (disabled; pass --metal or --auto to measure)")
 	} else {
-		fmt.Fprintln(os.Stderr, "Metal: unavailable (pure Go / no CGO)")
+		reason := gopherllm.MetalError()
+		if reason == "" {
+			reason = "not available on this system"
+		}
+		fmt.Fprintf(os.Stderr, "Metal: unavailable (%s)\n", reason)
 	}
 	if cfg.prepareQuant && !cfg.compress {
 		fmt.Fprintln(os.Stderr, "Quant prep: enabled for supported quantized weights")

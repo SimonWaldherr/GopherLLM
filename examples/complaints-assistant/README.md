@@ -17,6 +17,14 @@ Run the demo with the GGUF model that it should load directly:
 go run ./examples/complaints-assistant -model /path/to/model.gguf
 ```
 
+The HTML, JavaScript and CSS are embedded in the binary. A built executable
+also works outside the source checkout, including builds with `-trimpath`:
+
+```sh
+go build -trimpath -o /tmp/complaints-assistant ./examples/complaints-assistant
+/tmp/complaints-assistant -model /absolute/path/to/model.gguf
+```
+
 Open [http://127.0.0.1:8090](http://127.0.0.1:8090). The demo process opens
 the model once with `gopherllm.Open`, then calls `model.Generate` directly for
 each form submission. The browser only talks to the demo's small local handler;

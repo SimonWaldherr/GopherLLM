@@ -16,7 +16,7 @@ import (
 func main() {
 	modelPath := flag.String("model", "", "path to local text GGUF (required)")
 	projectorPath := flag.String("mmproj", "", "path to matching Pixtral vision projector GGUF (required)")
-	imagePath := flag.String("image", "", "path to local JPEG/PNG/WebP image (required)")
+	imagePath := flag.String("image", "", "path to local JPEG/PNG image (required)")
 	prompt := flag.String("prompt", "Describe only clearly visible evidence in this image.", "question for the image")
 	flag.Parse()
 	if *modelPath == "" || *projectorPath == "" || *imagePath == "" {
