@@ -175,11 +175,11 @@ pinned BFL revision in a local reference directory, then run:
 
 ```sh
 python scripts/flux3-reference.py /path/to/reference testdata/flux3
-go test . -run 'TestFlux3|TestOpenImageModel' -count=1
-GOMAXPROCS=8 go test . -run '^$' -bench 'BenchmarkFlux3TextAttention|BenchmarkImageUpsampleConv' -benchmem -count=5
-GOMAXPROCS=8 go test . -run '^$' -bench BenchmarkFlux3Stages -benchmem -benchtime=3x -count=5
-CGO_ENABLED=0 go test . -run 'TestFlux3|TestOpenImageModel' -count=1
-go test -race . ./server -run 'TestFlux3|TestOpenImageModel|TestQwenImage21|TestImage' -count=1
+go test ./internal/engine -run 'TestFlux3|TestOpenImageModel' -count=1
+GOMAXPROCS=8 go test ./internal/engine -run '^$' -bench 'BenchmarkFlux3TextAttention|BenchmarkImageUpsampleConv' -benchmem -count=5
+GOMAXPROCS=8 go test ./internal/engine -run '^$' -bench BenchmarkFlux3Stages -benchmem -benchtime=3x -count=5
+CGO_ENABLED=0 go test ./internal/engine -run 'TestFlux3|TestOpenImageModel' -count=1
+go test -race ./internal/engine ./server -run 'TestFlux3|TestOpenImageModel|TestQwenImage21|TestImage' -count=1
 python -m unittest discover -s scripts -p 'test_download_*.py'
 node --test server/web_ui/images_test.cjs
 ```

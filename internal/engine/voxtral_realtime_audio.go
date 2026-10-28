@@ -1,0 +1,654 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"math"
+)
+
+// This file implements the offline (non-streaming) forward pass from raw
+// 16kHz mono PCM samples through the mel-spectrogram frontend, the causal
+// audio encoder, and the audio-to-text adapter, producing one embedding per
+// AudioLengthPerTok worth of audio in the decoder's hidden size. It does not
+// decode arbitrary audio file formats. The incremental frontend and session
+// live in voxtral_stream_audio.go and voxtral_realtime_session.go; see
+// voxtral_realtime.go's doc comment for the overall architecture and how
+// each stage's math was verified.
+
+// voxtralDFTTables holds the precomputed real-DFT basis used to turn a
+// windowed frame into a power spectrum. The direct DFT preserves the original
+// SIMD dot-product order; speechMelTask schedules whole frames in parallel.
+type voxtralDFTTables struct {
+	cos, sin Weight // each Cols=NFFT, rows=NFFT/2+1 (inferred from len(F32)/Cols)
+	nFreq    int
+	nfft     int
+}
+
+func buildVoxtralDFTTables(nfft int) voxtralDFTTables {
+	nFreq := nfft/2 + 1
+	cos := make([]float32, nFreq*nfft)
+	sin := make([]float32, nFreq*nfft)
+	for k := range nFreq {
+		w := 2 * math.Pi * float64(k) / float64(nfft)
+		row := k * nfft
+		for n := range nfft {
+			s, c := math.Sincos(w * float64(n))
+			cos[row+n] = float32(c)
+			sin[row+n] = float32(-s) // conjugate: real DFT convention X[k] = sum x[n]*(cos - i*sin)
+		}
+	}
+	return voxtralDFTTables{
+		cos:   Weight{F32: cos, Cols: nfft},
+		sin:   Weight{F32: sin, Cols: nfft},
+		nFreq: nFreq,
+		nfft:  nfft,
+	}
+}
+
+// reflectPad mirrors numpy/torch "reflect" padding: the boundary sample is
+// not duplicated (pad=2 on [a,b,c,d,e] gives [c,b, a,b,c,d,e, d,c]), matching
+// torch.stft(center=True, pad_mode="reflect")'s default. Requires
+// len(samples) > pad; real audio clips are always far longer than
+// NFFT/2 (200 samples = 12.5ms at 16kHz).
+func reflectPad(samples []float32, pad int) ([]float32, error) {
+	n := len(samples)
+	if pad <= 0 {
+		return samples, nil
+	}
+	if n <= pad {
+		return nil, fmt.Errorf("reflect-padding: %d samples is too short for pad=%d", n, pad)
+	}
+	out := make([]float32, n+2*pad)
+	for i := range pad {
+		out[i] = samples[pad-i]
+		out[pad+n+i] = samples[n-2-i]
+	}
+	copy(out[pad:pad+n], samples)
+	return out, nil
+}
+
+// computeVoxtralRealtimeMelSpectrogramContext implements the exact frontend from
+// mistralai's reference feature extractor (verified against
+// antirez/voxtral.c's python_simple_implementation.py, which is
+// byte-for-byte OpenAI Whisper's log_mel_spectrogram with the one
+// deliberate change a streaming/causal model needs: the log-clamp floor is
+// the checkpoint's fixed Mel.GlobalLogMelMax instead of Whisper's per-clip
+// dynamic maximum, since a causal model can't know a future max):
+//
+//	stft   = STFT(pad_reflect(samples, NFFT/2), NFFT, hop, hann_window)
+//	power  = |stft[..., :-1]|^2                          // drop the last frame
+//	mel    = filterbank.T @ power                        // filterbank already Slaney-normalized on disk
+//	logmel = log10(max(mel, 1e-10))
+//	logmel = max(logmel, GlobalLogMelMax - 8.0)
+//	logmel = (logmel + 4.0) / 4.0
+//
+// Returns channel-major [NumMels][nFrames] flattened as mel[c*nFrames+t], the
+// layout the causal conv stem consumes directly. ctx is checked between
+// frames.
+func computeVoxtralRealtimeMelSpectrogramContext(ctx context.Context, cfg VoxtralRealtimeMelConfig, window []float32, filterbank Weight, samples []float32) (mel []float32, nFrames int, err error) {
+	if len(window) != cfg.WinLength {
+		return nil, 0, fmt.Errorf("mel spectrogram: window length %d, want win_length=%d", len(window), cfg.WinLength)
+	}
+	if cfg.WinLength != cfg.NFFT {
+		return nil, 0, fmt.Errorf("mel spectrogram: this implementation assumes win_length==n_fft (got %d/%d)", cfg.WinLength, cfg.NFFT)
+	}
+	padded := samples
+	if cfg.Center {
+		padded, err = reflectPad(samples, cfg.NFFT/2)
+		if err != nil {
+			return nil, 0, fmt.Errorf("mel spectrogram: %w", err)
+		}
+	}
+	if len(padded) < cfg.NFFT {
+		return nil, 0, fmt.Errorf("mel spectrogram: padded input (%d samples) shorter than n_fft=%d", len(padded), cfg.NFFT)
+	}
+	totalFrames := (len(padded)-cfg.NFFT)/cfg.HopLength + 1
+	// Whisper (and this checkpoint's frontend) discards the last centered
+	// STFT frame -- see this function's doc comment.
+	nFrames = totalFrames - 1
+	if nFrames <= 0 {
+		return nil, 0, fmt.Errorf("mel spectrogram: audio too short to produce any frames (%d samples)", len(samples))
+	}
+
+	numMels := cfg.NumMels
+	mel = make([]float32, numMels*nFrames)
+	task := speechMelTask{ctx: ctx, dft: cachedSpeechDFT(cfg.NFFT), samples: padded,
+		window: window, filterbank: filterbank, mel: mel, frames: nFrames,
+		hop: cfg.HopLength, preEmphasis: cfg.PreEmphasis}
+	if err := task.run(); err != nil {
+		return nil, 0, err
+	}
+	globalFloor := cfg.GlobalLogMelMax - 8.0
+	for i, v := range mel {
+		if i%numMels == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, err
+			}
+		}
+		if v < 1e-10 {
+			v = 1e-10
+		}
+		logv := float32(math.Log10(float64(v)))
+		if logv < globalFloor {
+			logv = globalFloor
+		}
+		mel[i] = (logv + 4) / 4
+	}
+	return mel, nFrames, nil
+}
+
+// causalConv1dOutputLen mirrors python_simple_implementation.py's
+// causal_conv1d padding arithmetic: pad left by kernel-stride (zeros), then
+// just enough zeros on the right to make the strided output cover every
+// input sample under ceiling division, rather than truncating floor-style.
+func causalConv1dOutputLen(length, kernel, stride int) (padLeft, padRight, outLen int) {
+	padLeft = kernel - stride
+	nFrames := float64(length-kernel+padLeft)/float64(stride) + 1
+	outLen = int(math.Ceil(nFrames - 1e-9))
+	targetLength := (outLen-1)*stride + (kernel - padLeft)
+	padRight = targetLength - length
+	if padRight < 0 {
+		padRight = 0
+	}
+	return
+}
+
+// applyCausalConv1dContext runs one of the encoder's two conv-stem layers. x is
+// channel-major [In][Length] flattened as x[i*length+t]; the result is
+// channel-major [Out][outLen], GELU-activated with the tanh approximation
+// (verified against antirez/voxtral.c's vox_gelu, not PyTorch's default
+// exact/erf GELU -- every GELU site in this file and voxtral_realtime_decoder.go
+// uses the same tanh approximation for this reason).
+func applyCausalConv1dContext(ctx context.Context, x []float32, in, length int, conv VoxtralRealtimeEncoderConv) (out []float32, outLen int, err error) {
+	if conv.In != in {
+		return nil, 0, fmt.Errorf("causal conv1d: input has %d channels, weight expects %d", in, conv.In)
+	}
+	padLeft, padRight, outLen := causalConv1dOutputLen(length, conv.Kernel, conv.Stride)
+	paddedLen := length + padLeft + padRight
+	padded := make([]float32, in*paddedLen)
+	for c := range in {
+		copy(padded[c*paddedLen+padLeft:c*paddedLen+padLeft+length], x[c*length:(c+1)*length])
+	}
+	out = make([]float32, conv.Out*outLen)
+	workers := 1
+	if outLen*conv.Out*in*conv.Kernel >= 1<<18 {
+		workers = max(1, min(outLen, numThreads()))
+	}
+	width := in * conv.Kernel
+	patches := make([]float32, workers*width)
+	// Independent output frames retain the exact per-channel dot/GELU order.
+	// One patch per worker bounds scratch regardless of the clip duration.
+	parallelChunks(workers, func(start, end int) {
+		for worker := start; worker < end; worker++ {
+			patch := patches[worker*width : (worker+1)*width]
+			for t := worker; t < outLen; t += workers {
+				if ctx.Err() != nil {
+					return
+				}
+				base := t * conv.Stride
+				for c := range in {
+					copy(patch[c*conv.Kernel:(c+1)*conv.Kernel], padded[c*paddedLen+base:c*paddedLen+base+conv.Kernel])
+				}
+				for o := range conv.Out {
+					v := DotF32(conv.Weight[o*width:(o+1)*width], patch)
+					if len(conv.Bias) > o {
+						v += conv.Bias[o]
+					}
+					out[o*outLen+t] = geluTanh(v)
+				}
+			}
+		}
+	})
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, outLen, nil
+}
+
+// standardRopeInvFreqSlice builds plain (non-YaRN) RoPE inverse frequencies
+// for pairs = headDim/2, decoupled from the Config-based buildRopeInvFreq
+// (the encoder/decoder here aren't loaded through the generic text-model
+// path this turn).
+func standardRopeInvFreqSlice(headDim int, theta float32) []float32 {
+	pairs := headDim / 2
+	inv := make([]float32, pairs)
+	for pair := range pairs {
+		i := float32(pair * 2)
+		inv[pair] = 1 / float32(math.Pow(float64(theta), float64(i/float32(headDim))))
+	}
+	return inv
+}
+
+// EncodeAudioVoxtralRealtime runs the mel frontend, causal conv stem, and
+// the NLayers-block causal audio-encoder transformer over one offline
+// (complete, non-streaming) audio clip, then the adapter, producing one
+// DecoderHiddenSize-wide embedding per group of Projector.DownsampleFactor
+// encoder frames -- ready to be summed into the decoder's text token
+// embeddings at matching sequence positions (see voxtral_realtime.go's doc
+// comment, point 4).
+func EncodeAudioVoxtralRealtime(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, samples []float32) (audioEmbeds [][]float32, err error) {
+	return EncodeAudioVoxtralRealtimeContext(context.Background(), cfg, weights, samples)
+}
+
+// EncodeAudioVoxtralRealtimeContext is the cancellable variant of EncodeAudioVoxtralRealtime.
+func EncodeAudioVoxtralRealtimeContext(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, samples []float32) (audioEmbeds [][]float32, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	mel, melFrames, err := computeVoxtralRealtimeMelSpectrogramContext(ctx, cfg.Mel, weights.MelWindow, weights.MelFilterbank, samples)
+	if err != nil {
+		return nil, fmt.Errorf("encoding audio: %w", err)
+	}
+
+	h, hLen, err := applyCausalConv1dContext(ctx, mel, cfg.Mel.NumMels, melFrames, weights.Encoder.Conv[0])
+	if err != nil {
+		return nil, fmt.Errorf("encoding audio: conv0: %w", err)
+	}
+	h, hLen, err = applyCausalConv1dContext(ctx, h, cfg.Encoder.DModel, hLen, weights.Encoder.Conv[1])
+	if err != nil {
+		return nil, fmt.Errorf("encoding audio: conv1: %w", err)
+	}
+	x, err := forwardVoxtralEncoderChunk(ctx, cfg, weights, h, hLen, nil)
+	if err != nil {
+		return nil, err
+	}
+	return projectAudioVoxtralRealtime(cfg, weights, x)
+}
+
+// A nil state evaluates an offline clip; a state retains only the causal
+// attention window, with absolute positions independent of cache eviction.
+//
+// kHead/vHead are per-layer, head-major K/V caches (each heads*stride*headDim
+// floats; only the first `total` positions per head are valid at any time).
+// stride is the currently allocated per-head capacity, grown -- with a
+// one-time per-head reshuffle via growVoxtralHeadBuffer -- only when a chunk
+// needs more room than it already has. A stable streaming chunk size (the
+// common case) settles the stride once and then only ever writes the new
+// rows for that push and, once the window is full, shifts each head's
+// region left in one bulk copy; it does not repack the whole window's worth
+// of already-cached positions on every push the way rebuilding a flat
+// buffer from a row-major history would.
+type voxtralEncoderState struct {
+	pos          int
+	kHead, vHead [][]float32
+	stride       int
+	scratch      voxtralEncoderScratch
+}
+
+// Transformer intermediates belong to one stream and can be overwritten by
+// its next chunk. The residual stream and returned encoder rows deliberately
+// live outside this workspace: adapter downsampling can retain some of them
+// until a later push.
+type voxtralEncoderScratch struct {
+	q, k, v, attnOut                    voxtralAudioMatrix
+	outProj, normed                     voxtralAudioMatrix
+	ffnGate, ffnUp, ffnDown             voxtralAudioMatrix
+	ropeSin, ropeCos, sin, cos, invFreq []float32
+	scores, offlineKHead, offlineVHead  []float32
+	ropeHeadDim                         int
+	ropeTheta                           float32
+}
+
+const voxtralEncoderScratchRetentionBytes = 64 << 20
+
+func (s *voxtralEncoderScratch) retainedBytes() uint64 {
+	var size uint64
+	for _, m := range []*voxtralAudioMatrix{&s.q, &s.k, &s.v, &s.attnOut, &s.outProj, &s.normed, &s.ffnGate, &s.ffnUp, &s.ffnDown} {
+		// A row header occupies at most 24 bytes on supported platforms.
+		size += uint64(cap(m.data))*4 + uint64(cap(m.rows))*24
+	}
+	for _, data := range [][]float32{s.ropeSin, s.ropeCos, s.sin, s.cos, s.invFreq, s.scores, s.offlineKHead, s.offlineVHead} {
+		size += uint64(cap(data)) * 4
+	}
+	return size
+}
+
+func (s *voxtralEncoderScratch) releaseIfOversized(limit uint64) {
+	if s.retainedBytes() > limit {
+		*s = voxtralEncoderScratch{}
+	}
+}
+
+type voxtralAudioMatrix struct {
+	rows [][]float32
+	data []float32
+}
+
+func (b *voxtralAudioMatrix) resize(rows, cols int) [][]float32 {
+	return resizeMatrixRows(&b.data, &b.rows, rows, cols, false)
+}
+
+// growVoxtralHeadBuffer enlarges a per-layer head-major K/V buffer from
+// oldStride to newStride per-head capacity, preserving each head's first
+// validLen positions at their new offset. A plain slice append cannot do
+// this: growing the per-head stride moves where every head after the first
+// begins, since each head's region is stride*headDim floats apart.
+func growVoxtralHeadBuffer(buf *[]float32, heads, headDim, oldStride, newStride, validLen int) {
+	grown := make([]float32, heads*newStride*headDim)
+	if oldStride > 0 && validLen > 0 {
+		for hh := range heads {
+			src := (*buf)[hh*oldStride*headDim : hh*oldStride*headDim+validLen*headDim]
+			dst := grown[hh*newStride*headDim : hh*newStride*headDim+validLen*headDim]
+			copy(dst, src)
+		}
+	}
+	*buf = grown
+}
+
+// evictVoxtralHeadBuffer keeps only the most recent window positions per
+// head, shifting each head's region left by the evicted amount with one
+// bulk copy (Go's copy is memmove-safe for overlapping ranges) instead of
+// appendVoxtralHistory's per-row shift-and-recycle.
+func evictVoxtralHeadBuffer(buf []float32, heads, headDim, stride, total, window int) {
+	if window <= 0 || total <= window {
+		return
+	}
+	evict := total - window
+	for hh := range heads {
+		base := hh * stride * headDim
+		copy(buf[base:base+window*headDim], buf[base+evict*headDim:base+total*headDim])
+	}
+}
+
+// audioMatrixRows stores an audio batch in one backing allocation. Keeping
+// each row's remaining capacity lets the BLAS path recognize and use the
+// contiguous matrix directly, while portable kernels still consume rows.
+func audioMatrixRows(rows, cols int) [][]float32 {
+	result := make([][]float32, rows)
+	data := make([]float32, rows*cols)
+	for i := range result {
+		result[i] = data[i*cols : (i+1)*cols]
+	}
+	return result
+}
+
+func forwardVoxtralEncoderChunk(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, h []float32, hLen int, state *voxtralEncoderState) ([][]float32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Offline convolution produces channel-major [DModel][n]. Streaming
+	// convolution already produces time-major rows and bypasses this copy.
+	x := audioMatrixRows(hLen, cfg.Encoder.DModel)
+	for t := range hLen {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		for c := range cfg.Encoder.DModel {
+			x[t][c] = h[c*hLen+t]
+		}
+	}
+	return forwardVoxtralEncoderRowsChunk(ctx, cfg, weights, x, state)
+}
+
+// forwardVoxtralEncoderRowsChunk consumes owned time-major convolution rows
+// in place. Neither its result nor those rows alias the reusable scratch.
+func forwardVoxtralEncoderRowsChunk(ctx context.Context, cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, x [][]float32, state *voxtralEncoderState) ([][]float32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	startPos := 0
+	var localScratch voxtralEncoderScratch
+	scratch := &localScratch
+	if state != nil {
+		startPos = state.pos
+		scratch = &state.scratch
+		// A large one-off audio burst can use temporary workspace without
+		// keeping its largest intermediates resident for the whole session.
+		defer scratch.releaseIfOversized(voxtralEncoderScratchRetentionBytes)
+		if state.kHead == nil {
+			state.kHead = make([][]float32, len(weights.Encoder.Layers))
+			state.vHead = make([][]float32, len(weights.Encoder.Layers))
+		}
+	}
+
+	dim := cfg.Encoder.DModel
+	heads := cfg.Encoder.NHeads
+	headDim := cfg.Encoder.HeadDim
+	// Q/K/V project DModel (1280) up to heads*headDim (2048) -- verified
+	// against the real checkpoint's attn.q/k/v.weight dims [1280,2048] and
+	// attn.out.weight dims [2048,1280]. Unlike most decoder-only text
+	// architectures in this codebase, the audio encoder's attention width
+	// is NOT tied to its residual-stream width, so qkvDim must be tracked
+	// separately from dim rather than asserted equal to it.
+	qkvDim := heads * headDim
+	if qkvDim <= 0 {
+		return nil, fmt.Errorf("encoding audio: invalid encoder heads=%d headDim=%d", heads, headDim)
+	}
+	n := len(x)
+
+	if scratch.ropeHeadDim != headDim || scratch.ropeTheta != cfg.Encoder.RopeTheta {
+		scratch.invFreq = standardRopeInvFreqSlice(headDim, cfg.Encoder.RopeTheta)
+		scratch.ropeHeadDim, scratch.ropeTheta = headDim, cfg.Encoder.RopeTheta
+	}
+	scale := float32(1 / math.Sqrt(float64(headDim)))
+
+	q := scratch.q.resize(n, qkvDim)
+	k := scratch.k.resize(n, qkvDim)
+	v := scratch.v.resize(n, qkvDim)
+	attnOut := scratch.attnOut.resize(n, qkvDim)
+	outProj := scratch.outProj.resize(n, dim)
+	normed := scratch.normed.resize(n, dim)
+	ffnGateOut := scratch.ffnGate.resize(n, cfg.Encoder.FFNDim)
+	ffnUpOut := scratch.ffnUp.resize(n, cfg.Encoder.FFNDim)
+	ffnDownOut := scratch.ffnDown.resize(n, dim)
+
+	ensureLenNoClear(&scratch.ropeSin, n*(headDim/2))
+	ensureLenNoClear(&scratch.ropeCos, n*(headDim/2))
+	ropeSin, ropeCos := scratch.ropeSin, scratch.ropeCos
+	ropeHalf := 0
+	for t := range n {
+		half, nCache := prepareRopeScratch(startPos+t, headDim, headDim, scratch.invFreq, 1, &scratch.sin, &scratch.cos)
+		ropeHalf = half
+		if nCache > 0 {
+			copy(ropeSin[t*half:t*half+nCache], scratch.sin[:nCache])
+			copy(ropeCos[t*half:t*half+nCache], scratch.cos[:nCache])
+		}
+	}
+
+	window := cfg.Encoder.SlidingWindow
+
+	// past/total/stride are identical for every layer (all layers see the
+	// same new frames and the same window), so resolve and, rarely, grow
+	// every layer's persistent buffer once here rather than per layer.
+	past := 0
+	if state != nil {
+		if window > 0 {
+			past = min(state.pos, window)
+		} else {
+			past = state.pos
+		}
+	}
+	total := past + n
+	if state != nil && total > state.stride {
+		for li := range state.kHead {
+			growVoxtralHeadBuffer(&state.kHead[li], heads, headDim, state.stride, total, past)
+			growVoxtralHeadBuffer(&state.vHead[li], heads, headDim, state.stride, total, past)
+		}
+		state.stride = total
+	}
+	stride := total
+	if state != nil {
+		stride = state.stride
+	}
+
+	for li := range weights.Encoder.Layers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		layer := &weights.Encoder.Layers[li]
+		for t := range n {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			rmsNormInto(x[t], layer.AttnNorm, cfg.Encoder.Epsilon, &normed[t])
+		}
+		blasMatvecBatch(layer.Q, normed, q)
+		blasMatvecBatch(layer.K, normed, k)
+		blasMatvecBatch(layer.V, normed, v)
+		for t := range n {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if len(layer.QB) >= qkvDim {
+				addInPlace(q[t], layer.QB[:qkvDim])
+			}
+			if len(layer.VB) >= qkvDim {
+				addInPlace(v[t], layer.VB[:qkvDim])
+			}
+			if ropeHalf > 0 {
+				sin := ropeSin[t*ropeHalf : (t+1)*ropeHalf]
+				cos := ropeCos[t*ropeHalf : (t+1)*ropeHalf]
+				// Row order (split-half vs. interleaved) depends on which
+				// GGUF conversion tool produced this file -- see
+				// VoxtralRealtimeConfig.RopeInterleaved's doc comment.
+				applyPreparedRope(q[t], headDim, heads, ropeHalf, ropeHalf, sin, cos, cfg.RopeInterleaved)
+				applyPreparedRope(k[t], headDim, heads, ropeHalf, ropeHalf, sin, cos, cfg.RopeInterleaved)
+			}
+		}
+
+		var kHead, vHead []float32
+		if state != nil {
+			kHead, vHead = state.kHead[li], state.vHead[li]
+		} else {
+			ensureLenNoClear(&scratch.offlineKHead, heads*total*headDim)
+			ensureLenNoClear(&scratch.offlineVHead, heads*total*headDim)
+			kHead, vHead = scratch.offlineKHead, scratch.offlineVHead
+		}
+		// Only the new n rows need writing: any earlier [0,past) positions
+		// are already in place from a previous push (or, offline, past==0).
+		for t := range n {
+			kt, vt := k[t], v[t]
+			for hh := range heads {
+				off := hh * headDim
+				base := hh*stride*headDim + (past+t)*headDim
+				copy(kHead[base:base+headDim], kt[off:off+headDim])
+				copy(vHead[base:base+headDim], vt[off:off+headDim])
+			}
+		}
+
+		if !blasAttentionBatch(q, kHead, vHead, attnOut, heads, headDim, past, window, stride, scale) {
+			ensureLenNoClear(&scratch.scores, total)
+			scores := scratch.scores
+			for t := range n {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				lo := 0
+				end := past + t
+				if window > 0 && end-window+1 > 0 {
+					lo = end - window + 1
+				}
+				for hh := range heads {
+					off := hh * headDim
+					query := q[t][off : off+headDim]
+					kh := kHead[hh*stride*headDim : hh*stride*headDim+total*headDim]
+					vh := vHead[hh*stride*headDim : hh*stride*headDim+total*headDim]
+					maxScore := negMaxF32
+					for j := lo; j <= end; j++ {
+						s := DotF32(query, kh[j*headDim:(j+1)*headDim]) * scale
+						scores[j] = s
+						maxScore = max(maxScore, s)
+					}
+					denom := float32(0)
+					for j := lo; j <= end; j++ {
+						scores[j] = fastExpF32(scores[j] - maxScore)
+						denom += scores[j]
+					}
+					out := attnOut[t][off : off+headDim]
+					clear(out)
+					if denom > 0 {
+						inv := 1 / denom
+						for j := lo; j <= end; j++ {
+							AxpyF32(out, scores[j]*inv, vh[j*headDim:(j+1)*headDim])
+						}
+					}
+				}
+			}
+		}
+		if state != nil {
+			evictVoxtralHeadBuffer(kHead, heads, headDim, stride, total, window)
+			evictVoxtralHeadBuffer(vHead, heads, headDim, stride, total, window)
+		}
+		blasMatvecBatch(layer.Out, attnOut, outProj)
+		for t := range n {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if len(layer.OutB) >= dim {
+				addInPlace(outProj[t], layer.OutB[:dim])
+			}
+			addInPlace(x[t], outProj[t])
+		}
+
+		for t := range n {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			rmsNormInto(x[t], layer.FFNNorm, cfg.Encoder.Epsilon, &normed[t])
+		}
+		blasMatvecBatch(layer.FFNGate, normed, ffnGateOut)
+		blasMatvecBatch(layer.FFNUp, normed, ffnUpOut)
+		for t := range n {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			// Each activation consumes its gate element before replacing it.
+			// No later encoder stage needs the unactivated gate projection.
+			siluMulF32(ffnGateOut[t], ffnUpOut[t], ffnGateOut[t])
+		}
+		blasMatvecBatch(layer.FFNDown, ffnGateOut, ffnDownOut)
+		for t := range n {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if len(layer.FFNDownB) >= dim {
+				addInPlace(ffnDownOut[t], layer.FFNDownB[:dim])
+			}
+			addInPlace(x[t], ffnDownOut[t])
+		}
+	}
+
+	for t := range n {
+		rmsNormInto(x[t], weights.Encoder.FinalNorm, cfg.Encoder.Epsilon, &x[t])
+	}
+
+	if state != nil {
+		state.pos += n
+	}
+	return x, nil
+}
+
+// projectAudioVoxtralRealtime is the adapter: concatenate DownsampleFactor
+// consecutive encoder frames (in time order, most-recent-dims-last -- see
+// voxtral_realtime.go's doc comment point 3) into one InputDim vector, then
+// linear -> GELU -> linear (no biases) into the decoder's hidden size.
+// Trailing encoder frames that don't fill a complete group are dropped, same
+// as PyTorch's reshape-based downsample would refuse a ragged remainder.
+func projectAudioVoxtralRealtime(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, encoderOut [][]float32) ([][]float32, error) {
+	ds := cfg.Projector.DownsampleFactor
+	dim := cfg.Encoder.DModel
+	if ds*dim != cfg.Projector.InputDim {
+		return nil, fmt.Errorf("projecting audio: downsample_factor*DModel (%d*%d) != projector input_dim (%d)", ds, dim, cfg.Projector.InputDim)
+	}
+	groups := len(encoderOut) / ds
+	if groups == 0 {
+		return nil, fmt.Errorf("projecting audio: only %d encoder frames, need at least %d for one downsample group", len(encoderOut), ds)
+	}
+	concat := audioMatrixRows(groups, cfg.Projector.InputDim)
+	for g := range groups {
+		for j := range ds {
+			copy(concat[g][j*dim:(j+1)*dim], encoderOut[g*ds+j])
+		}
+	}
+	hiddenDim := weightRows(weights.Projector.Linear1, cfg.Projector.InputDim)
+	hidden := audioMatrixRows(groups, hiddenDim)
+	blasMatvecBatch(weights.Projector.Linear1, concat, hidden)
+	for g := range hidden {
+		for i, v := range hidden[g] {
+			hidden[g][i] = geluTanh(v)
+		}
+	}
+	grouped := audioMatrixRows(groups, weightRows(weights.Projector.Linear2, hiddenDim))
+	blasMatvecBatch(weights.Projector.Linear2, hidden, grouped)
+	return grouped, nil
+}

@@ -41,8 +41,8 @@ To reproduce, compile the reference and changed source separately, then
 alternate the resulting binaries in the order above:
 
 ```sh
-CGO_ENABLED=1 go test -c -o /tmp/parakeet.test .
+CGO_ENABLED=1 go test -c -o /tmp/parakeet.test ./internal/engine
 GOMAXPROCS=8 /tmp/parakeet.test -test.run '^$' -test.benchtime=500ms \
   -test.bench '^BenchmarkParakeet(EncoderLayer|FeedForwardBatch|RelPosSelfAttention)$'
-go test . -run '^TestParakeetFeedForward' -count=1
+go test ./internal/engine -run '^TestParakeetFeedForward' -count=1
 ```

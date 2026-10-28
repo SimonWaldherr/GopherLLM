@@ -109,7 +109,7 @@ opt-out comparison, native `go vet` and all six cross-build targets passed.
 Build the reference and changed source with the same benchmark files:
 
 ```sh
-CGO_ENABLED=1 go test -c -o /tmp/speech.test .
+CGO_ENABLED=1 go test -c -o /tmp/speech.test ./internal/engine
 GOMAXPROCS=8 /tmp/speech.test -test.run '^$' -test.benchtime=500ms \
   -test.bench '^(BenchmarkSpeechFrontend|BenchmarkSpeechCausalConvolution|BenchmarkSpeechStreamingFrontend)$'
 ```

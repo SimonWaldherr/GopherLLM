@@ -205,10 +205,12 @@ The checked-in Go module intentionally has no third-party dependencies: its
 `go.mod` contains only this module and the Go version, and `make deps-check`
 enforces that policy.
 
-The module-root Go files form the public `gopherllm` package, so core package
-sources remain there to preserve the stable import path
-`github.com/SimonWaldherr/GopherLLM`. Architecture-specific kernel dispatch
-lives in `kernels_<arch>.go`, with assembly in `*_<arch>.s` files. Executable
+The module-root Go files form the public `gopherllm` facade, preserving the
+stable import path `github.com/SimonWaldherr/GopherLLM`. Model loading,
+inference, kernels, assembly and their tests live in `internal/engine/`.
+Type aliases retain the engine's method sets and avoid copying model state;
+forwarding functions are regenerated with `go generate .` after API changes.
+Architecture-specific dispatch and assembly stay together there. Executable
 entry points live in `cmd/`, the embedding surface for other languages in
 `mobile/` and `bindings/`, implementation details in `internal/`, and
 test-only fixtures in `testdata/`. Public-boundary and opt-in local model tests
@@ -858,17 +860,18 @@ The history budget is additional to the live workspace.
 The root package is inference only. Its import closure excludes the optional
 demo application and its UI assets:
 
-| Import | You get | Transitive deps |
-|---|---|---|
-| `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop | 90 |
-| `github.com/SimonWaldherr/GopherLLM/rag` | Document chunking, hybrid BM25 + vector retrieval | 94 |
-| `github.com/SimonWaldherr/GopherLLM/huggingface` | Model/task search, artifact inspection/download, and local GGUF resolution | 192 |
+| Import | You get |
+|---|---|
+| `github.com/SimonWaldherr/GopherLLM` | GGUF loading, generation, chat, embeddings, tokenizer, sampling, autotuning, skills/agent loop |
+| `github.com/SimonWaldherr/GopherLLM/rag` | Document chunking, hybrid BM25 + vector retrieval |
+| `github.com/SimonWaldherr/GopherLLM/huggingface` | Model/task search, artifact inspection/download, and local GGUF resolution |
 
 `TestInferencePackageStaysFreeOfServerDependencies` enforces that boundary
 against the real dependency graph, so it cannot regress silently.
 
-Those counts are all standard library — the module has no `require` block, no
-`go.sum` and no vendor directory — but stdlib is not the same as free, since an
+Dependencies are standard-library packages and packages within this module;
+there is no `require` block, `go.sum` or vendor directory. The exact count
+depends on the Go version and build tags. Stdlib is not the same as free, since an
 embedder compiles every package in the closure. The root package therefore
 avoids `crypto/sha256` and `regexp`, each of which cost far more than its single
 use was worth, and `TestInferencePackageStaysFreeOfTheCryptoAndRegexpTrees` pins
@@ -881,7 +884,7 @@ so they are a build-time knob rather than a removal:
 go build -tags noimagedecoders ./...
 ```
 
-That takes the root package from 90 transitive dependencies to 83, dropping
+That drops
 `image/png` and `image/jpeg` along with `compress/zlib`, `compress/flate`,
 `hash/adler32` and `hash/crc32`. The public API is unchanged either way —
 `image.Image` stays in `DecodeImageBytes`' and `PreprocessImagePixtral`'s
@@ -1250,7 +1253,7 @@ buys more rounds where it matters.
 Run synthetic Go microbenchmarks:
 
 ```sh
-go test -run '^$' -bench=. -benchmem .
+go test -run '^$' -bench=. -benchmem ./internal/engine
 ```
 
 Run an end-to-end generation benchmark against a real GGUF:
@@ -1620,7 +1623,7 @@ retained output parity but had substantially higher absolute times; the
 21.2 GB checkpoint's working set matters on a 32 GB Mac.
 To repeat this full-model comparison, set
 `GOPHERLLM_MOE_MODEL` to a local MoE GGUF and run
-`go test -run '^TestMoEConfiguredGenerationParity$' -v .`; add `-tags metal`
+`go test -run '^TestMoEConfiguredGenerationParity$' -v ./internal/engine`; add `-tags metal`
 and `GOPHERLLM_MOE_METAL=1` to test Metal. `BenchmarkMoEConfiguredLayer`
 isolates one real sparse layer with synthetic inputs, rather than reporting
 whole-model throughput.
@@ -1840,17 +1843,17 @@ llama.cpp's phantom-space vocabulary layout and raw `##` continuation pieces.
 
 | Area | Files |
 |---|---|
-| Public API | `api.go` (Model, options), `doc.go` (package overview and version) |
-| GGUF parsing + file mapping | `gguf.go` over `internal/formats/gguf/`; `mmap.go` over `internal/mmapfile/` |
-| Model loading + forward pass | `runner.go`, `model_*.go`, per-family files (`gemma4.go`, `qwen35.go`, `moe.go`, …), `forward_batch.go` (batched prefill) |
-| Compute kernels + worker pool | `simd_*.go`, `quant_*.go`; platform dispatch and assembly in `kernels_*.go` / `kernels_*.s` |
+| Public API | `api_generated.go` (type aliases and forwarding functions), `doc.go` (package overview and version); implementations in `internal/engine/api.go` |
+| GGUF parsing + file mapping | `internal/engine/gguf.go` over `internal/formats/gguf/`; `internal/engine/mmap.go` over `internal/mmapfile/` |
+| Model loading + forward pass | `internal/engine/runner.go`, `internal/engine/model_*.go`, per-family files (`internal/engine/gemma4.go`, `internal/engine/qwen35.go`, `internal/engine/moe.go`, …), `internal/engine/forward_batch.go` (batched prefill) |
+| Compute kernels + worker pool | `internal/engine/simd_*.go`, `internal/engine/quant_*.go`; platform dispatch and assembly in `internal/engine/kernels_*.go` / `internal/engine/kernels_*.s` |
 | Tokenizers | `internal/tokenizer/` (SentencePiece, GPT-2/Tekken BPE, WordPiece), tables in `internal/wordpiece/` |
-| Sampling | `sampling.go` |
-| Generation orchestration + chat templates | `runtime.go`, `chat_render_*.go` |
-| Tool calling / reasoning / skills | `agent.go`, `extract.go`, `skills.go`; wire types in `internal/tooling/` |
-| Model discovery + selection | `catalog.go`, `catalog_ollama.go` |
+| Sampling | `internal/engine/sampling.go` |
+| Generation orchestration + chat templates | `internal/engine/runtime.go`, `internal/engine/chat_render_*.go` |
+| Tool calling / reasoning / skills | `internal/engine/agent.go`, `internal/engine/extract.go`, `internal/engine/skills.go`; wire types in `internal/tooling/` |
+| Model discovery + selection | `internal/engine/catalog.go`, `internal/engine/catalog_ollama.go` |
 | Embedding from other languages | `mobile/`, `bindings/` (C ABI, Swift, Rust, Python) |
-| CLI | `cmd/gopherllm/`, `kernel_bench.go` |
+| CLI | `cmd/gopherllm/`, `internal/engine/kernel_bench.go` |
 
 [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) maps every directory,
 shows how the language bindings layer on each other, and says where new code
@@ -1895,7 +1898,7 @@ make coverage-html  # same, plus an interactive HTML report
 Run a focused benchmark:
 
 ```sh
-go test -run '^$' -bench=BenchmarkMatvecQ4K -benchmem .
+go test -run '^$' -bench=BenchmarkMatvecQ4K -benchmem ./internal/engine
 ```
 
 Profile a real-model benchmark:

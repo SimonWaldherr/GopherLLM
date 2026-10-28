@@ -16,16 +16,16 @@
 //
 // # API layers
 //
-//   - Model (api.go): the primary embedding API — context-first methods with
+//   - Model: the primary embedding API — context-first methods with
 //     functional options (Open, Generate, Chat, Stream, Embed, Tokenize,
 //     Detokenize). Start here.
 //   - server.NewHandler (server/server.go, a separate package): the
 //     OpenAI-/Ollama-compatible HTTP API as a mountable http.Handler for
 //     applications that expose the model over HTTP themselves.
-//   - Runner (runtime.go): the lower-level engine underneath both, exposed
+//   - Runner: the lower-level engine underneath both, exposed
 //     for advanced uses (the agentic skill loop via RunAgenticChat, kernel
 //     benchmarking, custom loops).
-//   - AnalyzeGGUF / SearchTokens (analyze.go): header-only model structure
+//   - AnalyzeGGUF / SearchTokens: header-only model structure
 //     reports and vocabulary inspection without loading weights.
 //   - rag (rag/, a separate package): a hybrid BM25 + optional-vector index
 //     over your own documents. No dependency on this package's model type
@@ -39,24 +39,20 @@
 // The library never writes to stdout/stderr on its own; pass WithLogWriter
 // (or HandlerOptions.LogWriter) to opt into diagnostics.
 //
-// A rough map of the internals:
+// The implementation lives in internal/engine. This package preserves the
+// public import path with type aliases and forwarding functions, generated
+// from the engine's exported declarations by go generate .
 //
-//   - gguf.go       GGUF container parsing (header, metadata, tensor table)
-//   - mmap.go       public file-mapping facade (backends in internal/mmapfile)
-//   - model_*.go    model config, weight loading, transformer forward pass
-//   - forward_batch.go  batched prefill (prompt tokens processed per chunk)
-//   - simd_*.go, quant_extra.go  matvec/dot kernels + dequantization + pool
-//   - *_amd64.s / *_arm64.s  hand-written SIMD kernels behind runtime dispatch
-//   - tokenizer.go  facade over internal/tokenizer (SentencePiece, GPT-2/Tekken
-//     BPE, WordPiece)
-//   - sampling.go   temperature/top-k/top-p/min-p sampling
-//   - runtime.go    Runner: generation loop, chat templates per model family
-//   - agent.go, tool_schema.go, extract.go, skills.go  tool calling
-//     (including reflection-derived schemas via NewTool), reasoning
-//     extraction, the server-side skill loop (wire types in internal/tooling)
-//   - catalog.go    model discovery/selection in a models directory
-//   - cmd/gopherllm CLI built on all of the above
+// The go doc command does not expand methods behind type aliases. From a
+// repository checkout, use go doc ./internal/engine.Model.Generate to read
+// the implementation's method documentation.
+//
+// Platform backends, container formats, tokenizers and numeric helpers have
+// their own packages under internal/. See docs/PROJECT_STRUCTURE.md for the
+// directory map.
 package gopherllm
+
+//go:generate go run ./internal/cmd/genapi
 
 // Version is reported by the CLI's --version and usage header.
 const Version = "0.3.0-go"

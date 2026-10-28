@@ -143,16 +143,16 @@ GOMAXPROCS=8 /usr/bin/time -l /tmp/image-generate \
   -prompt 'A red ceramic teapot on a pale blue table, studio photograph.' \
   -width 256 -height 256 -seed 42 -threads 8 -out /tmp/teapot.png
 
-go test -run 'QwenImage21|QI21' -v .
-CGO_ENABLED=0 go test -run 'QwenImage21|QI21' .
+go test -run 'QwenImage21|QI21' -v ./internal/engine
+CGO_ENABLED=0 go test -run 'QwenImage21|QI21' ./internal/engine
 python -m unittest discover -s scripts -p 'test_download_qwen_image21.py'
 
 # Synthetic packed projections, without a checkpoint download.
 GOMAXPROCS=8 go test -run '^$' -bench '^BenchmarkQwenImage21Projection$' \
-  -benchtime=3x -count=2 .
+  -benchtime=3x -count=2 ./internal/engine
 # Optional full-graph profile; loading is outside benchmark timing.
-GOPHERLLM_QWEN_IMAGE_MODEL=.cache/qwen-image21/turbo GOMAXPROCS=8 \
-  go test -run '^$' -bench '^BenchmarkQwenImage21Generate$' -benchtime=1x .
+GOPHERLLM_QWEN_IMAGE_MODEL="$PWD/.cache/qwen-image21/turbo" GOMAXPROCS=8 \
+  go test -run '^$' -bench '^BenchmarkQwenImage21Generate$' -benchtime=1x ./internal/engine
 ```
 
 The reference generators in `scripts/` reproduce the encoder, transformer,
@@ -202,7 +202,7 @@ Reproduce the kernel comparison with:
 
 ```sh
 GOMAXPROCS=12 CGO_ENABLED=1 go test -run '^$' \
-  -bench '^BenchmarkQwenImage21Attention$' -benchtime=10x -count=3 .
+  -bench '^BenchmarkQwenImage21Attention$' -benchtime=10x -count=3 ./internal/engine
 ```
 
 ## Shared decoder and projection changes, 2026-10-27

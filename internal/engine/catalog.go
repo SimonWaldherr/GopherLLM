@@ -1,0 +1,684 @@
+package engine
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+const (
+	// lmStudioModelsSubdir is LM Studio's library root. Models downloaded
+	// from the community catalog as well as manually added repositories live
+	// below it, so scanning only lmstudio-community hides valid local GGUFs.
+	lmStudioModelsSubdir = ".cache/lm-studio/models"
+	// lmStudioCommunitySubdir is retained as a fallback for older LM Studio
+	// installs whose parent library directory has not been created yet.
+	lmStudioCommunitySubdir = lmStudioModelsSubdir + "/lmstudio-community"
+)
+
+// ModelEntry describes one GGUF file found under the model directory. ID is
+// the root-relative path without the .gguf suffix (unique within a scan and
+// what --list-models prints); IsProjector marks multimodal companion files
+// (mmproj-*/clip) that must not be offered for text generation.
+type ModelEntry struct {
+	ID            string
+	Repository    string
+	FileName      string
+	Path          string
+	SizeBytes     int64
+	Architecture  string
+	ContextLength int
+	ModelName     string
+	IsProjector   bool
+	// IsEmbedding identifies models named or tagged as embedding models. The
+	// runtime can pool hidden states from any supported model, but this flag
+	// keeps normal generation models out of the RAG model picker.
+	IsEmbedding bool
+	IsSupported bool
+	// Reasoning reports whether the GGUF advertises a reasoning/thinking mode.
+	// It is a capability, not a promise that every prompt will emit a visible
+	// chain of thought.
+	Reasoning bool
+	// ProjectorPath is a verified-compatible Pixtral mmproj (vision projector)
+	// GGUF found alongside this entry, paired by DiscoverModels' post-scan
+	// pass; "" if none was found. The pair is restricted to the exact parent
+	// directory, a Pixtral projector, equal text/projector dimensions, and the
+	// Mistral image-template tokens the runtime can render. Always overridable
+	// by passing an explicit LoadOptions.VisionProjectorPath.
+	ProjectorPath string
+
+	// The following catalog-only fields retain just enough header information
+	// to pair a text model with a projector without loading either model's
+	// weights. They intentionally remain private: callers should use the
+	// already-sanitised ProjectorPath capability rather than reproduce the
+	// compatibility rules themselves.
+	visionDimension        int
+	visionTemplateCapable  bool
+	visionPixtralProjector bool
+}
+
+func (m ModelEntry) Status() string {
+	if m.IsProjector {
+		return "projector"
+	}
+	if m.IsSupported {
+		return "supported"
+	}
+	return "unsupported"
+}
+
+// DefaultModelDir returns the directory scanned when --model-dir is not
+// given: $GOPHERLLM_MODEL_DIR if set, else the deprecated $RUSTY_LLM_MODEL_DIR
+// (the project's pre-rename spelling, kept so existing environments keep
+// working), else the LM Studio library root under $HOME. If that root does
+// not exist yet, the former community-only path remains the fallback.
+// (MODEL_DIR is a Makefile variable, not read here.)
+func DefaultModelDir() string {
+	if path := strings.TrimSpace(os.Getenv("GOPHERLLM_MODEL_DIR")); path != "" {
+		return path
+	}
+	// Deprecated fallback: prefer GOPHERLLM_MODEL_DIR.
+	if path := strings.TrimSpace(os.Getenv("RUSTY_LLM_MODEL_DIR")); path != "" {
+		return path
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		root := filepath.Join(home, lmStudioModelsSubdir)
+		if st, err := os.Stat(root); err == nil && st.IsDir() {
+			return root
+		}
+		return filepath.Join(home, lmStudioCommunitySubdir)
+	}
+	return lmStudioModelsSubdir
+}
+
+// DiscoverModels recursively finds every .gguf under root and parses each
+// file's header (mmap'd, weights untouched) to fill in architecture, name,
+// and support status. Unparseable files are skipped with a stderr note rather
+// than failing the whole scan. Results put supported models first, then sort
+// case-insensitively by their display name with ID as a deterministic tie.
+func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
+	files := []string{}
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && strings.EqualFold(filepath.Ext(path), ".gguf") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan %s: %w", root, err)
+	}
+	sort.Strings(files)
+	entries := make([]ModelEntry, 0, len(files))
+	for _, path := range files {
+		entry, err := inspectModel(root, path)
+		if err != nil {
+			fmt.Fprintf(logw, "Skipping %s: %v\n", path, err)
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	pairProjectors(entries)
+	sort.Slice(entries, func(i, j int) bool { return modelSortKey(entries[i]) < modelSortKey(entries[j]) })
+	return entries, nil
+}
+
+// pairProjectors fills in ProjectorPath only for a text model whose same-
+// directory companion is runnable through the currently implemented Pixtral
+// path. A neighbouring "mmproj" file alone is not enough: Qwen/Gemma and
+// other projector graphs use different encoders, and a projection-width
+// mismatch corrupts the decoder input even when both files load. The text
+// model must also contain the Mistral [INST]/[IMG] markers consumed by
+// renderMistralInstMessages. This deliberately prefers a false negative to
+// advertising a Vision badge for a model that will reject an image request.
+//
+// When more than one compatible projector candidate exists in the same
+// directory (F16/BF16/F32 variants are common), F16 is preferred over BF16
+// over F32 — smallest file size that still keeps full 16-bit mantissa
+// fidelity, not a blind smallest-file-wins rule that could pick a stray
+// corrupt file.
+func pairProjectors(entries []ModelEntry) {
+	var candidates []ModelEntry
+	for _, e := range entries {
+		if e.IsProjector && e.visionPixtralProjector && e.visionDimension > 0 {
+			candidates = append(candidates, e)
+		}
+	}
+	if len(candidates) == 0 {
+		return
+	}
+	for i := range entries {
+		if entries[i].IsProjector || !entries[i].IsSupported || entries[i].IsEmbedding || !entries[i].visionTemplateCapable || entries[i].visionDimension <= 0 {
+			continue
+		}
+		var chosen *ModelEntry
+		for ci := range candidates {
+			c := &candidates[ci]
+			// Repository is a display label (the final path component), so it
+			// is not a safe identity: two unrelated directories can share it.
+			// Pair only files physically next to one another.
+			if filepath.Clean(filepath.Dir(c.Path)) != filepath.Clean(filepath.Dir(entries[i].Path)) {
+				continue
+			}
+			if c.visionDimension != entries[i].visionDimension {
+				continue
+			}
+			if chosen == nil || projectorRank(*c) < projectorRank(*chosen) {
+				chosen = c
+			}
+		}
+		if chosen != nil {
+			entries[i].ProjectorPath = chosen.Path
+		}
+	}
+}
+
+// PairedVisionProjectorPath returns the automatically safe Pixtral projector
+// next to modelPath, if one exists. It starts at modelPath's containing
+// directory and never accepts a merely similarly named projector outside the
+// model's exact parent directory. An explicit --mmproj remains the caller's
+// override; this helper is for the no-explicit-projector case.
+func PairedVisionProjectorPath(modelPath string) (string, error) {
+	modelPath = catalogCanonicalPath(modelPath)
+	entries, err := DiscoverModels(filepath.Dir(modelPath), io.Discard)
+	if err != nil {
+		return "", err
+	}
+	for _, entry := range entries {
+		if !entry.IsProjector && catalogCanonicalPath(entry.Path) == modelPath {
+			return entry.ProjectorPath, nil
+		}
+	}
+	return "", nil
+}
+
+func catalogCanonicalPath(path string) string {
+	if absolute, err := filepath.Abs(path); err == nil {
+		return filepath.Clean(absolute)
+	}
+	return filepath.Clean(path)
+}
+
+// projectorRank orders mmproj filename variants: lower is preferred.
+func projectorRank(e ModelEntry) int {
+	lower := strings.ToLower(e.FileName)
+	switch {
+	case strings.Contains(lower, "f16"):
+		return 0
+	case strings.Contains(lower, "bf16"):
+		return 1
+	case strings.Contains(lower, "f32"):
+		return 2
+	default:
+		return 3
+	}
+}
+
+// modelSortKey orders supported models before unsupported ones (unsupported
+// entries can never actually be loaded, so they should not sit ahead of
+// usable choices even when a caller opts to show them), then
+// case-insensitively by the same display name the Web UI and --list-models
+// show, e.g. ModelName ("general.name" from the GGUF) falling back to ID.
+// A plain byte-wise sort on ID mixes repositories unpredictably, since
+// upper-case org names (e.g. "DavidAU") sort before all lower-case ones
+// (e.g. "bartowski") in ASCII.
+func modelSortKey(m ModelEntry) string {
+	supported := "1"
+	if m.IsSupported {
+		supported = "0"
+	}
+	name := m.ModelName
+	if name == "" {
+		name = m.ID
+	}
+	return supported + "\x00" + strings.ToLower(name) + "\x00" + strings.ToLower(m.ID) + "\x00" + m.ID
+}
+
+// ResolveModelPath turns the CLI's model selector into a concrete .gguf path.
+// A selector that is an existing file wins outright; an existing directory
+// (or a nil selector) opens the interactive picker over that directory;
+// anything else is matched against the discovered models by SelectModel.
+func ResolveModelPath(selection *string, modelDir string) (string, error) {
+	if selection != nil {
+		selected := *selection
+		if st, err := os.Stat(selected); err == nil {
+			if st.Mode().IsRegular() {
+				return selected, nil
+			}
+			if st.IsDir() {
+				return chooseFromDirectory(selected, nil, os.Stdin, os.Stderr)
+			}
+			return "", fmt.Errorf("model path is neither a file nor a directory: %s", selected)
+		}
+		entries, err := DiscoverModels(modelDir, os.Stderr)
+		if err != nil {
+			return "", err
+		}
+		entry, err := SelectModel(entries, selected)
+		if err != nil {
+			return "", err
+		}
+		return entry.Path, nil
+	}
+	return chooseFromDirectory(modelDir, nil, os.Stdin, os.Stderr)
+}
+
+// SelectModel matches selector against the usable (supported, non-projector)
+// entries: exact matches on id/repo/filename/name/path beat substring
+// matches, a unique match wins, and ambiguity or matching only an
+// unsupported/projector file produces a descriptive error listing the
+// choices.
+func SelectModel(entries []ModelEntry, selector string) (ModelEntry, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		return ModelEntry{}, fmt.Errorf("model selector must not be empty")
+	}
+	usable := []ModelEntry{}
+	for _, e := range entries {
+		if e.IsSupported && !e.IsProjector {
+			usable = append(usable, e)
+		}
+	}
+	matches := matchingEntries(usable, selector)
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return ModelEntry{}, fmt.Errorf("%s", formatAmbiguous(selector, matches))
+	}
+	unsupported := matchingEntries(entries, selector)
+	if len(unsupported) == 1 {
+		e := unsupported[0]
+		arch := e.Architecture
+		if arch == "" {
+			arch = "unknown"
+		}
+		return ModelEntry{}, fmt.Errorf("model %q matched %s, but it is marked as %s (architecture: %s)", selector, e.ID, e.Status(), arch)
+	}
+	if len(unsupported) > 1 {
+		return ModelEntry{}, fmt.Errorf("%s", formatAmbiguous(selector, unsupported))
+	}
+	return ModelEntry{}, fmt.Errorf("no GGUF model matched %q; use --list-models to see available models in %s", selector, modelDirFromEntries(entries))
+}
+
+func PrintModelList(entries []ModelEntry) {
+	if len(entries) == 0 {
+		fmt.Println("No GGUF files found.")
+		return
+	}
+	fmt.Printf("%-62s %-14s %-12s size\n", "id", "architecture", "status")
+	for _, e := range entries {
+		arch := e.Architecture
+		if arch == "" {
+			arch = "unknown"
+		}
+		fmt.Printf("%-62s %-14s %-12s %.2f GB\n", truncate(e.ID, 62), truncate(arch, 14), e.Status(), float64(e.SizeBytes)/(1024*1024*1024))
+	}
+}
+
+func chooseFromDirectory(dir string, selector *string, in io.Reader, out io.Writer) (string, error) {
+	entries, err := DiscoverModels(dir, out)
+	if err != nil {
+		return "", err
+	}
+	if selector != nil {
+		entry, err := SelectModel(entries, *selector)
+		if err != nil {
+			return "", err
+		}
+		return entry.Path, nil
+	}
+	usable := []ModelEntry{}
+	for _, e := range entries {
+		if e.IsSupported && !e.IsProjector {
+			usable = append(usable, e)
+		}
+	}
+	switch len(usable) {
+	case 0:
+		return "", fmt.Errorf("no supported text GGUF models found in %s", dir)
+	case 1:
+		return usable[0].Path, nil
+	default:
+		entry, err := PromptModelSelection(dir, usable, in, out)
+		if err != nil {
+			return "", err
+		}
+		return entry.Path, nil
+	}
+}
+
+// PromptModelSelection runs the interactive terminal picker: a numbered menu
+// that accepts an index, a filter substring (re-listing the matches), or
+// q/quit/exit to abort.
+func PromptModelSelection(dir string, entries []ModelEntry, in io.Reader, out io.Writer) (ModelEntry, error) {
+	if len(entries) == 0 {
+		return ModelEntry{}, fmt.Errorf("no selectable GGUF models found in %s", dir)
+	}
+	if len(entries) == 1 {
+		return entries[0], nil
+	}
+	if out == nil {
+		out = io.Discard
+	}
+	if in == nil {
+		return ModelEntry{}, fmt.Errorf("multiple GGUF models found in %s, but no input is available", dir)
+	}
+
+	fmt.Fprintf(out, "\nFound %d supported GGUF models in %s:\n\n", len(entries), dir)
+	printModelMenu(entries, out, len(entries))
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Select a model by number, enter text to filter, or type q to quit.")
+
+	scanner := bufio.NewScanner(in)
+	for {
+		fmt.Fprint(out, "model> ")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return ModelEntry{}, err
+			}
+			return ModelEntry{}, fmt.Errorf("model selection aborted")
+		}
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+		if strings.EqualFold(input, "q") || strings.EqualFold(input, "quit") || strings.EqualFold(input, "exit") {
+			return ModelEntry{}, fmt.Errorf("model selection aborted")
+		}
+		if idx, err := strconv.Atoi(input); err == nil {
+			if idx >= 1 && idx <= len(entries) {
+				selected := entries[idx-1]
+				fmt.Fprintf(out, "Selected: %s\n\n", selected.ID)
+				return selected, nil
+			}
+			fmt.Fprintf(out, "Please enter a number between 1 and %d.\n", len(entries))
+			continue
+		}
+
+		matches := matchingEntries(entries, input)
+		switch len(matches) {
+		case 0:
+			fmt.Fprintf(out, "No model matched %q.\n", input)
+		case 1:
+			fmt.Fprintf(out, "Selected: %s\n\n", matches[0].ID)
+			return matches[0], nil
+		default:
+			fmt.Fprintf(out, "\n%d matches for %q:\n\n", len(matches), input)
+			printModelMenuWithOriginalNumbers(entries, matches, out, min(len(matches), 20))
+			if len(matches) > 20 {
+				fmt.Fprintf(out, "  ... %d more matches. Refine the filter.\n", len(matches)-20)
+			}
+			fmt.Fprintln(out)
+			fmt.Fprintln(out, "Enter a number from the original list or refine the filter.")
+		}
+	}
+}
+
+func printModelMenu(entries []ModelEntry, out io.Writer, limit int) {
+	for i, e := range entries[:limit] {
+		printModelMenuLine(out, i+1, e)
+	}
+}
+
+func printModelMenuWithOriginalNumbers(all []ModelEntry, entries []ModelEntry, out io.Writer, limit int) {
+	for _, e := range entries[:limit] {
+		printModelMenuLine(out, modelMenuIndex(all, e), e)
+	}
+}
+
+func printModelMenuLine(out io.Writer, index int, e ModelEntry) {
+	arch := e.Architecture
+	if arch == "" {
+		arch = "unknown"
+	}
+	modelName := e.ModelName
+	if modelName == "" {
+		modelName = e.FileName
+	}
+	fmt.Fprintf(
+		out,
+		"  %2d. %-62s %-14s %6.2f GB  %s\n",
+		index,
+		truncate(e.ID, 62),
+		truncate(arch, 14),
+		float64(e.SizeBytes)/(1024*1024*1024),
+		truncate(modelName, 72),
+	)
+}
+
+func modelMenuIndex(entries []ModelEntry, entry ModelEntry) int {
+	for i, e := range entries {
+		if e.Path == entry.Path && e.ID == entry.ID {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func inspectModel(root, path string) (ModelEntry, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return ModelEntry{}, err
+	}
+	mmap, err := OpenMmap(path)
+	if err != nil {
+		return ModelEntry{}, err
+	}
+	defer mmap.Close()
+	gguf, err := ParseGGUFQuiet(mmap.Bytes())
+	if err != nil {
+		return ModelEntry{}, err
+	}
+	fileName := filepath.Base(path)
+	repository := filepath.Base(filepath.Dir(path))
+	rel, err := filepath.Rel(root, path)
+	id := strings.TrimSuffix(fileName, ".gguf")
+	if err == nil {
+		id = strings.TrimSuffix(rel, ".gguf")
+	}
+	declaredArch, _ := gguf.GetString("general.architecture")
+	// resolvedArch is what the loader will actually accept; hparamNS is where
+	// the hyperparameters live. The declared label (when present) stays the
+	// display identity, but support and metadata probes follow the resolution.
+	resolvedArch, hparamNS := ResolveArchitecture(gguf)
+	arch := declaredArch
+	if arch == "" {
+		arch = resolvedArch
+	}
+	modelName, _ := gguf.GetString("general.name")
+	contextLength := ConfigFromGGUF(gguf).MaxSeqLen
+	lower := strings.ToLower(fileName + " " + modelName)
+	isProjector := strings.HasPrefix(lower, "mmproj-") || strings.Contains(lower, "mmproj") || strings.EqualFold(arch, "clip")
+	_, hasPooling := gguf.Metadata[hparamNS+".pooling_type"]
+	_, hasEmbedding := gguf.Metadata["general.embedding"]
+	isEmbedding := hasPooling || hasEmbedding || containsEmbeddingModelName(lower)
+	entry := ModelEntry{
+		ID:            id,
+		Repository:    repository,
+		FileName:      fileName,
+		Path:          path,
+		SizeBytes:     st.Size(),
+		Architecture:  arch,
+		ContextLength: contextLength,
+		ModelName:     modelName,
+		IsProjector:   isProjector,
+		IsEmbedding:   isEmbedding,
+		IsSupported:   ArchitectureSupported(resolvedArch),
+		Reasoning:     modelSupportsReasoning(resolvedArch, fileName, modelName, gguf),
+	}
+	if isProjector {
+		entry.visionDimension, entry.visionPixtralProjector = pixtralProjectorCatalogInfo(gguf)
+	} else {
+		entry.visionDimension, entry.visionTemplateCapable = pixtralTextCatalogInfo(gguf, entry.IsSupported, entry.IsEmbedding)
+	}
+	return entry, nil
+}
+
+// pixtralProjectorCatalogInfo performs the header-level portion of
+// LoadPixtralVisionModel's compatibility contract. It intentionally checks
+// the exact projector type understood by the runtime instead of treating all
+// "clip" GGUFs as interchangeable.
+func pixtralProjectorCatalogInfo(gguf *GGUFFile) (projectionDim int, ok bool) {
+	if gguf == nil || !gguf.GetBool("clip.has_vision_encoder", false) {
+		return 0, false
+	}
+	projectorType, _ := gguf.GetString("clip.projector_type")
+	if projectorType != "pixtral" {
+		return 0, false
+	}
+	projectionDim = int(gguf.GetU32("clip.vision.projection_dim", 0))
+	return projectionDim, projectionDim > 0
+}
+
+// pixtralTextCatalogInfo checks the text-side requirements for GopherLLM's
+// current image renderer. A Pixtral embedding can only be spliced into a
+// model with the Mistral [INST] template (or its equivalent special-token
+// fallback) and all of its image markers; accepting just any decoder with
+// the same hidden width would make the catalog promise a feature that
+// renderMessagesForGeneration rejects.
+func pixtralTextCatalogInfo(gguf *GGUFFile, supported, embedding bool) (dimension int, ok bool) {
+	if gguf == nil || !supported || embedding {
+		return 0, false
+	}
+	dimension = ConfigFromGGUF(gguf).Dim
+	if dimension <= 0 {
+		return 0, false
+	}
+	tokenizer, err := TokenizerFromMetadata(gguf.Metadata)
+	if err != nil {
+		return dimension, false
+	}
+	template, hasTemplate := gguf.GetString("tokenizer.chat_template")
+	hasMistralTemplate := hasTemplate && strings.Contains(template, "[INST]") && strings.Contains(template, "[/INST]")
+	hasMistralTokens := false
+	if _, hasInst := tokenizer.SpecialID("[INST]"); hasInst {
+		if _, hasInstEnd := tokenizer.SpecialID("[/INST]"); hasInstEnd {
+			hasMistralTokens = true
+		}
+	}
+	if !hasMistralTemplate && !hasMistralTokens {
+		return dimension, false
+	}
+	for _, marker := range []string{"[INST]", "[/INST]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"} {
+		if _, exists := tokenizer.SpecialID(marker); !exists {
+			return dimension, false
+		}
+	}
+	return dimension, true
+}
+
+// modelSupportsReasoning identifies families with a native thinking mode and
+// models whose GGUF template/name explicitly advertises one.  Architecture
+// alone is deliberately not used for every family: Mistral 3, for example,
+// ships both instruct and reasoning variants under the same architecture.
+func modelSupportsReasoning(arch, fileName, modelName string, gguf *GGUFFile) bool {
+	switch strings.ToLower(arch) {
+	case "qwen3", "qwen3moe", "qwen35", "qwen35moe", "gpt-oss", "nemotron_h", "nemotron_h_moe":
+		return true
+	}
+	label := strings.ToLower(fileName + " " + modelName)
+	for _, marker := range []string{"reasoning", "thinking", "deepseek-r1", "deepseek_r1", "qwq", "-r1", " r1"} {
+		if strings.Contains(label, marker) {
+			return true
+		}
+	}
+	for key, value := range gguf.Metadata {
+		if !strings.Contains(key, "chat_template") {
+			continue
+		}
+		template, ok := value.AsString()
+		if !ok {
+			continue
+		}
+		lower := strings.ToLower(template)
+		if strings.Contains(lower, "<think") || strings.Contains(lower, "[think]") || strings.Contains(lower, "reasoning_content") || strings.Contains(lower, "channel>thought") {
+			return true
+		}
+	}
+	return false
+}
+
+// GGUF has no universally adopted "embedding model" metadata field. These
+// markers cover the common GGUF embedding model families while metadata above
+// handles exporters that provide an explicit pooling hint.
+func containsEmbeddingModelName(value string) bool {
+	for _, marker := range []string{"embed", "embedding", "bge", "e5-", "e5_", "nomic", "mxbai", "jina", "gte-", "gte_", "minilm", "arctic"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchingEntries(entries []ModelEntry, selector string) []ModelEntry {
+	needle := strings.ToLower(selector)
+	exact := []ModelEntry{}
+	partial := []ModelEntry{}
+	for _, e := range entries {
+		keys := []string{e.ID, e.Repository, e.FileName, e.ModelName, e.Path}
+		foundExact, foundPartial := false, false
+		for _, key := range keys {
+			if strings.EqualFold(key, selector) {
+				foundExact = true
+				break
+			}
+			if strings.Contains(strings.ToLower(key), needle) {
+				foundPartial = true
+			}
+		}
+		if foundExact {
+			exact = append(exact, e)
+		} else if foundPartial {
+			partial = append(partial, e)
+		}
+	}
+	if len(exact) > 0 {
+		return exact
+	}
+	return partial
+}
+
+func formatAmbiguous(selector string, entries []ModelEntry) string {
+	return fmt.Sprintf("model selector %q matched multiple GGUF files:\n\n%s", selector, formatModelChoices(entries))
+}
+
+func formatModelChoices(entries []ModelEntry) string {
+	lines := make([]string, len(entries))
+	for i, e := range entries {
+		arch := e.Architecture
+		if arch == "" {
+			arch = "unknown"
+		}
+		lines[i] = fmt.Sprintf("  - %s [%s; %s]", e.ID, arch, e.Status())
+	}
+	return strings.Join(lines, "\n")
+}
+
+func modelDirFromEntries(entries []ModelEntry) string {
+	if len(entries) == 0 {
+		return "the model directory"
+	}
+	return filepath.Dir(entries[0].Path)
+}
+
+func truncate(value string, maxChars int) string {
+	r := []rune(value)
+	if len(r) <= maxChars {
+		return value
+	}
+	if maxChars <= 1 {
+		return "~"
+	}
+	return string(r[:maxChars-1]) + "~"
+}

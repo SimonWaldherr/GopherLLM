@@ -85,7 +85,7 @@ CPU/GPU synchronization.
 GOPHERLLM_COREML_FFN_GGUF=/path/to/model.gguf \
 GOPHERLLM_COREML_FFN_PATH=/path/to/ffn-l0.mlmodelc \
 GOPHERLLM_COREML_FFN_UNITS=cpu,ane \
-  CGO_ENABLED=1 go test -tags 'metal coreml' . \
+  CGO_ENABLED=1 go test -tags 'metal coreml' ./internal/engine \
   -run '^TestCoreMLConfiguredFFN$' -count=1 -v
 ```
 
@@ -209,7 +209,7 @@ established full-model speedup. Reproduce it separately:
 ```sh
 GOPHERLLM_COREML_PREFILL_GGUF=/path/to/model.gguf \
 GOPHERLLM_COREML_PREFILL_MANIFEST=/path/to/ffn-l0.json \
-  CGO_ENABLED=1 go test -tags 'metal coreml' . \
+  CGO_ENABLED=1 go test -tags 'metal coreml' ./internal/engine \
   -run '^TestCoreMLConfiguredPrefill$' -count=1 -v
 ```
 
@@ -276,6 +276,6 @@ retain the more variable initial runs. The benchmark excludes source hashes,
 Core ML prediction and model loading; it does not measure total startup time.
 
 ```sh
-CGO_ENABLED=0 go test -tags coreml . -run '^$' \
+CGO_ENABLED=0 go test -tags coreml ./internal/engine -run '^$' \
   -bench '^BenchmarkCoreMLFFNReference$' -benchtime=3x -count=3
 ```

@@ -248,7 +248,7 @@ For complete recent experiments with raw data and reproduction commands, see
 
   ```sh
   GOPHERLLM_MINISTRAL_MODEL=/path/to/Ministral-Q4_K_M.gguf \
-    CGO_ENABLED=1 go test -tags metal -run '^TestMinistralConfiguredDecode$' -count=1 -v .
+    CGO_ENABLED=1 go test -tags metal -run '^TestMinistralConfiguredDecode$' -count=1 -v ./internal/engine
   ```
 
   Add `GOPHERLLM_MINISTRAL_AUTOTUNE=1` to exercise quick calibration, including
@@ -573,5 +573,5 @@ Mac and choose model-specific settings:
 
 ```sh
 make run-auto MODEL="your-model.gguf" AUTO_EFFORT=balanced
-CGO_ENABLED=1 go test -run '^$' -bench '^BenchmarkApplePrefillMatrixLayout$' -benchmem -count=5
+CGO_ENABLED=1 go test -run '^$' -bench '^BenchmarkApplePrefillMatrixLayout$' -benchmem -count=5 ./internal/engine
 ```

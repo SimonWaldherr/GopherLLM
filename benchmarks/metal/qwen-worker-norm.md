@@ -61,7 +61,7 @@ both implementations. [Loading, warmup and request measurements](m2-max-qwen-wor
 Build the reference revision and the changed source into separate test binaries:
 
 ```sh
-CGO_ENABLED=1 go test -tags metal -c -o /tmp/qwen-worker.test .
+CGO_ENABLED=1 go test -tags metal -c -o /tmp/qwen-worker.test ./internal/engine
 /tmp/qwen-worker.test -test.run '^$' -test.bench '^BenchmarkQwen35DeltaNet27B$' -test.benchtime=1s
 GOPHERLLM_DECODE_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf \
   GOPHERLLM_DECODE_MODE=1 GOPHERLLM_DECODE_CYCLES=1 GOPHERLLM_DECODE_TOKENS=32 \

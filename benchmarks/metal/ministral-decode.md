@@ -62,7 +62,7 @@ so it need not equal the difference between the two medians.
 
 ```sh
 GOPHERLLM_MINISTRAL_MODEL=/path/to/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
-  CGO_ENABLED=1 go test -tags metal . \
+  CGO_ENABLED=1 go test -tags metal ./internal/engine \
     -run '^TestMinistralConfiguredGeneration$' -count=3 -v
 ```
 

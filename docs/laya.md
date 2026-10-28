@@ -407,7 +407,7 @@ released afterward. Attention tasks and worker score pools remain request-local.
 Large feed-forward activations use the worker pool with exact GELU.
 
 ```sh
-CGO_ENABLED=0 go test . -run '^$' -bench BenchmarkLayaPortableAttention -benchmem
+CGO_ENABLED=0 go test ./internal/engine -run '^$' -bench BenchmarkLayaPortableAttention -benchmem
 CGO_ENABLED=1 go test ./internal/layablas -run '^$' -bench BenchmarkAttentionParallel -benchmem
 ```
 

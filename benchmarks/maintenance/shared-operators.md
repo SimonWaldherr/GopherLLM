@@ -43,7 +43,7 @@ present in both benchmark variants. [Raw results](m2-max-patch-copy-2026-10-25.t
 
 ```sh
 go test -run '^$' -bench '^BenchmarkConvolutionPatchCopy$' \
-  -benchtime=100ms -count=3 -benchmem .
+  -benchtime=100ms -count=3 -benchmem ./internal/engine
 ```
 
 ## Whole-model diagnostics and limits
@@ -87,7 +87,7 @@ GOMAXPROCS=8 GOPHERLLM_TTS_MODEL=/path/to/mms-tts-deu \
   GOPHERLLM_DIFFUSION_MODEL=/path/to/ddpm-cifar10-32 \
   go test -run '^$' \
   -bench '^(BenchmarkDiffusionCIFARStep|BenchmarkTTSSynthesize|BenchmarkParakeetEncoderLayer)$' \
-  -benchtime=5x -benchmem .
+  -benchtime=5x -benchmem ./internal/engine
 ```
 
 Repeat with `CGO_ENABLED=0` for the portable implementation. The recorded test
@@ -137,7 +137,7 @@ samples were 3.013–4.276 ms and 0.148–0.219 ms respectively.
 
 ```sh
 GOMAXPROCS=2 go test -run '^$' -bench '^BenchmarkAudioSampleValidation$' \
-  -benchtime=100ms -count=3 -benchmem .
+  -benchtime=100ms -count=3 -benchmem ./internal/engine
 ```
 
 Server and CLI now share RIFF inspection and PCM conversion in `internal/wav`.

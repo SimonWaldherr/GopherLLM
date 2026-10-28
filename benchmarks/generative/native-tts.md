@@ -133,13 +133,13 @@ Place `config.json`, `tokenizer_config.json`, `vocab.json` and
 downloads model weights or invokes Python:
 
 ```sh
-go test -run '^TestTTS' .
+go test -run '^TestTTS' ./internal/engine
 
 GOPHERLLM_TTS_MODEL=/path/to/mms-tts-deu \
-  go test -run '^TestTTSMMSReference$' -count=1 -v .
+  go test -run '^TestTTSMMSReference$' -count=1 -v ./internal/engine
 
 GOMAXPROCS=8 GOPHERLLM_TTS_MODEL=/path/to/mms-tts-deu \
-  go test -run '^$' -bench '^BenchmarkTTSSynthesize$' -benchtime=3x -benchmem .
+  go test -run '^$' -bench '^BenchmarkTTSSynthesize$' -benchtime=3x -benchmem ./internal/engine
 
 go build -o tts-synthesize ./cmd/tts-synthesize
 GOMAXPROCS=8 /usr/bin/time -l ./tts-synthesize -model /path/to/mms-tts-deu \

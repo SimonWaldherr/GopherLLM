@@ -46,6 +46,9 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Check public facade
+        run: go run ./internal/cmd/genapi -check
+
       - name: Test Core ML contracts
         run: go test -tags coreml ./...
 

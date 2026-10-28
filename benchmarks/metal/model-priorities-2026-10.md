@@ -121,7 +121,7 @@ Raw data:
 ## Reproduction and validation
 
 ```sh
-CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-models.test .
+CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-models.test ./internal/engine
 GOPHERLLM_DECODE_MODEL=/path/to/gemma-4-E2B-it-Q4_K_M.gguf \
   GOPHERLLM_DECODE_TOKENS=32 GOPHERLLM_DECODE_PENALTY=1 \
   /tmp/gopherllm-models.test -test.run '^TestConfiguredDecodePaging$' -test.count=3 -test.v

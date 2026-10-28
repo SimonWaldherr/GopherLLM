@@ -1,0 +1,367 @@
+package engine
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strings"
+)
+
+// This file is the primary embedding API for Go applications: a context-first,
+// functional-options veneer over the lower-level Runner. Typical use:
+//
+//	model, err := gopherllm.Open(ctx, "model.gguf")
+//	defer model.Close()
+//	res, err := model.Generate(ctx, "Why is the sky blue?",
+//	    gopherllm.WithMaxTokens(256), gopherllm.WithTemperature(0.7))
+//	fmt.Println(res.Text)
+//
+// The lower-level Runner and its Generate* methods remain available for
+// callers that need them, but new code should prefer Model.
+
+// Model is a loaded LLM ready for generation, chat, embeddings, and
+// tokenization. It wraps a Runner; the same concurrency contract applies
+// (safe to share across goroutines, requests execute one at a time).
+type Model struct {
+	r    *Runner
+	info LoadInfo
+}
+
+// Option configures model loading.
+type Option func(*loadSettings)
+
+type loadSettings struct {
+	logw                 io.Writer
+	threads              int
+	prepareQuantized     bool
+	useMetal             bool
+	outOfCore            bool
+	prefault             MmapPrefaultMode
+	visionProjectorPath  string
+	visionProjectorBytes []byte
+}
+
+// WithLogWriter directs load-progress and warning diagnostics (GGUF summary,
+// per-layer load progress, experimental-architecture warnings) to w. The
+// default is io.Discard: as a library, GopherLLM produces no output unless
+// asked to.
+func WithLogWriter(w io.Writer) Option {
+	return func(s *loadSettings) {
+		if w != nil {
+			s.logw = w
+		}
+	}
+}
+
+// WithThreads sets the compute worker count. NOTE: the worker pool is shared
+// process-wide (all Models in the process use one pool), so this is a global
+// knob despite being a load option; the last value set wins.
+func WithThreads(n int) Option {
+	return func(s *loadSettings) { s.threads = n }
+}
+
+// WithPrepareQuantized precomputes supported quantized scale data at load time
+// for the prepared quantized kernels.
+func WithPrepareQuantized(enabled bool) Option {
+	return func(s *loadSettings) { s.prepareQuantized = enabled }
+}
+
+// WithMetal enables experimental Metal-backed kernels when the current build
+// supports them.
+func WithMetal(enabled bool) Option {
+	return func(s *loadSettings) { s.useMetal = enabled }
+}
+
+// WithOutOfCore loads a GGUF through a CPU-only demand-paged mmap path.
+// Scalar F16/F32/BF16 weights stay in their on-disk form rather than expanding
+// into an owned float32 copy, and sparse MoE expert banks are not prewarmed.
+// It cannot be combined with Metal or prepared quantized weights.
+//
+// Split (sharded) models are supported and are the main reason to use this:
+// each shard stays mapped separately and no merged copy is ever materialised,
+// so peak memory tracks resident pages rather than model size.
+func WithOutOfCore(enabled bool) Option {
+	return func(s *loadSettings) { s.outOfCore = enabled }
+}
+
+// WithMmapPrefault sets the explicit mmap warm-up policy. The zero value
+// (MmapPrefaultAll) preserves normal eager readiness; MmapPrefaultNone is
+// useful for profiling demand paging. WithOutOfCore changes All to Core so
+// sparse expert banks stay cold by default.
+func WithMmapPrefault(mode MmapPrefaultMode) Option {
+	return func(s *loadSettings) { s.prefault = mode }
+}
+
+// WithVisionProjector loads a companion Pixtral-style "mmproj" vision
+// encoder GGUF from path alongside the text decoder, enabling image content
+// on ChatMessage (see ImageContent, Runner.HasVision).
+func WithVisionProjector(path string) Option {
+	return func(s *loadSettings) { s.visionProjectorPath = path }
+}
+
+// Open memory-maps and loads a GGUF model file. The returned Model borrows
+// quantized weights from the mapping zero-copy; Close releases it. ctx only
+// gates the start of the load (weight loading itself is not interruptible).
+func Open(ctx context.Context, path string, opts ...Option) (*Model, error) {
+	settings := applyLoadOptions(opts)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r, info, err := RunnerFromPathWithOptions(path, settings.loadOptions())
+	if err != nil {
+		return nil, err
+	}
+	return &Model{r: r, info: info}, nil
+}
+
+// OpenBytes loads a model from an in-memory GGUF image, copying quantized
+// tensors into owned memory (data may be released afterwards).
+func OpenBytes(ctx context.Context, data []byte, opts ...Option) (*Model, error) {
+	settings := applyLoadOptions(opts)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r, err := runnerFromGGUFBytes(data, false, settings.loadOptions())
+	if err != nil {
+		return nil, err
+	}
+	return &Model{r: r, info: LoadInfo{FileSizeBytes: len(data)}}, nil
+}
+
+func applyLoadOptions(opts []Option) loadSettings {
+	settings := loadSettings{logw: io.Discard}
+	for _, opt := range opts {
+		opt(&settings)
+	}
+	if settings.threads > 0 {
+		SetNumThreads(settings.threads)
+	}
+	return settings
+}
+
+func (s loadSettings) loadOptions() LoadOptions {
+	return LoadOptions{
+		PrepareQuantized:     s.prepareQuantized,
+		UseMetal:             s.useMetal,
+		OutOfCore:            s.outOfCore,
+		Prefault:             s.prefault,
+		LogWriter:            s.logw,
+		VisionProjectorPath:  s.visionProjectorPath,
+		VisionProjectorBytes: s.visionProjectorBytes,
+	}
+}
+
+// Close releases the model's memory-mapped weight file. No Model method may
+// be called afterwards.
+func (m *Model) Close() error { return m.r.Close() }
+
+// Runner exposes the underlying low-level Runner for callers that need
+// capabilities the Model API doesn't surface (custom forward passes, the
+// agentic skill loop, the HTTP handler).
+func (m *Model) Runner() *Runner { return m.r }
+
+// Info returns file size and load timing. Config, Tokenizer, GGUF, and Name
+// expose the model's static properties.
+func (m *Model) Info() LoadInfo        { return m.info }
+func (m *Model) Config() Config        { return m.r.Config() }
+func (m *Model) Tokenizer() *Tokenizer { return m.r.Tokenizer() }
+func (m *Model) GGUF() *GGUFFile       { return m.r.GGUF() }
+
+// Name returns the model's self-declared name (general.name), or the empty
+// string.
+func (m *Model) Name() string {
+	name, _ := m.r.ModelName()
+	return name
+}
+
+// IsMapped reports whether the path-based model was loaded through mmap.
+func (m *Model) IsMapped() bool { return m != nil && m.r != nil && m.r.IsMapped() }
+
+// GenOption configures a single generation request on top of
+// DefaultGenerationOptions.
+type GenOption func(*GenerationOptions)
+
+// WithMaxTokens caps the number of generated tokens (default 256).
+func WithMaxTokens(n int) GenOption { return func(o *GenerationOptions) { o.MaxTokens = n } }
+
+// WithMTPDraftTokens enables Qwen3.5/3.6/3.8's exact greedy MTP draft head.
+// The model must contain a NextN block and generation must be deterministic
+// (temperature 0 or top-k 1); zero leaves MTP disabled.
+func WithMTPDraftTokens(n int) GenOption {
+	return func(o *GenerationOptions) { o.MTPDraftTokens = n }
+}
+
+// WithPromptLookupTokens enables up to n known-history draft candidates (1–7).
+// Each candidate is target-verified; generation must use temperature 0 or top-k
+// 1. Zero disables lookup. With MTP enabled, matching history is tried first.
+func WithPromptLookupTokens(n int) GenOption {
+	return func(o *GenerationOptions) { o.PromptLookupTokens = n }
+}
+
+// WithTemperature sets the sampling temperature; 0 selects greedy decoding.
+func WithTemperature(t float32) GenOption {
+	return func(o *GenerationOptions) { o.Sampler.Temperature = t }
+}
+
+// WithTopP sets nucleus sampling mass in (0, 1]; 1 disables it.
+func WithTopP(p float32) GenOption { return func(o *GenerationOptions) { o.Sampler.TopP = p } }
+
+// WithTopK restricts sampling to the k most likely tokens; 0 disables it.
+func WithTopK(k int) GenOption { return func(o *GenerationOptions) { o.Sampler.TopK = k } }
+
+// WithMinP drops candidates below fraction p of the best token's probability.
+func WithMinP(p float32) GenOption { return func(o *GenerationOptions) { o.Sampler.MinP = p } }
+
+// WithRepeatPenalty penalizes recently generated tokens; 1 disables it.
+func WithRepeatPenalty(p float32) GenOption {
+	return func(o *GenerationOptions) { o.Sampler.RepeatPenalty = p }
+}
+
+// WithSeed makes sampling deterministic for a fixed seed (0 = time-based).
+func WithSeed(seed uint64) GenOption { return func(o *GenerationOptions) { o.Seed = seed } }
+
+// WithSystemPrompt replaces the default system prompt; pass "" for none.
+func WithSystemPrompt(s string) GenOption {
+	return func(o *GenerationOptions) { o.SystemPrompt = s }
+}
+
+// WithStop adds stop sequences that end generation when they appear.
+func WithStop(sequences ...string) GenOption {
+	return func(o *GenerationOptions) { o.StopSequences = append(o.StopSequences, sequences...) }
+}
+
+// WithTools offers OpenAI-shaped tool definitions to the model; calls the
+// model makes come back in Result.ToolCalls with FinishReason "tool_calls"
+// for the CALLER to execute and continue itself (e.g. via ToolResultMessage
+// on a follow-up Chat call).
+//
+// For a tool the loop should execute and answer with automatically — the
+// far more common case for a "give the model a Go function" tool — build one
+// with NewTool and run it through RunAgenticChatWithTools(model.Runner(),
+// ...) instead, or use the agent package's Agent.Ask/Chat, which wraps that
+// same loop with retrieval and citations on top. WithTools and an
+// AgenticTool's Definition are otherwise the same OpenAI-shaped schema; the
+// difference is only who executes the call.
+func WithTools(tools ...ToolDefinition) GenOption {
+	return func(o *GenerationOptions) { o.Tools = append(o.Tools, tools...) }
+}
+
+// WithToolChoice sets the tool_choice behavior ("none" suppresses tools).
+func WithToolChoice(choice string) GenOption {
+	return func(o *GenerationOptions) { o.ToolChoice = choice }
+}
+
+// WithGenerationOptions replaces the entire options struct (escape hatch for
+// callers that already hold a GenerationOptions); later GenOptions still
+// apply on top.
+func WithGenerationOptions(base GenerationOptions) GenOption {
+	return func(o *GenerationOptions) {
+		ctx := o.ctx
+		*o = base
+		o.ctx = ctx
+	}
+}
+
+func buildGenOptions(ctx context.Context, opts []GenOption) GenerationOptions {
+	options := DefaultGenerationOptions()
+	options.ctx = ctx
+	for _, opt := range opts {
+		opt(&options)
+	}
+	return options
+}
+
+// ApplyGenOptions builds a GenerationOptions the same way Model's own
+// context-first methods do (DefaultGenerationOptions plus every opt, in
+// order, with ctx attached), for the functions that don't take ...GenOption
+// themselves — RunAgenticChat, RunAgenticChatWithTools, RunAgenticChatObserved,
+// and RunAgenticChatWithGenerator all take a plain GenerationOptions, since
+// they existed before the GenOption veneer and are also called by hosts (the
+// HTTP server, the CLI) that already build one by hand from their own
+// request/flag parsing.
+//
+//	options := gopherllm.ApplyGenOptions(ctx, gopherllm.WithTemperature(0.2))
+//	result, err := gopherllm.RunAgenticChatWithTools(model.Runner(), messages, options, nil, tools, nil)
+//
+// Without this, reaching for WithTemperature/WithMaxTokens/etc. on that path
+// means either setting the corresponding GenerationOptions field directly, or
+// noticing that a GenOption is just a func(*GenerationOptions) and invoking
+// one by hand.
+func ApplyGenOptions(ctx context.Context, opts ...GenOption) GenerationOptions {
+	return buildGenOptions(ctx, opts)
+}
+
+// Generate runs a single-prompt completion. Cancellation via ctx takes effect
+// between prefill chunks and between decoded tokens; the returned error is
+// then the context's error.
+func (m *Model) Generate(ctx context.Context, prompt string, opts ...GenOption) (GenerationResult, error) {
+	return m.Chat(ctx, []ChatMessage{UserMessage(prompt)}, opts...)
+}
+
+// Chat runs a multi-turn conversation through the model's chat template.
+func (m *Model) Chat(ctx context.Context, messages []ChatMessage, opts ...GenOption) (GenerationResult, error) {
+	return m.r.GenerateChatStreamUntil(messages, buildGenOptions(ctx, opts), func(string) bool { return true })
+}
+
+// Stream is Chat with incremental delivery: onDelta receives each new chunk
+// of valid-UTF-8 output text as it is generated. Returning a non-nil error
+// from onDelta stops generation; that error is returned (wrapped) alongside
+// the partial result. When tools are offered, output is delivered in a single
+// final call instead of incrementally so raw tool-call syntax never leaks
+// (see RunAgenticChat for why).
+func (m *Model) Stream(ctx context.Context, messages []ChatMessage, onDelta func(delta string) error, opts ...GenOption) (GenerationResult, error) {
+	var deltaErr error
+	result, err := m.r.GenerateChatStreamUntil(messages, buildGenOptions(ctx, opts), func(text string) bool {
+		if onDelta == nil {
+			return true
+		}
+		if err := onDelta(text); err != nil {
+			deltaErr = err
+			return false
+		}
+		return true
+	})
+	if deltaErr != nil {
+		return result, fmt.Errorf("stream callback: %w", deltaErr)
+	}
+	return result, err
+}
+
+// Embed returns the mean-pooled, L2-normalized final-hidden-state embedding
+// of text. Cancellation granularity is the whole call (embedding runs a
+// prompt-length forward pass).
+func (m *Model) Embed(ctx context.Context, text string) (EmbeddingResult, error) {
+	if err := ctx.Err(); err != nil {
+		return EmbeddingResult{}, err
+	}
+	return m.r.EmbedContext(ctx, text)
+}
+
+// EmbedBatch is Model.Embed for a batch of texts, embedding all of them under
+// a single model lease. See Runner.EmbedBatch for why this is not merely a
+// loop over Embed at the call site: setup (and, on a decoder model, the KV
+// prefix-cache clear) is paid once for the whole batch instead of once per
+// text, and ctx is honored between texts rather than only around the call.
+func (m *Model) EmbedBatch(ctx context.Context, texts []string) ([]EmbeddingResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return m.r.EmbedBatch(ctx, texts)
+}
+
+// HTTP serving lives in the server subpackage so that importing this one for
+// inference alone does not pull in net/http, html/template, or the embedded
+// web UI. Use server.HandlerForModel(m, opts) instead of a method here.
+
+// Tokenize encodes text with the model's tokenizer (including BOS when the
+// model declares it). Detokenize is its inverse over generated ids.
+func (m *Model) Tokenize(text string) []uint32 { return m.r.Tokenizer().Encode(text) }
+
+// Detokenize decodes token ids back to text.
+func (m *Model) Detokenize(ids []uint32) string {
+	var sb strings.Builder
+	for _, id := range ids {
+		sb.WriteString(m.r.Tokenizer().DecodeToken(id))
+	}
+	return sb.String()
+}

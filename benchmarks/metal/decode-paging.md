@@ -133,7 +133,7 @@ reduction in SSD traffic or guaranteed swap-free operation at long contexts.
 Build once, then run model measurements sequentially without simultaneous builds:
 
 ```sh
-CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-decode.test .
+CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-decode.test ./internal/engine
 GOPHERLLM_DECODE_MODEL=/path/to/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
   /tmp/gopherllm-decode.test -test.run '^TestConfiguredDecodePaging$' -test.count=3 -test.v
 GOPHERLLM_DECODE_MODEL=/path/to/Qwen3.8-27B-Q4_K_M.gguf GOPHERLLM_DECODE_TOKENS=32 \
@@ -222,7 +222,7 @@ model's weights. These small step-latency improvements do not establish a
 reduction in paging or faster complete chat requests.
 
 ```sh
-CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-attention.test .
+CGO_ENABLED=1 go test -tags metal -c -o /tmp/gopherllm-attention.test ./internal/engine
 GOPHERLLM_ATTENTION_MODEL=/path/to/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf \
   /tmp/gopherllm-attention.test -test.run '^TestMetalConfiguredAttentionBenchmark$' \
   -test.count=3 -test.v

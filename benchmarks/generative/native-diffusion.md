@@ -109,13 +109,13 @@ GOMAXPROCS=8 /usr/bin/time -l /tmp/image-generate -model /path/to/ddpm-cifar10-3
   -out /tmp/cifar-seed42.png -seed 42 -steps 50 -threads 8
 
 GOPHERLLM_DIFFUSION_MODEL=/path/to/ddpm-cifar10-32 \
-  go test -run '^TestDiffusion' -v .
+  go test -run '^TestDiffusion' -v ./internal/engine
 
 CGO_ENABLED=0 GOPHERLLM_DIFFUSION_MODEL=/path/to/ddpm-cifar10-32 \
-  go test -run '^TestDiffusionCIFARReference$/^noise_' -v .
+  go test -run '^TestDiffusionCIFARReference$/^noise_' -v ./internal/engine
 
 GOMAXPROCS=8 GOPHERLLM_DIFFUSION_MODEL=/path/to/ddpm-cifar10-32 \
-  go test -run '^$' -bench '^BenchmarkDiffusionCIFARStep$' -benchtime=3x -benchmem .
+  go test -run '^$' -bench '^BenchmarkDiffusionCIFARStep$' -benchtime=3x -benchmem ./internal/engine
 ```
 
 Regenerate `testdata/diffusion_cifar10.safetensors` in a separate reference

@@ -90,7 +90,7 @@ Build reference and changed sources into separate test binaries, including the
 same added benchmarks in the reference:
 
 ```sh
-CGO_ENABLED=1 go test -c -o /tmp/encoders.test .
+CGO_ENABLED=1 go test -c -o /tmp/encoders.test ./internal/engine
 GOMAXPROCS=8 /tmp/encoders.test -test.run '^$' \
   -test.bench '^(BenchmarkLayaLayer|BenchmarkVoxtralAttention|BenchmarkVoxtralEncoderLayer)$' \
   -test.benchtime=500ms
