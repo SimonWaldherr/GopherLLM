@@ -1383,6 +1383,8 @@ experiments, use the recorded methodology and raw data:
 | Workload | Measurement record |
 |---|---|
 | Ministral 3B Metal decode, M2 Max | [Paired requests and decode steps](benchmarks/metal/ministral-decode.md) |
+| Ministral/Voxtral Tekken tokenization | [Splitter timing and allocation measurements](benchmarks/maintenance/tekken.md) |
+| Voxtral offline convolution stem, M2 Max | [Accelerate timing and scratch usage](benchmarks/encoders/laya-voxtral.md#offline-voxtral-convolution-tiles-2026-10-29) |
 | Core ML embeddings, M2 Max | [CPU/Neural Engine comparisons](benchmarks/coreml/README.md) |
 | Core ML FFNs, Qwen and Ministral | [Validation, memory and timing](benchmarks/coreml/ffn.md) |
 

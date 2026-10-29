@@ -108,3 +108,74 @@ parallel attention reference uses the same original serial CBLAS/softmax order.
 
 Portable and Metal/Core ML test suites, targeted Laya/Voxtral race tests,
 native `go vet` and all six `make cross-build` targets passed.
+
+## Offline Voxtral convolution tiles (2026-10-29)
+
+The offline convolution stem uses Accelerate SGEMM with a 32-frame patch and
+output tile on Darwin builds with cgo. It reads causal windows directly from
+the source, removing the full padded input copy. Bias and tanh GELU run across
+independent output channels when a tile has at least 16,384 elements, using the
+existing worker pool without changing per-element arithmetic. One reusable
+task serves all tiles in a call.
+
+Float scratch is bounded at 208 KiB for the first stem and 640 KiB for the second,
+independently of clip duration. If the complete output fits one tile, SGEMM
+writes directly into the caller output and GELU operates in place; only the
+patch needs separate float storage. Short calls, projections with fewer than
+128 input or 128 output channels, and portable builds retain the SIMD dot path.
+
+On M2 Max (32 GiB, macOS 27.2, Go 1.27.3), seven alternating same-process
+reference/changed pairs gave these median complete-convolution times. The
+reference preserves the frame-at-a-time implementation from `327810b`:
+
+| Workload | Reference | Changed | Speedup |
+| --- | ---: | ---: | ---: |
+| First stem, 100 input frames | 1.469 ms | 0.569 ms | 2.58× |
+| Second stem, 100 input frames | 3.992 ms | 1.837 ms | 2.17× |
+| First stem, 700 input frames | 10.183 ms | 3.200 ms | 3.18× |
+| Second stem, 700 input frames | 29.048 ms | 8.084 ms | 3.59× |
+
+The measurements include allocations, packing, projection and tanh GELU at
+checkpoint dimensions, using deterministic synthetic inputs and weights.
+Allocated bytes per call from a separate seven-iteration report were:
+
+| Workload | Reference | Changed |
+| --- | ---: | ---: |
+| First stem, 10 input frames | 76,184 B | 73,857 B |
+| Second stem, 700 input frames | 5,513,776 B | 2,449,723 B |
+
+Intermediate-length clips can still allocate more because the tile replaces a
+smaller padded input. No additional weight copy is introduced. Background host
+load was not controlled, while independent repository builds and benchmarks
+were kept outside this timing window. These component results do not measure
+complete transcription latency, peak RSS or paging.
+
+Narrow custom encoders retain bit-exact SIMD dot outputs. Tests cover the
+input/output channel gate, stride 1/2, tile tails, causal padding, input
+preservation, missing/partial biases and cancellation. Activation tests compare
+every float bit across 1/8 workers, aliased/disjoint outputs, subnormals,
+infinities, NaNs and signed zeros. A selective real-weight check loads only
+the two convolution weights and biases from the local Voxtral Mini 4B Realtime
+Q6_K GGUF; its largest absolute output difference was 2.24e-7. Existing tiny
+offline/streaming encoder boundary tests also pass. SGEMM changes matrix
+reduction order, so real-weight checks use an explicit floating-point tolerance.
+
+Offline transcription also closes its temporary Metal decoder on success and
+error returns, releasing native KV/activation buffers and decoder-owned
+projections. Model-owned weights remain reusable. A small Metal fixture checks
+closure before/after a step and after an input error, including repeated close
+and preservation of borrowed weights. This is lifecycle validation, without
+process-memory or complete-checkpoint latency measurements.
+
+Raw pairs, allocation reports, source and binary hashes, commands and limits:
+[m2-max-voxtral-conv-2026-10-29.json](m2-max-voxtral-conv-2026-10-29.json).
+
+```sh
+CGO_ENABLED=1 go test -tags 'metal coreml' -c -o /tmp/voxtral.test ./internal/engine
+GOMAXPROCS=8 /tmp/voxtral.test -test.run '^$' \
+  -test.bench '^BenchmarkVoxtralCausalConvPaired$' -test.benchtime=7x -test.v
+GOMAXPROCS=8 /tmp/voxtral.test -test.run '^$' \
+  -test.bench '^BenchmarkVoxtralCausalConv$' -test.benchtime=7x -test.benchmem
+GOMAXPROCS=8 GOPHERLLM_VOXTRAL_MODEL=/path/to/Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf \
+  /tmp/voxtral.test -test.run 'TestVoxtralCausalConv|TestVoxtralConvActivation|TestVoxtralMetalDecoderCloseOwnership|TestVoxtralOfflineCPUFallback' -test.v
+```

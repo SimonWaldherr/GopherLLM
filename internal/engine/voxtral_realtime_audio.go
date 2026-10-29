@@ -160,16 +160,25 @@ func causalConv1dOutputLen(length, kernel, stride int) (padLeft, padRight, outLe
 // exact/erf GELU -- every GELU site in this file and voxtral_realtime_decoder.go
 // uses the same tanh approximation for this reason).
 func applyCausalConv1dContext(ctx context.Context, x []float32, in, length int, conv VoxtralRealtimeEncoderConv) (out []float32, outLen int, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if conv.In != in {
 		return nil, 0, fmt.Errorf("causal conv1d: input has %d channels, weight expects %d", in, conv.In)
 	}
 	padLeft, padRight, outLen := causalConv1dOutputLen(length, conv.Kernel, conv.Stride)
+	out = make([]float32, conv.Out*outLen)
+	if used, err := voxtralCausalConvBatch(ctx, x, length, conv, padLeft, outLen, out); used {
+		if err != nil {
+			return nil, 0, err
+		}
+		return out, outLen, nil
+	}
 	paddedLen := length + padLeft + padRight
 	padded := make([]float32, in*paddedLen)
 	for c := range in {
 		copy(padded[c*paddedLen+padLeft:c*paddedLen+padLeft+length], x[c*length:(c+1)*length])
 	}
-	out = make([]float32, conv.Out*outLen)
 	workers := 1
 	if outLen*conv.Out*in*conv.Kernel >= 1<<18 {
 		workers = max(1, min(outLen, numThreads()))

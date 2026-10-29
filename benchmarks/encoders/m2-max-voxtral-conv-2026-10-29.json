@@ -1,0 +1,390 @@
+{
+  "date": "2026-10-29",
+  "hardware": {
+    "chip": "Apple M2 Max",
+    "ram_gib": 32,
+    "os": "macOS 27.2 (26B123)"
+  },
+  "go": "go1.27.3 darwin/arm64",
+  "gomaxprocs": 8,
+  "cgo_enabled": true,
+  "build_tags": [
+    "metal",
+    "coreml"
+  ],
+  "backend": "Darwin Accelerate SGEMM",
+  "build_command": "CGO_ENABLED=1 go test -tags 'metal coreml' -c -o .cache/european-commit/engine-final.test ./internal/engine",
+  "baseline_revision": "327810b",
+  "reference": "Test-only copy of the 327810b padded-input / frame-at-a-time SIMD-dot implementation. The changed implementation includes bounded SGEMM tiles, parallel bias/GELU and one-tile output reuse.",
+  "workload": "Individual offline Voxtral causal convolution stem, including output/scratch allocation, patch packing, projection and tanh GELU. Synthetic deterministic input and weights at Voxtral Mini 4B Realtime checkpoint dimensions.",
+  "method": "Seven same-process alternating reference/batched and batched/reference pairs per shape, after warming both modes. Go benchmark one-iteration calibration records excluded; the final seven pairs are retained. Separate seven-iteration allocation report.",
+  "commands": [
+    "GOMAXPROCS=8 engine-final.test -test.run ^$ -test.bench ^BenchmarkVoxtralCausalConvPaired$ -test.benchtime=7x -test.count=1 -test.v",
+    "GOMAXPROCS=8 engine-final.test -test.run ^$ -test.bench ^BenchmarkVoxtralCausalConv$ -test.benchtime=7x -test.count=1 -test.benchmem"
+  ],
+  "limits": [
+    "Component measurements do not establish complete transcription latency, recognition accuracy, peak RSS, or paging improvement.",
+    "Host background load was not controlled. Independent repository builds and benchmarks were kept outside this timing window.",
+    "The optimized branch is Darwin+cgo only and requires at least 128 input and 128 output channels; narrower custom encoders, short calls and portable builds keep the original SIMD-dot path.",
+    "Float scratch is bounded at 32 frames. Calls with at most 32 output frames reuse the caller output as the projected slab; intermediate-length clips can still allocate more than the original padded-input path. No extra weight copy is introduced.",
+    "Allocation totals include Go allocator size classes and worker/pool refill noise."
+  ],
+  "scratch_cap_bytes": {
+    "stem0": 212992,
+    "stem1": 655360
+  },
+  "single_tile_scratch_bytes": {
+    "formula": "in_channels * kernel * output_frames * sizeof(float32); projected slab aliases caller output",
+    "stem0_10_output_frames": 15360
+  },
+  "activation_schedule": {
+    "parallel_min_tile_elements": 16384,
+    "unit": "independent output channels; original per-element bias/GELU math unchanged",
+    "single_tile_projection": "GEMM writes directly into caller output when output_frames<=32"
+  },
+  "source_sha256": {
+    "internal/engine/voxtral_realtime_audio.go": "f16591c47b978b877cbdab2dae18b801c7ae155b9fb7c0a24a0dc03ffda86d6b",
+    "internal/engine/voxtral_conv_darwin.go": "cb400ec83f0bc1ecf5de6e1428170a4cdc226a964fe997e9450dce762c1879b7",
+    "internal/engine/voxtral_conv_stub.go": "e3497caa9122743fc5c44fbbe29669020877cece02a3b71e6114649ba9968f52",
+    "internal/engine/voxtral_conv_bench_test.go": "0ab2c495713b4a69956c9f05d21a22956779827d13bbe5762591cd62aaf705a7",
+    "internal/engine/voxtral_conv_darwin_test.go": "18915bdfd770e5fc85ec4886db70a6c7c933d3482d70be7b49a1dcb4908ef88d",
+    "internal/engine/voxtral_transcribe.go": "ac5c5ccbb6e9d54d1752baa54bfea03a6ff49f8dab844da1a5ca239aba345717",
+    "internal/engine/voxtral_stream_metal_test.go": "f21df9991fb52fa38a4b3fb6357d86c72f67b96da05a16c22707c5aad3529917",
+    "internal/engine/voxtral_transcribe_test.go": "3141ec86c7a295e2d9edc58b41b55538b616459a73e59fd4a36f639d2185a536"
+  },
+  "binary_sha256": "4e54bf4b9106b2d04dcddb3f6b9c7b86cba5b641041db94d5fc01bb71c728196",
+  "measurements": [
+    {
+      "shape": "stem0_1s",
+      "in_channels": 128,
+      "out_channels": 1280,
+      "kernel": 3,
+      "stride": 1,
+      "input_frames": 100,
+      "reference_median_ns": 1468958,
+      "batched_median_ns": 569250,
+      "median_speedup": 2.580514712340799,
+      "median_paired_savings_ns": 905250,
+      "pairs": [
+        {
+          "pair": 0,
+          "reference_ns": 1449417,
+          "batched_ns": 626458
+        },
+        {
+          "pair": 1,
+          "reference_ns": 1473667,
+          "batched_ns": 517750
+        },
+        {
+          "pair": 2,
+          "reference_ns": 1448500,
+          "batched_ns": 796333
+        },
+        {
+          "pair": 3,
+          "reference_ns": 1925542,
+          "batched_ns": 536042
+        },
+        {
+          "pair": 4,
+          "reference_ns": 1468958,
+          "batched_ns": 555417
+        },
+        {
+          "pair": 5,
+          "reference_ns": 1447458,
+          "batched_ns": 764584
+        },
+        {
+          "pair": 6,
+          "reference_ns": 1474500,
+          "batched_ns": 569250
+        }
+      ]
+    },
+    {
+      "shape": "stem1_1s",
+      "in_channels": 1280,
+      "out_channels": 1280,
+      "kernel": 3,
+      "stride": 2,
+      "input_frames": 100,
+      "reference_median_ns": 3991958,
+      "batched_median_ns": 1836833,
+      "median_speedup": 2.173283036617918,
+      "median_paired_savings_ns": 2238792,
+      "pairs": [
+        {
+          "pair": 0,
+          "reference_ns": 3886750,
+          "batched_ns": 1998709
+        },
+        {
+          "pair": 1,
+          "reference_ns": 5601458,
+          "batched_ns": 1863291
+        },
+        {
+          "pair": 2,
+          "reference_ns": 3991958,
+          "batched_ns": 1936458
+        },
+        {
+          "pair": 3,
+          "reference_ns": 4035709,
+          "batched_ns": 1576417
+        },
+        {
+          "pair": 4,
+          "reference_ns": 3930542,
+          "batched_ns": 1836833
+        },
+        {
+          "pair": 5,
+          "reference_ns": 3926625,
+          "batched_ns": 1687833
+        },
+        {
+          "pair": 6,
+          "reference_ns": 4359125,
+          "batched_ns": 1786542
+        }
+      ]
+    },
+    {
+      "shape": "stem0_7s",
+      "in_channels": 128,
+      "out_channels": 1280,
+      "kernel": 3,
+      "stride": 1,
+      "input_frames": 700,
+      "reference_median_ns": 10183291,
+      "batched_median_ns": 3200417,
+      "median_speedup": 3.1818638008734488,
+      "median_paired_savings_ns": 6807667,
+      "pairs": [
+        {
+          "pair": 0,
+          "reference_ns": 10432291,
+          "batched_ns": 3144042
+        },
+        {
+          "pair": 1,
+          "reference_ns": 10140166,
+          "batched_ns": 3380583
+        },
+        {
+          "pair": 2,
+          "reference_ns": 10183291,
+          "batched_ns": 3200417
+        },
+        {
+          "pair": 3,
+          "reference_ns": 10198667,
+          "batched_ns": 3391000
+        },
+        {
+          "pair": 4,
+          "reference_ns": 9898875,
+          "batched_ns": 3178542
+        },
+        {
+          "pair": 5,
+          "reference_ns": 9669958,
+          "batched_ns": 3345792
+        },
+        {
+          "pair": 6,
+          "reference_ns": 11644333,
+          "batched_ns": 3187375
+        }
+      ]
+    },
+    {
+      "shape": "stem1_7s",
+      "in_channels": 1280,
+      "out_channels": 1280,
+      "kernel": 3,
+      "stride": 2,
+      "input_frames": 700,
+      "reference_median_ns": 29048000,
+      "batched_median_ns": 8083959,
+      "median_speedup": 3.593288882340942,
+      "median_paired_savings_ns": 22059708,
+      "pairs": [
+        {
+          "pair": 0,
+          "reference_ns": 26564000,
+          "batched_ns": 7590167
+        },
+        {
+          "pair": 1,
+          "reference_ns": 29048000,
+          "batched_ns": 6157000
+        },
+        {
+          "pair": 2,
+          "reference_ns": 32410375,
+          "batched_ns": 8416542
+        },
+        {
+          "pair": 3,
+          "reference_ns": 30143667,
+          "batched_ns": 8083959
+        },
+        {
+          "pair": 4,
+          "reference_ns": 28641709,
+          "batched_ns": 9635833
+        },
+        {
+          "pair": 5,
+          "reference_ns": 30807625,
+          "batched_ns": 8236666
+        },
+        {
+          "pair": 6,
+          "reference_ns": 27705959,
+          "batched_ns": 7204750
+        }
+      ]
+    }
+  ],
+  "allocation_reports": {
+    "stem0_100ms": {
+      "reference": {
+        "iterations": 7,
+        "ns_per_op": 250089,
+        "allocated_bytes_per_op": 76184,
+        "allocations_per_op": 4
+      },
+      "batched": {
+        "iterations": 7,
+        "ns_per_op": 167655,
+        "allocated_bytes_per_op": 73857,
+        "allocations_per_op": 5
+      }
+    },
+    "stem1_100ms": {
+      "reference": {
+        "iterations": 7,
+        "ns_per_op": 659173,
+        "allocated_bytes_per_op": 166920,
+        "allocations_per_op": 4
+      },
+      "batched": {
+        "iterations": 7,
+        "ns_per_op": 600524,
+        "allocated_bytes_per_op": 166939,
+        "allocations_per_op": 6
+      }
+    },
+    "stem0_1s": {
+      "reference": {
+        "iterations": 7,
+        "ns_per_op": 1540637,
+        "allocated_bytes_per_op": 586322,
+        "allocations_per_op": 5
+      },
+      "batched": {
+        "iterations": 7,
+        "ns_per_op": 598637,
+        "allocated_bytes_per_op": 729573,
+        "allocations_per_op": 7
+      }
+    },
+    "stem1_1s": {
+      "reference": {
+        "iterations": 7,
+        "ns_per_op": 4352583,
+        "allocated_bytes_per_op": 909701,
+        "allocations_per_op": 4
+      },
+      "batched": {
+        "iterations": 7,
+        "ns_per_op": 1719536,
+        "allocated_bytes_per_op": 917808,
+        "allocations_per_op": 6
+      }
+    },
+    "stem0_7s": {
+      "reference": {
+        "iterations": 7,
+        "ns_per_op": 11529179,
+        "allocated_bytes_per_op": 3961835,
+        "allocations_per_op": 6
+      },
+      "batched": {
+        "iterations": 7,
+        "ns_per_op": 3355500,
+        "allocated_bytes_per_op": 3801957,
+        "allocations_per_op": 8
+      }
+    },
+    "stem1_7s": {
+      "reference": {
+        "iterations": 7,
+        "ns_per_op": 27080202,
+        "allocated_bytes_per_op": 5513776,
+        "allocations_per_op": 4
+      },
+      "batched": {
+        "iterations": 7,
+        "ns_per_op": 7147798,
+        "allocated_bytes_per_op": 2449723,
+        "allocations_per_op": 6
+      }
+    }
+  },
+  "validation": {
+    "activation": "Exact float-bit comparison across 1/8 workers, 1/31/32 frames, aliased/disjoint slabs, absent/partial/full bias, normal/subnormal/nonfinite values and signed zeros.",
+    "synthetic": "Stride 1/2, partial/full 32-frame tiles, causal boundary padding, input immutability, missing/partial biases, pre/mid-call cancellation.",
+    "checkpoint": "Only two convolution tensors and their biases from Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf are loaded for real-weight numerical parity; decoder and remaining encoder are not expanded.",
+    "checkpoint_source": "handy-computer/Voxtral-Mini-4B-Realtime-2602-gguf/Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+    "checkpoint_results": [
+      {
+        "conv": 0,
+        "input_frames": 67,
+        "max_abs_error": 2.60770320892334e-08
+      },
+      {
+        "conv": 0,
+        "input_frames": 129,
+        "max_abs_error": 2.3283064365386963e-08
+      },
+      {
+        "conv": 1,
+        "input_frames": 67,
+        "max_abs_error": 2.2351741790771484e-07
+      },
+      {
+        "conv": 1,
+        "input_frames": 129,
+        "max_abs_error": 1.4156103134155273e-07
+      }
+    ],
+    "checkpoint_tolerance": "2e-5 * (1 + abs(reference))",
+    "command": "GOMAXPROCS=8 GOPHERLLM_VOXTRAL_MODEL=/path/to/Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf ../../.cache/european-commit/engine-final.test -test.run 'TestVoxtralCausalConv|TestEncodeAudioVoxtral|TestVoxtralStreamingEncoder|TestVoxtralConvActivation|TestVoxtralMetalDecoderCloseOwnership|TestVoxtralOfflineCPUFallback' -test.v",
+    "working_directory": "internal/engine",
+    "native_suite": {
+      "result": "PASS",
+      "command": "CGO_ENABLED=1 go test -tags 'metal coreml' ./... -count=1"
+    },
+    "portable_suite": {
+      "result": "PASS",
+      "command": "CGO_ENABLED=0 go test ./... -count=1"
+    },
+    "small_channel_fallback": "Inputs or outputs below 128 channels retain bit-exact prior SIMD dot outputs. Tests cover 33/64, 127/128 and 128/127 channels, each with strides 1/2/3. Existing TestSpeechCausalConvolutionMatchesSerial is unchanged and passes.",
+    "metal_decoder_close": "PASS with actual Metal execution (not skipped): close before first step, after a successful step and after failed input validation; owned projections and native decoder close, borrowed model output weight remains usable, repeated and nil close stay safe. The offline entry point now defers this close on every return after fast-decoder creation.",
+    "result": "PASS; full native/portable suites and explicit verbose convolution/activation/checkpoint/Metal-lifecycle/CPU-fallback checks."
+  },
+  "raw_log_sha256": {
+    "voxtral-conv-final-pairs.log": "cf66aee301e0c5bdb49b88223577ae9f0381d7beead6f75c7058db60a235c160",
+    "voxtral-conv-final-allocs.log": "3fe812df90e76e73ec580e6ce87e6d49e2f120596de128fc024875313f4394f8",
+    "voxtral-validation.log": "4278a32e264fa62d806f23c0ae6b6fa6a8c8a21a7d1dd45dd006acc645295853",
+    "native-tests.log": "bf9c65b457ee0de6c3f28bd25b6841011ed73d4c0d68489793e3465c55b71d9f",
+    "portable-tests.log": "8b61e4502d53e276cf3aa8f673612c7109e1b77e95222c7bdccd101f300ba0b1"
+  },
+  "raw_log_note": "Ignored local diagnostic logs. All measured pairs and allocation report rows are retained in this JSON. Earlier exploratory binaries/logs and the prior european-next run are excluded."
+}
