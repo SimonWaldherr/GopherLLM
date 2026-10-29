@@ -442,15 +442,23 @@ func (t *Tokenizer) encodeGPT2BPE(text string) []uint32 {
 	out := make([]uint32, 0, len(text)/3+8)
 	var syms []bpeSymbol
 	var heap bpeHeap
+	var encoded strings.Builder
 	for _, piece := range t.pretokenize(text) {
-		var encoded strings.Builder
-		encoded.Grow(2 * len(piece))
+		// Reuse bounded mapping slabs; reserve an unusually large piece in
+		// one allocation instead of growing through every smaller capacity.
+		if encoded.Len() >= 64<<10 || 2*len(piece) > encoded.Cap()-encoded.Len() {
+			encoded.Reset()
+		}
+		if encoded.Cap() == 0 {
+			encoded.Grow(max(2*len(piece), min(2*len(text), 64<<10)))
+		}
+		start := encoded.Len()
 		for i := 0; i < len(piece); i++ {
 			if ch, ok := t.ByteEncoder[piece[i]]; ok {
 				encoded.WriteRune(ch)
 			}
 		}
-		mapped := encoded.String()
+		mapped := encoded.String()[start:]
 		if mapped == "" {
 			continue
 		}
@@ -826,36 +834,46 @@ func kimiWhitespaceEnd(r []rune, n, i int) int {
 // character becomes its own piece and words split on upper/lower-case
 // boundaries, matching how the Tekken merges were trained.
 func pretokenizeTekken(text string) []string {
-	r := []rune(text)
-	n := len(r)
-	pieces := make([]string, 0, len(r)/3+1)
-	i := 0
-	for i < n {
-		if end, ok := matchTekkenWord(r, n, i); ok {
-			pieces = append(pieces, string(r[i:end]))
+	// Preserve the rune-based splitter's replacement of each invalid byte.
+	// Valid UTF-8 pieces can borrow the input instead of copying every word.
+	if !utf8.ValidString(text) {
+		text = string([]rune(text))
+	}
+	pieces := make([]string, 0, utf8.RuneCountInString(text)/3+1)
+	for i := 0; i < len(text); {
+		if end, ok := matchTekkenWord(text, i); ok {
+			pieces = append(pieces, text[i:end])
 			i = end
 			continue
 		}
-		if isTekkenNumber(r[i]) {
-			pieces = append(pieces, string(r[i:i+1]))
-			i++
+		c, width := tekkenRune(text, i)
+		if isTekkenNumber(c) {
+			pieces = append(pieces, text[i:i+width])
+			i += width
 			continue
 		}
-		if end, ok := matchTekkenPunct(r, n, i); ok {
-			pieces = append(pieces, string(r[i:end]))
+		if end, ok := matchTekkenPunct(text, i); ok {
+			pieces = append(pieces, text[i:end])
 			i = end
 			continue
 		}
-		if unicode.IsSpace(r[i]) {
-			end := tekkenWhitespaceEnd(r, n, i)
-			pieces = append(pieces, string(r[i:end]))
+		if unicode.IsSpace(c) {
+			end := tekkenWhitespaceEnd(text, i)
+			pieces = append(pieces, text[i:end])
 			i = end
 			continue
 		}
-		pieces = append(pieces, string(r[i:i+1]))
-		i++
+		pieces = append(pieces, text[i:i+width])
+		i += width
 	}
 	return pieces
+}
+
+func tekkenRune(text string, i int) (rune, int) {
+	if text[i] < utf8.RuneSelf {
+		return rune(text[i]), 1
+	}
+	return utf8.DecodeRuneInString(text[i:])
 }
 
 func isTekkenNumber(c rune) bool { return unicode.IsNumber(c) }
@@ -871,52 +889,59 @@ func tekkenLowerClass(c rune) bool {
 }
 
 // matchTekkenWord handles the two letter alternatives (optional leading
-// non-letter/digit character, then case-split letter runs).
-func matchTekkenWord(r []rune, n, i int) (int, bool) {
+// non-letter/digit character, then case-split letter runs). Offsets are bytes.
+func matchTekkenWord(text string, i int) (int, bool) {
 	opt := i
-	if opt < n && r[opt] != '\r' && r[opt] != '\n' && !unicode.IsLetter(r[opt]) && !isTekkenNumber(r[opt]) {
-		opt++
+	c, width := tekkenRune(text, opt)
+	if c != '\r' && c != '\n' && !unicode.IsLetter(c) && !isTekkenNumber(c) {
+		opt += width
 	}
 	// Alt 1: U* L+
 	k := opt
-	for k < n && tekkenUpperClass(r[k]) {
-		k++
+	for k < len(text) {
+		c, width := tekkenRune(text, k)
+		if !tekkenUpperClass(c) {
+			break
+		}
+		k += width
 	}
 	lStart := k
-	for k < n && tekkenLowerClass(r[k]) {
-		k++
+	for k < len(text) {
+		c, width := tekkenRune(text, k)
+		if !tekkenLowerClass(c) {
+			break
+		}
+		k += width
 	}
 	if k > lStart {
 		return k, true
 	}
-	// Alt 2: U+ L*
-	k = opt
-	for k < n && tekkenUpperClass(r[k]) {
-		k++
-	}
+	// Alt 2: U+ L*. The U* scan above already found the end of the U run;
+	// if it was nonempty, the failed L+ scan consumed no characters.
 	if k > opt {
-		for k < n && tekkenLowerClass(r[k]) {
-			k++
-		}
 		return k, true
 	}
 	return i, false
 }
 
 // matchTekkenPunct handles " ?[^\s\p{L}\p{N}]+[\r\n/]*".
-func matchTekkenPunct(r []rune, n, i int) (int, bool) {
+func matchTekkenPunct(text string, i int) (int, bool) {
 	j := i
-	if j < n && r[j] == ' ' {
+	if text[j] == ' ' {
 		j++
 	}
 	pStart := j
-	for j < n && !unicode.IsSpace(r[j]) && !unicode.IsLetter(r[j]) && !isTekkenNumber(r[j]) {
-		j++
+	for j < len(text) {
+		c, width := tekkenRune(text, j)
+		if unicode.IsSpace(c) || unicode.IsLetter(c) || isTekkenNumber(c) {
+			break
+		}
+		j += width
 	}
 	if j == pStart {
 		return i, false
 	}
-	for j < n && (r[j] == '\r' || r[j] == '\n' || r[j] == '/') {
+	for j < len(text) && (text[j] == '\r' || text[j] == '\n' || text[j] == '/') {
 		j++
 	}
 	return j, true
@@ -925,17 +950,21 @@ func matchTekkenPunct(r []rune, n, i int) (int, bool) {
 // tekkenWhitespaceEnd handles "\s*[\r\n]+ | \s+(?!\S) | \s+": a whitespace run
 // that ends at its final newline is cut there, otherwise the whole run is one
 // piece.
-func tekkenWhitespaceEnd(r []rune, n, i int) int {
+func tekkenWhitespaceEnd(text string, i int) int {
 	k := i
 	lastNL := -1
-	for k < n && unicode.IsSpace(r[k]) {
-		if r[k] == '\r' || r[k] == '\n' {
+	for k < len(text) {
+		c, width := tekkenRune(text, k)
+		if !unicode.IsSpace(c) {
+			break
+		}
+		k += width
+		if c == '\r' || c == '\n' {
 			lastNL = k
 		}
-		k++
 	}
 	if lastNL >= 0 {
-		return lastNL + 1
+		return lastNL
 	}
 	return k
 }

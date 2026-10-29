@@ -13,6 +13,7 @@ func PreTokenizerKimi(text string) []string { return pretokenizeKimi(text) }
 func PreTokenizerQwen35(text string) []string { return pretokenizeQwen35(text) }
 
 // PreTokenizerTekken exposes Mistral Tekken's GPT-2-family splitting rule.
+// Returned pieces may share backing storage with text.
 func PreTokenizerTekken(text string) []string { return pretokenizeTekken(text) }
 
 // VoxtralTokenizerFromTekkenJSON builds a tokenizer from the official Tekken JSON format.

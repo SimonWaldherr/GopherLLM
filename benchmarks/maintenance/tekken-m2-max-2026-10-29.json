@@ -1,0 +1,2563 @@
+{
+  "date": "2026-10-29",
+  "host": {
+    "cpu": "Apple M2 Max",
+    "memory_gib": 32,
+    "os": "macOS-27.2-arm64-arm-64bit-Mach-O",
+    "go": "go1.27.3 darwin/arm64",
+    "gomaxprocs": 8
+  },
+  "baseline_commit": "327810b",
+  "changes": [
+    "Tekken splitting with UTF-8 byte offsets and borrowed input pieces; uppercase-run scan reused.",
+    "GPT2-family byte mapping uses one call-local append-only string builder. Reset after 64KiB or before a piece exceeds the available reserve. Ordinary reserve capped at 64KiB; a single large piece may exceed that."
+  ],
+  "model": {
+    "file": "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
+    "pretokenizer": "tekken",
+    "header_sha256": [
+      "e1521a6eff66c39fba3a4e9a0a73a5aee36c3fcf38be52083f018d5c043857df"
+    ],
+    "load": "mmap and GGUF metadata parsing only; tensor data not consumed"
+  },
+  "method": {
+    "pairs": 7,
+    "sample_benchmark_target": "100ms",
+    "order": "alternating reference/offsets versus offsets/reference for split; reference/per_piece/workspace versus workspace/per_piece/reference for encode",
+    "vocabulary": "real Ministral checkpoint vocabulary and BPE merge ranks for encode; same corpus and merge code for all modes",
+    "correctness": "each encode benchmark checks exact token IDs before timing; differential tests additionally cover Unicode, invalid UTF-8 and custom/mutable byte maps",
+    "reference": "frozen original rune splitter and per-piece encode buffers",
+    "per_piece_control": "optimized UTF8 splitter with previous per-piece encode buffers; isolates builder changes",
+    "workspace": "optimized UTF8 splitter plus reusable mapping builder"
+  },
+  "source_sha256": {
+    "internal/tokenizer/tokenizer.go": "9a111abf85a4276f2cd637a18ddd2b901ecd38f67692e206d63431502e1226f0",
+    "internal/tokenizer/tekken_offsets_test.go": "5cd2771f0bc28a5890c8ffeaa66daa2be2825481804ef51e7c23b112842838f2",
+    "internal/tokenizer/gpt2_mapping_workspace_test.go": "6f20073b7d53b82a901efd2657ae854d1f502a0061e4896802fbc0c607651dc1",
+    "internal/tokenizer/api.go": "e5e69a1cd51abcefb034a44252f8940482a2541a9d905411289167b035da8038"
+  },
+  "binary_sha256": "c7104ac3f40036851b62b7814e9ca67205ac524eb7a0c2e4f1a402b4fec82987",
+  "limits": [
+    "Component measurements only; no decode, full-generation, STT, RSS or paging speedup claim.",
+    "Synthetic prompt text, real checkpoint tokenizer vocabulary; model weight quantization does not participate.",
+    "Host background load was not fully controlled.",
+    "Bytes/op and allocs/op are allocations, not peak live memory. Borrowed pieces retain the input string while retained by a caller.",
+    "The long_unique corpus repeats a 1024-distinct-word block eight times; the mapping optimization does not cache pieces."
+  ],
+  "workloads": [
+    {
+      "corpus": "short",
+      "stage": "split",
+      "input_utf8_bytes": 31,
+      "input_sha256": "93af0903982faf1e80dcb99010aa3e4b162fa626c9de660c9cba2d6c707bcace",
+      "median_ns": {
+        "reference": 588.6,
+        "offsets": 379.2
+      },
+      "ratio_of_medians": 1.5522151898734178,
+      "median_paired_ratio": 1.4702024522383805,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 552.5,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          },
+          "offsets": {
+            "ns_per_op": 357.7,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 351.0,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 510.8,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 588.6,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          },
+          "offsets": {
+            "ns_per_op": 410.9,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 379.2,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 589.0,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 892.1,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          },
+          "offsets": {
+            "ns_per_op": 424.8,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 350.7,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 515.6,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 730.3,
+            "bytes_per_op": 232,
+            "allocs_per_op": 7
+          },
+          "offsets": {
+            "ns_per_op": 512.8,
+            "bytes_per_op": 176,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "short",
+      "stage": "encode",
+      "input_utf8_bytes": 31,
+      "input_sha256": "93af0903982faf1e80dcb99010aa3e4b162fa626c9de660c9cba2d6c707bcace",
+      "median_ns": {
+        "reference": 5505.0,
+        "per_piece": 4951.0,
+        "workspace": 5255.0
+      },
+      "ratio_of_medians": 1.0475737392959086,
+      "median_paired_ratio": 1.0248706725029846,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 5151.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          },
+          "per_piece": {
+            "ns_per_op": 5028.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "workspace": {
+            "ns_per_op": 5026.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 4704.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          },
+          "per_piece": {
+            "ns_per_op": 4922.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "reference": {
+            "ns_per_op": 5018.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 5505.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          },
+          "per_piece": {
+            "ns_per_op": 5576.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "workspace": {
+            "ns_per_op": 5444.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 5255.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          },
+          "per_piece": {
+            "ns_per_op": 4910.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "reference": {
+            "ns_per_op": 5639.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 5965.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          },
+          "per_piece": {
+            "ns_per_op": 5458.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "workspace": {
+            "ns_per_op": 8423.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 4741.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          },
+          "per_piece": {
+            "ns_per_op": 4951.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "reference": {
+            "ns_per_op": 5314.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 5789.0,
+            "bytes_per_op": 1448,
+            "allocs_per_op": 40
+          },
+          "per_piece": {
+            "ns_per_op": 4847.0,
+            "bytes_per_op": 1400,
+            "allocs_per_op": 34
+          },
+          "workspace": {
+            "ns_per_op": 5954.0,
+            "bytes_per_op": 1376,
+            "allocs_per_op": 29
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 0.9421503330161751,
+      "builder_only_median_paired_ratio": 1.0003979307600477
+    },
+    {
+      "corpus": "ascii",
+      "stage": "split",
+      "input_utf8_bytes": 1280,
+      "input_sha256": "b2663555b9ad5c136804bc3bf4d352348c3d1569462f523dfdf6bd658f82b9d6",
+      "median_ns": {
+        "reference": 21486.0,
+        "offsets": 13313.0
+      },
+      "ratio_of_medians": 1.6139112146022685,
+      "median_paired_ratio": 1.569398994333147,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 21486.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          },
+          "offsets": {
+            "ns_per_op": 15290.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 12529.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 19663.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 22447.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          },
+          "offsets": {
+            "ns_per_op": 14950.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 12756.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 19999.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 26834.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          },
+          "offsets": {
+            "ns_per_op": 13313.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 12603.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 19890.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 27464.0,
+            "bytes_per_op": 14848,
+            "allocs_per_op": 259
+          },
+          "offsets": {
+            "ns_per_op": 15448.0,
+            "bytes_per_op": 6912,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "ascii",
+      "stage": "encode",
+      "input_utf8_bytes": 1280,
+      "input_sha256": "b2663555b9ad5c136804bc3bf4d352348c3d1569462f523dfdf6bd658f82b9d6",
+      "median_ns": {
+        "reference": 199877.0,
+        "per_piece": 187361.0,
+        "workspace": 183115.0
+      },
+      "ratio_of_medians": 1.0915381044698687,
+      "median_paired_ratio": 1.0810991730888226,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 206694.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          },
+          "per_piece": {
+            "ns_per_op": 187361.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "workspace": {
+            "ns_per_op": 179931.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 198020.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          },
+          "per_piece": {
+            "ns_per_op": 187840.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "reference": {
+            "ns_per_op": 188788.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 227419.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          },
+          "per_piece": {
+            "ns_per_op": 197898.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "workspace": {
+            "ns_per_op": 199972.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 183115.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          },
+          "per_piece": {
+            "ns_per_op": 185149.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "reference": {
+            "ns_per_op": 189263.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 199877.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          },
+          "per_piece": {
+            "ns_per_op": 188517.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "workspace": {
+            "ns_per_op": 185887.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 177770.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          },
+          "per_piece": {
+            "ns_per_op": 181477.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "reference": {
+            "ns_per_op": 192187.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 204230.0,
+            "bytes_per_op": 26032,
+            "allocs_per_op": 1511
+          },
+          "per_piece": {
+            "ns_per_op": 178783.0,
+            "bytes_per_op": 18096,
+            "allocs_per_op": 1253
+          },
+          "workspace": {
+            "ns_per_op": 182106.0,
+            "bytes_per_op": 16944,
+            "allocs_per_op": 997
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.0231876143407148,
+      "builder_only_median_paired_ratio": 1.0111077738033476
+    },
+    {
+      "corpus": "unique",
+      "stage": "split",
+      "input_utf8_bytes": 9216,
+      "input_sha256": "f02e06f50d977eedee78bce75f3af02f9759864c73015bd04b01a05b214c07e9",
+      "median_ns": {
+        "reference": 120168.0,
+        "offsets": 70448.0
+      },
+      "ratio_of_medians": 1.7057687940040882,
+      "median_paired_ratio": 1.6253057593951523,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 125390.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          },
+          "offsets": {
+            "ns_per_op": 69631.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 68198.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 120697.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 120168.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          },
+          "offsets": {
+            "ns_per_op": 76514.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 73414.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 135142.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 115407.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          },
+          "offsets": {
+            "ns_per_op": 83491.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 67455.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 109635.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 114152.0,
+            "bytes_per_op": 114688,
+            "allocs_per_op": 1026
+          },
+          "offsets": {
+            "ns_per_op": 70448.0,
+            "bytes_per_op": 57344,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "unique",
+      "stage": "encode",
+      "input_utf8_bytes": 9216,
+      "input_sha256": "f02e06f50d977eedee78bce75f3af02f9759864c73015bd04b01a05b214c07e9",
+      "median_ns": {
+        "reference": 1639920.0,
+        "per_piece": 1557946.0,
+        "workspace": 1489597.0
+      },
+      "ratio_of_medians": 1.1009152139806941,
+      "median_paired_ratio": 1.1257403476785277,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 1875378.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          },
+          "per_piece": {
+            "ns_per_op": 1557946.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "workspace": {
+            "ns_per_op": 1489597.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 1589350.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          },
+          "per_piece": {
+            "ns_per_op": 1698102.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "reference": {
+            "ns_per_op": 1544503.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 3140313.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          },
+          "per_piece": {
+            "ns_per_op": 1886655.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "workspace": {
+            "ns_per_op": 1742078.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 1729482.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          },
+          "per_piece": {
+            "ns_per_op": 1694256.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "reference": {
+            "ns_per_op": 1626813.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 1678927.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          },
+          "per_piece": {
+            "ns_per_op": 1493836.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "workspace": {
+            "ns_per_op": 1468620.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 1409644.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          },
+          "per_piece": {
+            "ns_per_op": 1433911.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "reference": {
+            "ns_per_op": 1495338.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 1639920.0,
+            "bytes_per_op": 190976,
+            "allocs_per_op": 8039
+          },
+          "per_piece": {
+            "ns_per_op": 1471064.0,
+            "bytes_per_op": 133632,
+            "allocs_per_op": 7014
+          },
+          "workspace": {
+            "ns_per_op": 1456748.0,
+            "bytes_per_op": 127488,
+            "allocs_per_op": 5991
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.0458842223769247,
+      "builder_only_median_paired_ratio": 1.0172149847762981
+    },
+    {
+      "corpus": "long_unique",
+      "stage": "split",
+      "input_utf8_bytes": 73728,
+      "input_sha256": "365780cab694bace50eccded5e2a5aedeca18bac92f2a6c4af0778e433695ab7",
+      "median_ns": {
+        "reference": 945767.0,
+        "offsets": 528524.0
+      },
+      "ratio_of_medians": 1.789449485737639,
+      "median_paired_ratio": 1.789449485737639,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 953154.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          },
+          "offsets": {
+            "ns_per_op": 522337.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 580509.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 1521579.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 1150018.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          },
+          "offsets": {
+            "ns_per_op": 634448.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 598921.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 939450.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 945767.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          },
+          "offsets": {
+            "ns_per_op": 528524.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 517204.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 881638.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 886048.0,
+            "bytes_per_op": 827392,
+            "allocs_per_op": 8194
+          },
+          "offsets": {
+            "ns_per_op": 525867.0,
+            "bytes_per_op": 401408,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "long_unique",
+      "stage": "encode",
+      "input_utf8_bytes": 73728,
+      "input_sha256": "365780cab694bace50eccded5e2a5aedeca18bac92f2a6c4af0778e433695ab7",
+      "median_ns": {
+        "reference": 12807188.0,
+        "per_piece": 12417102.0,
+        "workspace": 12250046.0
+      },
+      "ratio_of_medians": 1.0454808088067589,
+      "median_paired_ratio": 1.0548795561577564,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 12225361.0,
+            "bytes_per_op": 1428929,
+            "allocs_per_op": 64256
+          },
+          "per_piece": {
+            "ns_per_op": 12110940.0,
+            "bytes_per_op": 1002945,
+            "allocs_per_op": 56063
+          },
+          "workspace": {
+            "ns_per_op": 11589343.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 12917907.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          },
+          "per_piece": {
+            "ns_per_op": 12417102.0,
+            "bytes_per_op": 1002945,
+            "allocs_per_op": 56063
+          },
+          "reference": {
+            "ns_per_op": 12472764.0,
+            "bytes_per_op": 1428931,
+            "allocs_per_op": 64256
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 16354315.0,
+            "bytes_per_op": 1428932,
+            "allocs_per_op": 64256
+          },
+          "per_piece": {
+            "ns_per_op": 13780828.0,
+            "bytes_per_op": 1002946,
+            "allocs_per_op": 56063
+          },
+          "workspace": {
+            "ns_per_op": 13579769.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 13284907.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          },
+          "per_piece": {
+            "ns_per_op": 17001757.0,
+            "bytes_per_op": 1002946,
+            "allocs_per_op": 56063
+          },
+          "reference": {
+            "ns_per_op": 20296525.0,
+            "bytes_per_op": 1428931,
+            "allocs_per_op": 64256
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 12807188.0,
+            "bytes_per_op": 1428930,
+            "allocs_per_op": 64256
+          },
+          "per_piece": {
+            "ns_per_op": 12657370.0,
+            "bytes_per_op": 1002946,
+            "allocs_per_op": 56063
+          },
+          "workspace": {
+            "ns_per_op": 12250046.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 11431616.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          },
+          "per_piece": {
+            "ns_per_op": 11463699.0,
+            "bytes_per_op": 1002945,
+            "allocs_per_op": 56063
+          },
+          "reference": {
+            "ns_per_op": 14398843.0,
+            "bytes_per_op": 1428929,
+            "allocs_per_op": 64256
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 11779769.0,
+            "bytes_per_op": 1428929,
+            "allocs_per_op": 64256
+          },
+          "per_piece": {
+            "ns_per_op": 11575518.0,
+            "bytes_per_op": 1002945,
+            "allocs_per_op": 56063
+          },
+          "workspace": {
+            "ns_per_op": 11295120.0,
+            "bytes_per_op": 937409,
+            "allocs_per_op": 47873
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.0136371732808187,
+      "builder_only_median_paired_ratio": 1.0248247030576036
+    },
+    {
+      "corpus": "long_piece",
+      "stage": "split",
+      "input_utf8_bytes": 73735,
+      "input_sha256": "f7dffef728b2e6fabade14a86daaa5eff97d121d69edb879d99beac1b0fd286c",
+      "median_ns": {
+        "reference": 1464669.0,
+        "offsets": 799893.0
+      },
+      "ratio_of_medians": 1.8310811571047627,
+      "median_paired_ratio": 1.8963920684920874,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 1428912.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          },
+          "offsets": {
+            "ns_per_op": 926242.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 799893.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 1613225.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 1464669.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          },
+          "offsets": {
+            "ns_per_op": 761141.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 940909.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 1909690.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 1467472.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          },
+          "offsets": {
+            "ns_per_op": 773943.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 800486.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 1426341.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 1417170.0,
+            "bytes_per_op": 327696,
+            "allocs_per_op": 4
+          },
+          "offsets": {
+            "ns_per_op": 747298.0,
+            "bytes_per_op": 139264,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "long_piece",
+      "stage": "encode",
+      "input_utf8_bytes": 73735,
+      "input_sha256": "f7dffef728b2e6fabade14a86daaa5eff97d121d69edb879d99beac1b0fd286c",
+      "median_ns": {
+        "reference": 18341472.0,
+        "per_piece": 17996229.0,
+        "workspace": 15565286.0
+      },
+      "ratio_of_medians": 1.1783575322676372,
+      "median_paired_ratio": 1.0353058239005304,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 19786976.0,
+            "bytes_per_op": 17453730,
+            "allocs_per_op": 57385
+          },
+          "per_piece": {
+            "ns_per_op": 17996229.0,
+            "bytes_per_op": 17265266,
+            "allocs_per_op": 57382
+          },
+          "workspace": {
+            "ns_per_op": 15565286.0,
+            "bytes_per_op": 17330788,
+            "allocs_per_op": 57382
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 19076431.0,
+            "bytes_per_op": 17330805,
+            "allocs_per_op": 57382
+          },
+          "per_piece": {
+            "ns_per_op": 18204215.0,
+            "bytes_per_op": 17265264,
+            "allocs_per_op": 57382
+          },
+          "reference": {
+            "ns_per_op": 18341472.0,
+            "bytes_per_op": 17453696,
+            "allocs_per_op": 57385
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 17266958.0,
+            "bytes_per_op": 17453698,
+            "allocs_per_op": 57385
+          },
+          "per_piece": {
+            "ns_per_op": 19936798.0,
+            "bytes_per_op": 17265268,
+            "allocs_per_op": 57382
+          },
+          "workspace": {
+            "ns_per_op": 19749530.0,
+            "bytes_per_op": 17330786,
+            "allocs_per_op": 57382
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 30359469.0,
+            "bytes_per_op": 17330784,
+            "allocs_per_op": 57382
+          },
+          "per_piece": {
+            "ns_per_op": 27366812.0,
+            "bytes_per_op": 17265296,
+            "allocs_per_op": 57382
+          },
+          "reference": {
+            "ns_per_op": 22213683.0,
+            "bytes_per_op": 17453699,
+            "allocs_per_op": 57385
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 16673500.0,
+            "bytes_per_op": 17453698,
+            "allocs_per_op": 57385
+          },
+          "per_piece": {
+            "ns_per_op": 15473792.0,
+            "bytes_per_op": 17265264,
+            "allocs_per_op": 57382
+          },
+          "workspace": {
+            "ns_per_op": 15426714.0,
+            "bytes_per_op": 17330786,
+            "allocs_per_op": 57382
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 14425266.0,
+            "bytes_per_op": 17330792,
+            "allocs_per_op": 57382
+          },
+          "per_piece": {
+            "ns_per_op": 14833047.0,
+            "bytes_per_op": 17265270,
+            "allocs_per_op": 57382
+          },
+          "reference": {
+            "ns_per_op": 40467479.0,
+            "bytes_per_op": 17453696,
+            "allocs_per_op": 57385
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 15445857.0,
+            "bytes_per_op": 17453698,
+            "allocs_per_op": 57385
+          },
+          "per_piece": {
+            "ns_per_op": 15007381.0,
+            "bytes_per_op": 17265266,
+            "allocs_per_op": 57382
+          },
+          "workspace": {
+            "ns_per_op": 14919125.0,
+            "bytes_per_op": 17330786,
+            "allocs_per_op": 57382
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.1561772138333983,
+      "builder_only_median_paired_ratio": 1.0059156284299515
+    },
+    {
+      "corpus": "european",
+      "stage": "split",
+      "input_utf8_bytes": 2976,
+      "input_sha256": "a79b63dffbb853b4587567bd6e8606eb849aba157f1b116059cdb3fa25f219bc",
+      "median_ns": {
+        "reference": 66173.0,
+        "offsets": 53616.0
+      },
+      "ratio_of_medians": 1.2342024768725754,
+      "median_paired_ratio": 1.2337347875521119,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 66388.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          },
+          "offsets": {
+            "ns_per_op": 56110.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 53298.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 66173.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 66398.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          },
+          "offsets": {
+            "ns_per_op": 53616.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 107255.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 119817.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 60638.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          },
+          "offsets": {
+            "ns_per_op": 47671.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 67497.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 60166.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 58595.0,
+            "bytes_per_op": 26880,
+            "allocs_per_op": 514
+          },
+          "offsets": {
+            "ns_per_op": 47494.0,
+            "bytes_per_op": 12288,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "european",
+      "stage": "encode",
+      "input_utf8_bytes": 2976,
+      "input_sha256": "a79b63dffbb853b4587567bd6e8606eb849aba157f1b116059cdb3fa25f219bc",
+      "median_ns": {
+        "reference": 657086.0,
+        "per_piece": 644041.0,
+        "workspace": 627186.0
+      },
+      "ratio_of_medians": 1.0476732580127746,
+      "median_paired_ratio": 1.0219346222221426,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 839622.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          },
+          "per_piece": {
+            "ns_per_op": 772462.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "workspace": {
+            "ns_per_op": 690673.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 627186.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          },
+          "per_piece": {
+            "ns_per_op": 666370.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "reference": {
+            "ns_per_op": 657086.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 621629.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          },
+          "per_piece": {
+            "ns_per_op": 644041.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "workspace": {
+            "ns_per_op": 627311.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 1057904.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          },
+          "per_piece": {
+            "ns_per_op": 860245.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "reference": {
+            "ns_per_op": 775788.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 575705.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          },
+          "per_piece": {
+            "ns_per_op": 570729.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "workspace": {
+            "ns_per_op": 575466.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 555852.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          },
+          "per_piece": {
+            "ns_per_op": 590567.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "reference": {
+            "ns_per_op": 700265.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 570821.0,
+            "bytes_per_op": 56384,
+            "allocs_per_op": 3272
+          },
+          "per_piece": {
+            "ns_per_op": 556052.0,
+            "bytes_per_op": 41792,
+            "allocs_per_op": 2759
+          },
+          "workspace": {
+            "ns_per_op": 558569.0,
+            "bytes_per_op": 38976,
+            "allocs_per_op": 2248
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.0268740054784387,
+      "builder_only_median_paired_ratio": 1.026669387273617
+    },
+    {
+      "corpus": "digits",
+      "stage": "split",
+      "input_utf8_bytes": 1472,
+      "input_sha256": "0716e674e03a2435bf02988c49707ece19ac70ac0aa9b62e94bedb8dd4c216da",
+      "median_ns": {
+        "reference": 72442.0,
+        "offsets": 60748.0
+      },
+      "ratio_of_medians": 1.1925001646144728,
+      "median_paired_ratio": 1.3121609313744902,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 70518.0,
+            "bytes_per_op": 45440,
+            "allocs_per_op": 1028
+          },
+          "offsets": {
+            "ns_per_op": 60748.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 62116.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          },
+          "reference": {
+            "ns_per_op": 72442.0,
+            "bytes_per_op": 45439,
+            "allocs_per_op": 1028
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 72473.0,
+            "bytes_per_op": 45440,
+            "allocs_per_op": 1028
+          },
+          "offsets": {
+            "ns_per_op": 53836.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 85725.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          },
+          "reference": {
+            "ns_per_op": 86582.0,
+            "bytes_per_op": 45440,
+            "allocs_per_op": 1028
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 66712.0,
+            "bytes_per_op": 45440,
+            "allocs_per_op": 1028
+          },
+          "offsets": {
+            "ns_per_op": 49989.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 100312.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          },
+          "reference": {
+            "ns_per_op": 242616.0,
+            "bytes_per_op": 45440,
+            "allocs_per_op": 1028
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 66272.0,
+            "bytes_per_op": 45440,
+            "allocs_per_op": 1028
+          },
+          "offsets": {
+            "ns_per_op": 50506.0,
+            "bytes_per_op": 35456,
+            "allocs_per_op": 3
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "digits",
+      "stage": "encode",
+      "input_utf8_bytes": 1472,
+      "input_sha256": "0716e674e03a2435bf02988c49707ece19ac70ac0aa9b62e94bedb8dd4c216da",
+      "median_ns": {
+        "reference": 164971.0,
+        "per_piece": 159854.0,
+        "workspace": 137551.0
+      },
+      "ratio_of_medians": 1.1993442432261487,
+      "median_paired_ratio": 1.2105080964652486,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 175277.0,
+            "bytes_per_op": 67808,
+            "allocs_per_op": 2442
+          },
+          "per_piece": {
+            "ns_per_op": 188861.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "workspace": {
+            "ns_per_op": 253624.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 131592.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          },
+          "per_piece": {
+            "ns_per_op": 139767.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "reference": {
+            "ns_per_op": 164014.0,
+            "bytes_per_op": 67808,
+            "allocs_per_op": 2442
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 164971.0,
+            "bytes_per_op": 67808,
+            "allocs_per_op": 2442
+          },
+          "per_piece": {
+            "ns_per_op": 159854.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "workspace": {
+            "ns_per_op": 133824.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 180066.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          },
+          "per_piece": {
+            "ns_per_op": 220650.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "reference": {
+            "ns_per_op": 226781.0,
+            "bytes_per_op": 67808,
+            "allocs_per_op": 2442
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 157360.0,
+            "bytes_per_op": 67807,
+            "allocs_per_op": 2442
+          },
+          "per_piece": {
+            "ns_per_op": 144379.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "workspace": {
+            "ns_per_op": 129995.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 246349.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          },
+          "per_piece": {
+            "ns_per_op": 256302.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "reference": {
+            "ns_per_op": 245030.0,
+            "bytes_per_op": 67808,
+            "allocs_per_op": 2442
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 156241.0,
+            "bytes_per_op": 67807,
+            "allocs_per_op": 2442
+          },
+          "per_piece": {
+            "ns_per_op": 139233.0,
+            "bytes_per_op": 57824,
+            "allocs_per_op": 1417
+          },
+          "workspace": {
+            "ns_per_op": 137551.0,
+            "bytes_per_op": 51680,
+            "allocs_per_op": 394
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.1621434958669876,
+      "builder_only_median_paired_ratio": 1.0621238373153383
+    },
+    {
+      "corpus": "unspaced",
+      "stage": "split",
+      "input_utf8_bytes": 1920,
+      "input_sha256": "c6fbb9caf24a237ed0720c406c3642f91aee3487a33ddc99bf040d6bef7dd12e",
+      "median_ns": {
+        "reference": 48988.0,
+        "offsets": 26459.0
+      },
+      "ratio_of_medians": 1.8514683094599191,
+      "median_paired_ratio": 1.889908256880734,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 48988.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          },
+          "offsets": {
+            "ns_per_op": 32863.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 26487.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 50058.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 47689.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          },
+          "offsets": {
+            "ns_per_op": 25270.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 26459.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 62451.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 46464.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          },
+          "offsets": {
+            "ns_per_op": 25341.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "offsets",
+            "reference"
+          ],
+          "offsets": {
+            "ns_per_op": 27045.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          },
+          "reference": {
+            "ns_per_op": 77706.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "offsets"
+          ],
+          "reference": {
+            "ns_per_op": 46535.0,
+            "bytes_per_op": 8192,
+            "allocs_per_op": 3
+          },
+          "offsets": {
+            "ns_per_op": 22961.0,
+            "bytes_per_op": 3456,
+            "allocs_per_op": 1
+          }
+        }
+      ]
+    },
+    {
+      "corpus": "unspaced",
+      "stage": "encode",
+      "input_utf8_bytes": 1920,
+      "input_sha256": "c6fbb9caf24a237ed0720c406c3642f91aee3487a33ddc99bf040d6bef7dd12e",
+      "median_ns": {
+        "reference": 455397.0,
+        "per_piece": 442200.0,
+        "workspace": 408090.0
+      },
+      "ratio_of_medians": 1.1159229581709917,
+      "median_paired_ratio": 1.0062076417380328,
+      "samples": [
+        {
+          "pair": 1,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 376215.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          },
+          "per_piece": {
+            "ns_per_op": 391523.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "workspace": {
+            "ns_per_op": 373894.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          }
+        },
+        {
+          "pair": 2,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 408090.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "per_piece": {
+            "ns_per_op": 442200.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "reference": {
+            "ns_per_op": 455397.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          }
+        },
+        {
+          "pair": 3,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 511915.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          },
+          "per_piece": {
+            "ns_per_op": 459140.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "workspace": {
+            "ns_per_op": 414408.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          }
+        },
+        {
+          "pair": 4,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 975883.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "per_piece": {
+            "ns_per_op": 727776.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "reference": {
+            "ns_per_op": 688050.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          }
+        },
+        {
+          "pair": 5,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 385504.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          },
+          "per_piece": {
+            "ns_per_op": 374336.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "workspace": {
+            "ns_per_op": 356159.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          }
+        },
+        {
+          "pair": 6,
+          "order": [
+            "workspace",
+            "per_piece",
+            "reference"
+          ],
+          "workspace": {
+            "ns_per_op": 1525547.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "per_piece": {
+            "ns_per_op": 3318473.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "reference": {
+            "ns_per_op": 580727.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          }
+        },
+        {
+          "pair": 7,
+          "order": [
+            "reference",
+            "per_piece",
+            "workspace"
+          ],
+          "reference": {
+            "ns_per_op": 375598.0,
+            "bytes_per_op": 284352,
+            "allocs_per_op": 1490
+          },
+          "per_piece": {
+            "ns_per_op": 348436.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          },
+          "workspace": {
+            "ns_per_op": 384674.0,
+            "bytes_per_op": 279616,
+            "allocs_per_op": 1488
+          }
+        }
+      ],
+      "builder_only_ratio_of_medians": 1.0835845034183635,
+      "builder_only_median_paired_ratio": 1.0510361945086324
+    }
+  ],
+  "validation": {
+    "package_tests_cgo_1": "pass",
+    "package_tests_cgo_0": "pass",
+    "race_tests": "pass",
+    "seeded_splitter_differential_inputs": 6000,
+    "generic_encoder_controls": [
+      "gpt2",
+      "tekken",
+      "qwen35",
+      "kimi"
+    ],
+    "custom_byte_maps": [
+      "missing bytes",
+      "NUL",
+      "invalid runes",
+      "mutation between calls",
+      "nil map"
+    ],
+    "fuzz": {
+      "target": "FuzzTekkenOffsets",
+      "duration_target": "3s",
+      "workers": 2,
+      "executions": 34300,
+      "result": "pass"
+    }
+  }
+}
