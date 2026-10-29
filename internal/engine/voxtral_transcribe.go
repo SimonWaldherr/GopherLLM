@@ -108,12 +108,11 @@ func TranscribeVoxtralRealtimeFromSafetensors(ctx context.Context, dir string, s
 }
 
 // decodeVoxtralRealtimeOffline runs the offline/batch encode-then-decode
-// algorithm shared by TranscribeVoxtralRealtime (which always loads its own
-// weights and decodes on CPU) and VoxtralModel.TranscribeOffline (which
-// reuses an already-loaded model and, when disableFast is false and the
-// build/checkpoint support it, decodes on the same Metal fast decoder the
-// live-session path uses). Only the decode loop's step function differs
-// between the two; encoding, prefill and text assembly are identical.
+// algorithm shared by TranscribeVoxtralRealtime (which loads its own weights)
+// and VoxtralModel.TranscribeOffline (which reuses an already-loaded model).
+// Both use the live-session Metal decoder when disableFast is false and the
+// build/checkpoint support it; otherwise they use the CPU decoder. Encoding,
+// prefill and text assembly are identical.
 func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, tok *Tokenizer, tokenTypes []uint32, eosID, bosID int, samples []float32, maxExtraSteps int, disableFast bool, logw io.Writer) (string, error) {
 	if err := validateVoxtralOfflineInput(ctx, samples, maxExtraSteps); err != nil {
 		return "", err
@@ -151,6 +150,9 @@ func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig
 	var fast voxtralFastDecoder
 	if !disableFast {
 		fast = newVoxtralFastDecoder(cfg, w, state)
+	}
+	if fast != nil {
+		defer fast.Close()
 	}
 	step := func(fused []float32, pos int, generate bool) (int, error) {
 		if fast != nil {

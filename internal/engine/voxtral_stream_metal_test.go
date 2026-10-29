@@ -6,11 +6,12 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+
+	metalbackend "github.com/SimonWaldherr/GopherLLM/internal/metal"
 )
 
-// Exercise Q6-only initialization, unequal residual/attention widths, Ada
-// folding, sliding attention and cache compaction against the scalar decoder.
-func TestVoxtralMetalStreamingParityAndCompaction(t *testing.T) {
+func voxtralMetalDecoderFixture(t *testing.T) (VoxtralRealtimeConfig, VoxtralRealtimeWeights, *VoxtralRealtimeDecoderState, *rand.Rand) {
+	t.Helper()
 	if !MetalAvailable() {
 		t.Skip(MetalError())
 	}
@@ -44,6 +45,13 @@ func TestVoxtralMetalStreamingParityAndCompaction(t *testing.T) {
 			state.AdaScale[i][j] = float32(rng.NormFloat64()) * .1
 		}
 	}
+	return cfg, w, state, rng
+}
+
+// Exercise Q6-only initialization, unequal residual/attention widths, Ada
+// folding, sliding attention and cache compaction against the scalar decoder.
+func TestVoxtralMetalStreamingParityAndCompaction(t *testing.T) {
+	cfg, w, state, rng := voxtralMetalDecoderFixture(t)
 	fast := newVoxtralFastDecoder(cfg, w, state)
 	if fast == nil {
 		t.Fatal("Metal decoder was not created")
@@ -81,4 +89,66 @@ func TestVoxtralMetalStreamingParityAndCompaction(t *testing.T) {
 	if gpu.physical >= gpu.capacity {
 		t.Fatal("cache was not compacted")
 	}
+}
+
+// The offline path owns the fast decoder for one transcription; the model's
+// prepared weights remain borrowed. Closing must also work before the first
+// step or after a failed step, when an early return still releases the cache.
+func TestVoxtralMetalDecoderCloseOwnership(t *testing.T) {
+	for _, stage := range []string{"before_step", "after_step", "step_error"} {
+		t.Run(stage, func(t *testing.T) {
+			cfg, w, state, _ := voxtralMetalDecoderFixture(t)
+			output := w.Decoder.TokenEmbd
+			borrowed := metalbackend.PrepareQ6K(output.Raw, output.Rows, output.Cols, false)
+			if borrowed == nil {
+				t.Fatal("cannot prepare borrowed output weight:", MetalError())
+			}
+			t.Cleanup(func() { metalbackend.Release(borrowed) })
+			w.Decoder.TokenEmbd.Metal = &MetalWeight{q6: borrowed, typ: output.Type, rows: output.Rows, cols: output.Cols}
+			fast := newVoxtralFastDecoder(cfg, w, state)
+			if fast == nil {
+				t.Fatal("Metal decoder was not created")
+			}
+			defer fast.Close()
+			gpu := fast.(*voxtralMetalDecoder)
+			if len(gpu.owned) != 7*len(w.Decoder.Layers) {
+				t.Fatal("fixture did not mix owned layer weights with borrowed output weight")
+			}
+			owned := gpu.owned[0]
+			input := make([]float32, cfg.Decoder.HiddenSize)
+			projection := make([]float32, cfg.Decoder.NHeads*cfg.Decoder.HeadDim)
+			if !metalbackend.MatvecQ6K(owned, input, projection) {
+				t.Fatal("owned projection was not live")
+			}
+			if !gpu.decoder.Cache(0, 0, nil, nil, true) {
+				t.Fatal("decoder cache was not live")
+			}
+			switch stage {
+			case "after_step":
+				if _, err := fast.Step(input, 0, true); err != nil {
+					t.Fatal(err)
+				}
+			case "step_error":
+				if _, err := fast.Step(input[:1], 0, true); err == nil {
+					t.Fatal("invalid input accepted")
+				}
+			}
+			fast.Close()
+			fast.Close() // A later owner cleanup remains harmless.
+			if gpu.decoder.Cache(0, 0, nil, nil, true) {
+				t.Fatal("closed decoder retained its cache")
+			}
+			if metalbackend.MatvecQ6K(owned, input, projection) {
+				t.Fatal("closed decoder retained an owned projection")
+			}
+			if len(gpu.owned) != 0 || len(gpu.refs) != 0 {
+				t.Fatal("closed decoder retained weight references")
+			}
+			if !metalbackend.MatvecQ6K(borrowed, input, make([]float32, output.Rows)) {
+				t.Fatal("closing decoder released model-owned weights")
+			}
+		})
+	}
+	var absent *voxtralMetalDecoder
+	absent.Close()
 }

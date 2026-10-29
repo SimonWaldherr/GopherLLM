@@ -56,3 +56,24 @@ func TestVoxtralOfflinePaddingAlignment(t *testing.T) {
 		}
 	}
 }
+
+func TestVoxtralOfflineCPUFallback(t *testing.T) {
+	model := tinyVoxtralHost()
+	defer model.Close()
+	source := model.source
+	samples := benchTone(.01)
+	var reference string
+	for _, disableFast := range []bool{true, false} {
+		// This tiny checkpoint's head width cannot use the Metal graph, so both
+		// modes must take the same CPU path even in Metal-enabled builds.
+		got, err := decodeVoxtralRealtimeOffline(context.Background(), source.cfg, source.weights, source.tokenizer, source.tokenTypes, source.eosID, source.bosID, samples, 0, disableFast, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if disableFast {
+			reference = got
+		} else if got != reference {
+			t.Fatalf("fallback transcript %q want %q", got, reference)
+		}
+	}
+}
