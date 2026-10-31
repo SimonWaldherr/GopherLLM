@@ -76,8 +76,12 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 	tokenTypes, _ := gguf.Metadata["tokenizer.ggml.token_type"].AsU32Array()
 	eosID := int(tok.EOSID)
 	bosID := int(tok.BOSID)
+	var metalMapping []byte
+	if mmap.IsMapped() {
+		metalMapping = data
+	}
 
-	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, !useMetal, logw)
+	return decodeVoxtralRealtimeOffline(ctx, cfg, w, tok, tokenTypes, eosID, bosID, samples, maxExtraSteps, !useMetal, logw, metalMapping)
 }
 
 // TranscribeVoxtralRealtimeFromSafetensors is TranscribeVoxtralRealtime's
@@ -113,7 +117,7 @@ func TranscribeVoxtralRealtimeFromSafetensors(ctx context.Context, dir string, s
 // Both use the live-session Metal decoder when disableFast is false and the
 // build/checkpoint support it; otherwise they use the CPU decoder. Encoding,
 // prefill and text assembly are identical.
-func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, tok *Tokenizer, tokenTypes []uint32, eosID, bosID int, samples []float32, maxExtraSteps int, disableFast bool, logw io.Writer) (string, error) {
+func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, tok *Tokenizer, tokenTypes []uint32, eosID, bosID int, samples []float32, maxExtraSteps int, disableFast bool, logw io.Writer, mapping ...[]byte) (string, error) {
 	if err := validateVoxtralOfflineInput(ctx, samples, maxExtraSteps); err != nil {
 		return "", err
 	}
@@ -149,7 +153,7 @@ func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig
 	}
 	var fast voxtralFastDecoder
 	if !disableFast {
-		fast = newVoxtralFastDecoder(cfg, w, state)
+		fast = newVoxtralFastDecoder(cfg, w, state, mapping...)
 	}
 	if fast != nil {
 		defer fast.Close()

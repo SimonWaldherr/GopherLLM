@@ -166,6 +166,7 @@ func (r *Runner) generateChatStreamUntil(messages []ChatMessage, options Generat
 	}
 	cacheLen := generationCacheLen(r.config.MaxSeqLen, len(tokens), options.MaxTokens)
 	cache, buf := r.generationChatWorkspace(cacheLen, mtpDraftTokens > 0)
+	defer releaseTransientMetalCache(buf, cache, r.workspaceCache)
 	if r.kind == loadedQwen35 && mtpDraftTokens == 0 && options.PromptLookupTokens == 0 {
 		// Serial requests need neither a recurrent verification checkpoint nor
 		// draft-head KV. Retire the MTP boundary before releasing those rows so

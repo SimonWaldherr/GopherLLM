@@ -123,6 +123,9 @@ func openVoxtralBytes(ctx context.Context, data []byte, mmap *MmapFile, opts ...
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if mmap != nil && mmap.IsMapped() {
+		source.metalMapping = data
+	}
 	success = true
 	return &VoxtralModel{source: source}, nil
 }
@@ -145,7 +148,7 @@ func (m *VoxtralModel) NewSession(ctx context.Context) (*VoxtralRealtimeSession,
 	}
 	m.active = true
 	source := m.source
-	s := &VoxtralRealtimeSession{owner: m, cfg: source.cfg, weights: source.weights, tokenizer: source.tokenizer, tokenTypes: source.tokenTypes, eosID: source.eosID, bosID: source.bosID, disableFast: source.disableFast}
+	s := &VoxtralRealtimeSession{owner: m, metalMapping: source.metalMapping, cfg: source.cfg, weights: source.weights, tokenizer: source.tokenizer, tokenTypes: source.tokenTypes, eosID: source.eosID, bosID: source.bosID, disableFast: source.disableFast}
 	m.mu.Unlock()
 	if _, err := s.Push(ctx, nil, false); err != nil {
 		_ = s.Close()
@@ -244,7 +247,7 @@ func (m *VoxtralModel) TranscribeOffline(ctx context.Context, samples []float32,
 	source := m.source
 	m.mu.Unlock()
 	defer func() { _ = m.releaseSession() }()
-	return decodeVoxtralRealtimeOffline(ctx, source.cfg, source.weights, source.tokenizer, source.tokenTypes, source.eosID, source.bosID, samples, maxExtraSteps, source.disableFast, logw)
+	return decodeVoxtralRealtimeOffline(ctx, source.cfg, source.weights, source.tokenizer, source.tokenTypes, source.eosID, source.bosID, samples, maxExtraSteps, source.disableFast, logw, source.metalMapping)
 }
 
 // Flush finalizes the transcript without adding audio. Close is still required.

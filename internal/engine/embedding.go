@@ -105,6 +105,7 @@ func (r *Runner) embedDecoderLocked(ctx context.Context, text string) (Embedding
 	}
 	cacheLen := min(r.config.MaxSeqLen, len(tokens)+1)
 	cache, buf := r.generationWorkspace(cacheLen)
+	defer releaseTransientMetalCache(buf, cache, r.workspaceCache)
 	sum := make([]float32, r.config.Dim)
 	if r.canBatchPrefill() {
 		// Mean pooling needs every final hidden state, not just the last

@@ -16,7 +16,7 @@ they are not a current cross-model leaderboard or additive speedups.
 - [Environment variables](../README.md#environment-variables)
 
 For complete recent experiments with raw data and reproduction commands, see
-[Ministral/Voxtral decoding and memory on a 32-GiB Mac](../benchmarks/metal/real-mac-32gb.md),
+[Ministral/Voxtral KV lifetime and memory on a 32-GiB Mac](../benchmarks/metal/mac-model-memory-2026-10-31.md),
 [Ministral Metal decoding](../benchmarks/metal/ministral-decode.md),
 [Core ML embeddings](../benchmarks/coreml/README.md), and
 [Core ML FFNs](../benchmarks/coreml/ffn.md).

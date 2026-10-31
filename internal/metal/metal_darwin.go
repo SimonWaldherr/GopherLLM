@@ -2235,6 +2235,20 @@ func (d *Decoder) ShiftCache(length, drop int) bool {
 	}
 	return bool(C.gllm_decode_shift_cache(d.ptr, C.int(length), C.int(drop)))
 }
+
+// GrowCache preserves all live rows while increasing an owned cache's capacity.
+// Shared Go caches cannot grow here: their owner controls storage and pinning.
+func (d *Decoder) GrowCache(length, capacity int) bool {
+	if d == nil || d.ptr == nil || length < 0 || length > d.maxlen || capacity <= d.maxlen || capacity > 16384 {
+		return false
+	}
+	if !bool(C.gllm_decode_grow_cache(d.ptr, C.int(length), C.int(capacity))) {
+		return false
+	}
+	d.maxlen = capacity
+	return true
+}
+
 func (d *Decoder) Cache(layer, pos int, k, v []float32, upload bool) bool {
 	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || pos < 0 || pos >= d.maxlen {
 		return false

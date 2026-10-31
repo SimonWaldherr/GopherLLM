@@ -17,6 +17,7 @@ type VoxtralRealtimeSession struct {
 	owner        *VoxtralModel
 	disableFast  bool
 	mmap         *MmapFile
+	metalMapping []byte
 	cfg          VoxtralRealtimeConfig
 	weights      VoxtralRealtimeWeights
 	tokenizer    *Tokenizer
@@ -86,7 +87,7 @@ func (s *VoxtralRealtimeSession) Push(ctx context.Context, pcm []float32, final 
 			return "", err
 		}
 		if !s.disableFast {
-			s.fast = newVoxtralFastDecoder(s.cfg, s.weights, s.decoder)
+			s.fast = newVoxtralFastDecoder(s.cfg, s.weights, s.decoder, s.metalMapping)
 		}
 	}
 	embeds, err := s.audio.push(ctx, s.weights, pcm, final)
@@ -147,6 +148,7 @@ func (s *VoxtralRealtimeSession) Close() error {
 	s.audio = nil
 	s.decoder = nil
 	s.embedding = nil
+	s.metalMapping = nil
 	s.tokenizer = nil
 	s.tokenTypes = nil
 	s.text.Reset()

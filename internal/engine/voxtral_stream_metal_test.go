@@ -152,3 +152,47 @@ func TestVoxtralMetalDecoderCloseOwnership(t *testing.T) {
 	var absent *voxtralMetalDecoder
 	absent.Close()
 }
+
+// Multiple growth boundaries precede compaction. Absolute RoPE positions and
+// every retained K/V row must agree with the independently allocated CPU cache.
+func TestVoxtralMetalCacheGrowsWithoutLosingHistory(t *testing.T) {
+	cfg, w, state, rng := voxtralMetalDecoderFixture(t)
+	cfg.Decoder.SlidingWindow = 513
+	fast := newVoxtralFastDecoder(cfg, w, state)
+	if fast == nil {
+		t.Fatal(MetalError())
+	}
+	defer fast.Close()
+	gpu := fast.(*voxtralMetalDecoder)
+	if gpu.capacity != 256 {
+		t.Fatalf("initial capacity %d", gpu.capacity)
+	}
+	for pos := 0; pos < cfg.Decoder.SlidingWindow+256+17; pos++ {
+		input := make([]float32, cfg.Decoder.HiddenSize)
+		for i := range input {
+			input[i] = float32(rng.NormFloat64()) * .2
+		}
+		want, err := ForwardVoxtralRealtimeDecoderStep(cfg, w, state, input, pos)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := fast.Step(input, pos, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != voxtralArgmax(want) {
+			t.Fatalf("position %d: token %d, want %d", pos, got, voxtralArgmax(want))
+		}
+		for i, expected := range state.scratch.finalNormed {
+			if math.Abs(float64(gpu.normed[i]-expected)) > 2e-4 {
+				t.Fatalf("position %d normalized dimension %d differs", pos, i)
+			}
+		}
+	}
+	if gpu.capacity != cfg.Decoder.SlidingWindow+256 || gpu.physical >= gpu.capacity {
+		t.Fatal("cache did not grow and compact")
+	}
+	if gpu.decoder.GrowCache(-1, 1024) || gpu.decoder.GrowCache(0, gpu.capacity) || gpu.decoder.GrowCache(0, 16385) {
+		t.Fatal("invalid growth accepted")
+	}
+}

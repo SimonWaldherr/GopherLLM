@@ -321,6 +321,16 @@ func tryMetalDenseStep(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, to
 	return true
 }
 
+// A one-off request can exceed the retained KV budget. Its pinned caches
+// must not survive indirectly through the reusable activation workspace.
+func releaseTransientMetalCache(buf *DecodeBuffer, cache, retained *KVCache) {
+	if cache == retained || buf == nil || buf.metalDense == nil || buf.metalDense.cache != cache {
+		return
+	}
+	buf.metalDense.close()
+	buf.metalDense = nil
+}
+
 func metalDenseZero(vectors ...[]float32) bool {
 	for _, v := range vectors {
 		for _, x := range v {

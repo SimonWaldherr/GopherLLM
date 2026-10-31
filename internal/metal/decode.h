@@ -431,6 +431,27 @@ static bool gllm_decode_shift_cache(void* ptr,int length,int drop) {
  }
  return true;
 }
+// Grow owned caches one layer at a time to avoid holding two complete KV
+// sets. On allocation failure, every live row remains valid at the old maxlen;
+// already enlarged layers can be reused by a retry and are released by Close.
+static bool gllm_decode_grow_cache(void* ptr,int length,int capacity) {
+ @autoreleasepool {
+ GLLMDecoder* d=ptr;
+ for(int i=0;i<d->layers;i++)if(d->layer[i].sharedKV || d->layer[i].k==nil || d->layer[i].v==nil)return false;
+ id<MTLBuffer> partial=gllm_dec_buffer((NSUInteger)d->heads*((capacity+31)/32)*130);
+ if(partial==nil)return false;
+ NSUInteger size=(NSUInteger)capacity*d->kvheads*128*sizeof(float),bytes=(NSUInteger)length*d->kvheads*128*sizeof(float);
+ for(int i=0;i<d->layers;i++) {
+  GLLMDecodeLayer* l=&d->layer[i];
+  if([l->k length]>=size && [l->v length]>=size)continue;
+  id<MTLBuffer> k=gllm_dec_buffer((NSUInteger)capacity*d->kvheads*128),v=gllm_dec_buffer((NSUInteger)capacity*d->kvheads*128);
+  if(k==nil || v==nil){[k release];[v release];[partial release];return false;}
+  memcpy([k contents],[l->k contents],bytes);memcpy([v contents],[l->v contents],bytes);
+  [l->k release];[l->v release];l->k=k;l->v=v;
+ }
+ [d->partial release];d->partial=partial;d->maxlen=capacity;return true;
+ }
+}
 static void gllm_decode_norm(id<MTLComputeCommandEncoder> e,id<MTLBuffer> x,id<MTLBuffer> w,id<MTLBuffer> out,int n,int groups,float eps) {
  [e setComputePipelineState:gllm_dec_pipes[0]];[e setBuffer:x offset:0 atIndex:0];[e setBuffer:w offset:0 atIndex:1];[e setBuffer:out offset:0 atIndex:2];
  GLLMNormParams p={(uint32_t)n,eps};[e setBytes:&p length:sizeof(p) atIndex:3];

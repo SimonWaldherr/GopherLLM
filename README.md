@@ -130,7 +130,7 @@ and optionally runs Ministral for task suggestions and row explanations.
 
 ## Tested models
 
-Recorded checkpoint tests through **2026-10-30**. Each entry links to its evidence;
+Recorded checkpoint tests through **2026-10-31**. Each entry links to its evidence;
 the final table identifies component and synthetic-reference coverage. The
 broader [architecture list](#supported-architectures) describes implementation
 support rather than a successful run of every pretrained checkpoint. Results
@@ -1390,7 +1390,7 @@ experiments, use the recorded methodology and raw data:
 
 | Workload | Measurement record |
 |---|---|
-| Ministral 3B/14B and Voxtral decoder, 32-GiB M2 Max | [Real checkpoints, warm decode, RSS and paging](benchmarks/metal/real-mac-32gb.md) |
+| Ministral 3B/14B and Voxtral decoder, 32-GiB M2 Max | [KV lifetime, warm decode, RSS and paging](benchmarks/metal/mac-model-memory-2026-10-31.md) |
 | Ministral 3B Metal decode, M2 Max | [Paired requests and decode steps](benchmarks/metal/ministral-decode.md) |
 | Decoder scratch and Voxtral teacher-forced CPU steps | [Allocation savings and component timings](benchmarks/encoders/decode-memory.md) |
 | Ministral/Voxtral Tekken tokenization | [Splitter timing and allocation measurements](benchmarks/maintenance/tekken.md) |

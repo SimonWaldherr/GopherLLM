@@ -2,6 +2,6 @@
 
 package engine
 
-func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState) voxtralFastDecoder {
+func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState, mapping ...[]byte) voxtralFastDecoder {
 	return nil
 }

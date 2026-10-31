@@ -131,3 +131,5 @@ func metalDenseBatchProjectionQKV(*DecodeBuffer, int, []float32, []float32, []fl
 func metalDenseBatchAttention(*DecodeBuffer, int, *KVCache, []float32, int, int, []float32) bool {
 	return false
 }
+
+func releaseTransientMetalCache(*DecodeBuffer, *KVCache, *KVCache) {}

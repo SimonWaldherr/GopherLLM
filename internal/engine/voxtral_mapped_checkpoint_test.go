@@ -105,6 +105,13 @@ func TestVoxtralMappedCheckpointOwnership(t *testing.T) {
 	if s.fast == nil {
 		t.Fatal("Metal decoder inactive")
 	}
+	gpu := s.fast.(*voxtralMetalDecoder)
+	if gpu.borrowedWeightBytes == 0 || gpu.copiedWeightBytes != 0 {
+		t.Fatalf("decoder weights: borrowed=%d copied=%d", gpu.borrowedWeightBytes, gpu.copiedWeightBytes)
+	}
+	if gpu.capacity != 256 {
+		t.Fatalf("decoder eagerly reserved %d KV positions", gpu.capacity)
+	}
 	if err = m.Close(); err != nil {
 		t.Fatal(err)
 	}

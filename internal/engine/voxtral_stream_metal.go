@@ -10,20 +10,21 @@ import (
 )
 
 type voxtralMetalDecoder struct {
-	decoder                         *metalbackend.Decoder
-	owned                           []*metalbackend.Weight
-	refs                            []*metalbackend.Weight
-	physical, capacity, window      int
-	interleaved                     bool
-	inv, sin, cos, residual, normed []float32
+	decoder                                *metalbackend.Decoder
+	owned                                  []*metalbackend.Weight
+	refs                                   []*metalbackend.Weight
+	physical, capacity, window             int
+	borrowedWeightBytes, copiedWeightBytes int64
+	interleaved                            bool
+	inv, sin, cos, residual, normed        []float32
 }
 
-func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState) voxtralFastDecoder {
+func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState, mapping ...[]byte) voxtralFastDecoder {
 	dc := cfg.Decoder
 	if !MetalAvailable() || dc.HeadDim != 128 || dc.SlidingWindow <= 1 || dc.SlidingWindow > 8192 {
 		return nil
 	}
-	s := &voxtralMetalDecoder{capacity: dc.SlidingWindow + 256, window: dc.SlidingWindow, interleaved: cfg.RopeInterleaved, inv: standardRopeInvFreqSlice(128, dc.RopeTheta), residual: make([]float32, dc.HiddenSize), normed: make([]float32, dc.HiddenSize)}
+	s := &voxtralMetalDecoder{capacity: min(256, dc.SlidingWindow+256), window: dc.SlidingWindow, interleaved: cfg.RopeInterleaved, inv: standardRopeInvFreqSlice(128, dc.RopeTheta), residual: make([]float32, dc.HiddenSize), normed: make([]float32, dc.HiddenSize)}
 	s.decoder = metalbackend.NewDecoder(dc.HiddenSize, dc.IntermediateSize, dc.NHeads, dc.NKVHeads, len(w.Decoder.Layers), s.capacity, dc.Epsilon, float32(1/math.Sqrt(128)), w.Decoder.OutputNorm)
 	if s.decoder == nil {
 		return nil
@@ -52,16 +53,24 @@ func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, 
 			return nil, 0
 		}
 		if p == nil {
+			borrow := len(mapping) > 0 && weightBytesInMapping(m.Raw, mapping[0])
 			switch q {
 			case 4:
-				p = metalbackend.PrepareQ4K(m.Raw, m.Rows, m.Cols, false)
+				p = metalbackend.PrepareQ4K(m.Raw, m.Rows, m.Cols, borrow)
 			case 6:
-				p = metalbackend.PrepareQ6K(m.Raw, m.Rows, m.Cols, false)
+				p = metalbackend.PrepareQ6K(m.Raw, m.Rows, m.Cols, borrow)
 			case 8:
-				p = metalbackend.PrepareQ8_0(m.Raw, m.Rows, m.Cols, false)
+				p = metalbackend.PrepareQ8_0(m.Raw, m.Rows, m.Cols, borrow)
 			}
 			if p != nil {
 				s.owned = append(s.owned, p)
+				rowBytes, _ := m.Type.DataSize(m.Cols)
+				bytes := int64(m.Rows) * int64(rowBytes)
+				if borrow {
+					s.borrowedWeightBytes += bytes
+				} else {
+					s.copiedWeightBytes += bytes
+				}
 			}
 		}
 		s.refs = append(s.refs, p)
@@ -94,6 +103,18 @@ func newVoxtralFastDecoder(cfg VoxtralRealtimeConfig, w VoxtralRealtimeWeights, 
 }
 
 func (s *voxtralMetalDecoder) Step(input []float32, pos int, generate bool) (int, error) {
+	if s.physical == s.capacity && s.capacity < s.window+256 {
+		capacity := min(2*s.capacity, s.window+256)
+		// Include compaction headroom on the last doubling, avoiding a second
+		// full-history copy immediately after reaching the attention window.
+		if capacity >= s.window {
+			capacity = s.window + 256
+		}
+		if !s.decoder.GrowCache(s.physical, capacity) {
+			return 0, fmt.Errorf("cannot grow Voxtral GPU cache")
+		}
+		s.capacity = capacity
+	}
 	if s.physical == s.capacity {
 		drop := s.physical - s.window + 1
 		if !s.decoder.ShiftCache(s.physical, drop) {

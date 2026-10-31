@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -81,7 +82,7 @@ func TestRealMacDecode(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			fast := newVoxtralFastDecoder(c, w, state)
+			fast := newVoxtralFastDecoder(c, w, state, model.source.metalMapping)
 			if fast == nil {
 				t.Fatal("Metal decoder inactive")
 			}
@@ -116,7 +117,8 @@ func TestRealMacDecode(t *testing.T) {
 				t.Fatal("repeated decoder tokens differ")
 			}
 			reference = digest
-			realMacRecord(t, "decode", map[string]any{"repetition": rep, "seconds": elapsed.Seconds(), "tokens": 64, "tokens_per_second": 64 / elapsed.Seconds(), "prefill_seconds": prefill.Seconds(), "token_digest": digest})
+			gpu := fast.(*voxtralMetalDecoder)
+			realMacRecord(t, "decode", map[string]any{"repetition": rep, "seconds": elapsed.Seconds(), "tokens": 64, "tokens_per_second": 64 / elapsed.Seconds(), "prefill_seconds": prefill.Seconds(), "token_digest": digest, "decoder_kv_capacity": gpu.capacity, "decoder_kv_bytes": int64(gpu.capacity) * int64(c.Decoder.NKVHeads) * 128 * 4 * 2 * int64(len(w.Decoder.Layers)), "decoder_borrowed_weight_bytes": gpu.borrowedWeightBytes, "decoder_copied_weight_bytes": gpu.copiedWeightBytes})
 			fast.Close()
 			runtime.GC()
 			realMacRecord(t, "decoder_closed", map[string]any{"repetition": rep})
@@ -133,6 +135,23 @@ func TestRealMacDecode(t *testing.T) {
 	opts.MaxTokens = 64
 	opts.Seed = 41
 	opts.Sampler.Temperature = 0
+	longContext := os.Getenv("GOPHERLLM_REAL_MAC_LONG_CONTEXT") == "1"
+	prompt := "Erkläre in fünf Sätzen, wie ein Computerprogramm ausgeführt wird."
+	if longContext {
+		bytesPerPosition := kvCacheBytes(r.config.NLayers, r.config.NKVHeads*r.config.HeadDim, r.config.NKVHeads*r.config.ValueDim, 1, kvF32)
+		target := int(maxReusableKVCacheBytes/bytesPerPosition) + 32
+		lo, hi := 0, target*2
+		for lo < hi {
+			mid := lo + (hi-lo)/2
+			text := strings.Repeat(" memory", mid) + "\n" + prompt
+			if len(r.renderMessages([]ChatMessage{UserMessage(text)}, opts.SystemPrompt, nil)) < target {
+				lo = mid + 1
+			} else {
+				hi = mid
+			}
+		}
+		prompt = strings.Repeat(" memory", lo) + "\n" + prompt
+	}
 	var digest string
 	preparedMetalWeights := 0
 	for _, layer := range r.standard.Layers {
@@ -143,7 +162,7 @@ func TestRealMacDecode(t *testing.T) {
 		}
 	}
 	for rep := 0; rep < 4; rep++ {
-		result, e := r.GenerateChat([]ChatMessage{UserMessage("Erkläre in fünf Sätzen, wie ein Computerprogramm ausgeführt wird.")}, opts)
+		result, e := r.GenerateChat([]ChatMessage{UserMessage(prompt)}, opts)
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -153,6 +172,13 @@ func TestRealMacDecode(t *testing.T) {
 		// Selective offload is also a valid workload when a checkpoint or
 		// configuration cannot use the complete dense Metal graph.
 		dense := r.workspaceBuf.metalDense
+		retainedMetalKV := int64(0)
+		if dense != nil && dense.cache != r.workspaceCache {
+			retainedMetalKV = kvCacheStorageBytes(dense.cache)
+		}
+		if longContext {
+			runtime.GC()
+		}
 		if dense == nil && preparedMetalWeights == 0 {
 			t.Fatal("no Metal decoder or prepared projections")
 		}
@@ -161,7 +187,7 @@ func TestRealMacDecode(t *testing.T) {
 			t.Fatal("repeated generation differs")
 		}
 		digest = d
-		fields := map[string]any{"repetition": rep, "seconds": result.Stats.DecodeTime.Seconds(), "tokens": result.Stats.GeneratedTokens, "tokens_per_second": float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds(), "prefill_seconds": result.Stats.PrefillTime.Seconds(), "token_digest": d, "prompt_cache": result.PromptCache, "dense_metal": dense != nil, "prepared_metal_weights": preparedMetalWeights}
+		fields := map[string]any{"repetition": rep, "seconds": result.Stats.DecodeTime.Seconds(), "tokens": result.Stats.GeneratedTokens, "tokens_per_second": float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds(), "prefill_seconds": result.Stats.PrefillTime.Seconds(), "token_digest": d, "prompt_cache": result.PromptCache, "dense_metal": dense != nil, "prepared_metal_weights": preparedMetalWeights, "long_context": longContext, "gc_before_record": longContext, "retained_transient_metal_kv_bytes": retainedMetalKV}
 		if dense != nil {
 			// This counter covers buffers created by the dense graph only.
 			fields["copied_weight_bytes"] = dense.copiedWeightBytes
