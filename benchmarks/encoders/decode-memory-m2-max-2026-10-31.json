@@ -1,0 +1,113 @@
+{
+  "date": "2026-10-31",
+  "baseline_revision": "af91a37ff6177f18fb7632c7ab5a6adbbaa2194a",
+  "host": "Apple M2 Max, 32 GiB, Go 1.27.3, Darwin/arm64, CGO=1, GOMAXPROCS=8",
+  "method": "Seven alternating same-process reference/changed pairs after warmup, 32 teacher-forced steps each. Calibration pair excluded. Allocation reports use seven iterations separately.",
+  "voxtral_geometry": {
+    "hidden": 12,
+    "layers": 2,
+    "ffn": 16,
+    "vocab": 131072,
+    "weights": "synthetic F32; deliberately reduced transformer geometry, full vocabulary width"
+  },
+  "limits": [
+    "Not a pretrained/full-model throughput benchmark. The tiny body amplifies the contribution of discarded vocabulary projections.",
+    "No measured paging or peak RSS reduction. Host background load uncontrolled.",
+    "Ministral metadata comes from locally cached 3B/14B Q4_K_M files; full configuration parsed; constructor only, weight loading/KV caches/decoding excluded.",
+    "Ministral constructor timing is noisy and establishes no speedup; optional buffers allocate on first use if needed."
+  ],
+  "pairs": [
+    {
+      "pair": 0,
+      "reference_ns": 13462083,
+      "changed_ns": 160750
+    },
+    {
+      "pair": 1,
+      "reference_ns": 14288584,
+      "changed_ns": 161125
+    },
+    {
+      "pair": 2,
+      "reference_ns": 13728375,
+      "changed_ns": 164291
+    },
+    {
+      "pair": 3,
+      "reference_ns": 13821959,
+      "changed_ns": 160541
+    },
+    {
+      "pair": 4,
+      "reference_ns": 13854208,
+      "changed_ns": 168709
+    },
+    {
+      "pair": 5,
+      "reference_ns": 14492541,
+      "changed_ns": 163542
+    },
+    {
+      "pair": 6,
+      "reference_ns": 14226125,
+      "changed_ns": 167791
+    }
+  ],
+  "reference_median_ns": 13854208,
+  "changed_median_ns": 163542,
+  "allocation_reports": [
+    {
+      "name": "BenchmarkMinistralOptionalScratch/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf/eager=true-8",
+      "ns_per_op": 49256,
+      "bytes_per_op": 907837,
+      "allocs_per_op": 34
+    },
+    {
+      "name": "BenchmarkMinistralOptionalScratch/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf/eager=false-8",
+      "ns_per_op": 55542,
+      "bytes_per_op": 809501,
+      "allocs_per_op": 32
+    },
+    {
+      "name": "BenchmarkMinistralOptionalScratch/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf/eager=true-8",
+      "ns_per_op": 62863,
+      "bytes_per_op": 1126626,
+      "allocs_per_op": 34
+    },
+    {
+      "name": "BenchmarkMinistralOptionalScratch/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf/eager=false-8",
+      "ns_per_op": 52643,
+      "bytes_per_op": 954605,
+      "allocs_per_op": 32
+    },
+    {
+      "name": "BenchmarkVoxtralTeacherForcedAllocations/reference=true-8",
+      "ns_per_op": 13358286,
+      "bytes_per_op": 16784115,
+      "allocs_per_op": 79
+    },
+    {
+      "name": "BenchmarkVoxtralTeacherForcedAllocations/reference=false-8",
+      "ns_per_op": 161869,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32
+    }
+  ],
+  "metadata_log": [
+    "decode_memory_optimization_test.go:78: model=Ministral-3-3B-Instruct-2512-Q4_K_M.gguf dim=3072 hidden=9216 heads=32 kv_heads=8 head_dim=128 value_dim=128 vocab=131072",
+    "decode_memory_optimization_test.go:78: model=Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf dim=5120 hidden=16384 heads=32 kv_heads=8 head_dim=160 value_dim=128 vocab=131072"
+  ],
+  "source_sha256": {
+    "internal/engine/model_decode_buffer.go": "739f9ef0165c8371b225fa64c1d4e9837228857883e4efaea022031774d4b549",
+    "internal/engine/model_forward.go": "71e6b79ca40fc8f5d70b9bd620b59aac089f175fb78245bcd03aff4eb4daecad",
+    "internal/engine/voxtral_realtime_decoder.go": "e35041c07028f3d1ac33b6c54f8b6d7d8b02b6d601698bea22e771ee12476424",
+    "internal/engine/voxtral_realtime_session.go": "ce901bbf793562c4c2206169376f45267760c0c7f46bd21e735f268dff55c957",
+    "internal/engine/voxtral_decode_reference_test.go": "8e0e838366ea584354227e6a4301dfd8f105dd7732f64e17c1b165b746fb6a3c",
+    "internal/engine/decode_memory_optimization_test.go": "41f0cbb4a0cfd5910ef3f7f53660f1c4303cd5acd27789c93b613c18d7d47681"
+  },
+  "binary_sha256": "2a60a3ea7bbe0dc92c4aab8e0770ebbd1795a4462788463d41b8b3bf4bbc3342",
+  "raw_logs": {
+    "pairs.log": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode\n    decode_memory_optimization_test.go:143: pair=0 reference_ns=16149458 changed_ns=193375\n    decode_memory_optimization_test.go:143: pair=0 reference_ns=13462083 changed_ns=160750\n    decode_memory_optimization_test.go:143: pair=1 reference_ns=14288584 changed_ns=161125\n    decode_memory_optimization_test.go:143: pair=2 reference_ns=13728375 changed_ns=164291\n    decode_memory_optimization_test.go:143: pair=3 reference_ns=13821959 changed_ns=160541\n    decode_memory_optimization_test.go:143: pair=4 reference_ns=13854208 changed_ns=168709\n    decode_memory_optimization_test.go:143: pair=5 reference_ns=14492541 changed_ns=163542\n    decode_memory_optimization_test.go:143: pair=6 reference_ns=14226125 changed_ns=167791\nBenchmarkVoxtralTeacherForcedDecode-8   \t       7\t  14168244 ns/op\t16787360 B/op\t     130 allocs/op\nPASS\n",
+    "allocations.log": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkMinistralOptionalScratch\n    decode_memory_optimization_test.go:78: model=Ministral-3-3B-Instruct-2512-Q4_K_M.gguf dim=3072 hidden=9216 heads=32 kv_heads=8 head_dim=128 value_dim=128 vocab=131072\n    decode_memory_optimization_test.go:78: model=Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf dim=5120 hidden=16384 heads=32 kv_heads=8 head_dim=160 value_dim=128 vocab=131072\nBenchmarkMinistralOptionalScratch/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf/eager=true\nBenchmarkMinistralOptionalScratch/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf/eager=true-8         \t       7\t     49256 ns/op\t  907837 B/op\t      34 allocs/op\nBenchmarkMinistralOptionalScratch/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf/eager=false\nBenchmarkMinistralOptionalScratch/Ministral-3-3B-Instruct-2512-Q4_K_M.gguf/eager=false-8        \t       7\t     55542 ns/op\t  809501 B/op\t      32 allocs/op\nBenchmarkMinistralOptionalScratch/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf/eager=true\nBenchmarkMinistralOptionalScratch/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf/eager=true-8       \t       7\t     62863 ns/op\t 1126626 B/op\t      34 allocs/op\nBenchmarkMinistralOptionalScratch/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf/eager=false\nBenchmarkMinistralOptionalScratch/Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf/eager=false-8      \t       7\t     52643 ns/op\t  954605 B/op\t      32 allocs/op\nBenchmarkVoxtralTeacherForcedAllocations\nBenchmarkVoxtralTeacherForcedAllocations/reference=true\nBenchmarkVoxtralTeacherForcedAllocations/reference=true-8                                       \t       7\t  13358286 ns/op\t16784115 B/op\t      79 allocs/op\nBenchmarkVoxtralTeacherForcedAllocations/reference=false\nBenchmarkVoxtralTeacherForcedAllocations/reference=false-8                                      \t       7\t    161869 ns/op\t     768 B/op\t      32 allocs/op\nPASS\n"
+  }
+}

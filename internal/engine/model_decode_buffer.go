@@ -28,7 +28,7 @@ type DecodeBuffer struct {
 	AttnProj []float32
 	Gate     []float32
 	Up       []float32
-	GateUp   []float32
+	GateUp   []float32 // allocated on demand by fused gate/up projections
 	Hidden   []float32
 	MOE      []float32
 	// MoELatent keeps Nemotron-H's optional projected expert input alive
@@ -127,6 +127,7 @@ type ExpertScore struct {
 	Score float32
 }
 
+// Optional GateUp and MTPInput storage is allocated by its first consumer.
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
 	inv, mscale := buildRopeInvFreq(config, maxHeadDim)
 	var swaInv []float32
@@ -158,7 +159,6 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		AttnProj:                make([]float32, config.Dim),
 		Gate:                    make([]float32, config.HiddenDim),
 		Up:                      make([]float32, config.HiddenDim),
-		GateUp:                  make([]float32, config.HiddenDim*2),
 		Hidden:                  make([]float32, config.HiddenDim),
 		MOE:                     make([]float32, config.Dim),
 		MoELatent:               make([]float32, config.Dim),
@@ -178,7 +178,6 @@ func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *D
 		GeneratedTokens:         make([]uint32, 0, 64),
 		StreamBytes:             make([]byte, 0, 256),
 		Q4KXSums:                make([]float32, max(1, config.Dim/32)),
-		MTPInput:                make([]float32, 2*config.Dim),
 		RopeInvFreq:             inv,
 		RopeSin:                 make([]float32, max(1, maxHeadDim/2)),
 		RopeCos:                 make([]float32, max(1, maxHeadDim/2)),

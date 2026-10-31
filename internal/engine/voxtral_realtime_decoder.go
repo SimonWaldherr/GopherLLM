@@ -35,12 +35,12 @@ type VoxtralRealtimeDecoderState struct {
 }
 
 type voxtralRealtimeDecoderScratch struct {
-	invFreq                                              []float32
-	ropeHeadDim                                          int
-	ropeTheta                                            float32
-	x, normed, q, k, v, attnOut, outProj                 []float32
-	ffnGate, ffnUp, ffnAct, ffnDown, finalNormed, scores []float32
-	sin, cos                                             []float32
+	invFreq                                      []float32
+	ropeHeadDim                                  int
+	ropeTheta                                    float32
+	x, normed, q, k, v, attnOut, outProj         []float32
+	ffnGate, ffnUp, ffnDown, finalNormed, scores []float32
+	sin, cos                                     []float32
 }
 
 // NewVoxtralRealtimeDecoderState allocates decode state and precomputes the
@@ -121,6 +121,11 @@ func EmbedVoxtralRealtimeToken(cfg VoxtralRealtimeConfig, weights VoxtralRealtim
 // across calls and must be reused across a single generation's steps in
 // order.
 func ForwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState, input []float32, pos int) (logits []float32, err error) {
+	return forwardVoxtralRealtimeDecoderStep(cfg, weights, state, input, pos, true)
+}
+
+// Teacher-forced positions need K/V updates but no vocabulary projection.
+func forwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState, input []float32, pos int, generate bool) (logits []float32, err error) {
 	dc := cfg.Decoder
 	if state == nil {
 		return nil, fmt.Errorf("decoder step: nil state")
@@ -234,9 +239,8 @@ func ForwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 		}
 		layer.FFNGate.MatvecInto(b.normed, &b.ffnGate)
 		layer.FFNUp.MatvecInto(b.normed, &b.ffnUp)
-		ensureLenNoClear(&b.ffnAct, len(b.ffnGate))
-		siluMulF32(b.ffnGate, b.ffnUp, b.ffnAct)
-		layer.FFNDown.MatvecInto(b.ffnAct, &b.ffnDown)
+		siluMulF32(b.ffnGate, b.ffnUp, b.ffnGate)
+		layer.FFNDown.MatvecInto(b.ffnGate, &b.ffnDown)
 		if len(b.ffnDown) != dc.HiddenSize {
 			return nil, fmt.Errorf("decoder step: layer %d ffn_down has %d elements, want HiddenSize=%d", li, len(b.ffnDown), dc.HiddenSize)
 		}
@@ -244,7 +248,9 @@ func ForwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 	}
 
 	rmsNormInto(x, weights.Decoder.OutputNorm, dc.Epsilon, &b.finalNormed)
-	weights.Decoder.TokenEmbd.MatvecInto(b.finalNormed, &logits)
+	if generate {
+		weights.Decoder.TokenEmbd.MatvecInto(b.finalNormed, &logits)
+	}
 	state.nextPos++
 	return logits, nil
 }

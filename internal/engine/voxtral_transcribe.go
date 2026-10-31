@@ -158,9 +158,12 @@ func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig
 		if fast != nil {
 			return fast.Step(fused, pos, generate)
 		}
-		logits, err := ForwardVoxtralRealtimeDecoderStep(cfg, w, state, fused, pos)
+		logits, err := forwardVoxtralRealtimeDecoderStep(cfg, w, state, fused, pos, generate)
 		if err != nil {
 			return 0, err
+		}
+		if !generate {
+			return 0, nil
 		}
 		return voxtralArgmax(logits), nil
 	}

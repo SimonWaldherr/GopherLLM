@@ -176,9 +176,12 @@ func (s *VoxtralRealtimeSession) step(ctx context.Context, audio []float32, toke
 	if s.fast != nil {
 		return s.fast.Step(te, pos, generate)
 	}
-	logits, err := ForwardVoxtralRealtimeDecoderStep(s.cfg, s.weights, s.decoder, te, pos)
+	logits, err := forwardVoxtralRealtimeDecoderStep(s.cfg, s.weights, s.decoder, te, pos, generate)
 	if err != nil {
 		return 0, err
+	}
+	if !generate {
+		return 0, nil
 	}
 	return voxtralArgmax(logits), nil
 }

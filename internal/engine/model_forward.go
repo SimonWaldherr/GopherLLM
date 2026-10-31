@@ -265,6 +265,7 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 					addInPlace(buf.Proj, layer.FFNDownBias)
 				} else {
 					if layer.HasGateUp {
+						ensureLenNoClear(&buf.GateUp, 2*config.HiddenDim)
 						layer.WGateUp.MatvecInto(buf.XN2, &buf.GateUp)
 						ensureLenNoClear(&buf.Gate, config.HiddenDim)
 						ensureLenNoClear(&buf.Up, config.HiddenDim)

@@ -1296,6 +1296,7 @@ type DecodeBuffer = engineimpl.DecodeBuffer
 
 type ExpertScore = engineimpl.ExpertScore
 
+// Optional GateUp and MTPInput storage is allocated by its first consumer.
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
 	return engineimpl.NewDecodeBuffer(config, maxHeadDim, maxNKVHeads, maxValueDim)
 }
