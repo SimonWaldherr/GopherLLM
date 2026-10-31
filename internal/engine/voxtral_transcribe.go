@@ -47,7 +47,7 @@ func TranscribeVoxtralRealtime(ctx context.Context, modelPath string, samples []
 	}
 
 	useMetal := MetalAvailable()
-	cfg, w, err := LoadVoxtralRealtimeModel(data, gguf, useMetal, logw)
+	cfg, w, err := loadVoxtralRealtimeModel(data, gguf, useMetal, logw, mmap.IsMapped())
 	defer releaseVoxtralRealtimeWeights(&w)
 	if err != nil {
 		return "", fmt.Errorf("loading Voxtral Realtime model: %w", err)

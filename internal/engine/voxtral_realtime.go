@@ -462,6 +462,11 @@ func transposeF32(f []float32, rows, cols int) []float32 {
 // convention. See this file's doc comment for the computational graph these
 // weights feed.
 func LoadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw io.Writer) (VoxtralRealtimeConfig, VoxtralRealtimeWeights, error) {
+	return loadVoxtralRealtimeModel(data, gguf, useMetal, logw, false)
+}
+
+// Borrow only from a mapping whose owner outlives all inference and GPU handles.
+func loadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw io.Writer, borrow bool) (VoxtralRealtimeConfig, VoxtralRealtimeWeights, error) {
 	if logw == nil {
 		logw = io.Discard
 	}
@@ -598,7 +603,7 @@ func LoadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw i
 	names := detectVoxtralTensorNames(tensors)
 	config.RopeInterleaved = names.compact
 	load := func(name string) (Weight, error) {
-		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, false, false, useMetal)
+		return loadWeight(data, gguf.DataOffset, name, tensors, inferred, false, borrow, false, useMetal)
 	}
 	loadConv := func(weightName, biasName string, kernel, in, out, stride int) (VoxtralRealtimeEncoderConv, error) {
 		info, ok := tensors[weightName]
@@ -677,10 +682,10 @@ func LoadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw i
 		return config, weights, fmt.Errorf("loading voxtral realtime model: %w", err)
 	}
 
-	encLayers := make([]VoxtralRealtimeEncoderLayer, 0, enc.NLayers)
+	weights.Encoder.Layers = make([]VoxtralRealtimeEncoderLayer, enc.NLayers)
 	for l := range enc.NLayers {
 		n := names.encBlock(l)
-		var layer VoxtralRealtimeEncoderLayer
+		layer := &weights.Encoder.Layers[l]
 		layer.AttnNorm, err = loadF32Vec(data, gguf.DataOffset, n.AttnNorm, tensors, inferred)
 		if err != nil {
 			return config, weights, fmt.Errorf("loading voxtral realtime model: %w", err)
@@ -715,12 +720,10 @@ func LoadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw i
 			return config, weights, fmt.Errorf("loading voxtral realtime model: %w", err)
 		}
 		layer.FFNDownB = loadOptionalF32Vec(data, gguf.DataOffset, n.DownB, tensors, inferred, enc.DModel)
-		encLayers = append(encLayers, layer)
 		if l == 0 || l+1 == enc.NLayers || (l+1)%8 == 0 {
 			fmt.Fprintf(logw, "  Loaded voxtral encoder layer %d/%d\n", l+1, enc.NLayers)
 		}
 	}
-	weights.Encoder.Layers = encLayers
 
 	projLinear1, projLinear2 := names.proj()
 	if weights.Projector.Linear1, err = load(projLinear1); err != nil {
@@ -754,10 +757,10 @@ func LoadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw i
 		return config, weights, fmt.Errorf("loading voxtral realtime model: time embedding inv_freq has %d elements, want hidden_size/2=%d", len(weights.Decoder.TimeEmbedInvFreq), want)
 	}
 
-	decLayers := make([]VoxtralRealtimeDecoderLayer, 0, dec.NLayers)
+	weights.Decoder.Layers = make([]VoxtralRealtimeDecoderLayer, dec.NLayers)
 	for l := range dec.NLayers {
 		n := names.decBlock(l)
-		var layer VoxtralRealtimeDecoderLayer
+		layer := &weights.Decoder.Layers[l]
 		layer.AttnNorm, err = loadF32Vec(data, gguf.DataOffset, n.AttnNorm, tensors, inferred)
 		if err != nil {
 			return config, weights, fmt.Errorf("loading voxtral realtime model: %w", err)
@@ -793,12 +796,10 @@ func LoadVoxtralRealtimeModel(data []byte, gguf *GGUFFile, useMetal bool, logw i
 		if layer.FFNDown, err = load(n.Down); err != nil {
 			return config, weights, fmt.Errorf("loading voxtral realtime model: %w", err)
 		}
-		decLayers = append(decLayers, layer)
 		if l == 0 || l+1 == dec.NLayers || (l+1)%8 == 0 {
 			fmt.Fprintf(logw, "  Loaded voxtral decoder layer %d/%d\n", l+1, dec.NLayers)
 		}
 	}
-	weights.Decoder.Layers = decLayers
 
 	return config, weights, nil
 }

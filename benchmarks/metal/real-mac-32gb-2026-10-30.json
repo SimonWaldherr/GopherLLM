@@ -1,0 +1,4393 @@
+{
+  "date": "2026-10-30",
+  "hardware": "Apple M2 Max, 32 GiB unified RAM",
+  "backend": "Metal + Accelerate, Go 1.27.3, GOMAXPROCS=8",
+  "baseline_revision": "af91a37ff6177f18fb7632c7ab5a6adbbaa2194a",
+  "binary_sha256": "b229da82f09d517b55819237a43556bb25d0c9f79163fd3a7b998f45a060e06f",
+  "source_sha256": {
+    "internal/engine/real_mac_decode_test.go": "885a977d070699b9b81dfef4afc299951a55d4f2fb8d72fb5bd4100d09293c25",
+    "internal/engine/voxtral_api.go": "8a65aede7081f5c47eb135a47c784bdefd18d3a2f5a4e7c77d44136d1bd08850",
+    "internal/engine/voxtral_realtime.go": "42966bb5fc62241fc1bd6a639c39cba4e35d81f3fc9ca0a4f06cef45da860106",
+    "internal/engine/voxtral_transcribe.go": "96ceac4b86d6625ea66f56680c0b25b9632303b9b122ab15a5c9fe4c1b9a2d98",
+    "internal/engine/voxtral_realtime_decoder.go": "e35041c07028f3d1ac33b6c54f8b6d7d8b02b6d601698bea22e771ee12476424",
+    "internal/engine/model_decode_buffer.go": "739f9ef0165c8371b225fa64c1d4e9837228857883e4efaea022031774d4b549",
+    "internal/engine/model_forward.go": "71e6b79ca40fc8f5d70b9bd620b59aac089f175fb78245bcd03aff4eb4daecad"
+  },
+  "method": "Separate processes, one full checkpoint each; real model weights, no synthetic weight matrices. Two Ministral processes per size, three Voxtral processes per loader. First decode per process excluded from warm statistics. Sampling 0.5 seconds plus collection overhead. No builds/tests during measured runs.",
+  "limits": [
+    "RSS and getrusage MaxRSS are process residency counters, not complete accounting of all unified GPU/driver memory. HeapAlloc is Go heap only.",
+    "VM counters are system-wide and cannot be attributed exclusively to the benchmark process. Pageins include mapped weight loading; resident swap occupancy alone is not active paging.",
+    "No cache purge, background applications/thermal state uncontrolled; these are load and first-decode observations, not cold-SSD guarantees.",
+    "Ministral: full autoregressive chat, 27 prompt tokens, 64 output tokens, seed41, temperature0, default repeat penalty1.1, prefault core. Warm requests reuse complete prompt and its boundary logits.",
+    "Voxtral: full loaded model including prepared encoder, full Metal decoder; 32 teacher-forced token embeddings then 64 fixed embedding inputs with complete vocabulary selection. No audio encoding in timing, no transcript/recognition-quality or end-to-end STT rate claim.",
+    "All repeated token digests agree per Ministral model and across both Voxtral loaders. No proven Ministral decode speedup from this change.",
+    "Short-context decoder runs do not establish long-context throughput; Voxtral audio encoding can allocate additional workspace beyond the measured decoder workload."
+  ],
+  "summary": {
+    "ministral3b": {
+      "warm_samples": 6,
+      "warm_median_tokens_per_second": 68.55791907876173,
+      "warm_min_tokens_per_second": 60.66384251392738,
+      "warm_max_tokens_per_second": 72.25192550308977,
+      "process_peak_rss_bytes_min": 2221588480,
+      "process_peak_rss_bytes_max": 2221604864,
+      "process_peak_rss_bytes_median": 2221596672.0
+    },
+    "ministral14b": {
+      "warm_samples": 6,
+      "warm_median_tokens_per_second": 20.45541679274386,
+      "warm_min_tokens_per_second": 19.811252679526483,
+      "warm_max_tokens_per_second": 21.193774391823883,
+      "process_peak_rss_bytes_min": 7935983616,
+      "process_peak_rss_bytes_max": 7937605632,
+      "process_peak_rss_bytes_median": 7936794624.0
+    },
+    "voxtral_borrow": {
+      "warm_samples": 6,
+      "warm_median_tokens_per_second": 68.22874430262299,
+      "warm_min_tokens_per_second": 65.2360214844766,
+      "warm_max_tokens_per_second": 74.84494521804342,
+      "process_peak_rss_bytes_min": 5186748416,
+      "process_peak_rss_bytes_max": 5187256320,
+      "process_peak_rss_bytes_median": 5187158016
+    },
+    "voxtral_copy": {
+      "warm_samples": 6,
+      "warm_median_tokens_per_second": 62.19345370828799,
+      "warm_min_tokens_per_second": 49.84547575405308,
+      "warm_max_tokens_per_second": 75.09304497604062,
+      "process_peak_rss_bytes_min": 7595655168,
+      "process_peak_rss_bytes_max": 14440939520,
+      "process_peak_rss_bytes_median": 14440366080
+    }
+  },
+  "runs": [
+    {
+      "model": "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
+      "mode": "ministral3b",
+      "started": 1793350717.4313369,
+      "elapsed_s": 8.258194923400879,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 27546,
+          "Pages active": 526470,
+          "Pages inactive": 531642,
+          "Pages speculative": 1930,
+          "Pages throttled": 0,
+          "Pages wired down": 302820,
+          "Pages purgeable": 9962,
+          "\"Translation faults\"": 699096378,
+          "Pages copy-on-write": 47857406,
+          "Pages zero filled": 528587554,
+          "Pages reactivated": 25495269,
+          "Pages purged": 8545957,
+          "File-backed pages": 347898,
+          "Anonymous pages": 712144,
+          "Pages stored in compressor": 1397250,
+          "Pages occupied by compressor": 650084,
+          "Decompressions": 17703072,
+          "Compressions": 29587459,
+          "Pageins": 28408640,
+          "Pageouts": 192690,
+          "Swapins": 87153,
+          "Swapouts": 482540
+        },
+        "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 158173,
+          "Pages active": 425077,
+          "Pages inactive": 419556,
+          "Pages speculative": 3693,
+          "Pages throttled": 0,
+          "Pages wired down": 293457,
+          "Pages purgeable": 2109,
+          "\"Translation faults\"": 699325454,
+          "Pages copy-on-write": 48000133,
+          "Pages zero filled": 528676543,
+          "Pages reactivated": 25667134,
+          "Pages purged": 8554534,
+          "File-backed pages": 390018,
+          "Anonymous pages": 458308,
+          "Pages stored in compressor": 1603266,
+          "Pages occupied by compressor": 740536,
+          "Decompressions": 17714021,
+          "Compressions": 29819593,
+          "Pageins": 28545557,
+          "Pageouts": 192702,
+          "Swapins": 87157,
+          "Swapouts": 482540
+        },
+        "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791440,
+          "heap_sys_bytes": 3801088,
+          "major_faults": 60,
+          "minor_faults": 1342,
+          "phase": "before_load",
+          "rss_peak_bytes": 18448384
+        },
+        {
+          "heap_alloc_bytes": 55941040,
+          "heap_sys_bytes": 62226432,
+          "major_faults": 131105,
+          "minor_faults": 6186,
+          "phase": "loaded",
+          "rss_peak_bytes": 2221588480,
+          "seconds": 3.103474375
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86904056,
+          "heap_sys_bytes": 91586560,
+          "major_faults": 131114,
+          "minor_faults": 7189,
+          "phase": "decode",
+          "prefill_seconds": 0.223628916,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": false,
+            "reused_tokens": 0,
+            "prompt_tokens": 27
+          },
+          "repetition": 0,
+          "rss_peak_bytes": 2221588480,
+          "seconds": 0.963056041,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 66.45511504558435
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86939768,
+          "heap_sys_bytes": 91586560,
+          "major_faults": 131119,
+          "minor_faults": 7197,
+          "phase": "decode",
+          "prefill_seconds": 1.66e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 1,
+          "rss_peak_bytes": 2221588480,
+          "seconds": 0.968069417,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 66.11096154481658
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86952040,
+          "heap_sys_bytes": 91586560,
+          "major_faults": 131119,
+          "minor_faults": 7199,
+          "phase": "decode",
+          "prefill_seconds": 2.5e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 2,
+          "rss_peak_bytes": 2221588480,
+          "seconds": 0.972110041,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 65.83616802698985
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86962112,
+          "heap_sys_bytes": 91586560,
+          "major_faults": 131119,
+          "minor_faults": 7201,
+          "phase": "decode",
+          "prefill_seconds": 5e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 3,
+          "rss_peak_bytes": 2221588480,
+          "seconds": 1.054994167,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 60.66384251392738
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350717.4389708,
+          "rss_bytes": 32768,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28408648,
+            "Pageouts": 192690,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350717.952481,
+          "rss_bytes": 17498112,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28409906,
+            "Pageouts": 192690,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350718.462282,
+          "rss_bytes": 734724096,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28452811,
+            "Pageouts": 192690,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350718.9749959,
+          "rss_bytes": 1282080768,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28486149,
+            "Pageouts": 192699,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350719.486454,
+          "rss_bytes": 1802895360,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28518578,
+            "Pageouts": 192699,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350720.009121,
+          "rss_bytes": 2217328640,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28543125,
+            "Pageouts": 192699,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350720.535695,
+          "rss_bytes": 1463418880,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28543487,
+            "Pageouts": 192699,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350721.0511549,
+          "rss_bytes": 89587712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28543514,
+            "Pageouts": 192701,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350721.56608,
+          "rss_bytes": 104202240,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28544012,
+            "Pageouts": 192701,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350722.081557,
+          "rss_bytes": 104726528,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28544021,
+            "Pageouts": 192701,
+            "Swapins": 87153,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350722.595586,
+          "rss_bytes": 105136128,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28544040,
+            "Pageouts": 192701,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350723.109296,
+          "rss_bytes": 105136128,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28544049,
+            "Pageouts": 192701,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350723.628315,
+          "rss_bytes": 105136128,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28544053,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350724.143542,
+          "rss_bytes": 105168896,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28544126,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350724.65982,
+          "rss_bytes": 105168896,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28545373,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350725.172765,
+          "rss_bytes": 105201664,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28545376,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 2221588480,
+      "major_faults": 131119,
+      "minor_faults": 7205,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791440,\"heap_sys_bytes\":3801088,\"major_faults\":60,\"minor_faults\":1342,\"phase\":\"before_load\",\"rss_peak_bytes\":18448384}\nREAL_MAC_JSON {\"heap_alloc_bytes\":55941040,\"heap_sys_bytes\":62226432,\"major_faults\":131105,\"minor_faults\":6186,\"phase\":\"loaded\",\"rss_peak_bytes\":2221588480,\"seconds\":3.103474375}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86904056,\"heap_sys_bytes\":91586560,\"major_faults\":131114,\"minor_faults\":7189,\"phase\":\"decode\",\"prefill_seconds\":0.223628916,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":false,\"reused_tokens\":0,\"prompt_tokens\":27},\"repetition\":0,\"rss_peak_bytes\":2221588480,\"seconds\":0.963056041,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":66.45511504558435}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86939768,\"heap_sys_bytes\":91586560,\"major_faults\":131119,\"minor_faults\":7197,\"phase\":\"decode\",\"prefill_seconds\":1.66e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":1,\"rss_peak_bytes\":2221588480,\"seconds\":0.968069417,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":66.11096154481658}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86952040,\"heap_sys_bytes\":91586560,\"major_faults\":131119,\"minor_faults\":7199,\"phase\":\"decode\",\"prefill_seconds\":2.5e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":2,\"rss_peak_bytes\":2221588480,\"seconds\":0.972110041,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":65.83616802698985}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86962112,\"heap_sys_bytes\":91586560,\"major_faults\":131119,\"minor_faults\":7201,\"phase\":\"decode\",\"prefill_seconds\":5e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":3,\"rss_peak_bytes\":2221588480,\"seconds\":1.054994167,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":60.66384251392738}\n--- PASS: TestRealMacDecode (7.36s)\nPASS\n"
+    },
+    {
+      "model": "Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf",
+      "mode": "ministral14b",
+      "started": 1793350725.6972532,
+      "elapsed_s": 25.296857833862305,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 157810,
+          "Pages active": 425114,
+          "Pages inactive": 419933,
+          "Pages speculative": 3693,
+          "Pages throttled": 0,
+          "Pages wired down": 293457,
+          "Pages purgeable": 2109,
+          "\"Translation faults\"": 699326869,
+          "Pages copy-on-write": 48000380,
+          "Pages zero filled": 528676695,
+          "Pages reactivated": 25667134,
+          "Pages purged": 8554534,
+          "File-backed pages": 390052,
+          "Anonymous pages": 458688,
+          "Pages stored in compressor": 1602893,
+          "Pages occupied by compressor": 740485,
+          "Decompressions": 17714403,
+          "Compressions": 29819593,
+          "Pageins": 28545559,
+          "Pageouts": 192702,
+          "Swapins": 87157,
+          "Swapouts": 482540
+        },
+        "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 473771,
+          "Pages active": 278447,
+          "Pages inactive": 272756,
+          "Pages speculative": 4989,
+          "Pages throttled": 0,
+          "Pages wired down": 294440,
+          "Pages purgeable": 755,
+          "\"Translation faults\"": 700413305,
+          "Pages copy-on-write": 48518786,
+          "Pages zero filled": 528987642,
+          "Pages reactivated": 26056655,
+          "Pages purged": 8564941,
+          "File-backed pages": 370278,
+          "Anonymous pages": 185914,
+          "Pages stored in compressor": 1568913,
+          "Pages occupied by compressor": 716088,
+          "Decompressions": 18085750,
+          "Compressions": 30450130,
+          "Pageins": 29146351,
+          "Pageouts": 192977,
+          "Swapins": 103185,
+          "Swapouts": 613196
+        },
+        "swapusage": "vm.swapusage: total = 8192.00M  used = 7427.12M  free = 764.88M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791920,
+          "heap_sys_bytes": 8028160,
+          "major_faults": 72,
+          "minor_faults": 1340,
+          "phase": "before_load",
+          "rss_peak_bytes": 18595840
+        },
+        {
+          "heap_alloc_bytes": 60932640,
+          "heap_sys_bytes": 70647808,
+          "major_faults": 556730,
+          "minor_faults": -67029,
+          "phase": "loaded",
+          "rss_peak_bytes": 7935983616,
+          "seconds": 11.047239917
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94116360,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 556840,
+          "minor_faults": -64165,
+          "phase": "decode",
+          "prefill_seconds": 0.620249708,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": false,
+            "reused_tokens": 0,
+            "prompt_tokens": 27
+          },
+          "repetition": 0,
+          "rss_peak_bytes": 7935983616,
+          "seconds": 3.370519875,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 18.98816870201663
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94155664,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 556853,
+          "minor_faults": -64151,
+          "phase": "decode",
+          "prefill_seconds": 2.09e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 1,
+          "rss_peak_bytes": 7935983616,
+          "seconds": 3.205061375,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 19.968416361449552
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94167568,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 556859,
+          "minor_faults": -64149,
+          "phase": "decode",
+          "prefill_seconds": 3.75e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 2,
+          "rss_peak_bytes": 7935983616,
+          "seconds": 3.230487291,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 19.811252679526483
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94177480,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 556862,
+          "minor_faults": -64149,
+          "phase": "decode",
+          "prefill_seconds": 5.42e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 3,
+          "rss_peak_bytes": 7935983616,
+          "seconds": 3.217103666,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 19.89367040807071
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350725.703417,
+          "rss_bytes": 327680,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28545579,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350726.217854,
+          "rss_bytes": 771735552,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28591645,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350726.728978,
+          "rss_bytes": 1619673088,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28644042,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350727.242583,
+          "rss_bytes": 2418655232,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28693760,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350727.764868,
+          "rss_bytes": 2963685376,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28728007,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350728.283642,
+          "rss_bytes": 3457646592,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28758216,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350728.797481,
+          "rss_bytes": 3938746368,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28787627,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350729.3103518,
+          "rss_bytes": 4450336768,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28819553,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350729.8220348,
+          "rss_bytes": 4960075776,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28851331,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350730.343533,
+          "rss_bytes": 5390106624,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28880341,
+            "Pageouts": 192702,
+            "Swapins": 87157,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350730.8595572,
+          "rss_bytes": 5901910016,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28912417,
+            "Pageouts": 192702,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350731.3713331,
+          "rss_bytes": 6470139904,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28948014,
+            "Pageouts": 192704,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350731.8860428,
+          "rss_bytes": 7034421248,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 28983089,
+            "Pageouts": 192880,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350732.401154,
+          "rss_bytes": 7636647936,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29019923,
+            "Pageouts": 192950,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350732.915466,
+          "rss_bytes": 7188070400,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29034583,
+            "Pageouts": 192950,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350733.4318411,
+          "rss_bytes": 5617500160,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29035129,
+            "Pageouts": 192953,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350733.945076,
+          "rss_bytes": 3627352064,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29035876,
+            "Pageouts": 192953,
+            "Swapins": 87161,
+            "Swapouts": 482540
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 5633.69M  free = 1534.31M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350734.462923,
+          "rss_bytes": 2044379136,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29036457,
+            "Pageouts": 192955,
+            "Swapins": 87165,
+            "Swapouts": 526928
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 6335.62M  free = 832.38M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350734.9784808,
+          "rss_bytes": 1169899520,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29052040,
+            "Pageouts": 192973,
+            "Swapins": 87165,
+            "Swapouts": 572896
+          },
+          "swapusage": "vm.swapusage: total = 7168.00M  used = 7045.50M  free = 122.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350735.493097,
+          "rss_bytes": 774340608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29078053,
+            "Pageouts": 192975,
+            "Swapins": 87165,
+            "Swapouts": 573516
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7055.19M  free = 1136.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350736.008272,
+          "rss_bytes": 661749760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29091074,
+            "Pageouts": 192975,
+            "Swapins": 87173,
+            "Swapouts": 573516
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7055.19M  free = 1136.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350736.5235,
+          "rss_bytes": 577110016,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29111186,
+            "Pageouts": 192976,
+            "Swapins": 87173,
+            "Swapouts": 573516
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7055.19M  free = 1136.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350737.0352268,
+          "rss_bytes": 86409216,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29114155,
+            "Pageouts": 192976,
+            "Swapins": 87305,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7675.19M  free = 516.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350737.550708,
+          "rss_bytes": 105725952,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29115531,
+            "Pageouts": 192976,
+            "Swapins": 89465,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7643.19M  free = 548.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350738.068139,
+          "rss_bytes": 105889792,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29116139,
+            "Pageouts": 192976,
+            "Swapins": 89705,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7643.19M  free = 548.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350738.583018,
+          "rss_bytes": 105693184,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29131094,
+            "Pageouts": 192976,
+            "Swapins": 90205,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7635.19M  free = 556.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350739.098659,
+          "rss_bytes": 105807872,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29132498,
+            "Pageouts": 192976,
+            "Swapins": 91013,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7627.19M  free = 564.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350739.61289,
+          "rss_bytes": 105971712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29132572,
+            "Pageouts": 192976,
+            "Swapins": 91409,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7611.19M  free = 580.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350740.127303,
+          "rss_bytes": 106168320,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29134407,
+            "Pageouts": 192976,
+            "Swapins": 92177,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7603.19M  free = 588.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350740.638725,
+          "rss_bytes": 106364928,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29137656,
+            "Pageouts": 192976,
+            "Swapins": 92381,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7603.19M  free = 588.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350741.156267,
+          "rss_bytes": 102531072,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29138706,
+            "Pageouts": 192976,
+            "Swapins": 95345,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7555.19M  free = 636.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350741.6695979,
+          "rss_bytes": 102531072,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29138768,
+            "Pageouts": 192976,
+            "Swapins": 95409,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7555.19M  free = 636.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350742.1844301,
+          "rss_bytes": 96321536,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29138835,
+            "Pageouts": 192976,
+            "Swapins": 95501,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7555.19M  free = 636.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350742.7028558,
+          "rss_bytes": 96337920,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29139398,
+            "Pageouts": 192976,
+            "Swapins": 95877,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7547.19M  free = 644.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350743.2234612,
+          "rss_bytes": 96370688,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29139647,
+            "Pageouts": 192976,
+            "Swapins": 96921,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7531.12M  free = 660.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350743.741069,
+          "rss_bytes": 96370688,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29139706,
+            "Pageouts": 192976,
+            "Swapins": 96965,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7531.12M  free = 660.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350744.263672,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140262,
+            "Pageouts": 192976,
+            "Swapins": 97333,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7523.12M  free = 668.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350744.781399,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140282,
+            "Pageouts": 192977,
+            "Swapins": 97353,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7523.12M  free = 668.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350745.297784,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140455,
+            "Pageouts": 192977,
+            "Swapins": 97481,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7523.12M  free = 668.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350745.81359,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140502,
+            "Pageouts": 192977,
+            "Swapins": 97525,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7523.12M  free = 668.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350746.332767,
+          "rss_bytes": 96452608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140507,
+            "Pageouts": 192977,
+            "Swapins": 97633,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7523.12M  free = 668.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350746.848153,
+          "rss_bytes": 96452608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140533,
+            "Pageouts": 192977,
+            "Swapins": 97649,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7523.12M  free = 668.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350747.369167,
+          "rss_bytes": 96452608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140548,
+            "Pageouts": 192977,
+            "Swapins": 97685,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7515.12M  free = 676.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350747.889531,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140589,
+            "Pageouts": 192977,
+            "Swapins": 97761,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7515.12M  free = 676.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350748.4080498,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29140617,
+            "Pageouts": 192977,
+            "Swapins": 97789,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7515.12M  free = 676.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350748.923009,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29141026,
+            "Pageouts": 192977,
+            "Swapins": 99857,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7475.12M  free = 716.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350749.441836,
+          "rss_bytes": 96501760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29141104,
+            "Pageouts": 192977,
+            "Swapins": 101433,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7459.12M  free = 732.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350749.959626,
+          "rss_bytes": 96452608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29141829,
+            "Pageouts": 192977,
+            "Swapins": 101573,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7451.12M  free = 740.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350750.475061,
+          "rss_bytes": 89473024,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29142372,
+            "Pageouts": 192977,
+            "Swapins": 101629,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7451.12M  free = 740.88M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 7935983616,
+      "major_faults": 556862,
+      "minor_faults": -64118,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791920,\"heap_sys_bytes\":8028160,\"major_faults\":72,\"minor_faults\":1340,\"phase\":\"before_load\",\"rss_peak_bytes\":18595840}\nREAL_MAC_JSON {\"heap_alloc_bytes\":60932640,\"heap_sys_bytes\":70647808,\"major_faults\":556730,\"minor_faults\":-67029,\"phase\":\"loaded\",\"rss_peak_bytes\":7935983616,\"seconds\":11.047239917}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94116360,\"heap_sys_bytes\":104202240,\"major_faults\":556840,\"minor_faults\":-64165,\"phase\":\"decode\",\"prefill_seconds\":0.620249708,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":false,\"reused_tokens\":0,\"prompt_tokens\":27},\"repetition\":0,\"rss_peak_bytes\":7935983616,\"seconds\":3.370519875,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":18.98816870201663}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94155664,\"heap_sys_bytes\":104202240,\"major_faults\":556853,\"minor_faults\":-64151,\"phase\":\"decode\",\"prefill_seconds\":2.09e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":1,\"rss_peak_bytes\":7935983616,\"seconds\":3.205061375,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":19.968416361449552}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94167568,\"heap_sys_bytes\":104202240,\"major_faults\":556859,\"minor_faults\":-64149,\"phase\":\"decode\",\"prefill_seconds\":3.75e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":2,\"rss_peak_bytes\":7935983616,\"seconds\":3.230487291,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":19.811252679526483}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94177480,\"heap_sys_bytes\":104202240,\"major_faults\":556862,\"minor_faults\":-64149,\"phase\":\"decode\",\"prefill_seconds\":5.42e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":3,\"rss_peak_bytes\":7935983616,\"seconds\":3.217103666,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":19.89367040807071}\n--- PASS: TestRealMacDecode (24.83s)\nPASS\n"
+    },
+    {
+      "model": "Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+      "mode": "voxtral_copy",
+      "started": 1793350751.000493,
+      "elapsed_s": 13.376358985900879,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 473697,
+          "Pages active": 278557,
+          "Pages inactive": 272747,
+          "Pages speculative": 4989,
+          "Pages throttled": 0,
+          "Pages wired down": 294439,
+          "Pages purgeable": 755,
+          "\"Translation faults\"": 700414545,
+          "Pages copy-on-write": 48519034,
+          "Pages zero filled": 528987897,
+          "Pages reactivated": 26056655,
+          "Pages purged": 8564941,
+          "File-backed pages": 370282,
+          "Anonymous pages": 186011,
+          "Pages stored in compressor": 1568840,
+          "Pages occupied by compressor": 716063,
+          "Decompressions": 18085832,
+          "Compressions": 30450130,
+          "Pageins": 29146353,
+          "Pageouts": 192977,
+          "Swapins": 103185,
+          "Swapouts": 613196
+        },
+        "swapusage": "vm.swapusage: total = 8192.00M  used = 7427.12M  free = 764.88M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 827493,
+          "Pages active": 196718,
+          "Pages inactive": 252654,
+          "Pages speculative": 14112,
+          "Pages throttled": 0,
+          "Pages wired down": 284564,
+          "Pages purgeable": 7504,
+          "\"Translation faults\"": 701686733,
+          "Pages copy-on-write": 48537140,
+          "Pages zero filled": 530076684,
+          "Pages reactivated": 26358184,
+          "Pages purged": 8577030,
+          "File-backed pages": 325303,
+          "Anonymous pages": 138181,
+          "Pages stored in compressor": 1031215,
+          "Pages occupied by compressor": 464935,
+          "Decompressions": 18440467,
+          "Compressions": 31234376,
+          "Pageins": 29391589,
+          "Pageouts": 193167,
+          "Swapins": 105461,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 796984,
+          "heap_sys_bytes": 3801088,
+          "major_faults": 179,
+          "minor_faults": 1250,
+          "phase": "before_load",
+          "rss_peak_bytes": 18644992
+        },
+        {
+          "heap_alloc_bytes": 7555157120,
+          "heap_sys_bytes": 7582777344,
+          "major_faults": 223648,
+          "minor_faults": 696533,
+          "phase": "loaded",
+          "rss_peak_bytes": 7595655168,
+          "seconds": 7.8035981660000004
+        },
+        {
+          "heap_alloc_bytes": 7557179216,
+          "heap_sys_bytes": 7582679040,
+          "major_faults": 223685,
+          "minor_faults": 714268,
+          "phase": "decode",
+          "prefill_seconds": 1.118914,
+          "repetition": 0,
+          "rss_peak_bytes": 7595655168,
+          "seconds": 0.946110625,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 67.64536652360289
+        },
+        {
+          "heap_alloc_bytes": 7554031552,
+          "heap_sys_bytes": 7582679040,
+          "major_faults": 223687,
+          "minor_faults": 714605,
+          "phase": "decoder_closed",
+          "repetition": 0,
+          "rss_peak_bytes": 7595655168
+        },
+        {
+          "heap_alloc_bytes": 7556000576,
+          "heap_sys_bytes": 7582679040,
+          "major_faults": 223690,
+          "minor_faults": 731464,
+          "phase": "decode",
+          "prefill_seconds": 0.431106667,
+          "repetition": 1,
+          "rss_peak_bytes": 7595655168,
+          "seconds": 0.904944208,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 70.72259199431221
+        },
+        {
+          "heap_alloc_bytes": 7554010568,
+          "heap_sys_bytes": 7582679040,
+          "major_faults": 223690,
+          "minor_faults": 731469,
+          "phase": "decoder_closed",
+          "repetition": 1,
+          "rss_peak_bytes": 7595655168
+        },
+        {
+          "heap_alloc_bytes": 7556021784,
+          "heap_sys_bytes": 7582679040,
+          "major_faults": 223697,
+          "minor_faults": 739747,
+          "phase": "decode",
+          "prefill_seconds": 0.45687525,
+          "repetition": 2,
+          "rss_peak_bytes": 7595655168,
+          "seconds": 0.869389375,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 73.61488631029106
+        },
+        {
+          "heap_alloc_bytes": 7554032272,
+          "heap_sys_bytes": 7582679040,
+          "major_faults": 223697,
+          "minor_faults": 739747,
+          "phase": "decoder_closed",
+          "repetition": 2,
+          "rss_peak_bytes": 7595655168
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350751.0055208,
+          "rss_bytes": 327680,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29146395,
+            "Pageouts": 192977,
+            "Swapins": 103185,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7427.12M  free = 764.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350751.519835,
+          "rss_bytes": 745816064,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29165570,
+            "Pageouts": 192977,
+            "Swapins": 103761,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7419.12M  free = 772.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350752.033565,
+          "rss_bytes": 1603780608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29187145,
+            "Pageouts": 192977,
+            "Swapins": 103897,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7419.12M  free = 772.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350752.5470889,
+          "rss_bytes": 2436481024,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29209712,
+            "Pageouts": 192977,
+            "Swapins": 103965,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7411.12M  free = 780.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350753.0608928,
+          "rss_bytes": 3591634944,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29230709,
+            "Pageouts": 192977,
+            "Swapins": 103973,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7411.12M  free = 780.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350753.57279,
+          "rss_bytes": 4575264768,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29251356,
+            "Pageouts": 192977,
+            "Swapins": 104017,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7411.12M  free = 780.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350754.0863202,
+          "rss_bytes": 5612060672,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29272739,
+            "Pageouts": 192977,
+            "Swapins": 104053,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7411.12M  free = 780.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350754.597728,
+          "rss_bytes": 6605193216,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29293785,
+            "Pageouts": 192977,
+            "Swapins": 104221,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7411.12M  free = 780.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350755.1083531,
+          "rss_bytes": 7523876864,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29312870,
+            "Pageouts": 192977,
+            "Swapins": 104265,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7403.12M  free = 788.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350755.624767,
+          "rss_bytes": 5993201664,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29321940,
+            "Pageouts": 192977,
+            "Swapins": 104273,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7403.12M  free = 788.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350756.141439,
+          "rss_bytes": 5705023488,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29337833,
+            "Pageouts": 192977,
+            "Swapins": 104321,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7403.12M  free = 788.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350756.65672,
+          "rss_bytes": 5666340864,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29353468,
+            "Pageouts": 192982,
+            "Swapins": 104337,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7403.12M  free = 788.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350757.172548,
+          "rss_bytes": 5748948992,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29369088,
+            "Pageouts": 193019,
+            "Swapins": 104473,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7403.12M  free = 788.88M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350757.6869252,
+          "rss_bytes": 6345441280,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29372437,
+            "Pageouts": 193153,
+            "Swapins": 104477,
+            "Swapouts": 613196
+          },
+          "swapusage": "vm.swapusage: total = 8192.00M  used = 7413.25M  free = 778.75M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350758.208408,
+          "rss_bytes": 6447775744,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29372505,
+            "Pageouts": 193155,
+            "Swapins": 104625,
+            "Swapouts": 676844
+          },
+          "swapusage": "vm.swapusage: total = 9216.00M  used = 8405.62M  free = 810.38M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350758.7202072,
+          "rss_bytes": 6513278976,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29372622,
+            "Pageouts": 193155,
+            "Swapins": 104733,
+            "Swapouts": 729216
+          },
+          "swapusage": "vm.swapusage: total = 9216.00M  used = 9216.00M  free = 0.00M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350759.241237,
+          "rss_bytes": 5053628416,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29372775,
+            "Pageouts": 193167,
+            "Swapins": 104813,
+            "Swapouts": 764680
+          },
+          "swapusage": "vm.swapusage: total = 10240.00M  used = 9777.19M  free = 462.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350759.756298,
+          "rss_bytes": 5054087168,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29372984,
+            "Pageouts": 193167,
+            "Swapins": 104849,
+            "Swapouts": 833740
+          },
+          "swapusage": "vm.swapusage: total = 11264.00M  used = 10856.19M  free = 407.81M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350760.271632,
+          "rss_bytes": 5054234624,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29374239,
+            "Pageouts": 193167,
+            "Swapins": 104981,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350760.781441,
+          "rss_bytes": 5054267392,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29375383,
+            "Pageouts": 193167,
+            "Swapins": 104985,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350761.2968261,
+          "rss_bytes": 5327667200,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29377889,
+            "Pageouts": 193167,
+            "Swapins": 105041,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350761.806696,
+          "rss_bytes": 5327896576,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29381548,
+            "Pageouts": 193167,
+            "Swapins": 105085,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350762.326187,
+          "rss_bytes": 5327896576,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29383829,
+            "Pageouts": 193167,
+            "Swapins": 105149,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350762.838706,
+          "rss_bytes": 5328044032,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29385242,
+            "Pageouts": 193167,
+            "Swapins": 105189,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350763.351281,
+          "rss_bytes": 5328093184,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29388659,
+            "Pageouts": 193167,
+            "Swapins": 105273,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350763.8608088,
+          "rss_bytes": 2023522304,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29389973,
+            "Pageouts": 193167,
+            "Swapins": 105361,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 7595655168,
+      "major_faults": 223721,
+      "minor_faults": 739753,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":796984,\"heap_sys_bytes\":3801088,\"major_faults\":179,\"minor_faults\":1250,\"phase\":\"before_load\",\"rss_peak_bytes\":18644992}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7555157120,\"heap_sys_bytes\":7582777344,\"major_faults\":223648,\"minor_faults\":696533,\"phase\":\"loaded\",\"rss_peak_bytes\":7595655168,\"seconds\":7.8035981660000004}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7557179216,\"heap_sys_bytes\":7582679040,\"major_faults\":223685,\"minor_faults\":714268,\"phase\":\"decode\",\"prefill_seconds\":1.118914,\"repetition\":0,\"rss_peak_bytes\":7595655168,\"seconds\":0.946110625,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":67.64536652360289}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554031552,\"heap_sys_bytes\":7582679040,\"major_faults\":223687,\"minor_faults\":714605,\"phase\":\"decoder_closed\",\"repetition\":0,\"rss_peak_bytes\":7595655168}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7556000576,\"heap_sys_bytes\":7582679040,\"major_faults\":223690,\"minor_faults\":731464,\"phase\":\"decode\",\"prefill_seconds\":0.431106667,\"repetition\":1,\"rss_peak_bytes\":7595655168,\"seconds\":0.904944208,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":70.72259199431221}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554010568,\"heap_sys_bytes\":7582679040,\"major_faults\":223690,\"minor_faults\":731469,\"phase\":\"decoder_closed\",\"repetition\":1,\"rss_peak_bytes\":7595655168}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7556021784,\"heap_sys_bytes\":7582679040,\"major_faults\":223697,\"minor_faults\":739747,\"phase\":\"decode\",\"prefill_seconds\":0.45687525,\"repetition\":2,\"rss_peak_bytes\":7595655168,\"seconds\":0.869389375,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":73.61488631029106}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554032272,\"heap_sys_bytes\":7582679040,\"major_faults\":223697,\"minor_faults\":739747,\"phase\":\"decoder_closed\",\"repetition\":2,\"rss_peak_bytes\":7595655168}\n--- PASS: TestRealMacDecode (12.85s)\nPASS\n"
+    },
+    {
+      "model": "Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+      "mode": "voxtral_borrow",
+      "started": 1793350764.3822348,
+      "elapsed_s": 7.199464321136475,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 827392,
+          "Pages active": 196854,
+          "Pages inactive": 252648,
+          "Pages speculative": 14116,
+          "Pages throttled": 0,
+          "Pages wired down": 284561,
+          "Pages purgeable": 7504,
+          "\"Translation faults\"": 701687861,
+          "Pages copy-on-write": 48537387,
+          "Pages zero filled": 530076826,
+          "Pages reactivated": 26358184,
+          "Pages purged": 8577030,
+          "File-backed pages": 325334,
+          "Anonymous pages": 138284,
+          "Pages stored in compressor": 1031130,
+          "Pages occupied by compressor": 464901,
+          "Decompressions": 18440586,
+          "Compressions": 31234376,
+          "Pageins": 29391603,
+          "Pageouts": 193167,
+          "Swapins": 105469,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 745514,
+          "Pages active": 249177,
+          "Pages inactive": 298594,
+          "Pages speculative": 19747,
+          "Pages throttled": 0,
+          "Pages wired down": 284989,
+          "Pages purgeable": 4875,
+          "\"Translation faults\"": 702162995,
+          "Pages copy-on-write": 48712525,
+          "Pages zero filled": 530720610,
+          "Pages reactivated": 26358193,
+          "Pages purged": 8577030,
+          "File-backed pages": 376534,
+          "Anonymous pages": 190984,
+          "Pages stored in compressor": 980060,
+          "Pages occupied by compressor": 442445,
+          "Decompressions": 18488227,
+          "Compressions": 31234376,
+          "Pageins": 29435381,
+          "Pageouts": 193167,
+          "Swapins": 112666,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11449.50M  free = 838.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791408,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 859,
+          "minor_faults": 928,
+          "phase": "before_load",
+          "rss_peak_bytes": 18530304
+        },
+        {
+          "heap_alloc_bytes": 3923793096,
+          "heap_sys_bytes": 3950510080,
+          "major_faults": 875,
+          "minor_faults": 291707,
+          "phase": "loaded",
+          "rss_peak_bytes": 4782686208,
+          "seconds": 1.388270167
+        },
+        {
+          "heap_alloc_bytes": 3925815208,
+          "heap_sys_bytes": 3950411776,
+          "major_faults": 32150,
+          "minor_faults": 277857,
+          "phase": "decode",
+          "prefill_seconds": 0.872110959,
+          "repetition": 0,
+          "rss_peak_bytes": 5061165056,
+          "seconds": 0.941001917,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 68.01261383615225
+        },
+        {
+          "heap_alloc_bytes": 3923303304,
+          "heap_sys_bytes": 3950411776,
+          "major_faults": 32150,
+          "minor_faults": 277861,
+          "phase": "decoder_closed",
+          "repetition": 0,
+          "rss_peak_bytes": 5061165056
+        },
+        {
+          "heap_alloc_bytes": 3925231440,
+          "heap_sys_bytes": 3950411776,
+          "major_faults": 32150,
+          "minor_faults": 286232,
+          "phase": "decode",
+          "prefill_seconds": 0.460282583,
+          "repetition": 1,
+          "rss_peak_bytes": 5122080768,
+          "seconds": 0.925204042,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 69.17393039231881
+        },
+        {
+          "heap_alloc_bytes": 3923325592,
+          "heap_sys_bytes": 3950411776,
+          "major_faults": 32150,
+          "minor_faults": 286234,
+          "phase": "decoder_closed",
+          "repetition": 1,
+          "rss_peak_bytes": 5122080768
+        },
+        {
+          "heap_alloc_bytes": 3925211520,
+          "heap_sys_bytes": 3950411776,
+          "major_faults": 32150,
+          "minor_faults": 294508,
+          "phase": "decode",
+          "prefill_seconds": 0.447682667,
+          "repetition": 2,
+          "rss_peak_bytes": 5186748416,
+          "seconds": 0.951198208,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 67.28355821292716
+        },
+        {
+          "heap_alloc_bytes": 3923304608,
+          "heap_sys_bytes": 3950411776,
+          "major_faults": 32150,
+          "minor_faults": 294509,
+          "phase": "decoder_closed",
+          "repetition": 2,
+          "rss_peak_bytes": 5186748416
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350764.38719,
+          "rss_bytes": 131072,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29391650,
+            "Pageouts": 193167,
+            "Swapins": 105473,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350764.8976262,
+          "rss_bytes": 17416192,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29395048,
+            "Pageouts": 193167,
+            "Swapins": 105549,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11545.50M  free = 742.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350765.4101472,
+          "rss_bytes": 1552187392,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29396151,
+            "Pageouts": 193167,
+            "Swapins": 105881,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11537.50M  free = 750.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350765.923954,
+          "rss_bytes": 3342909440,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29396157,
+            "Pageouts": 193167,
+            "Swapins": 105901,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11537.50M  free = 750.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350766.435831,
+          "rss_bytes": 5061050368,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29397884,
+            "Pageouts": 193167,
+            "Swapins": 105941,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11537.50M  free = 750.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350766.946162,
+          "rss_bytes": 5059657728,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29427678,
+            "Pageouts": 193167,
+            "Swapins": 105969,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11537.50M  free = 750.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350767.4558442,
+          "rss_bytes": 5059772416,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29427705,
+            "Pageouts": 193167,
+            "Swapins": 105985,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11537.50M  free = 750.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350767.971435,
+          "rss_bytes": 5059870720,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29427723,
+            "Pageouts": 193167,
+            "Swapins": 106001,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11537.50M  free = 750.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350768.483822,
+          "rss_bytes": 5061476352,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29430719,
+            "Pageouts": 193167,
+            "Swapins": 106580,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11529.50M  free = 758.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350768.998239,
+          "rss_bytes": 5061525504,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29435161,
+            "Pageouts": 193167,
+            "Swapins": 112230,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11457.50M  free = 830.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350769.510835,
+          "rss_bytes": 5061541888,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29435187,
+            "Pageouts": 193167,
+            "Swapins": 112258,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11457.50M  free = 830.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350770.024493,
+          "rss_bytes": 5061558272,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29435217,
+            "Pageouts": 193167,
+            "Swapins": 112262,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11457.50M  free = 830.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350770.5415869,
+          "rss_bytes": 5061574656,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29435271,
+            "Pageouts": 193167,
+            "Swapins": 112274,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11457.50M  free = 830.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350771.058932,
+          "rss_bytes": 5061574656,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29435291,
+            "Pageouts": 193167,
+            "Swapins": 112294,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11457.50M  free = 830.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 5186748416,
+      "major_faults": 32150,
+      "minor_faults": 294511,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791408,\"heap_sys_bytes\":3833856,\"major_faults\":859,\"minor_faults\":928,\"phase\":\"before_load\",\"rss_peak_bytes\":18530304}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923793096,\"heap_sys_bytes\":3950510080,\"major_faults\":875,\"minor_faults\":291707,\"phase\":\"loaded\",\"rss_peak_bytes\":4782686208,\"seconds\":1.388270167}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925815208,\"heap_sys_bytes\":3950411776,\"major_faults\":32150,\"minor_faults\":277857,\"phase\":\"decode\",\"prefill_seconds\":0.872110959,\"repetition\":0,\"rss_peak_bytes\":5061165056,\"seconds\":0.941001917,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":68.01261383615225}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923303304,\"heap_sys_bytes\":3950411776,\"major_faults\":32150,\"minor_faults\":277861,\"phase\":\"decoder_closed\",\"repetition\":0,\"rss_peak_bytes\":5061165056}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925231440,\"heap_sys_bytes\":3950411776,\"major_faults\":32150,\"minor_faults\":286232,\"phase\":\"decode\",\"prefill_seconds\":0.460282583,\"repetition\":1,\"rss_peak_bytes\":5122080768,\"seconds\":0.925204042,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":69.17393039231881}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923325592,\"heap_sys_bytes\":3950411776,\"major_faults\":32150,\"minor_faults\":286234,\"phase\":\"decoder_closed\",\"repetition\":1,\"rss_peak_bytes\":5122080768}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925211520,\"heap_sys_bytes\":3950411776,\"major_faults\":32150,\"minor_faults\":294508,\"phase\":\"decode\",\"prefill_seconds\":0.447682667,\"repetition\":2,\"rss_peak_bytes\":5186748416,\"seconds\":0.951198208,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":67.28355821292716}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923304608,\"heap_sys_bytes\":3950411776,\"major_faults\":32150,\"minor_faults\":294509,\"phase\":\"decoder_closed\",\"repetition\":2,\"rss_peak_bytes\":5186748416}\n--- PASS: TestRealMacDecode (6.24s)\nPASS\n"
+    },
+    {
+      "model": "Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+      "mode": "voxtral_borrow_r1",
+      "started": 1793350837.396023,
+      "elapsed_s": 6.699463844299316,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 603820,
+          "Pages active": 371484,
+          "Pages inactive": 341231,
+          "Pages speculative": 30091,
+          "Pages throttled": 0,
+          "Pages wired down": 278634,
+          "Pages purgeable": 13845,
+          "\"Translation faults\"": 702681744,
+          "Pages copy-on-write": 48756152,
+          "Pages zero filled": 531205692,
+          "Pages reactivated": 26358311,
+          "Pages purged": 8577725,
+          "File-backed pages": 430707,
+          "Anonymous pages": 312099,
+          "Pages stored in compressor": 908279,
+          "Pages occupied by compressor": 415232,
+          "Decompressions": 18594171,
+          "Compressions": 31234376,
+          "Pageins": 29454873,
+          "Pageouts": 193167,
+          "Swapins": 119171,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 606097,
+          "Pages active": 357102,
+          "Pages inactive": 351347,
+          "Pages speculative": 30593,
+          "Pages throttled": 0,
+          "Pages wired down": 281759,
+          "Pages purgeable": 14308,
+          "\"Translation faults\"": 703066836,
+          "Pages copy-on-write": 48929445,
+          "Pages zero filled": 531886044,
+          "Pages reactivated": 26358311,
+          "Pages purged": 8577742,
+          "File-backed pages": 435764,
+          "Anonymous pages": 303278,
+          "Pages stored in compressor": 903293,
+          "Pages occupied by compressor": 413594,
+          "Decompressions": 18599309,
+          "Compressions": 31234376,
+          "Pageins": 29456204,
+          "Pageouts": 193167,
+          "Swapins": 119283,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791408,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 58,
+          "minor_faults": 1346,
+          "phase": "before_load",
+          "rss_peak_bytes": 18399232
+        },
+        {
+          "heap_alloc_bytes": 3923409496,
+          "heap_sys_bytes": 3954704384,
+          "major_faults": 64,
+          "minor_faults": 292148,
+          "phase": "loaded",
+          "rss_peak_bytes": 4782964736,
+          "seconds": 1.4206305000000001
+        },
+        {
+          "heap_alloc_bytes": 3925431560,
+          "heap_sys_bytes": 3954606080,
+          "major_faults": 65,
+          "minor_faults": 309591,
+          "phase": "decode",
+          "prefill_seconds": 0.706928541,
+          "repetition": 0,
+          "rss_peak_bytes": 5061672960,
+          "seconds": 1.008422041,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 63.46549103243966
+        },
+        {
+          "heap_alloc_bytes": 3923304192,
+          "heap_sys_bytes": 3954606080,
+          "major_faults": 65,
+          "minor_faults": 309597,
+          "phase": "decoder_closed",
+          "repetition": 0,
+          "rss_peak_bytes": 5061672960
+        },
+        {
+          "heap_alloc_bytes": 3925189944,
+          "heap_sys_bytes": 3954606080,
+          "major_faults": 65,
+          "minor_faults": 317965,
+          "phase": "decode",
+          "prefill_seconds": 0.472458458,
+          "repetition": 1,
+          "rss_peak_bytes": 5155782656,
+          "seconds": 0.981053083,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 65.2360214844766
+        },
+        {
+          "heap_alloc_bytes": 3923304192,
+          "heap_sys_bytes": 3954606080,
+          "major_faults": 65,
+          "minor_faults": 317965,
+          "phase": "decoder_closed",
+          "repetition": 1,
+          "rss_peak_bytes": 5155782656
+        },
+        {
+          "heap_alloc_bytes": 3925295600,
+          "heap_sys_bytes": 3954606080,
+          "major_faults": 65,
+          "minor_faults": 326241,
+          "phase": "decode",
+          "prefill_seconds": 0.472196125,
+          "repetition": 2,
+          "rss_peak_bytes": 5187256320,
+          "seconds": 0.974457375,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 65.67757773909814
+        },
+        {
+          "heap_alloc_bytes": 3923283320,
+          "heap_sys_bytes": 3954606080,
+          "major_faults": 65,
+          "minor_faults": 326242,
+          "phase": "decoder_closed",
+          "repetition": 2,
+          "rss_peak_bytes": 5187256320
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350837.407661,
+          "rss_bytes": 4030464,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29454934,
+            "Pageouts": 193167,
+            "Swapins": 119175,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350837.923321,
+          "rss_bytes": 1337180160,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29454942,
+            "Pageouts": 193167,
+            "Swapins": 119179,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350838.4371352,
+          "rss_bytes": 3153608704,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455129,
+            "Pageouts": 193167,
+            "Swapins": 119207,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350838.946917,
+          "rss_bytes": 5061672960,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455142,
+            "Pageouts": 193167,
+            "Swapins": 119215,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350839.458017,
+          "rss_bytes": 5060231168,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455184,
+            "Pageouts": 193167,
+            "Swapins": 119223,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350839.973393,
+          "rss_bytes": 5060313088,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455733,
+            "Pageouts": 193167,
+            "Swapins": 119227,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350840.48669,
+          "rss_bytes": 5060411392,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455736,
+            "Pageouts": 193167,
+            "Swapins": 119231,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350841.0028312,
+          "rss_bytes": 5062017024,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455739,
+            "Pageouts": 193167,
+            "Swapins": 119235,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350841.5145972,
+          "rss_bytes": 5062049792,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455781,
+            "Pageouts": 193167,
+            "Swapins": 119239,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350842.026664,
+          "rss_bytes": 5062049792,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455873,
+            "Pageouts": 193167,
+            "Swapins": 119243,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350842.5407739,
+          "rss_bytes": 5062049792,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29455898,
+            "Pageouts": 193167,
+            "Swapins": 119247,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350843.056285,
+          "rss_bytes": 5062082560,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456096,
+            "Pageouts": 193167,
+            "Swapins": 119279,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350843.572633,
+          "rss_bytes": 5062082560,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456157,
+            "Pageouts": 193167,
+            "Swapins": 119279,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 5187256320,
+      "major_faults": 65,
+      "minor_faults": 326244,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791408,\"heap_sys_bytes\":3833856,\"major_faults\":58,\"minor_faults\":1346,\"phase\":\"before_load\",\"rss_peak_bytes\":18399232}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923409496,\"heap_sys_bytes\":3954704384,\"major_faults\":64,\"minor_faults\":292148,\"phase\":\"loaded\",\"rss_peak_bytes\":4782964736,\"seconds\":1.4206305000000001}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925431560,\"heap_sys_bytes\":3954606080,\"major_faults\":65,\"minor_faults\":309591,\"phase\":\"decode\",\"prefill_seconds\":0.706928541,\"repetition\":0,\"rss_peak_bytes\":5061672960,\"seconds\":1.008422041,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":63.46549103243966}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923304192,\"heap_sys_bytes\":3954606080,\"major_faults\":65,\"minor_faults\":309597,\"phase\":\"decoder_closed\",\"repetition\":0,\"rss_peak_bytes\":5061672960}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925189944,\"heap_sys_bytes\":3954606080,\"major_faults\":65,\"minor_faults\":317965,\"phase\":\"decode\",\"prefill_seconds\":0.472458458,\"repetition\":1,\"rss_peak_bytes\":5155782656,\"seconds\":0.981053083,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":65.2360214844766}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923304192,\"heap_sys_bytes\":3954606080,\"major_faults\":65,\"minor_faults\":317965,\"phase\":\"decoder_closed\",\"repetition\":1,\"rss_peak_bytes\":5155782656}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925295600,\"heap_sys_bytes\":3954606080,\"major_faults\":65,\"minor_faults\":326241,\"phase\":\"decode\",\"prefill_seconds\":0.472196125,\"repetition\":2,\"rss_peak_bytes\":5187256320,\"seconds\":0.974457375,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":65.67757773909814}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923283320,\"heap_sys_bytes\":3954606080,\"major_faults\":65,\"minor_faults\":326242,\"phase\":\"decoder_closed\",\"repetition\":2,\"rss_peak_bytes\":5187256320}\n--- PASS: TestRealMacDecode (6.23s)\nPASS\n"
+    },
+    {
+      "model": "Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+      "mode": "voxtral_copy_r1",
+      "started": 1793350844.104479,
+      "elapsed_s": 9.022814989089966,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 606085,
+          "Pages active": 357112,
+          "Pages inactive": 351349,
+          "Pages speculative": 30593,
+          "Pages throttled": 0,
+          "Pages wired down": 281759,
+          "Pages purgeable": 14308,
+          "\"Translation faults\"": 703067817,
+          "Pages copy-on-write": 48929705,
+          "Pages zero filled": 531886181,
+          "Pages reactivated": 26358311,
+          "Pages purged": 8577742,
+          "File-backed pages": 435766,
+          "Anonymous pages": 303288,
+          "Pages stored in compressor": 903293,
+          "Pages occupied by compressor": 413594,
+          "Decompressions": 18599309,
+          "Compressions": 31234376,
+          "Pageins": 29456206,
+          "Pageouts": 193167,
+          "Swapins": 119283,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 771157,
+          "Pages active": 267514,
+          "Pages inactive": 286994,
+          "Pages speculative": 11586,
+          "Pages throttled": 0,
+          "Pages wired down": 298895,
+          "Pages purgeable": 82,
+          "\"Translation faults\"": 704088336,
+          "Pages copy-on-write": 48944584,
+          "Pages zero filled": 533061327,
+          "Pages reactivated": 26459563,
+          "Pages purged": 8595291,
+          "File-backed pages": 286581,
+          "Anonymous pages": 279513,
+          "Pages stored in compressor": 900389,
+          "Pages occupied by compressor": 404342,
+          "Decompressions": 18772877,
+          "Compressions": 31793131,
+          "Pageins": 29472678,
+          "Pageouts": 193171,
+          "Swapins": 119611,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791408,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 58,
+          "minor_faults": 1349,
+          "phase": "before_load",
+          "rss_peak_bytes": 18432000
+        },
+        {
+          "heap_alloc_bytes": 7555168072,
+          "heap_sys_bytes": 7582744576,
+          "major_faults": 59,
+          "minor_faults": 873133,
+          "phase": "loaded",
+          "rss_peak_bytes": 14301609984,
+          "seconds": 2.272915541
+        },
+        {
+          "heap_alloc_bytes": 7557169040,
+          "heap_sys_bytes": 7582646272,
+          "major_faults": 61,
+          "minor_faults": 881950,
+          "phase": "decode",
+          "prefill_seconds": 1.911284,
+          "repetition": 0,
+          "rss_peak_bytes": 14440939520,
+          "seconds": 1.143242208,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 55.98113816315641
+        },
+        {
+          "heap_alloc_bytes": 7554016160,
+          "heap_sys_bytes": 7582646272,
+          "major_faults": 61,
+          "minor_faults": 883370,
+          "phase": "decoder_closed",
+          "repetition": 0,
+          "rss_peak_bytes": 14440939520
+        },
+        {
+          "heap_alloc_bytes": 7556048472,
+          "heap_sys_bytes": 7582646272,
+          "major_faults": 61,
+          "minor_faults": 898144,
+          "phase": "decode",
+          "prefill_seconds": 0.417964625,
+          "repetition": 1,
+          "rss_peak_bytes": 14440939520,
+          "seconds": 0.852276,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 75.09304497604062
+        },
+        {
+          "heap_alloc_bytes": 7554080056,
+          "heap_sys_bytes": 7582646272,
+          "major_faults": 61,
+          "minor_faults": 898144,
+          "phase": "decoder_closed",
+          "repetition": 1,
+          "rss_peak_bytes": 14440939520
+        },
+        {
+          "heap_alloc_bytes": 7555965984,
+          "heap_sys_bytes": 7582646272,
+          "major_faults": 62,
+          "minor_faults": 906420,
+          "phase": "decode",
+          "prefill_seconds": 0.40710975,
+          "repetition": 2,
+          "rss_peak_bytes": 14440939520,
+          "seconds": 1.192598834,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 53.664315422263776
+        },
+        {
+          "heap_alloc_bytes": 7554037480,
+          "heap_sys_bytes": 7582646272,
+          "major_faults": 62,
+          "minor_faults": 906420,
+          "phase": "decoder_closed",
+          "repetition": 2,
+          "rss_peak_bytes": 14440939520
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350844.111521,
+          "rss_bytes": 3637248,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456268,
+            "Pageouts": 193167,
+            "Swapins": 119283,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350844.627605,
+          "rss_bytes": 4746969088,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456302,
+            "Pageouts": 193167,
+            "Swapins": 119283,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350845.138211,
+          "rss_bytes": 10436247552,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456339,
+            "Pageouts": 193167,
+            "Swapins": 119287,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350845.648509,
+          "rss_bytes": 11950014464,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456415,
+            "Pageouts": 193167,
+            "Swapins": 119291,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350846.163884,
+          "rss_bytes": 13497597952,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456447,
+            "Pageouts": 193167,
+            "Swapins": 119299,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350846.930529,
+          "rss_bytes": 9689677824,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29456623,
+            "Pageouts": 193171,
+            "Swapins": 119307,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350847.47559,
+          "rss_bytes": 4643831808,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29457935,
+            "Pageouts": 193171,
+            "Swapins": 119315,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350847.9882529,
+          "rss_bytes": 4338958336,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29458769,
+            "Pageouts": 193171,
+            "Swapins": 119315,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350848.500024,
+          "rss_bytes": 4290527232,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29459857,
+            "Pageouts": 193171,
+            "Swapins": 119323,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11353.50M  free = 934.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350849.014294,
+          "rss_bytes": 3922673664,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29459937,
+            "Pageouts": 193171,
+            "Swapins": 119327,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11345.50M  free = 942.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350849.530414,
+          "rss_bytes": 3922788352,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29460575,
+            "Pageouts": 193171,
+            "Swapins": 119427,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11345.50M  free = 942.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350850.045988,
+          "rss_bytes": 4175773696,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29460890,
+            "Pageouts": 193171,
+            "Swapins": 119475,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11345.50M  free = 942.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350850.556662,
+          "rss_bytes": 4175806464,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29461215,
+            "Pageouts": 193171,
+            "Swapins": 119487,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11345.50M  free = 942.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350851.066186,
+          "rss_bytes": 4175806464,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29463981,
+            "Pageouts": 193171,
+            "Swapins": 119491,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11345.50M  free = 942.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350851.5772932,
+          "rss_bytes": 4175790080,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29468096,
+            "Pageouts": 193171,
+            "Swapins": 119503,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11345.50M  free = 942.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350852.094595,
+          "rss_bytes": 3962028032,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29469151,
+            "Pageouts": 193171,
+            "Swapins": 119563,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350852.6069472,
+          "rss_bytes": 0,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29471014,
+            "Pageouts": 193171,
+            "Swapins": 119571,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 14440939520,
+      "major_faults": 62,
+      "minor_faults": 906448,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791408,\"heap_sys_bytes\":3833856,\"major_faults\":58,\"minor_faults\":1349,\"phase\":\"before_load\",\"rss_peak_bytes\":18432000}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7555168072,\"heap_sys_bytes\":7582744576,\"major_faults\":59,\"minor_faults\":873133,\"phase\":\"loaded\",\"rss_peak_bytes\":14301609984,\"seconds\":2.272915541}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7557169040,\"heap_sys_bytes\":7582646272,\"major_faults\":61,\"minor_faults\":881950,\"phase\":\"decode\",\"prefill_seconds\":1.911284,\"repetition\":0,\"rss_peak_bytes\":14440939520,\"seconds\":1.143242208,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":55.98113816315641}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554016160,\"heap_sys_bytes\":7582646272,\"major_faults\":61,\"minor_faults\":883370,\"phase\":\"decoder_closed\",\"repetition\":0,\"rss_peak_bytes\":14440939520}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7556048472,\"heap_sys_bytes\":7582646272,\"major_faults\":61,\"minor_faults\":898144,\"phase\":\"decode\",\"prefill_seconds\":0.417964625,\"repetition\":1,\"rss_peak_bytes\":14440939520,\"seconds\":0.852276,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":75.09304497604062}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554080056,\"heap_sys_bytes\":7582646272,\"major_faults\":61,\"minor_faults\":898144,\"phase\":\"decoder_closed\",\"repetition\":1,\"rss_peak_bytes\":14440939520}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7555965984,\"heap_sys_bytes\":7582646272,\"major_faults\":62,\"minor_faults\":906420,\"phase\":\"decode\",\"prefill_seconds\":0.40710975,\"repetition\":2,\"rss_peak_bytes\":14440939520,\"seconds\":1.192598834,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":53.664315422263776}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554037480,\"heap_sys_bytes\":7582646272,\"major_faults\":62,\"minor_faults\":906420,\"phase\":\"decoder_closed\",\"repetition\":2,\"rss_peak_bytes\":14440939520}\n--- PASS: TestRealMacDecode (8.43s)\nPASS\n"
+    },
+    {
+      "model": "Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+      "mode": "voxtral_copy_r2",
+      "started": 1793350853.1328828,
+      "elapsed_s": 11.350873231887817,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 771006,
+          "Pages active": 267533,
+          "Pages inactive": 286995,
+          "Pages speculative": 11713,
+          "Pages throttled": 0,
+          "Pages wired down": 298897,
+          "Pages purgeable": 82,
+          "\"Translation faults\"": 704089366,
+          "Pages copy-on-write": 48944847,
+          "Pages zero filled": 533061474,
+          "Pages reactivated": 26459563,
+          "Pages purged": 8595291,
+          "File-backed pages": 286734,
+          "Anonymous pages": 279507,
+          "Pages stored in compressor": 900387,
+          "Pages occupied by compressor": 404341,
+          "Decompressions": 18772880,
+          "Compressions": 31793131,
+          "Pageins": 29472772,
+          "Pageouts": 193171,
+          "Swapins": 119611,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 783695,
+          "Pages active": 262895,
+          "Pages inactive": 264219,
+          "Pages speculative": 4464,
+          "Pages throttled": 0,
+          "Pages wired down": 288339,
+          "Pages purgeable": 12304,
+          "\"Translation faults\"": 705174350,
+          "Pages copy-on-write": 48968145,
+          "Pages zero filled": 534126213,
+          "Pages reactivated": 26520234,
+          "Pages purged": 8597856,
+          "File-backed pages": 307077,
+          "Anonymous pages": 224501,
+          "Pages stored in compressor": 968868,
+          "Pages occupied by compressor": 436880,
+          "Decompressions": 18893839,
+          "Compressions": 32253073,
+          "Pageins": 29613362,
+          "Pageouts": 193174,
+          "Swapins": 120648,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791728,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 145,
+          "minor_faults": 1266,
+          "phase": "before_load",
+          "rss_peak_bytes": 18464768
+        },
+        {
+          "heap_alloc_bytes": 7555157296,
+          "heap_sys_bytes": 7586971648,
+          "major_faults": 118793,
+          "minor_faults": 754530,
+          "phase": "loaded",
+          "rss_peak_bytes": 14301216768,
+          "seconds": 4.640243583
+        },
+        {
+          "heap_alloc_bytes": 7557179376,
+          "heap_sys_bytes": 7586873344,
+          "major_faults": 118795,
+          "minor_faults": 763304,
+          "phase": "decode",
+          "prefill_seconds": 1.283337833,
+          "repetition": 0,
+          "rss_peak_bytes": 14440366080,
+          "seconds": 1.025779959,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 62.39154843928862
+        },
+        {
+          "heap_alloc_bytes": 7554031888,
+          "heap_sys_bytes": 7586873344,
+          "major_faults": 118795,
+          "minor_faults": 763463,
+          "phase": "decoder_closed",
+          "repetition": 0,
+          "rss_peak_bytes": 14440366080
+        },
+        {
+          "heap_alloc_bytes": 7555960008,
+          "heap_sys_bytes": 7586873344,
+          "major_faults": 118795,
+          "minor_faults": 771755,
+          "phase": "decode",
+          "prefill_seconds": 0.544721417,
+          "repetition": 1,
+          "rss_peak_bytes": 14440366080,
+          "seconds": 1.273760791,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 50.24491290060443
+        },
+        {
+          "heap_alloc_bytes": 7554010904,
+          "heap_sys_bytes": 7586873344,
+          "major_faults": 118795,
+          "minor_faults": 771760,
+          "phase": "decoder_closed",
+          "repetition": 1,
+          "rss_peak_bytes": 14440366080
+        },
+        {
+          "heap_alloc_bytes": 7555895432,
+          "heap_sys_bytes": 7586873344,
+          "major_faults": 118795,
+          "minor_faults": 780035,
+          "phase": "decode",
+          "prefill_seconds": 0.61429,
+          "repetition": 2,
+          "rss_peak_bytes": 14440366080,
+          "seconds": 1.283968084,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 49.84547575405308
+        },
+        {
+          "heap_alloc_bytes": 7554011400,
+          "heap_sys_bytes": 7586873344,
+          "major_faults": 118795,
+          "minor_faults": 780035,
+          "phase": "decoder_closed",
+          "repetition": 2,
+          "rss_peak_bytes": 14440366080
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350853.137866,
+          "rss_bytes": 1835008,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29472958,
+            "Pageouts": 193171,
+            "Swapins": 119611,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350853.6479712,
+          "rss_bytes": 696893440,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29494046,
+            "Pageouts": 193171,
+            "Swapins": 119703,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350854.1626508,
+          "rss_bytes": 1490763776,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29518083,
+            "Pageouts": 193171,
+            "Swapins": 119943,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350854.6759748,
+          "rss_bytes": 2329018368,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29541030,
+            "Pageouts": 193171,
+            "Swapins": 119960,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350855.1894798,
+          "rss_bytes": 3453534208,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29561745,
+            "Pageouts": 193171,
+            "Swapins": 119960,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350855.703211,
+          "rss_bytes": 5973049344,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29577962,
+            "Pageouts": 193171,
+            "Swapins": 119980,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350856.216442,
+          "rss_bytes": 9668493312,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29588319,
+            "Pageouts": 193171,
+            "Swapins": 120000,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350856.727977,
+          "rss_bytes": 10842849280,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29605028,
+            "Pageouts": 193171,
+            "Swapins": 120052,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350857.241801,
+          "rss_bytes": 12465831936,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29605418,
+            "Pageouts": 193171,
+            "Swapins": 120124,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11337.50M  free = 950.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350857.7582011,
+          "rss_bytes": 14081867776,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29605863,
+            "Pageouts": 193172,
+            "Swapins": 120544,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350858.2844958,
+          "rss_bytes": 10947117056,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29605889,
+            "Pageouts": 193172,
+            "Swapins": 120548,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350858.815423,
+          "rss_bytes": 8384495616,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29606182,
+            "Pageouts": 193172,
+            "Swapins": 120560,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350859.326711,
+          "rss_bytes": 8384610304,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29606226,
+            "Pageouts": 193172,
+            "Swapins": 120560,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350859.843209,
+          "rss_bytes": 8362606592,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29606464,
+            "Pageouts": 193172,
+            "Swapins": 120584,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350860.3592808,
+          "rss_bytes": 8331804672,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29606751,
+            "Pageouts": 193172,
+            "Swapins": 120588,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350860.8748622,
+          "rss_bytes": 8150188032,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29606840,
+            "Pageouts": 193172,
+            "Swapins": 120588,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350861.390678,
+          "rss_bytes": 8018542592,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29607293,
+            "Pageouts": 193174,
+            "Swapins": 120588,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350861.904449,
+          "rss_bytes": 8014462976,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29607932,
+            "Pageouts": 193174,
+            "Swapins": 120588,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350862.416034,
+          "rss_bytes": 7624130560,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29608536,
+            "Pageouts": 193174,
+            "Swapins": 120624,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350862.930946,
+          "rss_bytes": 7552761856,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29609622,
+            "Pageouts": 193174,
+            "Swapins": 120636,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350863.449911,
+          "rss_bytes": 7391756288,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29611325,
+            "Pageouts": 193174,
+            "Swapins": 120640,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350863.967505,
+          "rss_bytes": 7043022848,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29613269,
+            "Pageouts": 193174,
+            "Swapins": 120648,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 14440366080,
+      "major_faults": 118795,
+      "minor_faults": 780037,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791728,\"heap_sys_bytes\":3833856,\"major_faults\":145,\"minor_faults\":1266,\"phase\":\"before_load\",\"rss_peak_bytes\":18464768}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7555157296,\"heap_sys_bytes\":7586971648,\"major_faults\":118793,\"minor_faults\":754530,\"phase\":\"loaded\",\"rss_peak_bytes\":14301216768,\"seconds\":4.640243583}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7557179376,\"heap_sys_bytes\":7586873344,\"major_faults\":118795,\"minor_faults\":763304,\"phase\":\"decode\",\"prefill_seconds\":1.283337833,\"repetition\":0,\"rss_peak_bytes\":14440366080,\"seconds\":1.025779959,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":62.39154843928862}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554031888,\"heap_sys_bytes\":7586873344,\"major_faults\":118795,\"minor_faults\":763463,\"phase\":\"decoder_closed\",\"repetition\":0,\"rss_peak_bytes\":14440366080}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7555960008,\"heap_sys_bytes\":7586873344,\"major_faults\":118795,\"minor_faults\":771755,\"phase\":\"decode\",\"prefill_seconds\":0.544721417,\"repetition\":1,\"rss_peak_bytes\":14440366080,\"seconds\":1.273760791,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":50.24491290060443}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554010904,\"heap_sys_bytes\":7586873344,\"major_faults\":118795,\"minor_faults\":771760,\"phase\":\"decoder_closed\",\"repetition\":1,\"rss_peak_bytes\":14440366080}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7555895432,\"heap_sys_bytes\":7586873344,\"major_faults\":118795,\"minor_faults\":780035,\"phase\":\"decode\",\"prefill_seconds\":0.61429,\"repetition\":2,\"rss_peak_bytes\":14440366080,\"seconds\":1.283968084,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":49.84547575405308}\nREAL_MAC_JSON {\"heap_alloc_bytes\":7554011400,\"heap_sys_bytes\":7586873344,\"major_faults\":118795,\"minor_faults\":780035,\"phase\":\"decoder_closed\",\"repetition\":2,\"rss_peak_bytes\":14440366080}\n--- PASS: TestRealMacDecode (10.85s)\nPASS\n"
+    },
+    {
+      "model": "Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf",
+      "mode": "voxtral_borrow_r2",
+      "started": 1793350864.49196,
+      "elapsed_s": 6.700078964233398,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 783683,
+          "Pages active": 262907,
+          "Pages inactive": 264219,
+          "Pages speculative": 4464,
+          "Pages throttled": 0,
+          "Pages wired down": 288339,
+          "Pages purgeable": 12304,
+          "\"Translation faults\"": 705175356,
+          "Pages copy-on-write": 48968405,
+          "Pages zero filled": 534126346,
+          "Pages reactivated": 26520234,
+          "Pages purged": 8597856,
+          "File-backed pages": 307079,
+          "Anonymous pages": 224511,
+          "Pages stored in compressor": 968862,
+          "Pages occupied by compressor": 436880,
+          "Decompressions": 18893851,
+          "Compressions": 32253073,
+          "Pageins": 29613364,
+          "Pageouts": 193174,
+          "Swapins": 120648,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 693418,
+          "Pages active": 279132,
+          "Pages inactive": 356106,
+          "Pages speculative": 5754,
+          "Pages throttled": 0,
+          "Pages wired down": 270986,
+          "Pages purgeable": 6908,
+          "\"Translation faults\"": 705554648,
+          "Pages copy-on-write": 49140068,
+          "Pages zero filled": 534780097,
+          "Pages reactivated": 26520235,
+          "Pages purged": 8598456,
+          "File-backed pages": 408048,
+          "Anonymous pages": 232944,
+          "Pages stored in compressor": 963131,
+          "Pages occupied by compressor": 435096,
+          "Decompressions": 18899841,
+          "Compressions": 32253073,
+          "Pageins": 29711510,
+          "Pageouts": 193174,
+          "Swapins": 120692,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791248,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 124,
+          "minor_faults": 1284,
+          "phase": "before_load",
+          "rss_peak_bytes": 18415616
+        },
+        {
+          "heap_alloc_bytes": 3923793016,
+          "heap_sys_bytes": 3954704384,
+          "major_faults": 124,
+          "minor_faults": 292096,
+          "phase": "loaded",
+          "rss_peak_bytes": 4783046656,
+          "seconds": 1.36938075
+        },
+        {
+          "heap_alloc_bytes": 3925836192,
+          "heap_sys_bytes": 3954573312,
+          "major_faults": 96658,
+          "minor_faults": 213089,
+          "phase": "decode",
+          "prefill_seconds": 1.205769709,
+          "repetition": 0,
+          "rss_peak_bytes": 5061738496,
+          "seconds": 0.896976459,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 71.35081345540641
+        },
+        {
+          "heap_alloc_bytes": 3923325496,
+          "heap_sys_bytes": 3954573312,
+          "major_faults": 96658,
+          "minor_faults": 213095,
+          "phase": "decoder_closed",
+          "repetition": 0,
+          "rss_peak_bytes": 5061738496
+        },
+        {
+          "heap_alloc_bytes": 3925211424,
+          "heap_sys_bytes": 3954573312,
+          "major_faults": 96658,
+          "minor_faults": 221463,
+          "phase": "decode",
+          "prefill_seconds": 0.41569025,
+          "repetition": 1,
+          "rss_peak_bytes": 5187158016,
+          "seconds": 0.855101167,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 74.84494521804342
+        },
+        {
+          "heap_alloc_bytes": 3923283432,
+          "heap_sys_bytes": 3954573312,
+          "major_faults": 96658,
+          "minor_faults": 221465,
+          "phase": "decoder_closed",
+          "repetition": 1,
+          "rss_peak_bytes": 5187158016
+        },
+        {
+          "heap_alloc_bytes": 3925190360,
+          "heap_sys_bytes": 3954573312,
+          "major_faults": 96658,
+          "minor_faults": 229741,
+          "phase": "decode",
+          "prefill_seconds": 0.41789925,
+          "repetition": 2,
+          "rss_peak_bytes": 5187158016,
+          "seconds": 0.861794125,
+          "token_digest": "5caa011dabcaec265ef9dda295d1072b",
+          "tokens": 64,
+          "tokens_per_second": 74.26367637398317
+        },
+        {
+          "heap_alloc_bytes": 3923303448,
+          "heap_sys_bytes": 3954573312,
+          "major_faults": 96658,
+          "minor_faults": 229741,
+          "phase": "decoder_closed",
+          "repetition": 2,
+          "rss_peak_bytes": 5187158016
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793350864.4981859,
+          "rss_bytes": 983040,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29613400,
+            "Pageouts": 193174,
+            "Swapins": 120648,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350865.0126238,
+          "rss_bytes": 1541734400,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29613738,
+            "Pageouts": 193174,
+            "Swapins": 120652,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350865.5265028,
+          "rss_bytes": 3365306368,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29613849,
+            "Pageouts": 193174,
+            "Swapins": 120656,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350866.037663,
+          "rss_bytes": 4997169152,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29618446,
+            "Pageouts": 193174,
+            "Swapins": 120664,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350866.550946,
+          "rss_bytes": 5060771840,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29674351,
+            "Pageouts": 193174,
+            "Swapins": 120664,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350867.066742,
+          "rss_bytes": 5060263936,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711209,
+            "Pageouts": 193174,
+            "Swapins": 120664,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350867.5827332,
+          "rss_bytes": 5060329472,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711257,
+            "Pageouts": 193174,
+            "Swapins": 120668,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350868.097057,
+          "rss_bytes": 5060444160,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711260,
+            "Pageouts": 193174,
+            "Swapins": 120668,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350868.611788,
+          "rss_bytes": 5062049792,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711264,
+            "Pageouts": 193174,
+            "Swapins": 120668,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350869.12498,
+          "rss_bytes": 5062066176,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711270,
+            "Pageouts": 193174,
+            "Swapins": 120676,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350869.6365519,
+          "rss_bytes": 5062098944,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711282,
+            "Pageouts": 193174,
+            "Swapins": 120680,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350870.145157,
+          "rss_bytes": 5062131712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711285,
+            "Pageouts": 193174,
+            "Swapins": 120680,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793350870.6637208,
+          "rss_bytes": 5062131712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 29711495,
+            "Pageouts": 193174,
+            "Swapins": 120692,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11329.50M  free = 958.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 5187158016,
+      "major_faults": 96658,
+      "minor_faults": 229743,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791248,\"heap_sys_bytes\":3833856,\"major_faults\":124,\"minor_faults\":1284,\"phase\":\"before_load\",\"rss_peak_bytes\":18415616}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923793016,\"heap_sys_bytes\":3954704384,\"major_faults\":124,\"minor_faults\":292096,\"phase\":\"loaded\",\"rss_peak_bytes\":4783046656,\"seconds\":1.36938075}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925836192,\"heap_sys_bytes\":3954573312,\"major_faults\":96658,\"minor_faults\":213089,\"phase\":\"decode\",\"prefill_seconds\":1.205769709,\"repetition\":0,\"rss_peak_bytes\":5061738496,\"seconds\":0.896976459,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":71.35081345540641}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923325496,\"heap_sys_bytes\":3954573312,\"major_faults\":96658,\"minor_faults\":213095,\"phase\":\"decoder_closed\",\"repetition\":0,\"rss_peak_bytes\":5061738496}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925211424,\"heap_sys_bytes\":3954573312,\"major_faults\":96658,\"minor_faults\":221463,\"phase\":\"decode\",\"prefill_seconds\":0.41569025,\"repetition\":1,\"rss_peak_bytes\":5187158016,\"seconds\":0.855101167,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":74.84494521804342}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923283432,\"heap_sys_bytes\":3954573312,\"major_faults\":96658,\"minor_faults\":221465,\"phase\":\"decoder_closed\",\"repetition\":1,\"rss_peak_bytes\":5187158016}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3925190360,\"heap_sys_bytes\":3954573312,\"major_faults\":96658,\"minor_faults\":229741,\"phase\":\"decode\",\"prefill_seconds\":0.41789925,\"repetition\":2,\"rss_peak_bytes\":5187158016,\"seconds\":0.861794125,\"token_digest\":\"5caa011dabcaec265ef9dda295d1072b\",\"tokens\":64,\"tokens_per_second\":74.26367637398317}\nREAL_MAC_JSON {\"heap_alloc_bytes\":3923303448,\"heap_sys_bytes\":3954573312,\"major_faults\":96658,\"minor_faults\":229741,\"phase\":\"decoder_closed\",\"repetition\":2,\"rss_peak_bytes\":5187158016}\n--- PASS: TestRealMacDecode (6.31s)\nPASS\n"
+    },
+    {
+      "model": "Ministral-3-3B-Instruct-2512-Q4_K_M.gguf",
+      "mode": "ministral3b_r1",
+      "started": 1793351155.832278,
+      "elapsed_s": 5.669003963470459,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 458861,
+          "Pages active": 449841,
+          "Pages inactive": 419980,
+          "Pages speculative": 37205,
+          "Pages throttled": 0,
+          "Pages wired down": 275338,
+          "Pages purgeable": 15058,
+          "\"Translation faults\"": 720290291,
+          "Pages copy-on-write": 49805423,
+          "Pages zero filled": 543870703,
+          "Pages reactivated": 26817727,
+          "Pages purged": 8666960,
+          "File-backed pages": 391812,
+          "Anonymous pages": 515214,
+          "Pages stored in compressor": 858218,
+          "Pages occupied by compressor": 399267,
+          "Decompressions": 19881564,
+          "Compressions": 33336188,
+          "Pageins": 30254604,
+          "Pageouts": 193610,
+          "Swapins": 132552,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11153.50M  free = 1134.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 342441,
+          "Pages active": 517866,
+          "Pages inactive": 476652,
+          "Pages speculative": 38521,
+          "Pages throttled": 0,
+          "Pages wired down": 265682,
+          "Pages purgeable": 15551,
+          "\"Translation faults\"": 720496174,
+          "Pages copy-on-write": 49946339,
+          "Pages zero filled": 543910775,
+          "Pages reactivated": 26817809,
+          "Pages purged": 8666964,
+          "File-backed pages": 529350,
+          "Anonymous pages": 503689,
+          "Pages stored in compressor": 858582,
+          "Pages occupied by compressor": 399330,
+          "Decompressions": 19883612,
+          "Compressions": 33336188,
+          "Pageins": 30389042,
+          "Pageouts": 193610,
+          "Swapins": 133164,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791600,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 317,
+          "minor_faults": 1103,
+          "phase": "before_load",
+          "rss_peak_bytes": 18513920
+        },
+        {
+          "heap_alloc_bytes": 56050344,
+          "heap_sys_bytes": 62259200,
+          "major_faults": 131420,
+          "minor_faults": 5636,
+          "phase": "loaded",
+          "rss_peak_bytes": 2221604864,
+          "seconds": 1.655250208
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86348336,
+          "heap_sys_bytes": 91619328,
+          "major_faults": 131446,
+          "minor_faults": 6659,
+          "phase": "decode",
+          "prefill_seconds": 0.173356792,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": false,
+            "reused_tokens": 0,
+            "prompt_tokens": 27
+          },
+          "repetition": 0,
+          "rss_peak_bytes": 2221604864,
+          "seconds": 0.886992,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 72.1539765860346
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86388448,
+          "heap_sys_bytes": 91619328,
+          "major_faults": 131460,
+          "minor_faults": 6657,
+          "phase": "decode",
+          "prefill_seconds": 2.959e-06,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 1,
+          "rss_peak_bytes": 2221604864,
+          "seconds": 0.901346542,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 71.00487661270687
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86400544,
+          "heap_sys_bytes": 91619328,
+          "major_faults": 131461,
+          "minor_faults": 6658,
+          "phase": "decode",
+          "prefill_seconds": 5.84e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 2,
+          "rss_peak_bytes": 2221604864,
+          "seconds": 0.885789542,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 72.25192550308977
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 86410632,
+          "heap_sys_bytes": 91619328,
+          "major_faults": 131461,
+          "minor_faults": 6658,
+          "phase": "decode",
+          "prefill_seconds": 3.75e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 3,
+          "rss_peak_bytes": 2221604864,
+          "seconds": 0.888782459,
+          "token_digest": "3b2a5b4fe2d2ab10a94bb9890c564b36",
+          "tokens": 64,
+          "tokens_per_second": 72.00862185332575
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793351155.837536,
+          "rss_bytes": 4063232,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30254674,
+            "Pageouts": 193610,
+            "Swapins": 132552,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11153.50M  free = 1134.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351156.345762,
+          "rss_bytes": 808878080,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30302588,
+            "Pageouts": 193610,
+            "Swapins": 132552,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11153.50M  free = 1134.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351156.859201,
+          "rss_bytes": 1729478656,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30359202,
+            "Pageouts": 193610,
+            "Swapins": 132586,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11153.50M  free = 1134.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351157.372535,
+          "rss_bytes": 1106345984,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30386709,
+            "Pageouts": 193610,
+            "Swapins": 132590,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11153.50M  free = 1134.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351157.8852942,
+          "rss_bytes": 105627648,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388307,
+            "Pageouts": 193610,
+            "Swapins": 133072,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11153.50M  free = 1134.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351158.4008708,
+          "rss_bytes": 106201088,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388595,
+            "Pageouts": 193610,
+            "Swapins": 133076,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351158.917323,
+          "rss_bytes": 106676224,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388801,
+            "Pageouts": 193610,
+            "Swapins": 133116,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351159.429353,
+          "rss_bytes": 106692608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388806,
+            "Pageouts": 193610,
+            "Swapins": 133116,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351159.9468422,
+          "rss_bytes": 106708992,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388810,
+            "Pageouts": 193610,
+            "Swapins": 133136,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351160.466251,
+          "rss_bytes": 106725376,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388976,
+            "Pageouts": 193610,
+            "Swapins": 133164,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351160.9831429,
+          "rss_bytes": 106725376,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30388979,
+            "Pageouts": 193610,
+            "Swapins": 133164,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 2221604864,
+      "major_faults": 131466,
+      "minor_faults": 6659,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791600,\"heap_sys_bytes\":3833856,\"major_faults\":317,\"minor_faults\":1103,\"phase\":\"before_load\",\"rss_peak_bytes\":18513920}\nREAL_MAC_JSON {\"heap_alloc_bytes\":56050344,\"heap_sys_bytes\":62259200,\"major_faults\":131420,\"minor_faults\":5636,\"phase\":\"loaded\",\"rss_peak_bytes\":2221604864,\"seconds\":1.655250208}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86348336,\"heap_sys_bytes\":91619328,\"major_faults\":131446,\"minor_faults\":6659,\"phase\":\"decode\",\"prefill_seconds\":0.173356792,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":false,\"reused_tokens\":0,\"prompt_tokens\":27},\"repetition\":0,\"rss_peak_bytes\":2221604864,\"seconds\":0.886992,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":72.1539765860346}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86388448,\"heap_sys_bytes\":91619328,\"major_faults\":131460,\"minor_faults\":6657,\"phase\":\"decode\",\"prefill_seconds\":0.000002959,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":1,\"rss_peak_bytes\":2221604864,\"seconds\":0.901346542,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":71.00487661270687}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86400544,\"heap_sys_bytes\":91619328,\"major_faults\":131461,\"minor_faults\":6658,\"phase\":\"decode\",\"prefill_seconds\":5.84e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":2,\"rss_peak_bytes\":2221604864,\"seconds\":0.885789542,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":72.25192550308977}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":86410632,\"heap_sys_bytes\":91619328,\"major_faults\":131461,\"minor_faults\":6658,\"phase\":\"decode\",\"prefill_seconds\":3.75e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":3,\"rss_peak_bytes\":2221604864,\"seconds\":0.888782459,\"token_digest\":\"3b2a5b4fe2d2ab10a94bb9890c564b36\",\"tokens\":64,\"tokens_per_second\":72.00862185332575}\n--- PASS: TestRealMacDecode (5.46s)\nPASS\n"
+    },
+    {
+      "model": "Ministral-3-14B-Reasoning-2512-Q4_K_M.gguf",
+      "mode": "ministral14b_r1",
+      "started": 1793351161.506677,
+      "elapsed_s": 22.166659116744995,
+      "returncode": 0,
+      "before": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 342391,
+          "Pages active": 517644,
+          "Pages inactive": 476924,
+          "Pages speculative": 38521,
+          "Pages throttled": 0,
+          "Pages wired down": 265682,
+          "Pages purgeable": 15551,
+          "\"Translation faults\"": 720497256,
+          "Pages copy-on-write": 49946607,
+          "Pages zero filled": 543910980,
+          "Pages reactivated": 26817809,
+          "Pages purged": 8666964,
+          "File-backed pages": 529352,
+          "Anonymous pages": 503737,
+          "Pages stored in compressor": 858582,
+          "Pages occupied by compressor": 399330,
+          "Decompressions": 19883612,
+          "Compressions": 33336188,
+          "Pageins": 30389044,
+          "Pageouts": 193610,
+          "Swapins": 133164,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+      },
+      "after": {
+        "page_size": 16384,
+        "counters": {
+          "Pages free": 503172,
+          "Pages active": 384479,
+          "Pages inactive": 381747,
+          "Pages speculative": 5300,
+          "Pages throttled": 0,
+          "Pages wired down": 275930,
+          "Pages purgeable": 4464,
+          "\"Translation faults\"": 721328351,
+          "Pages copy-on-write": 50459481,
+          "Pages zero filled": 544073639,
+          "Pages reactivated": 27110732,
+          "Pages purged": 8684505,
+          "File-backed pages": 554126,
+          "Anonymous pages": 217400,
+          "Pages stored in compressor": 1081830,
+          "Pages occupied by compressor": 489864,
+          "Decompressions": 20166584,
+          "Compressions": 33857408,
+          "Pageins": 30885027,
+          "Pageouts": 193673,
+          "Swapins": 133420,
+          "Swapouts": 878820
+        },
+        "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+      },
+      "records": [
+        {
+          "heap_alloc_bytes": 791440,
+          "heap_sys_bytes": 3833856,
+          "major_faults": 58,
+          "minor_faults": 1356,
+          "phase": "before_load",
+          "rss_peak_bytes": 18481152
+        },
+        {
+          "heap_alloc_bytes": 60932048,
+          "heap_sys_bytes": 70647808,
+          "major_faults": 479939,
+          "minor_faults": 7778,
+          "phase": "loaded",
+          "rss_peak_bytes": 7937605632,
+          "seconds": 8.921834916
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94115944,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 480090,
+          "minor_faults": 10017,
+          "phase": "decode",
+          "prefill_seconds": 0.561775167,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": false,
+            "reused_tokens": 0,
+            "prompt_tokens": 27
+          },
+          "repetition": 0,
+          "rss_peak_bytes": 7937605632,
+          "seconds": 3.048400625,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 20.99461582415861
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94155768,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 480107,
+          "minor_faults": 10068,
+          "phase": "decode",
+          "prefill_seconds": 2.08e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 1,
+          "rss_peak_bytes": 7937605632,
+          "seconds": 3.055998709,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 20.942417224038167
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94167864,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 480107,
+          "minor_faults": 10074,
+          "phase": "decode",
+          "prefill_seconds": 5.42e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 2,
+          "rss_peak_bytes": 7937605632,
+          "seconds": 3.020561833,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 21.188111198649313
+        },
+        {
+          "copied_weight_bytes": 0,
+          "heap_alloc_bytes": 94177760,
+          "heap_sys_bytes": 104202240,
+          "major_faults": 480107,
+          "minor_faults": 10075,
+          "phase": "decode",
+          "prefill_seconds": 2.08e-07,
+          "prompt_cache": {
+            "mode": "prefix",
+            "hit": true,
+            "reused_tokens": 27,
+            "prompt_tokens": 27
+          },
+          "repetition": 3,
+          "rss_peak_bytes": 7937605632,
+          "seconds": 3.019754708,
+          "token_digest": "cabc9c95af4f085866c4e15b583452d0",
+          "tokens": 64,
+          "tokens_per_second": 21.193774391823883
+        }
+      ],
+      "samples": [
+        {
+          "unix_time": 1793351161.5112488,
+          "rss_bytes": 3342336,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30389096,
+            "Pageouts": 193610,
+            "Swapins": 133164,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351162.0212648,
+          "rss_bytes": 799555584,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30436128,
+            "Pageouts": 193610,
+            "Swapins": 133164,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351162.5309708,
+          "rss_bytes": 1646592000,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30487866,
+            "Pageouts": 193610,
+            "Swapins": 133168,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351163.045599,
+          "rss_bytes": 2490318848,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30539398,
+            "Pageouts": 193610,
+            "Swapins": 133168,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351163.558421,
+          "rss_bytes": 3312287744,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30589957,
+            "Pageouts": 193610,
+            "Swapins": 133168,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351164.07201,
+          "rss_bytes": 4136566784,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30640164,
+            "Pageouts": 193610,
+            "Swapins": 133172,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351164.58626,
+          "rss_bytes": 4968300544,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30690926,
+            "Pageouts": 193610,
+            "Swapins": 133172,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351165.097719,
+          "rss_bytes": 5684690944,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30734603,
+            "Pageouts": 193610,
+            "Swapins": 133176,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351165.6092842,
+          "rss_bytes": 6313508864,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30772971,
+            "Pageouts": 193612,
+            "Swapins": 133176,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351166.121471,
+          "rss_bytes": 6929776640,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30810704,
+            "Pageouts": 193612,
+            "Swapins": 133176,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351166.633586,
+          "rss_bytes": 7538130944,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30850589,
+            "Pageouts": 193612,
+            "Swapins": 133176,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351167.147686,
+          "rss_bytes": 7274987520,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30872491,
+            "Pageouts": 193612,
+            "Swapins": 133180,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351167.6616352,
+          "rss_bytes": 5568544768,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30872540,
+            "Pageouts": 193619,
+            "Swapins": 133240,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351168.18731,
+          "rss_bytes": 3997941760,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30872710,
+            "Pageouts": 193619,
+            "Swapins": 133244,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351168.697716,
+          "rss_bytes": 2666381312,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30872801,
+            "Pageouts": 193650,
+            "Swapins": 133244,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351169.212481,
+          "rss_bytes": 1230585856,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30872966,
+            "Pageouts": 193670,
+            "Swapins": 133244,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351169.7252429,
+          "rss_bytes": 958349312,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30873259,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351170.240056,
+          "rss_bytes": 659226624,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30873931,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351170.753674,
+          "rss_bytes": 85934080,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30876640,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351171.2646458,
+          "rss_bytes": 95649792,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30877247,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351171.7788758,
+          "rss_bytes": 94257152,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30877708,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351172.2948759,
+          "rss_bytes": 94404608,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30878497,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351172.8107579,
+          "rss_bytes": 94633984,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30880450,
+            "Pageouts": 193670,
+            "Swapins": 133268,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351173.3279622,
+          "rss_bytes": 94814208,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30880826,
+            "Pageouts": 193670,
+            "Swapins": 133276,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351173.845116,
+          "rss_bytes": 95010816,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30880917,
+            "Pageouts": 193670,
+            "Swapins": 133276,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351174.3564658,
+          "rss_bytes": 95502336,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30880976,
+            "Pageouts": 193670,
+            "Swapins": 133276,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351174.8728802,
+          "rss_bytes": 95518720,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30881866,
+            "Pageouts": 193670,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351175.383901,
+          "rss_bytes": 95518720,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30881869,
+            "Pageouts": 193670,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351175.900257,
+          "rss_bytes": 95518720,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30882572,
+            "Pageouts": 193670,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351176.41485,
+          "rss_bytes": 95518720,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30882640,
+            "Pageouts": 193670,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351176.933748,
+          "rss_bytes": 95617024,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30882673,
+            "Pageouts": 193670,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351177.4518661,
+          "rss_bytes": 95682560,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883307,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351177.9718149,
+          "rss_bytes": 95682560,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883440,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351178.4910269,
+          "rss_bytes": 95682560,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883443,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351179.011285,
+          "rss_bytes": 95698944,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883446,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351179.5276852,
+          "rss_bytes": 95698944,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883455,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351180.044152,
+          "rss_bytes": 95715328,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883494,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351180.559181,
+          "rss_bytes": 95731712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883654,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351181.076829,
+          "rss_bytes": 95731712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883699,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351181.592416,
+          "rss_bytes": 95731712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883779,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351182.112688,
+          "rss_bytes": 95731712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883879,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351182.6313448,
+          "rss_bytes": 95731712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883887,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        },
+        {
+          "unix_time": 1793351183.147874,
+          "rss_bytes": 95731712,
+          "page_size": 16384,
+          "counters": {
+            "Pageins": 30883964,
+            "Pageouts": 193673,
+            "Swapins": 133420,
+            "Swapouts": 878820
+          },
+          "swapusage": "vm.swapusage: total = 12288.00M  used = 11145.50M  free = 1142.50M  (encrypted)"
+        }
+      ],
+      "maxrss_bytes": 7937605632,
+      "major_faults": 480107,
+      "minor_faults": 10110,
+      "raw_log": "=== RUN   TestRealMacDecode\nREAL_MAC_JSON {\"heap_alloc_bytes\":791440,\"heap_sys_bytes\":3833856,\"major_faults\":58,\"minor_faults\":1356,\"phase\":\"before_load\",\"rss_peak_bytes\":18481152}\nREAL_MAC_JSON {\"heap_alloc_bytes\":60932048,\"heap_sys_bytes\":70647808,\"major_faults\":479939,\"minor_faults\":7778,\"phase\":\"loaded\",\"rss_peak_bytes\":7937605632,\"seconds\":8.921834916}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94115944,\"heap_sys_bytes\":104202240,\"major_faults\":480090,\"minor_faults\":10017,\"phase\":\"decode\",\"prefill_seconds\":0.561775167,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":false,\"reused_tokens\":0,\"prompt_tokens\":27},\"repetition\":0,\"rss_peak_bytes\":7937605632,\"seconds\":3.048400625,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":20.99461582415861}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94155768,\"heap_sys_bytes\":104202240,\"major_faults\":480107,\"minor_faults\":10068,\"phase\":\"decode\",\"prefill_seconds\":2.08e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":1,\"rss_peak_bytes\":7937605632,\"seconds\":3.055998709,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":20.942417224038167}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94167864,\"heap_sys_bytes\":104202240,\"major_faults\":480107,\"minor_faults\":10074,\"phase\":\"decode\",\"prefill_seconds\":5.42e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":2,\"rss_peak_bytes\":7937605632,\"seconds\":3.020561833,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":21.188111198649313}\nREAL_MAC_JSON {\"copied_weight_bytes\":0,\"heap_alloc_bytes\":94177760,\"heap_sys_bytes\":104202240,\"major_faults\":480107,\"minor_faults\":10075,\"phase\":\"decode\",\"prefill_seconds\":2.08e-7,\"prompt_cache\":{\"mode\":\"prefix\",\"hit\":true,\"reused_tokens\":27,\"prompt_tokens\":27},\"repetition\":3,\"rss_peak_bytes\":7937605632,\"seconds\":3.019754708,\"token_digest\":\"cabc9c95af4f085866c4e15b583452d0\",\"tokens\":64,\"tokens_per_second\":21.193774391823883}\n--- PASS: TestRealMacDecode (21.73s)\nPASS\n"
+    }
+  ],
+  "post_measurement_review": {
+    "date": "2026-10-31",
+    "description": "Measured source hashes and raw results are retained. After measurement, partial loader layers were made reachable for error cleanup, and the harness gained failure cleanup and length checks. Successful inference and tensor allocations are unchanged. The patch maps measured sources to reviewed sources.",
+    "patch": "--- a/internal/engine/voxtral_realtime.go\n+++ b/internal/engine/voxtral_realtime.go\n@@ -682,10 +682,10 @@\n \t\treturn config, weights, fmt.Errorf(\"loading voxtral realtime model: %w\", err)\n \t}\n \n-\tencLayers := make([]VoxtralRealtimeEncoderLayer, 0, enc.NLayers)\n+\tweights.Encoder.Layers = make([]VoxtralRealtimeEncoderLayer, enc.NLayers)\n \tfor l := range enc.NLayers {\n \t\tn := names.encBlock(l)\n-\t\tvar layer VoxtralRealtimeEncoderLayer\n+\t\tlayer := &weights.Encoder.Layers[l]\n \t\tlayer.AttnNorm, err = loadF32Vec(data, gguf.DataOffset, n.AttnNorm, tensors, inferred)\n \t\tif err != nil {\n \t\t\treturn config, weights, fmt.Errorf(\"loading voxtral realtime model: %w\", err)\n@@ -720,12 +720,10 @@\n \t\t\treturn config, weights, fmt.Errorf(\"loading voxtral realtime model: %w\", err)\n \t\t}\n \t\tlayer.FFNDownB = loadOptionalF32Vec(data, gguf.DataOffset, n.DownB, tensors, inferred, enc.DModel)\n-\t\tencLayers = append(encLayers, layer)\n \t\tif l == 0 || l+1 == enc.NLayers || (l+1)%8 == 0 {\n \t\t\tfmt.Fprintf(logw, \"  Loaded voxtral encoder layer %d/%d\\n\", l+1, enc.NLayers)\n \t\t}\n \t}\n-\tweights.Encoder.Layers = encLayers\n \n \tprojLinear1, projLinear2 := names.proj()\n \tif weights.Projector.Linear1, err = load(projLinear1); err != nil {\n@@ -759,10 +757,10 @@\n \t\treturn config, weights, fmt.Errorf(\"loading voxtral realtime model: time embedding inv_freq has %d elements, want hidden_size/2=%d\", len(weights.Decoder.TimeEmbedInvFreq), want)\n \t}\n \n-\tdecLayers := make([]VoxtralRealtimeDecoderLayer, 0, dec.NLayers)\n+\tweights.Decoder.Layers = make([]VoxtralRealtimeDecoderLayer, dec.NLayers)\n \tfor l := range dec.NLayers {\n \t\tn := names.decBlock(l)\n-\t\tvar layer VoxtralRealtimeDecoderLayer\n+\t\tlayer := &weights.Decoder.Layers[l]\n \t\tlayer.AttnNorm, err = loadF32Vec(data, gguf.DataOffset, n.AttnNorm, tensors, inferred)\n \t\tif err != nil {\n \t\t\treturn config, weights, fmt.Errorf(\"loading voxtral realtime model: %w\", err)\n@@ -798,12 +796,10 @@\n \t\tif layer.FFNDown, err = load(n.Down); err != nil {\n \t\t\treturn config, weights, fmt.Errorf(\"loading voxtral realtime model: %w\", err)\n \t\t}\n-\t\tdecLayers = append(decLayers, layer)\n \t\tif l == 0 || l+1 == dec.NLayers || (l+1)%8 == 0 {\n \t\t\tfmt.Fprintf(logw, \"  Loaded voxtral decoder layer %d/%d\\n\", l+1, dec.NLayers)\n \t\t}\n \t}\n-\tweights.Decoder.Layers = decLayers\n \n \treturn config, weights, nil\n }\n--- a/internal/engine/real_mac_decode_test.go\n+++ b/internal/engine/real_mac_decode_test.go\n@@ -74,6 +74,7 @@\n \t\t\tif fast == nil {\n \t\t\t\tt.Fatal(\"Metal decoder inactive\")\n \t\t\t}\n+\t\t\tdefer fast.Close() // Also release the decoder if a step fails.\n \t\t\tbegan := time.Now()\n \t\t\tfor pos := 0; pos < 32; pos++ {\n \t\t\t\tx, e := EmbedVoxtralRealtimeToken(c, w, (pos+10)%c.Decoder.VocabSize)\n@@ -127,6 +128,12 @@\n \t\tif e != nil {\n \t\t\tt.Fatal(e)\n \t\t}\n+\t\tif result.Stats.GeneratedTokens != opts.MaxTokens {\n+\t\t\tt.Fatalf(\"short decode: %d tokens, want %d\", result.Stats.GeneratedTokens, opts.MaxTokens)\n+\t\t}\n+\t\tif r.workspaceBuf.metalDense == nil {\n+\t\t\tt.Fatal(\"Metal decoder inactive\")\n+\t\t}\n \t\td := specABDigest(r.workspaceBuf.GeneratedTokens[:result.Stats.GeneratedTokens])\n \t\tif digest != \"\" && digest != d {\n \t\t\tt.Fatal(\"repeated generation differs\")\n",
+    "reviewed_source_sha256": {
+      "internal/engine/voxtral_realtime.go": "56298dd694952d05e4550dc41787f2f547037271f560cc87912cb7bfa22cfbf6",
+      "internal/engine/real_mac_decode_test.go": "ae65df1d1f857b0ae1d6087b78c1845496d321ba75a0c9ccd2e0d6e7a73675a2"
+    }
+  }
+}

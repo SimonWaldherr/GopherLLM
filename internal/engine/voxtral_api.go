@@ -99,7 +99,7 @@ func openVoxtralBytes(ctx context.Context, data []byte, mmap *MmapFile, opts ...
 	if err != nil {
 		return nil, fmt.Errorf("parsing Voxtral GGUF: %w", err)
 	}
-	source.cfg, source.weights, err = LoadVoxtralRealtimeModel(data, gguf, settings.metal, settings.logw)
+	source.cfg, source.weights, err = loadVoxtralRealtimeModel(data, gguf, settings.metal, settings.logw, mmap != nil && mmap.IsMapped())
 	if err != nil {
 		return nil, fmt.Errorf("loading Voxtral weights: %w", err)
 	}
