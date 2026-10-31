@@ -130,7 +130,7 @@ and optionally runs Ministral for task suggestions and row explanations.
 
 ## Tested models
 
-Recorded checkpoint tests as of **2026-10-28**. Each entry links to its evidence;
+Recorded checkpoint tests through **2026-10-30**. Each entry links to its evidence;
 the final table identifies component and synthetic-reference coverage. The
 broader [architecture list](#supported-architectures) describes implementation
 support rather than a successful run of every pretrained checkpoint. Results
@@ -140,8 +140,8 @@ apply to the recorded formats, backends and workloads.
 
 | Model | Tested weights | Upstream | Recorded validation |
 | --- | --- | --- | --- |
-| Ministral 3 3B Instruct 2512 | Q4_K_M | Mistral AI · [@mistralai](https://github.com/mistralai) | [Complete Metal chat requests and token/state parity](benchmarks/metal/ministral-decode.md) |
-| Ministral 3 14B Reasoning 2512 | Q4_K_M | Mistral AI · [@mistralai](https://github.com/mistralai) | [Prefill/decode checks](docs/performance.md#metal) and [fixed-input decoder parity through 415 positions](benchmarks/metal/decode-paging.md#attention-through-512-positions-2026-10-25) |
+| Ministral 3 3B Instruct 2512 | Q4_K_M | Mistral AI · [@mistralai](https://github.com/mistralai) | [Complete Metal chat requests and token/state parity](benchmarks/metal/ministral-decode.md); [64-token generation, RSS and paging](benchmarks/metal/real-mac-32gb.md) |
+| Ministral 3 14B Reasoning 2512 | Q4_K_M | Mistral AI · [@mistralai](https://github.com/mistralai) | [64-token generation, RSS and paging](benchmarks/metal/real-mac-32gb.md), plus [fixed-input decoder parity through 415 positions](benchmarks/metal/decode-paging.md#attention-through-512-positions-2026-10-25) |
 | Qwen 4B | Q8_0 | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Complete serial/prompt-lookup generation comparisons](#speculative-decoding); the historical record does not identify the checkpoint revision |
 | Qwen3.5-4B with native MTP | Q4_K_M, prithivMLmods conversion | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Paired complete generation with identical tokens, using the linked pinned GGUF](#speculative-decoding) |
 | Qwen3.8-27B | Q4_K_M, `qwen35` architecture | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Complete prefill/decode requests and live-state parity](benchmarks/metal/qwen-worker-norm.md#complete-qwen38-27b-q4_k_m-model) |
@@ -172,7 +172,7 @@ are included; its downloaded weights remain outside Git.
 
 | Model / graph | Upstream | Scope of successful checks |
 | --- | --- | --- |
-| Voxtral Mini 4B Realtime 2602, Q6_K GGUF | Mistral AI · [@mistralai](https://github.com/mistralai) | [Streaming encoder layer with real checkpoint weights](benchmarks/encoders/laya-voxtral.md), plus frontend/decoder fixtures; these measurements do not establish full-transcription accuracy or latency |
+| Voxtral Mini 4B Realtime 2602, Q6_K GGUF | Mistral AI · [@mistralai](https://github.com/mistralai) | [Full checkpoint loading, real Metal decoder, RSS and paging](benchmarks/metal/real-mac-32gb.md), [streaming encoder layer with real weights](benchmarks/encoders/laya-voxtral.md), and frontend/decoder fixtures; no complete transcription accuracy or latency measurement |
 | Qwen3-VL-4B-Instruct | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [First 32 text layers and eight intermediate states exercised inside pretrained FLUX generation](benchmarks/generative/flux3.md); no standalone vision-language evaluation |
 | Qwen-Image-2.1 base | Qwen / Alibaba · [@QwenLM](https://github.com/QwenLM) | [Shared component references and base scheduler checks](benchmarks/generative/qwen-image21.md#independent-numerical-tests); no pretrained base image run recorded |
 | FLUX 3 Image Klein Base | Black Forest Labs · [@black-forest-labs](https://github.com/black-forest-labs) | [Synthetic official-reference DiT and complete CFG pipelines](benchmarks/generative/flux3.md#checks-completed); no pretrained base generation recorded |
@@ -1210,12 +1210,13 @@ those Make targets, but it prints the tuning report and exits before generation;
 `make autotune` is the convenient report-only target. `run-auto` and
 `run-auto-metal` are shortcuts for their corresponding command with `AUTO=1`.
 
-What it tunes: thread count, the int8-activation matvec kernels, the f16 KV
-cache, worker-dispatch oversubscription, and the prefill chunk size. Load-time
-choices (`--metal`, `--prepare-quant`) are *not* tuned, because changing them
-means reloading the weights; `--auto-json` reports whether they were active.
-They are nevertheless part of the cache key, so a Metal or prepared-quant
-run never reuses a CPU-only calibration.
+The Runner tuner measures thread count, int8-activation matvec kernels, f16 KV,
+worker-dispatch oversubscription, prefill chunk size and eligible Metal decode
+scheduling. These settings reuse the loaded weights. The CLI can first compare
+CPU and Metal by loading each backend when `--metal` was not explicitly selected;
+that separate probe runs before Runner tuning. `--prepare-quant` remains an
+explicit load-time choice. The report records the active backend and prepared
+state, and both are part of the tuning cache key.
 
 ### Why it is built the way it is
 
@@ -1237,9 +1238,9 @@ any real tuning gain. The tuner therefore:
   per-knob exploration, one final interleaved sweep judges the starting config,
   the full proposed set, and each proposed change *in isolation*. So a set that
   only looked good because two knobs each got a lucky sample is rejected, while
-  a single genuine win inside a losing set is still kept — and since the starting
-  config is always a candidate, auto mode can never leave the model slower than
-  it found it.
+  a single measured win inside a losing set can still be kept. The starting config
+  remains a candidate. These checks reduce bad choices under measurement noise;
+  they do not guarantee a speedup for later requests or different host conditions.
 - **repeats probes until they are measurable.** A single forward pass through a
   small model times as exactly zero against the Windows clock's granularity,
   which would leave every candidate tied.
@@ -1295,6 +1296,13 @@ go tool pprof -top bin/gopherllm /tmp/gopherllm.prof
 For repeatable comparisons, keep the prompt, token count, sampler settings,
 thread count, and model path fixed. The first run may include cache and warmup
 effects, so prefer `--bench-runs 3` or more when comparing changes.
+
+For 32-GiB Mac decoding and memory measurements, use the
+[real-checkpoint sampler](benchmarks/metal/real-mac-32gb.md#validation-and-reproduction).
+It records process RSS and global VM counters alongside load, prefill and decode
+phases. Keep warm cached requests separate from uncached prefill, and verify the
+generated token count and digest before comparing timings. RSS, Go heap and
+system swap counters measure different things; they are not additive RAM totals.
 
 ## Make Targets
 
@@ -1382,7 +1390,9 @@ experiments, use the recorded methodology and raw data:
 
 | Workload | Measurement record |
 |---|---|
+| Ministral 3B/14B and Voxtral decoder, 32-GiB M2 Max | [Real checkpoints, warm decode, RSS and paging](benchmarks/metal/real-mac-32gb.md) |
 | Ministral 3B Metal decode, M2 Max | [Paired requests and decode steps](benchmarks/metal/ministral-decode.md) |
+| Decoder scratch and Voxtral teacher-forced CPU steps | [Allocation savings and component timings](benchmarks/encoders/decode-memory.md) |
 | Ministral/Voxtral Tekken tokenization | [Splitter timing and allocation measurements](benchmarks/maintenance/tekken.md) |
 | Voxtral offline convolution stem, M2 Max | [Accelerate timing and scratch usage](benchmarks/encoders/laya-voxtral.md#offline-voxtral-convolution-tiles-2026-10-29) |
 | Core ML embeddings, M2 Max | [CPU/Neural Engine comparisons](benchmarks/coreml/README.md) |

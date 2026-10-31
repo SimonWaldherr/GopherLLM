@@ -14,18 +14,25 @@ import (
 	"time"
 )
 
-func realMacRecord(phase string, fields map[string]any) {
+func realMacRecord(t testing.TB, phase string, fields map[string]any) {
+	t.Helper()
 	var r syscall.Rusage
-	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &r)
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &r); err != nil {
+		t.Fatal(err)
+	}
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	fields["phase"] = phase
+	fields["unix_time"] = float64(time.Now().UnixNano()) / 1e9
 	fields["rss_peak_bytes"] = r.Maxrss
 	fields["minor_faults"] = r.Minflt
 	fields["major_faults"] = r.Majflt
 	fields["heap_alloc_bytes"] = m.HeapAlloc
 	fields["heap_sys_bytes"] = m.HeapSys
-	data, _ := json.Marshal(fields)
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fmt.Println("REAL_MAC_JSON " + string(data))
 }
 
@@ -36,13 +43,17 @@ func TestRealMacDecode(t *testing.T) {
 	if path == "" {
 		t.Skip("set GOPHERLLM_REAL_MAC_MODEL")
 	}
+	kind := os.Getenv("GOPHERLLM_REAL_MAC_KIND")
+	if kind != "ministral" && kind != "voxtral" {
+		t.Fatal("set GOPHERLLM_REAL_MAC_KIND to ministral or voxtral")
+	}
 	if !MetalAvailable() {
 		t.Fatal(MetalError())
 	}
 	setPerformanceThreads(t, 8)
-	realMacRecord("before_load", map[string]any{})
+	realMacRecord(t, "before_load", map[string]any{})
 	start := time.Now()
-	if os.Getenv("GOPHERLLM_REAL_MAC_KIND") == "voxtral" {
+	if kind == "voxtral" {
 		ctx := context.Background()
 		var model *VoxtralModel
 		var err error
@@ -60,7 +71,7 @@ func TestRealMacDecode(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer model.Close()
-		realMacRecord("loaded", map[string]any{"seconds": time.Since(start).Seconds()})
+		realMacRecord(t, "loaded", map[string]any{"seconds": time.Since(start).Seconds()})
 		c, w := model.source.cfg, model.source.weights
 		// Full real decoder weights, deterministic embedding inputs. This is a
 		// decoder test, not an audio transcription or recognition-quality test.
@@ -105,10 +116,10 @@ func TestRealMacDecode(t *testing.T) {
 				t.Fatal("repeated decoder tokens differ")
 			}
 			reference = digest
-			realMacRecord("decode", map[string]any{"repetition": rep, "seconds": elapsed.Seconds(), "tokens": 64, "tokens_per_second": 64 / elapsed.Seconds(), "prefill_seconds": prefill.Seconds(), "token_digest": digest})
+			realMacRecord(t, "decode", map[string]any{"repetition": rep, "seconds": elapsed.Seconds(), "tokens": 64, "tokens_per_second": 64 / elapsed.Seconds(), "prefill_seconds": prefill.Seconds(), "token_digest": digest})
 			fast.Close()
 			runtime.GC()
-			realMacRecord("decoder_closed", map[string]any{"repetition": rep})
+			realMacRecord(t, "decoder_closed", map[string]any{"repetition": rep})
 		}
 		return
 	}
@@ -117,12 +128,20 @@ func TestRealMacDecode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
-	realMacRecord("loaded", map[string]any{"seconds": time.Since(start).Seconds()})
+	realMacRecord(t, "loaded", map[string]any{"seconds": time.Since(start).Seconds(), "dim": r.config.Dim, "head_dim": r.config.HeadDim, "value_dim": r.config.ValueDim, "heads": r.config.NHeads, "kv_heads": r.config.NKVHeads})
 	opts := DefaultGenerationOptions()
 	opts.MaxTokens = 64
 	opts.Seed = 41
 	opts.Sampler.Temperature = 0
 	var digest string
+	preparedMetalWeights := 0
+	for _, layer := range r.standard.Layers {
+		for _, weight := range [...]Weight{layer.WQ, layer.WK, layer.WV, layer.WO, layer.W1, layer.W3, layer.W2, layer.WQKV, layer.WGateUp} {
+			if weight.Metal != nil {
+				preparedMetalWeights++
+			}
+		}
+	}
 	for rep := 0; rep < 4; rep++ {
 		result, e := r.GenerateChat([]ChatMessage{UserMessage("Erkläre in fünf Sätzen, wie ein Computerprogramm ausgeführt wird.")}, opts)
 		if e != nil {
@@ -131,14 +150,22 @@ func TestRealMacDecode(t *testing.T) {
 		if result.Stats.GeneratedTokens != opts.MaxTokens {
 			t.Fatalf("short decode: %d tokens, want %d", result.Stats.GeneratedTokens, opts.MaxTokens)
 		}
-		if r.workspaceBuf.metalDense == nil {
-			t.Fatal("Metal decoder inactive")
+		// Selective offload is also a valid workload when a checkpoint or
+		// configuration cannot use the complete dense Metal graph.
+		dense := r.workspaceBuf.metalDense
+		if dense == nil && preparedMetalWeights == 0 {
+			t.Fatal("no Metal decoder or prepared projections")
 		}
 		d := specABDigest(r.workspaceBuf.GeneratedTokens[:result.Stats.GeneratedTokens])
 		if digest != "" && digest != d {
 			t.Fatal("repeated generation differs")
 		}
 		digest = d
-		realMacRecord("decode", map[string]any{"repetition": rep, "seconds": result.Stats.DecodeTime.Seconds(), "tokens": result.Stats.GeneratedTokens, "tokens_per_second": float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds(), "prefill_seconds": result.Stats.PrefillTime.Seconds(), "token_digest": d, "prompt_cache": result.PromptCache, "copied_weight_bytes": r.workspaceBuf.metalDense.copiedWeightBytes})
+		fields := map[string]any{"repetition": rep, "seconds": result.Stats.DecodeTime.Seconds(), "tokens": result.Stats.GeneratedTokens, "tokens_per_second": float64(result.Stats.GeneratedTokens) / result.Stats.DecodeTime.Seconds(), "prefill_seconds": result.Stats.PrefillTime.Seconds(), "token_digest": d, "prompt_cache": result.PromptCache, "dense_metal": dense != nil, "prepared_metal_weights": preparedMetalWeights}
+		if dense != nil {
+			// This counter covers buffers created by the dense graph only.
+			fields["copied_weight_bytes"] = dense.copiedWeightBytes
+		}
+		realMacRecord(t, "decode", fields)
 	}
 }

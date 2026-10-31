@@ -100,8 +100,49 @@ python3 benchmarks/metal/measure-real-mac.py \
 Repeat for 14B. For Voxtral use `--kind voxtral` with the Q6_K checkpoint;
 add `--copy` to select the old loader as a control. Use fresh output directories
 per process, alternate loader order, and keep builds outside timing windows.
+The sampler refuses to overwrite `run.log` or `run.json`, rejects incomplete
+phase sequences, non-finite or nonpositive load/decode times, inconsistent rates
+and differing token digests, and kills/reaps the child on timeout. Failed runs
+retain the raw log; a successful JSON requires all expected decode repetitions.
+Phase records now include wall-clock timestamps for alignment with RSS/VM
+samples; elapsed process time uses a monotonic clock. These harness changes do
+not alter the historical measurements linked below.
+
+New Ministral decode records also identify the backend resources:
+
+- `dense_metal` reports whether the complete dense Metal graph is active after
+  the request. Selective offload remains valid when this is false; graph
+  eligibility depends on the configuration resolved from metadata and tensors.
+- `prepared_metal_weights` counts per-layer projection fields with a Metal
+  handle. It excludes the embedding/output fields and is a resource count,
+  rather than a count of GPU dispatches or proof that every projection used Metal.
+- `copied_weight_bytes` is emitted only when the dense graph exists and counts
+  copies owned by that graph. It excludes other weight resources, driver memory
+  and activations. An omitted value means unavailable; zero describes this
+  graph's copies rather than total model memory.
+
 The sampler reads RSS and global VM counters every 0.5 seconds plus collection
 overhead; short peaks may be missed by sampling, so process maximum RSS is
-also retained. Run from a host permitting Metal, `ps`, `vm_stat` and `sysctl`.
+also retained. `--timeout` defaults to 300 seconds and includes telemetry while
+the model process runs. Initial/final VM snapshots are outside that timed window
+and cap each command at five seconds. Run from macOS with access to Metal,
+`ps`, `vm_stat` and `sysctl`.
+
+Sampler contracts run without weights, a GPU or macOS, using only Python's
+standard library. CI runs the same command:
+
+```sh
+python3 -m unittest discover -s benchmarks/metal -p 'test_*.py'
+```
+
+The [mapped-checkpoint ownership tests](../../internal/engine/voxtral_mapped_checkpoint_test.go)
+require real Voxtral weights and Metal. In a Metal test build they skip when the
+model environment variable is unset:
+
+```sh
+GOPHERLLM_VOXTRAL_MODEL=/path/to/Voxtral-Mini-4B-Realtime-2602-Q6_K.gguf \
+  CGO_ENABLED=1 go test -tags metal ./internal/engine \
+  -run '^TestVoxtralMappedCheckpoint' -count=1 -v
+```
 
 [All ten runs, raw phase records, sampled counters, limits and source/binary hashes](real-mac-32gb-2026-10-30.json).

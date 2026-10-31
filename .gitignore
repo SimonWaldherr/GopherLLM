@@ -39,3 +39,4 @@ hestia-data/
 xcuserdata/
 DerivedData/
 scripts/__pycache__
+benchmarks/metal/__pycache__/

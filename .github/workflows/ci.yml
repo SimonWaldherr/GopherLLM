@@ -66,7 +66,7 @@ jobs:
         run: go build ./...
 
   coreml-exporters:
-    name: Core ML exporter contracts
+    name: Python tool contracts
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -79,6 +79,9 @@ jobs:
 
       - name: Test without Core ML dependencies
         run: python -m unittest discover -s scripts -p 'test_export_coreml*.py'
+
+      - name: Test benchmark sampler without model weights
+        run: python -m unittest discover -s benchmarks/metal -p 'test_*.py'
 
   cross-build:
     name: Cross-build

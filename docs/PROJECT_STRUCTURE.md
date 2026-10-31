@@ -79,6 +79,10 @@ surface it in the language packages that need it.
 
 Run engine tests or microbenchmarks explicitly with `go test ./internal/engine`;
 `go test ./...` still includes the engine, public examples and integration tests.
+When running a compiled engine test binary directly, use `internal/engine/` as
+its working directory: fixture tests resolve `../../testdata` from there.
+`go test` sets the package working directory automatically, as does the
+[Mac decoder sampler](../benchmarks/metal/measure-real-mac.py).
 The `go doc` command does not expand methods behind the public type aliases;
 from a checkout, use `go doc ./internal/engine.Model.Generate` for method
 documentation, replacing `Model.Generate` with the desired type and method.

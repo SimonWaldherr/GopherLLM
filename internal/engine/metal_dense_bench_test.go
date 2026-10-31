@@ -23,7 +23,7 @@ func TestMetalFixedDecodeBenchmark(t *testing.T) {
 	if !MetalAvailable() {
 		t.Fatal(MetalError())
 	}
-	SetNumThreads(8)
+	setPerformanceThreads(t, 8)
 	r, _, err := RunnerFromPathWithOptions(path, LoadOptions{UseMetal: true, LogWriter: io.Discard})
 	if err != nil {
 		t.Fatal(err)
@@ -41,6 +41,7 @@ func TestMetalFixedDecodeBenchmark(t *testing.T) {
 	}
 	cache := NewKVCache(c.NLayers, c.NKVHeads*c.HeadDim, c.NKVHeads*c.ValueDim, 256)
 	buf := NewDecodeBuffer(c, c.HeadDim, c.NKVHeads, c.ValueDim)
+	buf.metalMapping = r.metalMapping
 	defer func() {
 		if buf.metalDense != nil {
 			buf.metalDense.close()
@@ -48,7 +49,7 @@ func TestMetalFixedDecodeBenchmark(t *testing.T) {
 	}()
 	var logits []float32
 	ForwardInto(c, r.standard, cache, buf, tokens[0], 0, &logits)
-	if metalDenseDecodeEnabled && buf.metalDense == nil {
+	if metalDenseEligible(c, r.standard, cache) && buf.metalDense == nil {
 		t.Fatalf("dense decoder was not active: %s config=%+v", MetalError(), c)
 	}
 	for repeat := 0; repeat < 3; repeat++ {
@@ -63,7 +64,7 @@ func TestMetalFixedDecodeBenchmark(t *testing.T) {
 		if len(logits) == 0 || !finite32(logits[0]) {
 			t.Fatal("invalid logits")
 		}
-		report := map[string]any{"engine": "GopherLLM", "repetition": repeat, "dense": metalDenseDecodeEnabled, "depth": 160, "steps": 64, "threads": 8, "kv": "f32", "seed": 1, "vocab": c.VocabSize, "seconds": elapsed, "prefill_seconds": prefill, "tokens_per_second": 64 / elapsed, "first_logit": logits[0]}
+		report := map[string]any{"engine": "GopherLLM", "repetition": repeat, "dense": buf.metalDense != nil, "depth": 160, "steps": 64, "threads": 8, "kv": "f32", "seed": 1, "vocab": c.VocabSize, "seconds": elapsed, "prefill_seconds": prefill, "tokens_per_second": 64 / elapsed, "first_logit": logits[0]}
 		raw, _ := json.Marshal(report)
 		fmt.Println("FIXED_DECODE_JSON " + string(raw))
 	}
