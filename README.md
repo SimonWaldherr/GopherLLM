@@ -1390,6 +1390,7 @@ experiments, use the recorded methodology and raw data:
 
 | Workload | Measurement record |
 |---|---|
+| Ministral 3B/14B and Voxtral Metal kernels, 32-GiB M2 Max | [Alternating real-model decode comparisons](benchmarks/metal/mac-decode-kernels-2026-10-31.md) |
 | Ministral 3B/14B and Voxtral decoder, 32-GiB M2 Max | [KV lifetime, warm decode, RSS and paging](benchmarks/metal/mac-model-memory-2026-10-31.md) |
 | Ministral 3B Metal decode, M2 Max | [Paired requests and decode steps](benchmarks/metal/ministral-decode.md) |
 | Decoder scratch and Voxtral teacher-forced CPU steps | [Allocation savings and component timings](benchmarks/encoders/decode-memory.md) |
@@ -1436,6 +1437,8 @@ and measurements are in the [performance reference](docs/performance.md).
 | `GOPHERLLM_METAL_WHOLE_PREFILL` | `0` disables complete GPU-resident dense prefill chunks (enabled by default for eligible shapes) |
 | `GOPHERLLM_METAL_DENSE_VECTOR` | `0` uses legacy matvec kernels within complete Metal decode for comparison |
 | `GOPHERLLM_METAL_DENSE_ROWS_PER_GROUP` | Override dense Metal SIMD groups per threadgroup (`2`, `4`, or `8`; uncalibrated default `4`, auto mode measures all three) |
+| `GOPHERLLM_METAL_DENSE_Q4_SPLIT_SUM` | `0` restores the previous FP32 addition order in dense Q4_K decode; default uses independent low/high sums |
+| `GOPHERLLM_METAL_DENSE_FUSED_GATE` | `0` uses separate gate/up projections and SiLU in dense Metal decode; default fuses matching Q4_K or Q6_K projections |
 | `GOPHERLLM_METAL_DENSE_CONCURRENT` | `0` serializes all dispatches within complete Metal decode |
 | `GOPHERLLM_METAL_DENSE_PARALLEL_ARGMAX` | `0` restores single-threadgroup vocabulary selection in dense Metal greedy decode for A/B measurements |
 | `GOPHERLLM_METAL_DENSE_SHARED_KV` | `0` uses staging copies instead of pinned shared F32 KV buffers |

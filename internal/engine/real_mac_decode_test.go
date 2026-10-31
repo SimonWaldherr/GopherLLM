@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	metalbackend "github.com/SimonWaldherr/GopherLLM/internal/metal"
 )
 
 func realMacRecord(t testing.TB, phase string, fields map[string]any) {
@@ -30,6 +32,12 @@ func realMacRecord(t testing.TB, phase string, fields map[string]any) {
 	fields["major_faults"] = r.Majflt
 	fields["heap_alloc_bytes"] = m.HeapAlloc
 	fields["heap_sys_bytes"] = m.HeapSys
+	if resident, footprint, faults, pageins, ok := metalbackend.ProcessMemory(); ok {
+		fields["resident_bytes"] = resident
+		fields["footprint_bytes"] = footprint
+		fields["page_faults"] = faults
+		fields["pageins"] = pageins
+	}
 	data, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
@@ -87,31 +95,7 @@ func TestRealMacDecode(t *testing.T) {
 				t.Fatal("Metal decoder inactive")
 			}
 			defer fast.Close() // Also release the decoder if a step fails.
-			began := time.Now()
-			for pos := 0; pos < 32; pos++ {
-				x, e := EmbedVoxtralRealtimeToken(c, w, (pos+10)%c.Decoder.VocabSize)
-				if e != nil {
-					t.Fatal(e)
-				}
-				if _, e = fast.Step(x, pos, false); e != nil {
-					t.Fatal(e)
-				}
-			}
-			prefill := time.Since(began)
-			tokens := make([]uint32, 64)
-			began = time.Now()
-			for j := range tokens {
-				x, e := EmbedVoxtralRealtimeToken(c, w, j+42)
-				if e != nil {
-					t.Fatal(e)
-				}
-				token, e := fast.Step(x, j+32, true)
-				if e != nil {
-					t.Fatal(e)
-				}
-				tokens[j] = uint32(token)
-			}
-			elapsed := time.Since(began)
+			prefill, elapsed, tokens := realMacVoxtralSteps(t, c, w, fast)
 			digest := specABDigest(tokens)
 			if reference != "" && digest != reference {
 				t.Fatal("repeated decoder tokens differ")
@@ -194,4 +178,36 @@ func TestRealMacDecode(t *testing.T) {
 		}
 		realMacRecord(t, "decode", fields)
 	}
+}
+
+// Both real-model protocols use the same decoder workload. Keep input IDs,
+// prefix length and timed vocabulary selections identical as the harness evolves.
+func realMacVoxtralSteps(t testing.TB, c VoxtralRealtimeConfig, w VoxtralRealtimeWeights, fast voxtralFastDecoder) (prefill, decode time.Duration, tokens []uint32) {
+	t.Helper()
+	began := time.Now()
+	for pos := 0; pos < 32; pos++ {
+		x, e := EmbedVoxtralRealtimeToken(c, w, (pos+10)%c.Decoder.VocabSize)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if _, e = fast.Step(x, pos, false); e != nil {
+			t.Fatal(e)
+		}
+	}
+	prefill = time.Since(began)
+	tokens = make([]uint32, 64)
+	began = time.Now()
+	for j := range tokens {
+		x, e := EmbedVoxtralRealtimeToken(c, w, j+42)
+		if e != nil {
+			t.Fatal(e)
+		}
+		token, e := fast.Step(x, j+32, true)
+		if e != nil {
+			t.Fatal(e)
+		}
+		tokens[j] = uint32(token)
+	}
+	decode = time.Since(began)
+	return
 }
