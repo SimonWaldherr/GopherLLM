@@ -194,8 +194,16 @@ const VoxtralSampleRate = 16000
 // checks cancellation between 200 ms chunks. It uses the live decoder's
 // finalization schedule; the legacy offline decoder remains separately available.
 func (m *VoxtralModel) Transcribe(ctx context.Context, pcm []float32) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if len(pcm) == 0 {
 		return "", errors.New("audio is empty")
+	}
+	// Reject the entire recording before reserving the model and warming its
+	// silence prefix. Push still validates each independently supplied chunk.
+	if err := validateAudioSamples(pcm); err != nil {
+		return "", err
 	}
 	s, err := m.NewSession(ctx)
 	if err != nil {

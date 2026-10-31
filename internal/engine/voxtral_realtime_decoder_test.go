@@ -247,3 +247,49 @@ func TestVoxtralDecoderUsesGGUFSplitHalfKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestVoxtralTimeCondRejectsInvalidConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		dim   int
+		freq  []float32
+		delay int
+	}{
+		{"negative_dimension", -1, nil, 0},
+		{"zero_dimension", 0, nil, 0},
+		{"odd_dimension", 3, []float32{1}, 0},
+		{"missing_frequency", 4, []float32{1}, 0},
+		{"negative_delay", 2, []float32{1}, -1},
+		{"nan_frequency", 2, []float32{float32(math.NaN())}, 0},
+		{"infinite_frequency", 2, []float32{float32(math.Inf(1))}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := voxtralRealtimeTimeCond(VoxtralRealtimeTimeConfig{EmbedDim: tc.dim}, tc.freq, tc.delay); err == nil {
+				t.Fatal("invalid time conditioning accepted")
+			}
+		})
+	}
+	// Zero delay is valid, with exactly cos(0)=1 and sin(0)=0.
+	got, err := voxtralRealtimeTimeCond(VoxtralRealtimeTimeConfig{EmbedDim: 2}, []float32{1}, 0)
+	if err != nil || len(got) != 2 || got[0] != 1 || got[1] != 0 {
+		t.Fatalf("zero delay: %v, %v", got, err)
+	}
+}
+
+func TestVoxtralDecoderRejectsMismatchedFFN(t *testing.T) {
+	for _, gate := range []bool{false, true} {
+		cfg, weights := buildTinyVoxtralRealtimeWeights()
+		projection := &weights.Decoder.Layers[0].FFNUp
+		if gate {
+			projection = &weights.Decoder.Layers[0].FFNGate
+		}
+		projection.F32 = projection.F32[:len(projection.F32)-cfg.Decoder.HiddenSize]
+		state, err := NewVoxtralRealtimeDecoderState(cfg, weights, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ForwardVoxtralRealtimeDecoderStep(cfg, weights, state, make([]float32, cfg.Decoder.HiddenSize), 0); err == nil {
+			t.Fatalf("mismatched FFN (gate=%t) accepted", gate)
+		}
+	}
+}

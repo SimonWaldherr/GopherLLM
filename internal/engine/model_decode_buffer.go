@@ -6,9 +6,9 @@ package engine
 // output logits and generation/token scratch, the sampler's candidate scratch,
 // and precomputed RoPE tables (per-pair inverse frequencies plus per-position
 // sin/cos filled in prepareRopeScratch). One DecodeBuffer serves successive
-// requests, so decode allocates nothing per token and prefill reuses its
-// activation slabs. Not safe for concurrent use; Runner.genLock serializes
-// requests.
+// requests and retains activation storage at its high-water capacity. Optional
+// paths grow their scratch on first use. Not safe for concurrent use;
+// Runner.genLock serializes requests.
 type DecodeBuffer struct {
 	coreMLFFN    coreMLFFNSet // installed only for ordinary prompt prefill
 	metalDense   *metalDenseState
@@ -92,10 +92,9 @@ type DecodeBuffer struct {
 	// the ordinary Q buffer so every existing per-head helper still applies).
 	QGate    []float32
 	AttnGate []float32
-	// MTPInput is Qwen's NextN [normalized token embedding | normalized
-	// previous target hidden] pair. It is only touched by the optional Qwen
-	// draft head, but keeping it in DecodeBuffer makes the draft loop
-	// allocation-free once its separate workspace has been created.
+	// MTPInput holds Qwen NextN's [normalized token embedding | normalized
+	// previous target hidden] pair. The optional draft head allocates it on
+	// first use and reuses it for subsequent tokens.
 	MTPInput     []float32
 	ExpertRow    []float32
 	ExpertHidden []float32
@@ -127,7 +126,8 @@ type ExpertScore struct {
 	Score float32
 }
 
-// Optional GateUp and MTPInput storage is allocated by its first consumer.
+// NewDecodeBuffer allocates reusable activations for the supplied maximum head
+// dimensions. Optional GateUp and MTPInput storage is allocated on first use.
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
 	inv, mscale := buildRopeInvFreq(config, maxHeadDim)
 	var swaInv []float32

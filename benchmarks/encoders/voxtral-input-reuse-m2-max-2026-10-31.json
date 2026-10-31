@@ -1,0 +1,208 @@
+{
+  "date": "2026-10-31",
+  "kind": "synthetic_cpu_components",
+  "baseline_runtime_revision": "246c45f78d0ddf89de20711d6194722a3a9cd51c",
+  "method": "Seven alternating process pairs; each operation is 32 warmed teacher-forced positions. Before binary uses initial worktree runtime, equivalent to baseline revision apart from comments; benchmark harness has prior uncommitted changes. Same host, cgo/Accelerate, GOMAXPROCS=8. No full-model or paging speedup is established. Embedding benchmark compares old two-slab offline fusion with request-owned reused storage. Background activity not controlled.",
+  "binary_sha256": {
+    "before": "fdccc9f4f8dc6804e7affabfc649a4dd78c0b3ba8be00a6c9bb643d5d4d6c97d",
+    "after": "e2b882e1efa3854c99fd6011d71870face164d7e51d6cd51c7b832dbc9ca365a"
+  },
+  "source_sha256": {
+    "internal/engine/voxtral_realtime_decoder.go": "bebd256057e45d66dea1190dae3553f82c3dd961cdb0ecb6e67a178ddcbac9ca",
+    "internal/engine/decode_memory_optimization_test.go": "f14cf7ea2ce72706b101fc768c3febd92d69bb836c397e8c92c020ffb9cfe044",
+    "internal/engine/voxtral_embedding_reuse_test.go": "18ec417f1c127e1e43e2c66671f874e9e3f81f60f7f047ebac596f3d44b8fdce",
+    "internal/engine/voxtral_api.go": "e2c44613f399fbe5c3378ab0221c0ed88954c34bb17342a0f58f7b1c35b1a0d5",
+    "internal/engine/voxtral_realtime_session.go": "d8921f4fa4131592ad0e81b61b1f47d35558c07e5d46a9ba653fd2c00dc9be48",
+    "internal/engine/voxtral_transcribe.go": "e8a9dad2010c1fb88eefc5911cbc39ddb47ab2428bb769091f030fc1bb451489"
+  },
+  "teacher_forced_pairs": [
+    {
+      "pair": 0,
+      "variant": "before",
+      "ns_per_32_steps": 159762.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    159762 ns/op\t    200297 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 0,
+      "variant": "after",
+      "ns_per_32_steps": 159280.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    159280 ns/op\t    200904 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 1,
+      "variant": "after",
+      "ns_per_32_steps": 170089.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    170089 ns/op\t    188137 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 1,
+      "variant": "before",
+      "ns_per_32_steps": 160956.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    160956 ns/op\t    198812 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 2,
+      "variant": "before",
+      "ns_per_32_steps": 159857.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    159857 ns/op\t    200179 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 2,
+      "variant": "after",
+      "ns_per_32_steps": 161948.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    161948 ns/op\t    197594 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 3,
+      "variant": "after",
+      "ns_per_32_steps": 183691.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    183691 ns/op\t    174206 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 3,
+      "variant": "before",
+      "ns_per_32_steps": 210032.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    210032 ns/op\t    152358 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 4,
+      "variant": "before",
+      "ns_per_32_steps": 169630.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    169630 ns/op\t    188646 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 4,
+      "variant": "after",
+      "ns_per_32_steps": 161081.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    161081 ns/op\t    198658 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 5,
+      "variant": "after",
+      "ns_per_32_steps": 161796.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    161796 ns/op\t    197781 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 5,
+      "variant": "before",
+      "ns_per_32_steps": 163425.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    163425 ns/op\t    195809 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 6,
+      "variant": "before",
+      "ns_per_32_steps": 163425.0,
+      "bytes_per_op": 768,
+      "allocs_per_op": 32,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    163425 ns/op\t    195809 steps/s\t     768 B/op\t      32 allocs/op\nPASS\n"
+    },
+    {
+      "pair": 6,
+      "variant": "after",
+      "ns_per_32_steps": 162417.0,
+      "bytes_per_op": 0,
+      "allocs_per_op": 0,
+      "raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralTeacherForcedDecode/reference=false-8         \t    1000\t    162417 ns/op\t    197023 steps/s\t       0 B/op\t       0 allocs/op\nPASS\n"
+    }
+  ],
+  "embedding_raw": "goos: darwin\ngoarch: arm64\npkg: github.com/SimonWaldherr/GopherLLM/internal/engine\ncpu: Apple M2 Max\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3275263\t        69.32 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3548108\t        69.43 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3539572\t        68.96 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3458739\t        68.90 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3504580\t        68.48 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3487831\t        68.63 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=false-8         \t 3313335\t        70.16 ns/op\t      96 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 8300070\t        28.57 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 8490327\t        28.29 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 8341333\t        30.99 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 8467424\t        31.80 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 7559779\t        32.48 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 7552641\t        29.61 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=12/reuse=true-8          \t 7897803\t        30.53 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   16321\t     13442 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   24699\t      9851 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   20916\t     11206 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   18735\t     12333 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   19912\t     12425 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   23229\t     10676 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=false-8       \t   20934\t     10680 ns/op\t   24576 B/op\t       2 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t  101074\t      2005 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t   92762\t      2280 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t  121486\t      1949 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t  106688\t      2265 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t  114879\t      2009 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t  124800\t      1860 ns/op\t       0 B/op\t       0 allocs/op\nBenchmarkVoxtralFusedEmbedding/width=3072/reuse=true-8        \t  124632\t      1837 ns/op\t       0 B/op\t       0 allocs/op\nPASS\n",
+  "summary": {
+    "teacher_forced": {
+      "before": {
+        "samples": 7,
+        "median_ns_per_32_steps": 163425.0,
+        "bytes_per_32_steps": [
+          768
+        ],
+        "allocs_per_32_steps": [
+          32
+        ]
+      },
+      "after": {
+        "samples": 7,
+        "median_ns_per_32_steps": 161948.0,
+        "bytes_per_32_steps": [
+          0
+        ],
+        "allocs_per_32_steps": [
+          0
+        ]
+      }
+    },
+    "embedding": {
+      "width=12/reuse=false": {
+        "samples": 7,
+        "median_ns_per_op": 68.96,
+        "bytes_per_op": [
+          96
+        ],
+        "allocs_per_op": [
+          2
+        ]
+      },
+      "width=12/reuse=true": {
+        "samples": 7,
+        "median_ns_per_op": 30.53,
+        "bytes_per_op": [
+          0
+        ],
+        "allocs_per_op": [
+          0
+        ]
+      },
+      "width=3072/reuse=false": {
+        "samples": 7,
+        "median_ns_per_op": 11206.0,
+        "bytes_per_op": [
+          24576
+        ],
+        "allocs_per_op": [
+          2
+        ]
+      },
+      "width=3072/reuse=true": {
+        "samples": 7,
+        "median_ns_per_op": 2005.0,
+        "bytes_per_op": [
+          0
+        ],
+        "allocs_per_op": [
+          0
+        ]
+      }
+    }
+  },
+  "hardware": "Apple M2 Max, 32 GiB unified RAM",
+  "go": "go1.27.3 darwin/arm64",
+  "post_measurement_review": {
+    "date": "2026-10-31",
+    "changes": "Ministral scratch benchmark now resolves head dimensions from attention tensor shapes, as LoadModel does. The allocation-only regression test moved to a !race file because race instrumentation deliberately discards sync.Pool entries. Voxtral benchmark and measured runtime remain unchanged; original measurement hashes are preserved.",
+    "reviewed_source_sha256": {
+      "internal/engine/decode_memory_optimization_test.go": "128f665fb1aa6a174926cb489ca9a0420c21cb4e53a763d1769365c193c5762a"
+    }
+  }
+}

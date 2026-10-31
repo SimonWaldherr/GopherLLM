@@ -1289,14 +1289,15 @@ func ConfigFromGGUF(gguf *GGUFFile) Config {
 // output logits and generation/token scratch, the sampler's candidate scratch,
 // and precomputed RoPE tables (per-pair inverse frequencies plus per-position
 // sin/cos filled in prepareRopeScratch). One DecodeBuffer serves successive
-// requests, so decode allocates nothing per token and prefill reuses its
-// activation slabs. Not safe for concurrent use; Runner.genLock serializes
-// requests.
+// requests and retains activation storage at its high-water capacity. Optional
+// paths grow their scratch on first use. Not safe for concurrent use;
+// Runner.genLock serializes requests.
 type DecodeBuffer = engineimpl.DecodeBuffer
 
 type ExpertScore = engineimpl.ExpertScore
 
-// Optional GateUp and MTPInput storage is allocated by its first consumer.
+// NewDecodeBuffer allocates reusable activations for the supplied maximum head
+// dimensions. Optional GateUp and MTPInput storage is allocated on first use.
 func NewDecodeBuffer(config Config, maxHeadDim, maxNKVHeads, maxValueDim int) *DecodeBuffer {
 	return engineimpl.NewDecodeBuffer(config, maxHeadDim, maxNKVHeads, maxValueDim)
 }

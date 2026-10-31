@@ -15,10 +15,9 @@ import (
 // comment for how this was verified, and voxtral_realtime_audio.go for the
 // audio encoder that feeds this decoder's input embeddings.
 //
-// This is single-step (one token position per call) autoregressive decode
-// with a bounded sliding-window K/V history and reusable scratch buffers, not yet
-// the engine's quantized/ring-buffer KV cache types (kv_f16.go/kv_i8.go),
-// which are Runner-integration work landing separately.
+// Each call processes one token position. K/V rows are owned float32 storage,
+// recycled once the sliding window is full; public histories stay chronological.
+// Scratch is reused across steps. Runner's quantized KV cache types are separate.
 
 // VoxtralRealtimeDecoderState is one generation's mutable state: per-layer
 // K/V history (each entry NKVHeads*HeadDim wide) and the fixed per-layer Ada
@@ -83,9 +82,15 @@ func NewVoxtralRealtimeDecoderState(cfg VoxtralRealtimeConfig, weights VoxtralRe
 // voxtralRealtimeTimeCond builds the fixed time-conditioning vector:
 // t_cond = concat(cos(t*inv_freq), sin(t*inv_freq)), t = float(numDelayTokens),
 // using the checkpoint's own dec.time_embed.inv_freq tensor (length
-// HiddenSize/2) rather than recomputing it from Time.EmbedTheta, for
-// byte-exact fidelity to the reference.
+// HiddenSize/2) rather than recomputing it from Time.EmbedTheta. Checkpoints can
+// store frequencies that differ from the formula implied by that metadata.
 func voxtralRealtimeTimeCond(timeCfg VoxtralRealtimeTimeConfig, invFreq []float32, numDelayTokens int) ([]float32, error) {
+	if timeCfg.EmbedDim <= 0 || timeCfg.EmbedDim%2 != 0 {
+		return nil, fmt.Errorf("time embedding: EmbedDim must be positive and even, got %d", timeCfg.EmbedDim)
+	}
+	if numDelayTokens < 0 {
+		return nil, fmt.Errorf("time embedding: negative delay %d", numDelayTokens)
+	}
 	half := timeCfg.EmbedDim / 2
 	if len(invFreq) != half {
 		return nil, fmt.Errorf("time embedding: inv_freq has %d elements, want EmbedDim/2=%d", len(invFreq), half)
@@ -93,6 +98,9 @@ func voxtralRealtimeTimeCond(timeCfg VoxtralRealtimeTimeConfig, invFreq []float3
 	t := float64(numDelayTokens)
 	out := make([]float32, timeCfg.EmbedDim)
 	for i, f := range invFreq {
+		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+			return nil, fmt.Errorf("time embedding: non-finite frequency at %d", i)
+		}
 		angle := t * float64(f)
 		s, c := math.Sincos(angle)
 		out[i] = float32(c)
@@ -104,12 +112,21 @@ func voxtralRealtimeTimeCond(timeCfg VoxtralRealtimeTimeConfig, invFreq []float3
 // EmbedVoxtralRealtimeToken looks up one token's embedding row (also usable
 // as the tied output projection's input width check).
 func EmbedVoxtralRealtimeToken(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, tokenID int) ([]float32, error) {
-	if tokenID < 0 || tokenID >= cfg.Decoder.VocabSize {
-		return nil, fmt.Errorf("embedding token: id %d out of range [0,%d)", tokenID, cfg.Decoder.VocabSize)
-	}
 	var out []float32
-	weights.Decoder.TokenEmbd.RowInto(tokenID, cfg.Decoder.HiddenSize, &out)
+	if err := embedVoxtralRealtimeTokenInto(cfg, weights, tokenID, &out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// The destination owns its row; callers may fuse audio into it without changing
+// the embedding weights. Sessions and offline requests reuse this storage.
+func embedVoxtralRealtimeTokenInto(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, tokenID int, out *[]float32) error {
+	if tokenID < 0 || tokenID >= cfg.Decoder.VocabSize {
+		return fmt.Errorf("embedding token: id %d out of range [0,%d)", tokenID, cfg.Decoder.VocabSize)
+	}
+	weights.Decoder.TokenEmbd.RowInto(tokenID, cfg.Decoder.HiddenSize, out)
+	return nil
 }
 
 // ForwardVoxtralRealtimeDecoderStep runs one autoregressive decode step.
@@ -125,7 +142,7 @@ func ForwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 }
 
 // Teacher-forced positions need K/V updates but no vocabulary projection.
-func forwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState, input []float32, pos int, generate bool) (logits []float32, err error) {
+func forwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights VoxtralRealtimeWeights, state *VoxtralRealtimeDecoderState, input []float32, pos int, generate bool) ([]float32, error) {
 	dc := cfg.Decoder
 	if state == nil {
 		return nil, fmt.Errorf("decoder step: nil state")
@@ -133,7 +150,7 @@ func forwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 	if pos != state.nextPos {
 		return nil, fmt.Errorf("decoder step: position %d, want next position %d", pos, state.nextPos)
 	}
-	if dc.HiddenSize <= 0 || dc.HeadDim <= 0 || dc.HeadDim%2 != 0 || dc.NHeads <= 0 {
+	if dc.HiddenSize <= 0 || dc.IntermediateSize <= 0 || dc.HeadDim <= 0 || dc.HeadDim%2 != 0 || dc.NHeads <= 0 {
 		return nil, fmt.Errorf("decoder step: invalid decoder dimensions")
 	}
 	if len(state.KHistory) != len(weights.Decoder.Layers) || len(state.VHistory) != len(weights.Decoder.Layers) {
@@ -239,6 +256,9 @@ func forwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 		}
 		layer.FFNGate.MatvecInto(b.normed, &b.ffnGate)
 		layer.FFNUp.MatvecInto(b.normed, &b.ffnUp)
+		if len(b.ffnGate) != dc.IntermediateSize || len(b.ffnUp) != dc.IntermediateSize {
+			return nil, fmt.Errorf("decoder step: layer %d FFN widths gate=%d up=%d, want %d", li, len(b.ffnGate), len(b.ffnUp), dc.IntermediateSize)
+		}
 		siluMulF32(b.ffnGate, b.ffnUp, b.ffnGate)
 		layer.FFNDown.MatvecInto(b.ffnGate, &b.ffnDown)
 		if len(b.ffnDown) != dc.HiddenSize {
@@ -248,11 +268,14 @@ func forwardVoxtralRealtimeDecoderStep(cfg VoxtralRealtimeConfig, weights Voxtra
 	}
 
 	rmsNormInto(x, weights.Decoder.OutputNorm, dc.Epsilon, &b.finalNormed)
-	if generate {
-		weights.Decoder.TokenEmbd.MatvecInto(b.finalNormed, &logits)
-	}
 	state.nextPos++
-	return logits, nil
+	if generate {
+		// Allocate the returned logits only on output steps. Keeping a named
+		// result passed to MatvecInto would heap-allocate its slice header even
+		// on teacher-forced steps that never project the vocabulary.
+		return weights.Decoder.TokenEmbd.Matvec(b.finalNormed), nil
+	}
+	return nil, nil
 }
 
 // appendVoxtralHistory copies a projection into owned storage so that scratch

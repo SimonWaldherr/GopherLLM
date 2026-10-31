@@ -25,6 +25,7 @@ type VoxtralRealtimeSession struct {
 	audio        *voxtralStreamAudio
 	decoder      *VoxtralRealtimeDecoderState
 	fast         voxtralFastDecoder
+	embedding    []float32 // token + audio input; both decoder paths consume it synchronously
 	prev, pos    int
 	text         strings.Builder
 	pendingUTF8  string
@@ -145,6 +146,7 @@ func (s *VoxtralRealtimeSession) Close() error {
 	s.weights = VoxtralRealtimeWeights{}
 	s.audio = nil
 	s.decoder = nil
+	s.embedding = nil
 	s.tokenizer = nil
 	s.tokenTypes = nil
 	s.text.Reset()
@@ -166,17 +168,16 @@ func (s *VoxtralRealtimeSession) step(ctx context.Context, audio []float32, toke
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	te, err := EmbedVoxtralRealtimeToken(s.cfg, s.weights, token)
-	if err != nil {
+	if err := embedVoxtralRealtimeTokenInto(s.cfg, s.weights, token, &s.embedding); err != nil {
 		return 0, err
 	}
-	for i := range te {
-		te[i] += audio[i]
+	for i := range s.embedding {
+		s.embedding[i] += audio[i]
 	}
 	if s.fast != nil {
-		return s.fast.Step(te, pos, generate)
+		return s.fast.Step(s.embedding, pos, generate)
 	}
-	logits, err := forwardVoxtralRealtimeDecoderStep(s.cfg, s.weights, s.decoder, te, pos, generate)
+	logits, err := forwardVoxtralRealtimeDecoderStep(s.cfg, s.weights, s.decoder, s.embedding, pos, generate)
 	if err != nil {
 		return 0, err
 	}

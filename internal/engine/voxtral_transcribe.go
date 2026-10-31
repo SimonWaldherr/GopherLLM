@@ -187,17 +187,18 @@ func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig
 
 	decodeStart := time.Now()
 	var prevToken int
+	// RowInto replaces the entire token row on each call. Fuse audio into this
+	// owned request scratch; CPU and Metal steps consume the input before return.
+	var fused []float32
 	for pos := range L {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		te, err := EmbedVoxtralRealtimeToken(cfg, w, promptIDs[pos])
-		if err != nil {
+		if err := embedVoxtralRealtimeTokenInto(cfg, w, promptIDs[pos], &fused); err != nil {
 			return "", fmt.Errorf("prefill pos %d: embedding token %d: %w", pos, promptIDs[pos], err)
 		}
-		fused := make([]float32, len(te))
 		for i := range fused {
-			fused[i] = te[i] + audioEmbeds[pos][i]
+			fused[i] += audioEmbeds[pos][i]
 		}
 		next, err := step(fused, pos, pos == L-1)
 		if err != nil {
@@ -222,13 +223,11 @@ func decodeVoxtralRealtimeOffline(ctx context.Context, cfg VoxtralRealtimeConfig
 			return "", err
 		}
 		ae := audioEmbeds[pos]
-		te, err := EmbedVoxtralRealtimeToken(cfg, w, prevToken)
-		if err != nil {
+		if err := embedVoxtralRealtimeTokenInto(cfg, w, prevToken, &fused); err != nil {
 			return "", fmt.Errorf("pos %d: embedding token %d: %w", pos, prevToken, err)
 		}
-		fused := make([]float32, len(te))
 		for i := range fused {
-			fused[i] = te[i] + ae[i]
+			fused[i] += ae[i]
 		}
 
 		next, err := step(fused, pos, true)

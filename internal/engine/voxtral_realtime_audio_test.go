@@ -5,15 +5,9 @@ import (
 	"testing"
 )
 
-// buildTinyVoxtralRealtimeWeights hand-builds a tiny but structurally
-// faithful Voxtral Realtime model directly (skipping the GGUF encode/decode
-// round trip, which LoadVoxtralRealtimeModel's real-checkpoint verification
-// already covers -- see voxtral_realtime.go's doc comment). The encoder's
-// heads*headDim (qkvDim) is deliberately kept different from DModel, the
-// same way the real 4B checkpoint's 1280-wide residual stream vs. 2048-wide
-// Q/K/V projection is: a regression that re-conflates the two (as an earlier
-// draft of EncodeAudioVoxtralRealtime did) fails immediately here instead of
-// only against the real 3.6GB file.
+// buildTinyVoxtralRealtimeWeights builds a synthetic model without GGUF I/O.
+// The encoder projection width deliberately differs from the residual width,
+// as in the real checkpoint, to catch accidental conflation of those dimensions.
 func buildTinyVoxtralRealtimeWeights() (VoxtralRealtimeConfig, VoxtralRealtimeWeights) {
 	const (
 		numMels = 8
