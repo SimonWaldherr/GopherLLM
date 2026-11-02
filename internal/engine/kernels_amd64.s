@@ -550,7 +550,7 @@ TEXT ·q4kDotQ8KRow(SB), NOSPLIT, $32-44
 q4kq8k_block:
 	// d (f16 at +0) and dmin (f16 at +2)
 	MOVL (SI), AX
-	MOVQ AX, X8
+	VMOVD AX, X8
 	VCVTPH2PS X8, X8           // X8 = [d, dmin, ., .]
 	// decode the 12 packed scale/min bytes into 8 scales + 8 mins
 	// (getScaleMinK4 for all j at once, llama.cpp's kmask dance)
@@ -666,7 +666,7 @@ TEXT ·q5kDotQ8KRow(SB), NOSPLIT, $32-44
 q5kq8k_block:
 	// d (f16 at +0) and dmin (f16 at +2)
 	MOVL (SI), AX
-	MOVQ AX, X8
+	VMOVD AX, X8
 	VCVTPH2PS X8, X8           // X8 = [d, dmin, ., .]
 	// decode the 12 packed scale/min bytes (identical to q4kDotQ8KRow)
 	MOVL 4(SI), AX             // A = scale bytes 0..3
@@ -904,7 +904,7 @@ TEXT ·q2kDotQ8KRow(SB), NOSPLIT, $32-44
 q2kq8k_block:
 	// d (f16 at +80) and dmin (f16 at +82)
 	MOVL 80(SI), AX
-	MOVQ AX, X8
+	VMOVD AX, X8
 	VCVTPH2PS X8, X8          // X8 = [d, dmin, ., .]
 	// d-scale nibbles (sc&0x0f) for all 16 sub-blocks -> int16 stack array,
 	// consumed by Q2KQ8CHUNK's SCOFF/SCOFF2 below.
@@ -1035,7 +1035,7 @@ q3kq8k_block:
 	// d is the last two bytes of the block; load exactly two so the final
 	// block cannot read past the end of the row.
 	MOVWLZX 108(SI), AX
-	MOVQ AX, X8
+	VMOVD AX, X8
 	VCVTPH2PS X8, X8           // X8[0] = d
 	// Unpack the 12 packed scale bytes into 16 six-bit scales. This is
 	// q3KScales' shuffle with the shift folded into the mask: the original
@@ -1238,7 +1238,7 @@ TEXT ·q6kDotQ8KRow(SB), NOSPLIT, $32-44
 q6kq8k_block:
 	// d (f16 at +208)
 	MOVWLZX 208(SI), AX
-	MOVQ AX, X8
+	VMOVD AX, X8
 	VCVTPH2PS X8, X8           // X8[0] = d
 	// 16 signed per-16 scales -> int16 on the stack
 	VPMOVSXBW 192(SI), Y1
@@ -1403,9 +1403,7 @@ q6k_ret:
 // accumulator Y12 (the shared per-256-element activation scale is applied
 // once by the caller after all 8 sub-blocks are summed).
 #define Q80CHUNK(BLOCKOFF, Q8OFF) \
-	MOVWLZX (BLOCKOFF)(SI), AX \
-	MOVQ AX, X8 \
-	VCVTPH2PS X8, X8 \
+	VCVTPH2PS (BLOCKOFF)(SI), X8 \
 	VBROADCASTSS X8, Y8 \
 	VMOVDQU (BLOCKOFF+2)(SI), Y0 \
 	VMOVDQU (Q8OFF)(DI), Y1 \

@@ -263,6 +263,42 @@ For complete recent experiments with raw data and reproduction commands, see
 
 ## CPU kernels
 
+- **x86-64 K-quant and Q8_0 row dots no longer mix legacy SSE with AVX2.** The
+  Q2_K, Q3_K, Q4_K, Q5_K and Q6_K `*DotQ8KRow` kernels loaded each block's f16
+  scale with a legacy-encoded `MOVQ AX, X8`, and the Q8_0 kernel did so for
+  every 32-element sub-block, while the upper halves of the YMM registers were
+  dirty from the previous iteration. Switching to the VEX-encoded `VMOVD` (and a
+  memory-operand `VCVTPH2PS` for Q8_0) changes no arithmetic; the kernel tests
+  still pass. The Q4_0/Q4_1 kernels already used the VEX form. Measured on a
+  4-vCPU Intel Xeon (AVX-512 capable) VM with `go test -bench` in
+  `internal/engine`, single run each:
+
+  | Benchmark | Before | After |
+  | --- | --- | --- |
+  | `DotQ8_0Q8KRow_4096` | 13,897 ns | 124 ns |
+  | `DotQ4KQ8KRow_4096` | 1,989 ns | 257 ns |
+  | `DotQ6KQ8KRow_4096` | 1,999 ns | 263 ns |
+  | `DotQ5KQ8KRow_4096` | 2,044 ns | 362 ns |
+  | `Q3KRowDotAsm` | 2,190 ns | 515 ns |
+  | `MatvecQ4K_1024x1024` | 236 µs | 55 µs |
+  | `MatvecQ6K_1024x1024` | 258 µs | 102 µs |
+  | `MatvecBatchQ4KByPromptSize/P128/q8` (3072×3072) | 145.9 ms | 19.7 ms |
+
+  The size of the penalty depends on the microarchitecture, so re-measure on
+  your CPU. With the old kernels the Q8-activation batch path lost to
+  `dequant_once` from P=4 onward; it is now ahead at P=4 and P=16 and within
+  about 15% of it (ahead at P=96 and P=128, behind at P=64) for P=32–128. Q2_K
+  has no dot-row benchmark of its own; its scale load was changed the same way
+  but is unmeasured. Only the x86-64 assembly is affected; no ARM64 code was
+  touched.
+- `layerNormInto` (BERT, Parakeet, Flux and the LayerNorm decoder families)
+  accumulated mean and variance in one serial float-add chain. It now uses four
+  independent accumulators for the mean, the SIMD dot product for the variance
+  and the SIMD scale/multiply/axpy helpers for the affine step (the same
+  per-element rounding as `(x-mean)*scale*w + b`). 4096 elements fell from
+  7.6 to 2.7 µs on the same x86-64 machine. The variance and mean sums now
+  round in a different order, so results can differ from the previous
+  implementation in the last float32 bits.
 - Parakeet distributes independent Swish rows in wide FFN batches over the
   existing worker pool and returns the already allocated output row views.
   With eight workers on M2 Max, one FFN half-step fell from 2.226 to 1.420 ms
