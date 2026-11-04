@@ -751,27 +751,60 @@ func layerNormInto(x, weight, bias []float32, epsilon float32, out *[]float32) {
 	if n == 0 {
 		return
 	}
-	mean := float32(0)
-	for _, v := range x {
-		mean += v
+	o := (*out)[:n]
+	x = x[:n]
+
+	// Mean with four independent accumulators: a single running sum is a
+	// serial float-add dependency chain (4 cycles per element), which made
+	// this the slowest per-token op in the BERT/Parakeet/LayerNorm-decoder
+	// paths relative to its size.
+	var s0, s1, s2, s3 float32
+	i := 0
+	for ; i+4 <= n; i += 4 {
+		s0 += x[i]
+		s1 += x[i+1]
+		s2 += x[i+2]
+		s3 += x[i+3]
 	}
-	mean /= float32(n)
-	variance := float32(0)
-	for _, v := range x {
-		d := v - mean
-		variance += d * d
+	for ; i < n; i++ {
+		s0 += x[i]
 	}
-	scale := float32(1 / math.Sqrt(float64(variance/float32(n)+epsilon)))
+	mean := ((s0 + s1) + (s2 + s3)) / float32(n)
+
+	// Centre into the output buffer (element i is read before it is written,
+	// so out may alias x), then take the variance as a SIMD self-dot product.
 	for i, v := range x {
-		w := float32(1)
-		if i < len(weight) {
-			w = weight[i]
+		o[i] = v - mean
+	}
+	variance := DotF32(o, o) / float32(n)
+	scale := float32(1 / math.Sqrt(float64(variance+epsilon)))
+
+	// The affine step runs on the SIMD helpers when weight (and bias) cover the
+	// whole row. Splitting (d*scale)*w + b into scale, multiply, add keeps the
+	// per-element rounding of the scalar expression: the multiply by 1 and the
+	// alpha=1 axpy are exact.
+	switch {
+	case len(weight) >= n && len(bias) >= n:
+		ScaleF32(o, scale)
+		mulScaleF32(o, weight[:n], 1, o)
+		AxpyF32(o, 1, bias[:n])
+	case len(weight) >= n && len(bias) == 0:
+		ScaleF32(o, scale)
+		mulScaleF32(o, weight[:n], 1, o)
+	default:
+		// Short or missing weight/bias: missing entries act as the identity
+		// (weight 1, bias 0), matching the original per-element handling.
+		for i, d := range o {
+			w := float32(1)
+			if i < len(weight) {
+				w = weight[i]
+			}
+			b := float32(0)
+			if i < len(bias) {
+				b = bias[i]
+			}
+			o[i] = d*scale*w + b
 		}
-		b := float32(0)
-		if i < len(bias) {
-			b = bias[i]
-		}
-		(*out)[i] = (v-mean)*scale*w + b
 	}
 }
 

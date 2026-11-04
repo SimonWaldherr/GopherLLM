@@ -44,8 +44,14 @@ func BenchmarkScaleF32_4096(b *testing.B) {
 	out := benchFloatSlice(4096)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(out) * 4))
+	// Alternate between 0.5 and 2 (both exact in binary) so the in-place
+	// data stays bounded. Repeatedly applying a factor below 1 drives the
+	// values into the denormal range, where every multiply takes a
+	// microcode assist and the benchmark measures that instead of the kernel.
+	alpha := float32(0.5)
 	for b.Loop() {
-		ScaleF32(out, 0.999)
+		ScaleF32(out, alpha)
+		alpha = 2.5 - alpha // toggles 0.5 <-> 2
 	}
 }
 
