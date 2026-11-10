@@ -1,6 +1,126 @@
 package rag
 
-import "testing"
+import (
+	"fmt"
+	"maps"
+	"strings"
+	"testing"
+)
+
+// Score each chunk independently as a reference for posting-list traversal.
+func referenceBM25Scores(b *bm25Index, query string, mode LexicalMode) map[string]float32 {
+	var terms []string
+	seen := map[string]bool{}
+	for _, term := range tokenize(query) {
+		if !b.stopwords[term] && !seen[term] {
+			terms = append(terms, term)
+			seen[term] = true
+		}
+	}
+	out := map[string]float32{}
+	for key, length := range b.length {
+		var score float32
+		matched := 0
+		for _, term := range terms {
+			f := b.postings[term][key]
+			if f == 0 {
+				continue
+			}
+			matched++
+			denom := float64(f) + bm25K1*(1-bm25B+bm25B*float64(length)/b.avgdl())
+			score += float32(bm25IDF(len(b.length), b.df[term]) * (float64(f) * (bm25K1 + 1)) / denom)
+		}
+		if matched > 0 && (mode != LexicalAll || matched == len(terms)) {
+			out[key] = score
+		}
+	}
+	return out
+}
+
+func TestBM25ScoresMatchReference(t *testing.T) {
+	b := newBM25Index(map[string]bool{"the": true})
+	for i := 0; i < 100; i++ {
+		text := "common " + strings.Repeat("alpha ", i%5)
+		if i%7 == 0 {
+			text += "rare GX-1180 日本語"
+		}
+		b.add(fmt.Sprint(i), text)
+	}
+	b.add("empty", "the")
+	queries := []string{"", "the", "missing", "common", "alpha alpha the", "common rare", "rare common", "common missing", "missing common", "alpha rare common", "rare replacement", "GX-1180", "日本語 alpha"}
+	check := func(stage string) {
+		for _, query := range queries {
+			for _, mode := range []LexicalMode{LexicalAny, LexicalAll} {
+				got, want := b.scores(query, mode), referenceBM25Scores(b, query, mode)
+				if !maps.Equal(got, want) {
+					t.Fatalf("%s query=%q mode=%d: got %v, want %v", stage, query, mode, got, want)
+				}
+			}
+		}
+	}
+	check("initial")
+	b.remove("0")
+	b.remove("7")
+	b.add("7", "common replacement")
+	check("replaced")
+	b = newBM25Index(nil)
+	check("empty")
+}
+
+func BenchmarkBM25Scores(b *testing.B) {
+	ix := newBM25Index(nil)
+	for i := 0; i < 10000; i++ {
+		text := "common alpha beta document text"
+		if i%100 == 0 {
+			text += " rare"
+		}
+		ix.add(fmt.Sprint(i), text)
+	}
+	for _, tc := range []struct {
+		name, query string
+		mode        LexicalMode
+	}{
+		{"any", "common alpha rare", LexicalAny},
+		{"all_selective", "common alpha rare", LexicalAll},
+		{"all_common", "common alpha", LexicalAll},
+		{"all_missing", "common missing", LexicalAll},
+		{"all_single", "common", LexicalAll},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				ix.scores(tc.query, tc.mode)
+			}
+		})
+	}
+}
+
+func BenchmarkBM25Replace(b *testing.B) {
+	ix := newBM25Index(nil)
+	for i := 0; i < 10000; i++ {
+		ix.add(fmt.Sprint(i), fmt.Sprintf("common document unique%d", i))
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		ix.remove("0")
+		ix.add("0", "common document unique0")
+	}
+}
+
+func TestBM25RemoveMatchesFreshIndex(t *testing.T) {
+	b := newTestBM25(map[string]string{"a": "shared shared unique", "b": "shared remaining", "empty": ""})
+	b.remove("a")
+	b.remove("a")
+	b.remove("empty")
+	b.remove("absent")
+	want := newTestBM25(map[string]string{"b": "shared remaining"})
+	if len(b.terms) != 1 || len(b.terms["b"]) != 2 {
+		t.Fatalf("removal left stale reverse postings: %v", b.terms)
+	}
+	if b.totalLength != want.totalLength || !maps.Equal(b.length, want.length) || !maps.Equal(b.df, want.df) || !maps.EqualFunc(b.postings, want.postings, func(a, b map[string]int) bool { return maps.Equal(a, b) }) {
+		t.Fatalf("removal left stale corpus statistics or postings: %+v", b)
+	}
+}
 
 func TestTokenizeSplitsAndJoinsIdentifiers(t *testing.T) {
 	got := tokenize("Order GX-1180 shipped")

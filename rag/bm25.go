@@ -69,6 +69,9 @@ type bm25Index struct {
 	// postings maps a term to the chunk keys containing it and their term
 	// frequency within that chunk.
 	postings map[string]map[string]int
+	// terms records each chunk's distinct terms so removal only visits its
+	// own postings, rather than scanning the entire corpus vocabulary.
+	terms map[string][]string
 	// df is document frequency: how many chunks contain each term at least
 	// once.
 	df map[string]int
@@ -82,6 +85,7 @@ type bm25Index struct {
 func newBM25Index(stopwords map[string]bool) *bm25Index {
 	return &bm25Index{
 		postings:  map[string]map[string]int{},
+		terms:     map[string][]string{},
 		df:        map[string]int{},
 		length:    map[string]int{},
 		stopwords: stopwords,
@@ -108,7 +112,9 @@ func (b *bm25Index) add(key, text string) {
 		freq[term]++
 		total++
 	}
+	terms := make([]string, 0, len(freq))
 	for term, f := range freq {
+		terms = append(terms, term)
 		if b.postings[term] == nil {
 			b.postings[term] = map[string]int{}
 		}
@@ -117,6 +123,7 @@ func (b *bm25Index) add(key, text string) {
 		}
 		b.postings[term][key] = f
 	}
+	b.terms[key] = terms
 	b.length[key] = total
 	b.totalLength += int64(total)
 }
@@ -131,10 +138,8 @@ func (b *bm25Index) remove(key string) {
 	if !ok {
 		return
 	}
-	for term, chunks := range b.postings {
-		if _, has := chunks[key]; !has {
-			continue
-		}
+	for _, term := range b.terms[key] {
+		chunks := b.postings[term]
 		delete(chunks, key)
 		b.df[term]--
 		if len(chunks) == 0 {
@@ -142,6 +147,7 @@ func (b *bm25Index) remove(key string) {
 			delete(b.df, term)
 		}
 	}
+	delete(b.terms, key)
 	delete(b.length, key)
 	b.totalLength -= int64(length)
 }
@@ -167,8 +173,43 @@ func (b *bm25Index) scores(query string, mode LexicalMode) map[string]float32 {
 		return nil
 	}
 	avgdl := b.avgdl()
+	if mode == LexicalAll && len(terms) > 1 {
+		// Only chunks in the shortest posting list can contain every term.
+		// Keep the query's term order when summing to preserve float32 scores.
+		type posting struct {
+			chunks map[string]int
+			idf    float64
+		}
+		postings := make([]posting, 0, len(terms))
+		var shortest map[string]int
+		for _, term := range terms {
+			chunks := b.postings[term]
+			if len(chunks) == 0 {
+				return map[string]float32{}
+			}
+			postings = append(postings, posting{chunks, bm25IDF(n, b.df[term])})
+			if shortest == nil || len(chunks) < len(shortest) {
+				shortest = chunks
+			}
+		}
+		out := map[string]float32{}
+	candidates:
+		for key := range shortest {
+			dl := float64(b.length[key])
+			norm := bm25K1 * (1 - bm25B + bm25B*dl/avgdl)
+			var score float32
+			for _, p := range postings {
+				f, ok := p.chunks[key]
+				if !ok {
+					continue candidates
+				}
+				score += float32(p.idf * (float64(f) * (bm25K1 + 1)) / (float64(f) + norm))
+			}
+			out[key] = score
+		}
+		return out
+	}
 	out := map[string]float32{}
-	matchedTerms := map[string]int{}
 	for _, term := range terms {
 		chunks, ok := b.postings[term]
 		if !ok {
@@ -180,14 +221,6 @@ func (b *bm25Index) scores(query string, mode LexicalMode) map[string]float32 {
 			dl := float64(b.length[key])
 			denom := float64(f) + bm25K1*(1-bm25B+bm25B*dl/avgdl)
 			out[key] += float32(idf * (float64(f) * (bm25K1 + 1)) / denom)
-			matchedTerms[key]++
-		}
-	}
-	if mode == LexicalAll {
-		for key, count := range matchedTerms {
-			if count < len(terms) {
-				delete(out, key)
-			}
 		}
 	}
 	return out
