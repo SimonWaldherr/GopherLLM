@@ -29,6 +29,32 @@ static const char* gllm_decode_source =
 " if(i<n)y[ulong(pos)*n+i]=x[i];\n"
 "}\n"
 "kernel void dec_add(device float* x [[buffer(0)]],const device float* y [[buffer(1)]],constant uint& n [[buffer(2)]],uint i [[thread_position_in_grid]]) { if(i<n)x[i]+=y[i]; }\n"
+"kernel void dec_add_norm(device float* x [[buffer(0)]],const device float* update [[buffer(1)]],const device float* w [[buffer(2)]],device float* y [[buffer(3)]],constant NP& p [[buffer(4)]],uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]],uint group [[threadgroup_position_in_grid]]) {\n"
+" threadgroup float sums[8];\n"
+" float sum=0; uint base=group*p.n;\n"
+" for(uint i=tid;i<p.n;i+=256){float v=x[base+i]+update[base+i];x[base+i]=v;sum+=v*v;}\n"
+" sum=simd_sum(sum); if(lane==0) sums[sg]=sum;\n"
+" threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+" float total=simd_sum(lane<8?sums[lane]:0.0f);\n"
+" float scale=rsqrt(total/float(p.n)+p.eps);\n"
+" for(uint i=tid;i<p.n;i+=256) y[base+i]=x[base+i]*scale*w[i];\n"
+"}\n"
+"struct RKP { uint q_elems; uint kv_elems; uint pairs; uint pos; uint interleaved; float temperature; };\n"
+"kernel void dec_rope_kv(const device float* q_in [[buffer(0)]],device float* q_out [[buffer(1)]],const device float* k_in [[buffer(2)]],device float* k_cache [[buffer(3)]],const device float* v_in [[buffer(4)]],device float* v_cache [[buffer(5)]],const device float* sn [[buffer(6)]],const device float* cs [[buffer(7)]],constant RKP& p [[buffer(8)]],uint i [[thread_position_in_grid]]) {\n"
+" if(i<p.q_elems) {\n"
+"  uint d=i%128,base=i-d; float v=q_in[i];\n"
+"  if(d<2*p.pairs){uint j=p.interleaved?d/2:d%p.pairs,a=p.interleaved?2*j:j,b=p.interleaved?2*j+1:j+p.pairs;v=d==a?q_in[base+a]*cs[j]-q_in[base+b]*sn[j]:q_in[base+a]*sn[j]+q_in[base+b]*cs[j];}\n"
+"  q_out[i]=v*p.temperature; return;\n"
+" }\n"
+" uint ki=i-p.q_elems;\n"
+" if(ki<p.kv_elems) {\n"
+"  uint d=ki%128,base=ki-d; float v=k_in[ki];\n"
+"  if(d<2*p.pairs){uint j=p.interleaved?d/2:d%p.pairs,a=p.interleaved?2*j:j,b=p.interleaved?2*j+1:j+p.pairs;v=d==a?k_in[base+a]*cs[j]-k_in[base+b]*sn[j]:k_in[base+a]*sn[j]+k_in[base+b]*cs[j];}\n"
+"  k_cache[ulong(p.pos)*p.kv_elems+ki]=v; return;\n"
+" }\n"
+" uint vi=ki-p.kv_elems;\n"
+" if(vi<p.kv_elems) v_cache[ulong(p.pos)*p.kv_elems+vi]=v_in[vi];\n"
+"}\n"
 "struct AP { uint heads; uint kvheads; uint hd; uint stride; uint pos; uint start; uint chunks; float scale; };\n"
 "struct DecAttentionTile { float4 acc; float maximum,total; };\n"
 "inline DecAttentionTile dec_attention_tile(const device float* q,const device float* k,const device float* v,constant AP& p,uint head,uint part,uint lane) {\n"
@@ -326,7 +352,7 @@ typedef struct {
  GLLMDecodeLayer* layer;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
-static NSString* const gllm_dec_names[]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up",@"dec_argmax_part",@"dec_argmax_merge",@"dec_attention_short",@"dec_attention_medium",@"dec_attention_long",@"dec_q6_gate_up"};
+static NSString* const gllm_dec_names[]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up",@"dec_argmax_part",@"dec_argmax_merge",@"dec_attention_short",@"dec_attention_medium",@"dec_attention_long",@"dec_q6_gate_up",@"dec_add_norm",@"dec_rope_kv"};
 enum { GLLMDecodePipelineCount=sizeof(gllm_dec_names)/sizeof(gllm_dec_names[0]) };
 static id<MTLComputePipelineState> gllm_dec_pipes[GLLMDecodePipelineCount]={nil};
 // Two small control pipelines share the shader source and all model buffers.
@@ -544,6 +570,25 @@ static void gllm_decode_add(id<MTLComputeCommandEncoder> e,GLLMDecoder* d) {
  [e setComputePipelineState:gllm_dec_pipes[3]];[e setBuffer:d->x offset:0 atIndex:0];[e setBuffer:d->proj offset:0 atIndex:1];
  uint32_t n=d->dim;[e setBytes:&n length:sizeof(n) atIndex:2];[e dispatchThreadgroups:MTLSizeMake((n+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
 }
+static void gllm_decode_add_norm(id<MTLComputeCommandEncoder> e,id<MTLBuffer> x,id<MTLBuffer> proj,id<MTLBuffer> w,id<MTLBuffer> out,int n,float eps) {
+ [e setComputePipelineState:gllm_dec_pipes[19]];[e setBuffer:x offset:0 atIndex:0];[e setBuffer:proj offset:0 atIndex:1];
+ [e setBuffer:w offset:0 atIndex:2];[e setBuffer:out offset:0 atIndex:3];
+ GLLMNormParams p={(uint32_t)n,eps};[e setBytes:&p length:sizeof(p) atIndex:4];
+ [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+}
+static void gllm_decode_rope_kv(id<MTLComputeCommandEncoder> e,id<MTLBuffer> q_in,id<MTLBuffer> q_out,id<MTLBuffer> k_in,id<MTLBuffer> k_cache,id<MTLBuffer> v_in,id<MTLBuffer> v_cache,id<MTLBuffer> sn,id<MTLBuffer> cs,int heads,int kvheads,int pairs,int pos,bool interleaved,float temperature) {
+ [e setComputePipelineState:gllm_dec_pipes[20]];
+ [e setBuffer:q_in offset:0 atIndex:0];[e setBuffer:q_out offset:0 atIndex:1];
+ [e setBuffer:k_in offset:0 atIndex:2];[e setBuffer:k_cache offset:0 atIndex:3];
+ [e setBuffer:v_in offset:0 atIndex:4];[e setBuffer:v_cache offset:0 atIndex:5];
+ [e setBuffer:sn offset:0 atIndex:6];[e setBuffer:cs offset:0 atIndex:7];
+ struct RKP { uint32_t q_elems, kv_elems, pairs, pos, interleaved; float temperature; } p = {
+  (uint32_t)(heads * 128), (uint32_t)(kvheads * 128), (uint32_t)pairs, (uint32_t)pos, (uint32_t)interleaved, temperature
+ };
+ [e setBytes:&p length:sizeof(p) atIndex:8];
+ uint32_t total = p.q_elems + p.kv_elems * 2;
+ [e dispatchThreadgroups:MTLSizeMake((total + 255) / 256, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
 // Concurrent dispatch is limited to independent Q/K/V, Q/K norms and gate/up.
 // Every producer/consumer boundary has an explicit buffer barrier.
 static void gllm_decode_barrier(id<MTLComputeCommandEncoder> e,bool concurrent) {
@@ -594,32 +639,49 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
  fused_gate=fused_gate && schedule>=0;
  setting=getenv("GOPHERLLM_METAL_DENSE_Q4_SPLIT_SUM");
  bool separate=setting==NULL || strcmp(setting,"0")!=0;
+ setting=getenv("GOPHERLLM_METAL_DENSE_FUSED_RESIDUAL_NORM");
+ bool fused_norm=setting==NULL || strcmp(setting,"0")!=0;
+ setting=getenv("GOPHERLLM_METAL_DENSE_FUSED_ROPE_KV");
+ bool fused_rope_kv=setting==NULL || strcmp(setting,"0")!=0;
  id<MTLCommandBuffer> cb=gllm_metal_new_command_buffer();
  id<MTLComputeCommandEncoder> e=[cb computeCommandEncoderWithDispatchType:concurrent?MTLDispatchTypeConcurrent:MTLDispatchTypeSerial];
+ if(fused_norm) {
+  gllm_decode_norm(e,d->x,d->layer[0].norm,d->xn,d->dim,1,d->eps);
+  gllm_decode_barrier(e,concurrent);
+ }
  for(int layer=0;layer<d->layers;layer++) {
   GLLMDecodeLayer* l=&d->layer[layer];
-  gllm_decode_norm(e,d->x,l->norm,d->xn,d->dim,1,d->eps);
-  gllm_decode_barrier(e,concurrent);
+  if(!fused_norm) {
+   gllm_decode_norm(e,d->x,l->norm,d->xn,d->dim,1,d->eps);
+   gllm_decode_barrier(e,concurrent);
+  }
   gllm_decode_matvec(e,l,0,d->xn,d->q,schedule,separate);gllm_decode_matvec(e,l,1,d->xn,d->k,schedule,separate);gllm_decode_matvec(e,l,2,d->xn,d->v,schedule,separate);
   gllm_decode_barrier(e,concurrent);
   id<MTLBuffer> q=d->q,k=d->k;
   if(l->qNorm!=nil){gllm_decode_norm(e,q,l->qNorm,d->qr,128,d->heads,d->eps);q=d->qr;}
   if(l->kNorm!=nil){gllm_decode_norm(e,k,l->kNorm,d->kr,128,d->kvheads,d->eps);k=d->kr;}
   if(l->qNorm!=nil || l->kNorm!=nil)gllm_decode_barrier(e,concurrent);
-  for(int isK=0;isK<2;isK++) {
-   uint32_t heads=isK?d->kvheads:d->heads;
-   GLLMRopeParams p={heads,128,(uint32_t)pairs,isK?(uint32_t)pos:0,isK?heads*128:0,(uint32_t)interleaved,isK?1.0f:temperature};
-   [e setComputePipelineState:gllm_dec_pipes[1]];[e setBuffer:isK?k:q offset:0 atIndex:0];
-   [e setBuffer:isK?l->k:(q==d->q?d->qr:d->q) offset:0 atIndex:1];
-   [e setBuffer:d->sn offset:0 atIndex:2];[e setBuffer:d->cs offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];
-   [e dispatchThreadgroups:MTLSizeMake((heads*128+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+  uint32_t stride=d->kvheads*128;
+  if(fused_rope_kv && l->qNorm==nil && l->kNorm==nil) {
+   gllm_decode_rope_kv(e,q,d->qr,k,l->k,d->v,l->v,d->sn,d->cs,d->heads,d->kvheads,pairs,pos,interleaved,temperature);
+   q=d->qr;
+   gllm_decode_barrier(e,concurrent);
+  } else {
+   for(int isK=0;isK<2;isK++) {
+    uint32_t heads=isK?d->kvheads:d->heads;
+    GLLMRopeParams p={heads,128,(uint32_t)pairs,isK?(uint32_t)pos:0,isK?heads*128:0,(uint32_t)interleaved,isK?1.0f:temperature};
+    [e setComputePipelineState:gllm_dec_pipes[1]];[e setBuffer:isK?k:q offset:0 atIndex:0];
+    [e setBuffer:isK?l->k:(q==d->q?d->qr:d->q) offset:0 atIndex:1];
+    [e setBuffer:d->sn offset:0 atIndex:2];[e setBuffer:d->cs offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];
+    [e dispatchThreadgroups:MTLSizeMake((heads*128+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+   }
+   q=q==d->q?d->qr:d->q;
+   uint32_t position=pos;
+   [e setComputePipelineState:gllm_dec_pipes[2]];[e setBuffer:d->v offset:0 atIndex:0];[e setBuffer:l->v offset:0 atIndex:1];
+   [e setBytes:&stride length:sizeof(stride) atIndex:2];[e setBytes:&position length:sizeof(position) atIndex:3];
+   [e dispatchThreadgroups:MTLSizeMake((stride+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+   gllm_decode_barrier(e,concurrent);
   }
-  q=q==d->q?d->qr:d->q;
-  uint32_t stride=d->kvheads*128,position=pos;
-  [e setComputePipelineState:gllm_dec_pipes[2]];[e setBuffer:d->v offset:0 atIndex:0];[e setBuffer:l->v offset:0 atIndex:1];
-  [e setBytes:&stride length:sizeof(stride) atIndex:2];[e setBytes:&position length:sizeof(position) atIndex:3];
-  [e dispatchThreadgroups:MTLSizeMake((stride+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-  gllm_decode_barrier(e,concurrent);
   uint32_t start=l->window>0 && pos>l->window?pos-l->window:0;
   uint32_t chunks=(pos-start+32)/32;
   GLLMAttentionParams ap={(uint32_t)d->heads,(uint32_t)d->kvheads,128,stride,(uint32_t)pos,start,chunks,d->scale};
@@ -638,10 +700,15 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
   gllm_decode_barrier(e,concurrent);
   gllm_decode_matvec(e,l,3,d->attn,d->proj,schedule,separate);
   gllm_decode_barrier(e,concurrent);
-  gllm_decode_add(e,d);
-  gllm_decode_barrier(e,concurrent);
-  gllm_decode_norm(e,d->x,l->ffnNorm,d->xn,d->dim,1,d->eps);
-  gllm_decode_barrier(e,concurrent);
+  if(fused_norm) {
+   gllm_decode_add_norm(e,d->x,d->proj,l->ffnNorm,d->xn,d->dim,d->eps);
+   gllm_decode_barrier(e,concurrent);
+  } else {
+   gllm_decode_add(e,d);
+   gllm_decode_barrier(e,concurrent);
+   gllm_decode_norm(e,d->x,l->ffnNorm,d->xn,d->dim,1,d->eps);
+   gllm_decode_barrier(e,concurrent);
+  }
   if(fused_gate && l->quant[4]==l->quant[5] && (l->quant[4]==4 || l->quant[4]==6)) {
    GLLMMetalWeight* gate=l->w[4];GLLMMetalWeight* up=l->w[5];
    [e setComputePipelineState:l->quant[4]==6?gllm_dec_pipes[18]:(separate?gllm_dec_pipes[12]:gllm_dec_q4_reference[1])];
@@ -658,10 +725,16 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
   gllm_decode_barrier(e,concurrent);
   gllm_decode_matvec(e,l,6,d->hid,d->proj,schedule,separate);
   gllm_decode_barrier(e,concurrent);
-  gllm_decode_add(e,d);
-  gllm_decode_barrier(e,concurrent);
+  if(fused_norm) {
+   id<MTLBuffer> nextNorm=layer+1<d->layers?d->layer[layer+1].norm:d->outputNorm;
+   gllm_decode_add_norm(e,d->x,d->proj,nextNorm,d->xn,d->dim,d->eps);
+   gllm_decode_barrier(e,concurrent);
+  } else {
+   gllm_decode_add(e,d);
+   gllm_decode_barrier(e,concurrent);
+  }
  }
- gllm_decode_norm(e,d->x,d->outputNorm,d->xn,d->dim,1,d->eps);
+ if(!fused_norm)gllm_decode_norm(e,d->x,d->outputNorm,d->xn,d->dim,1,d->eps);
  if(logits!=NULL || next!=NULL) {
   gllm_decode_barrier(e,concurrent);
   gllm_decode_quantized_with_pipe(e,d->outputWeight,d->outputQuant,d->xn,d->logits,schedule,gllm_decode_matvec_pipe(d->outputQuant,separate));
