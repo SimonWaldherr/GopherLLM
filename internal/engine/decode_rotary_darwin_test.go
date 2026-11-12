@@ -107,3 +107,27 @@ func TestMetalDenseDecodeRejectsResizedSharedCache(t *testing.T) {
 		}
 	}
 }
+
+// Small projections expose dispatch overhead in a complete two-layer decode.
+func BenchmarkMetalDenseRotaryKV(b *testing.B) {
+	if !MetalAvailable() {
+		b.Skip(MetalError())
+	}
+	c, _, gpu := metalPrefillFixture(b, "qwen3")
+	for _, variant := range []struct{ name, setting string }{{"separate", "0"}, {"fused", "1"}} {
+		b.Run(variant.name, func(b *testing.B) {
+			b.Setenv("GOPHERLLM_METAL_DENSE_FUSED_ROPE_KV", variant.setting)
+			cache, buf := metalPrefillBuffer(b, c, 32)
+			for pos := range 32 {
+				if !tryMetalDenseDecode(c, gpu, cache, buf, uint32(pos%16), pos) {
+					b.Fatal("dense decode inactive:", MetalError())
+				}
+			}
+			for b.Loop() {
+				if !tryMetalDenseDecode(c, gpu, cache, buf, 15, 31) {
+					b.Fatal("dense decode inactive:", MetalError())
+				}
+			}
+		})
+	}
+}

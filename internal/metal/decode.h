@@ -662,26 +662,26 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
   if(l->kNorm!=nil){gllm_decode_norm(e,k,l->kNorm,d->kr,128,d->kvheads,d->eps);k=d->kr;}
   if(l->qNorm!=nil || l->kNorm!=nil)gllm_decode_barrier(e,concurrent);
   uint32_t stride=d->kvheads*128;
-  if(fused_rope_kv && l->qNorm==nil && l->kNorm==nil) {
-   gllm_decode_rope_kv(e,q,d->qr,k,l->k,d->v,l->v,d->sn,d->cs,d->heads,d->kvheads,pairs,pos,interleaved,temperature);
-   q=d->qr;
-   gllm_decode_barrier(e,concurrent);
+  // RoPE reads both members of a pair; rotate into the unused Q buffer.
+  id<MTLBuffer> rotatedQ=q==d->q?d->qr:d->q;
+  if(fused_rope_kv) {
+   gllm_decode_rope_kv(e,q,rotatedQ,k,l->k,d->v,l->v,d->sn,d->cs,d->heads,d->kvheads,pairs,pos,interleaved,temperature);
   } else {
    for(int isK=0;isK<2;isK++) {
     uint32_t heads=isK?d->kvheads:d->heads;
     GLLMRopeParams p={heads,128,(uint32_t)pairs,isK?(uint32_t)pos:0,isK?heads*128:0,(uint32_t)interleaved,isK?1.0f:temperature};
     [e setComputePipelineState:gllm_dec_pipes[1]];[e setBuffer:isK?k:q offset:0 atIndex:0];
-    [e setBuffer:isK?l->k:(q==d->q?d->qr:d->q) offset:0 atIndex:1];
+    [e setBuffer:isK?l->k:rotatedQ offset:0 atIndex:1];
     [e setBuffer:d->sn offset:0 atIndex:2];[e setBuffer:d->cs offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];
     [e dispatchThreadgroups:MTLSizeMake((heads*128+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
    }
-   q=q==d->q?d->qr:d->q;
    uint32_t position=pos;
    [e setComputePipelineState:gllm_dec_pipes[2]];[e setBuffer:d->v offset:0 atIndex:0];[e setBuffer:l->v offset:0 atIndex:1];
    [e setBytes:&stride length:sizeof(stride) atIndex:2];[e setBytes:&position length:sizeof(position) atIndex:3];
    [e dispatchThreadgroups:MTLSizeMake((stride+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-   gllm_decode_barrier(e,concurrent);
   }
+  q=rotatedQ;
+  gllm_decode_barrier(e,concurrent);
   uint32_t start=l->window>0 && pos>l->window?pos-l->window:0;
   uint32_t chunks=(pos-start+32)/32;
   GLLMAttentionParams ap={(uint32_t)d->heads,(uint32_t)d->kvheads,128,stride,(uint32_t)pos,start,chunks,d->scale};
