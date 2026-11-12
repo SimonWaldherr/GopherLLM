@@ -473,3 +473,88 @@ func TestSearchTinyMinScoreMatchesFullScan(t *testing.T) {
 		t.Fatalf("tiny minimum score: got %v, want %v, err=%v", got, want, err)
 	}
 }
+
+func TestIndexBatchMutationsMatchSequentialUpdates(t *testing.T) {
+	opts := Options{Chunker: Chunker{MaxRunes: 12, MinRunes: 1, OverlapRunes: 1}, Embedder: fakeEmbedder{vec: func(s string) []float32 {
+		if len(s)%2 == 0 {
+			return []float32{1, 0}
+		}
+		return []float32{0, 1}
+	}}}
+	batch, seq := New(opts), New(opts)
+	initial := []Doc{{ID: "keep", Text: "survivor"}, {ID: "a", Text: "old alpha in a long document"}, {ID: "b", Text: "old beta"}}
+	for _, ix := range []*Index{batch, seq} {
+		if err := ix.Add(t.Context(), initial...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	updates := []Doc{{ID: "a", Text: "transient"}, {ID: "c", Text: "new charlie"}, {ID: "b", Text: "updated beta"}, {ID: "a", Text: "final"}, {ID: "empty", Text: "temporary"}, {ID: "empty"}}
+	if err := batch.Add(t.Context(), updates...); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range updates {
+		if err := seq.Add(t.Context(), d); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func() {
+		t.Helper()
+		if !slices.Equal(batch.order, seq.order) || !slices.Equal(batch.List(), seq.List()) || batch.Docs() != seq.Docs() || batch.Len() != seq.Len() {
+			t.Fatalf("batch order %v, want %v", batch.order, seq.order)
+		}
+		for _, query := range []string{"transient", "temporary", "old", "beta", "final"} {
+			q := Query{TopK: 20, MinScore: -1}
+			got, err := batch.Search(t.Context(), query, q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := seq.Search(t.Context(), query, q)
+			if err != nil || !slices.Equal(got, want) {
+				t.Fatalf("%q: got %v, want %v, err=%v", query, got, want, err)
+			}
+		}
+	}
+	check()
+	ids := []string{"b", "missing", "empty", "b", "c"}
+	if got := batch.Remove(ids...); got != 3 {
+		t.Fatalf("removed %d docs, want 3", got)
+	}
+	for _, id := range ids {
+		seq.Remove(id)
+	}
+	check()
+}
+
+func BenchmarkIndexBatchUpdates(b *testing.B) {
+	for _, size := range []int{1, 128} {
+		for _, remove := range []bool{false, true} {
+			name := "replace"
+			if remove {
+				name = "remove_add"
+			}
+			b.Run(fmt.Sprintf("%s/%d", name, size), func(b *testing.B) {
+				ix := New(Options{})
+				docs := make([]Doc, 10000)
+				for i := range docs {
+					docs[i] = Doc{ID: fmt.Sprint(i), Text: "common document text"}
+				}
+				if err := ix.Add(b.Context(), docs...); err != nil {
+					b.Fatal(err)
+				}
+				ids := make([]string, size)
+				for i := range ids {
+					ids[i] = docs[i].ID
+				}
+				b.ReportAllocs()
+				for b.Loop() {
+					if remove && ix.Remove(ids...) != size {
+						b.Fatal("unexpected removal count")
+					}
+					if err := ix.Add(b.Context(), docs[:size]...); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}

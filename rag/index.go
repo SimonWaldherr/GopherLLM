@@ -298,14 +298,11 @@ func (ix *Index) Add(ctx context.Context, docs ...Doc) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
+	retired := make(map[string]int)
 	vi := 0
 	for _, p := range plan {
 		if existing, ok := ix.docs[p.doc.ID]; ok {
-			for _, key := range existing.chunkKeys {
-				ix.bm25.remove(key)
-				delete(ix.chunks, key)
-			}
-			ix.order = removeAll(ix.order, existing.chunkKeys)
+			ix.retireChunks(existing, retired)
 		}
 		entry := &docEntry{doc: p.doc, chunkKeys: make([]string, 0, len(p.chunks))}
 		for _, c := range p.chunks {
@@ -325,24 +322,46 @@ func (ix *Index) Add(ctx context.Context, docs ...Doc) error {
 		}
 		ix.docs[p.doc.ID] = entry
 	}
+	ix.compactOrder(retired)
 	return nil
 }
 
-func removeAll(order []string, remove []string) []string {
-	if len(remove) == 0 {
-		return order
+// retireChunks removes the postings immediately, so later replacements in
+// the same batch can safely index a new chunk under the same key.
+func (ix *Index) retireChunks(entry *docEntry, retired map[string]int) {
+	for _, key := range entry.chunkKeys {
+		ix.bm25.remove(key)
+		delete(ix.chunks, key)
+		retired[key]++
 	}
-	drop := make(map[string]bool, len(remove))
-	for _, k := range remove {
-		drop[k] = true
+}
+
+// Replacements append to order. For each key, discard its retired
+// occurrences from the front and keep the final occurrence if still live.
+func (ix *Index) compactOrder(retired map[string]int) {
+	if len(retired) == 0 {
+		return
 	}
-	out := order[:0]
-	for _, k := range order {
-		if !drop[k] {
-			out = append(out, k)
+	// A single replaced chunk only needs a string search and one slice move.
+	if len(retired) == 1 {
+		for key, count := range retired {
+			if count == 1 {
+				i := slices.Index(ix.order, key)
+				ix.order = slices.Delete(ix.order, i, i+1)
+				return
+			}
 		}
 	}
-	return out
+	live := ix.order[:0]
+	for _, key := range ix.order {
+		if retired[key] > 0 {
+			retired[key]--
+			continue
+		}
+		live = append(live, key)
+	}
+	clear(ix.order[len(live):])
+	ix.order = live
 }
 
 // Len reports the total number of indexed chunks.
@@ -404,20 +423,18 @@ func (ix *Index) List() []DocInfo {
 func (ix *Index) Remove(ids ...string) int {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	retired := make(map[string]int)
 	removed := 0
 	for _, id := range ids {
 		entry, ok := ix.docs[id]
 		if !ok {
 			continue
 		}
-		for _, key := range entry.chunkKeys {
-			ix.bm25.remove(key)
-			delete(ix.chunks, key)
-		}
-		ix.order = removeAll(ix.order, entry.chunkKeys)
+		ix.retireChunks(entry, retired)
 		delete(ix.docs, id)
 		removed++
 	}
+	ix.compactOrder(retired)
 	return removed
 }
 
