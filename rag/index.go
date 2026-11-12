@@ -1,10 +1,11 @@
 package rag
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -421,7 +422,7 @@ func (ix *Index) Remove(ids ...string) int {
 }
 
 type scored struct {
-	key                string
+	entry              *chunkEntry
 	vecRaw, kwRaw, rec float32
 	score              float32
 	lexicalOnly        bool
@@ -429,9 +430,7 @@ type scored struct {
 
 // Search ranks the index against query, blending BM25 keyword matching,
 // cosine vector similarity (when this Index has an Embedder), and recency,
-// per q and the Index's Ranking. See the package doc for why this always
-// scores the whole index rather than a top-N candidate shortlist: at this
-// package's target scale, the union IS the brute-force scan.
+// per q and the Index's Ranking.
 func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -474,12 +473,30 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 	}
 	halfLife := ix.opts.Ranking.recencyHalfLife()
 
-	candidates := make([]scored, 0, len(ix.chunks))
-	for _, key := range ix.order {
+	keys := ix.order
+	// Without vectors or kind multipliers, an unmatched chunk scores zero
+	// after subtracting recency for MinScore. A Filter must still see all
+	// chunks in insertion order. For dense matches reuse the existing keys.
+	// A fused multiply-subtract can leave a rounding residual on removal of
+	// recency. Since recNorm is at most 1, one float32 epsilon times the
+	// weight bounds it. Preserve full-scan results at smaller thresholds.
+	recencyRoundoff := math.Abs(float64(recWeight)) * 0x1p-23
+	if ix.opts.Embedder == nil && len(ix.opts.KindWeight) == 0 && q.Filter == nil &&
+		float64(q.minScore()) > recencyRoundoff && len(kwScores) <= len(keys)/2 {
+		keys = make([]string, 0, len(kwScores))
+		for key := range kwScores {
+			keys = append(keys, key)
+		}
+	}
+
+	now := time.Now()
+	candidates := make([]scored, 0, len(keys))
+	for _, key := range keys {
 		ce := ix.chunks[key]
-		doc := ix.docs[ce.chunk.DocID]
-		if q.Filter != nil && doc != nil && !q.Filter(doc.doc) {
-			continue
+		if q.Filter != nil {
+			if doc := ix.docs[ce.chunk.DocID]; doc != nil && !q.Filter(doc.doc) {
+				continue
+			}
 		}
 		kwRaw := kwScores[key]
 		var vecRaw float32
@@ -496,7 +513,7 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 			kwNorm = kwRaw / maxKw
 		}
 		vecNorm := (vecRaw + 1) / 2
-		recNorm := recencyScore(ce.time, halfLife)
+		recNorm := recencyScore(ce.time, now, halfLife)
 
 		score := vw*vecNorm + kwWeight*kwNorm + recWeight*recNorm
 		if kind := ce.kind; kind != "" {
@@ -516,29 +533,28 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 			continue
 		}
 
-		candidates = append(candidates, scored{key: key, vecRaw: vecRaw, kwRaw: kwNorm, rec: recNorm, score: score, lexicalOnly: lexicalOnly})
+		candidates = append(candidates, scored{entry: ce, vecRaw: vecRaw, kwRaw: kwNorm, rec: recNorm, score: score, lexicalOnly: lexicalOnly})
 	}
 
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].score != candidates[j].score {
-			return candidates[i].score > candidates[j].score
+	slices.SortFunc(candidates, func(a, b scored) int {
+		if a.score != b.score {
+			return cmp.Compare(b.score, a.score)
 		}
-		ci, cj := ix.chunks[candidates[i].key].chunk, ix.chunks[candidates[j].key].chunk
-		if ci.DocID != cj.DocID {
-			return ci.DocID < cj.DocID
+		if id := strings.Compare(a.entry.chunk.DocID, b.entry.chunk.DocID); id != 0 {
+			return id
 		}
-		return ci.Index < cj.Index
+		return cmp.Compare(a.entry.chunk.Index, b.entry.chunk.Index)
 	})
 
 	maxPerDoc := q.maxChunksPerDoc()
 	perDoc := map[string]int{}
 	docsUsed := map[string]bool{}
-	hits := make([]Hit, 0, q.topK())
+	hits := make([]Hit, 0, min(q.topK(), len(candidates)))
 	for _, c := range candidates {
 		if len(hits) >= q.topK() {
 			break
 		}
-		ce := ix.chunks[c.key]
+		ce := c.entry
 		docID := ce.chunk.DocID
 		if maxPerDoc > 0 && perDoc[docID] >= maxPerDoc {
 			continue
@@ -594,11 +610,11 @@ func dot(a, b []float32) float32 {
 // recencyScore is exponential decay against halfLife: 1.0 for a document
 // dated now, 0.5 at exactly one half-life old, approaching 0 beyond that. A
 // zero Time (Doc.Time never set) scores 0 — there is nothing to decay from.
-func recencyScore(t time.Time, halfLife time.Duration) float32 {
+func recencyScore(t, now time.Time, halfLife time.Duration) float32 {
 	if t.IsZero() || halfLife <= 0 {
 		return 0
 	}
-	age := time.Since(t)
+	age := now.Sub(t)
 	if age < 0 {
 		age = 0
 	}

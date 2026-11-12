@@ -3,6 +3,9 @@ package rag
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"slices"
 	"testing"
 	"time"
 
@@ -383,5 +386,90 @@ func TestIndexRemoveDeletesChunksAndPostings(t *testing.T) {
 	list := ix.List()
 	if len(list) != 1 || list[0].ID != "d2" {
 		t.Fatalf("List() after Remove = %+v, want only d2", list)
+	}
+}
+
+func BenchmarkIndexSearchLexical(b *testing.B) {
+	ix := New(Options{})
+	docs := make([]Doc, 10000)
+	for i := range docs {
+		text := "common word"
+		if i%100 == 0 {
+			text += " rare"
+		}
+		docs[i] = Doc{ID: fmt.Sprint(i), Text: text}
+	}
+	if err := ix.Add(b.Context(), docs...); err != nil {
+		b.Fatal(err)
+	}
+	for _, query := range []string{"missing", "common rare", "common"} {
+		b.Run(query, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := ix.Search(b.Context(), query, Query{Lexical: LexicalAll}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestSparseLexicalSearchMatchesFullScan(t *testing.T) {
+	ix := New(Options{})
+	// Identical timestamps and text exercise tie breaking independently of
+	// posting list order. Future timestamps have a constant recency of one.
+	date := time.Now().Add(24 * time.Hour)
+	for i := 19; i >= 0; i-- {
+		text := "common"
+		if i%5 == 0 {
+			text += " rare"
+		}
+		if err := ix.Add(t.Context(), Doc{ID: fmt.Sprint(i), Text: text, Time: date}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, minScore := range []float32{-1, 0, 2} {
+		for _, query := range []string{"missing", "common rare", "common"} {
+			q := Query{Lexical: LexicalAll, TopK: 3, MinScore: minScore}
+			got, err := ix.Search(t.Context(), query, q)
+			if err != nil {
+				t.Fatal(err)
+			}
+			visited := 0
+			q.Filter = func(Doc) bool { visited++; return true }
+			want, err := ix.Search(t.Context(), query, q)
+			if err != nil || visited != ix.Len() || !slices.Equal(got, want) {
+				t.Fatalf("%q minScore=%g visited=%d got=%v want=%v err=%v", query, minScore, visited, got, want, err)
+			}
+		}
+	}
+}
+
+func TestSearchAppliesKindWeightToUnmatchedChunks(t *testing.T) {
+	ix := New(Options{Ranking: Ranking{KindWeight: map[string]float32{"priority": 3}}})
+	if err := ix.Add(t.Context(), Doc{ID: "recent", Text: "example", Kind: "priority", Time: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	hits, err := ix.Search(t.Context(), "missing", Query{})
+	if err != nil || len(hits) != 1 || hits[0].DocID != "recent" || hits[0].Keyword != 0 {
+		t.Fatalf("kind-weighted search returned %+v, err=%v", hits, err)
+	}
+}
+
+func TestSearchTinyMinScoreMatchesFullScan(t *testing.T) {
+	ix := New(Options{Ranking: Ranking{KeywordWeight: 4, RecencyWeight: 1}})
+	age := time.Duration(float64(ix.opts.recencyHalfLife()) * math.Log2(4.0/3))
+	if err := ix.Add(t.Context(), Doc{ID: "item", Text: "example", Time: time.Now().Add(-age)}); err != nil {
+		t.Fatal(err)
+	}
+	q := Query{MinScore: 1e-10}
+	got, err := ix.Search(t.Context(), "missing", q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Filter = func(Doc) bool { return true }
+	want, err := ix.Search(t.Context(), "missing", q)
+	if err != nil || !slices.Equal(got, want) {
+		t.Fatalf("tiny minimum score: got %v, want %v, err=%v", got, want, err)
 	}
 }
