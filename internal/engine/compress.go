@@ -277,6 +277,9 @@ func CompressModel(sourcePath, outPath string, opts CompressOptions) error {
 	if err != nil {
 		return fmt.Errorf("compress: parse %s: %w", sourcePath, err)
 	}
+	if hasLittleBitGGUF(src) {
+		return fmt.Errorf("compress: %s contains LittleBit factors, which are unsupported by row-wise compression", sourcePath)
+	}
 	if shardNo, shardCount, ok := splitInfo(src); ok {
 		return fmt.Errorf("compress: %s is shard %d/%d of a split GGUF; merge the shards before quantizing", sourcePath, shardNo+1, shardCount)
 	}

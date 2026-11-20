@@ -62,6 +62,9 @@ func rawScalarDot(raw []byte, typ GGMLType, offset int, x []float32, cols int) f
 	if typ == GGMLTypeF16 && n > 0 {
 		return dotF32F16(x[:n], f16RowView(raw, offset, n))
 	}
+	if typ == GGMLTypeBF16 {
+		return dotF32BF16(x[:n], raw[offset:offset+2*n])
+	}
 	var s0, s1, s2, s3 float32
 	i := 0
 	switch typ {
@@ -85,16 +88,6 @@ func rawScalarDot(raw []byte, typ GGMLType, offset int, x []float32, cols int) f
 		for ; i < n; i++ {
 			s0 += F16ToF32(binary.LittleEndian.Uint16(raw[offset+i*2:])) * x[i]
 		}
-	case GGMLTypeBF16:
-		for ; i+4 <= n; i += 4 {
-			s0 += math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[offset+i*2:]))<<16) * x[i]
-			s1 += math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[offset+(i+1)*2:]))<<16) * x[i+1]
-			s2 += math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[offset+(i+2)*2:]))<<16) * x[i+2]
-			s3 += math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[offset+(i+3)*2:]))<<16) * x[i+3]
-		}
-		for ; i < n; i++ {
-			s0 += math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[offset+i*2:]))<<16) * x[i]
-		}
 	case GGMLTypeF64:
 		for ; i+4 <= n; i += 4 {
 			s0 += float32(math.Float64frombits(binary.LittleEndian.Uint64(raw[offset+i*8:]))) * x[i]
@@ -107,6 +100,35 @@ func rawScalarDot(raw []byte, typ GGMLType, offset int, x []float32, cols int) f
 		}
 	}
 	return s0 + s1 + s2 + s3
+}
+
+func bf16WeightValue(raw []byte, i int) float32 {
+	return math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[i*2:])) << 16)
+}
+
+// dotF32BF16Scalar maintains the ordinary raw-scalar accumulation on
+// platforms where the vector path is unavailable.
+func dotF32BF16Scalar(x []float32, raw []byte) float32 {
+	var s0, s1, s2, s3 float32
+	i := 0
+	for ; i+4 <= len(x); i += 4 {
+		s0 += bf16WeightValue(raw, i) * x[i]
+		s1 += bf16WeightValue(raw, i+1) * x[i+1]
+		s2 += bf16WeightValue(raw, i+2) * x[i+2]
+		s3 += bf16WeightValue(raw, i+3) * x[i+3]
+	}
+	for ; i < len(x); i++ {
+		s0 += bf16WeightValue(raw, i) * x[i]
+	}
+	return s0 + s1 + s2 + s3
+}
+
+// dotF32BF16Tail uses the same final, sequential FP32 additions as DotF32.
+func dotF32BF16Tail(sum float32, x []float32, raw []byte) float32 {
+	for i, value := range x {
+		sum += float32(value * bf16WeightValue(raw, i))
+	}
+	return sum
 }
 
 func (w Weight) rawScalarMatvecInto(x []float32, out *[]float32) bool {

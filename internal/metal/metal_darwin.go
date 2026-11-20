@@ -926,6 +926,8 @@ static bool gllm_metal_ensure_batch_buffer(id<MTLBuffer>* buffer, NSUInteger len
 	return true;
 }
 
+#include "littlebit.h"
+
 // gllm_metal_ensure_batch_argmax_buffers owns only the input, projected
 // vocabulary values, and one tiny result record per draft position. Unlike a
 // materialized [batch][vocab] readback, the projected values stay on device;
@@ -1499,6 +1501,7 @@ static void gllm_metal_release_weight(void* handle) {
 	}
 }
 #include "q8_0.h"
+#include "bf16_head.h"
 #include "decode.h"
 #include "geglu.h"
 
@@ -1759,6 +1762,208 @@ type Weight struct {
 	cols int
 }
 
+type LittleBitScaleKind uint32
+
+const (
+	LittleBitF32  LittleBitScaleKind = 1
+	LittleBitF16  LittleBitScaleKind = 2
+	LittleBitBF16 LittleBitScaleKind = 3
+)
+
+type LittleBitScale struct {
+	Data []byte
+	Kind LittleBitScaleKind
+}
+
+type LittleBitFactors struct {
+	Rank           int
+	U, V           []byte
+	U1, U2, V1, V2 LittleBitScale
+}
+
+// LittleBitWeight owns a compact Metal copy of the packed factors and scales.
+// Input, latent and output slabs are shared across weights and runners.
+type LittleBitWeight struct {
+	ptr        unsafe.Pointer
+	rows, cols int
+	rank       int
+	bytes      int
+}
+
+type littleBitUpload struct {
+	offset int
+	data   []byte
+}
+
+type littleBitLayout struct {
+	bytes int
+	parts []littleBitUpload
+}
+
+func (l *littleBitLayout) add(data []byte) (C.uint32_t, bool) {
+	offset := (l.bytes + 3) &^ 3
+	if len(data) == 0 || len(data) > math.MaxUint32-offset {
+		return 0, false
+	}
+	l.parts = append(l.parts, littleBitUpload{offset: offset, data: data})
+	l.bytes = offset + len(data)
+	return C.uint32_t(offset), true
+}
+
+func (l *littleBitLayout) matrix(data []byte, rows, cols int) (C.uint32_t, bool) {
+	words := (cols + 31) / 32
+	if words > len(data)/rows/4 || len(data) != rows*words*4 {
+		return 0, false
+	}
+	return l.add(data)
+}
+
+func (l *littleBitLayout) scale(s LittleBitScale, n int) (C.GLLMLittleBitScale, bool) {
+	size := 2
+	switch s.Kind {
+	case LittleBitF32:
+		size = 4
+	case LittleBitF16, LittleBitBF16:
+	default:
+		return C.GLLMLittleBitScale{}, false
+	}
+	if len(s.Data) != n*size {
+		return C.GLLMLittleBitScale{}, false
+	}
+	offset, ok := l.add(s.Data)
+	return C.GLLMLittleBitScale{offset: offset, kind: C.uint32_t(s.Kind)}, ok
+}
+
+func (l *littleBitLayout) factors(f LittleBitFactors, rows, cols int) (C.GLLMLittleBitFactors, bool) {
+	var result C.GLLMLittleBitFactors
+	if f.Rank <= 0 || f.Rank > math.MaxInt32 {
+		return result, false
+	}
+	result.rank = C.uint32_t(f.Rank)
+	var ok bool
+	if result.u, ok = l.matrix(f.U, rows, f.Rank); !ok {
+		return result, false
+	}
+	if result.v, ok = l.matrix(f.V, f.Rank, cols); !ok {
+		return result, false
+	}
+	for i, s := range []LittleBitScale{f.U1, f.U2, f.V1, f.V2} {
+		target := [...]*C.GLLMLittleBitScale{&result.u1, &result.u2, &result.v1, &result.v2}[i]
+		n := [...]int{rows, f.Rank, f.Rank, cols}[i]
+		if *target, ok = l.scale(s, n); !ok {
+			return result, false
+		}
+	}
+	return result, true
+}
+
+func PrepareLittleBit(rows, cols int, main LittleBitFactors, residual *LittleBitFactors, bias LittleBitScale) *LittleBitWeight {
+	if rows <= 0 || rows > math.MaxInt32 || cols <= 0 || cols > math.MaxInt32 {
+		return nil
+	}
+	var parts [13]littleBitUpload
+	layout := littleBitLayout{parts: parts[:0]}
+	params := C.GLLMLittleBitParams{rows: C.uint32_t(rows), cols: C.uint32_t(cols)}
+	var ok bool
+	if params.main, ok = layout.factors(main, rows, cols); !ok {
+		return nil
+	}
+	rank := main.Rank
+	if residual != nil {
+		if params.residual, ok = layout.factors(*residual, rows, cols); !ok {
+			return nil
+		}
+		if residual.Rank > math.MaxInt32-rank {
+			return nil
+		}
+		rank += residual.Rank
+	}
+	if len(bias.Data) > 0 {
+		if params.bias, ok = layout.scale(bias, rows); !ok {
+			return nil
+		}
+	}
+	ptr := C.gllm_metal_new_littlebit(C.NSUInteger(layout.bytes), &params)
+	if ptr == nil {
+		return nil
+	}
+	dst := unsafe.Slice((*byte)(C.gllm_metal_littlebit_contents(ptr)), layout.bytes)
+	for _, part := range layout.parts {
+		copy(dst[part.offset:], part.data)
+	}
+	w := &LittleBitWeight{ptr: ptr, rows: rows, cols: cols, rank: rank, bytes: layout.bytes}
+	runtime.SetFinalizer(w, ReleaseLittleBit)
+	return w
+}
+
+func ReleaseLittleBit(w *LittleBitWeight) {
+	if w != nil && w.ptr != nil {
+		C.gllm_metal_release_littlebit(w.ptr)
+		w.ptr = nil
+		runtime.SetFinalizer(w, nil)
+	}
+}
+
+// LittleBitWeightBytes is the length of this projection's Metal factor buffer.
+func LittleBitWeightBytes(w *LittleBitWeight) int {
+	if w == nil || w.ptr == nil {
+		return 0
+	}
+	return w.bytes
+}
+
+// LittleBitScratchBytes is the retained process-wide input, latent and output
+// storage. Driver allocations and CPU-side data are excluded.
+func LittleBitScratchBytes() uint64 { return uint64(C.gllm_metal_littlebit_scratch_bytes()) }
+
+func (w *LittleBitWeight) supportsBatch(batch int) bool {
+	return w != nil && w.ptr != nil && batch > 0 && batch <= 256 &&
+		batch <= math.MaxUint32/max(w.rows, w.cols, w.rank)
+}
+
+func MatvecLittleBit(w *LittleBitWeight, x, out []float32, batch int) bool {
+	if !w.supportsBatch(batch) || batch > len(x)/w.cols || batch > len(out)/w.rows {
+		return false
+	}
+	ok := bool(C.gllm_metal_littlebit_matvec(w.ptr, (*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&out[0])), C.NSUInteger(batch)))
+	runtime.KeepAlive(w)
+	return ok
+}
+
+// MatvecLittleBitQKV evaluates three independent projections of the same
+// activation slab with one upload and one GPU completion wait.
+func MatvecLittleBitQKV(q, k, v *LittleBitWeight, x, qOut, kOut, vOut []float32, batch int) bool {
+	if !q.supportsBatch(batch) || !k.supportsBatch(batch) || !v.supportsBatch(batch) ||
+		q.cols != k.cols || q.cols != v.cols || batch > len(x)/q.cols ||
+		batch > len(qOut)/q.rows || batch > len(kOut)/k.rows || batch > len(vOut)/v.rows {
+		return false
+	}
+	ok := bool(C.gllm_metal_littlebit_qkv(q.ptr, k.ptr, v.ptr, (*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&qOut[0])), (*C.float)(unsafe.Pointer(&kOut[0])),
+		(*C.float)(unsafe.Pointer(&vOut[0])), C.NSUInteger(batch)))
+	runtime.KeepAlive(q)
+	runtime.KeepAlive(k)
+	runtime.KeepAlive(v)
+	return ok
+}
+
+// MatvecLittleBitSwiGLU leaves gate, up and hidden activations on the GPU
+// and reads back only the final down projection.
+func MatvecLittleBitSwiGLU(gate, up, down *LittleBitWeight, x, out []float32, batch int) bool {
+	if !gate.supportsBatch(batch) || !up.supportsBatch(batch) || !down.supportsBatch(batch) ||
+		gate.cols != up.cols || gate.rows != up.rows || gate.rows != down.cols ||
+		batch > len(x)/gate.cols || batch > len(out)/down.rows {
+		return false
+	}
+	ok := bool(C.gllm_metal_littlebit_ffn(gate.ptr, up.ptr, down.ptr, (*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&out[0])), C.NSUInteger(batch)))
+	runtime.KeepAlive(gate)
+	runtime.KeepAlive(up)
+	runtime.KeepAlive(down)
+	return ok
+}
+
 // quantizedWeightData bounds both the GPU layout and the allocation to the
 // matrix itself. Extra bytes in a containing mapped region are never copied.
 func quantizedWeightData(data []byte, rows, cols, blockSize, blockBytes int) []byte {
@@ -1770,6 +1975,52 @@ func quantizedWeightData(data []byte, rows, cols, blockSize, blockBytes int) []b
 		return nil
 	}
 	return data[:rows*blocks*blockBytes]
+}
+
+// PrepareBorrowedBF16Head aliases read-only OS mmap data. The mapping must
+// stay live until Release; Go heap slices must never be passed here.
+func PrepareBorrowedBF16Head(data []byte, rows, cols int) *Weight {
+	if rows <= 0 || rows > math.MaxInt32 || cols <= 0 || cols > math.MaxInt32/2 ||
+		cols%16 != 0 || rows != len(data)/(2*cols) || len(data)%(2*cols) != 0 {
+		return nil
+	}
+	ptr := C.gllm_metal_new_bf16_head(unsafe.Pointer(&data[0]), C.long(len(data)), C.int(rows), C.int(cols))
+	if ptr == nil {
+		return nil
+	}
+	w := &Weight{ptr: ptr, rows: rows, cols: cols}
+	runtime.SetFinalizer(w, Release)
+	return w
+}
+
+func MatvecBF16Head(w *Weight, x, out []float32) bool {
+	if w == nil || w.ptr == nil || len(x) != w.cols || len(out) < w.rows {
+		return false
+	}
+	ok := C.gllm_metal_bf16_head(w.ptr, (*C.float)(unsafe.Pointer(&x[0])),
+		(*C.float)(unsafe.Pointer(&out[0])), nil, 0, 1, nil)
+	runtime.KeepAlive(w)
+	return bool(ok)
+}
+
+func ArgmaxBF16Head(w *Weight, x []float32, recent []uint32, penalty float32) (uint32, bool) {
+	if w == nil || w.ptr == nil || len(x) != w.cols || (penalty != 1 && len(recent) > 64) ||
+		penalty <= 0 || math.IsNaN(float64(penalty)) || math.IsInf(float64(penalty), 0) {
+		return 0, false
+	}
+	var history *C.uint32_t
+	if penalty != 1 && len(recent) != 0 {
+		history = (*C.uint32_t)(unsafe.Pointer(&recent[0]))
+	} else {
+		recent = nil
+	}
+	token := C.gllm_metal_bf16_head_argmax(w.ptr, (*C.float)(unsafe.Pointer(&x[0])),
+		history, C.uint32_t(len(recent)), C.float(penalty))
+	runtime.KeepAlive(w)
+	if token < 0 {
+		return 0, false
+	}
+	return uint32(token), true
 }
 
 // PrepareQ4K prepares one quantized matrix. With noCopy, data must remain
@@ -2183,6 +2434,8 @@ type Decoder struct {
 	dim, heads, kvheads, layers, maxlen int
 	hidden                              int
 	outputRows                          int
+	littleBit                           bool
+	bf16Output                          bool
 	sharedK, sharedV                    []unsafe.Pointer
 }
 
@@ -2224,6 +2477,35 @@ func (d *Decoder) BindLayer(index int, w [7]*Weight, quant [7]uint32, norm, ffn,
 	}
 	ok := bool(C.gllm_decode_layer(d.ptr, C.int(index), w[0].ptr, w[1].ptr, w[2].ptr, w[3].ptr, w[4].ptr, w[5].ptr, w[6].ptr, (*C.uint32_t)(unsafe.Pointer(&quant[0])), (*C.float)(unsafe.Pointer(&norm[0])), (*C.float)(unsafe.Pointer(&ffn[0])), qn, kn, C.int(window)))
 	runtime.KeepAlive(w)
+	return ok
+}
+
+// BindLittleBitLayer binds the packed device handles for a scalar decoder
+// layer. The caller owns the weights for the lifetime of the decoder.
+func (d *Decoder) BindLittleBitLayer(index int, w [7]*LittleBitWeight, norm, ffn, qnorm, knorm []float32, window int) bool {
+	if d == nil || d.ptr == nil || index < 0 || index >= d.layers || len(norm) != d.dim || len(ffn) != d.dim || (len(qnorm) != 0 && len(qnorm) != 128) || (len(knorm) != 0 && len(knorm) != 128) {
+		return false
+	}
+	rows := [7]int{d.heads * 128, d.kvheads * 128, d.kvheads * 128, d.dim, d.hidden, d.hidden, d.dim}
+	cols := [7]int{d.dim, d.dim, d.dim, d.heads * 128, d.dim, d.dim, d.hidden}
+	for i, v := range w {
+		if v == nil || v.ptr == nil || v.rows != rows[i] || v.cols != cols[i] {
+			return false
+		}
+	}
+	var qn, kn *C.float
+	if len(qnorm) > 0 {
+		qn = (*C.float)(unsafe.Pointer(&qnorm[0]))
+	}
+	if len(knorm) > 0 {
+		kn = (*C.float)(unsafe.Pointer(&knorm[0]))
+	}
+	ok := bool(C.gllm_decode_littlebit_layer(d.ptr, C.int(index), w[0].ptr, w[1].ptr, w[2].ptr, w[3].ptr, w[4].ptr, w[5].ptr, w[6].ptr,
+		(*C.float)(unsafe.Pointer(&norm[0])), (*C.float)(unsafe.Pointer(&ffn[0])), qn, kn, C.int(window)))
+	runtime.KeepAlive(w)
+	if ok {
+		d.littleBit = true
+	}
 	return ok
 }
 
@@ -2313,13 +2595,14 @@ func (d *Decoder) Step(input, sn, cs []float32, pairs, pos int, interleaved bool
 }
 
 func (d *Decoder) BindOutput(w *Weight, quant uint32) bool {
-	if d == nil || d.ptr == nil || w == nil || w.ptr == nil || w.cols != d.dim || w.rows <= 0 || (quant != 4 && quant != 6 && quant != 8) {
+	if d == nil || d.ptr == nil || w == nil || w.ptr == nil || w.cols != d.dim || w.rows <= 0 || (quant != 4 && quant != 6 && quant != 8 && quant != 16) {
 		return false
 	}
 	ok := bool(C.gllm_decode_output(d.ptr, w.ptr, C.uint32_t(quant)))
 	runtime.KeepAlive(w)
 	if ok {
 		d.outputRows = w.rows
+		d.bf16Output = quant == 16
 	}
 	return ok
 }
@@ -2376,6 +2659,9 @@ func (d *Decoder) prefillBatch(ctx context.Context, input, sn, cs, temperature [
 	if d == nil || d.ptr == nil || batch < 2 || batch > 256 || start < 0 || start > d.maxlen-batch || len(keys) != d.layers || len(values) != d.layers || len(input) < batch*d.dim || len(residual) < batch*d.dim || len(output) < batch*d.dim || len(sn) < batch*64 || len(cs) < batch*64 || len(temperature) < batch {
 		return false, nil
 	}
+	if recent != nil && (d.outputRows <= 0 || d.bf16Output || d.littleBit) {
+		return false, nil
+	}
 	n := (start + batch) * d.kvheads * 128
 	for layer := range keys {
 		if len(keys[layer]) < n || len(values[layer]) < n || (d.sharedK[layer] != nil && (d.sharedK[layer] != unsafe.Pointer(&keys[layer][0]) || d.sharedV[layer] != unsafe.Pointer(&values[layer][0]))) {
@@ -2395,9 +2681,6 @@ func (d *Decoder) prefillBatch(ctx context.Context, input, sn, cs, temperature [
 	}
 	var rp, cp *C.uint32_t
 	if recent != nil {
-		if d.outputRows <= 0 {
-			return false, nil
-		}
 		history := argmaxBatchHistoryPool.Get().(*argmaxBatchHistory)
 		defer argmaxBatchHistoryPool.Put(history)
 		for i := range recent {
@@ -2474,7 +2757,7 @@ func GemmaOutput(w *Weight, quant uint32, x, out []float32, recent []uint32, pen
 
 // Project computes one dense attention projection for a bounded contiguous batch.
 func (d *Decoder) Project(layer, matrix int, x, out []float32, batch int) bool {
-	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || matrix < 0 || matrix > 3 || batch < 16 || batch > 256 {
+	if d == nil || d.ptr == nil || d.littleBit || layer < 0 || layer >= d.layers || matrix < 0 || matrix > 3 || batch < 16 || batch > 256 {
 		return false
 	}
 	cols, rows := d.dim, d.heads*128
@@ -2497,7 +2780,7 @@ func (d *Decoder) Project(layer, matrix int, x, out []float32, batch int) bool {
 // Project calls -- see gllm_decode_project_qkv's doc comment. qOut/kOut/vOut
 // are [batch][heads*128]/[batch][kvheads*128]/[batch][kvheads*128] slabs.
 func (d *Decoder) ProjectQKV(layer int, x, qOut, kOut, vOut []float32, batch int) bool {
-	if d == nil || d.ptr == nil || layer < 0 || layer >= d.layers || batch < 16 || batch > 256 {
+	if d == nil || d.ptr == nil || d.littleBit || layer < 0 || layer >= d.layers || batch < 16 || batch > 256 {
 		return false
 	}
 	qRows, kvRows := d.heads*128, d.kvheads*128

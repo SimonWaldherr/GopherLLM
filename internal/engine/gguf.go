@@ -32,6 +32,7 @@ const (
 	GGMLTypeIQ3_S   = ggufformat.GGMLTypeIQ3_S
 	GGMLTypeIQ2_S   = ggufformat.GGMLTypeIQ2_S
 	GGMLTypeIQ4_XS  = ggufformat.GGMLTypeIQ4_XS
+	GGMLTypeI32     = ggufformat.GGMLTypeI32
 	GGMLTypeF64     = ggufformat.GGMLTypeF64
 	GGMLTypeIQ1_M   = ggufformat.GGMLTypeIQ1_M
 	GGMLTypeBF16    = ggufformat.GGMLTypeBF16

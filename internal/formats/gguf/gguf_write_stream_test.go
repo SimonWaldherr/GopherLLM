@@ -4,8 +4,18 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 	"testing"
 )
+
+func TestWriteI32RejectsUnrepresentableTensorSize(t *testing.T) {
+	for _, dims := range [][]uint64{{math.MaxUint64, 2}, {uint64(math.MaxInt/4) + 1}} {
+		plan := []PlannedTensor{{Name: "blk.0.attn_q.weight.lb.u", Dims: dims, DType: GGMLTypeI32}}
+		if _, err := NewGGUFWriter(io.Discard, nil, plan, 32); err == nil {
+			t.Errorf("accepted overflowing shape %v", dims)
+		}
+	}
+}
 
 func TestGGUFWriterTensorStreamRoundTrip(t *testing.T) {
 	planned := []PlannedTensor{

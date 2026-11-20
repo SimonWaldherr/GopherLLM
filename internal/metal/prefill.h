@@ -84,7 +84,7 @@ static const char* gllm_prefill_source =
 // never alias a shared Go cache: a failed/canceled submission publishes nothing.
 enum {
  PF_X,PF_XN,PF_Q,PF_QR,PF_K,PF_KR,PF_V,PF_ATTN,PF_PROJ,PF_GATE,PF_UP,PF_HID,
- PF_SN,PF_CS,PF_TEMP,PF_PENDING_K,PF_PENDING_V,PF_PARTIAL,PF_LOGITS,PF_ARGMAX,PF_RECENT,PF_BUFFERS,
+ PF_SN,PF_CS,PF_TEMP,PF_PENDING_K,PF_PENDING_V,PF_PARTIAL,PF_LOGITS,PF_ARGMAX,PF_RECENT,PF_LBZ,PF_BUFFERS,
 };
 #define GLLM_PREFILL_PARTIAL_BYTES ((NSUInteger)64*1024*1024)
 #define GLLM_PREFILL_TOTAL_BYTES ((NSUInteger)256*1024*1024)
@@ -121,12 +121,14 @@ static bool gllm_prefill_init(void) {
 }
 static bool gllm_prefill_buffers(GLLMDecoder* d,int batch,int start_pos,bool tiled,bool verify) {
  NSUInteger p=(NSUInteger)batch,q=(NSUInteger)d->heads*128,kv=(NSUInteger)d->kvheads*128;
+ NSUInteger gate=d->littleBitZ!=nil?0:p*d->hidden;
  NSUInteger chunks=((NSUInteger)start_pos+p+31)/32;
  NSUInteger partial=tiled?MIN(GLLM_PREFILL_PARTIAL_BYTES/sizeof(float),p*q/128*chunks*130):1;
  NSUInteger count[PF_BUFFERS]={
-  p*d->dim,p*d->dim,p*q,p*q,p*kv,p*kv,p*kv,p*q,p*d->dim,p*d->hidden,p*d->hidden,p*d->hidden,
+  p*d->dim,p*d->dim,p*q,p*q,p*kv,p*kv,p*kv,p*q,p*d->dim,gate,gate,p*d->hidden,
   p*64,p*64,p,p*kv*d->layers,p*kv*d->layers,partial,
   verify?p*d->outputWeight->rows:1,verify?p*2:1,verify?p*GLLM_REPEAT_WINDOW:1,
+  d->littleBitZ!=nil?2*p*(d->littleBitStride/sizeof(float)):0,
  };
  GLLMPrefill* work=d->prefill;
  NSUInteger total=0;
@@ -195,16 +197,24 @@ static void gllm_prefill_quantized(id<MTLComputeCommandEncoder> e,GLLMMetalWeigh
  if(gllm_metal_encode_verify(e,w,x,out,batch,quant))return;
  gllm_metal_encode_quantized_to(e,w,quant,x,out,batch,4);
 }
+static void gllm_prefill_project(id<MTLComputeCommandEncoder> e,GLLMDecodeLayer* l,int m,id<MTLBuffer> in,id<MTLBuffer> z,id<MTLBuffer> out,int batch) {
+ if(l->littleBit[m]!=NULL)gllm_encode_littlebit_matvec(e,l->littleBit[m],in,z,out,batch,false);
+ else gllm_prefill_quantized(e,l->w[m],l->quant[m],in,out,batch);
+}
 static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,const float* cs,const float* temperature,int start_pos,int batch,bool interleaved,bool tiled,const uint32_t* recent,const uint32_t* counts,float penalty) {
  @autoreleasepool {
  GLLMDecoder* d=ptr;
  if(d==NULL || batch<2 || batch>256 || start_pos<0 || start_pos>d->maxlen-batch || input==NULL || sn==NULL || cs==NULL || temperature==NULL)return false;
  bool verify=counts!=NULL;
- if(verify && (batch>8 || d->outputWeight==NULL || recent==NULL || !isfinite(penalty) || penalty<=0))return false;
+ bool littleBit=d->littleBitZ!=nil;
+ if(verify && (littleBit || d->outputQuant==16 || batch>8 || d->outputWeight==NULL || recent==NULL || !isfinite(penalty) || penalty<=0))return false;
  if(verify)for(int i=0;i<batch;i++)if(counts[i]>GLLM_REPEAT_WINDOW)return false;
  if(!gllm_prefill_init() || !gllm_prefill_buffers(d,batch,start_pos,tiled,verify))return false;
  GLLMPrefill* p=d->prefill;
- for(int layer=0;layer<d->layers;layer++)for(int i=0;i<7;i++)if(d->layer[layer].w[i]==NULL)return false;
+ for(int layer=0;layer<d->layers;layer++)for(int i=0;i<7;i++){
+  GLLMDecodeLayer* l=&d->layer[layer];
+  if(littleBit?l->littleBit[i]==NULL:l->w[i]==NULL)return false;
+ }
  memcpy([p->b[PF_X] contents],input,(NSUInteger)batch*d->dim*sizeof(float));
  memcpy([p->b[PF_SN] contents],sn,(NSUInteger)batch*64*sizeof(float));
  memcpy([p->b[PF_CS] contents],cs,(NSUInteger)batch*64*sizeof(float));
@@ -216,9 +226,9 @@ static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,cons
  gllm_decode_norm(e,p->b[PF_X],d->layer[0].norm,p->b[PF_XN],d->dim,batch,d->eps);
  for(int layer=0;layer<d->layers;layer++){
   GLLMDecodeLayer* l=&d->layer[layer];
-  gllm_prefill_quantized(e,l->w[0],l->quant[0],p->b[PF_XN],p->b[PF_Q],batch);
-  gllm_prefill_quantized(e,l->w[1],l->quant[1],p->b[PF_XN],p->b[PF_K],batch);
-  gllm_prefill_quantized(e,l->w[2],l->quant[2],p->b[PF_XN],p->b[PF_V],batch);
+  gllm_prefill_project(e,l,0,p->b[PF_XN],p->b[PF_LBZ],p->b[PF_Q],batch);
+  gllm_prefill_project(e,l,1,p->b[PF_XN],p->b[PF_LBZ],p->b[PF_K],batch);
+  gllm_prefill_project(e,l,2,p->b[PF_XN],p->b[PF_LBZ],p->b[PF_V],batch);
   id<MTLBuffer> q=p->b[PF_Q],k=p->b[PF_K];
   if(l->qNorm!=nil){gllm_decode_norm(e,q,l->qNorm,p->b[PF_QR],128,batch*d->heads,d->eps);q=p->b[PF_QR];}
   if(l->kNorm!=nil){gllm_decode_norm(e,k,l->kNorm,p->b[PF_KR],128,batch*d->kvheads,d->eps);k=p->b[PF_KR];}
@@ -230,12 +240,16 @@ static bool gllm_prefill_batch(void* ptr,const float* input,const float* sn,cons
   uint32_t count=(uint32_t)kvCount;[e setBytes:&count length:sizeof(count) atIndex:2];
   [e dispatchThreadgroups:MTLSizeMake((kvCount+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
   gllm_prefill_attention(e,d,l,p,qr,layer,batch,start_pos,tiled);
-  gllm_prefill_quantized(e,l->w[3],l->quant[3],p->b[PF_ATTN],p->b[PF_PROJ],batch);
+  gllm_prefill_project(e,l,3,p->b[PF_ATTN],p->b[PF_LBZ],p->b[PF_PROJ],batch);
   gllm_prefill_add_norm(e,p->b[PF_X],p->b[PF_PROJ],l->ffnNorm,p->b[PF_XN],d->dim,batch,d->eps);
-  gllm_prefill_quantized(e,l->w[4],l->quant[4],p->b[PF_XN],p->b[PF_GATE],batch);
-  gllm_prefill_quantized(e,l->w[5],l->quant[5],p->b[PF_XN],p->b[PF_UP],batch);
-  gllm_metal_encode_silu(e,p->b[PF_GATE],p->b[PF_UP],p->b[PF_HID],(uint32_t)batch*d->hidden);
-  gllm_prefill_quantized(e,l->w[6],l->quant[6],p->b[PF_HID],p->b[PF_PROJ],batch);
+  if(littleBit){
+   gllm_encode_littlebit_gate_up(e,l->littleBit[4],l->littleBit[5],p->b[PF_XN],p->b[PF_LBZ],(NSUInteger)batch*d->littleBitStride,p->b[PF_HID],batch,false);
+  }else{
+   gllm_prefill_quantized(e,l->w[4],l->quant[4],p->b[PF_XN],p->b[PF_GATE],batch);
+   gllm_prefill_quantized(e,l->w[5],l->quant[5],p->b[PF_XN],p->b[PF_UP],batch);
+   gllm_metal_encode_silu(e,p->b[PF_GATE],p->b[PF_UP],p->b[PF_HID],(uint32_t)batch*d->hidden);
+  }
+  gllm_prefill_project(e,l,6,p->b[PF_HID],p->b[PF_LBZ],p->b[PF_PROJ],batch);
   id<MTLBuffer> nextNorm=layer+1<d->layers?d->layer[layer+1].norm:d->outputNorm;
   gllm_prefill_add_norm(e,p->b[PF_X],p->b[PF_PROJ],nextNorm,p->b[PF_XN],d->dim,batch,d->eps);
  }

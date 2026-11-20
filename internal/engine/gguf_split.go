@@ -10,7 +10,7 @@ package engine
 // plus the split keys.
 //
 // There are two loading strategies, and which one runs is decided by
-// LoadOptions.OutOfCore.
+// LoadOptions.OutOfCore and the tensor layout.
 //
 // The default MERGES. GopherLLM's tensor-loading path assumes one contiguous
 // byte slice with every TensorInfo.Offset relative to one GGUFFile.DataOffset,
@@ -21,8 +21,8 @@ package engine
 // what a single-file GGUF with these tensors would look like, at the cost of
 // one full copy of the model's weights into anonymous memory.
 //
-// OutOfCore does NOT merge. That copy is exactly what makes the merging path
-// unusable for the models people actually shard — a 400 GB checkpoint would
+// OutOfCore and mmap-backed LittleBit files keep the shards separate. A copy
+// makes the merging path unusable for very large models — a 400 GB checkpoint would
 // need 400 GB of RAM before the first token. Instead each shard keeps its own
 // mmap and every TensorInfo carries a view of the shard it lives in
 // (TensorInfo.Shard), which model.go's tensorContainer resolves against. A
@@ -33,6 +33,9 @@ package engine
 
 import (
 	"fmt"
+	"math"
+	"reflect"
+	"strings"
 )
 
 // splitPathPrefix is the inverse of splitShardPath: it recognises
@@ -147,6 +150,10 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 	}()
 
 	firstNo, count, _ := splitInfo(firstGGUF)
+	// The on-disk split naming convention has exactly five decimal digits.
+	if count < 2 || count > 99999 {
+		return nil, 0, fmt.Errorf("split model: split.count=%d is outside the split filename range", count)
+	}
 
 	prefix, isSplitFilename := splitPathPrefix(path)
 	if !isSplitFilename {
@@ -155,6 +162,7 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 	}
 
 	shards = make([]shard, count)
+	littleBit, allMapped := false, true
 	for i := 1; i <= count; i++ {
 		shardPath := splitShardPath(prefix, i, count)
 		var mm *MmapFile
@@ -172,6 +180,11 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 		if err != nil {
 			return nil, 0, fmt.Errorf("split model: failed to parse shard %d/%d (%s): %w", i, count, shardPath, err)
 		}
+		if g.DataOffset > mm.Len() {
+			return nil, 0, fmt.Errorf("split model: shard %d has a data offset past EOF", i)
+		}
+		littleBit = littleBit || hasLittleBitGGUF(g)
+		allMapped = allMapped && mm.IsMapped()
 		no, shardCount, ok := splitInfo(g)
 		if !ok || shardCount != count {
 			no = i - 1 // tolerate a shard missing/mismatching its own split metadata; filename order still wins
@@ -186,7 +199,34 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 		if s.no < 0 || s.no >= count {
 			return nil, 0, fmt.Errorf("split model: shard %s declares split.no=%d out of range [0,%d)", path, s.no, count)
 		}
+		if byNo[s.no].mmap != nil {
+			return nil, 0, fmt.Errorf("split model: duplicate split.no=%d", s.no)
+		}
 		byNo[s.no] = s
+	}
+	if littleBit {
+		first := byNo[0].gguf
+		var totalTensors uint64
+		for _, shard := range byNo {
+			totalTensors += uint64(len(shard.gguf.Tensors))
+		}
+		for i, shard := range byNo {
+			no, shardCount, ok := splitInfo(shard.gguf)
+			_, hasNo := shard.gguf.Metadata["split.no"].AsU32()
+			if !ok || !hasNo || no != i || shardCount != count {
+				return nil, 0, fmt.Errorf("LittleBit GGUF: inconsistent split metadata for shard %d", i+1)
+			}
+			if declared, exists := shard.gguf.Metadata["split.tensors.count"]; exists {
+				if n, valid := declared.AsU32(); !valid || uint64(n) != totalTensors {
+					return nil, 0, fmt.Errorf("LittleBit GGUF: incorrect split.tensors.count in shard %d", i+1)
+				}
+			}
+			for k, v := range shard.gguf.Metadata {
+				if strings.HasPrefix(k, littleBitNamespace) && !reflect.DeepEqual(v, first.Metadata[k]) {
+					return nil, 0, fmt.Errorf("LittleBit GGUF: inconsistent %s in shard %d", k, i+1)
+				}
+			}
+		}
 	}
 
 	// Out-of-core: no concatenation at all. Each tensor keeps a view of its
@@ -194,7 +234,7 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 	// demand-paged residency rather than 400 GB of anonymous memory. This is
 	// the only way out-of-core is useful in practice — every model large
 	// enough to want it ships sharded.
-	if options.OutOfCore {
+	if options.OutOfCore || (littleBit && allMapped) {
 		for _, s := range byNo {
 			if !s.mmap.IsMapped() {
 				return nil, 0, fmt.Errorf("out-of-core loading requires an OS memory map, but shard %d of %s fell back to an in-memory read", s.no+1, path)
@@ -206,6 +246,9 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 		for _, s := range byNo {
 			region := s.mmap.Bytes()[s.gguf.DataOffset:]
 			mappedBytes += int64(len(region))
+			if littleBit {
+				mappedBytes += int64(s.gguf.DataOffset)
+			}
 			for _, t := range s.gguf.Tensors {
 				// Offset stays relative to this shard's tensor region; the
 				// Shard view is what tensorContainer resolves against.
@@ -226,9 +269,7 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 			delete(metadata, k)
 		}
 		combined := &GGUFFile{Metadata: metadata, Tensors: shardedTensors, DataOffset: 0, Version: firstGGUF.Version}
-		// borrowQuantized is safe and is the entire point: every borrowed
-		// slice points into a live mapping the Runner now owns. Metal is
-		// already rejected for out-of-core by validateLoadOptions.
+		// Every borrowed slice points into a live mapping the Runner owns.
 		r, err := runnerFromParsedGGUF(nil, combined, true, options)
 		if err != nil {
 			return nil, 0, err
@@ -242,7 +283,11 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 
 	totalBytes := 0
 	for _, s := range byNo {
-		totalBytes += len(s.mmap.Bytes()) - s.gguf.DataOffset
+		regionBytes := len(s.mmap.Bytes()) - s.gguf.DataOffset
+		if regionBytes > math.MaxInt-totalBytes {
+			return nil, 0, fmt.Errorf("split model: combined tensor regions exceed host integer size")
+		}
+		totalBytes += regionBytes
 	}
 	merged := make([]byte, 0, totalBytes)
 	mergedTensors := make([]TensorInfo, 0)

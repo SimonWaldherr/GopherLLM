@@ -44,9 +44,15 @@ type Analysis struct {
 	Version   uint32
 	Supported bool
 
-	Params        int64 // total weight count across all tensors
+	Params        int64 // original projection weights plus ordinary tensor elements
 	FileBytes     int64 // sum of tensor bytes (excludes the small header)
 	BitsPerWeight float64
+	// LittleBitOriginalParams describes the matrices represented by factors.
+	// LittleBitBytes counts their stored tensor payload, including scales and bias.
+	LittleBitVersion        uint32 `json:",omitempty"`
+	LittleBitVariant        uint32 `json:",omitempty"`
+	LittleBitOriginalParams uint64 `json:",omitempty"`
+	LittleBitBytes          int64  `json:",omitempty"`
 
 	Layers        int
 	Dim           int
@@ -130,6 +136,13 @@ func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 	}
 
 	byType := map[GGMLType]*DTypeStat{}
+	if hasLittleBitGGUF(g) {
+		a.LittleBitVersion, _ = g.Metadata[littleBitNamespace+"version"].Value.(uint32)
+		a.LittleBitVariant, _ = g.Metadata[littleBitNamespace+"variant"].Value.(uint32)
+		a.LittleBitOriginalParams, _ = g.Metadata[littleBitNamespace+"original_parameters"].Value.(uint64)
+		a.Supported = littleBitArchitectureSupported(resolved) && a.LittleBitVersion == 1 &&
+			(a.LittleBitVariant == 1 || a.LittleBitVariant == 2)
+	}
 	for _, t := range g.Tensors {
 		numel := int64(t.Numel())
 		bytes64, ok := t.DType.DataSize(t.Numel())
@@ -145,9 +158,16 @@ func AnalyzeGGUF(g *GGUFFile, tok *Tokenizer) *Analysis {
 		st.Tensors++
 		st.Params += numel
 		st.Bytes += bytes
-		a.Params += numel
+		if strings.Contains(t.Name, littleBitTensorMarker) {
+			a.LittleBitBytes += bytes
+		} else {
+			a.Params += numel
+		}
 		a.FileBytes += bytes
 		a.LargestTensors = append(a.LargestTensors, TensorStat{Name: t.Name, Type: t.DType, Params: numel, Bytes: bytes})
+	}
+	if a.LittleBitOriginalParams <= math.MaxInt64 && a.Params >= 0 && int64(a.LittleBitOriginalParams) <= math.MaxInt64-a.Params {
+		a.Params += int64(a.LittleBitOriginalParams)
 	}
 	for _, st := range byType {
 		a.DTypes = append(a.DTypes, *st)
@@ -220,6 +240,11 @@ func (a *Analysis) WriteText(w io.Writer) {
 	}
 	fmt.Fprintf(w, "gguf version:   %d\n", a.Version)
 	fmt.Fprintf(w, "parameters:     %.2fB (%s tensor data, %.2f bits/weight)\n", float64(a.Params)/1e9, gb(a.FileBytes), a.BitsPerWeight)
+	if a.LittleBitVersion > 0 && a.LittleBitOriginalParams > 0 {
+		fmt.Fprintf(w, "LittleBit:      variant %d, schema %d, %d original projection weights, %d payload bytes, %.6f stored bits/weight\n",
+			a.LittleBitVariant, a.LittleBitVersion, a.LittleBitOriginalParams, a.LittleBitBytes,
+			8*float64(a.LittleBitBytes)/float64(a.LittleBitOriginalParams))
+	}
 	fmt.Fprintf(w, "geometry:       %d layers, dim %d, hidden %d, heads %d/%d (head_dim %d)\n", a.Layers, a.Dim, a.HiddenDim, a.Heads, a.KVHeads, a.HeadDim)
 	fmt.Fprintf(w, "vocab/context:  %d tokens, %d context\n", a.VocabSize, a.ContextLength)
 	if a.SlidingWindow > 0 {

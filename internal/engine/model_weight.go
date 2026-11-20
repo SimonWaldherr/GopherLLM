@@ -5,20 +5,20 @@ import (
 	"sync"
 )
 
-// Weight is one loaded tensor in one of three states: F32 non-nil (owned
-// float32 values), Raw quantized bytes, or Raw scalar F32/F16/BF16/F64 bytes.
-// The last state is used by out-of-core loads: it keeps a mmap-backed matrix
-// in its on-disk representation and converts only values used by a row dot.
-// Rows/Cols describe every Raw form; the owned F32 form infers rows from
+// Weight stores owned F32 values, raw quantized or scalar tensor bytes, or
+// a LittleBit projection. Raw scalar bytes let out-of-core loads keep a
+// mmap-backed matrix in its on-disk representation and convert rows on demand.
+// Rows/Cols describe the raw and factored forms. The owned F32 form infers rows from
 // len(F32)/cols at the call site for compatibility with existing callers.
 type Weight struct {
-	F32      []float32
-	Raw      []byte
-	Type     GGMLType
-	Rows     int
-	Cols     int
-	Prepared *PreparedQuantizedWeight
-	Metal    *MetalWeight
+	F32       []float32
+	Raw       []byte
+	Type      GGMLType
+	Rows      int
+	Cols      int
+	Prepared  *PreparedQuantizedWeight
+	Metal     *MetalWeight
+	LittleBit *LittleBitWeight
 	// GPU is this tensor's WebGPU-resident copy (Q4_K/Q6_K only), non-nil
 	// only under GOOS=js with a successfully acquired WebGPU device -- see
 	// webgpu_js.go/webgpu_stub.go. Mutually exclusive with Metal in
@@ -37,6 +37,13 @@ func (w Weight) Matvec(x []float32) []float32 {
 }
 
 func (w Weight) MatvecInto(x []float32, out *[]float32) {
+	if w.LittleBit != nil {
+		if matvecMetalLittleBitInto(w.LittleBit.Metal, x, w.Rows, w.Cols, out) {
+			return
+		}
+		w.LittleBit.matvecInto(x, w.Rows, w.Cols, out, true)
+		return
+	}
 	if w.F32 != nil {
 		cols := len(x)
 		rows := 0
@@ -44,6 +51,9 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 			rows = len(w.F32) / cols
 		}
 		MatvecF32Into(w.F32, x, rows, cols, out)
+		return
+	}
+	if w.Type == GGMLTypeBF16 && matvecMetalBF16HeadInto(w.Metal, x, out) {
 		return
 	}
 	if w.rawScalarMatvecInto(x, out) {
@@ -122,10 +132,22 @@ func (w Weight) MatvecInto(x []float32, out *[]float32) {
 // quantized formats llama.cpp's own quantize tool leaves on tied/output
 // embeddings: Q6_K (the "_M"/"_L" floor), and Q4_K/Q5_K/Q8_0 (the "_S"
 // presets and this project's own --compress skip that floor). Other
-// quantized types fall through to the general logits path below.
+// quantized types fall through to the general logits path below. LittleBit
+// reduces pooled logits to keep the same ordering as its matvec backend.
 func (w Weight) ArgmaxMatvec(x []float32) (uint32, bool) {
 	if len(x) == 0 {
 		return 0, false
+	}
+	if w.LittleBit != nil {
+		if w.Rows <= 0 || len(x) != w.Cols {
+			return 0, false
+		}
+		logits := littleBitArgmaxPool.Get().(*[]float32)
+		w.MatvecInto(x, logits)
+		token := argmaxFiniteToken(*logits)
+		*logits = (*logits)[:0]
+		littleBitArgmaxPool.Put(logits)
+		return token, true
 	}
 	if w.F32 != nil {
 		rows := len(w.F32) / len(x)
@@ -477,6 +499,9 @@ func (w Weight) Row(row, cols int) []float32 {
 }
 
 func (w Weight) RowInto(row, cols int, out *[]float32) {
+	if w.LittleBit != nil {
+		panic("LittleBit projections do not support embedding lookup")
+	}
 	ensureLenNoClear(out, cols)
 	if w.F32 != nil {
 		start := row * cols

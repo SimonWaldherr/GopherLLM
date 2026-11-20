@@ -15,6 +15,7 @@ const metalBatchFFNMaxTokens = 256
 var metalFusedFFNEnabled = os.Getenv("GOPHERLLM_METAL_FUSED_FFN") != "0"
 
 type MetalWeight struct {
+	bf16 *metalbackend.Weight
 	q4   *metalbackend.Weight
 	q5   *metalbackend.Weight
 	q6   *metalbackend.Weight
@@ -284,14 +285,28 @@ func (r *Runner) metalBatchFFNPrefillChunk() int {
 		return 0
 	}
 	chunk := metalBatchFFNMaxTokens
+	littleBit := metalDenseLittleBitModel(r.standard)
+	if littleBit {
+		// Larger slabs amortize the packed projection dispatches. On the
+		// Qwen3-8B checkpoint 128 beat 32 and 256 for a 512-token prompt.
+		chunk = 128
+	}
 	for i := range r.standard.Layers {
 		layer := &r.standard.Layers[i]
+		if layer.MoE != nil || layer.HasGateUp || len(layer.FFNUpBias) != 0 || len(layer.FFNDownBias) != 0 {
+			return 0
+		}
+		if littleBit {
+			if _, ok := metalDenseLittleBitLayer(layer); !ok || layer.HasQKV {
+				return 0
+			}
+			continue
+		}
 		if layer.W1.Type == GGMLTypeQ8_0 {
 			// Keep Qwen attention on its CPU-oriented slab size.
 			chunk = 128
 		}
-		if layer.MoE != nil || layer.HasGateUp || len(layer.FFNUpBias) != 0 || len(layer.FFNDownBias) != 0 ||
-			!metalSwiGLUBatchWeightsReady(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal) {
+		if !metalSwiGLUBatchWeightsReady(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal) {
 			return 0
 		}
 	}
@@ -325,6 +340,10 @@ func metalQwen35FFNBatchReady(gate, up, down *MetalWeight) bool {
 func releaseMetalWeight(w *MetalWeight) {
 	if w == nil {
 		return
+	}
+	if w.bf16 != nil {
+		metalbackend.Release(w.bf16)
+		w.bf16 = nil
 	}
 	if w.q4 != nil {
 		metalbackend.Release(w.q4)

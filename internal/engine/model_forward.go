@@ -71,6 +71,9 @@ func argmaxOutputTokenPenalizedInto(config Config, weights ModelWeights, buf *De
 			return next, true
 		}
 	}
+	if token, ok := argmaxMetalBF16Head(weights.Output.Metal, buf.XN, recent, repeatPenalty); ok {
+		return token, true
+	}
 	// Greedy decode only needs the winning token. Positive logit scaling and the
 	// optional positive softcap preserve argmax ordering, so Metal can reduce its
 	// Q6_K output buffer on-device and avoid a 131k-logit readback plus CPU scan.
@@ -243,7 +246,8 @@ func ForwardBodyInto(config Config, weights ModelWeights, cache *KVCache, buf *D
 			// through to the unchanged CPU/GPU path; removing this branch is rollback.
 			fusedMetalFFN := !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
 				len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
-				matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj)
+				(matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, buf.XN2, &buf.Proj) ||
+					matvecMetalLittleBitSwiGLUInto(layer.W1, layer.W3, layer.W2, buf.XN2, 1, &buf.Proj))
 			if !fusedMetalFFN && config.UseGELU && !config.UseExactGELU && !config.usesPlainMLP() && !layer.HasGateUp && len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 {
 				fusedMetalFFN = matvecMetalGeGLUInto(layer.W1, layer.W3, layer.W2, buf.XN2, 1, &buf.Proj)
 			}

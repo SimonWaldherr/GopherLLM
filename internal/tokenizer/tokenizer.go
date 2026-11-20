@@ -62,6 +62,8 @@ type Tokenizer struct {
 	Lowercase         bool
 	StripAccents      bool
 	RawWordPieceVocab bool
+	NormalizeNFC      bool
+	EOGIDs            []uint32
 }
 
 // TokenizerFromMetadata builds a Tokenizer from a GGUF's tokenizer.* keys:
@@ -193,6 +195,7 @@ func TokenizerFromMetadata(metadata map[string]gguf.MetaValue) (*Tokenizer, erro
 	addBOS = readBool(addBOS, "tokenizer.ggml.add_bos_token")
 	addEOS = readBool(addEOS, "tokenizer.ggml.add_eos_token")
 	addSEP = readBool(addSEP, "tokenizer.ggml.add_sep_token")
+	eogIDs, _ := metadata["tokenizer.ggml.eog_token_ids"].AsU32Array()
 	// llama.cpp's BertNormalizer defaults to lowercase=true. Keep that default
 	// scoped to WordPiece; the field is unused by the other tokenizer modes.
 	lowercase := readBool(mode == TokenizerWordPiece, "tokenizer.ggml.normalizer.lowercase")
@@ -220,6 +223,8 @@ func TokenizerFromMetadata(metadata map[string]gguf.MetaValue) (*Tokenizer, erro
 		BOSID: bosID, EOSID: eosID, UNKID: unkID, SEPID: sepID,
 		Lowercase: lowercase, StripAccents: stripAccents,
 		RawWordPieceVocab: rawWordPieceVocab,
+		NormalizeNFC:      readBool(false, "tokenizer.ggml.normalizer.nfc"),
+		EOGIDs:            eogIDs,
 	}, nil
 }
 
@@ -443,6 +448,9 @@ func (t *Tokenizer) encodeGPT2BPE(text string) []uint32 {
 	var syms []bpeSymbol
 	var heap bpeHeap
 	var encoded strings.Builder
+	if t.NormalizeNFC {
+		text = normalizeNFC(text)
+	}
 	for _, piece := range t.pretokenize(text) {
 		// Reuse bounded mapping slabs; reserve an unusually large piece in
 		// one allocation instead of growing through every smaller capacity.
@@ -524,6 +532,12 @@ func (t *Tokenizer) decodeGPT2Bytes(raw string) string {
 }
 
 func (t *Tokenizer) pretokenize(text string) []string {
+	switch t.Pre {
+	case "llama-bpe":
+		return pretokenizeLlamaQwenBPE(text, 3)
+	case "qwen3":
+		return pretokenizeLlamaQwenBPE(text, 1)
+	}
 	if strings.Contains(t.Pre, "qwen35") {
 		return pretokenizeQwen35(text)
 	}

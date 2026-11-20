@@ -132,6 +132,12 @@ func (t *QwenImageTokenizer) Encode(text string) ([]uint32, error) {
 func (t *QwenImageTokenizer) ValidateVocab(size int) error { return t.bpe.ValidateVocab(size) }
 
 func qwenImagePieces(text string) []string {
+	return pretokenizeLlamaQwenBPE(text, 1)
+}
+
+// Qwen's byte-BPE pre-tokenizer isolates each digit. Llama 3's pre-tokenizer
+// otherwise follows the same rules and groups digits in runs of up to three.
+func pretokenizeLlamaQwenBPE(text string, maxDigits int) []string {
 	r := []rune(text)
 	out := make([]string, 0, len(r)/3+1)
 	for i := 0; i < len(r); {
@@ -152,6 +158,9 @@ func qwenImagePieces(text string) []string {
 		}
 		if end == i && unicode.IsNumber(r[i]) {
 			end = i + 1
+			for end < len(r) && end-i < maxDigits && unicode.IsNumber(r[end]) {
+				end++
+			}
 		}
 		if end == i {
 			start := i

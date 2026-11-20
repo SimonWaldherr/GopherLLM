@@ -86,7 +86,7 @@ func printUsage(name string) {
 	fmt.Fprintln(os.Stderr, "  --seed <N>                RNG seed (default: time-based)")
 	fmt.Fprintln(os.Stderr, "  --context-window <mode>  Chat overflow: full | recent | autoCompress (default: full)")
 	fmt.Fprintln(os.Stderr, "  --threads <N>             Override thread count")
-	fmt.Fprintln(os.Stderr, "  --metal                   Use selective Metal Q4_K/Q5_K/Q6_K/Q8_0 offload when available")
+	fmt.Fprintln(os.Stderr, "  --metal                   Use selective Metal quantized and LittleBit offload when available")
 	fmt.Fprintln(os.Stderr, "  --prepare-quant           Precompute supported quantized scale data during load for faster matvecs")
 	fmt.Fprintln(os.Stderr, "  --prefault <mode>         Mmap warm-up: all | core | none (default: core; skips sparse expert banks)")
 	fmt.Fprintln(os.Stderr, "  --out-of-core             CPU-only mmap inference; keep sparse MoE experts and scalar weights demand-paged")

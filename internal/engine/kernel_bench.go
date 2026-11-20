@@ -96,7 +96,7 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		q, k, v, xs := []float32{}, []float32{}, []float32{}, []float32{}
 		rows = append(rows, measureFunction(
 			"attn_qkv_path",
-			fmt.Sprintf("%s/%s/%s", layer.WQ.Type, layer.WK.Type, layer.WV.Type),
+			fmt.Sprintf("%s/%s/%s", kernelBenchDType(layer.WQ), kernelBenchDType(layer.WK), kernelBenchDType(layer.WV)),
 			layer.WQ.Rows+layer.WK.Rows+layer.WV.Rows,
 			layer.WQ.Cols,
 			runs,
@@ -112,7 +112,7 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		gate, up, xs := []float32{}, []float32{}, []float32{}
 		rows = append(rows, measureFunction(
 			"ffn_gate_up_path",
-			fmt.Sprintf("%s/%s", layer.W1.Type, layer.W3.Type),
+			fmt.Sprintf("%s/%s", kernelBenchDType(layer.W1), kernelBenchDType(layer.W3)),
 			layer.W1.Rows+layer.W3.Rows,
 			layer.W1.Cols,
 			runs,
@@ -138,7 +138,7 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		}
 		rows = append(rows, measureFunction(
 			"ffn_swiglu_down_reference",
-			fmt.Sprintf("%s/%s/SiLU/%s", layer.W1.Type, layer.W3.Type, layer.W2.Type),
+			fmt.Sprintf("%s/%s/SiLU/%s", kernelBenchDType(layer.W1), kernelBenchDType(layer.W3), kernelBenchDType(layer.W2)),
 			layer.W1.Rows+layer.W3.Rows+layer.W2.Rows,
 			layer.W1.Cols,
 			runs,
@@ -146,12 +146,13 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 		))
 		rows = append(rows, measureFunction(
 			"ffn_swiglu_down_path",
-			fmt.Sprintf("%s/%s/SiLU/%s", layer.W1.Type, layer.W3.Type, layer.W2.Type),
+			fmt.Sprintf("%s/%s/SiLU/%s", kernelBenchDType(layer.W1), kernelBenchDType(layer.W3), kernelBenchDType(layer.W2)),
 			layer.W1.Rows+layer.W3.Rows+layer.W2.Rows,
 			layer.W1.Cols,
 			runs,
 			func() {
-				if !matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, dimInput, &projection) {
+				if !matvecMetalLittleBitSwiGLUInto(layer.W1, layer.W3, layer.W2, dimInput, 1, &projection) &&
+					!matvecMetalSwiGLUInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, dimInput, &projection) {
 					oldPath()
 				}
 			},
@@ -160,7 +161,7 @@ func kernelBenchRows(r *Runner, runs, layerIndex int) []KernelBenchRow {
 	rows = append(rows, measureMatvec("output", r.standard.Output, dimInput, runs, &out))
 	rows = append(rows, measureFunction(
 		"output_argmax_path",
-		fmt.Sprintf("%s/argmax", r.standard.Output.Type),
+		kernelBenchDType(r.standard.Output)+"/argmax",
 		r.standard.Output.Rows,
 		r.standard.Output.Cols,
 		runs,
@@ -195,7 +196,14 @@ func measureMatvec(name string, weight Weight, x []float32, runs int, out *[]flo
 }
 
 func measureKernel(name string, weight Weight, rows, cols, runs int, body func()) KernelBenchRow {
-	return measureFunction(name, weight.Type.String(), rows, cols, runs, body)
+	return measureFunction(name, kernelBenchDType(weight), rows, cols, runs, body)
+}
+
+func kernelBenchDType(weight Weight) string {
+	if weight.LittleBit != nil {
+		return "LittleBit"
+	}
+	return weight.Type.String()
 }
 
 func measureFunction(name, dtype string, rows, cols, runs int, body func()) KernelBenchRow {

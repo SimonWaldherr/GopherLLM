@@ -49,6 +49,7 @@ const (
 	GGMLTypeIQ3_S   GGMLType = 21
 	GGMLTypeIQ2_S   GGMLType = 22
 	GGMLTypeIQ4_XS  GGMLType = 23
+	GGMLTypeI32     GGMLType = 26
 	GGMLTypeF64     GGMLType = 28
 	GGMLTypeIQ1_M   GGMLType = 29
 	GGMLTypeBF16    GGMLType = 30
@@ -71,7 +72,7 @@ func TypeFromID(v uint32) GGMLType {
 		GGMLTypeQ8_0, GGMLTypeQ8_1, GGMLTypeQ2_K, GGMLTypeQ3_K, GGMLTypeQ4_K, GGMLTypeQ5_K,
 		GGMLTypeQ6_K, GGMLTypeQ8_K, GGMLTypeIQ4_NL, GGMLTypeIQ3_S, GGMLTypeIQ2_S, GGMLTypeIQ4_XS,
 		GGMLTypeIQ2_XXS, GGMLTypeIQ2_XS, GGMLTypeIQ3_XXS, GGMLTypeIQ1_S, GGMLTypeIQ1_M,
-		GGMLTypeF64, GGMLTypeBF16, GGMLTypeTQ1_0, GGMLTypeTQ2_0, GGMLTypeMXFP4, GGMLTypeQ1_0, GGMLTypeQ2_0:
+		GGMLTypeI32, GGMLTypeF64, GGMLTypeBF16, GGMLTypeTQ1_0, GGMLTypeTQ2_0, GGMLTypeMXFP4, GGMLTypeQ1_0, GGMLTypeQ2_0:
 		return GGMLType(v)
 	default:
 		return GGMLTypeUnknown
@@ -128,6 +129,8 @@ func (t GGMLType) String() string {
 		return "IQ1_M"
 	case GGMLTypeF64:
 		return "F64"
+	case GGMLTypeI32:
+		return "I32"
 	case GGMLTypeBF16:
 		return "BF16"
 	case GGMLTypeTQ1_0:
@@ -150,7 +153,7 @@ func (t GGMLType) String() string {
 // and IQ4_XS use 256-element superblocks. DataSize remains the authoritative
 // byte-size accessor for every format.
 func (t GGMLType) BlockSize() int {
-	if t == GGMLTypeF32 || t == GGMLTypeF16 || t == GGMLTypeF64 || t == GGMLTypeBF16 {
+	if t == GGMLTypeF32 || t == GGMLTypeF16 || t == GGMLTypeF64 || t == GGMLTypeBF16 || t == GGMLTypeI32 {
 		return 1
 	}
 	switch t {
@@ -174,7 +177,7 @@ func (t GGMLType) BlockSize() int {
 // MXFP4 are not representable here (ok=false); use DataSize instead.
 func (t GGMLType) BlockBytes() (int, bool) {
 	switch t {
-	case GGMLTypeF32:
+	case GGMLTypeF32, GGMLTypeI32:
 		return 4, true
 	case GGMLTypeF16:
 		return 2, true
@@ -243,6 +246,11 @@ func (t GGMLType) BlockBytes() (int, bool) {
 func (t GGMLType) DataSize(n int) (int, bool) {
 	switch t {
 	case GGMLTypeF32:
+		return n * 4, true
+	case GGMLTypeI32:
+		if n < 0 || n > math.MaxInt/4 {
+			return 0, false
+		}
 		return n * 4, true
 	case GGMLTypeF64:
 		return n * 8, true

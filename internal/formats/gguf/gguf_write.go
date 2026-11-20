@@ -353,13 +353,27 @@ func NewGGUFWriter(w io.Writer, metadata map[string]MetaValue, planned []Planned
 	offset := uint64(0)
 	tensors := make([]TensorInfo, len(planned))
 	for i, p := range planned {
+		if len(p.Dims) == 0 || len(p.Dims) > 16 {
+			return nil, fmt.Errorf("tensor %q: invalid rank %d", p.Name, len(p.Dims))
+		}
 		numel := 1
 		for _, d := range p.Dims {
+			if d == 0 || d > uint64(math.MaxInt/numel) {
+				return nil, fmt.Errorf("tensor %q: invalid dimensions %v", p.Name, p.Dims)
+			}
 			numel *= int(d)
 		}
-		size, ok := p.DType.DataSize(numel)
-		if !ok {
+		block := p.DType.BlockSize()
+		bytes, ok := p.DType.DataSize(block)
+		if !ok || bytes <= 0 {
 			return nil, fmt.Errorf("tensor %q: unsupported output type %s", p.Name, p.DType)
+		}
+		if numel/block > math.MaxInt/bytes {
+			return nil, fmt.Errorf("tensor %q: byte size exceeds host integer size", p.Name)
+		}
+		size, _ := p.DType.DataSize(numel)
+		if uint64(size)+uint64(alignment-1) > math.MaxInt64-offset {
+			return nil, fmt.Errorf("tensor %q: GGUF output offset overflow", p.Name)
 		}
 		tensors[i] = TensorInfo{Name: p.Name, Dims: p.Dims, DType: p.DType, Offset: offset}
 		offset = alignUp64(offset+uint64(size), uint64(alignment))

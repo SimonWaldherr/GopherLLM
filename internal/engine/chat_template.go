@@ -1,8 +1,14 @@
 package engine
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 func (r *Runner) isStopToken(token uint32) bool {
+	if slices.Contains(r.tok.EOGIDs, token) {
+		return true
+	}
 	if r.arch == "gpt-oss" {
 		return token == r.tok.EOSID || token == 200002 || token == 200007
 	}

@@ -80,6 +80,7 @@ and optionally runs Ministral for task suggestions and row explanations.
 - [CLI Usage](#cli-usage)
 - [GGUF Analyzer](#gguf-analyzer)
 - [Model Compression](#model-compression)
+- [LittleBit and LittleBit-2](#littlebit-and-littlebit-2)
 - [Auto Mode (hardware autotuning)](#auto-mode-hardware-autotuning)
 - [Benchmarking and Profiling](#benchmarking-and-profiling)
 - [Make Targets](#make-targets)
@@ -1154,6 +1155,20 @@ The library API is `CompressModel(source, output, options)`.
 `ParseCompressOptions("Q4_K_M")` retains the mixed preset in
 `CompressOptions.Preset`; the older `ParseCompressFormat` returns only its
 base GGML type. Set `CompressOptions.Context` for cancellation.
+
+## LittleBit and LittleBit-2
+
+GopherLLM runs native binary-factorized projections on dense Llama and Qwen3
+text models. The bundled Go tool converts a trained checkpoint into a GGUF file
+that the main CLI can run directly.
+
+```sh
+go run ./cmd/gopherllm-convert-littlebit -in /path/to/checkpoint -out littlebit.gguf
+go run ./cmd/gopherllm littlebit.gguf --prompt "Why is the sky blue?"
+```
+
+See [the LittleBit guide](docs/littlebit.md) for the GGUF schema, supported
+checkpoint layouts, Metal commands, validation and measurements.
 
 ## Auto Mode (hardware autotuning)
 

@@ -371,6 +371,14 @@ func runnerFromParsedGGUF(data []byte, gguf *GGUFFile, borrowQuantized bool, opt
 	declaredArch, _ := gguf.GetString("general.architecture")
 	declaredArch = strings.TrimSpace(declaredArch)
 	arch, hparamNS := ResolveArchitecture(gguf)
+	if hasLittleBitGGUF(gguf) {
+		if !littleBitArchitectureSupported(arch) {
+			return nil, fmt.Errorf("LittleBit GGUF: architecture %q is unsupported", arch)
+		}
+		if len(options.VisionProjectorBytes) != 0 || options.VisionProjectorPath != "" {
+			return nil, fmt.Errorf("LittleBit GGUF: vision projectors are unsupported")
+		}
+	}
 	switch {
 	case declaredArch == "" && namespaceHasHParams(gguf, hparamNS):
 		fmt.Fprintf(logw, "No general.architecture in metadata; detected %q from the %s.* hyperparameter namespace\n", arch, hparamNS)

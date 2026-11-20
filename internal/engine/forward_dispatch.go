@@ -311,10 +311,9 @@ func prefillChunkSize(config Config) int {
 
 // prefillChunkSize resolves a runner-local prefill default without changing
 // the package-level heuristic used by CPU-only and non-standard models. A
-// complete direct-Metal SwiGLU graph benefits from keeping the whole 256-token
-// slab in its GPU workspace: splitting it at the ordinary 128-token default
-// pays the command-buffer setup and synchronization cost twice. Any explicit
-// process override (the autotuner) or environment value remains authoritative.
+// complete Metal projection graph benefits from larger slabs, which amortize
+// command-buffer setup and synchronization. The dense and LittleBit graphs
+// use their own measured limits. An autotuner or environment override wins.
 //
 // The Metal predicate is deliberately runner-local: it verifies the real
 // prepared handles for every layer rather than guessing from model geometry.

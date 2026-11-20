@@ -142,6 +142,32 @@ func TestMetalBatchFFNPrefillChunkExplicitSettingsWin(t *testing.T) {
 	}
 }
 
+func TestMetalLittleBitPrefillChunkRequiresCompleteGraph(t *testing.T) {
+	old := prefillChunkOverrideValue()
+	t.Cleanup(func() { SetPrefillChunk(old) })
+	SetPrefillChunk(0)
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "")
+	packed := Weight{LittleBit: &LittleBitWeight{Metal: &MetalLittleBitWeight{handle: &metalbackend.LittleBitWeight{}}}}
+	layer := LayerWeights{WQ: packed, WK: packed, WV: packed, WO: packed, W1: packed, W3: packed, W2: packed}
+	r := &Runner{
+		kind:     loadedStandard,
+		config:   Config{Dim: 4096, HiddenDim: 12288},
+		standard: ModelWeights{Layers: []LayerWeights{layer, layer}},
+	}
+	if got := r.prefillChunkSize(); got != 128 {
+		t.Fatalf("complete packed graph chunk = %d, want 128", got)
+	}
+	r.standard.Layers[1].WO = Weight{}
+	if got, want := r.prefillChunkSize(), prefillChunkSize(r.config); got != want {
+		t.Fatalf("partial packed graph chunk = %d, want %d", got, want)
+	}
+	r.standard.Layers[1].WO = packed
+	t.Setenv("GOPHERLLM_PREFILL_CHUNK", "64")
+	if got := r.prefillChunkSize(); got != 64 {
+		t.Fatalf("explicit packed graph chunk = %d, want 64", got)
+	}
+}
+
 func TestMetalQ4KMatvecMatchesCPU(t *testing.T) {
 	if !MetalAvailable() {
 		t.Skip(MetalError())

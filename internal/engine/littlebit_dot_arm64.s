@@ -1,0 +1,120 @@
+#include "textflag.h"
+#include "arm64_fp_compat.h"
+
+// Vector mnemonics unavailable in the Go 1.25 assembler.
+#define USHL4S(Vd, Vn, Vm) WORD $(0x6ea04400 | ((Vm)<<16) | ((Vn)<<5) | (Vd))
+#define FADDP4S(Vd, Vn, Vm) WORD $(0x6e20d400 | ((Vm)<<16) | ((Vn)<<5) | (Vd))
+
+DATA littleBitShifts<>+0(SB)/4, $31
+DATA littleBitShifts<>+4(SB)/4, $30
+DATA littleBitShifts<>+8(SB)/4, $29
+DATA littleBitShifts<>+12(SB)/4, $28
+GLOBL littleBitShifts<>(SB), RODATA|NOPTR, $16
+
+// Process eight sign bits at a time. Shift each bit into its activation's
+// IEEE sign position, then XOR the result with that activation.
+TEXT ·littleBitDotNEON(SB), NOSPLIT|NOFRAME, $0-28
+	MOVD packed+0(FP), R0
+	MOVD x+8(FP), R1
+	MOVD groups+16(FP), R2
+	MOVD $littleBitShifts<>(SB), R3
+	VLD1 (R3), [V16.S4]
+	MOVD $0x80000000, R3
+	VDUP R3, V17.S4
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+
+loop:
+	MOVBU.P 1(R0), R3
+	LSR $4, R3, R4
+	VDUP R3, V2.S4
+	VDUP R4, V3.S4
+	VLD1.P 32(R1), [V4.S4, V5.S4]
+	USHL4S(2, 2, 16)
+	USHL4S(3, 3, 16)
+	VAND V17.B16, V2.B16, V2.B16
+	VAND V17.B16, V3.B16, V3.B16
+	VEOR V2.B16, V4.B16, V4.B16
+	VEOR V3.B16, V5.B16, V5.B16
+	FADD4S(0, 0, 4)
+	FADD4S(1, 1, 5)
+	SUBS $1, R2, R2
+	BNE loop
+
+	FADD4S(0, 0, 1)
+	FADDP4S(0, 0, 0)
+	FADDP4S(0, 0, 0)
+	FMOVS F0, ret+24(FP)
+	RET
+
+// Expand each byte into two masks once, then reuse them for four tokens.
+// Each accumulator and its final reduction match littleBitDotNEON.
+TEXT ·littleBitDot4NEON(SB), NOSPLIT|NOFRAME, $0-64
+	MOVD packed+0(FP), R0
+	MOVD x0+8(FP), R1
+	MOVD x1+16(FP), R2
+	MOVD x2+24(FP), R3
+	MOVD x3+32(FP), R4
+	MOVD groups+40(FP), R5
+	MOVD $littleBitShifts<>(SB), R6
+	VLD1 (R6), [V16.S4]
+	MOVD $0x80000000, R6
+	VDUP R6, V17.S4
+	VEOR V0.B16, V0.B16, V0.B16
+	VEOR V1.B16, V1.B16, V1.B16
+	VEOR V2.B16, V2.B16, V2.B16
+	VEOR V3.B16, V3.B16, V3.B16
+	VEOR V4.B16, V4.B16, V4.B16
+	VEOR V5.B16, V5.B16, V5.B16
+	VEOR V6.B16, V6.B16, V6.B16
+	VEOR V7.B16, V7.B16, V7.B16
+
+loop4:
+	MOVBU.P 1(R0), R6
+	LSR $4, R6, R7
+	VDUP R6, V18.S4
+	VDUP R7, V19.S4
+	USHL4S(18, 18, 16)
+	USHL4S(19, 19, 16)
+	VAND V17.B16, V18.B16, V18.B16
+	VAND V17.B16, V19.B16, V19.B16
+	VLD1.P 32(R1), [V20.S4, V21.S4]
+	VLD1.P 32(R2), [V22.S4, V23.S4]
+	VLD1.P 32(R3), [V24.S4, V25.S4]
+	VLD1.P 32(R4), [V26.S4, V27.S4]
+	VEOR V18.B16, V20.B16, V20.B16
+	VEOR V19.B16, V21.B16, V21.B16
+	VEOR V18.B16, V22.B16, V22.B16
+	VEOR V19.B16, V23.B16, V23.B16
+	VEOR V18.B16, V24.B16, V24.B16
+	VEOR V19.B16, V25.B16, V25.B16
+	VEOR V18.B16, V26.B16, V26.B16
+	VEOR V19.B16, V27.B16, V27.B16
+	FADD4S(0, 0, 20)
+	FADD4S(1, 1, 21)
+	FADD4S(2, 2, 22)
+	FADD4S(3, 3, 23)
+	FADD4S(4, 4, 24)
+	FADD4S(5, 5, 25)
+	FADD4S(6, 6, 26)
+	FADD4S(7, 7, 27)
+	SUBS $1, R5, R5
+	BNE loop4
+
+	FADD4S(0, 0, 1)
+	FADD4S(2, 2, 3)
+	FADD4S(4, 4, 5)
+	FADD4S(6, 6, 7)
+	FADDP4S(0, 0, 0)
+	FADDP4S(2, 2, 2)
+	FADDP4S(4, 4, 4)
+	FADDP4S(6, 6, 6)
+	FADDP4S(0, 0, 0)
+	FADDP4S(2, 2, 2)
+	FADDP4S(4, 4, 4)
+	FADDP4S(6, 6, 6)
+	FMOVS F0, s0+48(FP)
+	FMOVS F2, s1+52(FP)
+	FMOVS F4, s2+56(FP)
+	FMOVS F6, s3+60(FP)
+	RET

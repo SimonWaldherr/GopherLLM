@@ -18,6 +18,19 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	if logw == nil {
 		logw = io.Discard
 	}
+	littleBit := hasLittleBitGGUF(gguf)
+	if littleBit {
+		arch, namespace := ResolveArchitecture(gguf)
+		if !littleBitArchitectureSupported(arch) {
+			return Config{}, ModelWeights{}, fmt.Errorf("LittleBit GGUF: architecture %q is unsupported", arch)
+		}
+		if layers := gguf.GetU32(namespace+".block_count", 0); layers == 0 || uint64(layers) > uint64(len(gguf.Tensors)/9) {
+			return Config{}, ModelWeights{}, fmt.Errorf("LittleBit GGUF: block_count %d is inconsistent with the tensor count", layers)
+		}
+		if gguf.DataOffset < 0 || gguf.DataOffset > len(data) {
+			return Config{}, ModelWeights{}, fmt.Errorf("LittleBit GGUF: data offset exceeds the container")
+		}
+	}
 	config := ConfigFromGGUF(gguf)
 	if deepSeek2Family(config.Arch) {
 		// DeepSeek-V2/V3 and Kimi-K2 use MLA rather than the ordinary
@@ -43,7 +56,28 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		config.Dim, config.NLayers, config.NHeads, config.NKVHeads, config.HiddenDim, config.VocabSize, config.MaxSeqLen)
 	tensorIdx := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
-	inferAttentionShape(&config, tensorIdx)
+	var projections map[string]Weight
+	if littleBit {
+		var err error
+		projections, err = loadLittleBitProjections(data, gguf, config, tensorIdx, inferred, borrowQuantized)
+		if err != nil {
+			return config, ModelWeights{}, err
+		}
+		fmt.Fprintf(logw, "LittleBit variant %v: %d factorized projections\n", gguf.Metadata[littleBitNamespace+"variant"].Value, len(projections))
+	} else {
+		inferAttentionShape(&config, tensorIdx)
+	}
+	// A LittleBit model may still have a large ordinary vocabulary matrix.
+	// Widen BF16 in the dot kernel so the mmap survives as the only copy on
+	// CPUs with fast widening. Other model families keep their load policy.
+	keepBF16Head := littleBit && bf16WeightSIMD()
+	loadProjection := func(name string) (Weight, error) {
+		if w, ok := projections[name]; ok {
+			return w, nil
+		}
+		keepRaw := lazyScalarWeights || (keepBF16Head && name == "output.weight" && tensorIdx[name].DType == GGMLTypeBF16)
+		return loadWeight(data, gguf.DataOffset, name, tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, keepRaw)
+	}
 	if info, ok := tensorIdx["rope_factors_long.weight"]; ok {
 		config.RopeFactorsLong = loadOptionalF32Vec(data, gguf.DataOffset, "rope_factors_long.weight", tensorIdx, inferred, info.Numel())
 	}
@@ -73,7 +107,10 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	// matvec scales or accelerator handles. Tied embeddings still need those
 	// resources for the output projection below.
 	_, separateOutput := tensorIdx["output.weight"]
-	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized && !separateOutput, useMetal && !separateOutput, lazyScalarWeights)
+	separateOutput = separateOutput || projections["output.weight"].LittleBit != nil
+	keepEmbeddingRaw := lazyScalarWeights || (littleBit && separateOutput) ||
+		(keepBF16Head && tensorIdx["token_embd.weight"].DType == GGMLTypeBF16)
+	tokenEmbd, err := loadWeight(data, gguf.DataOffset, "token_embd.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized && !separateOutput, useMetal && !separateOutput, keepEmbeddingRaw)
 	if err != nil {
 		return config, ModelWeights{}, err
 	}
@@ -89,8 +126,8 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 		return config, ModelWeights{}, err
 	}
 	output := tokenEmbd
-	if _, ok := tensorIdx["output.weight"]; ok {
-		output, err = loadWeight(data, gguf.DataOffset, "output.weight", tensorIdx, inferred, false, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights)
+	if separateOutput {
+		output, err = loadProjection("output.weight")
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
@@ -117,13 +154,28 @@ func LoadModel(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuantized, u
 	kRows := config.NKVHeads * config.HeadDim
 	vRows := config.NKVHeads * config.ValueDim
 	for l := range config.NLayers {
-		layer, err := loadLayer(data, gguf.DataOffset, l, config, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights, qRows, kRows, vRows)
+		layer, err := loadLayer(data, gguf.DataOffset, l, config, tensorIdx, inferred, borrowQuantized, prepareQuantized, useMetal, lazyScalarWeights, qRows, kRows, vRows, loadProjection, littleBit)
 		if err != nil {
 			return config, ModelWeights{}, err
 		}
 		layers = append(layers, layer)
 		if l == 0 || (l+1)%8 == 0 || l+1 == config.NLayers {
 			fmt.Fprintf(logw, "  Loaded layer %d/%d\n", l+1, config.NLayers)
+		}
+	}
+	if useMetal {
+		for _, w := range projections {
+			w.LittleBit.Metal = newMetalLittleBitWeight(w.LittleBit, w.Rows, w.Cols)
+		}
+		if littleBit && borrowQuantized && output.Type == GGMLTypeBF16 {
+			name := "output.weight"
+			if !separateOutput {
+				name = "token_embd.weight"
+			}
+			mapping, _ := tensorContainer(data, gguf.DataOffset, tensorIdx[name])
+			if weightBytesInMapping(output.Raw, mapping) {
+				output.Metal = prepareMetalBF16Head(output)
+			}
 		}
 	}
 	return config, ModelWeights{
@@ -236,7 +288,7 @@ func loadFalconNorms(data []byte, dataOffset int, prefix string, tensors map[str
 	return base, base, nil
 }
 
-func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal, lazyScalarWeights bool, qRows, kRows, vRows int) (LayerWeights, error) {
+func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string]TensorInfo, inferred map[string]int, borrow, prepareQuantized, useMetal, lazyScalarWeights bool, qRows, kRows, vRows int, loadProjection func(string) (Weight, error), littleBit bool) (LayerWeights, error) {
 	prefix := fmt.Sprintf("blk.%d.", l)
 	var attnNorm, falconFFNNorm []float32
 	var err error
@@ -256,26 +308,26 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 	var wq, wk, wv, wqkv Weight
 	hasQKV := false
 	if _, ok := tensors[prefix+"attn_qkv.weight"]; ok {
-		wqkv, err = loadWeight(data, dataOffset, prefix+"attn_qkv.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		wqkv, err = loadProjection(prefix + "attn_qkv.weight")
 		if err != nil {
 			return LayerWeights{}, err
 		}
 		hasQKV = true
 	} else {
-		wq, err = loadWeight(data, dataOffset, prefix+"attn_q.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		wq, err = loadProjection(prefix + "attn_q.weight")
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		wk, err = loadWeight(data, dataOffset, prefix+"attn_k.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		wk, err = loadProjection(prefix + "attn_k.weight")
 		if err != nil {
 			return LayerWeights{}, err
 		}
-		wv, err = loadWeight(data, dataOffset, prefix+"attn_v.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		wv, err = loadProjection(prefix + "attn_v.weight")
 		if err != nil {
 			return LayerWeights{}, err
 		}
 	}
-	wo, err := loadWeight(data, dataOffset, prefix+"attn_output.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+	wo, err := loadProjection(prefix + "attn_output.weight")
 	if err != nil {
 		return LayerWeights{}, err
 	}
@@ -299,26 +351,26 @@ func loadLayer(data []byte, dataOffset, l int, config Config, tensors map[string
 			return LayerWeights{}, fmt.Errorf("layer %d MoE: %w", l, err)
 		}
 	} else {
-		w2, err = loadWeight(data, dataOffset, prefix+"ffn_down.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		w2, err = loadProjection(prefix + "ffn_down.weight")
 		if err != nil {
 			return LayerWeights{}, err
 		}
 		if config.usesPlainMLP() {
-			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+			w3, err = loadProjection(prefix + "ffn_up.weight")
 			if err != nil {
 				return LayerWeights{}, err
 			}
-		} else if _, ok := tensors[prefix+"ffn_gate.weight"]; ok {
-			w1, err = loadWeight(data, dataOffset, prefix+"ffn_gate.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+		} else if _, ok := tensors[prefix+"ffn_gate.weight"]; ok || littleBit {
+			w1, err = loadProjection(prefix + "ffn_gate.weight")
 			if err != nil {
 				return LayerWeights{}, err
 			}
-			w3, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+			w3, err = loadProjection(prefix + "ffn_up.weight")
 			if err != nil {
 				return LayerWeights{}, err
 			}
 		} else {
-			wGateUp, err = loadWeight(data, dataOffset, prefix+"ffn_up.weight", tensors, inferred, false, borrow, prepareQuantized, useMetal, lazyScalarWeights)
+			wGateUp, err = loadProjection(prefix + "ffn_up.weight")
 			if err != nil {
 				return LayerWeights{}, err
 			}
@@ -497,6 +549,9 @@ func inferTensorSizes(data []byte, gguf *GGUFFile) map[string]int {
 		var key *byte
 		limit := uint64(len(data) - gguf.DataOffset)
 		if t.Shard != nil {
+			if len(t.Shard) == 0 {
+				continue
+			}
 			key = &t.Shard[0]
 			limit = uint64(len(t.Shard))
 		}

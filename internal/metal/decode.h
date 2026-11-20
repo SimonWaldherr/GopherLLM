@@ -341,6 +341,7 @@ typedef struct { uint32_t heads,kvheads,stride,start_pos,window;float scale; } G
 typedef struct { uint32_t heads,kvheads,stride,start_pos,window,chunks;float scale; } GLLMBatchAttnParams2;
 typedef struct {
  GLLMMetalWeight* w[7]; uint32_t quant[7];
+ GLLMLittleBitWeight* littleBit[7];
  id<MTLBuffer> norm,ffnNorm,qNorm,kNorm,k,v;
  int window; bool sharedKV;
 } GLLMDecodeLayer;
@@ -350,6 +351,7 @@ typedef struct {
  float eps,scale;
  GLLMMetalWeight* outputWeight; uint32_t outputQuant; id<MTLBuffer> logits,recent,argmax,argmaxPartials;
  GLLMDecodeLayer* layer;
+ id<MTLBuffer> littleBitZ; NSUInteger littleBitStride;
  id<MTLBuffer> x,xn,q,qr,k,kr,v,attn,proj,gate,up,hid,sn,cs,partial,outputNorm;
 } GLLMDecoder;
 static NSString* const gllm_dec_names[]={@"dec_norm",@"dec_rope",@"dec_copy_kv",@"dec_add",@"dec_attention_part",@"dec_attention_merge",@"dec_q4",@"dec_q6",@"dec_q8",@"dec_batch_attention",@"dec_batch_attention_part",@"dec_batch_attention_merge",@"dec_q4_gate_up",@"dec_argmax_part",@"dec_argmax_merge",@"dec_attention_short",@"dec_attention_medium",@"dec_attention_long",@"dec_q6_gate_up",@"dec_add_norm",@"dec_rope_kv"};
@@ -408,6 +410,7 @@ static void gllm_decode_release(void* ptr) {
  free(d->layer);
  [d->x release];[d->xn release];[d->q release];[d->qr release];[d->k release];[d->kr release];[d->v release];
  [d->attn release];[d->proj release];[d->gate release];[d->up release];[d->hid release];
+ [d->littleBitZ release];
  [d->sn release];[d->cs release];[d->partial release];[d->outputNorm release];[d->logits release];[d->recent release];[d->argmax release];[d->argmaxPartials release];free(d);
 }
 static void* gllm_decode_new(int dim,int hidden,int heads,int kvheads,int layers,int maxlen,float eps,float scale,const float* norm) {
@@ -442,10 +445,36 @@ static bool gllm_decode_layer(void* ptr,int index,void* q,void* k,void* v,void* 
  return true;
  }
 }
+static bool gllm_decode_littlebit_layer(void* ptr,int index,void* q,void* k,void* v,void* o,void* gate,void* up,void* down,
+ const float* norm,const float* ffn,const float* qnorm,const float* knorm,int window) {
+ @autoreleasepool {
+ GLLMDecoder* d=ptr;
+ if(!gllm_metal_init_littlebit() || gllm_littlebit_swiglu_pipeline==nil)return false;
+ GLLMLittleBitWeight* weights[7]={q,k,v,o,gate,up,down};
+ NSUInteger stride=d->littleBitStride;
+ for(int i=0;i<7;i++) {
+  if(weights[i]==NULL)return false;
+  NSUInteger bytes=(NSUInteger)gllm_littlebit_rank(weights[i])*sizeof(float);
+  if(bytes>stride)stride=bytes;
+ }
+ // Independent Q/K/V latents occupy disjoint slices of this private decoder
+ // workspace. A barrier allows the same slices to serve the later FFN.
+ if(stride>d->littleBitStride) {
+  if(stride>[gllm_device maxBufferLength]/3)return false;
+  id<MTLBuffer> z=[gllm_device newBufferWithLength:3*stride options:MTLResourceStorageModePrivate];
+  if(z==nil)return false;
+  [d->littleBitZ release];d->littleBitZ=z;d->littleBitStride=stride;
+ }
+ uint32_t quant[7]={0};
+ if(!gllm_decode_layer(ptr,index,NULL,NULL,NULL,NULL,NULL,NULL,NULL,quant,norm,ffn,qnorm,knorm,window))return false;
+ for(int i=0;i<7;i++)d->layer[index].littleBit[i]=weights[i];
+ return true;
+ }
+}
 static bool gllm_decode_output(void* ptr,void* weight,uint32_t quant) {
  @autoreleasepool {
  GLLMDecoder* d=ptr; GLLMMetalWeight* w=weight;
- if(!gllm_metal_init_q6k())return false;
+ if((quant==16 && !gllm_metal_init_bf16_head()) || !gllm_metal_init_q6k())return false;
  if(d->recent==nil)d->recent=gllm_dec_buffer(GLLM_REPEAT_WINDOW);
  if(d->argmax==nil)d->argmax=gllm_dec_buffer(2);
  if(d->recent==nil || d->argmax==nil)return false;
@@ -594,6 +623,33 @@ static void gllm_decode_rope_kv(id<MTLComputeCommandEncoder> e,id<MTLBuffer> q_i
 static void gllm_decode_barrier(id<MTLComputeCommandEncoder> e,bool concurrent) {
  if(concurrent)[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
+static void gllm_encode_littlebit_latent(id<MTLComputeCommandEncoder> e,GLLMLittleBitWeight* w,id<MTLBuffer> x,id<MTLBuffer> z,NSUInteger offset,NSUInteger batch) {
+ [e setComputePipelineState:gllm_littlebit_latent_pipeline];
+ [e setBuffer:w->data offset:0 atIndex:0];[e setBuffer:x offset:0 atIndex:1];[e setBuffer:z offset:offset atIndex:2];
+ [e setBytes:&w->params length:sizeof(w->params) atIndex:3];
+ [e dispatchThreadgroups:MTLSizeMake(gllm_littlebit_latent_groups(w),batch,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+}
+static void gllm_encode_littlebit_project(id<MTLComputeCommandEncoder> e,GLLMLittleBitWeight* w,id<MTLBuffer> z,NSUInteger offset,id<MTLBuffer> out,NSUInteger batch) {
+ [e setComputePipelineState:gllm_littlebit_output_pipeline];
+ [e setBuffer:w->data offset:0 atIndex:0];[e setBuffer:z offset:offset atIndex:1];[e setBuffer:out offset:0 atIndex:2];
+ [e setBytes:&w->params length:sizeof(w->params) atIndex:3];
+ [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)w->params.rows+15)/16,batch,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+}
+static void gllm_encode_littlebit_gate_up(id<MTLComputeCommandEncoder> e,GLLMLittleBitWeight* gate,GLLMLittleBitWeight* up,id<MTLBuffer> x,id<MTLBuffer> z,NSUInteger stride,id<MTLBuffer> hidden,NSUInteger batch,bool concurrent) {
+ gllm_encode_littlebit_latent(e,gate,x,z,0,batch);
+ gllm_encode_littlebit_latent(e,up,x,z,stride,batch);
+ gllm_decode_barrier(e,concurrent);
+ [e setComputePipelineState:gllm_littlebit_swiglu_pipeline];
+ [e setBuffer:gate->data offset:0 atIndex:0];[e setBuffer:up->data offset:0 atIndex:1];
+ [e setBuffer:z offset:0 atIndex:2];[e setBuffer:z offset:stride atIndex:3];[e setBuffer:hidden offset:0 atIndex:4];
+ [e setBytes:&gate->params length:sizeof(gate->params) atIndex:5];[e setBytes:&up->params length:sizeof(up->params) atIndex:6];
+ [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)gate->params.rows+15)/16,batch,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+}
+static void gllm_encode_littlebit_matvec(id<MTLComputeCommandEncoder> e,GLLMLittleBitWeight* w,id<MTLBuffer> x,id<MTLBuffer> z,id<MTLBuffer> out,NSUInteger batch,bool concurrent) {
+ gllm_encode_littlebit_latent(e,w,x,z,0,batch);
+ gllm_decode_barrier(e,concurrent);
+ gllm_encode_littlebit_project(e,w,z,0,out,batch);
+}
 // Shared by dense and native Gemma vocabulary selection. Producers must have
 // completed before entry; concurrent encoders need the explicit merge barrier.
 static void gllm_parallel_argmax(id<MTLComputeCommandEncoder> e,id<MTLBuffer> logits,id<MTLBuffer> partials,id<MTLBuffer> result,id<MTLBuffer> recent,uint32_t rows,uint32_t recent_count,float penalty,bool concurrent) {
@@ -655,7 +711,15 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
    gllm_decode_norm(e,d->x,l->norm,d->xn,d->dim,1,d->eps);
    gllm_decode_barrier(e,concurrent);
   }
-  gllm_decode_matvec(e,l,0,d->xn,d->q,schedule,separate);gllm_decode_matvec(e,l,1,d->xn,d->k,schedule,separate);gllm_decode_matvec(e,l,2,d->xn,d->v,schedule,separate);
+  bool littleBit=l->littleBit[0]!=NULL;
+  if(littleBit) {
+   id<MTLBuffer> qkv[3]={d->q,d->k,d->v};
+   for(int i=0;i<3;i++)gllm_encode_littlebit_latent(e,l->littleBit[i],d->xn,d->littleBitZ,i*d->littleBitStride,1);
+   gllm_decode_barrier(e,concurrent);
+   for(int i=0;i<3;i++)gllm_encode_littlebit_project(e,l->littleBit[i],d->littleBitZ,i*d->littleBitStride,qkv[i],1);
+  } else {
+   gllm_decode_matvec(e,l,0,d->xn,d->q,schedule,separate);gllm_decode_matvec(e,l,1,d->xn,d->k,schedule,separate);gllm_decode_matvec(e,l,2,d->xn,d->v,schedule,separate);
+  }
   gllm_decode_barrier(e,concurrent);
   id<MTLBuffer> q=d->q,k=d->k;
   if(l->qNorm!=nil){gllm_decode_norm(e,q,l->qNorm,d->qr,128,d->heads,d->eps);q=d->qr;}
@@ -698,7 +762,8 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
    [e dispatchThreadgroups:MTLSizeMake(d->heads,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
   }
   gllm_decode_barrier(e,concurrent);
-  gllm_decode_matvec(e,l,3,d->attn,d->proj,schedule,separate);
+  if(littleBit)gllm_encode_littlebit_matvec(e,l->littleBit[3],d->attn,d->littleBitZ,d->proj,1,concurrent);
+  else gllm_decode_matvec(e,l,3,d->attn,d->proj,schedule,separate);
   gllm_decode_barrier(e,concurrent);
   if(fused_norm) {
    gllm_decode_add_norm(e,d->x,d->proj,l->ffnNorm,d->xn,d->dim,d->eps);
@@ -709,7 +774,9 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
    gllm_decode_norm(e,d->x,l->ffnNorm,d->xn,d->dim,1,d->eps);
    gllm_decode_barrier(e,concurrent);
   }
-  if(fused_gate && l->quant[4]==l->quant[5] && (l->quant[4]==4 || l->quant[4]==6)) {
+  if(littleBit) {
+   gllm_encode_littlebit_gate_up(e,l->littleBit[4],l->littleBit[5],d->xn,d->littleBitZ,d->littleBitStride,d->hid,1,concurrent);
+  } else if(fused_gate && l->quant[4]==l->quant[5] && (l->quant[4]==4 || l->quant[4]==6)) {
    GLLMMetalWeight* gate=l->w[4];GLLMMetalWeight* up=l->w[5];
    [e setComputePipelineState:l->quant[4]==6?gllm_dec_pipes[18]:(separate?gllm_dec_pipes[12]:gllm_dec_q4_reference[1])];
    [e setBuffer:gate->weights offset:gate->weight_offset atIndex:0];[e setBuffer:up->weights offset:up->weight_offset atIndex:1];
@@ -723,7 +790,8 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
    gllm_metal_encode_silu(e,d->gate,d->up,d->hid,d->hidden);
   }
   gllm_decode_barrier(e,concurrent);
-  gllm_decode_matvec(e,l,6,d->hid,d->proj,schedule,separate);
+  if(littleBit)gllm_encode_littlebit_matvec(e,l->littleBit[6],d->hid,d->littleBitZ,d->proj,1,concurrent);
+  else gllm_decode_matvec(e,l,6,d->hid,d->proj,schedule,separate);
   gllm_decode_barrier(e,concurrent);
   if(fused_norm) {
    id<MTLBuffer> nextNorm=layer+1<d->layers?d->layer[layer+1].norm:d->outputNorm;
@@ -737,7 +805,11 @@ static bool gllm_decode_step(void* ptr,const float* input,const float* sn,const 
  if(!fused_norm)gllm_decode_norm(e,d->x,d->outputNorm,d->xn,d->dim,1,d->eps);
  if(logits!=NULL || next!=NULL) {
   gllm_decode_barrier(e,concurrent);
-  gllm_decode_quantized_with_pipe(e,d->outputWeight,d->outputQuant,d->xn,d->logits,schedule,gllm_decode_matvec_pipe(d->outputQuant,separate));
+  if(d->outputQuant==16) {
+   if(!gllm_metal_encode_bf16_head(e,d->outputWeight,d->xn,d->logits)){[e endEncoding];return false;}
+  } else {
+   gllm_decode_quantized_with_pipe(e,d->outputWeight,d->outputQuant,d->xn,d->logits,schedule,gllm_decode_matvec_pipe(d->outputQuant,separate));
+  }
  }
  if(next!=NULL) {
   gllm_decode_barrier(e,concurrent);

@@ -1,0 +1,56 @@
+#include "textflag.h"
+
+// Zero-extend each BF16 word, then shift it into the IEEE FP32 bit pattern.
+// Accumulation and reduction follow dotF32AVX2.
+TEXT ·dotF32BF16AVX2(SB), NOSPLIT, $0-28
+	MOVQ x+0(FP), SI
+	MOVQ raw+8(FP), DI
+	MOVQ n+16(FP), AX
+	VXORPS Y0, Y0, Y0
+	VXORPS Y1, Y1, Y1
+	VXORPS Y2, Y2, Y2
+	VXORPS Y3, Y3, Y3
+	XORQ CX, CX
+	MOVQ AX, DX
+	ANDQ $-32, DX
+
+loop32:
+	CMPQ CX, DX
+	JGE reduce32
+	VPMOVZXWD (DI)(CX*2), Y4
+	VPMOVZXWD 16(DI)(CX*2), Y5
+	VPMOVZXWD 32(DI)(CX*2), Y6
+	VPMOVZXWD 48(DI)(CX*2), Y7
+	VPSLLD $16, Y4, Y4
+	VPSLLD $16, Y5, Y5
+	VPSLLD $16, Y6, Y6
+	VPSLLD $16, Y7, Y7
+	VFMADD231PS (SI)(CX*4), Y4, Y0
+	VFMADD231PS 32(SI)(CX*4), Y5, Y1
+	VFMADD231PS 64(SI)(CX*4), Y6, Y2
+	VFMADD231PS 96(SI)(CX*4), Y7, Y3
+	ADDQ $32, CX
+	JMP loop32
+
+reduce32:
+	VADDPS Y1, Y0, Y0
+	VADDPS Y3, Y2, Y2
+	VADDPS Y2, Y0, Y0
+
+loop8:
+	CMPQ CX, AX
+	JGE reduce8
+	VPMOVZXWD (DI)(CX*2), Y4
+	VPSLLD $16, Y4, Y4
+	VFMADD231PS (SI)(CX*4), Y4, Y0
+	ADDQ $8, CX
+	JMP loop8
+
+reduce8:
+	VEXTRACTF128 $1, Y0, X1
+	VADDPS X1, X0, X0
+	VHADDPS X0, X0, X0
+	VHADDPS X0, X0, X0
+	VZEROUPPER
+	MOVSS X0, ret+24(FP)
+	RET

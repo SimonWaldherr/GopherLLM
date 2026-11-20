@@ -316,6 +316,22 @@ func matvecBatchWithQ8AndSlabs(w Weight, xs, outs [][]float32, useQ8 bool, input
 	if cols == 0 {
 		return
 	}
+	if w.LittleBit != nil {
+		if w.LittleBit.Metal != nil {
+			x, inputOK := batchRowsInSlab(xs, w.Cols, input)
+			y, outputOK := batchRowsInSlab(outs, w.Rows, output)
+			if inputOK && outputOK && matvecMetalLittleBitBatch(w.LittleBit.Metal, x, y, p) {
+				return
+			}
+		}
+		if w.LittleBit.Metal == nil && w.LittleBit.matvecBatchCPU(xs, outs, w.Rows, w.Cols) {
+			return
+		}
+		for t := range p {
+			w.MatvecInto(xs[t], &outs[t])
+		}
+		return
+	}
 	if matvecBatchBLASWithSlabs(w, xs, outs, useQ8, input, output) {
 		return
 	}
@@ -689,7 +705,8 @@ func forwardBatchGraphIntoContext(ctx context.Context, config Config, weights Mo
 				copy(V[t], QKV[t][qLen+kLen:qLen+kLen+vLen])
 			}
 		} else {
-			if !denseBatch || !metalDenseBatchProjectionQKV(buf, l, b.XNFlat, b.QFlat, b.KFlat, b.VFlat, p) {
+			if (!denseBatch || !metalDenseBatchProjectionQKV(buf, l, b.XNFlat, b.QFlat, b.KFlat, b.VFlat, p)) &&
+				!matvecMetalLittleBitQKV(layer.WQ, layer.WK, layer.WV, b.XNFlat, b.QFlat, b.KFlat, b.VFlat, p) {
 				matvecBatch3Slabs(layer.WQ, layer.WK, layer.WV, XN, Q, K, V, b.XNFlat, b.QFlat, b.KFlat, b.VFlat)
 			}
 		}
@@ -773,8 +790,8 @@ func forwardBatchGraphIntoContext(ctx context.Context, config Config, weights Mo
 		// slabs (Gate, Up, Hidden) cross several kernel boundaries. The Metal
 		// fast path keeps those slabs GPU-resident for a complete prompt chunk,
 		// then returns only the final model-width projection for the residual.
-		// It admits prepared Q4_K gate/up with Q4_K or Q6_K down, or all-Q8_0
-		// no-bias shapes; other architectures keep the reference batch path.
+		// It admits compatible prepared Q4_K, Q6_K, Q8_0, and LittleBit
+		// layouts; unsupported shapes keep the reference batch path.
 		// GateUp is layer-local: a mixed-model graph may follow a fused layer
 		// with a split one, and the activation task must never observe a stale
 		// fused view from the preceding layer.
@@ -785,7 +802,8 @@ func forwardBatchGraphIntoContext(ctx context.Context, config Config, weights Mo
 		}
 		fusedBatchFFN := coreMLHandled || !config.usesPlainMLP() && !layer.HasGateUp && !config.UseGELU &&
 			len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 &&
-			matvecMetalSwiGLUBatchInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, b.XNFlat, p, &b.ProjFlat)
+			(matvecMetalSwiGLUBatchInto(layer.W1.Metal, layer.W3.Metal, layer.W2.Metal, b.XNFlat, p, &b.ProjFlat) ||
+				matvecMetalLittleBitSwiGLUInto(layer.W1, layer.W3, layer.W2, b.XNFlat, p, &b.ProjFlat))
 		if !fusedBatchFFN && config.UseGELU && !config.UseExactGELU && !config.usesPlainMLP() && !layer.HasGateUp && len(layer.FFNUpBias) == 0 && len(layer.FFNDownBias) == 0 {
 			fusedBatchFFN = matvecMetalGeGLUInto(layer.W1, layer.W3, layer.W2, b.XNFlat, p, &b.ProjFlat)
 		}

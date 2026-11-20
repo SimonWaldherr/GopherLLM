@@ -6,6 +6,9 @@ package engine
 // having written nothing, whenever types or shapes do not line up, and the
 // caller falls back to independent matvecs.
 func tryMatvec3Into(wq, wk, wv Weight, x []float32, q4kXSums *[]float32, q, k, v *[]float32) bool {
+	if wq.LittleBit != nil || wk.LittleBit != nil || wv.LittleBit != nil {
+		return matvecMetalLittleBitQKVInto(wq, wk, wv, x, q, k, v)
+	}
 	if wq.Type != wk.Type || wq.Type != wv.Type || wq.Cols != wk.Cols || wq.Cols != wv.Cols || wq.Cols != len(x) || wq.F32 != nil || wk.F32 != nil || wv.F32 != nil {
 		return false
 	}
@@ -98,6 +101,9 @@ func tryMatvecAttentionInto(wq, wk, wv Weight, x []float32, q4kXSums *[]float32,
 }
 
 func tryMatvec2Into(a, b Weight, x []float32, q4kXSums *[]float32, aOut, bOut *[]float32) bool {
+	if a.LittleBit != nil || b.LittleBit != nil {
+		return false
+	}
 	if a.Type != b.Type || a.Cols != b.Cols || a.Cols != len(x) || a.F32 != nil || b.F32 != nil {
 		return false
 	}

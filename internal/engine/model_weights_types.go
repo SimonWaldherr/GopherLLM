@@ -23,6 +23,10 @@ func (r *weightResourceReleaser) release(w *Weight) {
 		}
 		w.Metal = nil
 	}
+	if w.LittleBit != nil && w.LittleBit.Metal != nil {
+		releaseMetalLittleBitWeight(w.LittleBit.Metal)
+		w.LittleBit.Metal = nil
+	}
 	if w.GPU != nil {
 		if r.gpu == nil {
 			r.gpu = make(map[*GPUWeight]bool)

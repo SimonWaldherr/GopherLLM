@@ -24,6 +24,7 @@ type metalDenseState struct {
 	eps, scale                                  float32
 	refs, owned                                 []*metalbackend.Weight
 	borrowedWeightBytes, copiedWeightBytes      int64
+	littleBit                                   bool
 }
 
 func (s *metalDenseState) close() {
@@ -61,17 +62,44 @@ func metalDenseEligible(c Config, w ModelWeights, k *KVCache) bool {
 		k.PerPosKDim != c.NKVHeads*128 || k.PerPosVDim != c.NKVHeads*128 || len(k.K) != c.NLayers || len(k.V) != c.NLayers {
 		return false
 	}
+	littleBit := metalDenseLittleBitModel(w)
+	if littleBit && os.Getenv("GOPHERLLM_METAL_LITTLEBIT_RESIDENT") == "0" {
+		return false
+	}
 	for i := range w.Layers {
 		l := &w.Layers[i]
-		if l.W1.Metal == nil || l.HasQKV || l.HasGateUp || l.MoE != nil || l.MLA != nil ||
+		if l.HasQKV || l.HasGateUp || l.MoE != nil || l.MLA != nil ||
 			len(l.AttnNorm) != c.Dim || len(l.FFNNorm) != c.Dim ||
 			!metalDenseZero(l.AttnNormBias, l.FFNNormBias, l.BQ, l.BK, l.BV, l.BO, l.FFNUpBias, l.FFNDownBias) || len(l.PostAttnNorm)+len(l.PostFFNNorm)+len(l.AttnSinks) != 0 ||
 			(len(l.AttnQNorm) != 0 && len(l.AttnQNorm) != 128) || (len(l.AttnKNorm) != 0 && len(l.AttnKNorm) != 128) ||
 			len(k.K[i]) < k.MaxLen*k.PerPosKDim || len(k.V[i]) < k.MaxLen*k.PerPosVDim {
 			return false
 		}
+		if littleBit {
+			if _, ok := metalDenseLittleBitLayer(l); !ok {
+				return false
+			}
+		} else if l.W1.Metal == nil || l.WQ.LittleBit != nil || l.WK.LittleBit != nil || l.WV.LittleBit != nil || l.WO.LittleBit != nil ||
+			l.W1.LittleBit != nil || l.W2.LittleBit != nil || l.W3.LittleBit != nil {
+			return false
+		}
 	}
 	return true
+}
+
+func metalDenseLittleBitModel(w ModelWeights) bool {
+	return len(w.Layers) != 0 && w.Layers[0].W1.LittleBit != nil
+}
+
+func metalDenseLittleBitLayer(l *LayerWeights) ([7]*metalbackend.LittleBitWeight, bool) {
+	var handles [7]*metalbackend.LittleBitWeight
+	for i, w := range [7]Weight{l.WQ, l.WK, l.WV, l.WO, l.W1, l.W3, l.W2} {
+		handles[i] = metalLittleBitProjection(w)
+		if handles[i] == nil {
+			return handles, false
+		}
+	}
+	return handles, true
 }
 
 func newMetalDenseState(c Config, w ModelWeights, k *KVCache, mapping []byte) *metalDenseState {
@@ -80,6 +108,7 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache, mapping []byte) *m
 		scale = float32(1 / math.Sqrt(128))
 	}
 	s := &metalDenseState{sharedK: make([][]float32, c.NLayers), sharedV: make([][]float32, c.NLayers), owner: &w.Layers[0], cache: k, dim: c.Dim, hidden: c.HiddenDim, heads: c.NHeads, kvheads: c.NKVHeads, layers: c.NLayers, window: c.SlidingWindow, eps: c.RMSNormEps, scale: c.AttentionScale}
+	s.littleBit = metalDenseLittleBitModel(w)
 	s.decoder = metalbackend.NewDecoder(c.Dim, c.HiddenDim, c.NHeads, c.NKVHeads, c.NLayers, k.MaxLen, c.RMSNormEps, scale, w.OutputNorm)
 	if s.decoder == nil {
 		return nil
@@ -87,70 +116,17 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache, mapping []byte) *m
 	fail := func() *metalDenseState { s.close(); return nil }
 	for i := range w.Layers {
 		l := &w.Layers[i]
-		matrices := [7]Weight{l.WQ, l.WK, l.WV, l.WO, l.W1, l.W3, l.W2}
-		rows := [7]int{c.NHeads * 128, c.NKVHeads * 128, c.NKVHeads * 128, c.Dim, c.HiddenDim, c.HiddenDim, c.Dim}
-		cols := [7]int{c.Dim, c.Dim, c.Dim, c.NHeads * 128, c.Dim, c.Dim, c.HiddenDim}
-		var refs [7]*metalbackend.Weight
-		var quant [7]uint32
-		for j, m := range matrices {
-			if m.Rows != rows[j] || m.Cols != cols[j] || m.F32 != nil || m.Cols%256 != 0 {
-				return fail()
-			}
-			var p *metalbackend.Weight
-			switch m.Type {
-			case GGMLTypeQ4_K:
-				quant[j] = 4
-				if m.Metal != nil {
-					p = m.Metal.q4
-				}
-			case GGMLTypeQ6_K:
-				quant[j] = 6
-				if m.Metal != nil {
-					p = m.Metal.q6
-				}
-			case GGMLTypeQ8_0:
-				quant[j] = 8
-				if m.Metal != nil {
-					p = m.Metal.q8
-				}
-			default:
-				return fail()
-			}
-			if p == nil {
-				borrow := weightBytesInMapping(m.Raw, mapping)
-				switch quant[j] {
-				case 4:
-					p = metalbackend.PrepareQ4K(m.Raw, m.Rows, m.Cols, borrow)
-				case 6:
-					p = metalbackend.PrepareQ6K(m.Raw, m.Rows, m.Cols, borrow)
-				case 8:
-					p = metalbackend.PrepareQ8_0(m.Raw, m.Rows, m.Cols, borrow)
-				}
-				if p == nil {
-					return fail()
-				}
-				s.owned = append(s.owned, p)
-				rowBytes, _ := m.Type.DataSize(m.Cols)
-				weightBytes := int64(m.Rows) * int64(rowBytes)
-				if borrow {
-					s.borrowedWeightBytes += weightBytes
-				} else {
-					s.copiedWeightBytes += weightBytes
-				}
-			}
-			refs[j] = p
-			s.refs = append(s.refs, p)
-		}
-		// layerUsesSWA consults c.SWAPattern per layer when one is present
-		// (Ministral 8B's interleaved local/global attention), so this
-		// already binds the correct per-layer window regardless of whether
-		// the model uses a uniform window on every layer or an interleaved
-		// pattern -- metalDenseEligible no longer needs to reject the latter.
+		// Per-layer windows can differ on models with interleaved SWA.
 		window := 0
 		if c.layerUsesSWA(i) {
 			window = c.SlidingWindow
 		}
-		if !s.decoder.BindLayer(i, refs, quant, l.AttnNorm, l.FFNNorm, l.AttnQNorm, l.AttnKNorm, window) {
+		if s.littleBit {
+			handles, ok := metalDenseLittleBitLayer(l)
+			if !ok || !s.decoder.BindLittleBitLayer(i, handles, l.AttnNorm, l.FFNNorm, l.AttnQNorm, l.AttnKNorm, window) {
+				return fail()
+			}
+		} else if !s.bindQuantizedLayer(c, l, i, window, mapping) {
 			return fail()
 		}
 		if os.Getenv("GOPHERLLM_METAL_DENSE_SHARED_KV") != "0" && metalKVShareable(k.K[i]) && metalKVShareable(k.V[i]) {
@@ -164,6 +140,64 @@ func newMetalDenseState(c Config, w ModelWeights, k *KVCache, mapping []byte) *m
 	}
 	runtime.SetFinalizer(s, (*metalDenseState).close)
 	return s
+}
+
+func (s *metalDenseState) bindQuantizedLayer(c Config, l *LayerWeights, i, window int, mapping []byte) bool {
+	matrices := [7]Weight{l.WQ, l.WK, l.WV, l.WO, l.W1, l.W3, l.W2}
+	rows := [7]int{c.NHeads * 128, c.NKVHeads * 128, c.NKVHeads * 128, c.Dim, c.HiddenDim, c.HiddenDim, c.Dim}
+	cols := [7]int{c.Dim, c.Dim, c.Dim, c.NHeads * 128, c.Dim, c.Dim, c.HiddenDim}
+	var refs [7]*metalbackend.Weight
+	var quant [7]uint32
+	for j, m := range matrices {
+		if m.Rows != rows[j] || m.Cols != cols[j] || m.F32 != nil || m.Cols%256 != 0 {
+			return false
+		}
+		var p *metalbackend.Weight
+		switch m.Type {
+		case GGMLTypeQ4_K:
+			quant[j] = 4
+			if m.Metal != nil {
+				p = m.Metal.q4
+			}
+		case GGMLTypeQ6_K:
+			quant[j] = 6
+			if m.Metal != nil {
+				p = m.Metal.q6
+			}
+		case GGMLTypeQ8_0:
+			quant[j] = 8
+			if m.Metal != nil {
+				p = m.Metal.q8
+			}
+		default:
+			return false
+		}
+		if p == nil {
+			borrow := weightBytesInMapping(m.Raw, mapping)
+			switch quant[j] {
+			case 4:
+				p = metalbackend.PrepareQ4K(m.Raw, m.Rows, m.Cols, borrow)
+			case 6:
+				p = metalbackend.PrepareQ6K(m.Raw, m.Rows, m.Cols, borrow)
+			case 8:
+				p = metalbackend.PrepareQ8_0(m.Raw, m.Rows, m.Cols, borrow)
+			}
+			if p == nil {
+				return false
+			}
+			s.owned = append(s.owned, p)
+			rowBytes, _ := m.Type.DataSize(m.Cols)
+			weightBytes := int64(m.Rows) * int64(rowBytes)
+			if borrow {
+				s.borrowedWeightBytes += weightBytes
+			} else {
+				s.copiedWeightBytes += weightBytes
+			}
+		}
+		refs[j] = p
+		s.refs = append(s.refs, p)
+	}
+	return s.decoder.BindLayer(i, refs, quant, l.AttnNorm, l.FFNNorm, l.AttnQNorm, l.AttnKNorm, window)
 }
 
 func tryMetalDenseDecode(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, token uint32, pos int) bool {
@@ -190,7 +224,7 @@ func tryMetalDenseVerify(ctx context.Context, c Config, w ModelWeights, k *KVCac
 		return nil, false, err
 	}
 	n := len(tokens)
-	if n < 2 || n > 8 || len(recent) != n || predictions == nil || k == nil || b == nil || start < 0 || start > k.MaxLen-n ||
+	if n < 2 || n > 8 || len(recent) != n || predictions == nil || k == nil || b == nil || start < 0 || start > k.MaxLen-n || metalDenseLittleBitModel(w) || w.Output.Type == GGMLTypeBF16 ||
 		os.Getenv("GOPHERLLM_NO_GREEDY_ARGMAX") == "1" ||
 		os.Getenv("GOPHERLLM_METAL_WHOLE_PREFILL") == "0" || os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") == "0" ||
 		!metalBatchAttentionEnabled || !metalFusedFFNEnabled || len(b.RopeInvFreq) < 64 ||
@@ -221,7 +255,7 @@ func tryMetalDenseVerify(ctx context.Context, c Config, w ModelWeights, k *KVCac
 }
 
 func (s *metalDenseState) bindOutput(c Config, w ModelWeights) bool {
-	if w.Output.F32 != nil || w.Output.Metal == nil || w.Output.Cols != c.Dim || w.Output.Rows != c.VocabSize {
+	if w.Output.LittleBit != nil || w.Output.F32 != nil || w.Output.Metal == nil || w.Output.Cols != c.Dim || w.Output.Rows != c.VocabSize {
 		return false
 	}
 	var output *metalbackend.Weight
@@ -233,6 +267,8 @@ func (s *metalDenseState) bindOutput(c Config, w ModelWeights) bool {
 		output, quant = w.Output.Metal.q6, 6
 	case GGMLTypeQ8_0:
 		output, quant = w.Output.Metal.q8, 8
+	case GGMLTypeBF16:
+		output, quant = w.Output.Metal.bf16, 16
 	}
 	if output == nil {
 		return false
@@ -253,32 +289,8 @@ func tryMetalDenseStep(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, to
 	}
 
 	if logits != nil || next != nil {
-		if w.Output.F32 != nil || w.Output.Metal == nil || w.Output.Cols != c.Dim || w.Output.Rows != c.VocabSize {
+		if !s.bindOutput(c, w) {
 			return false
-		}
-		var output *metalbackend.Weight
-		var quant uint32
-		switch w.Output.Type {
-		case GGMLTypeQ4_K:
-			output = w.Output.Metal.q4
-			quant = 4
-		case GGMLTypeQ6_K:
-			output = w.Output.Metal.q6
-			quant = 6
-		case GGMLTypeQ8_0:
-			output = w.Output.Metal.q8
-			quant = 8
-		default:
-			return false
-		}
-		if output == nil {
-			return false
-		}
-		if s.output != output {
-			if !s.decoder.BindOutput(output, quant) {
-				return false
-			}
-			s.output = output
 		}
 		if logits != nil {
 			ensureLenNoClear(logits, c.VocabSize)
@@ -422,7 +434,7 @@ func metalDenseFor(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer) *metal
 }
 
 func prepareMetalDenseBatch(c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, batch int) bool {
-	return batch >= 16 && batch <= metalBatchFFNMaxTokens && os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" && metalDenseFor(c, w, k, b) != nil
+	return batch >= 16 && batch <= metalBatchFFNMaxTokens && !metalDenseLittleBitModel(w) && os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" && metalDenseFor(c, w, k, b) != nil
 }
 
 func tryMetalDensePrefill(ctx context.Context, c Config, w ModelWeights, k *KVCache, b *DecodeBuffer, start, batch int, shortVerifier bool) (bool, error) {
@@ -433,7 +445,13 @@ func tryMetalDensePrefill(ctx context.Context, c Config, w ModelWeights, k *KVCa
 		return false, nil
 	}
 	eligible := false
-	if shortVerifier && batch >= 2 && batch <= 8 {
+	if metalDenseLittleBitModel(w) {
+		// Use the resident graph on regular prefill slabs. Speculative
+		// verification still requires its separate device-logits path.
+		eligible = !shortVerifier && batch >= 16 && batch <= metalBatchFFNMaxTokens &&
+			os.Getenv("GOPHERLLM_METAL_LITTLEBIT_PREFILL") != "0" && os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" &&
+			metalDenseFor(c, w, k, b) != nil
+	} else if shortVerifier && batch >= 2 && batch <= 8 {
 		eligible = os.Getenv("GOPHERLLM_METAL_DENSE_PREFILL") != "0" && metalDenseFor(c, w, k, b) != nil
 	} else {
 		eligible = prepareMetalDenseBatch(c, w, k, b, batch)
