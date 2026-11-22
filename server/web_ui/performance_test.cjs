@@ -7,10 +7,20 @@ const vm = require('node:vm');
 const { performance } = require('node:perf_hooks');
 const source = fs.readFileSync(__dirname + '/script.js', 'utf8');
 const context = vm.createContext({});
+vm.runInContext(source.slice(0, source.indexOf('function bindCopy')), context);
 vm.runInContext(source.slice(source.indexOf('/* Untrimmed core:'), source.indexOf('/* IndexedDB')), context);
 vm.runInContext(source.slice(source.indexOf('function createChatFilter('), source.indexOf('// Search only controls')), context);
 const { splitThinkText, createThinkSplitter, createChatFilter, reconcileChildren } = context;
 const plain = value => JSON.parse(JSON.stringify(value));
+
+test('plain Markdown text stays escaped and inline formatting still renders', () => {
+  const { renderMarkdown } = context;
+  assert.equal(renderMarkdown('Grüße & <tag> "plain"'), '<p>Grüße &amp; &lt;tag&gt; &quot;plain&quot;</p>');
+  const rich = renderMarkdown('**Bold** *emphasis* ~~old~~ `a_b` [Link](/chat) https://example.org');
+  assert.match(rich, /<strong>Bold<\/strong> <em>emphasis<\/em> <del>old<\/del> <code>a_b<\/code>/);
+  assert.match(rich, /<a href="\/chat"[^>]*>Link<\/a>/);
+  assert.match(rich, /<a href="https:\/\/example.org"[^>]*>https:\/\/example.org<\/a>/);
+});
 
 test('incremental reasoning matches the full parser at every token boundary', () => {
   const examples = [

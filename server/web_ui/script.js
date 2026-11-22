@@ -70,6 +70,8 @@ function safeURL(raw) {
 
 function renderInline(s) {
   s = escapeHTML(s);
+  // Most prose needs HTML escaping only. A colon can start an auto-linked URL.
+  if (!/[`\[*_~:\u0000]/.test(s)) return s;
   // Inline code first, and its content is protected from every later rule by
   // placeholder substitution — otherwise `a_b_c` or `**x**` inside code would
   // get mangled into emphasis.
@@ -1562,6 +1564,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   const modelDownloadStatusEl = $("modelDownloadStatus");
   const settingsTabEls = Array.from(document.querySelectorAll("[data-settings-tab]"));
   const settingsPageEls = Array.from(document.querySelectorAll("[data-settings-page]"));
+  const modelSettingsPageEl = settingsPageEls.find((page) => page.dataset.settingsPage === "model");
   const chatTitleEl = $("chatTitle");
   const chatListEl = $("chatList");
   const chatSearchEl = $("chatSearch");
@@ -1701,6 +1704,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   let modelLoadStartedAt = 0;
   let modelLoadProgressActive = false;
   let modelCatalog = [];
+  let modelCatalogRevision = 0;
+  let modelCatalogMessage = null;
 
   function renderModelRoles() {
     const setRole = (element, text, ready) => {
@@ -2695,7 +2700,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     busy = value;
     if (value) closeCaptureMenus();
     modelSelectEl.disabled = value;
-    if (modelCatalog.length) renderModelLibrary();
+    renderModelPicker();
     newChatEl.disabled = value;
     renameChatEl.disabled = value;
     deleteChatEl.disabled = value;
@@ -2725,8 +2730,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     else setIdleStatus();
   }
 
-  function addMessage(role, text, attachments, images, visionContext) {
-    emptyEl.hidden = true;
+  function addMessage(role, text, attachments, images, visionContext, parent = messagesEl) {
+    if (parent === messagesEl) emptyEl.hidden = true;
     const el = document.createElement("article");
     el.className = "msg " + role;
     if (role === "error") el.setAttribute("role", "alert");
@@ -2758,28 +2763,37 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     el.appendChild(content);
     renderMessageAttachments(el, attachments);
     if (role === "user" && text) attachCopyButton(el);
-    messagesEl.appendChild(el);
+    parent.appendChild(el);
     return el;
   }
 
+  const reasoningViews = new WeakMap();
   function upsertReasoning(el, text, thinking) {
-    let details = el.querySelector(":scope > .reasoning");
+    let view = reasoningViews.get(el);
     if (!text && !thinking) {
-      if (details) details.remove();
+      if (view) {
+        view.details.remove();
+        reasoningViews.delete(el);
+      }
       return;
     }
-    if (!details) {
-      details = document.createElement("details");
+    if (!view) {
+      const details = document.createElement("details");
       details.className = "reasoning";
       const summary = document.createElement("summary");
       const body = document.createElement("div");
       body.className = "reasoning-body";
       details.append(summary, body);
       el.insertBefore(details, el.querySelector(".content"));
+      view = { details, summary, paint: createStreamTextRenderer(body), thinking: null };
+      reasoningViews.set(el, view);
     }
-    details.classList.toggle("reasoning-live", thinking);
-    details.querySelector("summary").textContent = thinking ? "Thinking…" : "Reasoning";
-    details.querySelector(".reasoning-body").textContent = text;
+    if (view.thinking !== thinking) {
+      view.thinking = thinking;
+      view.details.classList.toggle("reasoning-live", thinking);
+      view.summary.textContent = thinking ? "Thinking…" : "Reasoning";
+    }
+    view.paint(text);
   }
 
   /* A ticking read-out under the answer that is still arriving. It reports the
@@ -2971,22 +2985,25 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     el.appendChild(wrap);
   }
 
+  function renderStoredMessage(message, index, parent) {
+    const el = addMessage(message.role, message.content, message.attachments, message.images, message.visionContext, parent);
+    if (message.role === "assistant") {
+      finalizeAssistant(el, {
+        answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
+        usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache,
+        agent: message.agent, decodeMS: 0
+      });
+    }
+    addActions(el, message, index);
+  }
+
   function renderConversation(scrollEnd) {
     const chat = activeChat();
     if (!chat) return;
-    messagesEl.querySelectorAll(".msg").forEach((el) => el.remove());
+    const fragment = document.createDocumentFragment();
+    chat.messages.forEach((message, index) => renderStoredMessage(message, index, fragment));
     emptyEl.hidden = chat.messages.length > 0;
-    chat.messages.forEach((message, index) => {
-      const el = addMessage(message.role, message.content, message.attachments, message.images, message.visionContext);
-      if (message.role === "assistant") {
-        finalizeAssistant(el, {
-          answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
-          usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache,
-          agent: message.agent, decodeMS: 0
-        });
-      }
-      addActions(el, message, index);
-    });
+    messagesEl.replaceChildren(emptyEl, fragment);
     if (scrollEnd) {
       followStream = true;
       scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -3005,17 +3022,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     const chat = activeChat();
     if (!chat || !chat.messages.length) return;
     const index = chat.messages.length - 1;
-    const message = chat.messages[index];
-    emptyEl.hidden = true;
-    const el = addMessage(message.role, message.content, message.attachments, message.images, message.visionContext);
-    if (message.role === "assistant") {
-      finalizeAssistant(el, {
-        answer: message.content, reasoning: message.reasoning, toolCalls: message.tool_calls,
-        usage: message.usage, finishReason: message.finishReason, promptCache: message.prompt_cache,
-        agent: message.agent, decodeMS: 0
-      });
-    }
-    addActions(el, message, index);
+    renderStoredMessage(chat.messages[index], index, messagesEl);
     followStream = true;
     scrollEl.scrollTop = scrollEl.scrollHeight;
     jumpLatestEl.hidden = true;
@@ -3614,8 +3621,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     let firstTokenAt = 0;
     let latest = "";
     let reasoning = "";
-    let streamFinished = false;
-    let pending = false;
+    let paintFrame = null;
     let renderStreamText = null;
     // Live progress. Before the first token the server is reading the prompt,
     // which on a large context is the longest part of the wait and used to look
@@ -3642,14 +3648,11 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         content.classList.add("streaming");
         renderStreamText = createStreamTextRenderer(content);
       }
-      setStatus(thinkingNow ? "Thinking…" : "Generating…");
-      if (pending) return;
-      pending = true;
-      requestAnimationFrame(() => {
-        pending = false;
-        if (streamFinished) return;
+      if (paintFrame !== null) return;
+      paintFrame = requestAnimationFrame(() => {
+        paintFrame = null;
+        setStatus(thinkingNow ? "Thinking…" : "Generating…");
         renderStreamText(latest);
-        assistantEl.dataset.raw = latest;
         upsertReasoning(assistantEl, reasoning, thinkingNow);
         scrollToBottom(false);
       });
@@ -3689,7 +3692,6 @@ function planSettingsSearch(pages, query, activeKey, simple) {
           };
         }
       }
-      streamFinished = true;
       result.decodeMS = firstTokenAt ? performance.now() - firstTokenAt : performance.now() - startedAt;
       finalizeAssistant(assistantEl, result);
       announce("Answer ready.");
@@ -3708,7 +3710,6 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       updateComposer(false);
       setIdleStatus();
     } catch (error) {
-      streamFinished = true;
       lastContextWindow = null;
       // The last token may arrive before its animation frame is painted.
       const partial = latest;
@@ -3733,6 +3734,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         showToast("The answer could not be generated. Retry the last message.", "error");
       }
     } finally {
+      if (paintFrame !== null) cancelAnimationFrame(paintFrame);
       meter.stop();
       controller = null;
       setBusy(false);
@@ -3764,6 +3766,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       chat = createBranch(source, source.messages.slice(0, index), "edit");
       syncControls(false);
       renderChatList();
+      renderConversation(true);
       showToast("Created an edit branch. The original chat is unchanged.", "success");
     }
     const ragContext = text ? await buildRagContext(chat, text) : "";
@@ -3872,9 +3875,16 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   // card grid, until the person actually asks for a sort.
   let modelSortKey = null;
   let modelSortDir = 1;
+  let modelPickerState = "";
 
   function applyModelView(mode) {
-    modelViewMode = mode === "table" ? "table" : "cards";
+    const next = mode === "table" ? "table" : "cards";
+    if (next !== modelViewMode) {
+      if (next === "cards") modelLibraryTableBodyEl?.replaceChildren();
+      else modelLibraryEl.replaceChildren();
+      modelPickerState = "";
+    }
+    modelViewMode = next;
     try {
       localStorage.setItem(MODEL_VIEW_KEY, modelViewMode);
     } catch (error) {
@@ -3884,6 +3894,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     if (modelViewTableEl) modelViewTableEl.setAttribute("aria-pressed", String(modelViewMode === "table"));
     if (modelLibraryEl) modelLibraryEl.hidden = modelViewMode !== "cards";
     if (modelLibraryTableWrapEl) modelLibraryTableWrapEl.hidden = modelViewMode !== "table";
+    renderModelPicker();
   }
 
   function setupModelView() {
@@ -3899,7 +3910,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
           modelSortKey = key;
           modelSortDir = 1;
         }
-        renderModelLibrary();
+        renderModelPicker();
       });
     });
   }
@@ -4042,14 +4053,13 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     modelSelectEl.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  function renderModelCards(visible, query) {
-    modelLibraryEl.replaceChildren();
-    modelLibraryEl.setAttribute("aria-busy", "false");
+  function renderModelCards(visible, emptyMessage) {
+    const rows = document.createDocumentFragment();
     if (!visible.length) {
       const empty = document.createElement("p");
       empty.className = "model-library-empty";
-      empty.textContent = query ? "No GGUF matches this search." : "No compatible chat model found.";
-      modelLibraryEl.appendChild(empty);
+      empty.textContent = emptyMessage;
+      rows.appendChild(empty);
     }
     visible.forEach((model) => {
       const card = document.createElement("button");
@@ -4089,8 +4099,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       path.textContent = model.id;
       path.title = model.id;
       card.append(name, state, meta, path);
-      modelLibraryEl.appendChild(card);
+      rows.appendChild(card);
     });
+    modelLibraryEl.replaceChildren(rows);
   }
 
   function sortedModels(visible) {
@@ -4132,20 +4143,20 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     });
   }
 
-  function renderModelTable(visible, query) {
+  function renderModelTable(visible, emptyMessage) {
     if (!modelLibraryTableBodyEl) return;
     updateModelTableSortIndicators();
-    modelLibraryTableBodyEl.replaceChildren();
     if (!visible.length) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
       cell.colSpan = 7;
       cell.className = "model-table-empty";
-      cell.textContent = query ? "No GGUF matches this search." : "No compatible chat model found.";
+      cell.textContent = emptyMessage;
       row.appendChild(cell);
-      modelLibraryTableBodyEl.appendChild(row);
+      modelLibraryTableBodyEl.replaceChildren(row);
       return;
     }
+    const rows = document.createDocumentFragment();
     sortedModels(visible).forEach((model) => {
       const row = document.createElement("tr");
       row.className = "model-row";
@@ -4195,42 +4206,58 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       status.appendChild(statusBadge);
 
       row.append(name, arch, size, ctx, thinking, vision, status);
-      modelLibraryTableBodyEl.appendChild(row);
+      rows.appendChild(row);
     });
+    modelLibraryTableBodyEl.replaceChildren(rows);
   }
 
-  function renderModelLibrary() {
+  function chatCatalog() {
+    return modelCatalog.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
+  }
+
+  function renderModelPicker() {
+    if (settingsEl.hidden || modelSettingsPageEl.hidden || browserOnlyDeployment ||
+        !serverFeatureSet().has("model-catalog")) return;
     const query = modelSearchEl.value.trim().toLowerCase();
     const showUnsupported = modelShowUnsupportedEl.checked;
-    const chatModels = modelCatalog.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
-    const unsupportedHidden = chatModels.filter((model) => !model.supported && !showUnsupported).length;
-    const visible = chatModels.filter((model) => {
-      if (!showUnsupported && !model.supported) return false;
-      return !query || model.search.includes(query);
-    });
-
-    renderModelCards(visible, query);
-    renderModelTable(visible, query);
+    const state = JSON.stringify([modelCatalogRevision, modelCatalogMessage, modelViewMode, modelSortKey, modelSortDir,
+      query, showUnsupported, busy || tuning || loadingModel, loadingModelID]);
+    if (state === modelPickerState) return;
+    modelPickerState = state;
+    const chatModels = chatCatalog();
+    const visible = [];
+    let compatibleCount = 0;
+    for (const model of chatModels) {
+      if (model.supported) compatibleCount++;
+      if (!modelCatalogMessage && (showUnsupported || model.supported) && (!query || model.search.includes(query))) {
+        visible.push(model);
+      }
+    }
+    const emptyMessage = modelCatalogMessage ?? "Discovering local GGUF models…";
+    const fallback = query ? "No GGUF matches this search." : "No compatible chat model found.";
+    if (modelViewMode === "cards") renderModelCards(visible, emptyMessage || fallback);
+    else renderModelTable(visible, emptyMessage || fallback);
+    const unsupportedHidden = showUnsupported ? 0 : chatModels.length - compatibleCount;
     modelHiddenCountEl.textContent = unsupportedHidden ? "(" + unsupportedHidden + " hidden)" : "";
-    const compatibleCount = chatModels.filter((model) => model.supported).length;
     modelResultCountEl.textContent = visible.length + " shown · " + compatibleCount + " compatible";
 
     const active = chatModels.find((model) => model.loaded);
     const loading = chatModels.find((model) => model.id === loadingModelID);
     renderActiveModelSummary(loading || active || null, loading ? "loading" : "loaded");
-    renderEmptyState(Boolean(active));
-    if (hasActiveModel !== Boolean(active)) {
-      hasActiveModel = Boolean(active);
+  }
+
+  function renderModelLibrary() {
+    const active = chatCatalog().some((model) => model.loaded);
+    if (modelCatalog.length && hasActiveModel !== active) {
+      hasActiveModel = active;
+      renderEmptyState(active);
       // Loading/thinking/tuning already show their own status text; only
       // reassert the idle text when the page is actually idle, so this
       // refresh (which can run at any time, e.g. after a poll) never stomps
       // a status message that is currently accurate for a different reason.
       if (!busy && !tuning && !loadingModel) setIdleStatus();
     }
-  }
-
-  function filterModelOptions() {
-    renderModelLibrary();
+    renderModelPicker();
   }
 
   async function loadModels() {
@@ -4239,21 +4266,18 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       const response = await fetch("/models");
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
-      if (!data.models || !data.models.length) {
-        modelLibraryEl.setAttribute("aria-busy", "false");
-        // Only point at the download panel when this server actually has one.
-        modelLibraryEl.querySelector(".model-library-empty").textContent = serverFeatureSet().has("model-download")
-          ? "No GGUF models found in the configured model directory. Download one below to get started."
-          : "No GGUF models found in the configured model directory. Put a .gguf file there, or restart the server with --enable model-download.";
-        modelResultCountEl.textContent = "0 models";
-        return;
-      }
+      const models = Array.isArray(data.models) ? data.models : [];
       modelSelectEl.replaceChildren();
-      modelSelectEl.disabled = false;
-      const chatModels = data.models.filter((model) => model.embedding !== true && model.architecture !== "voxtral_realtime");
-      modelCatalog = data.models.map((model) => Object.assign({}, model, {
+      modelSelectEl.disabled = busy || tuning || loadingModel;
+      modelCatalog = models.map((model) => Object.assign({}, model, {
         search: [model.name, model.id, model.architecture, model.size_gb && model.size_gb.toFixed(1) + " GB", model.reasoning ? "thinking reasoning" : "no thinking", model.vision ? "vision" : "no vision"].filter(Boolean).join(" ").toLowerCase()
       }));
+      modelCatalogRevision++;
+      modelCatalogMessage = models.length ? "" : (serverFeatureSet().has("model-download")
+        ? "No GGUF models found. Download one below to get started."
+        : "No GGUF models found in the configured model directory.");
+      modelLibraryEl.setAttribute("aria-busy", "false");
+      const chatModels = chatCatalog();
       renderModelRoles();
       const placeholder = document.createElement("option");
       placeholder.value = "";
@@ -4280,8 +4304,8 @@ function planSettingsSearch(pages, query, activeKey, simple) {
         if (!model.supported) option.style.color = "var(--muted)";
         modelSelectEl.appendChild(option);
       });
-      filterModelOptions();
-      const embeddingModels = data.models.filter((model) => model.embedding === true);
+      renderModelLibrary();
+      const embeddingModels = models.filter((model) => model.embedding === true);
       ragModelEl.replaceChildren();
       if (!embeddingModels.length) {
         const option = document.createElement("option");
@@ -4310,13 +4334,9 @@ function planSettingsSearch(pages, query, activeKey, simple) {
 		// a server-side embedding-model loader through this async path.
 		syncDeploymentControls();
     } catch (_) {
+      modelCatalogMessage = "Could not reach the local model catalog.";
       modelLibraryEl.setAttribute("aria-busy", "false");
-      modelLibraryEl.replaceChildren();
-      const empty = document.createElement("p");
-      empty.className = "model-library-empty";
-      empty.textContent = "Could not reach the local model catalog.";
-      modelLibraryEl.appendChild(empty);
-      modelResultCountEl.textContent = "Catalog unavailable";
+      renderModelPicker();
       setStatus("Offline");
       renderModelRoles();
     }
@@ -5777,10 +5797,10 @@ function planSettingsSearch(pages, query, activeKey, simple) {
   agentosApproveEl.addEventListener("click", () => executeAgentOSProposal(true));
   agentosDenyEl.addEventListener("click", () => executeAgentOSProposal(false));
 
-  modelSearchEl.addEventListener("input", filterModelOptions);
+  modelSearchEl.addEventListener("input", renderModelPicker);
   modelShowUnsupportedEl.addEventListener("change", () => {
     preferences.showUnsupportedModels = modelShowUnsupportedEl.checked;
-    filterModelOptions();
+    renderModelPicker();
     save();
   });
   modelHubSearchFormatEl.addEventListener("change", () => { cancelModelHubSearch(); clearModelHubSearchResults(); modelDownloadVariantsEl.hidden = true; if (modelHubSearchQueryEl.value.trim()) searchModelHub(modelHubSearchQueryEl.value); });
@@ -5878,6 +5898,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       const loaded = Array.from(modelSelectEl.options).find((option) => option.value === model);
       if (loaded) loaded.dataset.loaded = "true";
       modelCatalog.forEach((entry) => { entry.loaded = entry.id === model; });
+      modelCatalogRevision++;
       contextLimit = Number(data.context_length) || 0;
       const loadedName = data.model || model;
       const retry = pendingModelRetry;
@@ -6043,6 +6064,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
       tab.tabIndex = active ? 0 : -1;
     });
     settingsPageEls.forEach((page) => { page.hidden = page.dataset.settingsPage !== selected.dataset.settingsTab; });
+    if (selected.dataset.settingsTab === "model") renderModelPicker();
     if (focusTab) selected.focus();
     // Switching tabs changes which match count is "active" for the empty-
     // state message; re-evaluate it against the tab just switched to.
@@ -6138,6 +6160,7 @@ function planSettingsSearch(pages, query, activeKey, simple) {
     // user never searched for this time -- start every visit unfiltered.
     clearSettingsSearch();
     openDialog(settingsEl, opener || settingsToggleEl, initialFocus || settingsSearchEl);
+    renderModelPicker();
   }
   function closeSettings() {
     if (settingsEl.hidden) return;

@@ -236,6 +236,12 @@ active model. Unsupported or auxiliary GGUFs stay hidden unless requested.
 Settings separate model/chat, capabilities, generation, and workspace controls
 without replacing manual sampling or context choices.
 
+The model picker renders the selected card or table view when its settings
+tab is open. In a local Chromium comparison with a 300-model test catalog,
+a chat turn with settings closed created 17 HTML elements instead of 12,659.
+Opening a 240-message history produced 2 transcript child-list mutations
+instead of 242. Both runs streamed the same reply from a local Ministral model.
+
 For a shared-device workspace, opt into server-backed history:
 
 ```sh

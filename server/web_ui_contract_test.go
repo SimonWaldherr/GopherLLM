@@ -156,7 +156,7 @@ func TestChatUICompactInteractionContracts(t *testing.T) {
 		`action.textContent = "Regenerate"`,
 		`changeModel.textContent = "Change model"`,
 		"function changeModelForMessage(",
-		"function filterModelOptions(",
+		"function renderModelPicker(",
 		"function renderModelLibrary(",
 		"function renderActiveModelSummary(",
 		"const WORKFLOWS = {",
