@@ -20,10 +20,16 @@ go run -tags metal ./examples/voice-assistant \
 Open [Gopher Voice](http://127.0.0.1:8092). Click **Start microphone** and
 grant browser permission. A pause ends the turn automatically, or you
 can click **Stop & send**. Check **Hands-free follow-ups** before a
-microphone turn to reopen the mic after playback. **New conversation**
-stops the current turn and clears the conversation. Recording starts from
-the button. The mic is closed during transcription, generation and
-playback.
+microphone turn to reopen the mic after playback. **Cancel** stops an active
+recording, reply or playback and preserves completed turns. **New
+conversation** also clears the conversation. The microphone closes during
+transcription, generation and playback. Switching tabs cancels active work.
+
+The microphone worklet delivers 16 kHz PCM directly. The demo sends that
+audio in a WAV container and shows the recognized text as soon as it arrives.
+Supported chat templates then stream the reply. Speech playback starts after
+the complete reply is available. Existing clients of `POST /turn` get the
+JSON response by default. The web UI requests `application/x-ndjson`.
 
 On CPU, omit `-tags metal` and `-metal`. The browser uses a local system
 voice when one is available. For a German WAV reply synthesized by
@@ -40,6 +46,13 @@ Use `-whisper /path/to/ggml-base.bin` for native Whisper with automatic
 language detection.
 
 ## Local measurements
+
+In a Chromium comparison on the M2 Max with a German FLEURS recording,
+native Whisper Base and Ministral 3B on Metal, the original demo displayed
+the transcript and reply together 1.27 s after capture ended. The updated
+demo displayed the same transcript at 0.43 s, the first reply text at
+0.61 s, and the identical full reply at 1.11 s. These are single-run
+browser timings before speech playback.
 
 For Ministral, `TestMetalFixedDecodeBenchmark` uses a fixed 160-token
 prefix and then runs 64 steps with full logits. Each figure is the

@@ -213,6 +213,10 @@ func (vs *VoiceSession) PushPCM16(ctx context.Context, pcm []byte) (string, erro
 
 // Finish transcribes the buffered recording and releases the recording slot.
 func (vs *VoiceSession) Finish(ctx context.Context) (string, error) {
+	return vs.finish(ctx, nil)
+}
+
+func (vs *VoiceSession) finish(ctx context.Context, tail []byte) (string, error) {
 	vs.mu.Lock()
 	if vs.done {
 		vs.mu.Unlock()
@@ -223,6 +227,14 @@ func (vs *VoiceSession) Finish(ctx context.Context) (string, error) {
 	vs.pcm = nil
 	vs.mu.Unlock()
 	defer vs.host.busy.Store(false)
+	if err := checkVoicePCM(len(tail), len(pcm)); err != nil {
+		return "", err
+	}
+	if len(pcm) == 0 {
+		pcm = tail
+	} else {
+		pcm = append(pcm, tail...)
+	}
 	return vs.host.transcribeClip(ctx, pcm)
 }
 

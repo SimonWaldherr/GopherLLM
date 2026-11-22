@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"testing"
+	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 )
@@ -32,7 +33,7 @@ func TestVoiceAssistantTurn(t *testing.T) {
 			}
 			return "Wie heiße ich?", nil
 		},
-		reply: func(_ context.Context, messages []gopherllm.ChatMessage) (string, error) {
+		reply: func(_ context.Context, messages []gopherllm.ChatMessage, _ func(string) bool) (string, error) {
 			var text []string
 			for _, m := range messages {
 				text = append(text, m.Content)
@@ -75,5 +76,64 @@ func TestVoiceAssistantTurn(t *testing.T) {
 	a.routes().ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("foreign origin got status %d", rec.Code)
+	}
+}
+
+func TestVoiceAssistantStreamsBeforeGenerationFinishes(t *testing.T) {
+	release := make(chan struct{})
+	const reply = "Guten Morgen!"
+	a := &assistant{
+		busy: make(chan struct{}, 1),
+		reply: func(ctx context.Context, _ []gopherllm.ChatMessage, emit func(string) bool) (string, error) {
+			if !emit("Guten") {
+				return "", context.Canceled
+			}
+			select {
+			case <-release:
+				emit(" Morgen!")
+				return reply, nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	}
+	srv := httptest.NewServer(a.routes())
+	defer srv.Close()
+	var body bytes.Buffer
+	form := multipart.NewWriter(&body)
+	_ = form.WriteField("text", "Hallo")
+	_ = form.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/turn", &body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", form.FormDataContentType())
+	req.Header.Set("Accept", turnStreamType)
+	res, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != turnStreamType {
+		t.Fatalf("unexpected streaming response: %v", res)
+	}
+	decoder := json.NewDecoder(res.Body)
+	next := func(kind string) turnEvent {
+		t.Helper()
+		var event turnEvent
+		if err := decoder.Decode(&event); err != nil || event.Type != kind {
+			t.Fatalf("event = %+v, error = %v, want %s", event, err, kind)
+		}
+		return event
+	}
+	if input, delta := next("input"), next("delta"); input.Text != "Hallo" || delta.Text != "Guten" {
+		t.Fatalf("initial events = %+v %+v", input, delta)
+	}
+	close(release)
+	if delta, final := next("delta"), next("done"); delta.Text != " Morgen!" || final.Result == nil ||
+		final.Result.Input != "Hallo" || final.Result.Text != reply {
+		t.Fatalf("remaining events = %+v %+v", delta, final)
 	}
 }

@@ -1,6 +1,7 @@
 package hestia
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -325,5 +326,65 @@ func TestVoiceTurnEndpointReturns503WithoutSpeechHost(t *testing.T) {
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", r.StatusCode, http.StatusServiceUnavailable)
+	}
+}
+
+func TestFinishVoiceTurnAcceptsPCMBody(t *testing.T) {
+	pcm := []byte{1, 2, 3, 4, 5, 6}
+	for _, chunked := range []bool{false, true} {
+		name := "recording in finish"
+		if chunked {
+			name = "partial chunks followed by final frame"
+		}
+		t.Run(name, func(t *testing.T) {
+			app := testApp(t)
+			calls := 0
+			app.Speech = &SpeechHost{transcribe: func(_ context.Context, got []byte) (string, error) {
+				calls++
+				if !bytes.Equal(got, pcm) {
+					t.Fatalf("decode got %v, want %v", got, pcm)
+				}
+				if chunked {
+					return "Macht die Lampe in der Küche an.", nil
+				}
+				return "Mach die Lampe in der Küche an.", nil
+			}}
+			ctx := context.Background()
+			turn, err := app.StartVoiceTurn(ctx, "conv1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tail := pcm
+			if chunked {
+				if _, err := app.PushVoiceAudio(ctx, turn.ID, pcm[:4]); err != nil {
+					t.Fatal(err)
+				}
+				tail = pcm[4:]
+			}
+			handler := NewHandler(app)
+			finish := func(pcm []byte) *httptest.ResponseRecorder {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8787/api/turns/"+turn.ID+"/finish", bytes.NewReader(pcm))
+				req.RemoteAddr = "127.0.0.1:12345"
+				req.Header.Set("Content-Type", "application/octet-stream")
+				handler.ServeHTTP(rec, req)
+				return rec
+			}
+			if res := finish([]byte{1}); res.Code != http.StatusBadRequest || calls != 0 {
+				t.Fatalf("accepted odd PCM: %d %s", res.Code, res.Body)
+			}
+			res := finish(tail)
+			var final Turn
+			if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &final) != nil ||
+				final.Status != TurnCompleted || final.Result != "Lampe ist an." || calls != 1 {
+				t.Fatalf("unexpected final response: %d %s", res.Code, res.Body)
+			}
+			if res = finish(tail); res.Code != http.StatusBadRequest || calls != 1 {
+				t.Fatalf("duplicate finish acted again: %d %s", res.Code, res.Body)
+			}
+			if app.Speech.busy.Load() {
+				t.Fatal("finalized recording kept the model reserved")
+			}
+		})
 	}
 }

@@ -19,12 +19,14 @@ import (
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	"github.com/SimonWaldherr/GopherLLM/internal/audioinput"
 	"github.com/SimonWaldherr/GopherLLM/speech"
+	"github.com/SimonWaldherr/GopherLLM/voiceweb"
 )
 
 //go:embed index.html voice.js voice.css
 var assets embed.FS
 
 const maxClipBytes = 2 << 20
+const turnStreamType = "application/x-ndjson"
 
 type turn struct {
 	Role string `json:"role"`
@@ -38,9 +40,15 @@ type answer struct {
 	LLM   int64  `json:"reply_ms"`
 }
 
+type turnEvent struct {
+	Type   string  `json:"type"`
+	Text   string  `json:"text,omitempty"`
+	Result *answer `json:"result,omitempty"`
+}
+
 type assistant struct {
 	transcribe func(context.Context, []byte) (string, error)
-	reply      func(context.Context, []gopherllm.ChatMessage) (string, error)
+	reply      func(context.Context, []gopherllm.ChatMessage, func(string) bool) (string, error)
 	speak      func(context.Context, string) (gopherllm.SpeechAudio, error)
 	busy       chan struct{}
 }
@@ -102,12 +110,36 @@ func run() error {
 		return err
 	}
 	defer runner.Close()
-	a.reply = func(ctx context.Context, messages []gopherllm.ChatMessage) (string, error) {
+	a.reply = func(ctx context.Context, messages []gopherllm.ChatMessage, emit func(string) bool) (string, error) {
 		opts := gopherllm.DefaultGenerationOptions().WithContext(ctx)
 		opts.MaxTokens = 72
 		opts.Sampler.Temperature = 0
 		opts.SystemPrompt = "You are a local voice assistant. Reply in the user's language using at most 25 words of plain spoken text."
-		result, err := runner.GenerateChat(messages, opts)
+		if emit == nil || runner.Architecture() == "gpt-oss" {
+			result, err := runner.GenerateChat(messages, opts)
+			return result.Text, err
+		}
+		var splitter interface {
+			Push(string, func(bool, string) bool) bool
+			Flush(func(bool, string) bool) bool
+		}
+		if runner.UsesMistralThinkProtocol() {
+			s := gopherllm.NewMistralThinkStreamSplitter()
+			splitter = &s
+		} else {
+			arch := runner.Architecture()
+			s := gopherllm.NewThinkStreamSplitter(arch == "nemotron_h_moe" || arch == "qwen35" || arch == "qwen35moe")
+			splitter = &s
+		}
+		content := func(reasoning bool, text string) bool {
+			return reasoning || text == "" || emit(text)
+		}
+		result, err := runner.GenerateChatStreamUntil(messages, opts, func(text string) bool {
+			return splitter.Push(text, content)
+		})
+		if err == nil {
+			splitter.Flush(content)
+		}
 		return result.Text, err
 	}
 	if *ttsPath != "" {
@@ -157,6 +189,10 @@ func loopback(address string) bool {
 func (a *assistant) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /", http.FileServer(http.FS(assets)))
+	mux.HandleFunc("GET /audio-worklet.js", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		_, _ = io.WriteString(w, voiceweb.AudioWorkletJS)
+	})
 	mux.HandleFunc("GET /options", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, map[string]bool{"tts": a.speak != nil})
 	})
@@ -193,11 +229,18 @@ func (a *assistant) handleTurn(w http.ResponseWriter, r *http.Request) {
 	}
 	select {
 	case a.busy <- struct{}{}:
-		defer func() { <-a.busy }()
 	default:
 		http.Error(w, "the assistant is processing another turn", http.StatusServiceUnavailable)
 		return
 	}
+	reserved := true
+	release := func() {
+		if reserved {
+			<-a.busy
+			reserved = false
+		}
+	}
+	defer release()
 	result := answer{Input: input}
 	if len(files) != 0 {
 		file, err := files[0].Open()
@@ -226,12 +269,47 @@ func (a *assistant) handleTurn(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	ctx := r.Context()
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	w.Header().Add("Vary", "Accept")
+	stream := r.Header.Get("Accept") == turnStreamType
+	var emit func(string) bool
+	var event func(turnEvent) bool
+	if stream {
+		w.Header().Set("Content-Type", turnStreamType)
+		w.Header().Set("Cache-Control", "no-store")
+		encoder := json.NewEncoder(w)
+		controller := http.NewResponseController(w)
+		event = func(e turnEvent) bool {
+			return ctx.Err() == nil && encoder.Encode(e) == nil && controller.Flush() == nil
+		}
+		if !event(turnEvent{Type: "input", Text: result.Input}) {
+			return
+		}
+		emit = func(text string) bool { return event(turnEvent{Type: "delta", Text: text}) }
+	}
+
 	start := time.Now()
-	result.Text, err = a.reply(r.Context(), append(messages, gopherllm.UserMessage(result.Input)))
+	result.Text, err = a.reply(ctx, append(messages, gopherllm.UserMessage(result.Input)), emit)
 	result.LLM = time.Since(start).Milliseconds()
+	// The browser may start speech synthesis as soon as it sees "done".
+	release()
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil || strings.TrimSpace(result.Text) == "" {
-		log.Printf("generation: %v", err)
-		http.Error(w, "the model could not answer this turn", http.StatusUnprocessableEntity)
+		const message = "the model could not answer this turn"
+		if stream {
+			event(turnEvent{Type: "error", Text: message})
+		} else {
+			http.Error(w, message, http.StatusUnprocessableEntity)
+		}
+		return
+	}
+	if stream {
+		event(turnEvent{Type: "done", Result: &result})
 		return
 	}
 	writeJSON(w, result)

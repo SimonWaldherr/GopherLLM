@@ -186,11 +186,15 @@ func (a *App) PushVoiceAudio(ctx context.Context, turnID string, pcm []byte) (*T
 // chain ProcessText uses (CONCEPT.md section 6: "Stoppen bedeutet zunächst
 // Audio-Flush, anschließend Interpretation.").
 func (a *App) FinishVoiceTurn(ctx context.Context, turnID string) (*Turn, error) {
+	return a.finishVoiceTurn(ctx, turnID, nil)
+}
+
+func (a *App) finishVoiceTurn(ctx context.Context, turnID string, tail []byte) (*Turn, error) {
 	t, vs, err := a.voiceTurn(turnID, true)
 	if err != nil {
 		return nil, err
 	}
-	text, err := vs.Finish(ctx)
+	text, err := vs.finish(ctx, tail)
 	defer a.storeTurn(t)
 	if err != nil {
 		t.Status = TurnFailed

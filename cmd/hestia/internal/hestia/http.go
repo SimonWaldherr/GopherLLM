@@ -130,7 +130,18 @@ func NewHandler(app *App) http.Handler {
 	})
 
 	mux.HandleFunc("POST /api/turns/{id}/finish", func(w http.ResponseWriter, r *http.Request) {
-		t, err := app.FinishVoiceTurn(r.Context(), r.PathValue("id"))
+		// An empty body finalizes previously uploaded chunks. The web demo
+		// can send its entire recording in the same request as finalization.
+		pcm, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxVoicePCMBytes))
+		if err != nil {
+			writeRequestError(w, err)
+			return
+		}
+		if err := checkVoicePCM(len(pcm), 0); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		t, err := app.finishVoiceTurn(r.Context(), r.PathValue("id"), pcm)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return

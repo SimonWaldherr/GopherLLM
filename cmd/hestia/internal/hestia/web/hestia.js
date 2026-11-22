@@ -4,6 +4,7 @@ const form = document.getElementById('command');
 const textField = document.getElementById('text');
 const send = document.getElementById('send');
 const mic = document.getElementById('mic');
+const cancelMic = document.getElementById('cancelMic');
 const listen = document.getElementById('listen');
 const micStatus = document.getElementById('micStatus');
 const listenHelp = document.getElementById('listenHelp');
@@ -193,7 +194,7 @@ function stopPlayback() {
 
 const silenceFrames = 3; // 200 ms per frame from the shared worklet.
 const maxListenFrames = 40;
-const maxManualFrames = 150;
+const maxManualBytes = 30 * 32000;
 const pcmHeaders = {'Content-Type': 'application/octet-stream'};
 
 function listeningStatus() {
@@ -203,6 +204,7 @@ function listeningStatus() {
 function updateCaptureButtons() {
   const available = capabilities.speech_enabled && canRecord;
   mic.disabled = !available || capture?.mode === 'listen' || Boolean(capture?.closing);
+  cancelMic.hidden = capture?.mode !== 'manual' || (!capture.node && !capture.closing);
   listen.disabled = !available || !capabilities.listen_word || capture?.mode === 'manual';
   mic.textContent = capture?.mode === 'manual' ? (capture.node ? 'Aufnahme abschließen' : 'Abbrechen') : 'Aufnehmen';
   listen.textContent = capture?.mode === 'listen' ? 'Zuhören stoppen' : 'Zuhören aktivieren';
@@ -211,6 +213,7 @@ function updateCaptureButtons() {
 
 function clearUtterance(job) {
   job.frames = [];
+  job.bytes = 0;
   job.previous = null;
   job.silence = 0;
   job.overflowing = false;
@@ -225,8 +228,10 @@ function releaseMic(job) {
     job.node.port.onmessage = null;
     job.node.disconnect();
     job.node.port.close();
+    job.node = null;
   }
   job.source?.disconnect();
+  job.source = null;
   for (const track of job.media?.getTracks() || []) track.stop();
   if (job.context && job.context.state !== 'closed') void job.context.close().catch(() => {});
 }
@@ -243,7 +248,6 @@ function stopCapture(job, status) {
   job.aborter.abort();
   releaseMic(job);
   clearUtterance(job);
-  job.queue.length = 0;
   cancelTurn(job.turnID);
   updateCaptureButtons();
   micStatus.textContent = status;
@@ -251,7 +255,7 @@ function stopCapture(job, status) {
 
 async function startCapture(mode) {
   if (capture || !canRecord) return;
-  const job = {mode, aborter: new AbortController(), queue: [], count: 0, cooldown: 0};
+  const job = {mode, aborter: new AbortController(), displaySeconds: 0, cooldown: 0};
   clearUtterance(job);
   capture = job;
   updateCaptureButtons();
@@ -345,12 +349,7 @@ function receiveListenFrame(job, frame) {
   job.frames.push(frame);
   job.silence = voiced ? 0 : job.silence + 1;
   if (job.silence >= silenceFrames) {
-    const pcm = new Uint8Array(job.frames.reduce((bytes, frame) => bytes + frame.byteLength, 0));
-    let offset = 0;
-    for (const frame of job.frames) {
-      pcm.set(new Uint8Array(frame), offset);
-      offset += frame.byteLength;
-    }
+    const pcm = joinFrames(job.frames, job.frames.reduce((bytes, frame) => bytes + frame.byteLength, 0));
     clearUtterance(job);
     void checkListenWord(job, pcm);
   } else if (job.frames.length >= maxListenFrames) {
@@ -383,27 +382,26 @@ async function checkListenWord(job, pcm) {
 }
 
 function receiveManualFrame(job, frame) {
-  if (job.count >= maxManualFrames) return;
-  job.queue.push(frame);
-  if (++job.count >= maxManualFrames) stopManual(job);
-  if (!job.draining) job.draining = drainManual(job);
+  const bytes = Math.min(frame.byteLength, maxManualBytes - job.bytes);
+  if (bytes === 0) return;
+  job.frames.push(bytes === frame.byteLength ? frame : frame.slice(0, bytes));
+  job.bytes += bytes;
+  if (job.bytes >= maxManualBytes) stopManual(job);
+  const seconds = Math.floor(job.bytes / 32000);
+  if (!job.closing && seconds !== job.displaySeconds) {
+    job.displaySeconds = seconds;
+    micStatus.textContent = `Nehme auf… (${seconds} s)`;
+  }
 }
 
-async function drainManual(job) {
-  try {
-    while (capture === job && job.queue.length) {
-      const turn = await requestJSON(`/api/turns/${encodeURIComponent(job.turnID)}/audio`, {
-        method: 'POST', headers: pcmHeaders, body: job.queue.shift(), signal: job.aborter.signal,
-      });
-      if (capture === job && !job.closing && turn.InputText) {
-        micStatus.textContent = `Nehme auf… „${turn.InputText}“`;
-      }
-    }
-  } catch (error) {
-    stopCapture(job, error.message);
-  } finally {
-    job.draining = null;
+function joinFrames(frames, bytes) {
+  const pcm = new Uint8Array(bytes);
+  let offset = 0;
+  for (const frame of frames) {
+    pcm.set(new Uint8Array(frame), offset);
+    offset += frame.byteLength;
   }
+  return pcm;
 }
 
 function stopManual(job) {
@@ -416,11 +414,15 @@ function stopManual(job) {
 
 async function finishManual(job) {
   releaseMic(job);
-  await job.draining;
-  if (capture !== job) return;
+  if (!job.bytes) {
+    stopCapture(job, 'Kein Ton aufgenommen.');
+    return;
+  }
+  const pcm = joinFrames(job.frames, job.bytes);
+  clearUtterance(job);
   try {
     const turn = await requestJSON(`/api/turns/${encodeURIComponent(job.turnID)}/finish`, {
-      method: 'POST', signal: job.aborter.signal,
+      method: 'POST', headers: pcmHeaders, body: pcm, signal: job.aborter.signal,
     });
     if (capture !== job) return;
     capture = null;
@@ -438,6 +440,9 @@ mic.addEventListener('click', () => {
     void startCapture('manual');
   } else if (capture.node) stopManual(capture);
   else stopCapture(capture, 'Mikrofon aus.');
+});
+cancelMic.addEventListener('click', () => {
+  if (capture?.mode === 'manual') stopCapture(capture, 'Aufnahme abgebrochen.');
 });
 listen.addEventListener('click', () => {
   if (capture) stopCapture(capture, 'Mikrofon aus.');

@@ -70,17 +70,19 @@ func ParseTextProposal(text string) Proposal {
 	return Proposal{Intent: IntentConversation}
 }
 
+const roomPhrase = `\s+(?:im|in\s+(?:der|dem))\s+([a-zäöüß]+)`
+
 var (
-	reAlleRaum  = regexp.MustCompile(`^(?:(?:schalte|mach)\s+)?alle\s+(?:lampen|lichter)\s+im\s+([a-zäöüß]+)\s+(ein|an|aus)[.!]?$`)
-	reDimme     = regexp.MustCompile(`(?i)^dimme\s+(?:die|den|das)\s+(.+?)(?:\s+im\s+([a-zäöüß]+))?\s+auf\s+([0-9]{1,3})\s*(?:prozent|%)?[.!]?$`)
+	reAlleRaum  = regexp.MustCompile(`^(?:(?:schaltet?|macht?)\s+)?alle\s+(?:lampen|lichter)` + roomPhrase + `\s+(ein|an|aus)[.!]?$`)
+	reDimme     = regexp.MustCompile(`(?i)^(?:dimme|dimmt)\s+(?:die|den|das)\s+(.+?)(?:` + roomPhrase + `)?\s+auf\s+([0-9]{1,3})\s*(?:prozent|%)?[.!]?$`)
 	reWikipedia = regexp.MustCompile(`(?is)^(?:wikipedia\s*:\s*|suche\s+auf\s+wikipedia\s+nach(?:\s+|$))(.*)$`)
 	reWebSearch = regexp.MustCompile(`(?is)^(?:websuche\s*:\s*|suche\s+im\s+(?:internet|web)\s+nach(?:\s+|$))(.*)$`)
-	reSchalte   = regexp.MustCompile(`(?i)^schalte\s+(?:die|den|das)\s+(.+?)\s*(?:im\s+([a-zäöüß]+))?\s*(ein|aus)\.?$`)
-	reMach      = regexp.MustCompile(`(?i)^mach\s+(?:die|den|das)\s+(.+?)\s*(?:im\s+([a-zäöüß]+))?\s*(an|aus)\.?$`)
+	reSchalte   = regexp.MustCompile(`(?i)^schaltet?\s+(?:die|den|das)\s+(.+?)(?:` + roomPhrase + `)?\s+(ein|aus)[.!]?$`)
+	reMach      = regexp.MustCompile(`(?i)^macht?\s+(?:die|den|das)\s+(.+?)(?:` + roomPhrase + `)?\s+(an|aus)[.!]?$`)
 )
 
 // matchSingleCommand extracts (target device phrase, room phrase, desired
-// power) from one of the two accepted verb forms. Both regexes carry the
+// power) from the accepted imperative forms. Both regexes carry the
 // (?i) flag and run against the original-cased text, so a device name's
 // own casing survives into target (matching against Inventory is
 // case-insensitive regardless -- see Device.nameMatches).

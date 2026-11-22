@@ -17,6 +17,7 @@ button, .file { cursor: pointer; }
 button:disabled { cursor: default; opacity: .55; }
 .file { position: relative; }
 .file input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
+.file:has(input:disabled) { cursor: default; opacity: .55; }
 .file:focus-within { outline: 2px solid currentColor; }
 .primary { background: #1b6249; color: white; border-color: #1b6249; }
 form { margin-top: .8rem; }

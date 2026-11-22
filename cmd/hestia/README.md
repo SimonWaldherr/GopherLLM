@@ -31,6 +31,7 @@ go run .
 
 Öffne [Hestia auf diesem Rechner](http://127.0.0.1:8787). Probiere
 „Schalte die Stehlampe im Wohnzimmer ein“ oder
+„Mach die Lampe in der Küche an“. Die Helligkeit änderst du mit
 „Dimme die Stehlampe im Wohnzimmer auf 30 Prozent“. Bei mehreren passenden
 Geräten fragt Hestia nach. Gruppenaktionen brauchen eine Bestätigung.
 
@@ -56,7 +57,10 @@ GGML-F16/F32-Modell und kannst `"language": "de"` ergänzen.
 [Native Whisper-Inferenz](../../docs/generation.md#whisper-transcription)
 
 Klicke **Aufnehmen** für einen einzelnen Befehl oder **Zuhören aktivieren**
-für den Aktivierungsmodus. Sage das Wort und den Befehl in einem Satz,
+für den Aktivierungsmodus. Bei einer manuellen Aufnahme zeigt der Browser
+die Dauer an und sendet den Clip erst mit **Aufnahme abschließen**. Mit
+**Abbrechen** kannst du die Aufnahme verwerfen. Sage im Aktivierungsmodus
+das Wort und den Befehl in einem Satz,
 etwa „Computer, schalte die Stehlampe im Wohnzimmer ein“. Ändere das Wort
 über `-listen-word "Hallo Nova"` oder `listen_word` in der Konfiguration.
 Ein leerer Wert deaktiviert den Aktivierungsmodus. Die Erkennung hängt vom
