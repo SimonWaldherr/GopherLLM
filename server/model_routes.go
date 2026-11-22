@@ -489,7 +489,7 @@ func registerModelDownloadRoutes(mux *http.ServeMux, state *runnerState, opts Ha
 	})
 }
 
-// discoverCatalog lists the GGUFs under dir. A directory that does not exist
+// discoverCatalog lists the local models under dir. A directory that does not exist
 // is an empty catalog rather than an error: the CLI ships a default model
 // directory, and someone who has not created it yet should see "no models
 // found" in the Web UI instead of a 500 on their first page load.

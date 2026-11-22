@@ -116,6 +116,7 @@ func (m *QwenImage21Model) Close() error {
 	}
 	m.gate <- struct{}{}
 	defer func() { <-m.gate }()
+	m.encoder.close()
 	m.encoder, m.transformer, m.vae = nil, nil, nil
 	for _, store := range m.stores {
 		store.close()

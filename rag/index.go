@@ -212,11 +212,8 @@ type chunkEntry struct {
 	vector []float32
 }
 
-// Index is an in-memory hybrid index. Add, Load and Search are all safe for
-// concurrent use — Search takes the read lock, Add/Load take the write lock.
-// A real sync.RWMutex, not merely a documented convention: the brute-force
-// scan this Index performs is a few milliseconds at most, so the lock's
-// overhead is not a measurable cost.
+// Index is an in-memory hybrid index. Search holds a read lock while ranking
+// indexed chunks. Add and Remove hold the write lock while updating them.
 type Index struct {
 	mu sync.RWMutex
 
@@ -445,6 +442,52 @@ type scored struct {
 	lexicalOnly        bool
 }
 
+func compareScored(a, b scored) int {
+	if a.score != b.score {
+		return cmp.Compare(b.score, a.score)
+	}
+	if id := strings.Compare(a.entry.chunk.DocID, b.entry.chunk.DocID); id != 0 {
+		return id
+	}
+	return cmp.Compare(a.entry.chunk.Index, b.entry.chunk.Index)
+}
+
+// keepTopCandidate maintains the sorted top K subject to the per-document
+// cap. A candidate can replace its document's lowest-ranked slot when that
+// document is at the cap, or the lowest-ranked slot overall otherwise.
+func keepTopCandidate(best []scored, candidate scored, topK, maxPerDoc int) []scored {
+	if len(best) == topK && compareScored(candidate, best[len(best)-1]) >= 0 {
+		return best
+	}
+	drop := len(best)
+	if maxPerDoc > 0 && maxPerDoc <= len(best) {
+		count := 0
+		for i, kept := range best {
+			if kept.entry.chunk.DocID == candidate.entry.chunk.DocID {
+				count++
+				if count == maxPerDoc {
+					if compareScored(candidate, kept) >= 0 {
+						return best
+					}
+					drop = i
+					break
+				}
+			}
+		}
+	}
+	if drop == len(best) {
+		if len(best) < topK {
+			best = append(best, scored{})
+		} else {
+			drop--
+		}
+	}
+	i, _ := slices.BinarySearchFunc(best[:drop], candidate, compareScored)
+	copy(best[i+1:drop+1], best[i:drop])
+	best[i] = candidate
+	return best
+}
+
 // Search ranks the index against query, blending BM25 keyword matching,
 // cosine vector similarity (when this Index has an Embedder), and recency,
 // per q and the Index's Ranking.
@@ -452,9 +495,30 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var qvec []float32
+	embedder := ix.opts.Embedder
+	if embedder != nil {
+		ix.mu.RLock()
+		empty := len(ix.chunks) == 0
+		ix.mu.RUnlock()
+		if empty {
+			return nil, nil
+		}
+		// Model inference can be slow. Allow index writes while it runs.
+		results, err := embedder.EmbedBatch(ctx, []string{ix.opts.QueryPrefix + query})
+		if err != nil {
+			return nil, fmt.Errorf("rag: embed query: %w", err)
+		}
+		if len(results) == 1 {
+			qvec = results[0].Embedding
+		}
+	}
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(ix.chunks) == 0 {
 		return nil, nil
 	}
@@ -467,19 +531,8 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 		}
 	}
 
-	var qvec []float32
-	if ix.opts.Embedder != nil {
-		results, err := ix.opts.Embedder.EmbedBatch(ctx, []string{ix.opts.QueryPrefix + query})
-		if err != nil {
-			return nil, fmt.Errorf("rag: embed query: %w", err)
-		}
-		if len(results) == 1 {
-			qvec = results[0].Embedding
-		}
-	}
-
 	vw, kwWeight, recWeight := effectiveWeights(ix.opts.Ranking)
-	if ix.opts.Embedder == nil {
+	if embedder == nil {
 		total := kwWeight + recWeight
 		if total > 0 {
 			kwWeight, recWeight = kwWeight/total, recWeight/total
@@ -489,6 +542,7 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 		vw = 0
 	}
 	halfLife := ix.opts.Ranking.recencyHalfLife()
+	minScore, topK, maxPerDoc := q.minScore(), q.topK(), q.maxChunksPerDoc()
 
 	keys := ix.order
 	// Without vectors or kind multipliers, an unmatched chunk scores zero
@@ -498,8 +552,8 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 	// recency. Since recNorm is at most 1, one float32 epsilon times the
 	// weight bounds it. Preserve full-scan results at smaller thresholds.
 	recencyRoundoff := math.Abs(float64(recWeight)) * 0x1p-23
-	if ix.opts.Embedder == nil && len(ix.opts.KindWeight) == 0 && q.Filter == nil &&
-		float64(q.minScore()) > recencyRoundoff && len(kwScores) <= len(keys)/2 {
+	if embedder == nil && len(ix.opts.KindWeight) == 0 && q.Filter == nil &&
+		float64(minScore) > recencyRoundoff && len(kwScores) <= len(keys)/2 {
 		keys = make([]string, 0, len(kwScores))
 		for key := range kwScores {
 			keys = append(keys, key)
@@ -507,8 +561,18 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 	}
 
 	now := time.Now()
-	candidates := make([]scored, 0, len(keys))
-	for _, key := range keys {
+	// MaxDocs admits documents in rank order. A chunk outside the global top
+	// K may still be needed if its document qualifies and others are excluded.
+	bounded := topK <= 32 && q.MaxDocs <= 0
+	capacity := len(keys)
+	if bounded {
+		capacity = min(capacity, topK)
+	}
+	candidates := make([]scored, 0, capacity)
+	for i, key := range keys {
+		if i%256 == 0 && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		ce := ix.chunks[key]
 		if q.Filter != nil {
 			if doc := ix.docs[ce.chunk.DocID]; doc != nil && !q.Filter(doc.doc) {
@@ -517,13 +581,13 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 		}
 		kwRaw := kwScores[key]
 		var vecRaw float32
-		if ix.opts.Embedder != nil && len(qvec) > 0 && len(ce.vector) > 0 {
+		if len(qvec) > 0 && len(ce.vector) > 0 {
 			vecRaw = dot(qvec, ce.vector)
 		}
-		if ix.opts.Embedder != nil && vecRaw < q.MinVector && kwRaw <= 0 {
+		if embedder != nil && vecRaw < q.MinVector && kwRaw <= 0 {
 			continue
 		}
-		lexicalOnly := ix.opts.Embedder != nil && vecRaw < q.MinVector && kwRaw > 0
+		lexicalOnly := embedder != nil && vecRaw < q.MinVector && kwRaw > 0
 
 		kwNorm := float32(0)
 		if maxKw > 0 {
@@ -546,38 +610,39 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 		if kwNorm == 0 {
 			threshold -= recWeight * recNorm
 		}
-		if threshold < q.minScore() {
+		if threshold < minScore {
 			continue
 		}
 
-		candidates = append(candidates, scored{entry: ce, vecRaw: vecRaw, kwRaw: kwNorm, rec: recNorm, score: score, lexicalOnly: lexicalOnly})
+		candidate := scored{entry: ce, vecRaw: vecRaw, kwRaw: kwNorm, rec: recNorm, score: score, lexicalOnly: lexicalOnly}
+		if bounded {
+			candidates = keepTopCandidate(candidates, candidate, topK, maxPerDoc)
+		} else {
+			candidates = append(candidates, candidate)
+		}
 	}
 
-	slices.SortFunc(candidates, func(a, b scored) int {
-		if a.score != b.score {
-			return cmp.Compare(b.score, a.score)
-		}
-		if id := strings.Compare(a.entry.chunk.DocID, b.entry.chunk.DocID); id != 0 {
-			return id
-		}
-		return cmp.Compare(a.entry.chunk.Index, b.entry.chunk.Index)
-	})
+	if !bounded {
+		slices.SortFunc(candidates, compareScored)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
-	maxPerDoc := q.maxChunksPerDoc()
 	perDoc := map[string]int{}
-	docsUsed := map[string]bool{}
-	hits := make([]Hit, 0, min(q.topK(), len(candidates)))
+	hits := make([]Hit, 0, min(topK, len(candidates)))
 	for _, c := range candidates {
-		if len(hits) >= q.topK() {
+		if len(hits) >= topK {
 			break
 		}
 		ce := c.entry
 		docID := ce.chunk.DocID
-		if maxPerDoc > 0 && perDoc[docID] >= maxPerDoc {
-			continue
-		}
-		if q.MaxDocs > 0 && !docsUsed[docID] && len(docsUsed) >= q.MaxDocs {
-			continue
+		if !bounded && (maxPerDoc > 0 || q.MaxDocs > 0) {
+			count := perDoc[docID]
+			if (maxPerDoc > 0 && count >= maxPerDoc) || (q.MaxDocs > 0 && count == 0 && len(perDoc) >= q.MaxDocs) {
+				continue
+			}
+			perDoc[docID] = count + 1
 		}
 		chunk := ce.chunk
 		if q.Neighbours > 0 {
@@ -587,8 +652,6 @@ func (ix *Index) Search(ctx context.Context, query string, q Query) ([]Hit, erro
 			Chunk: chunk, Title: ce.title, Path: ce.path, Kind: ce.kind, Time: ce.time,
 			Vector: c.vecRaw, Keyword: c.kwRaw, Recency: c.rec, Score: c.score, LexicalOnly: c.lexicalOnly,
 		})
-		perDoc[docID]++
-		docsUsed[docID] = true
 	}
 	return hits, nil
 }

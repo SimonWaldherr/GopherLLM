@@ -130,7 +130,7 @@ func TestPaginationRejectsForeignOriginAndCycles(t *testing.T) {
 			}))
 			defer srv.Close()
 			t.Setenv("HF_ENDPOINT", srv.URL)
-			if _, _, err := hfListFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}); err == nil {
+			if _, _, err := hfListFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, Options{}); err == nil {
 				t.Fatal("invalid pagination accepted")
 			}
 			if requests.Load() != 1 {
@@ -172,7 +172,7 @@ func TestBadResumeRangePreservesPartialFile(t *testing.T) {
 	os.MkdirAll(filepath.Join(cache.root, "blobs"), 0755)
 	partial := filepath.Join(cache.root, "blobs", "blob.incomplete")
 	os.WriteFile(partial, []byte("hello"), 0644)
-	if _, err := hfDownload(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, "model.onnx", cache, 10, nil, nil, nil); err == nil {
+	if _, err := hfDownload(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, "model.onnx", cache, 10, nil, Options{}, nil); err == nil {
 		t.Fatal("invalid range accepted")
 	}
 	b, err := os.ReadFile(partial)
@@ -231,7 +231,7 @@ func TestFailedArtifactSetDoesNotPublishRevision(t *testing.T) {
 	if _, err := DownloadFiles(context.Background(), "org/model", []string{"model.safetensors"}, nil, Options{}); err == nil {
 		t.Fatal("truncated file accepted")
 	}
-	if snapshot := newHFCache(hfReference{Repository: "org/model"}).snapshotForRef("main"); snapshot != "" {
+	if snapshot := newHFCache(hfReference{Repository: "org/model"}, Options{}).snapshotForRef("main"); snapshot != "" {
 		t.Fatal("published incomplete revision", snapshot)
 	}
 }

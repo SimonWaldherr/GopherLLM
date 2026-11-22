@@ -19,10 +19,9 @@ type File struct {
 	addr   uintptr
 }
 
-// Open memory-maps path read-only. The mapping-object handle and the
-// file handle are both closed before returning — a mapped view keeps the
+// The mapping-object and file handles are closed before returning. A view keeps the
 // underlying mapping (and file) alive on its own until UnmapViewOfFile.
-func Open(path string) (*File, error) {
+func open(path string, requireMapping bool) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -34,13 +33,14 @@ func Open(path string) (*File, error) {
 		return nil, err
 	}
 	size := st.Size()
-	if size == 0 {
-		return &File{}, nil
+	if size == 0 || size > int64(^uint(0)>>1) {
+		return checkMappingSize(path, size, requireMapping)
 	}
 
 	mapping, err := syscall.CreateFileMapping(syscall.Handle(f.Fd()), nil, syscall.PAGE_READONLY, uint32(size>>32), uint32(size), nil)
 	if err == nil {
-		addr, err := syscall.MapViewOfFile(mapping, syscall.FILE_MAP_READ, 0, 0, uintptr(size))
+		var addr uintptr
+		addr, err = syscall.MapViewOfFile(mapping, syscall.FILE_MAP_READ, 0, 0, uintptr(size))
 		syscall.CloseHandle(mapping)
 		if err == nil {
 			// addr references the OS mapping, memory the Go GC never
@@ -53,6 +53,9 @@ func Open(path string) (*File, error) {
 			data := unsafe.Slice((*byte)(base), size)
 			return &File{data: data, mapped: true, addr: addr}, nil
 		}
+	}
+	if requireMapping {
+		return nil, &os.PathError{Op: "mmap", Path: path, Err: err}
 	}
 
 	data, err := os.ReadFile(path)

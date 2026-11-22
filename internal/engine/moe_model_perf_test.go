@@ -10,6 +10,25 @@ import (
 	"time"
 )
 
+// Measure opening and closing a checkpoint against the OS file cache, without
+// touching weight pages as part of a prefault or running any tokens.
+func BenchmarkMoEConfiguredOpenOutOfCore(b *testing.B) {
+	path := os.Getenv("GOPHERLLM_MOE_MODEL")
+	if path == "" {
+		b.Skip("set GOPHERLLM_MOE_MODEL to a local MoE GGUF")
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		r, _, err := RunnerFromPathWithOptions(path, LoadOptions{OutOfCore: true, Prefault: MmapPrefaultNone})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := r.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // The real expert matrix bank, with 32 synthetic token inputs. This isolates
 // weight reuse from the full hybrid model's recurrent/attention work and VM
 // pressure. Full-request latency is measured separately on macOS.
@@ -71,7 +90,8 @@ func loadMoEPerformanceModel(t testing.TB) *Runner {
 	if metal && !MetalAvailable() {
 		t.Fatal(MetalError())
 	}
-	r, info, err := RunnerFromPathWithOptions(path, LoadOptions{UseMetal: metal, PrepareQuantized: false, Prefault: MmapPrefaultNone, LogWriter: io.Discard})
+	outOfCore := os.Getenv("GOPHERLLM_MOE_OUT_OF_CORE") == "1"
+	r, info, err := RunnerFromPathWithOptions(path, LoadOptions{UseMetal: metal, OutOfCore: outOfCore, Prefault: MmapPrefaultNone, LogWriter: io.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +99,7 @@ func loadMoEPerformanceModel(t testing.TB) *Runner {
 	if r.config.ExpertCount < 2 {
 		t.Fatal("configured model has no routed experts")
 	}
-	t.Logf("model=%s arch=%s layers=%d experts=%d used=%d dim=%d file_bytes=%d mapped=%t metal=%t q8=%t threads=8", path, r.arch, r.config.NLayers, r.config.ExpertCount, r.config.ExpertUsedCount, r.config.Dim, info.FileSizeBytes, r.IsMapped(), metal, useQ8Activations.Load())
+	t.Logf("model=%s arch=%s layers=%d experts=%d used=%d dim=%d file_bytes=%d mapped=%t out_of_core=%t metal=%t q8=%t threads=8", path, r.arch, r.config.NLayers, r.config.ExpertCount, r.config.ExpertUsedCount, r.config.Dim, info.FileSizeBytes, r.IsMapped(), outOfCore, metal, useQ8Activations.Load())
 	return r
 }
 

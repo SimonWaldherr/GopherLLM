@@ -209,7 +209,8 @@ func (b *bm25Index) scores(query string, mode LexicalMode) map[string]float32 {
 		}
 		return out
 	}
-	out := map[string]float32{}
+	// The first term's postings all contribute in OR mode.
+	out := make(map[string]float32, len(b.postings[terms[0]]))
 	for _, term := range terms {
 		chunks, ok := b.postings[term]
 		if !ok {

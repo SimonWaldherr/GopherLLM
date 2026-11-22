@@ -97,6 +97,10 @@ For complete recent experiments with raw data and reproduction commands, see
   merged copy is materialised, so peak memory tracks resident pages rather than
   model size; the default (non-out-of-core) split path still concatenates the
   shards into one buffer, which needs RAM for the whole model.
+  Out-of-core loads fail immediately if an OS mapping is unavailable for the
+  model or any shard, avoiding a full read into the Go heap.
+  Eligible Qwen3.5-MoE checkpoints group up to 32 prompt tokens by their
+  selected experts on CPU. Set `GOPHERLLM_NO_MOE_PREFILL=1` for serial prefill.
   It intentionally rejects `--metal`, `--prepare-quant`, `--auto`, and byte-backed loads.
   Library users can use
   `gopherllm.WithOutOfCore(true)` and optionally

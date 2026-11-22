@@ -609,10 +609,9 @@ func EmbedBERT(config Config, weights BERTWeights, tokens []uint32) (EmbeddingRe
 	return engineimpl.EmbedBERT(config, weights, tokens)
 }
 
-// ModelEntry describes one GGUF file found under the model directory. ID is
-// the root-relative path without the .gguf suffix (unique within a scan and
-// what --list-models prints); IsProjector marks multimodal companion files
-// (mmproj-*/clip) that must not be offered for text generation.
+// ModelEntry describes one model file found under the model directory. ID is
+// the root-relative path (GGUF IDs omit the suffix). IsProjector marks
+// multimodal companion files (mmproj-*/clip).
 type ModelEntry = engineimpl.ModelEntry
 
 // DefaultModelDir returns the directory scanned when --model-dir is not
@@ -625,8 +624,8 @@ func DefaultModelDir() string {
 	return engineimpl.DefaultModelDir()
 }
 
-// DiscoverModels recursively finds every .gguf under root and parses each
-// file's header (mmap'd, weights untouched) to fill in architecture, name,
+// DiscoverModels recursively finds GGUF and Phonon .fermion files under root
+// and reads their headers to fill in architecture, name,
 // and support status. Unparseable files are skipped with a stderr note rather
 // than failing the whole scan. Results put supported models first, then sort
 // case-insensitively by their display name with ID as a deterministic tie.
@@ -1005,6 +1004,8 @@ const GGMLTypeIQ2_S = engineimpl.GGMLTypeIQ2_S
 
 const GGMLTypeIQ4_XS = engineimpl.GGMLTypeIQ4_XS
 
+const GGMLTypeI32 = engineimpl.GGMLTypeI32
+
 const GGMLTypeF64 = engineimpl.GGMLTypeF64
 
 const GGMLTypeIQ1_M = engineimpl.GGMLTypeIQ1_M
@@ -1143,6 +1144,21 @@ type LayaModel = engineimpl.LayaModel
 func OpenLaya(ctx context.Context, dir string) (model *LayaModel, err error) {
 	return engineimpl.OpenLaya(ctx, dir)
 }
+
+// LittleBitWeight stores an affine projection with one or two binary
+// factorizations. Weight carries the input and output dimensions.
+type LittleBitWeight = engineimpl.LittleBitWeight
+
+// LittleBitFactors borrows the GGUF tensor bytes for one pair of binary
+// matrices and their scale vectors. U is [out, Rank] and V is [Rank, in].
+// The binary rows are padded to 32 bits, with bit zero encoding +1.
+type LittleBitFactors = engineimpl.LittleBitFactors
+
+// LittleBitScale holds a validated GGUF F16, BF16 or F32 vector in its
+// original little-endian representation.
+type LittleBitScale = engineimpl.LittleBitScale
+
+type MetalLittleBitWeight = engineimpl.MetalLittleBitWeight
 
 type Mamba2LayerWeights = engineimpl.Mamba2LayerWeights
 
@@ -1404,11 +1420,10 @@ func LoadGemma4Model(data []byte, gguf *GGUFFile, borrowQuantized, prepareQuanti
 	return engineimpl.LoadGemma4Model(data, gguf, borrowQuantized, prepareQuantized, useMetal, logw, outOfCore...)
 }
 
-// Weight is one loaded tensor in one of three states: F32 non-nil (owned
-// float32 values), Raw quantized bytes, or Raw scalar F32/F16/BF16/F64 bytes.
-// The last state is used by out-of-core loads: it keeps a mmap-backed matrix
-// in its on-disk representation and converts only values used by a row dot.
-// Rows/Cols describe every Raw form; the owned F32 form infers rows from
+// Weight stores owned F32 values, raw quantized or scalar tensor bytes, or
+// a LittleBit projection. Raw scalar bytes let out-of-core loads keep a
+// mmap-backed matrix in its on-disk representation and convert rows on demand.
+// Rows/Cols describe the raw and factored forms. The owned F32 form infers rows from
 // len(F32)/cols at the call site for compatibility with existing callers.
 type Weight = engineimpl.Weight
 
@@ -1551,8 +1566,8 @@ func ParakeetArchitectureSupported(arch string) bool {
 	return engineimpl.ParakeetArchitectureSupported(arch)
 }
 
-// ParakeetModel owns one loaded Parakeet-TDT GGUF's weights, mapped once and
-// reused across calls -- the same "load once, reuse weights" shape as
+// ParakeetModel owns one loaded Parakeet-family speech model's weights.
+// The weights are reused across calls, like those of
 // VoxtralModel, simplified: Parakeet has no live/streaming session support
 // yet (see parakeet.go's doc comment), only offline transcription of a
 // complete clip, so there is no session lifecycle to manage here. Safe for
@@ -1562,8 +1577,8 @@ func ParakeetArchitectureSupported(arch string) bool {
 // instances (each maps its own weights) rather than share one.
 type ParakeetModel = engineimpl.ParakeetModel
 
-// OpenParakeet maps a local GGUF and loads its config/weights once. No
-// network access or audio capture is performed.
+// OpenParakeet loads a local Parakeet-TDT GGUF or an unpacked Phonon
+// model.fermion with its sibling config.json. It does not access the network.
 func OpenParakeet(path string, logw io.Writer) (*ParakeetModel, error) {
 	return engineimpl.OpenParakeet(path, logw)
 }
@@ -1615,11 +1630,12 @@ func ParakeetDecodeTokens(vocab []string, tokens []int) (string, error) {
 }
 
 // TranscribeParakeet transcribes 16 kHz mono PCM using a local Parakeet-TDT
-// GGUF (general.architecture=="asr", asr.head_type=="tdt"). See parakeet.go's
+// GGUF (general.architecture=="asr", asr.head_type=="tdt") or unpacked
+// Phonon model.fermion with its sibling config.json. See parakeet.go's
 // doc comment for the architecture this loads and runs, and this package's
 // other parakeet_*.go files for each stage's implementation.
 //
-// Caveat this function's caller should know: unlike the Voxtral loaders in
+// For the older Parakeet GGUF, unlike the Voxtral loaders in
 // this codebase (each cross-validated component-by-component against a
 // second, independently-converted file of the identical checkpoint, down to
 // byte-identical intermediate tensors), this implementation has no such
@@ -1637,6 +1653,12 @@ func ParakeetDecodeTokens(vocab []string, tokens []int) (string, error) {
 // checkpoint's actual training configuration or a from-scratch NeMo run.
 func TranscribeParakeet(modelPath string, samples []float32, logw func(string, ...any)) (string, error) {
 	return engineimpl.TranscribeParakeet(modelPath, samples, logw)
+}
+
+// LoadPhononModel loads the original model.fermion and its bundled config.json
+// into the Parakeet FastConformer/TDT graph.
+func LoadPhononModel(data, configData []byte, logw io.Writer) (ParakeetConfig, ParakeetWeights, error) {
+	return engineimpl.LoadPhononModel(data, configData, logw)
 }
 
 // PixtralVisionConfig holds a Pixtral-style vision encoder's hyperparameters,

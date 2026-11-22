@@ -93,6 +93,7 @@ func TestLittleBitMetalParity(t *testing.T) {
 	}{
 		{3, 35, 5, 0, 1, false},
 		{67, 133, 33, 9, 7, true},
+		{67, 133, 33, 9, 17, true},
 		{512, 1056, 257, 33, 2, true},
 	} {
 		label := fmt.Sprintf("%dx%d_rank%d_residual%d_batch%d", c.rows, c.cols, c.rank, c.residual, c.batch)
@@ -149,6 +150,31 @@ func TestLittleBitMetalParity(t *testing.T) {
 		}
 		if out[0] != 1 {
 			t.Fatalf("scaled subnormal should equal one, got %g", out[0])
+		}
+	})
+	t.Run("BF16 decode with partial rank groups", func(t *testing.T) {
+		const rows, cols = 67, 128
+		w := littleBitMetalTestWeight(rows, cols, 33, 9, true)
+		for _, f := range []*LittleBitFactors{&w.LittleBit.Main, w.LittleBit.Residual} {
+			for i := range cols {
+				// The fixture scales are exactly representable in both half formats.
+				raw := f.V2.Raw[2*i:]
+				value := F16ToF32(binary.LittleEndian.Uint16(raw))
+				binary.LittleEndian.PutUint16(raw, uint16(math.Float32bits(value)>>16))
+			}
+			f.V2.Type = GGMLTypeBF16
+		}
+		handle := newMetalLittleBitWeight(w.LittleBit, rows, cols)
+		defer releaseMetalLittleBitWeight(handle)
+		x := littleBitMetalTestInputs(cols, 2)
+		single, batch := make([]float32, rows), make([]float32, 2*rows)
+		if !matvecMetalLittleBitBatch(handle, x[:cols], single, 1) || !matvecMetalLittleBitBatch(handle, x, batch, 2) {
+			t.Fatalf("dispatch LittleBit: %s", MetalError())
+		}
+		for i, got := range single {
+			if math.Float32bits(got) != math.Float32bits(batch[i]) {
+				t.Fatalf("output %d: decode=%g batch=%g", i, got, batch[i])
+			}
 		}
 	})
 }

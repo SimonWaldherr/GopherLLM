@@ -1,0 +1,29 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; color: #14271f; background: #eef3ed; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { max-width: 52rem; margin: auto; padding: 2rem 1rem; }
+header, .actions, form { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; }
+header { justify-content: space-between; margin-bottom: 1rem; }
+h1 { margin: 0; font-size: clamp(1.7rem, 5vw, 2.7rem); letter-spacing: -.04em; }
+#conversation { min-height: 16rem; max-height: 54dvh; overflow: auto; border: 1px solid #c5d4c7; padding: 1rem; border-radius: 1rem; background: #f9fbf8; }
+article { max-width: 82%; padding: .65rem .85rem; margin: 0 0 .75rem; border-radius: .75rem; background: #e3eee1; overflow-wrap: anywhere; }
+article.user { margin-left: auto; background: #d3e6dc; }
+article strong { font-size: .78rem; }
+article p { margin: .25rem 0 0; white-space: pre-wrap; }
+.controls { margin-top: 1rem; }
+#status { min-height: 1.4em; margin: 0 0 .75rem; }
+button, .file, #text { font: inherit; border: 1px solid #91aa9a; border-radius: .5rem; padding: .55rem .75rem; color: inherit; background: #f9fbf8; }
+button, .file { cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+.file { position: relative; }
+.file input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
+.file:focus-within { outline: 2px solid currentColor; }
+.primary { background: #1b6249; color: white; border-color: #1b6249; }
+form { margin-top: .8rem; }
+#text { flex: 1; min-width: 10rem; }
+@media(prefers-color-scheme: dark) {
+  :root { color: #edf6ed; background: #14221b; }
+  #conversation, button, .file, #text { background: #1c2c24; border-color: #597466; }
+  article { background: #263a30; } article.user { background: #2b473b; }
+  .primary { background: #1b6249; }
+}

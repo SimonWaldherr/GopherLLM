@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -330,6 +331,57 @@ func TestIndexSearchIsRaceFreeWithConcurrentAdd(t *testing.T) {
 	<-done
 }
 
+func TestIndexWritersCanProceedDuringQueryEmbedding(t *testing.T) {
+	started := make(chan struct{})
+	paused, resume := context.WithCancel(t.Context())
+	defer resume()
+	ix := New(Options{Embedder: fakeEmbedder{vec: func(text string) []float32 {
+		if text == "query" {
+			close(started)
+			<-paused.Done()
+		}
+		return []float32{1}
+	}}})
+	if err := ix.Add(t.Context(), Doc{ID: "d", Text: "document"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		hits []Hit
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		hits, err := ix.Search(ctx, "query", Query{})
+		done <- result{hits, err}
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("query did not start embedding")
+	}
+	removed := make(chan int, 1)
+	go func() { removed <- ix.Remove("d") }()
+	select {
+	case n := <-removed:
+		if n != 1 {
+			t.Fatalf("removed %d documents, want 1", n)
+		}
+	case <-ctx.Done():
+		t.Fatal("removing a document waited on query embedding")
+	}
+	resume()
+	select {
+	case r := <-done:
+		if r.err != nil || len(r.hits) != 0 {
+			t.Fatalf("search after removal = %v, %v, want no hits", r.hits, r.err)
+		}
+	case <-ctx.Done():
+		t.Fatal("query did not complete")
+	}
+}
+
 func TestGuessLexicalModeOnIdentifierLikeQuery(t *testing.T) {
 	if GuessLexicalMode("GX-1180") != LexicalAll {
 		t.Fatal("expected LexicalAll for an identifier-shaped query")
@@ -414,6 +466,42 @@ func BenchmarkIndexSearchLexical(b *testing.B) {
 	}
 }
 
+func BenchmarkIndexSearchHybrid(b *testing.B) {
+	const dim = 384
+	vectors := make(map[string][]float32)
+	for i := range 256 {
+		v := make([]float32, dim)
+		v[0] = float32(i) / 256
+		v[i+1] = float32(math.Sqrt(1 - float64(v[0]*v[0])))
+		vectors[fmt.Sprintf("common %03d", i)] = v
+	}
+	queryVector := vectors["common 128"]
+	embedder := fakeEmbedder{vec: func(text string) []float32 {
+		if v := vectors[text]; v != nil {
+			return v
+		}
+		return queryVector
+	}}
+	for _, size := range []int{128, 10000} {
+		b.Run(fmt.Sprint(size), func(b *testing.B) {
+			docs := make([]Doc, size)
+			for i := range docs {
+				docs[i] = Doc{ID: fmt.Sprint(i), Text: fmt.Sprintf("common %03d", i%len(vectors))}
+			}
+			ix := New(Options{Embedder: embedder})
+			if err := ix.Add(b.Context(), docs...); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := ix.Search(b.Context(), "common", Query{}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestSparseLexicalSearchMatchesFullScan(t *testing.T) {
 	ix := New(Options{})
 	// Identical timestamps and text exercise tie breaking independently of
@@ -440,6 +528,49 @@ func TestSparseLexicalSearchMatchesFullScan(t *testing.T) {
 			want, err := ix.Search(t.Context(), query, q)
 			if err != nil || visited != ix.Len() || !slices.Equal(got, want) {
 				t.Fatalf("%q minScore=%g visited=%d got=%v want=%v err=%v", query, minScore, visited, got, want, err)
+			}
+		}
+	}
+}
+
+func TestBoundedTopKMatchesFullRanking(t *testing.T) {
+	ix := New(Options{
+		Chunker: Chunker{MaxRunes: 18},
+		Embedder: fakeEmbedder{vec: func(text string) []float32 {
+			switch {
+			case strings.HasPrefix(text, "weak"):
+				return []float32{0, 1}
+			case strings.HasPrefix(text, "medium"):
+				return []float32{0.6, 0.8}
+			default:
+				return []float32{1, 0}
+			}
+		}},
+	})
+	for i := 19; i >= 0; i-- {
+		doc := Doc{ID: fmt.Sprintf("doc%02d", i), Text: "weak keyword\n\nmedium keyword\n\nstrong keyword"}
+		if err := ix.Add(t.Context(), doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ix.Len() != 60 {
+		t.Fatalf("indexed %d chunks, want 60", ix.Len())
+	}
+	for _, perDoc := range []int{-1, 0, 1} {
+		q := Query{TopK: ix.Len(), MaxChunksPerDoc: perDoc, MinVector: 0.5, Neighbours: 1}
+		want, err := ix.Search(t.Context(), "keyword", q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(want) < 20 {
+			t.Fatalf("full ranking returned only %d hits", len(want))
+		}
+		for _, topK := range []int{1, 5, 17, 32} {
+			q.TopK = topK
+			got, err := ix.Search(t.Context(), "keyword", q)
+			prefix := want[:min(topK, len(want))]
+			if err != nil || !slices.Equal(got, prefix) {
+				t.Fatalf("TopK=%d MaxChunksPerDoc=%d: got %v, want %v, err=%v", topK, perDoc, got, prefix, err)
 			}
 		}
 	}

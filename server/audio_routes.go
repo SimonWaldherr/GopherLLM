@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -18,7 +17,7 @@ import (
 	"time"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
-	"github.com/SimonWaldherr/GopherLLM/internal/wav"
+	"github.com/SimonWaldherr/GopherLLM/internal/audioinput"
 )
 
 const transcriptionMaxSeconds = 30
@@ -346,7 +345,7 @@ func registerAudioRoutesWithRealtime(mux *http.ServeMux, sem chan struct{}, opts
 		}
 		selector := strings.TrimSpace(req.FormValue("model"))
 		if selector == "" {
-			http.Error(w, "choose a Voxtral audio model", http.StatusBadRequest)
+			http.Error(w, "choose an audio model", http.StatusBadRequest)
 			return
 		}
 		format := req.FormValue("response_format")
@@ -657,26 +656,5 @@ func registerRealtimeAudioRoutes(mux *http.ServeMux, sem chan struct{}, opts Han
 // WAV. API clients send mono 16 kHz PCM16 or IEEE float32 WAV directly. Keep
 // the server parser strict so truncated chunks and NaNs never reach inference.
 func decodeTranscriptionWAV(raw []byte) ([]float32, error) {
-	if len(raw) < 12 || string(raw[:4]) != "RIFF" || string(raw[8:12]) != "WAVE" {
-		return nil, fmt.Errorf("send a mono 16 kHz PCM16 or float32 WAV file")
-	}
-	if uint64(binary.LittleEndian.Uint32(raw[4:8]))+8 != uint64(len(raw)) {
-		return nil, fmt.Errorf("invalid WAV container length")
-	}
-	info, err := wav.Inspect(bytes.NewReader(raw), int64(len(raw)))
-	if err != nil {
-		return nil, err
-	}
-	if info.Channels != 1 || info.SampleRate != 16000 || !info.PCM() || info.BlockAlign != info.BitsPerSample/8 {
-		return nil, fmt.Errorf("audio must be mono 16 kHz PCM16 or float32 WAV")
-	}
-	width := int64(info.BitsPerSample / 8)
-	if info.DataSize == 0 || info.DataSize%width != 0 {
-		return nil, fmt.Errorf("empty or incomplete WAV samples")
-	}
-	if info.DataSize/width > 16000*transcriptionMaxSeconds {
-		return nil, fmt.Errorf("audio exceeds the %d-second limit", transcriptionMaxSeconds)
-	}
-	data := raw[int(info.DataOffset):int(info.DataOffset+info.DataSize)]
-	return wav.DecodeMono(data, info.Format)
+	return audioinput.Decode16kMonoWAV(raw, transcriptionMaxSeconds)
 }

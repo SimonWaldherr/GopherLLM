@@ -173,3 +173,62 @@ The same M2 Max with four Go workers produced these medians over three measured 
 | Q4_K_M, same build as resident prefill | 146.02 | 34.74 | 5.08 GB |
 
 On the 26-token prompt, the final LittleBit build reached 96.90 prefill and 38.76 decode token/s. Q4_K_M reached 78.06 and 38.00 token/s on the same build. In a separate A/B run, enabling resident prefill increased LittleBit from 84.43 to 99.21 prefill token/s and reduced the median time to first token from 308 to 262 ms. The two LittleBit paths returned the same 16 generated tokens, and the 128-step output IDs also agreed. The 128-token resident prefill retained about 68.5 MB of GPU scratch, including pending KV rows. Its 151,936 prompt logits agreed with grouped prefill to a maximum absolute difference of `9.54e-6`.
+
+### Packed projection reuse in Metal prefill
+
+LittleBit shares the packed V words and V scales across pairs of input tokens in batches of at least 16. Each token keeps its own FP32 accumulators, including for residual factors. The final pair in an odd batch writes one result. The Q4_K, Q6_K, and Q8_0 matrix kernels load four adjacent quantized values per lane and reuse their scale. The matrix tiles and accumulation order stay the same.
+
+The M2 Max comparison with four Go workers, 128 input tokens and 128 greedy decode steps used the previous build at `c3ad12a` as the baseline. Each model returned the same greedy token IDs before and after. The figures are medians of three timed runs following a warm-up.
+
+| Qwen3-8B checkpoint | Prefill before → after (tok/s) | Decode before → after (tok/s) |
+| --- | ---: | ---: |
+| LittleBit 2 | 111.01 → 142.77 | 37.59 → 36.55 |
+| Q4_K_M | 148.52 → 204.93 | 36.33 → 36.03 |
+
+With the 26-token prompt, the updated build measured 126.45 prefill and 38.87 decode token/s for LittleBit and 114.98 prefill and 38.25 decode token/s for Q4_K_M. Peak process RSS in the 128-step comparison stayed about 3.51 GB for LittleBit and 5.09 GB for Q4_K_M.
+
+Four other cached models were checked on the M2 Max with 160 fixed input token IDs, 64 decode steps with full logits, and eight Go workers. Each cell is the median of three runs before and after the Metal change. All logits at the last decode step were bit-identical for each model.
+
+| Cached model | Prefill before → after (tok/s) | Decode before → after (tok/s) |
+| --- | ---: | ---: |
+| Qwen3-4B Q8_0 | 342.67 → 420.99 | 64.22 → 63.58 |
+| DeepSeek-R1-Distill-Qwen-7B Q4_K_M | 97.93 → 116.08 | 22.80 → 22.77 |
+| Hermes-3-Llama-3.2-3B Q4_K_M | 353.38 → 492.33 | 77.09 → 77.76 |
+| Ministral-3-3B-Instruct Q4_K_M | 328.94 → 453.08 | 74.22 → 74.44 |
+
+```sh
+GOPHERLLM_FIXED_MODEL=/path/to/model.gguf GOPHERLLM_FIXED_LOGITS=/tmp/final-logits.f32 \
+  /tmp/qwen3-bench.test -test.run '^TestMetalFixedDecodeBenchmark$' -test.v
+```
+
+### Single-token Metal projection
+
+For a single token with BF16 input scales and complete 32-column words, the Metal V projection reuses one scaled activation across four packed rows. Each row retains its own FP32 sum and reduction order. The generic kernel covers other scale types and partial words. This specialization applies to both branches when their V input scales meet the same conditions.
+
+The regular Q4_K decoder fully unrolls the four fixed subgroups in each packed block. This makes the scale and minimum selection static in both the plain projection and the fused gate/up shader. In a separate 32-step Qwen3-8B control, all 151,936 final logits were bit-identical to the original loop.
+
+On the M2 Max with four Go workers, both checkpoints generated the same token IDs before and after each change. Rates are medians of three warmed runs against the preceding prefill-optimized build.
+
+| Qwen3-8B checkpoint | 26 input / 16 output (decode tok/s) | 128 input / 128 decode steps (tok/s) |
+| --- | ---: | ---: |
+| LittleBit 2 | 39.71 → 49.95 | 37.21 → 47.22 |
+| Q4_K_M | 38.43 → 45.70 | 35.97 → 42.60 |
+
+Prefill in the 128-token test measured 142.23 → 143.20 tok/s for LittleBit and 205.26 → 205.08 tok/s for Q4_K_M. The independent NumPy reference for the real LittleBit checkpoint agreed across all 151,936 logits with a maximum absolute decode error below `1e-5`.
+
+The following test measures 48 greedy steps at each of several prefilled KV depths without charging prefill time to decode.
+
+```sh
+GOMAXPROCS=4 GOPHERLLM_QWEN3_BENCH_METAL=1 GOPHERLLM_QWEN3_BENCH_GGUF=/path/to/qwen3-8b.gguf \
+  /tmp/qwen3-bench.test -test.run '^TestQwen3MetalDecodeContexts$' -test.v
+```
+
+The 48 generated IDs agreed before and after in every run at each depth. These are the medians of three runs per depth on the M2 Max.
+
+| KV depth at first decode step | LittleBit 2 (tok/s) | Q4_K_M (tok/s) |
+| ---: | ---: | ---: |
+| 128 | 36.29 → 47.17 | 35.86 → 42.65 |
+| 512 | 37.31 → 45.74 | 35.43 → 41.73 |
+| 1,536 | 34.87 → 41.94 | 33.18 → 38.81 |
+
+The same Q4_K change improved full-logit decode on the two cached 3B models measured with `TestMetalFixedDecodeBenchmark`. Hermes reached 89.31 from 77.75 tok/s and Ministral reached 88.89 from 74.46 tok/s. Both models had bit-identical logits at the last step.

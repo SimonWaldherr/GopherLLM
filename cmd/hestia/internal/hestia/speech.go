@@ -2,175 +2,248 @@ package hestia
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 
-	gopherllm "github.com/SimonWaldherr/GopherLLM"
+	"github.com/SimonWaldherr/GopherLLM/speech"
 )
 
-// ErrSpeechNotConfigured is returned by voice endpoints when no Voxtral
-// model path was configured (CONCEPT.md section 3: voice is optional, the
-// text path keeps working without it).
-var ErrSpeechNotConfigured = errors.New("hestia: no speech model configured")
+const (
+	SpeechVoxtral = string(speech.Voxtral)
+	SpeechPhonon  = string(speech.Phonon)
+	SpeechWhisper = string(speech.Whisper)
 
-// ErrVoiceSessionBusy is returned when a recording is already in progress
-// (CONCEPT.md section 3's capacity limit, surfaced to the UI as the
-// "Belegt-Anzeige").
-var ErrVoiceSessionBusy = errors.New("hestia: a voice recording is already in progress")
+	voicePCMBytesPerSecond = speech.SampleRate * 2
+	maxVoiceSeconds        = speech.MaxSamples / speech.SampleRate
+	// MaxVoicePCMBytes bounds one recording of 16 kHz mono PCM16.
+	MaxVoicePCMBytes = speech.MaxSamples * 2
+)
 
-// SpeechHost configures Hestia's speech transcription and enforces
-// CONCEPT.md section 3's "genau eine aktive Sprachaufnahme" capacity limit.
-//
-// The model's incremental decoder can return an empty transcript for real
-// speech. To keep live transcription reliable, VoiceSession periodically
-// re-decodes the recording accumulated so far through the verified batch
-// path. Partial text is advisory only and is never used to trigger an action.
-type SpeechHost struct {
-	ModelPath string
+var (
+	ErrSpeechNotConfigured = errors.New("hestia: no speech model configured")
+	ErrVoiceSessionBusy    = errors.New("hestia: a voice recording is already in progress")
+	errVoiceSessionDone    = errors.New("hestia: voice session already finished")
+)
 
-	mu   sync.Mutex
-	busy bool
+// SpeechConfig selects local speech recognition. An empty configuration disables voice.
+type SpeechConfig struct {
+	Backend    string `json:"backend,omitempty"`
+	ModelPath  string `json:"model_path,omitempty"`
+	WhisperURL string `json:"whisper_url,omitempty"`
+	Language   string `json:"language,omitempty"`
 }
 
-// OpenSpeechHost validates that a Voxtral Realtime GGUF exists and is
-// loadable, without keeping it mapped (TranscribeVoxtralRealtime opens and
-// releases its own mapping per call -- see this file's doc comment).
-func OpenSpeechHost(ctx context.Context, modelPath string, logw io.Writer) (*SpeechHost, error) {
-	if logw == nil {
-		logw = io.Discard
+func (c SpeechConfig) Validate() error {
+	if c == (SpeechConfig{}) {
+		return nil
 	}
-	// A short, throwaway clip validates the model loads and decodes without
-	// keeping any state around afterward; "audio is empty" would be the
-	// only expected error for one all-zero sample.
-	probe := make([]float32, 1600)
-	if _, err := gopherllm.TranscribeVoxtralRealtime(ctx, modelPath, probe, 0, logw); err != nil {
-		return nil, fmt.Errorf("validating speech model: %w", err)
+	if c.WhisperURL != "" {
+		return fmt.Errorf("speech: configure a local Whisper model_path instead of whisper_url")
 	}
-	return &SpeechHost{ModelPath: modelPath}, nil
-}
-
-func (h *SpeechHost) Close() error { return nil }
-
-// VoiceSession accumulates one turn's raw PCM16 audio in memory and refreshes
-// a reliable partial transcript after each additional second of recording.
-type VoiceSession struct {
-	host     *SpeechHost
-	mu       sync.Mutex
-	pcm      []byte
-	partial  string
-	decoded  int
-	decoding bool
-	done     bool
-}
-
-// StartVoiceSession reserves the host's one recording slot.
-func (h *SpeechHost) StartVoiceSession(ctx context.Context) (*VoiceSession, error) {
-	if h == nil || h.ModelPath == "" {
-		return nil, ErrSpeechNotConfigured
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.busy {
-		return nil, ErrVoiceSessionBusy
-	}
-	h.busy = true
-	return &VoiceSession{host: h}, nil
-}
-
-// PushPCM16 appends one chunk of little-endian 16-bit mono PCM at 16kHz and
-// periodically refreshes its partial transcript using the known-good batch
-// decoder. Decoding happens outside the session lock so recording can keep
-// accepting audio while a previous partial is being rendered.
-func (vs *VoiceSession) PushPCM16(ctx context.Context, pcm []byte) (string, error) {
-	if len(pcm)%2 != 0 {
-		return "", fmt.Errorf("hestia: PCM16 chunk has an odd byte count")
-	}
-	vs.mu.Lock()
-	if vs.done {
-		vs.mu.Unlock()
-		return "", fmt.Errorf("hestia: voice session already finished")
-	}
-	vs.pcm = append(vs.pcm, pcm...)
-	seconds := float64(len(vs.pcm)) / 2 / 16000
-	vs.partial = fmt.Sprintf("… Aufnahme läuft (%.1fs) …", seconds)
-	if vs.decoding || len(vs.pcm)-vs.decoded < 16000*2 {
-		partial := vs.partial
-		vs.mu.Unlock()
-		return partial, nil
-	}
-	vs.decoding = true
-	snapshot := append([]byte(nil), vs.pcm...)
-	vs.mu.Unlock()
-	text, err := gopherllm.TranscribeVoxtralRealtime(ctx, vs.host.ModelPath, pcm16ToFloat32(snapshot), 0, io.Discard)
-	vs.mu.Lock()
-	vs.decoding = false
-	if err != nil {
-		// Keep capturing and preserve the last visible partial. A transient
-		// decode failure must not turn a microphone request into lost audio.
-		partial := vs.partial
-		vs.mu.Unlock()
-		return partial, nil
-	}
-	if !vs.done {
-		vs.decoded = len(snapshot)
-		if text != "" {
-			vs.partial = text
+	switch c.Backend {
+	case SpeechVoxtral, SpeechPhonon:
+		if strings.TrimSpace(c.ModelPath) == "" || c.Language != "" {
+			return fmt.Errorf("speech: %s requires model_path and detects the language automatically", c.Backend)
 		}
-	}
-	partial := vs.partial
-	vs.mu.Unlock()
-	return partial, nil
-}
-
-// Finish transcribes the whole buffered recording in one batch call and
-// releases the host's recording slot.
-func (vs *VoiceSession) Finish(ctx context.Context) (string, error) {
-	vs.mu.Lock()
-	pcm := vs.pcm
-	alreadyDone := vs.done
-	vs.done = true
-	vs.mu.Unlock()
-	if alreadyDone {
-		return "", fmt.Errorf("hestia: voice session already finished")
-	}
-	defer vs.release()
-
-	if len(pcm) == 0 {
-		return "", fmt.Errorf("hestia: no audio was recorded")
-	}
-	samples := pcm16ToFloat32(pcm)
-	return gopherllm.TranscribeVoxtralRealtime(ctx, vs.host.ModelPath, samples, 0, io.Discard)
-}
-
-// Abort releases the recording slot without transcribing.
-func (vs *VoiceSession) Abort() error {
-	vs.mu.Lock()
-	alreadyDone := vs.done
-	vs.done = true
-	vs.mu.Unlock()
-	if !alreadyDone {
-		vs.release()
+		if c.Backend == SpeechPhonon && !strings.EqualFold(filepath.Ext(c.ModelPath), ".fermion") {
+			return fmt.Errorf("speech: Phonon requires an extracted .fermion model beside config.json")
+		}
+	case SpeechWhisper:
+		if strings.TrimSpace(c.ModelPath) == "" {
+			return fmt.Errorf("speech: Whisper requires a local model_path")
+		}
+	default:
+		return fmt.Errorf("speech: backend must be voxtral, phonon or whisper")
 	}
 	return nil
 }
 
-func (vs *VoiceSession) release() {
-	vs.host.mu.Lock()
-	vs.host.busy = false
-	vs.host.mu.Unlock()
+// SpeechHost owns one resident speech backend and one active recording slot.
+type SpeechHost struct {
+	backend string
+	busy    atomic.Bool
+
+	mu         sync.RWMutex
+	transcribe func(context.Context, []byte) (string, error)
+	closeModel func() error
 }
 
-func pcm16ToFloat32(pcm []byte) []float32 {
-	samples := make([]float32, len(pcm)/2)
-	for i := range samples {
-		v := int16(binary.LittleEndian.Uint16(pcm[2*i:]))
-		samples[i] = float32(v) / 32768
+// OpenSpeechHost opens a resident Voxtral model for callers using the legacy API.
+func OpenSpeechHost(ctx context.Context, modelPath string, logw io.Writer) (*SpeechHost, error) {
+	return OpenConfiguredSpeechHost(ctx, SpeechConfig{Backend: SpeechVoxtral, ModelPath: modelPath}, logw)
+}
+
+// OpenConfiguredSpeechHost initializes speech recognition without recording or
+// sending any audio. Local models stay loaded until the host closes.
+func OpenConfiguredSpeechHost(ctx context.Context, cfg SpeechConfig, logw io.Writer) (*SpeechHost, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return samples
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.Backend == "" {
+		return nil, nil
+	}
+	h := &SpeechHost{backend: cfg.Backend}
+	model, err := speech.Open(ctx, cfg.ModelPath, speech.Options{Backend: speech.Backend(cfg.Backend), Language: cfg.Language}, logw)
+	if err != nil {
+		return nil, err
+	}
+	h.transcribe = model.TranscribePCM16
+	h.closeModel = model.Close
+	return h, nil
+}
+
+// Backend returns the configured engine name without exposing its address or path.
+func (h *SpeechHost) Backend() string {
+	if h == nil {
+		return ""
+	}
+	return h.backend
+}
+
+func (h *SpeechHost) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.transcribe = nil
+	if h.closeModel != nil {
+		closeModel := h.closeModel
+		h.closeModel = nil
+		return closeModel()
+	}
+	return nil
+}
+
+func (h *SpeechHost) reserve(ctx context.Context) error {
+	if h == nil {
+		return ErrSpeechNotConfigured
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !h.busy.CompareAndSwap(false, true) {
+		return ErrVoiceSessionBusy
+	}
+	h.mu.RLock()
+	ready := h.transcribe != nil
+	h.mu.RUnlock()
+	if !ready {
+		h.busy.Store(false)
+		return ErrSpeechNotConfigured
+	}
+	return nil
+}
+
+// TranscribePCM16 transcribes a complete clip and releases the recording slot
+// on completion or cancellation.
+func (h *SpeechHost) TranscribePCM16(ctx context.Context, pcm []byte) (string, error) {
+	if err := h.reserve(ctx); err != nil {
+		return "", err
+	}
+	defer h.busy.Store(false)
+	return h.transcribeClip(ctx, pcm)
+}
+
+func (h *SpeechHost) transcribeClip(ctx context.Context, pcm []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if len(pcm) == 0 {
+		return "", fmt.Errorf("hestia: no audio was recorded")
+	}
+	if err := checkVoicePCM(len(pcm), 0); err != nil {
+		return "", err
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.transcribe == nil {
+		return "", ErrSpeechNotConfigured
+	}
+	text, err := h.transcribe(ctx, pcm)
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(text), nil
+}
+
+// VoiceSession keeps at most one turn of raw audio in memory. PushPCM16
+// reports recording progress; Finish decodes the recording once.
+type VoiceSession struct {
+	host *SpeechHost
+	mu   sync.Mutex
+	pcm  []byte
+	done bool
+}
+
+func (h *SpeechHost) StartVoiceSession(ctx context.Context) (*VoiceSession, error) {
+	if err := h.reserve(ctx); err != nil {
+		return nil, err
+	}
+	return &VoiceSession{host: h}, nil
+}
+
+func (vs *VoiceSession) PushPCM16(ctx context.Context, pcm []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	if vs.done {
+		return "", errVoiceSessionDone
+	}
+	if err := checkVoicePCM(len(pcm), len(vs.pcm)); err != nil {
+		return "", err
+	}
+	vs.pcm = append(vs.pcm, pcm...)
+	seconds := float64(len(vs.pcm)) / voicePCMBytesPerSecond
+	return fmt.Sprintf("… Aufnahme läuft (%.1fs) …", seconds), nil
+}
+
+// Finish transcribes the buffered recording and releases the recording slot.
+func (vs *VoiceSession) Finish(ctx context.Context) (string, error) {
+	vs.mu.Lock()
+	if vs.done {
+		vs.mu.Unlock()
+		return "", errVoiceSessionDone
+	}
+	vs.done = true
+	pcm := vs.pcm
+	vs.pcm = nil
+	vs.mu.Unlock()
+	defer vs.host.busy.Store(false)
+	return vs.host.transcribeClip(ctx, pcm)
+}
+
+// Abort releases the recording slot and discards captured audio.
+func (vs *VoiceSession) Abort() error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	if !vs.done {
+		vs.done = true
+		vs.pcm = nil
+		vs.host.busy.Store(false)
+	}
+	return nil
+}
+
+func checkVoicePCM(n, recorded int) error {
+	if n%2 != 0 {
+		return fmt.Errorf("hestia: PCM16 chunk has an odd byte count")
+	}
+	if n > MaxVoicePCMBytes-recorded {
+		return fmt.Errorf("hestia: audio exceeds the %d-second limit", maxVoiceSeconds)
+	}
+	return nil
 }

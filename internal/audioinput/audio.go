@@ -101,3 +101,45 @@ func linearResample(in []float32, fromRate, toRate int) []float32 {
 	}
 	return out
 }
+
+// Decode16kMonoWAV validates and decodes one bounded 16 kHz mono PCM WAV.
+func Decode16kMonoWAV(raw []byte, maxSeconds int) ([]float32, error) {
+	info, err := inspect16kMonoWAV(raw, maxSeconds)
+	if err != nil {
+		return nil, err
+	}
+	return wav.DecodeMono(raw[info.DataOffset:info.DataOffset+info.DataSize], info.Format)
+}
+
+// CheckPCM16WAV validates an already converted Whisper input without decoding samples.
+func CheckPCM16WAV(raw []byte, maxSeconds int) error {
+	info, err := inspect16kMonoWAV(raw, maxSeconds)
+	if err == nil && info.BitsPerSample != 16 {
+		return fmt.Errorf("audio must be PCM16 WAV")
+	}
+	return err
+}
+
+func inspect16kMonoWAV(raw []byte, maxSeconds int) (wav.File, error) {
+	if len(raw) < 12 || string(raw[:4]) != "RIFF" || string(raw[8:12]) != "WAVE" {
+		return wav.File{}, fmt.Errorf("send a mono 16 kHz PCM16 or float32 WAV file")
+	}
+	if uint64(binary.LittleEndian.Uint32(raw[4:8]))+8 != uint64(len(raw)) {
+		return wav.File{}, fmt.Errorf("invalid WAV container length")
+	}
+	info, err := wav.Inspect(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		return wav.File{}, err
+	}
+	if info.Channels != 1 || info.SampleRate != 16000 || !info.PCM() || info.BlockAlign != info.BitsPerSample/8 {
+		return wav.File{}, fmt.Errorf("audio must be mono 16 kHz PCM16 or float32 WAV")
+	}
+	width := int64(info.BitsPerSample / 8)
+	if info.DataSize == 0 || info.DataSize%width != 0 {
+		return wav.File{}, fmt.Errorf("empty or incomplete WAV samples")
+	}
+	if info.DataSize/width > 16000*int64(maxSeconds) {
+		return wav.File{}, fmt.Errorf("audio exceeds the %d-second limit", maxSeconds)
+	}
+	return info, nil
+}

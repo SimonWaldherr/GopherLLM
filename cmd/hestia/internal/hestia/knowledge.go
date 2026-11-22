@@ -2,8 +2,10 @@ package hestia
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	gopherllm "github.com/SimonWaldherr/GopherLLM"
 	tinysql "github.com/SimonWaldherr/tinySQL"
@@ -54,39 +56,27 @@ func float32To64(v []float32) []float64 {
 type KnowledgeBase struct {
 	rag        *core.RAG
 	embedModel string
+	embedding  *gopherllm.Model
+	closeOnce  sync.Once
+	closeErr   error
 }
 
 // OpenKnowledgeBase loads embedModelPath once and opens (or creates) the
 // knowledge base database at dbPath.
 func OpenKnowledgeBase(embedModelPath, dbPath string) (*KnowledgeBase, error) {
-	mmap, err := gopherllm.OpenMmap(embedModelPath)
+	model, err := gopherllm.Open(context.Background(), embedModelPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening embedding model: %w", err)
 	}
-	success := false
-	defer func() {
-		if !success {
-			mmap.Close()
-		}
-	}()
-	data := mmap.Bytes()
-	gguf, err := gopherllm.ParseGGUF(data)
-	if err != nil {
-		return nil, fmt.Errorf("parsing embedding model GGUF: %w", err)
-	}
-	arch, _ := gguf.GetString("general.architecture")
-	runner, err := gopherllm.RunnerFromGGUFBytes(data)
-	if err != nil {
-		return nil, fmt.Errorf("loading embedding model: %w", err)
-	}
+	arch, _ := model.GGUF().GetString("general.architecture")
 	embedModel := archOrPathName(arch, embedModelPath)
 
-	kb, err := newKnowledgeBaseFromEmbedder(&GopherLLMEmbedder{Runner: runner}, embedModel, dbPath, tinysql.ModeWAL)
+	kb, err := newKnowledgeBaseFromEmbedder(&GopherLLMEmbedder{Runner: model.Runner()}, embedModel, dbPath, tinysql.ModeWAL)
 	if err != nil {
-		runner.Close()
+		_ = model.Close()
 		return nil, err
 	}
-	success = true
+	kb.embedding = model
 	return kb, nil
 }
 
@@ -114,7 +104,13 @@ func (kb *KnowledgeBase) Close() error {
 	if kb == nil || kb.rag == nil {
 		return nil
 	}
-	return kb.rag.Close()
+	kb.closeOnce.Do(func() {
+		kb.closeErr = kb.rag.Close()
+		if kb.embedding != nil {
+			kb.closeErr = errors.Join(kb.closeErr, kb.embedding.Close())
+		}
+	})
+	return kb.closeErr
 }
 
 // KnowledgeHit is one search result, ready to render as a source citation.

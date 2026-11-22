@@ -1,0 +1,17 @@
+:root {
+  color-scheme: light dark;
+  font: 16px/1.5 system-ui, sans-serif;
+}
+body { max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+h1 { margin: 0 0 1rem; font-size: 1.5rem; }
+label { display: block; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.25rem; }
+input[type=text] { min-width: min(16rem, 100%); flex: 1; }
+input[type=text], button { padding: 0.5rem 0.75rem; font: inherit; }
+.voice { margin-top: 1rem; }
+#micStatus { margin: 0.5rem 0; font-weight: 600; }
+.hint { color: GrayText; }
+.turn { border: 1px solid GrayText; border-radius: 0.375rem; padding: 0.75rem; margin-top: 0.75rem; overflow-wrap: anywhere; }
+.turn p { margin: 0.25rem 0; white-space: pre-wrap; }
+.turn ul { margin: 0.5rem 0; padding-inline-start: 1.4rem; }
+#error { color: light-dark(#9c1b1b, #ffa8a8); }

@@ -149,6 +149,21 @@ static void test_engine(const char *model) {
 	CHECK(!gopherllm_is_loaded(engine), "freed engine reports loaded");
 }
 
+static void test_assistant_api(void) {
+	CHECK(gopherllm_speech_available("voxtral") == 1, "Voxtral is unavailable");
+	CHECK(gopherllm_speech_available("unknown") == 0, "unknown speech backend is available");
+	gopherllm_operation op = gopherllm_operation_new();
+	CHECK(op != 0, "creating operation failed");
+	gopherllm_engine_free(op); /* Type mismatches must not free another handle. */
+	gopherllm_operation_cancel(op);
+	char *error_out = NULL;
+	gopherllm_speech speech = gopherllm_speech_open("unused.gguf", "{\"backend\":\"voxtral\"}", op, &error_out);
+	CHECK(speech == 0 && contains(error_out, "context canceled"), "canceled speech load was started");
+	gopherllm_free_string(error_out);
+	gopherllm_operation_free(op);
+	gopherllm_operation_free(op);
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
@@ -156,6 +171,7 @@ int main(int argc, char **argv) {
 	}
 	test_library(argv[1]);
 	test_engine(argv[1]);
+	test_assistant_api();
 	if (failures) {
 		fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

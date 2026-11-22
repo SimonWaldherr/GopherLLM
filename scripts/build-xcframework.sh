@@ -10,7 +10,9 @@
 #   PLATFORMS                any of "ios ios-simulator macos" (default: all three)
 #   IOS_DEPLOYMENT_TARGET    default 17.0
 #   MACOS_DEPLOYMENT_TARGET  default 14.0
+#   MACOS_ARCHS              "arm64 x86_64" by default; "arm64" for Apple Silicon only
 #   METAL                    1 (default) compiles the Metal GPU kernels in; 0 leaves them out
+#   WITH_HESTIA              1 embeds Hestia in a macOS-only build
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -24,28 +26,43 @@ out="${XCFRAMEWORK_OUT:-$root/bindings/swift/GopherLLMCore.xcframework}"
 platforms="${PLATFORMS:-ios ios-simulator macos}"
 ios_min="${IOS_DEPLOYMENT_TARGET:-17.0}"
 macos_min="${MACOS_DEPLOYMENT_TARGET:-14.0}"
+macos_archs="${MACOS_ARCHS:-arm64 x86_64}"
 tags="capi"
 [[ "${METAL:-1}" == "1" ]] && tags="capi metal"
-
 work=$(mktemp -d "${TMPDIR:-/tmp}/gopherllm-xcframework.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+hestia_stage=""
+trap 'rm -rf "$work"; if [[ -n "$hestia_stage" ]]; then rm -rf "$hestia_stage"; fi' EXIT
+go_dir="$root"
+go_target=./bindings/c/shim
+if [[ "${WITH_HESTIA:-0}" == 1 ]]; then
+  [[ "$platforms" == macos ]] || { echo "WITH_HESTIA=1 requires PLATFORMS=macos" >&2; exit 1; }
+  go_dir="$root/cmd/hestia"
+  hestia_stage=$(mktemp -d "$go_dir/.native-build.XXXXXX")
+  mkdir -p "$hestia_stage/shim" "$hestia_stage/include"
+  cp "$root"/bindings/c/shim/*.go "$go_dir/macos/bridge.go" "$hestia_stage/shim/"
+  cp "$root/bindings/c/include/gopherllm.h" "$go_dir/macos/hestia.h" "$hestia_stage/include/"
+  go_target="./${hestia_stage##*/}/shim"
+  tags="$tags hestiacapi"
+fi
 
 # build_slice <dir> <GOOS> <GOARCH> <sdk> <clang target triple>
 build_slice() {
-  local dir="$work/$1" goos=$2 goarch=$3 sdk=$4 target=$5 sysroot
+  local dir="$work/$1" goos=$2 goarch=$3 sdk=$4 target=$5 sysroot cflags
   sysroot=$(xcrun --sdk "$sdk" --show-sdk-path)
+  cflags="-O2 -target $target -isysroot \"$sysroot\""
   mkdir -p "$dir"
   echo "building $1 ($target)"
-  (cd "$root" && CGO_ENABLED=1 GOOS="$goos" GOARCH="$goarch" \
+  (cd "$go_dir" && CGO_ENABLED=1 GOOS="$goos" GOARCH="$goarch" \
     CC="$(xcrun --sdk "$sdk" --find clang)" \
-    CGO_CFLAGS="-O2 -target $target -isysroot $sysroot" \
-    CGO_LDFLAGS="-target $target -isysroot $sysroot" \
-    go build -trimpath -tags "$tags" -buildmode=c-archive -o "$dir/libgopherllm.a" ./bindings/c/shim)
+    CGO_CFLAGS="$cflags" \
+    CGO_LDFLAGS="-target $target -isysroot \"$sysroot\"" \
+    go build -trimpath -tags "$tags" -buildmode=c-archive -o "$dir/libgopherllm.a" "$go_target")
 }
 
 # The slices are independent and Go's build cache is safe for concurrent
 # use, so build them in parallel and fail if any one fails.
 slices=()
+macos_libraries=()
 for platform in $platforms; do
   case "$platform" in
     ios) slices+=("ios-arm64 ios arm64 iphoneos arm64-apple-ios$ios_min") ;;
@@ -53,8 +70,16 @@ for platform in $platforms; do
       slices+=("sim-arm64 ios arm64 iphonesimulator arm64-apple-ios$ios_min-simulator")
       slices+=("sim-x86_64 ios amd64 iphonesimulator x86_64-apple-ios$ios_min-simulator") ;;
     macos)
-      slices+=("macos-arm64 darwin arm64 macosx arm64-apple-macos$macos_min")
-      slices+=("macos-x86_64 darwin amd64 macosx x86_64-apple-macos$macos_min") ;;
+      for arch in $macos_archs; do
+        case "$arch" in
+          arm64) goarch=arm64 ;;
+          x86_64) goarch=amd64 ;;
+          *) echo "unknown macOS architecture $arch (want arm64 or x86_64)" >&2; exit 1 ;;
+        esac
+        slices+=("macos-$arch darwin $goarch macosx $arch-apple-macos$macos_min")
+        macos_libraries+=("$work/macos-$arch/libgopherllm.a")
+      done
+      [[ ${#macos_libraries[@]} != 0 ]] || { echo "no macOS architectures selected" >&2; exit 1; } ;;
     *) echo "unknown platform $platform (want ios, ios-simulator or macos)" >&2; exit 1 ;;
   esac
 done
@@ -73,15 +98,24 @@ for pid in "${pids[@]}"; do wait "$pid" || fail=1; done
 headers="$work/headers"
 mkdir -p "$headers/GopherLLMCore"
 cp "$root/bindings/c/include/gopherllm.h" "$headers/GopherLLMCore/"
-cat > "$headers/GopherLLMCore/module.modulemap" <<'MODULEMAP'
+{
+cat <<'MODULEMAP'
 module GopherLLMCore {
     header "gopherllm.h"
+MODULEMAP
+if [[ -n "$hestia_stage" ]]; then
+  cp "$go_dir/macos/hestia.h" "$headers/GopherLLMCore/"
+  printf '    header "hestia.h"\n'
+fi
+cat <<'MODULEMAP'
     link framework "Accelerate"
     link framework "Foundation"
     link framework "Metal"
+    link framework "Security"
     export *
 }
 MODULEMAP
+} > "$headers/GopherLLMCore/module.modulemap"
 
 args=()
 add_library() { args+=(-library "$1" -headers "$headers"); }
@@ -93,9 +127,13 @@ for platform in $platforms; do
       lipo -create "$work/sim-arm64/libgopherllm.a" "$work/sim-x86_64/libgopherllm.a" -output "$work/sim/libgopherllm.a"
       add_library "$work/sim/libgopherllm.a" ;;
     macos)
-      mkdir -p "$work/macos"
-      lipo -create "$work/macos-arm64/libgopherllm.a" "$work/macos-x86_64/libgopherllm.a" -output "$work/macos/libgopherllm.a"
-      add_library "$work/macos/libgopherllm.a" ;;
+      if [[ ${#macos_libraries[@]} == 1 ]]; then
+        add_library "${macos_libraries[0]}"
+      else
+        mkdir -p "$work/macos"
+        lipo -create "${macos_libraries[@]}" -output "$work/macos/libgopherllm.a"
+        add_library "$work/macos/libgopherllm.a"
+      fi ;;
   esac
 done
 

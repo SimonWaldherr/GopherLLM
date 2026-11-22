@@ -1,8 +1,8 @@
 # iOS integration
 
-GopherLLM runs GGUF models on the device, inside the app process: no server,
-no network, no runtime besides the app itself. An iOS app uses it through a
-Swift package whose binary part is an XCFramework built from GopherLLM's C ABI:
+GopherLLM runs inference offline inside the app process. An iOS app uses it
+through a Swift package whose binary part is an XCFramework built from
+GopherLLM's C ABI.
 
 ```
 your app ─► GopherLLM (Swift package, bindings/swift)
@@ -33,6 +33,7 @@ gomobile or other tool is downloaded. Useful variables:
 | Variable | Effect |
 |---|---|
 | `PLATFORMS="ios ios-simulator"` | Skip slices you do not need (faster local builds) |
+| `MACOS_ARCHS=arm64` | Build only the Apple Silicon macOS slice |
 | `METAL=0` | Leave the Metal GPU kernels out |
 | `XCFRAMEWORK_OUT=/path/GopherLLMCore.xcframework` | Write it elsewhere |
 
@@ -49,7 +50,7 @@ to your app target. From another package:
 .package(path: "../GopherLLM/bindings/swift")
 ```
 
-The module map links Accelerate, Foundation and Metal automatically.
+The module map links Accelerate, Foundation, Metal and Security automatically.
 
 To ship the package without a GopherLLM checkout (for example from your own
 repository), zip the XCFramework, compute its checksum with
@@ -112,9 +113,9 @@ to bundle with the app. Common approaches:
   Support, as the demo app does. Access to the picked file is
   security-scoped: call `startAccessingSecurityScopedResource()` around the
   copy.
-- Download it with a background `URLSession` download task (for example from
-  Hugging Face) into Application Support. The mobile library itself contains
-  no network code.
+- Download it from Hugging Face with `GopherLLMHub` into a folder in the
+  app container. A host that needs a system-managed background download can
+  also use `URLSession`. [Hub client setup](../bindings/swift/README.md#speech-and-model-downloads)
 - Exclude model files from backups:
   `var values = URLResourceValues(); values.isExcludedFromBackup = true; try url.setResourceValues(values)`.
 
@@ -164,8 +165,8 @@ loading:
 - GopherLLM is ordinary native code: no JIT, no downloaded code. Metal kernels
   are compiled at run time from source embedded in the library, which iOS
   permits.
-- Everything runs on the device and the library opens no network
-  connections, which keeps privacy declarations simple.
+- Inference runs on the device. Explicit Hub calls use the network to look
+  up and download models. Those calls send no inference inputs to the Hub.
 - The Go runtime and inference engine add several megabytes to the app
   binary.
 
@@ -189,8 +190,9 @@ CI runs these on every push.
 
 ## Current limits
 
-- The mobile API covers text generation and chat. Vision (Pixtral), tool
-  calling, embeddings, speech (Voxtral, Parakeet) and Laya classification are
+- The mobile API covers text, speech (Voxtral and Phonon), and Hub downloads.
+  [Speech and Hub setup](../bindings/swift/README.md#speech-and-model-downloads)
+- Vision (Pixtral), tool calling, embeddings and Laya classification are
   available to Go programs but not yet exposed through the C ABI and Swift.
   Adding one follows [the embedding layers](PROJECT_STRUCTURE.md#embedding-layers).
 - The KV cache uses f32 on ARM64 by default. The half-size f16 cache is only

@@ -2,8 +2,10 @@ package hestia
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
+	"github.com/SimonWaldherr/GopherLLM/internal/testmodel"
 	tinysql "github.com/SimonWaldherr/tinySQL"
 )
 
@@ -55,6 +57,60 @@ func TestKnowledgeBaseSearchWithNoDocumentsReturnsEmpty(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Fatalf("hits = %d, want 0 on an empty knowledge base", len(hits))
+	}
+}
+
+func TestKnowledgeBaseReopensWALDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "knowledge.db")
+	open := func() *KnowledgeBase {
+		t.Helper()
+		kb, err := newKnowledgeBaseFromEmbedder(stubEmbedder{}, "stub-embed", path, tinysql.ModeWAL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return kb
+	}
+	kb := open()
+	_, ingestErr := kb.AddDocument("Wartung", "Die Wärmepumpe wird jährlich gewartet.")
+	if err := kb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ingestErr != nil {
+		t.Fatal(ingestErr)
+	}
+	kb = open()
+	t.Cleanup(func() {
+		if err := kb.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	hits, err := kb.Search(t.Context(), "Wärmepumpe", 3)
+	if err != nil || len(hits) != 1 || hits[0].Title != "Wartung" {
+		t.Fatalf("reopened search = %v, %v, want the persisted Wartung document", hits, err)
+	}
+}
+
+func TestKnowledgeBaseOwnsLoadedEmbeddingModel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "embedding.gguf")
+	if err := testmodel.WriteFile(path); err != nil {
+		t.Fatal(err)
+	}
+	kb, err := OpenKnowledgeBase(path, filepath.Join(dir, "knowledge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = kb.Close() })
+	if kb.embedding == nil || kb.embedModel != "llama" {
+		t.Fatalf("knowledge base did not retain the expected model: %q", kb.embedModel)
+	}
+	if _, err := kb.AddDocument("Licht", "Das Licht im Wohnzimmer ist aus."); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := kb.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

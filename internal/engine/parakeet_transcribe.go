@@ -24,11 +24,12 @@ func ParakeetDecodeTokens(vocab []string, tokens []int) (string, error) {
 }
 
 // TranscribeParakeet transcribes 16 kHz mono PCM using a local Parakeet-TDT
-// GGUF (general.architecture=="asr", asr.head_type=="tdt"). See parakeet.go's
+// GGUF (general.architecture=="asr", asr.head_type=="tdt") or unpacked
+// Phonon model.fermion with its sibling config.json. See parakeet.go's
 // doc comment for the architecture this loads and runs, and this package's
 // other parakeet_*.go files for each stage's implementation.
 //
-// Caveat this function's caller should know: unlike the Voxtral loaders in
+// For the older Parakeet GGUF, unlike the Voxtral loaders in
 // this codebase (each cross-validated component-by-component against a
 // second, independently-converted file of the identical checkpoint, down to
 // byte-identical intermediate tensors), this implementation has no such

@@ -57,6 +57,12 @@ type hfReference struct {
 // made and only complete snapshots already in the shared cache are considered.
 type Options struct {
 	Offline bool
+	// CacheDir overrides the Hub cache root without changing process settings.
+	CacheDir string
+	// Endpoint overrides HF_ENDPOINT for this operation.
+	Endpoint string
+	// Token overrides HF_TOKEN. A pointer to an empty string opts out of auth.
+	Token *string
 	// OnProgress, when set, receives periodic byte-progress updates for each
 	// file transferred by a resolve/download call. It is throttled the same
 	// way the textual logw progress line is (roughly 4 times per second) plus
@@ -301,7 +307,7 @@ func SearchModels(ctx context.Context, search SearchOptions, opts Options) ([]Se
 		return nil, errors.New("Hugging Face search is unavailable while offline mode is enabled")
 	}
 
-	u, err := url.Parse(hfEndpoint() + "/api/models")
+	u, err := url.Parse(hfEndpoint(opts) + "/api/models")
 	if err != nil {
 		return nil, fmt.Errorf("build Hugging Face model search request: %w", err)
 	}
@@ -327,8 +333,8 @@ func SearchModels(ctx context.Context, search SearchOptions, opts Options) ([]Se
 	if err != nil {
 		return nil, err
 	}
-	hfAuth(req)
-	resp, err := http.DefaultClient.Do(req)
+	hfAuth(req, opts)
+	resp, err := hfClient(opts).Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -474,7 +480,7 @@ func listGGUFVariants(ctx context.Context, ref string, opts Options) (hfReferenc
 	if err != nil {
 		return hfReference{}, nil, err
 	}
-	cache := newHFCache(r)
+	cache := newHFCache(r, opts)
 	var entries []hfTreeEntry
 	if offline {
 		snapshot := cache.snapshotForRef(r.Revision)
@@ -486,7 +492,7 @@ func listGGUFVariants(ctx context.Context, ref string, opts Options) (hfReferenc
 			return r, nil, fmt.Errorf("read cached Hugging Face repository %s: %w", r.Repository, err)
 		}
 	} else {
-		entries, _, err = hfListFiles(ctx, r)
+		entries, _, err = hfListFiles(ctx, r, opts)
 		if err != nil {
 			return r, nil, err
 		}
@@ -584,7 +590,7 @@ func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, op
 	} else if logw != io.Discard {
 		logw = &synchronizedWriter{w: logw}
 	}
-	cache := newHFCache(r)
+	cache := newHFCache(r, options)
 	if options.Offline || hfBoolEnv("HF_HUB_OFFLINE") {
 		if snapshot := cache.snapshotForRef(r.Revision); snapshot != "" {
 			if files, err := cachedGGUFFiles(ctx, snapshot, r.Quant); err == nil && len(files) > 0 {
@@ -594,7 +600,7 @@ func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, op
 		}
 		return nil, offlineCacheError(r)
 	}
-	entries, commit, err := hfListFiles(ctx, r)
+	entries, commit, err := hfListFiles(ctx, r, options)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -646,7 +652,7 @@ func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, op
 	if resolvedCommit != "" {
 		downloadRef.Revision = resolvedCommit
 	}
-	if err := downloadHFFiles(ctx, downloadRef, cache, tasks, logw, options.OnProgress); err != nil {
+	if err := downloadHFFiles(ctx, downloadRef, cache, tasks, logw, options); err != nil {
 		return nil, err
 	}
 	if err := cache.writeRef(r.Revision, commit); err != nil {
@@ -663,7 +669,7 @@ func resolveHuggingFaceFiles(ctx context.Context, ref string, logw io.Writer, op
 // The worker pool makes split-model imports materially faster without opening
 // an unbounded number of large transfers. The first failure cancels siblings;
 // their .incomplete blobs remain available for resume on the next invocation.
-func downloadHFFiles(parent context.Context, r hfReference, cache hfCache, tasks []hfDownloadTask, logw io.Writer, progress ProgressFunc) error {
+func downloadHFFiles(parent context.Context, r hfReference, cache hfCache, tasks []hfDownloadTask, logw io.Writer, opts Options) error {
 	if len(tasks) == 0 {
 		return nil
 	}
@@ -687,7 +693,7 @@ func downloadHFFiles(parent context.Context, r hfReference, cache hfCache, tasks
 				if ctx.Err() != nil {
 					return
 				}
-				blob, err := hfDownload(ctx, r, task.name, cache, task.size, logw, progress, func(n int64) { downloaded.Add(n) })
+				blob, err := hfDownload(ctx, r, task.name, cache, task.size, logw, opts, func(n int64) { downloaded.Add(n) })
 				if err == nil {
 					err = linkHFCacheFile(blob, task.path)
 				}
@@ -747,16 +753,23 @@ func hfBoolEnv(name string) bool {
 	}
 }
 
-func hfEndpoint() string {
+func hfEndpoint(opts Options) string {
+	if endpoint := strings.TrimRight(strings.TrimSpace(opts.Endpoint), "/"); endpoint != "" {
+		return endpoint
+	}
 	if endpoint := strings.TrimRight(strings.TrimSpace(os.Getenv("HF_ENDPOINT")), "/"); endpoint != "" {
 		return endpoint
 	}
 	return "https://huggingface.co"
 }
 
-func newHFCache(r hfReference) hfCache {
+func newHFCache(r hfReference, opts Options) hfCache {
+	name := "models--" + strings.ReplaceAll(r.Repository, "/", "--")
+	if opts.CacheDir != "" {
+		return hfCache{repository: r.Repository, root: filepath.Join(opts.CacheDir, name)}
+	}
 	if root := strings.TrimSpace(os.Getenv("HF_HUB_CACHE")); root != "" {
-		return hfCache{repository: r.Repository, root: filepath.Join(root, "models--"+strings.ReplaceAll(r.Repository, "/", "--"))}
+		return hfCache{repository: r.Repository, root: filepath.Join(root, name)}
 	}
 	home := strings.TrimSpace(os.Getenv("HF_HOME"))
 	if home == "" {
@@ -766,7 +779,6 @@ func newHFCache(r hfReference) hfCache {
 			home = ".cache/huggingface"
 		}
 	}
-	name := "models--" + strings.ReplaceAll(r.Repository, "/", "--")
 	return hfCache{repository: r.Repository, root: filepath.Join(home, "hub", name)}
 }
 
@@ -831,15 +843,17 @@ func safeHFRefPath(revision string) string {
 	return filepath.Join(parts...)
 }
 
-func hfListFiles(ctx context.Context, r hfReference) ([]hfTreeEntry, string, error) {
-	u := hfEndpoint() + "/api/models/" + hfRepositoryPath(r.Repository) + "/tree/" + url.PathEscape(r.Revision) + "?recursive=true"
+func hfListFiles(ctx context.Context, r hfReference, opts Options) ([]hfTreeEntry, string, error) {
+	endpoint := hfEndpoint(opts)
+	u := endpoint + "/api/models/" + hfRepositoryPath(r.Repository) + "/tree/" + url.PathEscape(r.Revision) + "?recursive=true"
 	var entries []hfTreeEntry
 	var commit string
-	origin, err := url.Parse(hfEndpoint())
+	origin, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, "", err
 	}
 	visited := map[string]bool{}
+	client := hfClient(opts)
 	for u != "" {
 		pageURL, err := url.Parse(u)
 		if err != nil || pageURL.Scheme != origin.Scheme || pageURL.Host != origin.Host || pageURL.User != nil {
@@ -853,8 +867,8 @@ func hfListFiles(ctx context.Context, r hfReference) ([]hfTreeEntry, string, err
 		if err != nil {
 			return nil, "", err
 		}
-		hfAuth(req)
-		resp, err := http.DefaultClient.Do(req)
+		hfAuth(req, opts)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, "", fmt.Errorf("list Hugging Face repository %s: %w", r.Repository, err)
 		}
@@ -883,7 +897,7 @@ func hfListFiles(ctx context.Context, r hfReference) ([]hfTreeEntry, string, err
 		}
 		entries = append(entries, page...)
 		if strings.HasPrefix(next, "/") {
-			next = hfEndpoint() + next
+			next = endpoint + next
 		}
 		u = next
 	}
@@ -1051,8 +1065,8 @@ func safeHFFilePath(path string) bool {
 	return true
 }
 
-func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, expectedSize int64, logw io.Writer, onProgress ProgressFunc, onBytes func(int64)) (string, error) {
-	etag, err := hfFileETag(ctx, r, name)
+func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, expectedSize int64, logw io.Writer, opts Options, onBytes func(int64)) (string, error) {
+	etag, err := hfFileETag(ctx, r, name, opts)
 	if err != nil {
 		return "", err
 	}
@@ -1082,16 +1096,16 @@ func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, 
 		}
 		return blob, nil
 	}
-	u := hfEndpoint() + "/" + hfRepositoryPath(r.Repository) + "/resolve/" + url.PathEscape(r.Revision) + "/" + strings.Join(escapeHFPath(name), "/") + "?download=true"
+	u := hfEndpoint(opts) + "/" + hfRepositoryPath(r.Repository) + "/resolve/" + url.PathEscape(r.Revision) + "/" + strings.Join(escapeHFPath(name), "/") + "?download=true"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", err
 	}
-	hfAuth(req)
+	hfAuth(req, opts)
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := hfClient(opts).Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", name, err)
 	}
@@ -1128,7 +1142,7 @@ func hfDownload(ctx context.Context, r hfReference, name string, cache hfCache, 
 	if err != nil {
 		return "", err
 	}
-	progress := &hfProgressWriter{out: logw, name: name, total: expectedSize, completed: offset, onBytes: onBytes, onEvent: onProgress}
+	progress := &hfProgressWriter{out: logw, name: name, total: expectedSize, completed: offset, onBytes: onBytes, onEvent: opts.OnProgress}
 	progress.Start()
 	var bytesWritten int64
 	if bytesWritten, err = io.Copy(tmp, io.TeeReader(resp.Body, progress)); err == nil {
@@ -1225,13 +1239,13 @@ func (p *hfProgressWriter) writeStatus() {
 	fmt.Fprintf(p.out, "\r  %s downloaded", formatHFSize(p.completed))
 }
 
-func hfFileETag(ctx context.Context, r hfReference, name string) (string, error) {
-	u := hfEndpoint() + "/" + hfRepositoryPath(r.Repository) + "/resolve/" + url.PathEscape(r.Revision) + "/" + strings.Join(escapeHFPath(name), "/")
+func hfFileETag(ctx context.Context, r hfReference, name string, opts Options) (string, error) {
+	u := hfEndpoint(opts) + "/" + hfRepositoryPath(r.Repository) + "/resolve/" + url.PathEscape(r.Revision) + "/" + strings.Join(escapeHFPath(name), "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
 	if err != nil {
 		return "", err
 	}
-	hfAuth(req)
+	hfAuth(req, opts)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1334,10 +1348,39 @@ func escapeHFPath(path string) []string {
 func hfRepositoryPath(repository string) string {
 	return strings.Join(escapeHFPath(repository), "/")
 }
-func hfAuth(req *http.Request) {
-	if token := strings.TrimSpace(os.Getenv("HF_TOKEN")); token != "" {
+func hfAuth(req *http.Request, opts Options) {
+	token := os.Getenv("HF_TOKEN")
+	if opts.Token != nil {
+		token = *opts.Token
+	}
+	if token := strings.TrimSpace(token); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+}
+
+func hfClient(opts Options) *http.Client {
+	if opts.Token == nil {
+		return http.DefaultClient
+	}
+	client := *http.DefaultClient
+	previous := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		origin := via[0].URL
+		if origin.Scheme == "https" && req.URL.Scheme != "https" {
+			return errors.New("Hugging Face redirected to an insecure URL")
+		}
+		if origin.Host != req.URL.Host || origin.Scheme != req.URL.Scheme {
+			req.Header.Del("Authorization")
+		}
+		if previous != nil {
+			return previous(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("Hugging Face exceeded redirect limit")
+		}
+		return nil
+	}
+	return &client
 }
 func hfStatusError(resp *http.Response, target string) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))

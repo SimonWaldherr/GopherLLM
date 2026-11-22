@@ -21,11 +21,16 @@ static inline void gopherllm_invoke_complete(gopherllm_complete_cb cb, const cha
 static inline void gopherllm_invoke_error(gopherllm_error_cb cb, const char *s, void *ud) {
 	cb(s, ud);
 }
+static inline void gopherllm_invoke_progress(gopherllm_hub_progress_cb cb, const char *file, int64_t completed,
+                                             int64_t total, int done, const char *failure, void *ud) {
+	cb(file, completed, total, done, failure, ud);
+}
 */
 import "C"
 import (
 	"unsafe"
 
+	"github.com/SimonWaldherr/GopherLLM/huggingface"
 	"github.com/SimonWaldherr/GopherLLM/mobile"
 )
 
@@ -57,4 +62,16 @@ func (s *cCallbackSink) OnError(message string) {
 	cs := C.CString(message)
 	defer C.free(unsafe.Pointer(cs))
 	C.gopherllm_invoke_error(s.onError, cs, s.userdata)
+}
+
+func hubProgress(cb C.gopherllm_hub_progress_cb, userdata unsafe.Pointer, event huggingface.Progress) {
+	file := C.CString(event.File)
+	defer C.free(unsafe.Pointer(file))
+	failure := cError(event.Err)
+	defer C.free(unsafe.Pointer(failure))
+	var done C.int
+	if event.Done {
+		done = 1
+	}
+	C.gopherllm_invoke_progress(cb, file, C.int64_t(event.Completed), C.int64_t(event.Total), done, failure, userdata)
 }

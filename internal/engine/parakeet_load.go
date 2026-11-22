@@ -21,9 +21,6 @@ import (
 // needed none either, unlike GGUF's "voxtral.*" convention's transposed
 // mel filterbank.
 func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetConfig, ParakeetWeights, error) {
-	if logw == nil {
-		logw = io.Discard
-	}
 	config, err := loadParakeetConfig(gguf)
 	if err != nil {
 		return ParakeetConfig{}, ParakeetWeights{}, err
@@ -31,10 +28,10 @@ func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetCon
 
 	tensors := indexTensors(gguf)
 	inferred := inferTensorSizes(data, gguf)
-	f32 := func(name string) ([]float32, error) {
+	f32 := func(name string, _ ...int) ([]float32, error) {
 		return loadF32Vec(data, gguf.DataOffset, name, tensors, inferred)
 	}
-	f32Weight := func(name string) (Weight, error) {
+	f32Weight := func(name string, _, _ int) (Weight, error) {
 		w, err := loadWeight(data, gguf.DataOffset, name, tensors, inferred, true, false, false, false)
 		if err != nil {
 			return Weight{}, err
@@ -44,6 +41,32 @@ func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetCon
 		}
 		return w, nil
 	}
+
+	vocab := func() ([]string, error) {
+		value, ok := gguf.Metadata["asr.tokenizer.vocab"]
+		if !ok {
+			return nil, fmt.Errorf("missing asr.tokenizer.vocab")
+		}
+		pieces, ok := value.AsStringArray()
+		if !ok {
+			return nil, fmt.Errorf("asr.tokenizer.vocab is not a string array")
+		}
+		return pieces, nil
+	}
+	return loadParakeetWeights(config, f32, f32Weight, vocab, logw)
+}
+
+// The loaders share the same FastConformer and TDT tensor layout. The
+// accessors resolve names and decode the storage of each model format.
+func loadParakeetWeights(config ParakeetConfig,
+	f32 func(string, ...int) ([]float32, error), f32Weight func(string, int, int) (Weight, error),
+	vocab func() ([]string, error), logw io.Writer) (ParakeetConfig, ParakeetWeights, error) {
+	if logw == nil {
+		logw = io.Discard
+	}
+	var err error
+	dim, ff := config.Encoder.DModel, config.Encoder.DFF
+	pred, joint := config.RNNT.PredHidden, config.RNNT.JointDim
 
 	weights := ParakeetWeights{}
 	weights.MelFilterbank = voxtralSlaneyMelFilterbank(config.Preprocessor.SampleRate, config.Preprocessor.NFFT, config.Preprocessor.NumMelBins, 0, float64(config.Preprocessor.SampleRate)/2)
@@ -70,14 +93,14 @@ func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetCon
 	for i, spec := range convSpecs {
 		wName := fmt.Sprintf("encoder.pre_encode.conv.%d.weight", spec.idx)
 		bName := fmt.Sprintf("encoder.pre_encode.conv.%d.bias", spec.idx)
-		w, err := f32(wName)
+		w, err := f32(wName, spec.outCh, spec.inPerGroup, spec.kh, spec.kw)
 		if err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
 		if want := spec.outCh * spec.inPerGroup * spec.kh * spec.kw; len(w) != want {
 			return config, weights, fmt.Errorf("loading parakeet model: tensor %s has %d elements, want %d (out=%d in_per_group=%d kh=%d kw=%d)", wName, len(w), want, spec.outCh, spec.inPerGroup, spec.kh, spec.kw)
 		}
-		b, err := f32(bName)
+		b, err := f32(bName, spec.outCh)
 		if err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
@@ -86,10 +109,10 @@ func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetCon
 			KH: spec.kh, KW: spec.kw, StrideH: spec.sh, StrideW: spec.sw, PadH: spec.ph, PadW: spec.pw,
 		}
 	}
-	if weights.Encoder.SubsamplingOut, err = f32Weight("encoder.pre_encode.out.weight"); err != nil {
+	if weights.Encoder.SubsamplingOut, err = f32Weight("encoder.pre_encode.out.weight", dim, chans*((config.Preprocessor.NumMelBins+7)/8)); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
-	if weights.Encoder.SubsamplingOutBias, err = f32("encoder.pre_encode.out.bias"); err != nil {
+	if weights.Encoder.SubsamplingOutBias, err = f32("encoder.pre_encode.out.bias", dim); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
 	if weights.Encoder.PosEnc, err = f32("encoder.pos_enc.pe"); err != nil {
@@ -103,88 +126,88 @@ func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetCon
 	for l := range config.Encoder.NLayers {
 		p := fmt.Sprintf("encoder.layers.%d.", l)
 		var layer ParakeetEncoderLayer
-		if layer.NormFeedForward1Weight, err = f32(p + "norm_feed_forward1.weight"); err != nil {
+		if layer.NormFeedForward1Weight, err = f32(p+"norm_feed_forward1.weight", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormFeedForward1Bias, err = f32(p + "norm_feed_forward1.bias"); err != nil {
+		if layer.NormFeedForward1Bias, err = f32(p+"norm_feed_forward1.bias", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.FeedForward1Linear1, err = f32Weight(p + "feed_forward1.linear1.weight"); err != nil {
+		if layer.FeedForward1Linear1, err = f32Weight(p+"feed_forward1.linear1.weight", ff, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.FeedForward1Linear2, err = f32Weight(p + "feed_forward1.linear2.weight"); err != nil {
+		if layer.FeedForward1Linear2, err = f32Weight(p+"feed_forward1.linear2.weight", dim, ff); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormConvWeight, err = f32(p + "norm_conv.weight"); err != nil {
+		if layer.NormConvWeight, err = f32(p+"norm_conv.weight", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormConvBias, err = f32(p + "norm_conv.bias"); err != nil {
+		if layer.NormConvBias, err = f32(p+"norm_conv.bias", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.PointwiseConv1, err = f32Weight(p + "conv.pointwise_conv1.weight"); err != nil {
+		if layer.Conv.PointwiseConv1, err = f32Weight(p+"conv.pointwise_conv1.weight", 2*dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.DepthwiseConv, err = f32(p + "conv.depthwise_conv.weight"); err != nil {
+		if layer.Conv.DepthwiseConv, err = f32(p+"conv.depthwise_conv.weight", dim, 1, config.Encoder.ConvKernelSize); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.BatchNormWeight, err = f32(p + "conv.batch_norm.weight"); err != nil {
+		if layer.Conv.BatchNormWeight, err = f32(p+"conv.batch_norm.weight", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.BatchNormBias, err = f32(p + "conv.batch_norm.bias"); err != nil {
+		if layer.Conv.BatchNormBias, err = f32(p+"conv.batch_norm.bias", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.BatchNormMean, err = f32(p + "conv.batch_norm.running_mean"); err != nil {
+		if layer.Conv.BatchNormMean, err = f32(p+"conv.batch_norm.running_mean", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.BatchNormVar, err = f32(p + "conv.batch_norm.running_var"); err != nil {
+		if layer.Conv.BatchNormVar, err = f32(p+"conv.batch_norm.running_var", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.Conv.PointwiseConv2, err = f32Weight(p + "conv.pointwise_conv2.weight"); err != nil {
+		if layer.Conv.PointwiseConv2, err = f32Weight(p+"conv.pointwise_conv2.weight", dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormSelfAttWeight, err = f32(p + "norm_self_att.weight"); err != nil {
+		if layer.NormSelfAttWeight, err = f32(p+"norm_self_att.weight", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormSelfAttBias, err = f32(p + "norm_self_att.bias"); err != nil {
+		if layer.NormSelfAttBias, err = f32(p+"norm_self_att.bias", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.LinearQ, err = f32Weight(p + "self_attn.linear_q.weight"); err != nil {
+		if layer.SelfAttn.LinearQ, err = f32Weight(p+"self_attn.linear_q.weight", dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.LinearK, err = f32Weight(p + "self_attn.linear_k.weight"); err != nil {
+		if layer.SelfAttn.LinearK, err = f32Weight(p+"self_attn.linear_k.weight", dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.LinearV, err = f32Weight(p + "self_attn.linear_v.weight"); err != nil {
+		if layer.SelfAttn.LinearV, err = f32Weight(p+"self_attn.linear_v.weight", dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.LinearOut, err = f32Weight(p + "self_attn.linear_out.weight"); err != nil {
+		if layer.SelfAttn.LinearOut, err = f32Weight(p+"self_attn.linear_out.weight", dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.LinearPos, err = f32Weight(p + "self_attn.linear_pos.weight"); err != nil {
+		if layer.SelfAttn.LinearPos, err = f32Weight(p+"self_attn.linear_pos.weight", dim, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.PosBiasU, err = f32(p + "self_attn.pos_bias_u"); err != nil {
+		if layer.SelfAttn.PosBiasU, err = f32(p+"self_attn.pos_bias_u", config.Encoder.NHeads, config.Encoder.HeadDim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.SelfAttn.PosBiasV, err = f32(p + "self_attn.pos_bias_v"); err != nil {
+		if layer.SelfAttn.PosBiasV, err = f32(p+"self_attn.pos_bias_v", config.Encoder.NHeads, config.Encoder.HeadDim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormFeedForward2Weight, err = f32(p + "norm_feed_forward2.weight"); err != nil {
+		if layer.NormFeedForward2Weight, err = f32(p+"norm_feed_forward2.weight", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormFeedForward2Bias, err = f32(p + "norm_feed_forward2.bias"); err != nil {
+		if layer.NormFeedForward2Bias, err = f32(p+"norm_feed_forward2.bias", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.FeedForward2Linear1, err = f32Weight(p + "feed_forward2.linear1.weight"); err != nil {
+		if layer.FeedForward2Linear1, err = f32Weight(p+"feed_forward2.linear1.weight", ff, dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.FeedForward2Linear2, err = f32Weight(p + "feed_forward2.linear2.weight"); err != nil {
+		if layer.FeedForward2Linear2, err = f32Weight(p+"feed_forward2.linear2.weight", dim, ff); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormOutWeight, err = f32(p + "norm_out.weight"); err != nil {
+		if layer.NormOutWeight, err = f32(p+"norm_out.weight", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.NormOutBias, err = f32(p + "norm_out.bias"); err != nil {
+		if layer.NormOutBias, err = f32(p+"norm_out.bias", dim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
 		layers = append(layers, layer)
@@ -194,56 +217,55 @@ func LoadParakeetModel(data []byte, gguf *GGUFFile, logw io.Writer) (ParakeetCon
 	}
 	weights.Encoder.Layers = layers
 
-	if weights.Decoder.Embed, err = f32Weight("decoder.prediction.embed.weight"); err != nil {
+	if weights.Decoder.Embed, err = f32Weight("decoder.prediction.embed.weight", config.RNNT.VocabSize+1, config.RNNT.PredEmbedDim); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
 	decLayers := make([]ParakeetLSTMLayer, 0, config.RNNT.PredNumLayers)
 	for l := range config.RNNT.PredNumLayers {
 		const p = "decoder.prediction.dec_rnn.lstm."
 		suffix := fmt.Sprintf("l%d", l)
+		inputDim := pred
+		if l == 0 {
+			inputDim = config.RNNT.PredEmbedDim
+		}
 		var layer ParakeetLSTMLayer
-		if layer.WeightIH, err = f32Weight(p + "ih_" + suffix + ".weight"); err != nil {
+		if layer.WeightIH, err = f32Weight(p+"ih_"+suffix+".weight", 4*pred, inputDim); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.WeightHH, err = f32Weight(p + "hh_" + suffix + ".weight"); err != nil {
+		if layer.WeightHH, err = f32Weight(p+"hh_"+suffix+".weight", 4*pred, pred); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.BiasIH, err = f32(p + "ih_" + suffix + ".bias"); err != nil {
+		if layer.BiasIH, err = f32(p+"ih_"+suffix+".bias", 4*pred); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
-		if layer.BiasHH, err = f32(p + "hh_" + suffix + ".bias"); err != nil {
+		if layer.BiasHH, err = f32(p+"hh_"+suffix+".bias", 4*pred); err != nil {
 			return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 		}
 		decLayers = append(decLayers, layer)
 	}
 	weights.Decoder.LSTM = decLayers
 
-	if weights.Joint.Pred, err = f32Weight("joint.pred.weight"); err != nil {
+	if weights.Joint.Pred, err = f32Weight("joint.pred.weight", joint, pred); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
-	if weights.Joint.PredBias, err = f32("joint.pred.bias"); err != nil {
+	if weights.Joint.PredBias, err = f32("joint.pred.bias", joint); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
-	if weights.Joint.Enc, err = f32Weight("joint.enc.weight"); err != nil {
+	if weights.Joint.Enc, err = f32Weight("joint.enc.weight", joint, dim); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
-	if weights.Joint.EncBias, err = f32("joint.enc.bias"); err != nil {
+	if weights.Joint.EncBias, err = f32("joint.enc.bias", joint); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
-	if weights.Joint.Out, err = f32Weight("joint.joint_net.2.weight"); err != nil {
+	if weights.Joint.Out, err = f32Weight("joint.joint_net.2.weight", config.RNNT.VocabSize+1+len(config.RNNT.Durations), joint); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
-	if weights.Joint.OutBias, err = f32("joint.joint_net.2.bias"); err != nil {
+	if weights.Joint.OutBias, err = f32("joint.joint_net.2.bias", config.RNNT.VocabSize+1+len(config.RNNT.Durations)); err != nil {
 		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
 
-	vocabValue, ok := gguf.Metadata["asr.tokenizer.vocab"]
-	if !ok {
-		return config, weights, fmt.Errorf("loading parakeet model: missing asr.tokenizer.vocab")
-	}
-	weights.Vocab, ok = vocabValue.AsStringArray()
-	if !ok {
-		return config, weights, fmt.Errorf("loading parakeet model: asr.tokenizer.vocab is not a string array")
+	if weights.Vocab, err = vocab(); err != nil {
+		return config, weights, fmt.Errorf("loading parakeet model: %w", err)
 	}
 	if len(weights.Vocab) != config.RNNT.VocabSize {
 		return config, weights, fmt.Errorf("loading parakeet model: asr.tokenizer.vocab has %d entries, want VocabSize=%d", len(weights.Vocab), config.RNNT.VocabSize)

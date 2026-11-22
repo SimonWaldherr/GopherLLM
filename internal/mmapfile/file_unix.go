@@ -17,10 +17,7 @@ type File struct {
 	mapped bool
 }
 
-// Open uses the platform mmap syscall without CGO. If mmap is unavailable
-// for a specific file, it falls back to os.ReadFile while preserving the same
-// immutable byte-slice API.
-func Open(path string) (*File, error) {
+func open(path string, requireMapping bool) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -31,13 +28,16 @@ func Open(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if st.Size() == 0 {
-		return &File{}, nil
+	if size := st.Size(); size == 0 || size > int64(^uint(0)>>1) {
+		return checkMappingSize(path, size, requireMapping)
 	}
 
 	data, err := syscall.Mmap(int(f.Fd()), 0, int(st.Size()), syscall.PROT_READ, syscall.MAP_PRIVATE)
 	if err == nil {
 		return &File{data: data, mapped: true}, nil
+	}
+	if requireMapping {
+		return nil, &os.PathError{Op: "mmap", Path: path, Err: err}
 	}
 
 	data, err = os.ReadFile(path)

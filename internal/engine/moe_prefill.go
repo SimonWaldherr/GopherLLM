@@ -281,8 +281,8 @@ func sparseMoEPrefill(ctx context.Context, w *SparseMoEWeights, xs, outs [][]flo
 	return ctx.Err()
 }
 
-// Full-model paging measurements have not established a repeatable latency
-// win. Keep the scheduling experiment explicit until that changes.
-func moePrefillEnabled() bool {
-	return os.Getenv("GOPHERLLM_MOE_PREFILL") == "1" && os.Getenv("GOPHERLLM_NO_MOE_PREFILL") == ""
+// Group demand-paged experts to reuse each active plane across prompt tokens.
+// Resident models keep the explicit opt-in.
+func moePrefillEnabled(outOfCore bool) bool {
+	return (outOfCore || os.Getenv("GOPHERLLM_MOE_PREFILL") == "1") && os.Getenv("GOPHERLLM_NO_MOE_PREFILL") == ""
 }

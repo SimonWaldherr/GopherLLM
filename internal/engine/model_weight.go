@@ -3,6 +3,8 @@ package engine
 import (
 	"fmt"
 	"sync"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/formats/phonon"
 )
 
 // Weight stores owned F32 values, raw quantized or scalar tensor bytes, or
@@ -19,6 +21,8 @@ type Weight struct {
 	Prepared  *PreparedQuantizedWeight
 	Metal     *MetalWeight
 	LittleBit *LittleBitWeight
+	// Packed Phonon encoder matrices are consumed by parakeetMatvecBatch.
+	phononProjection *phonon.Tensor
 	// GPU is this tensor's WebGPU-resident copy (Q4_K/Q6_K only), non-nil
 	// only under GOOS=js with a successfully acquired WebGPU device -- see
 	// webgpu_js.go/webgpu_stub.go. Mutually exclusive with Metal in

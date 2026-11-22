@@ -171,6 +171,8 @@ static const char* gllm_decode_source =
 "// Independent low/high sums shorten the Q4 accumulation dependency chain.\n"
 "// This reassociates FP32 additions; the control keeps the previous order.\n"
 "inline float dec_q4_sum(float2 sum) { return simd_sum(dec_split_sums()?sum.x+sum.y:sum.x); }\n"
+"// Both callers unroll the four fixed subgroups of a Q4_K block so the\n"
+"// compiler can resolve their scale/min selection at compile time.\n"
 "inline void dec_q4_accumulate(const device uchar* v,float d,float dm,uint step,uint sub,float4 a,float4 z,thread float2& sum) {\n"
 " const device uchar* sc=v+4;uint j=step*2,s0,m0,s1,m1;\n"
 " if(j<4){s0=sc[j]&63;m0=sc[j+4]&63;s1=sc[j+1]&63;m1=sc[j+5]&63;}\n"
@@ -185,6 +187,7 @@ static const char* gllm_decode_source =
 " for(uint b=lane/8;b<p.cols/256;b+=4) {\n"
 "  const device uchar* v=data+ulong(row)*p.row_bytes+b*144;\n"
 "  float d=float(*((const device half*)v)), dm=float(*((const device half*)(v+2)));\n"
+"  #pragma clang loop unroll(full)\n"
 "  for(uint step=0;step<4;step++) {\n"
 "   float4 a=*((const device float4*)(x+b*256+step*64+sub*4));\n"
 "   float4 z=*((const device float4*)(x+b*256+step*64+sub*4+32));\n"
@@ -201,6 +204,7 @@ static const char* gllm_decode_source =
 "  const device uchar* uv=up+ulong(row)*p.row_bytes+b*144;\n"
 "  float gd=float(*((const device half*)gv)),gm=float(*((const device half*)(gv+2)));\n"
 "  float ud=float(*((const device half*)uv)),um=float(*((const device half*)(uv+2)));\n"
+"  #pragma clang loop unroll(full)\n"
 "  for(uint step=0;step<4;step++) {\n"
 "   float4 a=*((const device float4*)(x+b*256+step*64+sub*4));\n"
 "   float4 z=*((const device float4*)(x+b*256+step*64+sub*4+32));\n"
@@ -622,12 +626,6 @@ static void gllm_decode_rope_kv(id<MTLComputeCommandEncoder> e,id<MTLBuffer> q_i
 // Every producer/consumer boundary has an explicit buffer barrier.
 static void gllm_decode_barrier(id<MTLComputeCommandEncoder> e,bool concurrent) {
  if(concurrent)[e memoryBarrierWithScope:MTLBarrierScopeBuffers];
-}
-static void gllm_encode_littlebit_latent(id<MTLComputeCommandEncoder> e,GLLMLittleBitWeight* w,id<MTLBuffer> x,id<MTLBuffer> z,NSUInteger offset,NSUInteger batch) {
- [e setComputePipelineState:gllm_littlebit_latent_pipeline];
- [e setBuffer:w->data offset:0 atIndex:0];[e setBuffer:x offset:0 atIndex:1];[e setBuffer:z offset:offset atIndex:2];
- [e setBytes:&w->params length:sizeof(w->params) atIndex:3];
- [e dispatchThreadgroups:MTLSizeMake(gllm_littlebit_latent_groups(w),batch,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];
 }
 static void gllm_encode_littlebit_project(id<MTLComputeCommandEncoder> e,GLLMLittleBitWeight* w,id<MTLBuffer> z,NSUInteger offset,id<MTLBuffer> out,NSUInteger batch) {
  [e setComputePipelineState:gllm_littlebit_output_pipeline];

@@ -1,0 +1,14 @@
+PRODUCT_NAME = Hestia
+PRODUCT_BUNDLE_IDENTIFIER = de.simonwaldherr.hestia
+MARKETING_VERSION = 0.1.0
+CURRENT_PROJECT_VERSION = 1
+GENERATE_INFOPLIST_FILE = YES
+INFOPLIST_KEY_NSMicrophoneUsageDescription = Hestia nimmt nach deiner Freigabe Sprachbefehle auf und verarbeitet sie auf diesem Mac.
+INFOPLIST_KEY_LSApplicationCategoryType = public.app-category.productivity
+CODE_SIGN_ENTITLEMENTS = HestiaMac/HestiaMac.entitlements
+ENABLE_APP_SANDBOX = YES
+ENABLE_HARDENED_RUNTIME = YES
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+SWIFT_VERSION = 5.0
+SKIP_INSTALL = NO
+ALWAYS_SEARCH_USER_PATHS = NO

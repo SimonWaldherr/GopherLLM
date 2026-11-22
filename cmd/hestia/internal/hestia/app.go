@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/SimonWaldherr/GopherLLM/cmd/hestia/internal/hestia/adapters"
 )
@@ -23,11 +24,15 @@ var ErrOutcomeUnknown = errors.New("hestia: action outcome unknown")
 // Executor wie Texteingabe, einschließlich sichtbarer
 // Transkriptrevisionen."
 type App struct {
-	Journal   *Journal
-	Adapter   adapters.Adapter
-	Inventory Inventory
-	Speech    *SpeechHost    // nil if no voice model is configured
-	Knowledge *KnowledgeBase // nil if no knowledge base is configured
+	Journal    *Journal
+	Adapter    adapters.Adapter
+	Inventory  Inventory
+	Speech     *SpeechHost    // nil if no voice model is configured
+	Knowledge  *KnowledgeBase // nil if no knowledge base is configured
+	ListenWord string
+	Wikipedia  SearchProvider
+	WebSearch  SearchProvider
+	Chat       AssistantChat
 
 	mu    sync.Mutex
 	turns map[string]*Turn
@@ -43,7 +48,8 @@ type App struct {
 func NewApp(journal *Journal, adapter adapters.Adapter, inventory Inventory, speech *SpeechHost, knowledge *KnowledgeBase) *App {
 	return &App{
 		Journal: journal, Adapter: adapter, Inventory: inventory, Speech: speech, Knowledge: knowledge,
-		turns: make(map[string]*Turn), voice: make(map[string]*VoiceSession),
+		ListenWord: DefaultConfig().ListenWord,
+		turns:      make(map[string]*Turn), voice: make(map[string]*VoiceSession),
 	}
 }
 
@@ -60,6 +66,14 @@ func (a *App) Turn(turnID string) (*Turn, bool) {
 	return t, ok
 }
 
+// Published turns are immutable so an HTTP response can be encoded while
+// another request moves the turn to its next state.
+func (a *App) storeTurn(t *Turn) {
+	a.mu.Lock()
+	a.turns[t.ID] = t
+	a.mu.Unlock()
+}
+
 func (a *App) journal(conversationID, turnID, typ string, payload map[string]any) {
 	_, _ = a.Journal.Append(Event{
 		SchemaVersion: 1, EventID: newID("evt"),
@@ -72,15 +86,16 @@ func (a *App) journal(conversationID, turnID, typ string, payload map[string]any
 // interpretation/resolution/execution logic through FinishVoiceTurn below,
 // once their transcript is finalized.
 func (a *App) ProcessText(ctx context.Context, conversationID, text string) (*Turn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	turnID := newID("turn")
 	t := &Turn{ID: turnID, ConversationID: conversationID, Status: TurnCreated, InputText: text}
 	a.journal(conversationID, turnID, "turn.created", map[string]any{"input_text": text})
 
 	a.interpretAndAct(ctx, t)
 
-	a.mu.Lock()
-	a.turns[turnID] = t
-	a.mu.Unlock()
+	a.storeTurn(t)
 	return t, nil
 }
 
@@ -103,11 +118,13 @@ func (a *App) interpretAndAct(ctx context.Context, t *Turn) {
 		t.Result = "Auftrag abgebrochen."
 		a.journal(t.ConversationID, t.ID, "turn.cancelled", nil)
 	case IntentConversation:
-		t.Status = TurnCompleted
-		t.Result = "Das ist eine Frage oder Erklärung, keine Geräteaktion."
-		a.journal(t.ConversationID, t.ID, "turn.completed", map[string]any{"kind": "conversation"})
+		a.answerConversation(ctx, t)
 	case IntentKnowledgeQuery:
 		a.answerKnowledgeQuery(ctx, t, proposal.TargetPhrase)
+	case IntentWikipediaSearch:
+		a.answerExternalSearch(ctx, t, a.Wikipedia, "Wikipedia", proposal.TargetPhrase)
+	case IntentWebSearch:
+		a.answerExternalSearch(ctx, t, a.WebSearch, "Websuche", proposal.TargetPhrase)
 	case IntentDeviceAction:
 		a.resolveAndAct(ctx, t, proposal)
 	default:
@@ -119,7 +136,7 @@ func (a *App) interpretAndAct(ctx context.Context, t *Turn) {
 
 // StartVoiceTurn creates a turn in the "capturing" state and reserves the
 // speech host's one recording slot (CONCEPT.md section 3's capacity
-// limit -- surfaced to the caller as ErrVoxtralBusy when another recording
+// limit -- surfaced to the caller as ErrVoiceSessionBusy when another recording
 // is already in progress).
 func (a *App) StartVoiceTurn(ctx context.Context, conversationID string) (*Turn, error) {
 	if a.Speech == nil {
@@ -138,13 +155,16 @@ func (a *App) StartVoiceTurn(ctx context.Context, conversationID string) (*Turn,
 	a.turns[turnID] = t
 	a.voice[turnID] = vs
 	a.mu.Unlock()
+	// A browser can disappear before sending a cancel request. Do not keep
+	// its audio or the shared microphone slot indefinitely.
+	time.AfterFunc(time.Minute, func() { _, _ = a.CancelVoiceTurn(turnID) })
 	return t, nil
 }
 
 // PushVoiceAudio feeds one chunk of 16kHz mono PCM16 to a capturing turn
 // and updates its live (partial, never acted-on) transcript.
 func (a *App) PushVoiceAudio(ctx context.Context, turnID string, pcm []byte) (*Turn, error) {
-	t, vs, err := a.voiceTurn(turnID)
+	t, vs, err := a.voiceTurn(turnID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +173,11 @@ func (a *App) PushVoiceAudio(ctx context.Context, turnID string, pcm []byte) (*T
 		return nil, fmt.Errorf("hestia: pushing audio: %w", err)
 	}
 	t.InputText = text
+	a.mu.Lock()
+	if a.voice[turnID] == vs {
+		a.turns[turnID] = t
+	}
+	a.mu.Unlock()
 	return t, nil
 }
 
@@ -161,14 +186,12 @@ func (a *App) PushVoiceAudio(ctx context.Context, turnID string, pcm []byte) (*T
 // chain ProcessText uses (CONCEPT.md section 6: "Stoppen bedeutet zunächst
 // Audio-Flush, anschließend Interpretation.").
 func (a *App) FinishVoiceTurn(ctx context.Context, turnID string) (*Turn, error) {
-	t, vs, err := a.voiceTurn(turnID)
+	t, vs, err := a.voiceTurn(turnID, true)
 	if err != nil {
 		return nil, err
 	}
 	text, err := vs.Finish(ctx)
-	a.mu.Lock()
-	delete(a.voice, turnID)
-	a.mu.Unlock()
+	defer a.storeTurn(t)
 	if err != nil {
 		t.Status = TurnFailed
 		t.Result = "Sprachaufnahme fehlgeschlagen: " + err.Error()
@@ -186,31 +209,49 @@ func (a *App) FinishVoiceTurn(ctx context.Context, turnID string) (*Turn, error)
 // CancelVoiceTurn aborts a capturing/finalizing recording without
 // interpreting it (CONCEPT.md section 13: POST /api/turns/{id}/cancel).
 func (a *App) CancelVoiceTurn(turnID string) (*Turn, error) {
-	t, vs, err := a.voiceTurn(turnID)
+	t, vs, err := a.voiceTurn(turnID, true)
 	if err != nil {
 		return nil, err
 	}
 	if abortErr := vs.Abort(); abortErr != nil {
 		return nil, fmt.Errorf("hestia: cancelling recording: %w", abortErr)
 	}
-	a.mu.Lock()
-	delete(a.voice, turnID)
-	a.mu.Unlock()
 	t.Status = TurnCancelled
 	t.Result = "Aufnahme abgebrochen."
 	a.journal(t.ConversationID, t.ID, "turn.cancelled", map[string]any{"kind": "voice"})
+	a.storeTurn(t)
 	return t, nil
 }
 
-func (a *App) voiceTurn(turnID string) (*Turn, *VoiceSession, error) {
+func (a *App) voiceTurn(turnID string, claim bool) (*Turn, *VoiceSession, error) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	t, ok := a.turns[turnID]
 	vs, vsOK := a.voice[turnID]
-	a.mu.Unlock()
 	if !ok || !vsOK {
 		return nil, nil, fmt.Errorf("hestia: %q is not an in-progress voice turn", turnID)
 	}
-	return t, vs, nil
+	if claim {
+		delete(a.voice, turnID)
+	}
+	next := *t
+	return &next, vs, nil
+}
+
+func (a *App) answerConversation(ctx context.Context, t *Turn) {
+	t.Status = TurnCompleted
+	t.Result = "Das ist eine Frage oder Erklärung. Für lokale Antworten kannst du ein Chatmodell konfigurieren."
+	if a.Chat != nil {
+		answer, err := a.Chat.Answer(ctx, t.InputText)
+		if err != nil {
+			t.Status = TurnFailed
+			t.Result = "Das lokale Chatmodell konnte die Frage gerade nicht beantworten."
+			a.journal(t.ConversationID, t.ID, "turn.failed", map[string]any{"reason": "local_chat_failed"})
+			return
+		}
+		t.Result = answer
+	}
+	a.journal(t.ConversationID, t.ID, "turn.completed", map[string]any{"kind": "conversation"})
 }
 
 // answerKnowledgeQuery runs a HestiaRAG search and journals the result
@@ -286,39 +327,51 @@ func (a *App) resolveAndAct(ctx context.Context, t *Turn, proposal Proposal) {
 // an ambiguous single-target turn, or "" confirms an already-resolved
 // group turn's full candidate list (CONCEPT.md section 7, rule 4).
 func (a *App) Confirm(ctx context.Context, turnID, deviceID string) (*Turn, error) {
+	t, targets, err := a.claimConfirmation(turnID, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	if t.Proposal.Scope == "group" {
+		a.journal(t.ConversationID, t.ID, "group.confirmation_received", map[string]any{"candidate_count": len(targets)})
+	} else {
+		a.journal(t.ConversationID, t.ID, "clarification.answered", map[string]any{"device_id": targets[0].ID})
+	}
+	a.execute(ctx, t, targets, t.Proposal.Action, t.Proposal.Arguments)
+	a.storeTurn(t)
+	return t, nil
+}
+
+func (a *App) claimConfirmation(turnID, deviceID string) (*Turn, []Device, error) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	t, ok := a.turns[turnID]
-	a.mu.Unlock()
 	if !ok {
-		return nil, fmt.Errorf("hestia: unknown turn %q", turnID)
+		return nil, nil, fmt.Errorf("hestia: unknown turn %q", turnID)
 	}
 	if t.Status != TurnClarifying {
-		return nil, fmt.Errorf("hestia: turn %q is not awaiting clarification (status %s)", turnID, t.Status)
+		return nil, nil, fmt.Errorf("hestia: turn %q is not awaiting clarification (status %s)", turnID, t.Status)
 	}
 	if t.Proposal == nil {
-		return nil, fmt.Errorf("hestia: turn %q has no proposal", turnID)
+		return nil, nil, fmt.Errorf("hestia: turn %q has no proposal", turnID)
 	}
-
-	if t.Proposal.Scope == "group" {
-		a.journal(t.ConversationID, t.ID, "group.confirmation_received", map[string]any{"candidate_count": len(t.Candidates)})
-		a.execute(ctx, t, t.Candidates, t.Proposal.Action, t.Proposal.Arguments)
-		return t, nil
-	}
-
-	var chosen *Device
-	for i := range t.Candidates {
-		if t.Candidates[i].ID == deviceID {
-			chosen = &t.Candidates[i]
-			break
+	ready := *t
+	targets := t.Candidates
+	if t.Proposal.Scope != "group" {
+		for i, candidate := range targets {
+			if candidate.ID == deviceID {
+				targets = targets[i : i+1]
+				ready.ResolvedTarget = &targets[0]
+				break
+			}
+		}
+		if ready.ResolvedTarget == nil {
+			return nil, nil, fmt.Errorf("hestia: %q is not one of this turn's candidates", deviceID)
 		}
 	}
-	if chosen == nil {
-		return nil, fmt.Errorf("hestia: %q is not one of this turn's candidates", deviceID)
-	}
-	t.ResolvedTarget = chosen
-	a.journal(t.ConversationID, t.ID, "clarification.answered", map[string]any{"device_id": chosen.ID})
-	a.execute(ctx, t, []Device{*chosen}, t.Proposal.Action, t.Proposal.Arguments)
-	return t, nil
+	ready.Status = TurnReady
+	a.turns[turnID] = &ready
+	next := ready
+	return &next, targets, nil
 }
 
 func (a *App) execute(ctx context.Context, t *Turn, targets []Device, action string, args map[string]any) {
@@ -340,16 +393,24 @@ func (a *App) execute(ctx context.Context, t *Turn, targets []Device, action str
 			return
 		}
 		t.Status = TurnCompleted
-		t.Result = fmt.Sprintf("%s: %v", targets[0].Name, state)
+		if state["power"] == false {
+			t.Result = targets[0].Name + " ist aus."
+		} else if brightness, ok := percentage(state["brightness"]); action == "set_brightness" && ok {
+			t.Result = fmt.Sprintf("%s leuchtet mit %.0f Prozent.", targets[0].Name, brightness)
+		} else {
+			t.Result = targets[0].Name + " ist an."
+		}
 		a.journal(t.ConversationID, t.ID, "device.state_observed", map[string]any{"device_id": targets[0].ID, "state": state, "source": "device_readback"})
 		return
 	}
 
 	results := ExecuteGroup(ctx, a.Adapter, targets, action, args)
 	failures := 0
+	uncertain := false
 	for id, err := range results {
 		if err != nil {
 			failures++
+			uncertain = uncertain || errors.Is(err, ErrOutcomeUnknown)
 			a.journal(t.ConversationID, t.ID, "execution.failed", map[string]any{"device_id": id, "error": err.Error()})
 		} else {
 			a.journal(t.ConversationID, t.ID, "device.state_observed", map[string]any{"device_id": id, "source": "device_readback"})
@@ -358,7 +419,7 @@ func (a *App) execute(ctx context.Context, t *Turn, targets []Device, action str
 	if failures == 0 {
 		t.Status = TurnCompleted
 		t.Result = fmt.Sprintf("%d Geräte erfolgreich geschaltet.", len(targets))
-	} else if failures < len(targets) {
+	} else if failures < len(targets) || uncertain {
 		t.Status = TurnOutcomeUnknown
 		t.Result = fmt.Sprintf("%d von %d Geräten fehlgeschlagen.", failures, len(targets))
 	} else {

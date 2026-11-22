@@ -1,8 +1,8 @@
 /*
  * gopherllm.h - the C ABI of GopherLLM, a pure-Go GGUF inference engine.
  *
- * Every function forwards to mobile.Engine (see ../../../mobile); the Swift,
- * Rust and Python bindings are thin layers over exactly these functions.
+ * Functions forward to the Go mobile, speech and Hub APIs. The Swift, Rust
+ * and Python bindings call this ABI directly.
  *
  * Conventions
  *   - Strings are NUL-terminated UTF-8. Options, messages and results are
@@ -35,6 +35,8 @@ extern "C" {
 
 /* An opaque engine handle; 0 is never a valid engine. */
 typedef uintptr_t gopherllm_engine;
+typedef uintptr_t gopherllm_speech;
+typedef uintptr_t gopherllm_operation;
 
 /* Streaming callbacks, invoked on the calling thread before
  * gopherllm_*_stream returns: on_delta once per new piece of text, in order,
@@ -45,6 +47,13 @@ typedef uintptr_t gopherllm_engine;
 typedef void (*gopherllm_delta_cb)(const char *GOPHERLLM_NONNULL delta, void *GOPHERLLM_NULLABLE userdata);
 typedef void (*gopherllm_complete_cb)(const char *GOPHERLLM_NONNULL result_json, void *GOPHERLLM_NULLABLE userdata);
 typedef void (*gopherllm_error_cb)(const char *GOPHERLLM_NONNULL message, void *GOPHERLLM_NULLABLE userdata);
+
+/* Progress is per file. Strings are borrowed for the callback only. A callback
+ * may run on a download worker, including concurrently for different files.
+ * Cached files may complete without a progress event. */
+typedef void (*gopherllm_hub_progress_cb)(const char *GOPHERLLM_NONNULL file, int64_t completed,
+                                           int64_t total, int done, const char *GOPHERLLM_NULLABLE failure,
+                                           void *GOPHERLLM_NULLABLE userdata);
 
 /* The cgo build of the library declares the functions itself, with Go's
  * types, and only needs the typedefs above. */
@@ -135,6 +144,47 @@ char *GOPHERLLM_NULLABLE gopherllm_generate_stream(gopherllm_engine engine, cons
 char *GOPHERLLM_NULLABLE gopherllm_chat_stream(gopherllm_engine engine, const char *GOPHERLLM_NONNULL messages_json, const char *GOPHERLLM_NULLABLE options_json,
                                                gopherllm_delta_cb GOPHERLLM_NULLABLE on_delta, gopherllm_complete_cb GOPHERLLM_NULLABLE on_complete,
                                                gopherllm_error_cb GOPHERLLM_NULLABLE on_error, void *GOPHERLLM_NULLABLE userdata);
+
+/* ---- Operation-scoped cancellation ----------------------------------- */
+
+/* One handle per blocking call, or 0 for a non-cancelable call. Cancel
+ * may run from any thread and also works before the call starts. Free the
+ * handle after the call and its callbacks return. */
+gopherllm_operation gopherllm_operation_new(void);
+void gopherllm_operation_cancel(gopherllm_operation operation);
+void gopherllm_operation_free(gopherllm_operation operation);
+
+/* ---- Speech ---------------------------------------------------------- */
+
+int gopherllm_speech_available(const char *GOPHERLLM_NONNULL backend);
+
+/* Opens a local model once. Options: {"backend":"voxtral"|"phonon",
+ * "cpu_only":bool (Voxtral)}. 0 on failure. */
+gopherllm_speech gopherllm_speech_open(const char *GOPHERLLM_NONNULL path, const char *GOPHERLLM_NONNULL options_json,
+                                     gopherllm_operation operation, char *GOPHERLLM_NULLABLE *GOPHERLLM_NULLABLE error_out);
+void gopherllm_speech_free(gopherllm_speech speech);
+
+/* Borrows normalized float32 mono PCM at 16 kHz for the call (1 to 480000
+ * samples). Returns {"text":string}. With an activation phrase, only the
+ * command after the matched phrase is returned and "matched" is included. */
+char *GOPHERLLM_NULLABLE gopherllm_speech_transcribe(gopherllm_speech speech, const float *GOPHERLLM_NONNULL samples, uint32_t sample_count,
+                                                    const char *GOPHERLLM_NULLABLE activation_phrase, gopherllm_operation operation,
+                                                    char *GOPHERLLM_NULLABLE *GOPHERLLM_NULLABLE error_out);
+
+/* ---- Hugging Face Hub ------------------------------------------------- */
+
+/* Uses huggingface.co. Options: {"cache_dir":absolute path, "token":string,
+ * "offline":bool}. Search also accepts limit, format and pipeline_tag.
+ * Exact downloads select permitted model artifacts. With NULL files_json,
+ * download resolves a GGUF selector and all shards. Result is a path array. */
+char *GOPHERLLM_NULLABLE gopherllm_hub_search(const char *GOPHERLLM_NONNULL query, const char *GOPHERLLM_NONNULL options_json,
+                                            gopherllm_operation operation, char *GOPHERLLM_NULLABLE *GOPHERLLM_NULLABLE error_out);
+char *GOPHERLLM_NULLABLE gopherllm_hub_inspect(const char *GOPHERLLM_NONNULL reference, const char *GOPHERLLM_NONNULL options_json,
+                                             gopherllm_operation operation, char *GOPHERLLM_NULLABLE *GOPHERLLM_NULLABLE error_out);
+char *GOPHERLLM_NULLABLE gopherllm_hub_download(const char *GOPHERLLM_NONNULL reference, const char *GOPHERLLM_NULLABLE files_json,
+                                              const char *GOPHERLLM_NONNULL options_json, gopherllm_operation operation,
+                                              gopherllm_hub_progress_cb GOPHERLLM_NULLABLE on_progress, void *GOPHERLLM_NULLABLE userdata,
+                                              char *GOPHERLLM_NULLABLE *GOPHERLLM_NULLABLE error_out);
 
 #endif /* GOPHERLLM_CGO_EXPORTS */
 

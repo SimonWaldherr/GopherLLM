@@ -119,7 +119,7 @@ func TestHFListFilesFollowsPagination(t *testing.T) {
 	}))
 	defer server.Close()
 	t.Setenv("HF_ENDPOINT", server.URL)
-	entries, commit, err := hfListFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"})
+	entries, commit, err := hfListFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestHFDownloadResumesAnIncompleteBlob(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("HF_ENDPOINT", server.URL)
-	blob, err := hfDownload(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, "model.gguf", cache, 10, io.Discard, nil, nil)
+	blob, err := hfDownload(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, "model.gguf", cache, 10, io.Discard, Options{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestDownloadHFFilesUsesABoundedWorkerPool(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- downloadHFFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, cache, tasks, io.Discard, nil)
+		done <- downloadHFFiles(context.Background(), hfReference{Repository: "org/model", Revision: "main"}, cache, tasks, io.Discard, Options{})
 	}()
 	for range tasks {
 		select {

@@ -123,6 +123,13 @@ and optionally runs Ministral for task suggestions and row explanations.
 - Native YOLOv8 and YOLO11 object detection from safetensors or Ultralytics
   `.pt` files, without an ONNX, PyTorch or Python runtime (see
   [Object detection (YOLO)](#object-detection-yolo)).
+- Local speech transcription with Parakeet-TDT GGUF or Fermion Research’s
+  multilingual Phonon 2.5, through the CLI and the audio transcription API.
+  [Model setup and commands](docs/phonon.md).
+- Native Whisper transcription of 16 kHz clips with GGML F16/F32 weights.
+  [CLI and Go usage](docs/generation.md#whisper-transcription).
+- [Gopher Voice demo](examples/voice-assistant/README.md) for local spoken
+  conversations with Ministral and Phonon, Voxtral or Whisper.
 - Native German MMS/VITS speech synthesis to WAV, Qwen-Image-2.1/Turbo and
   experimental FLUX 3 Image Klein text-to-image generation to PNG (including
   the Web UI with `--image-model-dir`), and unconditional CIFAR-10 diffusion.
@@ -1601,7 +1608,7 @@ process in 39 load samples). This is a small activation-stage saving of
 1.5%; the 32-expert case showed no clear benefit. The arithmetic and
 reduction order are unchanged, with bit-exact output checks.
 
-An experimental Qwen3.5-MoE/Ornith prefill groups up to 32 tokens by selected
+Qwen3.5-MoE/Ornith prefill can group up to 32 tokens by selected
 expert, streams that expert's gate/up/down rows across its matching tokens,
 distributes work by each group's token count, and retains the original router
 order when summing each token's result. It reuses the CPU Q8
@@ -1610,12 +1617,10 @@ Attention and DeltaNet stay chronological and retain their CPU/Metal choices.
 Additional grouped-expert scratch is limited to 16 MiB per decode workspace;
 expert banks stay mapped and are never copied to Metal or expanded to floats.
 This path requires Q8 activations, F32 KV, Q4_K/Q6_K gate/up, and a supported
-quantized down projection. Compressed KV, out-of-core, unsupported layouts
-and MTP-enabled sparse prefill keep their established schedule.
-Enable it explicitly with `GOPHERLLM_MOE_PREFILL=1`;
-`GOPHERLLM_NO_MOE_PREFILL=1` disables it again for comparison. It stays off by
-default: isolated-layer savings have not translated into a repeatable
-full-model latency improvement under memory pressure.
+quantized down projection. Compressed KV, unsupported layouts and MTP-enabled
+sparse prefill use the token-by-token path. Eligible `--out-of-core` models
+group by default. Use `GOPHERLLM_MOE_PREFILL=1` to enable grouping on regular
+loads and `GOPHERLLM_NO_MOE_PREFILL=1` to disable it.
 
 Metal loading without `--prepare-quant` skips the separate token embedding
 and Qwen3.5-MoE projection pairs that always execute in fused CPU kernels.
@@ -1639,10 +1644,27 @@ versus 745,751. This remains an observation under memory pressure, with no
 continuous host-load monitoring for the CPU series. A fresh Metal series
 also passed output parity, but host-load monitoring captured other Go
 compilers or test binaries in 25 of 39 samples; those timings are unsuitable
-for a speedup claim. These results do not justify enabling grouped prefill
-by default or claiming a decode gain.
+for a speedup claim.
+
+On the same Ornith checkpoint with `--out-of-core` and warm model pages,
+grouping reduced median CPU prefill from 1.594 s to 1.183 s across three
+alternating pairs. Across all runs, the same 64 tokens were generated.
+Median decode was 2.697 s serial and 2.704 s grouped. Reusing the parsed
+GGUF header also reduced median open/close time with `--prefault none`
+from 111.6 ms to 93.3 ms and Go heap allocation from 91.9 MB to 68.5 MB
+per open. The open/close benchmark uses the OS file cache and measures
+allocation volume over the operation.
+
+Three fresh APFS clones per mode tested first requests without a global
+cache purge. Median prefill was 11.361 s serial and 10.087 s grouped.
+Median end-to-end time was 17.436 s and 15.434 s. Each run recorded about
+701,000 major faults and produced the same 64-token sequence. This measures
+first access to the cloned files on the M2 Max.
 Use the same `GOPHERLLM_MOE_MODEL` and optional
-`GOPHERLLM_MOE_METAL=1` settings as the generation benchmark below.
+`GOPHERLLM_MOE_METAL=1` settings as the generation benchmark below. Set
+`GOPHERLLM_MOE_OUT_OF_CORE=1` to exercise the SSD mode in the parity test,
+or use `go test -run '^$' -bench '^BenchmarkMoEConfiguredOpenOutOfCore$' -benchmem ./internal/engine`
+to repeat the load benchmark.
 
 With Ornith-1.0-35B Q4_K_M on M2 Max, eight CPU threads and Q8 activations,
 three alternating warm pairs generated the same 64 tokens. Median CPU-only
@@ -1676,8 +1698,7 @@ convolution/DeltaNet recurrence and causal attention. MTP prefill uses the same
 batches and catches its separate draft head up with every target hidden state.
 Dense Metal hybrids preserve their decode arithmetic while batching supported
 projections and FFNs, including with F16/I8 KV. Other accelerator-backed
-layouts and out-of-core models retain serial prefill; grouped sparse prefill
-has its separate opt-in above. With active MTP, quantized CPU-only projections
+layouts and dense out-of-core models retain serial prefill. With active MTP, quantized CPU-only projections
 retain serial prefill when Q8 activations are disabled.
 `GOPHERLLM_NO_BATCH_PREFILL=1` disables hybrid batching.
 CPU float projection kernels can reduce sums differently from serial decode;

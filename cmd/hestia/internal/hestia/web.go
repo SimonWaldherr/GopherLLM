@@ -5,7 +5,7 @@ import (
 	"io/fs"
 )
 
-//go:embed web/index.html
+//go:embed web/index.html web/hestia.css web/hestia.js
 var webEmbed embed.FS
 
 // webFS is rooted at web/ (not the embed.FS's own root, which still

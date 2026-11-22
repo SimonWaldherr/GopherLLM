@@ -96,8 +96,8 @@ func gopherllm_engine_new() uintptr {
 func gopherllm_engine_free(handle uintptr) {
 	if e, ok := engineFromHandle(handle); ok {
 		_ = e.Close()
+		deleteHandle(handle)
 	}
-	deleteEngineHandle(handle)
 }
 
 //export gopherllm_load

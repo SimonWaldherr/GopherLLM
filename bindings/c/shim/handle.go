@@ -20,21 +20,26 @@ func newEngineHandle() uintptr {
 	return uintptr(cgo.NewHandle(mobile.NewEngine()))
 }
 
-func engineFromHandle(h uintptr) (engine *mobile.Engine, ok bool) {
+func engineFromHandle(h uintptr) (*mobile.Engine, bool) {
+	return handleValue[*mobile.Engine](h)
+}
+
+func handleValue[T any](h uintptr) (value T, ok bool) {
 	if h == 0 {
-		return nil, false
+		return value, false
 	}
 	defer func() {
 		if recover() != nil {
-			engine, ok = nil, false
+			var zero T
+			value, ok = zero, false
 		}
 	}()
 	v := cgo.Handle(h).Value()
-	engine, ok = v.(*mobile.Engine)
-	return engine, ok
+	value, ok = v.(T)
+	return value, ok
 }
 
-func deleteEngineHandle(h uintptr) {
+func deleteHandle(h uintptr) {
 	if h == 0 {
 		return
 	}

@@ -82,7 +82,7 @@ func Inspect(ctx context.Context, ref string, opts Options) (Manifest, error) {
 	var entries []hfTreeEntry
 	var commit string
 	if opts.Offline || hfBoolEnv("HF_HUB_OFFLINE") {
-		snapshot := newHFCache(r).snapshotForRef(r.Revision)
+		snapshot := newHFCache(r, opts).snapshotForRef(r.Revision)
 		if snapshot == "" {
 			return Manifest{}, errors.New("Hugging Face revision is not cached")
 		}
@@ -109,7 +109,7 @@ func Inspect(ctx context.Context, ref string, opts Options) (Manifest, error) {
 			return nil
 		})
 	} else {
-		entries, commit, err = hfListFiles(ctx, r)
+		entries, commit, err = hfListFiles(ctx, r, opts)
 	}
 	if err != nil {
 		return Manifest{}, err
@@ -157,7 +157,7 @@ func DownloadFiles(ctx context.Context, ref string, names []string, logw io.Writ
 		}
 	}
 	r := hfReference{Repository: m.Repository, Revision: m.Revision}
-	cache := newHFCache(r)
+	cache := newHFCache(r, opts)
 	commit := m.Commit
 	if commit == "" {
 		commit = safeHFPathPart(r.Revision)
@@ -185,7 +185,7 @@ func DownloadFiles(ctx context.Context, ref string, names []string, logw io.Writ
 	if m.Commit != "" {
 		r.Revision = m.Commit
 	}
-	if err := downloadHFFiles(ctx, r, cache, tasks, logw, opts.OnProgress); err != nil {
+	if err := downloadHFFiles(ctx, r, cache, tasks, logw, opts); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {

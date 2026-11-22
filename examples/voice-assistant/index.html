@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gopher Voice</title>
+  <link rel="stylesheet" href="/voice.css">
+  <script src="/voice.js" defer></script>
+</head>
+<body>
+<main>
+  <header><h1>Gopher Voice</h1><button id="reset" type="button">New conversation</button></header>
+  <section id="conversation" aria-label="Conversation" aria-live="polite"></section>
+  <section class="controls" aria-label="Voice and text input">
+    <p id="status" role="status">Ready</p>
+    <div class="actions">
+      <button id="record" class="primary" type="button">Start microphone</button>
+      <label class="file">Upload audio<input id="file" type="file" accept="audio/*"></label>
+      <label><input id="speak" type="checkbox" checked> Speak replies</label>
+      <label><input id="handsfree" type="checkbox"> Hands-free follow-ups</label>
+    </div>
+    <form id="type">
+      <input id="text" aria-label="Message" placeholder="Type a message" maxlength="1000" required autocomplete="off">
+      <button id="send" type="submit">Send</button>
+    </form>
+  </section>
+</main>
+</body>
+</html>

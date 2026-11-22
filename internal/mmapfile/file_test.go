@@ -3,6 +3,7 @@
 package mmapfile
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -57,6 +58,27 @@ func TestOpenMmapEmptyFile(t *testing.T) {
 	defer mapped.Close()
 	if mapped.Len() != 0 || len(mapped.Bytes()) != 0 {
 		t.Fatalf("empty file: len=%d bytes=%d, want zero", mapped.Len(), len(mapped.Bytes()))
+	}
+}
+
+func TestOpenMappedRequiresARealMapping(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.bin")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := OpenMapped(path); f != nil || !errors.Is(err, errEmptyMapping) {
+		t.Fatalf("strict mmap of an empty file: file=%v, err=%v", f, err)
+	}
+	if err := os.WriteFile(path, []byte("test model"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := OpenMapped(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if !f.IsMapped() || string(f.Bytes()) != "test model" {
+		t.Fatal("strict mmap did not return the mapped contents")
 	}
 }
 

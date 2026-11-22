@@ -1,6 +1,5 @@
-// Command parakeet-transcribe is a minimal, standalone smoke-test CLI for
-// GopherLLM's Parakeet-TDT support (see parakeet.go and the other
-// parakeet_*.go files in the module root).
+// Command parakeet-transcribe transcribes audio with Parakeet-TDT GGUF models
+// and unpacked Phonon models.
 //
 // Usage:
 //
@@ -17,13 +16,13 @@ import (
 )
 
 func main() {
-	modelPath := flag.String("model", "", "path to a Parakeet-TDT GGUF (general.architecture=asr, asr.head_type=tdt)")
+	modelPath := flag.String("model", "", "path to a Parakeet-TDT GGUF or a Phonon model.fermion next to config.json")
 	audioPath := flag.String("audio", "", "path to an audio file (any format if ffmpeg is on PATH; otherwise a 16-bit or float32 PCM WAV)")
 	verbose := flag.Bool("v", false, "print encode/decode progress to stderr")
 	flag.Parse()
 
 	if *modelPath == "" || *audioPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: parakeet-transcribe --model parakeet.gguf --audio clip.wav [-v]")
+		fmt.Fprintln(os.Stderr, "usage: parakeet-transcribe --model MODEL --audio clip.wav [-v]")
 		os.Exit(2)
 	}
 

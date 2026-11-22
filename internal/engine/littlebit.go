@@ -74,7 +74,24 @@ type littleBitMatvecTask struct {
 var littleBitMatvecPool = sync.Pool{New: func() any { return new(littleBitMatvecTask) }}
 
 func (t *littleBitMatvecTask) runRows(start, end int) {
-	for row := start; row < end; row++ {
+	row := start
+	// Share the activation loads across four rows at a time: a single
+	// decode-time token has no sibling tokens to fuse against (unlike the
+	// batch path's littleBitDot4), so fuse across output rows instead.
+	if t.optimized && hasFastLittleBitDotRows4 {
+		for ; row+4 <= end; row += 4 {
+			p0 := t.packed[row*t.rowBytes : (row+1)*t.rowBytes]
+			p1 := t.packed[(row+1)*t.rowBytes : (row+2)*t.rowBytes]
+			p2 := t.packed[(row+2)*t.rowBytes : (row+3)*t.rowBytes]
+			p3 := t.packed[(row+3)*t.rowBytes : (row+4)*t.rowBytes]
+			a, b, c, d := littleBitDotRows4(p0, p1, p2, p3, t.input)
+			t.storeRow(row, a)
+			t.storeRow(row+1, b)
+			t.storeRow(row+2, c)
+			t.storeRow(row+3, d)
+		}
+	}
+	for ; row < end; row++ {
 		packed := t.packed[row*t.rowBytes : (row+1)*t.rowBytes]
 		var dot float32
 		if t.optimized {
@@ -82,19 +99,23 @@ func (t *littleBitMatvecTask) runRows(start, end int) {
 		} else {
 			dot = littleBitDotScalar(packed, t.input)
 		}
-		scale := t.rowScales.at(row)
-		if len(t.rankU2.Raw) != 0 {
-			scale *= t.rankU2.at(row)
-		}
-		result := dot * scale
-		if t.add {
-			result = t.output[row] + result
-		}
-		if len(t.bias.Raw) != 0 {
-			result += t.bias.at(row)
-		}
-		t.output[row] = result
+		t.storeRow(row, dot)
 	}
+}
+
+func (t *littleBitMatvecTask) storeRow(row int, dot float32) {
+	scale := t.rowScales.at(row)
+	if len(t.rankU2.Raw) != 0 {
+		scale *= t.rankU2.at(row)
+	}
+	result := dot * scale
+	if t.add {
+		result = t.output[row] + result
+	}
+	if len(t.bias.Raw) != 0 {
+		result += t.bias.at(row)
+	}
+	t.output[row] = result
 }
 
 func (t *littleBitMatvecTask) project(input, output []float32, packed []byte, scales, rankU2, bias LittleBitScale, add bool) {

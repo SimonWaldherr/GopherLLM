@@ -228,10 +228,10 @@ func TestQwen35MoEPrefillEligibility(t *testing.T) {
 			}
 		}
 		r.outOfCore = true
-		if r.canBatchQwen35Metal(cache) {
-			t.Fatal("out-of-core admitted")
+		t.Setenv("GOPHERLLM_MOE_PREFILL", "")
+		if !r.canBatchQwen35Metal(cache) || r.canVerifyBlock(cache) {
+			t.Fatal("out-of-core should group prefill without enabling speculative verification")
 		}
-		r.outOfCore = false
 		useQ8Activations.Store(false)
 		if r.canBatchQwen35Metal(cache) {
 			t.Fatal("changed float-activation arithmetic admitted")

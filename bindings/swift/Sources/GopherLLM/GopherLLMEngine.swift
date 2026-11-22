@@ -172,14 +172,14 @@ public final class GopherLLMEngine: @unchecked Sendable {
 // MARK: C bridging
 
 /// Copies and frees a string returned by the C API.
-private func takeString(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
+func takeString(_ pointer: UnsafeMutablePointer<CChar>?) -> String? {
     guard let pointer else { return nil }
     defer { gopherllm_free_string(pointer) }
     return String(cString: pointer)
 }
 
 /// Applies the C API's error_out convention.
-private func check(_ call: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> UnsafeMutablePointer<CChar>?) throws -> String {
+func check(_ call: (UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>) -> UnsafeMutablePointer<CChar>?) throws -> String {
     var error: UnsafeMutablePointer<CChar>?
     let result = takeString(call(&error))
     if let message = takeString(error) { throw GopherLLMError(message) }

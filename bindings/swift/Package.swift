@@ -19,6 +19,7 @@ let package = Package(
                 .linkedFramework("Accelerate"),
                 .linkedFramework("Foundation"),
                 .linkedFramework("Metal"),
+                .linkedFramework("Security"),
             ]
         ),
         .testTarget(name: "GopherLLMTests", dependencies: ["GopherLLM"]),

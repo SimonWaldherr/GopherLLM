@@ -195,6 +195,54 @@ func TestAudioRoutesCatalogAndTranscription(t *testing.T) {
 	}
 }
 
+func TestAudioRoutesDiscoverPhonon(t *testing.T) {
+	dir := t.TempDir()
+	modelDir := filepath.Join(dir, "phonon-2.5")
+	if err := os.Mkdir(modelDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	header := []byte(`{"format":"fermion-five-value-parakeet-v1","index":[{"n":"test","k":"fp16","shape":[1],"b":2}]}`)
+	data := binary.LittleEndian.AppendUint64(nil, uint64(len(header)))
+	data = append(data, header...)
+	modelPath := filepath.Join(modelDir, "model.fermion")
+	if err := os.WriteFile(modelPath, append(data, 0, 0), 0600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(modelDir, "config.json")
+	config := []byte(`{"fermion":{"model":"Phonon-2.5","container_format":"fermion-five-value-parakeet-v1"}}`)
+	if err := os.WriteFile(configPath, config, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	mux := http.NewServeMux()
+	registerAudioRoutes(mux, make(chan struct{}, 1), HandlerOptions{ModelDir: dir, Features: Features{ModelCatalog: true}}, nil,
+		func(_ context.Context, path string, samples []float32, _ int, _ io.Writer) (string, error) {
+			if path != modelPath || len(samples) != 1600 {
+				t.Fatalf("Phonon transcription received path %q and %d samples", path, len(samples))
+			}
+			return "Guten Morgen", nil
+		})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/models/audio", nil))
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"phonon-2.5/model.fermion"`) || !strings.Contains(rec.Body.String(), `"name":"Phonon-2.5"`) {
+		t.Fatalf("catalog: %d %s", rec.Code, rec.Body)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, transcriptionRequest(t, "phonon-2.5/model.fermion", "text", transcriptionWAV(1600, false)))
+	if rec.Code != 200 || rec.Body.String() != "Guten Morgen" {
+		t.Fatalf("transcription: %d %s", rec.Code, rec.Body)
+	}
+
+	if err := os.Remove(configPath); err != nil {
+		t.Fatal(err)
+	}
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("GET", "/models/audio", nil))
+	if rec.Code != 200 || strings.Contains(rec.Body.String(), "phonon-2.5") {
+		t.Fatalf("incomplete model must be omitted: %d %s", rec.Code, rec.Body)
+	}
+}
+
 func TestAudioRoutesDeploymentAndCancellation(t *testing.T) {
 	for _, opts := range []HandlerOptions{{}, {Features: AllFeatures(), DeploymentMode: DeploymentBrowser}} {
 		h := NewHandler(nil, opts)

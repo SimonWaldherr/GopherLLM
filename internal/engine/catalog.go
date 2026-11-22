@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/formats/phonon"
 )
 
 const (
@@ -21,10 +24,9 @@ const (
 	lmStudioCommunitySubdir = lmStudioModelsSubdir + "/lmstudio-community"
 )
 
-// ModelEntry describes one GGUF file found under the model directory. ID is
-// the root-relative path without the .gguf suffix (unique within a scan and
-// what --list-models prints); IsProjector marks multimodal companion files
-// (mmproj-*/clip) that must not be offered for text generation.
+// ModelEntry describes one model file found under the model directory. ID is
+// the root-relative path (GGUF IDs omit the suffix). IsProjector marks
+// multimodal companion files (mmproj-*/clip).
 type ModelEntry struct {
 	ID            string
 	Repository    string
@@ -96,8 +98,8 @@ func DefaultModelDir() string {
 	return lmStudioModelsSubdir
 }
 
-// DiscoverModels recursively finds every .gguf under root and parses each
-// file's header (mmap'd, weights untouched) to fill in architecture, name,
+// DiscoverModels recursively finds GGUF and Phonon .fermion files under root
+// and reads their headers to fill in architecture, name,
 // and support status. Unparseable files are skipped with a stderr note rather
 // than failing the whole scan. Results put supported models first, then sort
 // case-insensitively by their display name with ID as a deterministic tie.
@@ -110,7 +112,8 @@ func DiscoverModels(root string, logw io.Writer) ([]ModelEntry, error) {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() && strings.EqualFold(filepath.Ext(path), ".gguf") {
+		ext := strings.ToLower(filepath.Ext(path))
+		if !d.IsDir() && (ext == ".gguf" || ext == ".fermion") {
 			files = append(files, path)
 		}
 		return nil
@@ -313,7 +316,7 @@ func SelectModel(entries []ModelEntry, selector string) (ModelEntry, error) {
 
 func PrintModelList(entries []ModelEntry) {
 	if len(entries) == 0 {
-		fmt.Println("No GGUF files found.")
+		fmt.Println("No model files found.")
 		return
 	}
 	fmt.Printf("%-62s %-14s %-12s size\n", "id", "architecture", "status")
@@ -476,16 +479,27 @@ func inspectModel(root, path string) (ModelEntry, error) {
 		return ModelEntry{}, err
 	}
 	defer mmap.Close()
-	gguf, err := ParseGGUFQuiet(mmap.Bytes())
-	if err != nil {
-		return ModelEntry{}, err
-	}
 	fileName := filepath.Base(path)
 	repository := filepath.Base(filepath.Dir(path))
 	rel, err := filepath.Rel(root, path)
-	id := strings.TrimSuffix(fileName, ".gguf")
+	ext := filepath.Ext(path)
+	id := strings.TrimSuffix(fileName, ext)
 	if err == nil {
-		id = strings.TrimSuffix(rel, ".gguf")
+		id = strings.TrimSuffix(rel, ext)
+	}
+	if strings.EqualFold(ext, ".fermion") {
+		modelName, err := inspectPhonon(path, mmap.Bytes())
+		if err != nil {
+			return ModelEntry{}, err
+		}
+		// Like Parakeet GGUFs, Phonon models are picked by the audio
+		// endpoint; IsSupported describes the text-model Runner.
+		return ModelEntry{ID: id + ext, Repository: repository, FileName: fileName, Path: path,
+			SizeBytes: st.Size(), Architecture: "asr", ModelName: modelName}, nil
+	}
+	gguf, err := ParseGGUFQuiet(mmap.Bytes())
+	if err != nil {
+		return ModelEntry{}, err
 	}
 	declaredArch, _ := gguf.GetString("general.architecture")
 	// resolvedArch is what the loader will actually accept; hparamNS is where
@@ -523,6 +537,29 @@ func inspectModel(root, path string) (ModelEntry, error) {
 		entry.visionDimension, entry.visionTemplateCapable = pixtralTextCatalogInfo(gguf, entry.IsSupported, entry.IsEmbedding)
 	}
 	return entry, nil
+}
+
+func inspectPhonon(path string, data []byte) (string, error) {
+	if err := phonon.CheckHeader(data); err != nil {
+		return "", err
+	}
+	config, err := readPhononConfig(path)
+	if err != nil {
+		return "", err
+	}
+	var metadata struct {
+		Fermion struct {
+			Model  string `json:"model"`
+			Format string `json:"container_format"`
+		} `json:"fermion"`
+	}
+	if err := json.Unmarshal(config, &metadata); err != nil {
+		return "", fmt.Errorf("parsing Phonon config: %w", err)
+	}
+	if metadata.Fermion.Format != phonon.Format {
+		return "", fmt.Errorf("invalid Phonon config format %q", metadata.Fermion.Format)
+	}
+	return metadata.Fermion.Model, nil
 }
 
 // pixtralProjectorCatalogInfo performs the header-level portion of

@@ -536,36 +536,27 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 		return nil, LoadInfo{}, err
 	}
 	t0 := time.Now()
-	mmap, err := OpenMmap(path)
+	mmap, err := openModelMapping(path, options.OutOfCore)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) && looksLikeHubReference(path) {
 			return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w (not a local file: to fetch %q from Hugging Face see the huggingface package's Resolve, or to find a model already on disk see DiscoverModels/DefaultModelDir)", err, path)
 		}
 		return nil, LoadInfo{}, fmt.Errorf("failed to open model: %w", err)
 	}
-	if options.OutOfCore && !mmap.IsMapped() {
+	header, err := ParseGGUFQuiet(mmap.Bytes())
+	if err != nil {
 		_ = mmap.Close()
-		return nil, LoadInfo{}, fmt.Errorf("out-of-core loading requires an OS memory map; this file fell back to an in-memory read")
+		return nil, LoadInfo{}, err
 	}
-	if header, herr := ParseGGUFQuiet(mmap.Bytes()); herr == nil {
-		if _, count, ok := splitInfo(header); ok && count > 1 {
-			r, modelBytes, err := loadSplitRunner(path, header, mmap, options)
-			if err != nil {
-				return nil, LoadInfo{}, err
-			}
-			// Out-of-core keeps every shard mapped and reports the mapped
-			// size; the merging path reports the size of the copy it made.
-			return r, LoadInfo{FileSizeBytes: int(modelBytes), LoadTime: time.Since(t0), OutOfCore: options.OutOfCore}, nil
+	if _, _, ok := splitInfo(header); ok {
+		r, modelBytes, err := loadSplitRunner(path, header, mmap, options)
+		if err != nil {
+			return nil, LoadInfo{}, err
 		}
-		if mmap.IsMapped() {
-			prefaultMappedModel(mmap.Bytes(), header, options)
-		}
-	} else if mmap.IsMapped() {
-		// A malformed model will fail in the real parser below. Preserve the
-		// legacy full warm-up behavior when no trustworthy tensor map exists.
-		if effectivePrefaultMode(options) == MmapPrefaultAll {
-			prefaultPages(mmap.Bytes())
-		}
+		return r, LoadInfo{FileSizeBytes: int(modelBytes), LoadTime: time.Since(t0), OutOfCore: options.OutOfCore}, nil
+	}
+	if mmap.IsMapped() {
+		prefaultMappedModel(mmap.Bytes(), header, options)
 	}
 	// Quantized weights borrow sub-slices of the file buffer instead of
 	// copying (multi-gigabyte models load without a second copy). The one
@@ -574,7 +565,7 @@ func RunnerFromPathWithOptions(path string, options LoadOptions) (*Runner, LoadI
 	// C object must never keep a pointer into Go-managed heap memory. Without
 	// Metal, borrowing from the heap buffer is plain Go slice aliasing and
 	// always safe.
-	r, err := runnerFromGGUFBytes(mmap.Bytes(), mmap.IsMapped() || !options.UseMetal, options)
+	r, err := runnerFromParsedGGUF(mmap.Bytes(), header, mmap.IsMapped() || !options.UseMetal, options)
 	if err != nil {
 		_ = mmap.Close()
 		return nil, LoadInfo{}, err

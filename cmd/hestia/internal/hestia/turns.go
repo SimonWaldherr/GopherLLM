@@ -26,6 +26,8 @@ type Intent string
 const (
 	IntentDeviceAction          Intent = "device_action"
 	IntentKnowledgeQuery        Intent = "knowledge_query"
+	IntentWikipediaSearch       Intent = "wikipedia_search"
+	IntentWebSearch             Intent = "web_search"
 	IntentConversation          Intent = "conversation"
 	IntentClarificationResponse Intent = "clarification_response"
 	IntentCancel                Intent = "cancel"
@@ -49,7 +51,8 @@ type Turn struct {
 	Status         TurnStatus
 	InputText      string
 	Proposal       *Proposal
-	Candidates     []Device // resolver output awaiting clarification, if any
-	ResolvedTarget *Device  // single confirmed target, once known
-	Result         string   // human-readable outcome, set on completion
+	Candidates     []Device       // resolver output awaiting clarification, if any
+	ResolvedTarget *Device        // single confirmed target, once known
+	Result         string         // human-readable outcome, set on completion
+	Sources        []SearchResult `json:"sources,omitempty"`
 }

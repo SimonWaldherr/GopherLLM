@@ -14,7 +14,11 @@ func TestMoEConfiguredPrefillParity(t *testing.T) {
 	if r.config.Arch != "qwen35moe" {
 		t.Skip("grouped prefill requires qwen35moe")
 	}
-	t.Setenv("GOPHERLLM_MOE_PREFILL", "1")
+	if r.outOfCore {
+		t.Setenv("GOPHERLLM_MOE_PREFILL", "")
+	} else {
+		t.Setenv("GOPHERLLM_MOE_PREFILL", "1")
+	}
 	t.Setenv("GOPHERLLM_NO_MOE_PREFILL", "")
 	cache, _ := r.generationWorkspace(256)
 	if !r.canBatchQwen35Metal(cache) {

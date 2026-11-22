@@ -12,8 +12,10 @@ import (
 // Dense graphs preserve token-local cache codecs; grouped sparse experts
 // retain their existing F32-KV admission.
 func (r *Runner) canBatchQwen35Metal(cache *KVCache) bool {
-	return r != nil && r.kind == loadedQwen35 && !r.outOfCore &&
+	return r != nil && r.kind == loadedQwen35 &&
 		os.Getenv("GOPHERLLM_NO_BATCH_PREFILL") == "" &&
+		(r.config.Arch == "qwen35moe" && moePrefillEnabled(r.outOfCore) ||
+			r.config.Arch != "qwen35moe" && !r.outOfCore) &&
 		qwen35MetalBatchEligible(r.config, r.qwen35, cache)
 }
 
@@ -28,7 +30,7 @@ func qwen35MetalBatchEligible(cfg Config, weights Qwen35Weights, cache *KVCache)
 	for _, layer := range weights.Layers {
 		w := layer.FFN
 		if cfg.Arch == "qwen35moe" {
-			if !moePrefillEnabled() || !moePrefillReady(w.MoE, 32) {
+			if !moePrefillReady(w.MoE, 32) {
 				return false
 			}
 		} else if w.MoE != nil || w.Gate.GPU != nil || w.Up.GPU != nil || w.Down.GPU != nil ||

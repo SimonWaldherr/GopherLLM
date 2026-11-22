@@ -14,7 +14,7 @@ CGO_ENABLED=1 go build -tags capi -buildmode=c-archive -o "$work/libgopherllm.a"
 go run ./cmd/gopherllm-synth-testmodel -out "$work/tiny.gguf"
 
 case "$(uname -s)" in
-  Darwin) libs=(-framework Accelerate -framework Foundation) ;;
+  Darwin) libs=(-framework Accelerate -framework Foundation -framework Security) ;;
   *) libs=(-lpthread -lm -ldl) ;;
 esac
 ${CC:-cc} -std=c11 -Wall -Wextra -Werror -I bindings/c/include \

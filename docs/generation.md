@@ -192,6 +192,32 @@ The operator enables the endpoint with `ImageModelDir` in `server.HandlerOptions
 or `server.ServeOptions`; no chat runner is required. Browser-only deployments
 disable it because this pipeline runs on the local server, not in WebAssembly.
 
+## Whisper transcription
+
+GopherLLM runs the Whisper encoder and decoder in the same process as the
+caller. The Go path works with `CGO_ENABLED=0`. Apple builds with CGo also
+use the existing system Accelerate kernels. The model file is supplied by
+the caller.
+
+```sh
+go run ./cmd/whisper-transcribe -model /path/to/ggml-base.bin \
+  -audio /path/to/clip.wav -language auto
+```
+
+Use legacy little-endian GGML Whisper files with F16 or F32 weights. The
+CLI takes 16 kHz mono PCM16 WAV clips up to 30 seconds. Go callers can open
+a resident model through `speech.Open` with `speech.Whisper`, then pass
+normalized mono samples or PCM16 through `speech.Recognizer`. The same
+backend is selectable in Hestia, the browser demo, and the Swift bindings.
+The decoder returns text using greedy search and language detection or an
+explicit code such as `de`. Quantized GGML, PyTorch containers, timestamps,
+translation, beam search, and long-form transcription are outside this path.
+
+The multilingual Base F16 model was tested on a German FLEURS clip with
+automatic language selection and with `de`, including on a CGo-disabled
+build. The implementation follows the [OpenAI Whisper model](https://github.com/openai/whisper/blob/main/whisper/model.py)
+and the [Whisper audio frontend](https://github.com/openai/whisper/blob/main/whisper/audio.py).
+
 ## German speech
 
 Download `config.json`, `tokenizer_config.json`, `vocab.json` and

@@ -35,6 +35,10 @@ go build -tags capi -buildmode=c-archive -o libgopherllm.a  ./bindings/c/shim
 Include `gopherllm.h`. Go also writes a `libgopherllm.h` next to the library,
 which declares the same functions with Go's type names.
 
+When linking a static archive on macOS, link Accelerate, Foundation, and
+Security. The Metal builds also link Metal. The XCFramework and Swift package declare their
+framework dependencies. [Speech and Hub APIs](../swift/README.md#speech-and-model-downloads)
+
 ## API in short
 
 - `gopherllm_engine_new` / `gopherllm_engine_free` — one handle per model.

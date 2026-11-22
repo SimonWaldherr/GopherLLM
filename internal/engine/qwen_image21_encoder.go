@@ -20,6 +20,24 @@ type qi21TextEncoder struct {
 	weights   ModelWeights
 	tokenizer *tokenizerpkg.QwenImageTokenizer
 	drop      int
+	// cache and buf are lazily allocated and reused across Encode calls: the
+	// encoder's dimensions never change, so only cache's capacity needs to
+	// grow for a longer prompt. This avoids re-allocating up to ~1.2 GiB of
+	// KV cache plus the decode scratch buffers on every call.
+	cache *KVCache
+	buf   *DecodeBuffer
+}
+
+// close releases Metal resources retained by the encoder's reusable decode
+// buffer. Safe to call on a nil encoder or one that never ran Encode.
+func (e *qi21TextEncoder) close() {
+	if e == nil || e.buf == nil {
+		return
+	}
+	if e.buf.metalDense != nil {
+		e.buf.metalDense.close()
+		e.buf.metalDense = nil
+	}
 }
 
 func newQI21TextEncoder(configJSON, tokenizerJSON []byte, source qi21WeightSource) (*qi21TextEncoder, error) {
@@ -160,13 +178,13 @@ func (e *qi21TextEncoder) Encode(ctx context.Context, prompt string) ([]float32,
 	if uint64(len(tokens))*uint64(c.NLayers)*uint64(c.KVDim)*8 > 2<<30 {
 		return nil, 0, fmt.Errorf("qwen image encoder: prompt KV cache exceeds 2 GiB")
 	}
-	cache := NewKVCache(c.NLayers, c.KVDim, c.KVDim, len(tokens))
-	buf := NewDecodeBuffer(c, c.HeadDim, c.NKVHeads, c.ValueDim)
-	defer func() {
-		if buf.metalDense != nil {
-			buf.metalDense.close()
-		}
-	}()
+	if e.cache == nil || e.cache.MaxLen < len(tokens) {
+		e.cache = NewKVCache(c.NLayers, c.KVDim, c.KVDim, len(tokens))
+	}
+	if e.buf == nil {
+		e.buf = NewDecodeBuffer(c, c.HeadDim, c.NKVHeads, c.ValueDim)
+	}
+	cache, buf := e.cache, e.buf
 	out := make([]float32, (len(tokens)-e.drop)*c.Dim)
 	for start := 0; start < len(tokens); start += 32 {
 		end := min(start+32, len(tokens))

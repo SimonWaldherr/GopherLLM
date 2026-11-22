@@ -40,3 +40,4 @@ xcuserdata/
 DerivedData/
 scripts/__pycache__
 benchmarks/metal/__pycache__/
+littlebit-qwen3-8b

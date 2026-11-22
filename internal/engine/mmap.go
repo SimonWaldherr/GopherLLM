@@ -1,6 +1,10 @@
 package engine
 
-import "github.com/SimonWaldherr/GopherLLM/internal/mmapfile"
+import (
+	"fmt"
+
+	"github.com/SimonWaldherr/GopherLLM/internal/mmapfile"
+)
 
 // MmapFile exposes a model file as one immutable byte slice, memory-mapped
 // where the platform allows so multi-gigabyte weights are paged in on demand
@@ -11,6 +15,17 @@ type MmapFile = mmapfile.File
 // If mapping is unavailable for a specific file, it falls back to a read copy.
 func OpenMmap(path string) (*MmapFile, error) {
 	return mmapfile.Open(path)
+}
+
+func openModelMapping(path string, outOfCore bool) (*MmapFile, error) {
+	if !outOfCore {
+		return OpenMmap(path)
+	}
+	mapped, err := mmapfile.OpenMapped(path)
+	if err != nil {
+		return nil, fmt.Errorf("out-of-core loading requires an OS memory map: %w", err)
+	}
+	return mapped, nil
 }
 
 type mmapByteRange struct {

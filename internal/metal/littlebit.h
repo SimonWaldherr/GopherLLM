@@ -30,6 +30,8 @@ typedef struct {
 } GLLMLittleBitWeight;
 
 static id<MTLComputePipelineState> gllm_littlebit_latent_pipeline;
+static id<MTLComputePipelineState> gllm_littlebit_latent_two_tokens_pipeline;
+static id<MTLComputePipelineState> gllm_littlebit_latent_bf16_decode_pipeline;
 static id<MTLComputePipelineState> gllm_littlebit_output_pipeline;
 static id<MTLComputePipelineState> gllm_littlebit_swiglu_pipeline;
 static id<MTLBuffer> gllm_littlebit_x;
@@ -53,11 +55,9 @@ static NSString* const gllm_littlebit_source =
 "static float signed_mask(uint sign, float value) {\n"
 "  return as_type<float>(as_type<uint>(value) ^ (sign & 0x80000000u));\n"
 "}\n"
-"kernel void littlebit_latent(\n"
-"    const device uchar* data [[buffer(0)]], const device float* x [[buffer(1)]],\n"
-"    device float* z [[buffer(2)]], constant Params& p [[buffer(3)]],\n"
-"    uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],\n"
-"    uint lane [[thread_index_in_simdgroup]]) {\n"
+"template <bool paired>\n"
+"static void latent_rows(const device uchar* data, const device float* x, device float* z,\n"
+"                        constant Params& p, uint batch, uint2 group, uint sg, uint lane) {\n"
 "  // A SIMD group shares x*v2 between two adjacent V rows of one branch.\n"
 "  uint pair = group.x * 4 + sg;\n"
 "  uint rank_sum = p.main.rank + p.residual.rank;\n"
@@ -72,28 +72,96 @@ static NSString* const gllm_littlebit_source =
 "  const device uint* v0 = reinterpret_cast<const device uint*>(data + f.v) + row * words;\n"
 "  // Repeat the last row of an odd branch so both accumulators stay in bounds.\n"
 "  const device uint* v1 = v0 + (second ? words : 0);\n"
-"  const device float* input = x + group.y * p.cols;\n"
+"  uint token = group.y * (paired ? 2 : 1);\n"
+"  bool has_next = paired && token + 1 < batch;\n"
+"  const device float* input = x + token * p.cols;\n"
+"  // Reuse the last token in an odd batch, but never write a second result.\n"
+"  const device float* next = input + (has_next ? p.cols : 0);\n"
 "  uint sign_shift = 31 - lane;\n"
 "  uint full = p.cols >> 5;\n"
-"  float sum0 = 0.0f, sum1 = 0.0f;\n"
+"  float sum0 = 0.0f, sum1 = 0.0f, next0 = 0.0f, next1 = 0.0f;\n"
 "  for (uint word = 0; word < full; ++word) {\n"
 "    uint col = word * 32 + lane;\n"
-"    float scaled = input[col] * scale(data, f.v2, col);\n"
-"    sum0 += signed_mask(v0[word] << sign_shift, scaled);\n"
-"    sum1 += signed_mask(v1[word] << sign_shift, scaled);\n"
+"    float s = scale(data, f.v2, col), scaled = input[col] * s;\n"
+"    uint mask0 = v0[word] << sign_shift, mask1 = v1[word] << sign_shift;\n"
+"    sum0 += signed_mask(mask0, scaled);\n"
+"    sum1 += signed_mask(mask1, scaled);\n"
+"    if (paired) {\n"
+"      float scaled_next = next[col] * s;\n"
+"      next0 += signed_mask(mask0, scaled_next);\n"
+"      next1 += signed_mask(mask1, scaled_next);\n"
+"    }\n"
 "  }\n"
 "  if (lane < (p.cols & 31)) {\n"
 "    uint col = full * 32 + lane;\n"
-"    float scaled = input[col] * scale(data, f.v2, col);\n"
-"    sum0 += signed_mask(v0[full] << sign_shift, scaled);\n"
-"    sum1 += signed_mask(v1[full] << sign_shift, scaled);\n"
+"    float s = scale(data, f.v2, col), scaled = input[col] * s;\n"
+"    uint mask0 = v0[full] << sign_shift, mask1 = v1[full] << sign_shift;\n"
+"    sum0 += signed_mask(mask0, scaled);\n"
+"    sum1 += signed_mask(mask1, scaled);\n"
+"    if (paired) {\n"
+"      float scaled_next = next[col] * s;\n"
+"      next0 += signed_mask(mask0, scaled_next);\n"
+"      next1 += signed_mask(mask1, scaled_next);\n"
+"    }\n"
 "  }\n"
 "  sum0 = simd_sum(sum0);\n"
 "  sum1 = simd_sum(sum1);\n"
+"  if (paired) { next0 = simd_sum(next0); next1 = simd_sum(next1); }\n"
 "  if (lane == 0) {\n"
-"    uint offset = group.y * rank_sum + (residual ? p.main.rank : 0) + row;\n"
-"    z[offset] = sum0 * (scale(data, f.v1, row) * scale(data, f.u2, row));\n"
-"    if (second) z[offset + 1] = sum1 * (scale(data, f.v1, row + 1) * scale(data, f.u2, row + 1));\n"
+"    uint offset = token * rank_sum + (residual ? p.main.rank : 0) + row;\n"
+"    float s0 = scale(data, f.v1, row) * scale(data, f.u2, row);\n"
+"    z[offset] = sum0 * s0;\n"
+"    if (has_next) z[offset + rank_sum] = next0 * s0;\n"
+"    if (second) {\n"
+"      float s1 = scale(data, f.v1, row + 1) * scale(data, f.u2, row + 1);\n"
+"      z[offset + 1] = sum1 * s1;\n"
+"      if (has_next) z[offset + rank_sum + 1] = next1 * s1;\n"
+"    }\n"
+"  }\n"
+"}\n"
+"kernel void littlebit_latent(\n"
+"    const device uchar* data [[buffer(0)]], const device float* x [[buffer(1)]],\n"
+"    device float* z [[buffer(2)]], constant Params& p [[buffer(3)]],\n"
+"    uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]) { latent_rows<false>(data,x,z,p,0,group,sg,lane); }\n"
+"kernel void littlebit_latent_two_tokens(\n"
+"    const device uchar* data [[buffer(0)]], const device float* x [[buffer(1)]],\n"
+"    device float* z [[buffer(2)]], constant Params& p [[buffer(3)]],\n"
+"    constant uint& batch [[buffer(4)]],\n"
+"    uint2 group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]) { latent_rows<true>(data,x,z,p,batch,group,sg,lane); }\n"
+"kernel void littlebit_latent_bf16_decode(\n"
+"    const device uchar* data [[buffer(0)]], const device float* x [[buffer(1)]],\n"
+"    device float* z [[buffer(2)]], constant Params& p [[buffer(3)]],\n"
+"    uint group [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],\n"
+"    uint lane [[thread_index_in_simdgroup]]) {\n"
+"  uint quad = group * 2 + sg;\n"
+"  uint main_quads = (p.main.rank + 3) / 4;\n"
+"  if (quad >= main_quads + (p.residual.rank + 3) / 4) return;\n"
+"  bool residual = quad >= main_quads;\n"
+"  Factors f = residual ? p.residual : p.main;\n"
+"  uint row = 4 * (quad - (residual ? main_quads : 0));\n"
+"  uint words = p.cols / 32;\n"
+"  const device uint* packed = reinterpret_cast<const device uint*>(data + f.v);\n"
+"  const device ushort* v2 = reinterpret_cast<const device ushort*>(data + f.v2.offset);\n"
+"  uint4 rows = min(row + uint4(0,1,2,3), uint4(f.rank - 1));\n"
+"  uint4 base = rows * words;\n"
+"  uint shift = 31 - lane;\n"
+"  float4 sum = 0;\n"
+"  for (uint word = 0; word < words; ++word) {\n"
+"    uint col = word * 32 + lane;\n"
+"    float scaled = x[col] * as_type<float>(uint(v2[col]) << 16);\n"
+"    uint4 masks = uint4(packed[base.x + word], packed[base.y + word],\n"
+"                        packed[base.z + word], packed[base.w + word]) << shift;\n"
+"    sum += as_type<float4>(uint4(as_type<uint>(scaled)) ^ (masks & 0x80000000u));\n"
+"  }\n"
+"  sum = float4(simd_sum(sum.x), simd_sum(sum.y), simd_sum(sum.z), simd_sum(sum.w));\n"
+"  if (lane == 0) {\n"
+"    uint offset = residual ? p.main.rank : 0;\n"
+"    for (uint i = 0; i < 4 && row + i < f.rank; ++i) {\n"
+"      uint r = row + i;\n"
+"      z[offset + r] = sum[i] * (scale(data, f.v1, r) * scale(data, f.u2, r));\n"
+"    }\n"
 "  }\n"
 "}\n"
 "static float output_row(const device uchar* data, const device float* z,\n"
@@ -190,6 +258,22 @@ static bool gllm_metal_init_littlebit(void) {
 		if (swiglu != nil)
 			gllm_littlebit_swiglu_pipeline = [gllm_device newComputePipelineStateWithFunction:swiglu error:NULL];
 		[swiglu release];
+		id<MTLFunction> paired = [library newFunctionWithName:@"littlebit_latent_two_tokens"];
+		if (paired != nil) {
+			id<MTLComputePipelineState> pipe = [gllm_device newComputePipelineStateWithFunction:paired error:NULL];
+			if ([pipe threadExecutionWidth] == 32 && [pipe maxTotalThreadsPerThreadgroup] >= 128)
+				gllm_littlebit_latent_two_tokens_pipeline = pipe;
+			else [pipe release];
+			[paired release];
+		}
+		id<MTLFunction> decode = [library newFunctionWithName:@"littlebit_latent_bf16_decode"];
+		if (decode != nil) {
+			id<MTLComputePipelineState> pipe = [gllm_device newComputePipelineStateWithFunction:decode error:NULL];
+			if ([pipe threadExecutionWidth] == 32 && [pipe maxTotalThreadsPerThreadgroup] >= 64)
+				gllm_littlebit_latent_bf16_decode_pipeline = pipe;
+			else [pipe release];
+			[decode release];
+		}
 		if (gllm_littlebit_swiglu_pipeline != nil &&
 		    ([gllm_littlebit_swiglu_pipeline threadExecutionWidth] != 32 ||
 		     [gllm_littlebit_swiglu_pipeline maxTotalThreadsPerThreadgroup] < 128)) {
@@ -208,9 +292,13 @@ static bool gllm_metal_init_littlebit(void) {
 			gllm_set_error(@"unsupported Metal LittleBit SIMD group size", nil);
 		}
 		[gllm_littlebit_latent_pipeline release];
+		[gllm_littlebit_latent_two_tokens_pipeline release];
+		[gllm_littlebit_latent_bf16_decode_pipeline release];
 		[gllm_littlebit_output_pipeline release];
 		[gllm_littlebit_swiglu_pipeline release];
 		gllm_littlebit_latent_pipeline = nil;
+		gllm_littlebit_latent_two_tokens_pipeline = nil;
+		gllm_littlebit_latent_bf16_decode_pipeline = nil;
 		gllm_littlebit_output_pipeline = nil;
 		gllm_littlebit_swiglu_pipeline = nil;
 	});
@@ -293,15 +381,41 @@ static NSUInteger gllm_littlebit_latent_groups(GLLMLittleBitWeight* w) {
 	return (main + residual + 3) / 4;
 }
 
+static void gllm_encode_littlebit_latent(id<MTLComputeCommandEncoder> enc, GLLMLittleBitWeight* w,
+                                         id<MTLBuffer> x, id<MTLBuffer> z, NSUInteger z_offset, NSUInteger batch) {
+	bool paired = gllm_littlebit_latent_two_tokens_pipeline != nil && batch >= 16;
+	// Whole packed words and BF16 V2 let each SIMD group reuse one scaled
+	// activation across four rows. Two groups still cover eight rows per tile.
+	bool decode = batch == 1 && w->params.cols % 32 == 0 && w->params.main.v2.kind == 3 &&
+	              (w->params.residual.rank == 0 || w->params.residual.v2.kind == 3) &&
+	              gllm_littlebit_latent_bf16_decode_pipeline != nil;
+	id<MTLComputePipelineState> pipeline = gllm_littlebit_latent_pipeline;
+	NSUInteger groups = gllm_littlebit_latent_groups(w), threads = 128;
+	if (decode) {
+		pipeline = gllm_littlebit_latent_bf16_decode_pipeline;
+		NSUInteger main = ((NSUInteger)w->params.main.rank + 3) / 4;
+		NSUInteger residual = ((NSUInteger)w->params.residual.rank + 3) / 4;
+		groups = (main + residual + 1) / 2;
+		threads = 64;
+	} else if (paired) {
+		pipeline = gllm_littlebit_latent_two_tokens_pipeline;
+	}
+	[enc setComputePipelineState:pipeline];
+	[enc setBuffer:w->data offset:0 atIndex:0];
+	[enc setBuffer:x offset:0 atIndex:1];
+	[enc setBuffer:z offset:z_offset atIndex:2];
+	[enc setBytes:&w->params length:sizeof(w->params) atIndex:3];
+	if (paired) {
+		uint32_t tokens = (uint32_t)batch;
+		[enc setBytes:&tokens length:sizeof(tokens) atIndex:4];
+	}
+	[enc dispatchThreadgroups:MTLSizeMake(groups, paired ? (batch + 1) / 2 : batch, 1)
+	        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+}
+
 static void gllm_littlebit_encode_latent(id<MTLComputeCommandEncoder> enc, GLLMLittleBitWeight* w,
                                         NSUInteger batch, NSUInteger z_offset) {
-	[enc setComputePipelineState:gllm_littlebit_latent_pipeline];
-	[enc setBuffer:w->data offset:0 atIndex:0];
-	[enc setBuffer:gllm_littlebit_x offset:0 atIndex:1];
-	[enc setBuffer:gllm_littlebit_z offset:z_offset atIndex:2];
-	[enc setBytes:&w->params length:sizeof(w->params) atIndex:3];
-	[enc dispatchThreadgroups:MTLSizeMake(gllm_littlebit_latent_groups(w), batch, 1)
-	        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+	gllm_encode_littlebit_latent(enc, w, gllm_littlebit_x, gllm_littlebit_z, z_offset, batch);
 }
 
 static void gllm_littlebit_encode_output(id<MTLComputeCommandEncoder> enc, GLLMLittleBitWeight* w,

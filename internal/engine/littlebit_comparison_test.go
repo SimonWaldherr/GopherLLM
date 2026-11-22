@@ -122,3 +122,50 @@ func TestQwen3LittleBitFixedDecodeComparison(t *testing.T) {
 			i, promptTokens, decodeSteps, promptTokens/middle.Sub(start).Seconds(), decodeSteps/end.Sub(middle).Seconds(), buf.metalDense != nil, digest)
 	}
 }
+
+// TestQwen3MetalDecodeContexts times only greedy decode at several KV
+// depths. It prefills once and visits depths in descending order so a trial
+// can overwrite its own suffix without changing the prefix of a later trial.
+func TestQwen3MetalDecodeContexts(t *testing.T) {
+	r, _, useMetal, _ := openQwen3ComparisonModel(t)
+	if !useMetal || !r.canBatchPrefill() {
+		t.Skip("requires Metal and batched prefill")
+	}
+	const maxDepth, steps = 1536, 48
+	prompt := r.tok.EncodeWithoutBOS(strings.Repeat("Air scatters blue light more than red light. ", maxDepth))
+	if len(prompt) <= maxDepth {
+		t.Fatalf("comparison prompt has only %d tokens", len(prompt))
+	}
+	cache, buf := r.generationWorkspace(maxDepth + steps)
+	var logits []float32
+	if err := r.prefillBatched(context.Background(), cache, buf, prompt[:maxDepth], &logits); err != nil {
+		t.Fatal(err)
+	}
+	for _, depth := range []int{maxDepth, 512, 128} {
+		var expected string
+		for repeat := 0; repeat <= 3; repeat++ {
+			next := prompt[depth]
+			var output [steps]uint32
+			start := time.Now()
+			for j := range output {
+				var ok bool
+				next, ok = r.forwardGreedyToken(cache, buf, next, depth+j, nil, 1, &logits)
+				if !ok {
+					next = argmaxFiniteToken(logits)
+				}
+				output[j] = next
+			}
+			elapsed := time.Since(start)
+			digest := specABDigest(output[:])
+			if repeat == 0 {
+				expected = digest
+				continue
+			}
+			if digest != expected {
+				t.Fatalf("depth %d: greedy output changed in repeat %d: got %s, want %s", depth, repeat, digest, expected)
+			}
+			t.Logf("depth=%d run=%d steps=%d decode_tps=%.3f resident_decode=%t digest=%s",
+				depth, repeat, steps, steps/elapsed.Seconds(), buf.metalDense != nil, digest)
+		}
+	}
+}

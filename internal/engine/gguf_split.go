@@ -149,7 +149,7 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 		_ = firstMmap.Close()
 	}()
 
-	firstNo, count, _ := splitInfo(firstGGUF)
+	_, count, _ := splitInfo(firstGGUF)
 	// The on-disk split naming convention has exactly five decimal digits.
 	if count < 2 || count > 99999 {
 		return nil, 0, fmt.Errorf("split model: split.count=%d is outside the split filename range", count)
@@ -163,22 +163,23 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 
 	shards = make([]shard, count)
 	littleBit, allMapped := false, true
+	firstUsed := false
 	for i := 1; i <= count; i++ {
 		shardPath := splitShardPath(prefix, i, count)
-		var mm *MmapFile
-		if i-1 == firstNo && shardPath == path {
-			mm = firstMmap
+		mm, g := firstMmap, firstGGUF
+		if shardPath == path {
+			firstUsed = true
 		} else {
 			var err error
-			mm, err = OpenMmap(shardPath)
+			mm, err = openModelMapping(shardPath, options.OutOfCore)
 			if err != nil {
 				return nil, 0, fmt.Errorf("split model: failed to open shard %d/%d (%s): %w", i, count, shardPath, err)
 			}
-		}
-		shards[i-1].mmap = mm
-		g, err := ParseGGUFQuiet(mm.Bytes())
-		if err != nil {
-			return nil, 0, fmt.Errorf("split model: failed to parse shard %d/%d (%s): %w", i, count, shardPath, err)
+			shards[i-1].mmap = mm
+			g, err = ParseGGUFQuiet(mm.Bytes())
+			if err != nil {
+				return nil, 0, fmt.Errorf("split model: failed to parse shard %d/%d (%s): %w", i, count, shardPath, err)
+			}
 		}
 		if g.DataOffset > mm.Len() {
 			return nil, 0, fmt.Errorf("split model: shard %d has a data offset past EOF", i)
@@ -235,11 +236,6 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 	// the only way out-of-core is useful in practice — every model large
 	// enough to want it ships sharded.
 	if options.OutOfCore || (littleBit && allMapped) {
-		for _, s := range byNo {
-			if !s.mmap.IsMapped() {
-				return nil, 0, fmt.Errorf("out-of-core loading requires an OS memory map, but shard %d of %s fell back to an in-memory read", s.no+1, path)
-			}
-		}
 		var shardedTensors []TensorInfo
 		var metadata map[string]MetaValue
 		var mappedBytes int64
@@ -276,6 +272,9 @@ func loadSplitRunner(path string, firstGGUF *GGUFFile, firstMmap *MmapFile, opti
 		}
 		for _, s := range byNo {
 			r.extraMappedFiles = append(r.extraMappedFiles, s.mmap)
+		}
+		if !firstUsed {
+			_ = firstMmap.Close()
 		}
 		keepMappings = true
 		return r, mappedBytes, nil

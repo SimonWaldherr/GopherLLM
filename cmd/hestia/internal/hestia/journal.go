@@ -36,9 +36,12 @@ type Journal struct {
 	seq    int
 }
 
-// OpenJournal opens (creating if needed) a JSONL journal file at path and
-// replays its existing contents into memory.
+// OpenJournal opens a JSONL journal and replays its contents. An empty path
+// keeps the journal in memory for the process lifetime.
 func OpenJournal(path string) (*Journal, error) {
+	if path == "" {
+		return &Journal{}, nil
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("opening journal: %w", err)
@@ -75,11 +78,13 @@ func (j *Journal) Append(e Event) (Event, error) {
 	if e.At.IsZero() {
 		e.At = time.Now().UTC()
 	}
-	if err := j.enc.Encode(e); err != nil {
-		return Event{}, fmt.Errorf("appending event: %w", err)
-	}
-	if err := j.f.Sync(); err != nil {
-		return Event{}, fmt.Errorf("syncing journal: %w", err)
+	if j.f != nil {
+		if err := j.enc.Encode(e); err != nil {
+			return Event{}, fmt.Errorf("appending event: %w", err)
+		}
+		if err := j.f.Sync(); err != nil {
+			return Event{}, fmt.Errorf("syncing journal: %w", err)
+		}
 	}
 	j.events = append(j.events, e)
 	return e, nil
@@ -114,5 +119,8 @@ func (j *Journal) ByTurn(turnID string) []Event {
 func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.f == nil {
+		return nil
+	}
 	return j.f.Close()
 }

@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // This file implements the FastConformer encoder's per-block forward pass
@@ -36,8 +38,8 @@ import (
 
 // weightRows returns a Weight's output row count for a matvec over an input
 // of length cols. Rows/Cols are only populated on raw (quantized or lazy
-// scalar) weights; an owned F32 weight -- which is what every Parakeet
-// tensor loads as -- infers its row count from len(F32)/cols instead (see
+// scalar) weights; an owned F32 weight such as the Parakeet GGUF projections
+// infers its row count from len(F32)/cols instead (see
 // Weight's doc comment), so batched callers that need to pre-size an output
 // buffer before calling blasMatvecBatch/matvecBatch must compute it the same
 // way MatvecInto does internally rather than reading w.Rows directly.
@@ -49,6 +51,40 @@ func weightRows(w Weight, cols int) int {
 		return len(w.F32) / cols
 	}
 	return w.Rows
+}
+
+// The largest Phonon encoder projection is 4096 × 1024. Expand only the
+// current matrix into reusable scratch so the batched graph can still use
+// the existing FP32 GEMM backend with packed or FP16 weights at rest.
+const parakeetMaxProjectionElements = 4096 * 1024
+
+type parakeetProjectionScratch struct{ values []float32 }
+
+var parakeetProjectionPool = sync.Pool{New: func() any { return new(parakeetProjectionScratch) }}
+
+func parakeetMatvecBatch(w Weight, xs, out [][]float32) {
+	if len(xs) == 0 {
+		return
+	}
+	if w.phononProjection == nil && (len(xs) < 2 || w.F32 != nil || w.Type != GGMLTypeF16 || w.Cols <= 0 || w.Rows <= 0 ||
+		w.Rows > parakeetMaxProjectionElements/w.Cols || w.Rows > len(w.Raw)/2/w.Cols) {
+		blasMatvecBatch(w, xs, out)
+		return
+	}
+	n := w.Rows * w.Cols
+	scratch := parakeetProjectionPool.Get().(*parakeetProjectionScratch)
+	defer parakeetProjectionPool.Put(scratch)
+	ensureLenNoClear(&scratch.values, n)
+	if t := w.phononProjection; t != nil {
+		parallelRowsBatched(w.Rows, func(start, end int) {
+			t.DecodeFiveValueRows(scratch.values[start*w.Cols:end*w.Cols], start, end)
+		})
+	} else {
+		for i, packed := range f16RowView(w.Raw, 0, n) {
+			scratch.values[i] = F16ToF32(packed)
+		}
+	}
+	blasMatvecBatch(Weight{F32: scratch.values}, xs, out)
 }
 
 // parakeetFeedForwardBatch runs one macaron half-step FFN module over all T
@@ -67,7 +103,7 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 	}
 	hiddenDim := weightRows(lin1, dModel)
 	hidden := audioMatrixRows(t, hiddenDim)
-	blasMatvecBatch(lin1, normed, hidden)
+	parakeetMatvecBatch(lin1, normed, hidden)
 	// Rows are independent; keep the same Swish arithmetic in each element.
 	// Small batches stay inline to avoid worker dispatch overhead.
 	activate := func(start, end int) {
@@ -85,7 +121,7 @@ func parakeetFeedForwardBatch(xs [][]float32, normW, normB []float32, lin1, lin2
 	}
 	outDim := weightRows(lin2, hiddenDim)
 	out := audioMatrixRows(t, outDim)
-	blasMatvecBatch(lin2, hidden, out)
+	parakeetMatvecBatch(lin2, hidden, out)
 	for i := range out {
 		row := out[i][:len(xs[i])]
 		oi := out[i]
@@ -116,7 +152,7 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 
 	expandedDim := weightRows(conv.PointwiseConv1, dModel)
 	expanded := audioMatrixRows(t, expandedDim)
-	blasMatvecBatch(conv.PointwiseConv1, normed, expanded)
+	parakeetMatvecBatch(conv.PointwiseConv1, normed, expanded)
 
 	half := expandedDim / 2
 	glu := audioMatrixRows(t, half)
@@ -168,7 +204,7 @@ func parakeetConvModule(xs [][]float32, conv ParakeetEncoderConvLayer, normW, no
 
 	projDim := weightRows(conv.PointwiseConv2, dModel)
 	proj := audioMatrixRows(t, projDim)
-	blasMatvecBatch(conv.PointwiseConv2, dwOut, proj)
+	parakeetMatvecBatch(conv.PointwiseConv2, dwOut, proj)
 
 	for i := range proj {
 		row := proj[i][:dModel]
@@ -206,9 +242,9 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 	q := audioMatrixRows(t, dModel)
 	k := audioMatrixRows(t, dModel)
 	v := audioMatrixRows(t, dModel)
-	blasMatvecBatch(attn.LinearQ, normed, q)
-	blasMatvecBatch(attn.LinearK, normed, k)
-	blasMatvecBatch(attn.LinearV, normed, v)
+	parakeetMatvecBatch(attn.LinearQ, normed, q)
+	parakeetMatvecBatch(attn.LinearK, normed, k)
+	parakeetMatvecBatch(attn.LinearV, normed, v)
 
 	// Project the 2T-1 positional rows [center-(T-1) : center+(T-1)]
 	// (inclusive), i.e. relative positions from +(T-1) down to -(T-1),
@@ -220,7 +256,7 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 		posRows[i] = posEnc[(posStart+i)*dModel : (posStart+i+1)*dModel]
 	}
 	posProj := audioMatrixRows(posLen, dModel)
-	blasMatvecBatch(attn.LinearPos, posRows, posProj)
+	parakeetMatvecBatch(attn.LinearPos, posRows, posProj)
 
 	scale := float32(1 / math.Sqrt(float64(headDim)))
 	out := audioMatrixRows(t, dModel)
@@ -275,7 +311,7 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 	}
 
 	proj := audioMatrixRows(t, dModel)
-	blasMatvecBatch(attn.LinearOut, out, proj)
+	parakeetMatvecBatch(attn.LinearOut, out, proj)
 	for i, row := range proj {
 		for c := range row {
 			row[c] = xs[i][c] + row[c]
@@ -288,9 +324,19 @@ func parakeetRelPosSelfAttention(xs [][]float32, attn ParakeetEncoderAttention, 
 // dw_striding subsampling, then every Conformer block, returning one
 // DModel-wide embedding per output frame (row-major [T][DModel]).
 func ParakeetEncode(cfg ParakeetConfig, w ParakeetWeights, samples []float32) ([][]float32, error) {
+	return parakeetEncodeContext(context.Background(), cfg, w, samples)
+}
+
+func parakeetEncodeContext(ctx context.Context, cfg ParakeetConfig, w ParakeetWeights, samples []float32) ([][]float32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	mel, nFrames, err := parakeetLogMelSpectrogram(cfg.Preprocessor, w.MelFilterbank, samples)
 	if err != nil {
 		return nil, fmt.Errorf("parakeet encode: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	flat, outT, err := parakeetSubsample(cfg, w.Encoder, mel, nFrames)
 	if err != nil {
@@ -299,10 +345,14 @@ func ParakeetEncode(cfg ParakeetConfig, w ParakeetWeights, samples []float32) ([
 	dModel := cfg.Encoder.DModel
 	xs := make([][]float32, outT)
 	for i := range xs {
-		xs[i] = append([]float32(nil), flat[i*dModel:(i+1)*dModel]...)
+		end := (i + 1) * dModel
+		xs[i] = flat[i*dModel : end : end]
 	}
 
 	for li := range w.Encoder.Layers {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		layer := &w.Encoder.Layers[li]
 		xs2 := parakeetFeedForwardBatch(xs, layer.NormFeedForward1Weight, layer.NormFeedForward1Bias, layer.FeedForward1Linear1, layer.FeedForward1Linear2, cfg.Encoder.Epsilon)
 		xs3, err := parakeetRelPosSelfAttention(xs2, layer.SelfAttn, layer.NormSelfAttWeight, layer.NormSelfAttBias, cfg.Encoder.NHeads, cfg.Encoder.HeadDim, w.Encoder.PosEnc, w.Encoder.PosEncMaxLen, cfg.Encoder.Epsilon)

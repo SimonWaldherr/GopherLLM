@@ -247,7 +247,9 @@ func TestOutOfCoreSplitGGUFLoadsWithoutMerging(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r, info, err := RunnerFromPathWithOptions(path1, LoadOptions{OutOfCore: true})
+	// Open through a non-primary shard; the already parsed header must be
+	// reused without losing the tokenizer metadata stored in shard one.
+	r, info, err := RunnerFromPathWithOptions(path2, LoadOptions{OutOfCore: true})
 	if err != nil {
 		t.Fatalf("out-of-core split load: %v", err)
 	}

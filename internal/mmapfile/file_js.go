@@ -12,11 +12,11 @@ import "fmt"
 // this file exists solely so the package type-checks on these platforms.
 type File struct{}
 
-// Open unconditionally reports that memory-mapped files are unsupported.
+// Both open modes report that memory-mapped files are unsupported.
 // It does not attempt to touch the filesystem: under GOOS=js a browser tab
 // has none, and failing fast avoids a confusing not-exist error standing in
 // for the real reason.
-func Open(path string) (*File, error) {
+func open(_ string, _ bool) (*File, error) {
 	return nil, fmt.Errorf("mmapfile: memory-mapped files are not supported in the browser; load the model from bytes via RunnerFromGGUFBytes instead")
 }
 
